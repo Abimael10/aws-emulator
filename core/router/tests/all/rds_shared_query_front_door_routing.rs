@@ -24,6 +24,12 @@
 //! * an `Action` the model does not declare is the query protocol's own `400 InvalidAction`
 //!   as `text/xml`, never a JSON router refusal.
 //!
+//! A subnet is not DocumentDB's resource but Amazon EC2's, and that front door resolves
+//! every `SubnetIds` member against the service that owns subnets, so the group this suite
+//! creates is built out of subnets MINTED through EC2 on the very router under test — which
+//! is also the second thing assembly has to survive: the in-process hop from one mounted
+//! service to another.
+//!
 //! The crate's own suite (`services/service-com-amazonaws-docdb-amazonrdsv19/tests/all/`)
 //! states these rules over tables of inputs; this one proves they survive assembly with
 //! every other service mounted. Assembling the router costs stack (see `boot_serve.rs`), so
@@ -33,13 +39,18 @@
 use std::sync::Arc;
 
 use aws_emulator_router::{build_router, InMemoryEngine};
+use smithy_server_runtime::MultiServiceRouter;
 
 use crate::rds_docdb_neptune_signing_name_routing::{authorization, API_VERSION, BOOT_STACK_SIZE};
 
-/// The form-urlencoded body of an awsQuery call: the `Action`, the `Version`, and the
-/// already-encoded members.
-fn body(action: &str, params: &[(&str, &str)]) -> bytes::Bytes {
-    let mut body = format!("Action={action}&Version={API_VERSION}");
+/// The ec2Query API version Amazon EC2 publishes, for the calls that mint the network the
+/// subnet group below is made of.
+const EC2_API_VERSION: &str = "2016-11-15";
+
+/// The form-urlencoded body of a query-protocol call: the `Action`, the `Version`, and the
+/// members, each value percent-encoded.
+fn body(action: &str, version: &str, params: &[(String, String)]) -> bytes::Bytes {
+    let mut body = format!("Action={action}&Version={version}");
     for (name, value) in params {
         body.push('&');
         body.push_str(name);
@@ -54,6 +65,71 @@ fn body(action: &str, params: &[(&str, &str)]) -> bytes::Bytes {
         }
     }
     bytes::Bytes::from(body)
+}
+
+/// The members of one call, as the rows below write them.
+fn params(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    pairs
+        .iter()
+        .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+        .collect()
+}
+
+/// One call through the assembled router, signed for `signing_name`: the HTTP status, the
+/// `content-type` it was answered under, and the body.
+fn call(
+    runtime: &tokio::runtime::Runtime,
+    router: &MultiServiceRouter,
+    signing_name: &str,
+    version: &str,
+    action: &str,
+    members: &[(String, String)],
+) -> (u16, String, String) {
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("http://localhost/")
+        .header("authorization", authorization(signing_name))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(body(action, version, members))
+        .expect("a well-formed request");
+    let response = runtime.block_on(router.dispatch(request));
+    let status = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let rendered = String::from_utf8_lossy(response.body()).to_string();
+    (status, content_type, rendered)
+}
+
+/// The text of the first `<name>` element of a response, or `None`.
+fn element(rendered: &str, name: &str) -> Option<String> {
+    let (_, rest) = rendered.split_once(&format!("<{name}>"))?;
+    rest.split_once(&format!("</{name}>"))
+        .map(|(text, _)| text.to_string())
+}
+
+/// One ec2Query call that has to succeed, answering the `member` element it reported — the
+/// id EC2 MINTED, which is the only kind of subnet or VPC id another service can resolve.
+fn ec2_minted(
+    runtime: &tokio::runtime::Runtime,
+    router: &MultiServiceRouter,
+    action: &str,
+    members: &[(String, String)],
+    member: &str,
+) -> String {
+    let (status, _content_type, rendered) =
+        call(runtime, router, "ec2", EC2_API_VERSION, action, members);
+    assert_eq!(
+        status, 200,
+        "the network this suite names must be minted through EC2: {action} answered {status} \
+         with {rendered}"
+    );
+    element(&rendered, member).unwrap_or_else(|| {
+        panic!("{action} must report the <{member}> it minted, got {rendered}")
+    })
 }
 
 /// The `<Code>` of an awsQuery `<ErrorResponse>`, or of the router's JSON refusal.
@@ -80,12 +156,7 @@ enum Expect {
 }
 
 /// One row: the case, the awsQuery `Action`, its members, and what must come back.
-type Row = (
-    &'static str,
-    &'static str,
-    &'static [(&'static str, &'static str)],
-    Expect,
-);
+type Row = (&'static str, &'static str, Vec<(String, String)>, Expect);
 
 #[test]
 fn documentdb_serves_its_subnet_and_parameter_group_paths_through_the_router() {
@@ -98,69 +169,114 @@ fn documentdb_serves_its_subnet_and_parameter_group_paths_through_the_router() {
             router.set_request_authentication(false);
 
             let runtime = tokio::runtime::Builder::new_current_thread()
+                // IO and timers are on because the calls below reach services that open a
+                // core listener, and because one mounted service calls another in process.
+                .enable_all()
                 .build()
                 .expect("a current-thread runtime");
+
+            // The network the subnet group is made of, minted through the owner of subnets
+            // on this same router: a VPC and two subnets in two Availability Zones of the
+            // Region every request here is signed for.
+            let vpc_id = ec2_minted(
+                &runtime,
+                &router,
+                "CreateVpc",
+                &params(&[("CidrBlock", "10.71.0.0/16")]),
+                "vpcId",
+            );
+            let subnets: Vec<String> = ["us-east-1a", "us-east-1b"]
+                .iter()
+                .enumerate()
+                .map(|(index, zone)| {
+                    ec2_minted(
+                        &runtime,
+                        &router,
+                        "CreateSubnet",
+                        &params(&[
+                            ("VpcId", vpc_id.as_str()),
+                            ("CidrBlock", &format!("10.71.{}.0/24", index + 1)),
+                            ("AvailabilityZone", zone),
+                        ]),
+                        "subnetId",
+                    )
+                })
+                .collect();
 
             // The rows walk one lifecycle and then the not-found answers either side of it,
             // so each later row depends on the state an earlier one left: the create, the
             // read-back, the cluster that references the group, the refusals, the delete,
             // and the read that must no longer find it.
-            let rows: [Row; 11] = [
+            let rows: [Row; 12] = [
                 (
                     "create a subnet group",
                     "CreateDBSubnetGroup",
-                    &[
+                    params(&[
                         ("DBSubnetGroupName", "router-subnets"),
                         ("DBSubnetGroupDescription", "created through the router"),
-                        ("SubnetIds.SubnetIdentifier.1", "subnet-0aaaaaaaaaaaaaaa1"),
-                        ("SubnetIds.SubnetIdentifier.2", "subnet-0bbbbbbbbbbbbbbb2"),
-                    ],
+                        ("SubnetIds.SubnetIdentifier.1", subnets[0].as_str()),
+                        ("SubnetIds.SubnetIdentifier.2", subnets[1].as_str()),
+                    ]),
                     Expect::Ok,
                 ),
                 (
                     "read the group back",
                     "DescribeDBSubnetGroups",
-                    &[("DBSubnetGroupName", "router-subnets")],
+                    params(&[("DBSubnetGroupName", "router-subnets")]),
                     Expect::Ok,
+                ),
+                (
+                    // A subnet id the account has no subnet for reaches the owner of
+                    // subnets through the assembled router and is refused there: awsQuery's
+                    // documented common code for a value that cannot be used.
+                    "create a subnet group over a subnet nobody minted",
+                    "CreateDBSubnetGroup",
+                    params(&[
+                        ("DBSubnetGroupName", "unheld-subnets"),
+                        ("DBSubnetGroupDescription", "a group of unheld subnets"),
+                        ("SubnetIds.SubnetIdentifier.1", subnets[0].as_str()),
+                        ("SubnetIds.SubnetIdentifier.2", "subnet-00000000000000000"),
+                    ]),
+                    Expect::Code("InvalidParameterValue"),
                 ),
                 (
                     // The issue's own step: a subnet group that does not exist is the
                     // modelled 404, not a 500 refusal.
                     "describe a subnet group that does not exist",
                     "DescribeDBSubnetGroups",
-                    &[("DBSubnetGroupName", "no-such-group")],
+                    params(&[("DBSubnetGroupName", "no-such-group")]),
                     Expect::Code("DBSubnetGroupNotFoundFault"),
                 ),
                 (
                     "delete a subnet group that does not exist",
                     "DeleteDBSubnetGroup",
-                    &[("DBSubnetGroupName", "no-such-group")],
+                    params(&[("DBSubnetGroupName", "no-such-group")]),
                     Expect::Code("DBSubnetGroupNotFoundFault"),
                 ),
                 (
                     // A cluster create that names the stored group: the reference resolves.
                     "create a cluster in the group",
                     "CreateDBCluster",
-                    &[
+                    params(&[
                         ("DBClusterIdentifier", "router-cluster"),
                         ("Engine", "docdb"),
                         ("MasterUsername", "admin"),
                         ("MasterUserPassword", "secret99"),
                         ("DBSubnetGroupName", "router-subnets"),
-                    ],
+                    ]),
                     Expect::Ok,
                 ),
                 (
                     // …and one that names a group nothing holds is the modelled 404.
                     "create a cluster in a group that does not exist",
                     "CreateDBCluster",
-                    &[
+                    params(&[
                         ("DBClusterIdentifier", "refused-cluster"),
                         ("Engine", "docdb"),
                         ("MasterUsername", "admin"),
                         ("MasterUserPassword", "secret99"),
                         ("DBSubnetGroupName", "no-such-group"),
-                    ],
+                    ]),
                     Expect::Code("DBSubnetGroupNotFoundFault"),
                 ),
                 (
@@ -168,33 +284,33 @@ fn documentdb_serves_its_subnet_and_parameter_group_paths_through_the_router() {
                     // common code, not a success and not a 5xx.
                     "create a cluster on a version the engine does not publish",
                     "CreateDBCluster",
-                    &[
+                    params(&[
                         ("DBClusterIdentifier", "refused-version"),
                         ("Engine", "docdb"),
                         ("MasterUsername", "admin"),
                         ("MasterUserPassword", "secret99"),
                         ("EngineVersion", "99.9.9"),
-                    ],
+                    ]),
                     Expect::Code("InvalidParameterCombination"),
                 ),
                 (
                     // The group is in use by the cluster created above.
                     "delete the group while a cluster is in it",
                     "DeleteDBSubnetGroup",
-                    &[("DBSubnetGroupName", "router-subnets")],
+                    params(&[("DBSubnetGroupName", "router-subnets")]),
                     Expect::Code("InvalidDBSubnetGroupStateFault"),
                 ),
                 (
                     "a cluster parameter group the model publishes",
                     "DescribeDBClusterParameterGroups",
-                    &[("DBClusterParameterGroupName", "default.docdb5.0")],
+                    params(&[("DBClusterParameterGroupName", "default.docdb5.0")]),
                     Expect::Ok,
                 ),
                 (
                     // The answer a waiter polls a deleted parameter group for.
                     "a cluster parameter group that does not exist",
                     "DescribeDBClusterParameterGroups",
-                    &[("DBClusterParameterGroupName", "no-such-group")],
+                    params(&[("DBClusterParameterGroupName", "no-such-group")]),
                     // The model's `awsQueryError` code for `DBParameterGroupNotFoundFault`.
                     Expect::Code("DBParameterGroupNotFound"),
                 ),
@@ -204,30 +320,16 @@ fn documentdb_serves_its_subnet_and_parameter_group_paths_through_the_router() {
                     // issue: the refusal must be parseable by an awsQuery client.
                     "an Action this model does not declare",
                     "DescribeNothingAtAll",
-                    &[],
+                    Vec::new(),
                     Expect::Code("InvalidAction"),
                 ),
             ];
 
-            for (case, action, params, expect) in rows {
-                let request = http::Request::builder()
-                    .method("POST")
-                    .uri("http://localhost/")
-                    // The key that names Amazon DocumentDB itself; the shared `rds` name is
-                    // Amazon RDS's (see the module docs).
-                    .header("authorization", authorization("docdb"))
-                    .header("content-type", "application/x-www-form-urlencoded")
-                    .body(body(action, params))
-                    .expect("a well-formed request");
-                let response = runtime.block_on(router.dispatch(request));
-                let status = response.status().as_u16();
-                let content_type = response
-                    .headers()
-                    .get("content-type")
-                    .and_then(|value| value.to_str().ok())
-                    .unwrap_or_default()
-                    .to_string();
-                let rendered = String::from_utf8_lossy(response.body()).to_string();
+            for (case, action, members, expect) in rows {
+                // The key that names Amazon DocumentDB itself; the shared `rds` name is
+                // Amazon RDS's (see the module docs).
+                let (status, content_type, rendered) =
+                    call(&runtime, &router, "docdb", API_VERSION, action, &members);
                 let code = error_code(&rendered);
 
                 // No request may be a routing failure: `AmbiguousService` (two or more
@@ -257,6 +359,40 @@ fn documentdb_serves_its_subnet_and_parameter_group_paths_through_the_router() {
                          with {rendered}"
                     ),
                 }
+            }
+
+            // The group the rows created holds the subnets EC2 minted, with the VPC and the
+            // zones EC2 reports for them: the in-process resolution survives assembly.
+            let (status, _content_type, rendered) = call(
+                &runtime,
+                &router,
+                "docdb",
+                API_VERSION,
+                "DescribeDBSubnetGroups",
+                &params(&[("DBSubnetGroupName", "router-subnets")]),
+            );
+            assert_eq!(
+                status, 200,
+                "the stored group must read back through the router, got {status} with {rendered}"
+            );
+            assert_eq!(
+                element(&rendered, "VpcId").as_deref(),
+                Some(vpc_id.as_str()),
+                "the group must report the VPC EC2 holds its subnets in, got {rendered}"
+            );
+            for subnet_id in &subnets {
+                assert!(
+                    rendered.contains(subnet_id.as_str()),
+                    "the group must report the subnet {subnet_id} it was created over, got \
+                     {rendered}"
+                );
+            }
+            for zone in ["us-east-1a", "us-east-1b"] {
+                assert!(
+                    rendered.contains(zone),
+                    "the group must report the Availability Zone {zone} EC2 holds one of its \
+                     subnets in, got {rendered}"
+                );
             }
         })
         .expect("spawn the routing thread")

@@ -32,6 +32,13 @@ hex = { workspace = true }
 # `DbiResourceId` is recorded in, so a monitoring service (Performance Insights) can
 # tell which service owns that id.
 service-common = { path = "../common" }
+# The AWS SDK for EC2, driven over the in-process callback
+# (`OperationContext::callback`): the subnets a `CreateDBSubnetGroup` or
+# `ModifyDBSubnetGroup` names are EC2's resources, so `src/state/ec2_subnets.rs` asks EC2
+# whether each one exists and which VPC and Availability Zone it lies in rather than
+# deciding it here. Only the generated client is needed — the emulator supplies the
+# transport.
+aws-sdk-ec2 = { version = "1", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -40,6 +47,11 @@ emulator-core-build-support = { workspace = true }
 # The percent-encoder the test harness builds its awsQuery form bodies with
 # (`tests/all/cluster_lifecycle.rs`), rather than hand-writing one.
 percent-encoding = "2"
+# The EC2 service, mounted beside this one in the test harness: that a subnet group reports
+# the VPC and the zones of the subnets a client minted with `ec2:CreateSubnet` can only be
+# driven end to end with the owner of subnets on the same engine. DEV-ONLY: this crate
+# depends on no other service's crate outside its tests.
+service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 
 [lints]
 workspace = true

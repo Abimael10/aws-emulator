@@ -19,7 +19,13 @@
 //!   fault unless the resource exists, and nothing is stored;
 //! * an `EngineVersion` the engine does not offer is refused with awsQuery's documented
 //!   `InvalidParameterCombination`, and one it does offer is stored resolved to a published
-//!   version (`crate::state::DOCDB_ENGINE_VERSIONS`).
+//!   version (`crate::state::DOCDB_ENGINE_VERSIONS`);
+//! * a subnet group reports the placement the service that OWNS subnets holds for the
+//!   subnets it names — the VPC, each subnet's Availability Zone and the network types they
+//!   are addressed for — on the create, on the modify and on the read back, and a request
+//!   naming a subnet the account does not hold, or subnets of two VPCs, is refused with
+//!   nothing written. Those rows mount Amazon EC2 beside this service on ONE engine, so
+//!   every subnet id in them is one EC2 minted.
 
 use service_com_amazonaws_docdb_amazonrdsv19::state;
 
@@ -480,6 +486,825 @@ async fn a_subnet_group_in_use_by_a_cluster_cannot_be_deleted() {
             &[("DBSubnetGroupName", "in-use-group")],
         )
         .await;
+}
+
+// ---------------------------------------------------------------------------
+// The placement a subnet group reports, resolved against the owner of subnets
+// ---------------------------------------------------------------------------
+
+/// The IPv6 address pool the dual-stack rows below bring a VPC's IPv6 block from
+/// (`AssociateVpcCidrBlockRequest$Ipv6Pool`: "The ID of an IPv6 address pool from which to
+/// allocate the IPv6 CIDR block").
+const IPV6_POOL: &str = "ipv6pool-ec2-0123456789abcdef0";
+
+/// A well-formed subnet id for a subnet NOBODY minted: the `subnet-` plus 17 hexadecimal
+/// characters form EC2 reports its own ids in, so a refusal of it is about the account not
+/// holding the subnet rather than about the spelling.
+const UNHELD_SUBNET_A: &str = "subnet-00000000000000001";
+/// A second one; see [`UNHELD_SUBNET_A`].
+const UNHELD_SUBNET_B: &str = "subnet-00000000000000002";
+
+/// The account's network for the rows below: Amazon DocumentDB and Amazon EC2 — the service
+/// that OWNS subnets — on ONE engine, with the VPCs and subnets a client minted through EC2
+/// itself.
+///
+/// Every subnet id below is one EC2 MINTED and every expected zone and VPC is one EC2
+/// reported, so no value in an assertion is a value this service could have invented.
+struct Network {
+    docdb: Docdb,
+    ec2: ::aws_sdk_ec2::Client,
+}
+
+impl Network {
+    /// Both services on one engine, with an EC2 client over the router's own in-process
+    /// callback.
+    fn new() -> Self {
+        let (docdb, ec2) = Docdb::with_ec2();
+        Self { docdb, ec2 }
+    }
+
+    /// The Availability Zones of [`REGION`] the account has, as EC2 reports them — asked,
+    /// never assumed, so a subnet below is placed in a zone the Region really has.
+    async fn zones(&self) -> Vec<String> {
+        let reported = self
+            .ec2
+            .describe_availability_zones()
+            .send()
+            .await
+            .expect("EC2 must report the Region's Availability Zones");
+        let mut zones: Vec<String> = reported
+            .availability_zones()
+            .iter()
+            .filter_map(|zone| zone.zone_name().map(str::to_string))
+            .filter(|zone| zone.starts_with(REGION))
+            .collect();
+        zones.sort();
+        assert!(
+            zones.len() >= 3,
+            "case \"the account's zones\": the Region must publish at least three zones, got \
+             {zones:?}"
+        );
+        zones
+    }
+
+    /// A VPC with `cidr_block`, and with `ipv6_cidr_block` associated when one is given.
+    async fn vpc(&self, cidr_block: &str, ipv6_cidr_block: Option<&str>) -> String {
+        let mut create = self.ec2.create_vpc().cidr_block(cidr_block);
+        if let Some(block) = ipv6_cidr_block {
+            create = create.ipv6_cidr_block(block).ipv6_pool(IPV6_POOL);
+        }
+        create
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("EC2 must create the VPC {cidr_block}: {error:?}"))
+            .vpc()
+            .and_then(::aws_sdk_ec2::types::Vpc::vpc_id)
+            .expect("CreateVpc must report the VPC it minted")
+            .to_string()
+    }
+
+    /// A subnet of `vpc_id` with `cidr_block` in `zone`, and with `ipv6_cidr_block`
+    /// associated when one is given — the dual-stack case.
+    async fn subnet(
+        &self,
+        vpc_id: &str,
+        cidr_block: &str,
+        zone: &str,
+        ipv6_cidr_block: Option<&str>,
+    ) -> String {
+        let subnet_id = self
+            .ec2
+            .create_subnet()
+            .vpc_id(vpc_id)
+            .cidr_block(cidr_block)
+            .availability_zone(zone)
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("EC2 must create a subnet in {zone}: {error:?}"))
+            .subnet()
+            .and_then(::aws_sdk_ec2::types::Subnet::subnet_id)
+            .expect("CreateSubnet must report the subnet it minted")
+            .to_string();
+        if let Some(block) = ipv6_cidr_block {
+            self.ec2
+                .associate_subnet_cidr_block()
+                .subnet_id(&subnet_id)
+                .ipv6_cidr_block(block)
+                .send()
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("EC2 must associate {block} with {subnet_id}: {error:?}")
+                });
+        }
+        subnet_id
+    }
+
+    /// The Availability Zone EC2 reports for `subnet_id` — read off the owner's record, not
+    /// derived from the id or from what this service answered.
+    async fn zone_of(&self, subnet_id: &str) -> String {
+        self.ec2
+            .describe_subnets()
+            .subnet_ids(subnet_id)
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("EC2 must report the subnet {subnet_id}: {error:?}"))
+            .subnets()
+            .iter()
+            .find(|subnet| subnet.subnet_id() == Some(subnet_id))
+            .and_then(::aws_sdk_ec2::types::Subnet::availability_zone)
+            .unwrap_or_else(|| panic!("EC2 must report a zone for {subnet_id}"))
+            .to_string()
+    }
+
+    /// Remove `subnet_id` from the account, so the identifier names no subnet any more.
+    async fn delete_subnet(&self, subnet_id: &str) {
+        self.ec2
+            .delete_subnet()
+            .subnet_id(subnet_id)
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("EC2 must delete {subnet_id}: {error:?}"));
+    }
+}
+
+/// The awsQuery members a subnet-group create or modify carries for `subnets`, as owned
+/// pairs the harness borrows from.
+///
+/// The list form uses the list member's `xmlName` (`SubnetIdentifierList$member` ->
+/// `SubnetIdentifier`), so the subnets arrive as `SubnetIds.SubnetIdentifier.<n>`.
+fn group_members(
+    name: &str,
+    description: Option<&str>,
+    subnets: &[String],
+) -> Vec<(String, String)> {
+    let mut members = vec![("DBSubnetGroupName".to_string(), name.to_string())];
+    if let Some(description) = description {
+        members.push((
+            "DBSubnetGroupDescription".to_string(),
+            description.to_string(),
+        ));
+    }
+    for (index, subnet) in subnets.iter().enumerate() {
+        members.push((
+            format!("SubnetIds.SubnetIdentifier.{}", index + 1),
+            subnet.clone(),
+        ));
+    }
+    members
+}
+
+/// `group_members` as the harness takes them.
+fn borrowed(members: &[(String, String)]) -> Vec<(&str, &str)> {
+    members
+        .iter()
+        .map(|(member, value)| (member.as_str(), value.as_str()))
+        .collect()
+}
+
+/// What one `DBSubnetGroup` element of a response says about its placement.
+#[derive(Debug, PartialEq, Eq)]
+struct WirePlacement {
+    vpc_id: Option<String>,
+    /// Each subnet, in the order the group reports them, with the zone it reports.
+    subnets: Vec<(String, String)>,
+    network_types: Vec<String>,
+}
+
+/// The placement the one `DBSubnetGroup` in `xml` reports.
+///
+/// `DBSubnetGroup` carries exactly one list of plain strings (`SupportedNetworkTypes`) and
+/// one `Name` element per subnet (inside `SubnetAvailabilityZone`), so the shared reader's
+/// per-tag lists line up with the subnets in document order — which is why every row below
+/// names subnets that DO resolve to a zone.
+fn wire_placement(case: &str, xml: &str) -> WirePlacement {
+    let identifiers = texts(xml, "SubnetIdentifier");
+    let zones = texts(xml, "Name");
+    assert_eq!(
+        identifiers.len(),
+        zones.len(),
+        "case {case:?}: every subnet of the group must report its Availability Zone, got {xml}"
+    );
+    WirePlacement {
+        vpc_id: opt_text(xml, "VpcId"),
+        subnets: identifiers.into_iter().zip(zones).collect(),
+        network_types: texts(xml, "member"),
+    }
+}
+
+/// The placement these subnets must be reported with: the VPC and the zones EC2 holds for
+/// them, in the order the request named them, plus the network types the group offers.
+async fn expected_placement(
+    net: &Network,
+    vpc_id: &str,
+    subnets: &[String],
+    network_types: &[&str],
+) -> WirePlacement {
+    let mut reported = Vec::with_capacity(subnets.len());
+    for subnet in subnets {
+        reported.push((subnet.clone(), net.zone_of(subnet).await));
+    }
+    WirePlacement {
+        vpc_id: Some(vpc_id.to_string()),
+        subnets: reported,
+        network_types: network_types.iter().map(|kind| (*kind).to_string()).collect(),
+    }
+}
+
+/// A group reports, for every subnet it holds, the VPC and the Availability Zone the service
+/// that OWNS subnets reports it in, and the network types those subnets are addressed for —
+/// on the create and on the read back.
+///
+/// The rows differ along what the rule generalises over: how many subnets the group holds,
+/// the order they are named in, which VPC they sit in, and the address families EC2
+/// addresses them in (IPv4-only, dual-stack, and a group mixing the two).
+#[tokio::test]
+async fn a_group_reports_the_placement_ec2_holds_for_the_subnets_it_names() {
+    let net = Network::new();
+    let zones = net.zones().await;
+
+    let ipv4_vpc = net.vpc("10.61.0.0/16", None).await;
+    let mut ipv4_subnets = Vec::new();
+    for (index, zone) in zones.iter().take(3).enumerate() {
+        ipv4_subnets.push(
+            net.subnet(&ipv4_vpc, &format!("10.61.{}.0/24", index + 1), zone, None)
+                .await,
+        );
+    }
+    // A second VPC, this one with an IPv6 block of its own: two of its subnets carry a /64
+    // out of it and the third is addressed in IPv4 alone.
+    let dual_vpc = net.vpc("10.62.0.0/16", Some("2001:db8:62::/56")).await;
+    let dual_a = net
+        .subnet(
+            &dual_vpc,
+            "10.62.1.0/24",
+            &zones[0],
+            Some("2001:db8:62:1::/64"),
+        )
+        .await;
+    let dual_b = net
+        .subnet(
+            &dual_vpc,
+            "10.62.2.0/24",
+            &zones[1],
+            Some("2001:db8:62:2::/64"),
+        )
+        .await;
+    let ipv4_only_in_dual_vpc = net
+        .subnet(&dual_vpc, "10.62.3.0/24", &zones[2], None)
+        .await;
+
+    // (case, the subnets the request names, the VPC they lie in, the network types the
+    // group must offer). The two values are the ones `DBSubnetGroup$SupportedNetworkTypes`
+    // publishes — "Valid Values: IPV4 | DUAL" — and `DUAL` is offered only where EVERY
+    // subnet of the group carries both families.
+    let rows: [(&str, Vec<String>, &str, &[&str]); 5] = [
+        (
+            "two subnets of one VPC",
+            vec![ipv4_subnets[0].clone(), ipv4_subnets[1].clone()],
+            &ipv4_vpc,
+            &["IPV4"],
+        ),
+        (
+            "three subnets of one VPC",
+            ipv4_subnets.clone(),
+            &ipv4_vpc,
+            &["IPV4"],
+        ),
+        (
+            "the same three in another order",
+            vec![
+                ipv4_subnets[2].clone(),
+                ipv4_subnets[0].clone(),
+                ipv4_subnets[1].clone(),
+            ],
+            &ipv4_vpc,
+            &["IPV4"],
+        ),
+        (
+            "two dual-stack subnets of another VPC",
+            vec![dual_a.clone(), dual_b.clone()],
+            &dual_vpc,
+            &["IPV4", "DUAL"],
+        ),
+        (
+            "a dual-stack subnet beside an IPv4-only one",
+            vec![dual_a.clone(), ipv4_only_in_dual_vpc.clone()],
+            &dual_vpc,
+            &["IPV4"],
+        ),
+    ];
+
+    for (index, (case, subnets, vpc_id, network_types)) in rows.iter().enumerate() {
+        let name = format!("placement-{index}");
+        let expected = expected_placement(&net, vpc_id, subnets, network_types).await;
+        let members = group_members(&name, Some("a group of resolved subnets"), subnets);
+        let created = net
+            .docdb
+            .ok(case, "CreateDBSubnetGroup", &borrowed(&members))
+            .await;
+        // The create's answer and a later read of the same group report the same placement:
+        // it is persisted, not echoed.
+        let described = net
+            .docdb
+            .ok(
+                case,
+                "DescribeDBSubnetGroups",
+                &[("DBSubnetGroupName", name.as_str())],
+            )
+            .await;
+        for (reader, xml) in [("create", &created), ("describe", &described)] {
+            let reported = wire_placement(case, xml);
+            assert_eq!(
+                reported, expected,
+                "case {case:?} / {reader}: expected the VPC, zones and network types EC2 \
+                 holds for these subnets, got {xml}"
+            );
+        }
+    }
+}
+
+/// A modify re-resolves the list it is given: the group's reported placement is the one EC2
+/// holds for its NEW subnets, not the one it was created with.
+///
+/// The rows differ along what the rule generalises over: how many subnets the new list
+/// holds, the order they are named in, the address families EC2 addresses them in, and
+/// whether the request also carries a description. They all stay inside the group's own VPC,
+/// which is the only list a modify may name (the sibling suite spans the refusal for one
+/// that does not).
+#[tokio::test]
+async fn a_modify_rewrites_the_placement_from_the_subnets_it_names() {
+    let net = Network::new();
+    let zones = net.zones().await;
+
+    // One VPC with an IPv6 block of its own, so the rows can change which address families
+    // the group's subnets carry without leaving the VPC the group belongs to.
+    let vpc = net.vpc("10.63.0.0/16", Some("2001:db8:63::/56")).await;
+    let ipv4_a = net.subnet(&vpc, "10.63.1.0/24", &zones[0], None).await;
+    let ipv4_b = net.subnet(&vpc, "10.63.2.0/24", &zones[1], None).await;
+    let dual_a = net
+        .subnet(&vpc, "10.63.3.0/24", &zones[2], Some("2001:db8:63:3::/64"))
+        .await;
+    let dual_b = net
+        .subnet(&vpc, "10.63.4.0/24", &zones[0], Some("2001:db8:63:4::/64"))
+        .await;
+
+    // One row: the case, the new subnets, the network types the group then offers, and the
+    // description the modify carries.
+    type ModifyRow = (
+        &'static str,
+        Vec<String>,
+        &'static [&'static str],
+        Option<&'static str>,
+    );
+
+    let rows: [ModifyRow; 4] = [
+        (
+            "a wider list of IPv4-only subnets",
+            vec![ipv4_a.clone(), ipv4_b.clone(), dual_a.clone()],
+            &["IPV4"],
+            None,
+        ),
+        (
+            "two dual-stack subnets",
+            vec![dual_a.clone(), dual_b.clone()],
+            &["IPV4", "DUAL"],
+            None,
+        ),
+        (
+            "the same two in the other order, with a new description",
+            vec![dual_b.clone(), dual_a.clone()],
+            &["IPV4", "DUAL"],
+            Some("the edited description"),
+        ),
+        (
+            "a narrower list, back to IPv4 only",
+            vec![ipv4_b.clone(), dual_a.clone()],
+            &["IPV4"],
+            None,
+        ),
+    ];
+
+    for (index, (case, subnets, network_types, description)) in rows.iter().enumerate() {
+        let name = format!("modified-{index}");
+        // Every row starts from a group of the two IPv4-only subnets, so what the modify
+        // reports can only come from the list it was given.
+        let seed = group_members(&name, Some("the created description"), &[
+            ipv4_a.clone(),
+            ipv4_b.clone(),
+        ]);
+        net.docdb
+            .ok(case, "CreateDBSubnetGroup", &borrowed(&seed))
+            .await;
+
+        let expected = expected_placement(&net, &vpc, subnets, network_types).await;
+        let members = group_members(&name, *description, subnets);
+        let modified = net
+            .docdb
+            .ok(case, "ModifyDBSubnetGroup", &borrowed(&members))
+            .await;
+        let described = net
+            .docdb
+            .ok(
+                case,
+                "DescribeDBSubnetGroups",
+                &[("DBSubnetGroupName", name.as_str())],
+            )
+            .await;
+        for (reader, xml) in [("modify", &modified), ("describe", &described)] {
+            let reported = wire_placement(case, xml);
+            assert_eq!(
+                reported, expected,
+                "case {case:?} / {reader}: expected the placement EC2 holds for the new \
+                 subnets, got {xml}"
+            );
+            assert_eq!(
+                text(xml, "DBSubnetGroupDescription"),
+                description.unwrap_or("the created description"),
+                "case {case:?} / {reader}: a modify carrying no description leaves the \
+                 stored one alone, got {xml}"
+            );
+        }
+    }
+}
+
+/// The message AWS refuses a `SubnetIds` list it cannot use with, written here from the
+/// recorded template rather than from the handler's own helper: the fixed text
+/// "Some input subnets in :[" … "] are invalid." around the subnet ids the service could
+/// NOT use, comma-separated in the order the request named them.
+fn expected_invalid_subnets_message(subnet_ids: &[String]) -> String {
+    format!(
+        "Some input subnets in :[{}] are invalid.",
+        subnet_ids.join(", ")
+    )
+}
+
+/// A `SubnetIds` member the account has no subnet for names no subnet at all, so the
+/// request is refused with awsQuery's `InvalidParameterValue` quoting the subnets the
+/// request named — and nothing is written.
+///
+/// The rows differ along what the rule generalises over: how many identifiers do not
+/// resolve, where in the list they sit, whether one is repeated, and whether the identifier
+/// never existed or named a subnet the account has since removed.
+#[tokio::test]
+async fn a_subnet_the_account_does_not_hold_is_refused_and_nothing_is_stored() {
+    let net = Network::new();
+    let zones = net.zones().await;
+
+    let vpc = net.vpc("10.65.0.0/16", None).await;
+    let held_a = net.subnet(&vpc, "10.65.1.0/24", &zones[0], None).await;
+    let held_b = net.subnet(&vpc, "10.65.2.0/24", &zones[1], None).await;
+    // A subnet the account HAD: removed through the service that owns it, so the identifier
+    // stops resolving exactly as a typo'd one does.
+    let removed = net.subnet(&vpc, "10.65.3.0/24", &zones[2], None).await;
+    net.delete_subnet(&removed).await;
+
+    // (case, the subnets the request names, the identifiers the refusal must name — the
+    // ones the account holds no subnet for, each named once, in request order)
+    let rows: [(&str, Vec<String>, Vec<String>); 5] = [
+        (
+            "an unheld id in second place",
+            vec![held_a.clone(), UNHELD_SUBNET_A.to_string()],
+            vec![UNHELD_SUBNET_A.to_string()],
+        ),
+        (
+            "an unheld id first",
+            vec![UNHELD_SUBNET_A.to_string(), held_a.clone()],
+            vec![UNHELD_SUBNET_A.to_string()],
+        ),
+        (
+            "two unheld ids",
+            vec![UNHELD_SUBNET_B.to_string(), UNHELD_SUBNET_A.to_string()],
+            // In the order the request named them.
+            vec![UNHELD_SUBNET_B.to_string(), UNHELD_SUBNET_A.to_string()],
+        ),
+        (
+            "the same unheld id twice",
+            vec![
+                held_a.clone(),
+                UNHELD_SUBNET_A.to_string(),
+                UNHELD_SUBNET_A.to_string(),
+            ],
+            // One subnet named twice is one subnet, so it is named once.
+            vec![UNHELD_SUBNET_A.to_string()],
+        ),
+        (
+            "a subnet the account removed",
+            vec![held_a.clone(), removed.clone()],
+            vec![removed.clone()],
+        ),
+    ];
+
+    for (index, (case, subnets, invalid)) in rows.iter().enumerate() {
+        let name = format!("unheld-{index}");
+        let members = group_members(&name, Some("a group of unheld subnets"), subnets);
+        let reply = net
+            .docdb
+            .call("CreateDBSubnetGroup", &borrowed(&members))
+            .await;
+        assert_eq!(
+            (reply.status, error_code(&reply.xml).as_str()),
+            (400, "InvalidParameterValue"),
+            "case {case:?}: expected 400 InvalidParameterValue, got {} with {}",
+            reply.status,
+            reply.xml
+        );
+        assert_eq!(
+            text(&reply.xml, "Message"),
+            expected_invalid_subnets_message(invalid),
+            "case {case:?}: the refusal names the subnets the account holds none of, got {}",
+            reply.xml
+        );
+
+        let stored = net
+            .docdb
+            .call("DescribeDBSubnetGroups", &[("DBSubnetGroupName", &name)])
+            .await;
+        assert_eq!(
+            (stored.status, error_code(&stored.xml).as_str()),
+            (404, "DBSubnetGroupNotFoundFault"),
+            "case {case:?}: a refused create must store nothing, got {} with {}",
+            stored.status,
+            stored.xml
+        );
+    }
+
+    // The same rule on the modify path: the stored group keeps the subnets it had.
+    let name = "modify-unheld";
+    let seed = group_members(
+        name,
+        Some("a group of held subnets"),
+        &[held_a.clone(), held_b.clone()],
+    );
+    net.docdb
+        .ok("seed the modify row", "CreateDBSubnetGroup", &borrowed(&seed))
+        .await;
+    let members = group_members(
+        name,
+        None,
+        &[held_a.clone(), UNHELD_SUBNET_A.to_string()],
+    );
+    let reply = net
+        .docdb
+        .call("ModifyDBSubnetGroup", &borrowed(&members))
+        .await;
+    assert_eq!(
+        (reply.status, error_code(&reply.xml).as_str()),
+        (400, "InvalidParameterValue"),
+        "case \"modify to an unheld subnet\": expected 400 InvalidParameterValue, got {} with \
+         {}",
+        reply.status,
+        reply.xml
+    );
+    assert_eq!(
+        text(&reply.xml, "Message"),
+        expected_invalid_subnets_message(&[UNHELD_SUBNET_A.to_string()]),
+        "case \"modify to an unheld subnet\": the refusal names the subnet the account holds \
+         none of, got {}",
+        reply.xml
+    );
+    let described = net
+        .docdb
+        .ok(
+            "the group survives the refused modify",
+            "DescribeDBSubnetGroups",
+            &[("DBSubnetGroupName", name)],
+        )
+        .await;
+    assert_eq!(
+        texts(&described, "SubnetIdentifier"),
+        vec![held_a.clone(), held_b.clone()],
+        "case \"modify to an unheld subnet\": a refused modify changes nothing, got {described}"
+    );
+}
+
+/// A subnet group holds the subnets of ONE VPC. On the create, a list whose subnets lie in
+/// two is the modelled `InvalidSubnet`, worded with the sentence that fault itself states.
+/// On the modify that one VPC is the group's OWN, so a list naming a subnet of another VPC
+/// is refused as awsQuery's `InvalidParameterValue` naming exactly those subnets. Either way
+/// nothing is written.
+#[tokio::test]
+async fn subnets_of_two_vpcs_cannot_make_one_group() {
+    let net = Network::new();
+    let zones = net.zones().await;
+
+    let left_vpc = net.vpc("10.66.0.0/16", None).await;
+    let left_a = net.subnet(&left_vpc, "10.66.1.0/24", &zones[0], None).await;
+    let left_b = net.subnet(&left_vpc, "10.66.2.0/24", &zones[1], None).await;
+    let right_vpc = net.vpc("10.67.0.0/16", None).await;
+    let right_a = net
+        .subnet(&right_vpc, "10.67.1.0/24", &zones[0], None)
+        .await;
+    let right_b = net
+        .subnet(&right_vpc, "10.67.2.0/24", &zones[1], None)
+        .await;
+
+    // The rows differ in the order the two VPCs are named in and in how many subnets each
+    // contributes.
+    let rows: [(&str, Vec<String>); 3] = [
+        (
+            "one subnet from each VPC",
+            vec![left_a.clone(), right_a.clone()],
+        ),
+        (
+            "the same two in the other order",
+            vec![right_a.clone(), left_a.clone()],
+        ),
+        (
+            "two from one VPC and one from the other",
+            vec![left_a.clone(), left_b.clone(), right_b.clone()],
+        ),
+    ];
+
+    for (index, (case, subnets)) in rows.iter().enumerate() {
+        let name = format!("two-vpcs-{index}");
+        let members = group_members(&name, Some("a group spanning two VPCs"), subnets);
+        let reply = net
+            .docdb
+            .call("CreateDBSubnetGroup", &borrowed(&members))
+            .await;
+        assert_eq!(
+            (reply.status, error_code(&reply.xml).as_str()),
+            // The model's `awsQueryError` code for `InvalidSubnet`.
+            (400, "InvalidSubnet"),
+            "case {case:?}: expected 400 InvalidSubnet, got {} with {}",
+            reply.status,
+            reply.xml
+        );
+        assert_eq!(
+            text(&reply.xml, "Message"),
+            // The sentence `InvalidSubnet`'s own documentation states, which carries no
+            // identifier: the condition is about the list, not about one subnet of it.
+            "The requested subnet is not valid, or multiple subnets were requested that are \
+             not all in a common virtual private cloud (VPC).",
+            "case {case:?}: expected the sentence the fault states, got {}",
+            reply.xml
+        );
+
+        let stored = net
+            .docdb
+            .call("DescribeDBSubnetGroups", &[("DBSubnetGroupName", &name)])
+            .await;
+        assert_eq!(
+            (stored.status, error_code(&stored.xml).as_str()),
+            (404, "DBSubnetGroupNotFoundFault"),
+            "case {case:?}: a refused create must store nothing, got {} with {}",
+            stored.status,
+            stored.xml
+        );
+    }
+
+    // The same rule on the modify path, and one step stricter there: the group belongs to
+    // the VPC it was built in, so a list that names a subnet of ANOTHER VPC is refused even
+    // when every subnet it names lies in one VPC of its own — and the refusal names exactly
+    // the subnets that are outside the group's VPC.
+    let rows: [(&str, Vec<String>, Vec<String>); 2] = [
+        (
+            "a modify list straddling two VPCs",
+            vec![left_a.clone(), right_b.clone()],
+            vec![right_b.clone()],
+        ),
+        (
+            "a modify list wholly inside another VPC",
+            vec![right_a.clone(), right_b.clone()],
+            vec![right_a.clone(), right_b.clone()],
+        ),
+    ];
+    for (index, (case, subnets, outside)) in rows.iter().enumerate() {
+        let name = format!("modify-two-vpcs-{index}");
+        let seed = group_members(
+            &name,
+            Some("a group of one VPC's subnets"),
+            &[left_a.clone(), left_b.clone()],
+        );
+        net.docdb
+            .ok(case, "CreateDBSubnetGroup", &borrowed(&seed))
+            .await;
+        let members = group_members(&name, None, subnets);
+        let reply = net
+            .docdb
+            .call("ModifyDBSubnetGroup", &borrowed(&members))
+            .await;
+        assert_eq!(
+            (reply.status, error_code(&reply.xml).as_str()),
+            (400, "InvalidParameterValue"),
+            "case {case:?}: expected 400 InvalidParameterValue, got {} with {}",
+            reply.status,
+            reply.xml
+        );
+        assert_eq!(
+            text(&reply.xml, "Message"),
+            expected_invalid_subnets_message(outside),
+            "case {case:?}: the refusal names the subnets outside the group's own VPC, got {}",
+            reply.xml
+        );
+        let described = net
+            .docdb
+            .ok(
+                case,
+                "DescribeDBSubnetGroups",
+                &[("DBSubnetGroupName", name.as_str())],
+            )
+            .await;
+        assert_eq!(
+            texts(&described, "SubnetIdentifier"),
+            vec![left_a.clone(), left_b.clone()],
+            "case {case:?}: a refused modify changes nothing, got {described}"
+        );
+    }
+}
+
+/// `ModifyDBSubnetGroupMessage$DBSubnetGroupName`: "Must match the name of an existing
+/// DBSubnetGroup" — a name (or ARN) that matches none is the modelled 404, worded as the
+/// mutating paths of this front door word it.
+#[tokio::test]
+async fn modifying_a_subnet_group_that_does_not_exist_is_the_modelled_not_found_fault() {
+    let net = Network::new();
+    let zones = net.zones().await;
+    let vpc = net.vpc("10.68.0.0/16", None).await;
+    let held = vec![
+        net.subnet(&vpc, "10.68.1.0/24", &zones[0], None).await,
+        net.subnet(&vpc, "10.68.2.0/24", &zones[1], None).await,
+    ];
+
+    // (case, the name the modify gives)
+    let rows: [(&str, &str); 3] = [
+        ("a name never created", "no-such-group"),
+        (
+            "an ARN of a group that does not exist",
+            "arn:aws:rds:us-east-1:000000000000:subgrp:no-such-group",
+        ),
+        ("a near miss of a stored name", "held-groups"),
+    ];
+    let seed = group_members(
+        "held-group",
+        Some("a group that does exist"),
+        &held,
+    );
+    net.docdb
+        .ok("seed", "CreateDBSubnetGroup", &borrowed(&seed))
+        .await;
+
+    for (case, requested) in rows {
+        let members = group_members(requested, None, &held);
+        let reply = net
+            .docdb
+            .call("ModifyDBSubnetGroup", &borrowed(&members))
+            .await;
+        assert_eq!(
+            (reply.status, error_code(&reply.xml).as_str()),
+            (404, "DBSubnetGroupNotFoundFault"),
+            "case {case:?}: expected 404 DBSubnetGroupNotFoundFault, got {} with {}",
+            reply.status,
+            reply.xml
+        );
+        assert_eq!(
+            text(&reply.xml, "Message"),
+            format!("DB subnet group '{requested}' does not exist."),
+            "case {case:?}: expected the mutating path's wording, got {}",
+            reply.xml
+        );
+    }
+
+    // The stored group is still what it was: a refused modify of another name touched it
+    // not at all.
+    let described = net
+        .docdb
+        .ok(
+            "the stored group survives",
+            "DescribeDBSubnetGroups",
+            &[("DBSubnetGroupName", "held-group")],
+        )
+        .await;
+    assert_eq!(
+        texts(&described, "SubnetIdentifier"),
+        held,
+        "case \"the stored group survives\": expected the subnets it was created with, got \
+         {described}"
+    );
+}
+
+/// `DBSubnetGroup$SupportedNetworkTypes`: "Valid Values: IPV4 | DUAL ... A DBSubnetGroup can
+/// support only the IPv4 protocol or the IPv4 and the IPv6 protocols (DUAL)." Which of them
+/// a group offers follows from the address families EVERY one of its subnets is addressed
+/// in, because a cluster is placed across all of them.
+#[test]
+fn the_network_types_a_group_offers_follow_from_its_subnets_address_families() {
+    // (case, every subnet carries IPv4, every subnet carries IPv6, the published values)
+    let rows: [(&str, bool, bool, &[&str]); 4] = [
+        ("IPv4 everywhere", true, false, &["IPV4"]),
+        ("both families everywhere", true, true, &["IPV4", "DUAL"]),
+        // Both published values include IPv4, so a group a subnet carries no IPv4 block in
+        // offers neither rather than an invented one.
+        ("IPv6 only", false, true, &[]),
+        ("no block at all", false, false, &[]),
+    ];
+    for (case, ipv4, ipv6, expected) in rows {
+        let offered = state::group_network_types(ipv4, ipv6);
+        assert_eq!(
+            offered, expected,
+            "case {case:?}: expected {expected:?}, got {offered:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

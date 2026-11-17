@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDBSubnetGroup
-//! IMPLEMENTED: this operation inserts a subnet-group record into this service's state,
-//! keyed by the lowercased `DBSubnetGroupName`, and answers with the stored record. The
-//! group is what `CreateDBCluster`'s `DBSubnetGroupName` must name, what
-//! `DescribeDBSubnetGroups` reports, and what `DeleteDBSubnetGroup` reclaims.
+//! IMPLEMENTED: this operation resolves every `SubnetIds` member against the service that
+//! OWNS subnets (`crate::state::ec2_subnets`), then inserts a subnet-group record into this
+//! service's state, keyed by the lowercased `DBSubnetGroupName`, and answers with the stored
+//! record — including the placement EC2 answered with (the VPC, each subnet's Availability
+//! Zone and the network types the subnets are addressed for). The group is what
+//! `CreateDBCluster`'s `DBSubnetGroupName` must name, what `DescribeDBSubnetGroups` reports,
+//! what `ModifyDBSubnetGroup` rewrites, and what `DeleteDBSubnetGroup` reclaims.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -206,11 +209,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        let region = docdb::request_region(ctx);
+
+        // WHETHER each named subnet is a subnet of the account at all, and WHERE it is, are
+        // facts of the service that OWNS subnets: they are read off its records here, before
+        // anything is stored and before the store is locked, and never derived from the
+        // identifiers (`crate::state::ec2_subnets`).
+        let resolved = docdb::resolve_subnets(ctx, &region, &subnet_ids).await;
+        // An identifier EC2 answered it holds no subnet for names no subnet of the account,
+        // so it can make up no group: a value the request carried that cannot be used, which
+        // is the query protocol's common `InvalidParameterValue` rather than one of this
+        // operation's modelled faults. The refusal names the identifiers it could not use,
+        // and nothing is written.
+        let absent = resolved.absent(&subnet_ids);
+        if !absent.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                docdb::invalid_subnets_message(&absent),
+            ));
+        }
+        // A subnet group is a set of subnets of ONE VPC — the VPC it reports — so a list
+        // whose subnets lie in several is the modelled `InvalidSubnet`, answered with the
+        // sentence that fault states for exactly this condition.
+        if resolved.vpcs(&subnet_ids).len() > 1 {
+            return Err(
+                CreateDBSubnetGroupErrorModeled::InvalidSubnet(InvalidSubnet {
+                    message: Some(docdb::SUBNETS_NOT_IN_ONE_VPC_MESSAGE.to_string()),
+                })
+                .into(),
+            );
+        }
+
         // "subnet groups must contain at least one subnet in at least two Availability
-        // Zones"; see `docdb::MIN_SUBNETS_PER_SUBNET_GROUP` for why the count of distinct
-        // subnets is what this emulator can hold the rule to. `InvalidSubnet` — a subnet
-        // that does not exist, or subnets spread over two VPCs — is EC2 inventory this
-        // emulator does not have, so it is never answered rather than guessed at.
+        // Zones"; see `docdb::MIN_SUBNETS_PER_SUBNET_GROUP` for the floor the request itself
+        // settles.
         if subnet_ids.len() < docdb::MIN_SUBNETS_PER_SUBNET_GROUP {
             return Err(
                 CreateDBSubnetGroupErrorModeled::DBSubnetGroupDoesNotCoverEnoughAZs(
@@ -228,7 +259,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let region = docdb::request_region(ctx);
         // `DBSubnetGroupName`: "This value is stored as a lowercase string."
         let name = input.db_subnet_group_name.to_ascii_lowercase();
 
@@ -282,6 +312,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             name: name.clone(),
             description: input.db_subnet_group_description,
             region,
+            // The placement the group reports is the one EC2 answered with for its own
+            // subnets, kept with the group so every later read reports what the owner of
+            // subnets said rather than something computed afresh.
+            subnet_zones: resolved.zones_by_subnet(&subnet_ids),
+            vpc_id: resolved.vpc_of(&subnet_ids),
+            supported_network_types: resolved.network_types(&subnet_ids),
             subnet_ids,
             tags: docdb::tag_pairs(input.tags),
         };

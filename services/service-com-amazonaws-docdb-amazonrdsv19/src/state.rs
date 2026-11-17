@@ -19,6 +19,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
+/// The subnets a `SubnetIds` list names, resolved against the service that OWNS subnets.
+pub mod ec2_subnets;
+
+pub use ec2_subnets::{
+    group_network_types, invalid_subnets_message, resolve_subnets, ResolvedSubnet, ResolvedSubnets,
+    NETWORK_TYPE_DUAL, NETWORK_TYPE_IPV4, SUBNETS_NOT_IN_ONE_VPC_MESSAGE,
+};
+
 use crate::ops::types::{
     AvailabilityZone, Certificate, DBCluster, DBClusterMember, DBClusterParameterGroup,
     DBClusterSnapshot, DBClusterSnapshotAttribute, DBClusterSnapshotAttributesResult,
@@ -217,11 +225,8 @@ pub const RESERVED_SUBNET_GROUP_NAME: &str = "default";
 /// `CreateDBSubnetGroup`: "subnet groups must contain at least one subnet in at least two
 /// Availability Zones in the Amazon Web Services Region."
 ///
-/// Which Availability Zone a subnet sits in is EC2's to say, and this emulator has no
-/// subnet inventory to read it from, so the rule is enforced at the granularity the request
-/// itself carries: fewer than this many distinct subnets cannot cover two zones. A group
-/// that does clear the bound reports its subnets without inventing a zone for them (see
-/// [`DbSubnetGroupRecord::to_shape`]).
+/// Fewer than this many distinct subnets cannot cover two zones whatever zones they lie in,
+/// so this is the floor the request itself settles, checked before any subnet is resolved.
 pub const MIN_SUBNETS_PER_SUBNET_GROUP: usize = 2;
 
 /// `DBSubnetGroup$SubnetGroupStatus` for a group whose subnets are all usable.
@@ -721,6 +726,17 @@ pub struct DbSubnetGroupRecord {
     pub region: String,
     /// The `SubnetIds` the caller named, in request order.
     pub subnet_ids: Vec<String>,
+    /// The Availability Zone of each of [`Self::subnet_ids`], as the service that OWNS
+    /// subnets answered when the group was written ([`ec2_subnets`]). A subnet EC2 named no
+    /// zone for has no entry, and the group reports no zone for it rather than one chosen
+    /// here.
+    pub subnet_zones: BTreeMap<String, String>,
+    /// `DBSubnetGroup$VpcId`: the VPC EC2 reports owns every one of this group's subnets.
+    /// Absent where it answered for none of them.
+    pub vpc_id: Option<String>,
+    /// `DBSubnetGroup$SupportedNetworkTypes`, from the address families EC2 reports this
+    /// group's subnets are addressed in; see [`ec2_subnets::group_network_types`].
+    pub supported_network_types: Vec<String>,
     /// The group's tags, as (key, value).
     pub tags: Vec<(String, String)>,
 }
@@ -737,28 +753,35 @@ impl DbSubnetGroupRecord {
 
     /// This record as the modeled `DBSubnetGroup`.
     ///
-    /// `VpcId` and `SupportedNetworkTypes` are EC2's to answer — the VPC a subnet belongs
-    /// to, and whether that subnet carries IPv6 — and this emulator has no subnet
-    /// inventory to read either from, so both members are omitted rather than invented.
-    /// `SubnetAvailabilityZone` is omitted for the same reason.
+    /// The placement members — `VpcId`, `SupportedNetworkTypes` and each subnet's
+    /// `SubnetAvailabilityZone` — are EC2's facts about the subnets this group holds, read
+    /// off its records when the group was created or modified ([`ec2_subnets`]) and kept on
+    /// the record, so the create, the modify and every later read project the ONE resolved
+    /// placement. A fact EC2 answered none of is reported as an absent member rather than as
+    /// a value invented here.
     pub fn to_shape(&self) -> DBSubnetGroup {
         DBSubnetGroup {
             db_subnet_group_name: Some(self.name.clone()),
             db_subnet_group_description: Some(self.description.clone()),
-            vpc_id: None,
+            vpc_id: self.vpc_id.clone(),
             subnet_group_status: Some(SUBNET_GROUP_COMPLETE.to_string()),
             subnets: Some(
                 self.subnet_ids
                     .iter()
                     .map(|id| Subnet {
                         subnet_identifier: Some(id.clone()),
-                        subnet_availability_zone: None,
+                        subnet_availability_zone: self.subnet_zones.get(id).map(|zone| {
+                            AvailabilityZone {
+                                name: Some(zone.clone()),
+                            }
+                        }),
                         subnet_status: Some(SUBNET_ACTIVE.to_string()),
                     })
                     .collect(),
             ),
             db_subnet_group_arn: Some(self.arn()),
-            supported_network_types: None,
+            supported_network_types: (!self.supported_network_types.is_empty())
+                .then(|| self.supported_network_types.clone()),
         }
     }
 }

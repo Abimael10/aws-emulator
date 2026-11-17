@@ -69,6 +69,45 @@ impl Docdb {
         Self { router }
     }
 
+    /// This service AND Amazon EC2 on ONE engine, with an EC2 client over the router's own
+    /// in-process callback — the very seam a `SubnetIds` member is resolved through.
+    ///
+    /// A subnet is EC2's resource, so what a subnet group reports about the subnets it holds
+    /// can only be driven end to end with the owner of subnets mounted beside this service,
+    /// exactly as the assembled emulator mounts both. Used by
+    /// `tests/all/subnet_and_parameter_groups.rs`.
+    pub(crate) fn with_ec2() -> (Self, ::aws_sdk_ec2::Client) {
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let mut router = MultiServiceRouter::new();
+        // Signatures are not the subject of these tests; the requests still carry the SigV4
+        // credential scope, which is what routes them and names the region.
+        router.set_request_authentication(false);
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        router.register_service(service_com_amazonaws_ec2_amazonec2::EmulatedService::new(
+            Arc::clone(&engine),
+        ));
+        let callback = smithy_server_runtime::EmbeddedEmulator::from_router(router.clone());
+        let config = ::aws_sdk_ec2::Config::builder()
+            .behavior_version(::aws_sdk_ec2::config::BehaviorVersion::latest())
+            .region(::aws_sdk_ec2::config::Region::new(REGION.to_string()))
+            .endpoint_url(format!("https://ec2.{REGION}.amazonaws.com"))
+            .credentials_provider(callback.aws_credentials_provider())
+            .http_client(callback.http_client())
+            // The transport is in-process: nothing to retry, time out, cache an identity for
+            // or watch for a stalled stream.
+            .retry_config(::aws_sdk_ec2::config::retry::RetryConfig::disabled())
+            .timeout_config(::aws_sdk_ec2::config::timeout::TimeoutConfig::disabled())
+            .identity_cache(::aws_sdk_ec2::config::IdentityCache::no_cache())
+            .stalled_stream_protection(
+                ::aws_sdk_ec2::config::StalledStreamProtectionConfig::disabled(),
+            )
+            .build();
+        (
+            Self { router },
+            ::aws_sdk_ec2::Client::from_conf(config),
+        )
+    }
+
     /// Call `action` with the given query parameters and return the raw reply.
     pub(crate) async fn call(&self, action: &str, params: &[(&str, &str)]) -> Reply {
         let mut body = format!("Action={action}&Version={API_VERSION}");

@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyDBSubnetGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyDBSubnetGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyDBSubnetGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation replaces the subnets of the stored subnet group the request
+//! names (and its description, when the request carries one), resolving every new
+//! `SubnetIds` member against the service that OWNS subnets
+//! (`crate::state::ec2_subnets`) so the group's placement — the VPC, each subnet's
+//! Availability Zone and the network types its subnets are addressed for — is rewritten from
+//! EC2's records rather than left behind. The new subnets must be subnets of the group's own
+//! VPC; anything else is refused and the stored group is left as it was. It answers with the
+//! stored record, exactly as `CreateDBSubnetGroup` and `DescribeDBSubnetGroups` project it.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +152,180 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyDBSubnetGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyDBSubnetGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyDBSubnetGroup"))
+        use crate::state as docdb;
+
+        // The model constrains neither member, so the rules their own documentation states
+        // are enforced here. `DBSubnetGroupName` is a LOOKUP on this path rather than a
+        // value this call stores — "Must match the name of an existing DBSubnetGroup", in
+        // either of the two forms the member accepts (the name, or the group's ARN) — so it
+        // is resolved against state below rather than held to the name grammar a create
+        // holds a NEW name to, exactly as `delete_db_subnet_group.rs` resolves it.
+        if let Some(description) = &input.db_subnet_group_description {
+            docdb::bound_chars(
+                "DBSubnetGroupDescription",
+                description,
+                docdb::MAX_STRING_CHARS,
+            )
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+        }
+
+        // "The request would cause you to exceed the allowed number of subnets in a subnet
+        // group": the published per-group quota, checked on the COUNT the request carries —
+        // before the list is walked at all, so the work this handler does is bounded by the
+        // quota rather than by the request's length.
+        if input.subnet_ids.len() > docdb::MAX_SUBNETS_PER_SUBNET_GROUP {
+            return Err(
+                ModifyDBSubnetGroupErrorModeled::DBSubnetQuotaExceededFault(
+                    DBSubnetQuotaExceededFault {
+                        message: Some(format!(
+                            "Cannot create more than {} subnets in a subnet group, got {}",
+                            docdb::MAX_SUBNETS_PER_SUBNET_GROUP,
+                            input.subnet_ids.len()
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        for subnet in &input.subnet_ids {
+            docdb::bound_chars("SubnetIds", subnet, docdb::MAX_STRING_CHARS)
+                .map_err(crate::scaffolded::Scaffolded::validation)?;
+        }
+
+        // The subnets, in request order and without repeats: a subnet named twice is one
+        // subnet, and the Availability Zone rule below counts subnets, not mentions.
+        let mut seen: ::std::collections::BTreeSet<String> = ::std::collections::BTreeSet::new();
+        let mut subnet_ids: Vec<String> = Vec::with_capacity(input.subnet_ids.len());
+        for subnet in input.subnet_ids {
+            if seen.insert(subnet.clone()) {
+                subnet_ids.push(subnet);
+            }
+        }
+
+        let region = docdb::request_region(ctx);
+
+        // The new list is resolved against the service that OWNS subnets before this
+        // service's own store is locked, so the group's rewritten placement is EC2's answer
+        // about the subnets it now holds rather than the raw identifiers — one hop, no lock
+        // held across it (`crate::state::ec2_subnets`).
+        let resolved = docdb::resolve_subnets(ctx, &region, &subnet_ids).await;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The emulator's own failure, not the caller's: a 500 `InternalFailure`
+            // rather than a 400 that would blame the request or a 501 that would claim
+            // this operation was never written.
+            return Err(crate::scaffolded::Scaffolded::internal_failure(
+                "the docdb emulator could not reach its state store",
+            ));
+        };
+        let mut store = state.lock();
+
+        // The group this call ADDRESSES is resolved first: "Must match the name of an
+        // existing DBSubnetGroup" is the modelled 404, and there is nothing to hold a new
+        // subnet list against until the group it would change is known. A name (or ARN)
+        // that resolves to no stored group takes that fault, worded by the ROLE the group
+        // plays in the call — a group that cannot be CHANGED "does not exist", where a
+        // report of one answers "not found" — so a caller can tell the two apart;
+        // `create_db_cluster.rs` words the same mutating refusal this way.
+        let Some(key) = store.resolve_subnet_group_key(&input.db_subnet_group_name) else {
+            return Err(
+                ModifyDBSubnetGroupErrorModeled::DBSubnetGroupNotFoundFault(
+                    DBSubnetGroupNotFoundFault {
+                        message: Some(format!(
+                            "DB subnet group '{}' does not exist.",
+                            input.db_subnet_group_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        let Some(held_vpc_id) = store
+            .subnet_groups
+            .get(&key)
+            .map(|record| record.vpc_id.clone())
+        else {
+            // Unreachable: the key came from this very store under this lock. A
+            // disagreement is the emulator's own failure, never a fabricated success.
+            return Err(crate::scaffolded::Scaffolded::internal_failure(
+                "the docdb emulator could not read back the subnet group it resolved",
+            ));
+        };
+
+        // See `create_db_subnet_group.rs`: an identifier the account has no subnet for can
+        // make up no group, and the refusal names the identifiers it could not use.
+        let absent = resolved.absent(&subnet_ids);
+        if !absent.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                docdb::invalid_subnets_message(&absent),
+            ));
+        }
+        // A subnet group belongs to the VPC its subnets are in, and this call changes WHICH
+        // subnets OF THAT VPC it holds: an identifier naming a subnet of another VPC is not
+        // one this group can be made of, so those identifiers are reported invalid the way
+        // ones the account holds no subnet for are. A group whose VPC this service never
+        // learnt (one stored where the owner of subnets could not be asked) constrains
+        // nothing, so the list is then only held to lying in one VPC of its own — the
+        // modelled `InvalidSubnet`, answered with that fault's own sentence. This is the
+        // order the sibling view of this front door applies the two gates in: where the
+        // group's VPC is known it is the narrower statement.
+        let outside_the_group = held_vpc_id
+            .as_deref()
+            .map(|held| resolved.outside_vpc(&subnet_ids, held))
+            .unwrap_or_default();
+        if !outside_the_group.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                docdb::invalid_subnets_message(&outside_the_group),
+            ));
+        }
+        if resolved.vpcs(&subnet_ids).len() > 1 {
+            return Err(
+                ModifyDBSubnetGroupErrorModeled::InvalidSubnet(InvalidSubnet {
+                    message: Some(docdb::SUBNETS_NOT_IN_ONE_VPC_MESSAGE.to_string()),
+                })
+                .into(),
+            );
+        }
+
+        // "subnet groups must contain at least one subnet in at least two Availability
+        // Zones" holds for the list a modify names just as for a create's; see
+        // `docdb::MIN_SUBNETS_PER_SUBNET_GROUP`.
+        if subnet_ids.len() < docdb::MIN_SUBNETS_PER_SUBNET_GROUP {
+            return Err(
+                ModifyDBSubnetGroupErrorModeled::DBSubnetGroupDoesNotCoverEnoughAZs(
+                    DBSubnetGroupDoesNotCoverEnoughAZs {
+                        message: Some(format!(
+                            "DB subnet group '{}' must contain at least \
+                             {} subnets covering at least two Availability Zones, got {}",
+                            input.db_subnet_group_name,
+                            docdb::MIN_SUBNETS_PER_SUBNET_GROUP,
+                            subnet_ids.len()
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let Some(record) = store.subnet_groups.get_mut(&key) else {
+            // Unreachable for the same reason as above.
+            return Err(crate::scaffolded::Scaffolded::internal_failure(
+                "the docdb emulator could not read back the subnet group it resolved",
+            ));
+        };
+
+        // `DBSubnetGroupDescription` is optional on this message: a request that carries
+        // none leaves the stored description alone.
+        if let Some(description) = input.db_subnet_group_description {
+            record.description = description;
+        }
+        record.subnet_zones = resolved.zones_by_subnet(&subnet_ids);
+        record.vpc_id = resolved.vpc_of(&subnet_ids);
+        record.supported_network_types = resolved.network_types(&subnet_ids);
+        record.subnet_ids = subnet_ids;
+
+        Ok(ModifyDBSubnetGroupOutput {
+            db_subnet_group: Some(record.to_shape()),
+        })
     }
 }
