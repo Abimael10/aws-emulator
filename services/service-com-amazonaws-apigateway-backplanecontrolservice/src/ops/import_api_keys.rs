@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ImportApiKeys
-//! IMPLEMENTED: reads the API key file the request carries, writes one `ApiKey` record
-//! into [`crate::state`] per row it can carry over — metered by each stored usage plan
-//! that row's `usageplanIds` cell names — and answers with those ids beside one warning
-//! per row it could not fully carry over; a warning plus `failOnWarnings` turns that
-//! answer into the modelled 400, leaving the records the other rows committed in place.
+//! IMPLEMENTED: reads the API key file the request carries and resolves each row it can
+//! carry over against the API keys [`crate::state`] already holds — a row restating a
+//! stored key's value carries its columns onto that record, any other row writes a new
+//! one — metered by each stored usage plan that row's `usageplanIds` cell names, and
+//! answers with those keys' ids beside one warning per row it could not fully carry over;
+//! a warning plus `failOnWarnings` turns that answer into the modelled 400, leaving the
+//! records the other rows committed in place.
 //! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -579,12 +581,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A key value identifies the caller presenting it, so one payload declares each
         // value once: colliding rows COLLAPSE to a single API key in which the LAST
         // colliding row's columns win, which is what a repeated value in a CSV export
-        // means. The uniqueness is in-payload only — no row is checked against the keys
-        // the account already holds — so a collapse creates a key rather than warning
-        // about one.
+        // means. A collapse is not a row the import could not carry over, so it warns
+        // about nothing.
         //
         // The surviving row keeps the POSITION of the value's first occurrence, because
-        // that is where the import created the key before a later row updated it, so the
+        // that is where the import wrote the key before a later row updated it, so the
         // ids are answered in the payload's own row order.
         let mut creatable: Vec<ImportedKey> = Vec::with_capacity(keys.len());
         let mut position: BTreeMap<String, usize> = BTreeMap::new();
@@ -601,6 +602,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
         }
+
+        // A key VALUE identifies the API key presenting it within the ACCOUNT too, not
+        // just within one payload: the sibling `CreateApiKey` refuses a second key for a
+        // value a stored one already carries (`ConflictException`). So a surviving row
+        // whose value a stored key already carries names THAT key — the import carries
+        // the row's columns onto that record and answers with the identifier the account
+        // already knows it by — and a key is written only for a value no stored key
+        // carries. An import that re-states an already-present key is therefore
+        // continuous with the key that is there, however that key was created: one at a
+        // time, or by an earlier import of the same file.
+        //
+        // Resolved BEFORE anything is written, so the quota below counts only the rows
+        // that would really add a key; `None` is a row that writes a new record.
+        let resolved: Vec<Option<String>> = {
+            let stored_by_value: BTreeMap<&str, &str> = store
+                .api_keys
+                .values()
+                .map(|stored| (stored.value.as_str(), stored.id.as_str()))
+                .collect();
+            creatable
+                .iter()
+                .map(|key| {
+                    stored_by_value
+                        .get(key.value.as_str())
+                        .map(|id| (*id).to_string())
+                })
+                .collect()
+        };
 
         // Which STORED usage plan each surviving row is to be metered by. Resolved here,
         // against the plans this account really holds, BEFORE anything is written: a
@@ -631,6 +660,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ));
                     continue;
                 };
+                // A row resolving to a key this plan ALREADY meters asks for an
+                // association that is already there: it is left exactly as it stands, so
+                // the order the plan's keys were added in does not move and the plan's
+                // cap is not spent twice on one key.
+                if resolved
+                    .get(index)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|key_id| plan.keys.contains_key(key_id))
+                {
+                    continue;
+                }
                 let metered = plan.keys.len() + adding.get(plan_id).copied().unwrap_or_default();
                 if metered >= crate::state::MAX_USAGE_PLAN_KEYS_PER_PLAN {
                     warnings.push((
@@ -672,8 +712,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Bound the growth a caller drives, at API Gateway's published quota: an import
-        // that would carry the account past it imports nothing.
-        if store.api_keys.len() + creatable.len() > crate::state::MAX_API_KEYS {
+        // that would carry the account past it imports nothing. Only a row that writes a
+        // NEW record counts against it — a row resolving to a stored key adds none.
+        let minted_rows = resolved.iter().filter(|id| id.is_none()).count();
+        if store.api_keys.len() + minted_rows > crate::state::MAX_API_KEYS {
             return Err(ImportApiKeysErrorModeled::LimitExceededException(
                 LimitExceededException {
                     retry_after_seconds: None,
@@ -684,9 +726,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // One stored record per row that survived, in the payload's own row order, so the
-        // ids answered are in that order too.
+        // ids answered are in that order too: the record the row's value already names,
+        // carrying this row's columns, or a new record for a value no stored key carries.
         let mut ids: Vec<String> = Vec::with_capacity(creatable.len());
-        for key in creatable {
+        for (index, key) in creatable.into_iter().enumerate() {
+            if let Some(id) = resolved.get(index).and_then(Option::as_ref).cloned() {
+                // The row names a key this account already holds, so the key's identity
+                // stands — the id the account knows it by, the instant it was created,
+                // its creation rank — and the columns the API key file declares take this
+                // row's values, exactly as a later colliding row's columns win over an
+                // earlier one's inside one payload. What the file declares nothing about
+                // (the marketplace customer id, the stage associations, the labels and the
+                // tags) is left as it stands.
+                if let Some(stored) = store.api_keys.get_mut(&id) {
+                    stored.name = key.name;
+                    stored.description = key.description;
+                    stored.enabled = key.enabled;
+                    // The record changed now, so a read reports when it last did.
+                    stored.last_updated_date = Some(now);
+                }
+                ids.push(id);
+                continue;
+            }
             let id = store.mint_id();
             let sequence = store.next_sequence();
             store.api_keys.insert(
@@ -747,6 +808,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             operation = Self::NAME,
             caller = ?crate::state::request_caller(ctx.parts()),
             api_keys = ids.len(),
+            minted = minted_rows,
             warnings = warnings.len(),
             outcome = "imported",
             "api keys imported",

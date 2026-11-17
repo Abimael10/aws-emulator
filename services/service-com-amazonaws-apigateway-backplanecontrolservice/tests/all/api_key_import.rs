@@ -27,12 +27,16 @@
 //! * the document's shape: blank lines between rows, a byte order mark before the header;
 //! * WHICH check a row fails, and whether the rows around it are still imported;
 //! * how many of a `usageplanIds` cell's ids name a stored usage plan (all, none, some,
-//!   one named twice), and whether the key ends up metered by it.
+//!   one named twice), and whether the key ends up metered by it;
+//! * whether the row's value is one the ACCOUNT ALREADY HOLDS, how that key got there,
+//!   how many rows of a payload resolve to a stored key and where they sit among the rows
+//!   that do not, which columns such a row re-states, how many times one document is
+//!   imported, and whether the plan the row names already meters the key.
 
 use serde_json::Value;
 
 use crate::api_key_lifecycle::{create_key, get_key};
-use crate::rest_api_lifecycle::{assert_failure, Gateway};
+use crate::rest_api_lifecycle::{assert_failure, page_items, string_member, Gateway};
 use crate::usage_plan_key_lifecycle::get_usage_plan_key;
 use crate::usage_plan_lifecycle::create_usage_plan;
 
@@ -889,15 +893,14 @@ async fn a_row_naming_a_stored_usage_plan_is_metered_by_it_and_an_unknown_one_wa
     }
 }
 
-/// RULE: a key VALUE is unique within the submitted payload and nowhere else. Rows that
-/// share one value COLLAPSE to a single `ApiKey` in which the LAST colliding row's
-/// columns win, and no row is checked against the keys the account already holds — so an
-/// import that repeats a value creates keys instead of being refused or warned about.
+/// RULE: a key VALUE identifies the `ApiKey` carrying it. Rows of one payload that share
+/// one value COLLAPSE to a single `ApiKey` in which the LAST colliding row's columns win,
+/// and a row whose value the ACCOUNT already holds resolves to that stored key (the
+/// identity tables at the end of this suite) instead of being refused or warned about.
 ///
 /// The rows span what the rule generalises over: how many rows share one value, how far
 /// apart they sit in the payload, how many distinct values the payload declares beside
-/// them, which columns the colliding rows differ in, and whether the value is one the
-/// account already holds.
+/// them, and which columns the colliding rows differ in.
 #[tokio::test]
 async fn one_payload_declares_each_key_value_once_and_the_last_colliding_row_wins() {
     let gateway = Gateway::new();
@@ -995,8 +998,8 @@ async fn one_payload_declares_each_key_value_once_and_the_last_colliding_row_win
         }
     }
 
-    // No account-wide check either: a value an existing key already carries is imported
-    // as a key of its own, and both records stand afterwards.
+    // The same identity holds across calls: a value a stored key already carries names
+    // THAT key, so the import answers with its id rather than a second key's.
     let shared = "z".repeat(MIN_VALUE_CHARS);
     let created = create_key(
         &gateway,
@@ -1019,17 +1022,447 @@ async fn one_payload_declares_each_key_value_once_and_the_last_colliding_row_win
     assert_eq!(
         ids.len(),
         1,
-        "case {case}: expected the row to create one key, got {ids:?}"
+        "case {case}: expected the row to answer with one key id, got {ids:?}"
     );
-    assert_ne!(
+    assert_eq!(
         ids[0], stored_id,
-        "case {case}: expected a key of its own, got the stored key's id {stored_id:?}"
+        "case {case}: expected the stored key's id {stored_id:?}, got {:?}",
+        ids[0]
     );
-    assert_stored(&gateway, &ids[0], &expected(&shared, "imported"), case).await;
+    assert_stored(&gateway, &stored_id, &expected(&shared, "imported"), case).await;
     let read = get_key(&gateway, &stored_id, true).await;
     assert_eq!(
         read.status, 200,
         "case {case}: expected the already-stored key to survive, got {} with {:?}",
         read.status, read.body
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The IDENTITY a row resolves to.
+//
+// RULE: a key VALUE identifies the API key carrying it within the ACCOUNT — the sibling
+// `CreateApiKey` refuses a second key for a value a stored one already carries — so an
+// import row restating a stored key's value resolves to THAT key: the answer carries the
+// identifier the account already knows it by and the row's columns land on that record,
+// while a row whose value no stored key carries writes a new key.
+// ---------------------------------------------------------------------------
+
+/// Every API key id the account holds, in page order, through `GetApiKeys`.
+///
+/// What says whether a row resolved to a stored key or added one beside it: the account
+/// holds exactly one record per declared value when it did.
+async fn account_key_ids(gateway: &Gateway, case: &str) -> Vec<String> {
+    let answer = gateway.call("GET", "/apikeys?limit=500", None).await;
+    assert_eq!(
+        answer.status, 200,
+        "case {case}: expected 200 from GetApiKeys, got {} with {:?}",
+        answer.status, answer.body
+    );
+    page_items(&answer.body, case)
+        .iter()
+        .map(|item| string_member(item, "id", case))
+        .collect()
+}
+
+/// The API key ids one usage plan meters, in page order, through `GetUsagePlanKeys`.
+async fn plan_key_ids(gateway: &Gateway, plan: &str, case: &str) -> Vec<String> {
+    let answer = gateway
+        .call("GET", &format!("/usageplans/{plan}/keys?limit=500"), None)
+        .await;
+    assert_eq!(
+        answer.status, 200,
+        "case {case}: expected 200 from GetUsagePlanKeys, got {} with {:?}",
+        answer.status, answer.body
+    );
+    page_items(&answer.body, case)
+        .iter()
+        .map(|item| string_member(item, "id", case))
+        .collect()
+}
+
+/// A successful import of `document` that warns about nothing, answering with the ids of
+/// the keys its rows resolved to, in row order.
+async fn imported_without_warning(gateway: &Gateway, case: &str, document: &str) -> Vec<String> {
+    let answer = import(gateway, document, false).await;
+    assert_eq!(
+        answer.status, 201,
+        "case {case}: expected 201, got {} with {:?}",
+        answer.status, answer.body
+    );
+    let warnings = import_warnings(&answer.body, case);
+    assert!(
+        warnings.is_empty(),
+        "case {case}: expected no warning, got {warnings:?}"
+    );
+    imported_ids(&answer.body, case)
+}
+
+/// How a case gets the key the import then re-states into the account.
+#[derive(Debug, Clone, Copy)]
+enum Stored {
+    /// `CreateApiKey` with the value supplied, so the row re-states a key created one at
+    /// a time.
+    Created,
+    /// An earlier `ImportApiKeys` of the very document the case imports again, which is
+    /// the re-run of a provisioning script.
+    SameDocument,
+    /// An earlier `ImportApiKeys` of a DIFFERENT document declaring the same value in
+    /// other columns, so what resolves the row is the value and not the document.
+    OtherDocument,
+}
+
+#[tokio::test]
+async fn a_row_restating_a_value_the_account_holds_answers_with_that_key_s_id() {
+    // The rows differ in how the key reached the account: every way this service can put
+    // one there resolves the same.
+    for (index, (how, stored)) in [
+        ("created one at a time", Stored::Created),
+        ("imported from this same document", Stored::SameDocument),
+        ("imported from another document", Stored::OtherDocument),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let gateway = Gateway::new();
+        let case = format!("one row restating a key {how}");
+        let value = row_value(60 + index, 1);
+        let document = format!("key,name\n{value},restated\n");
+        let stored_id = match stored {
+            Stored::Created => {
+                let created = create_key(
+                    &gateway,
+                    &case,
+                    serde_json::json!({ "name": "already-stored", "value": value }),
+                )
+                .await;
+                string_member(&created, "id", &case)
+            }
+            Stored::SameDocument => {
+                imported_without_warning(&gateway, &case, &document).await[0].clone()
+            }
+            Stored::OtherDocument => {
+                let other = format!(
+                    "name,key,description\nalready-stored,{value},from the first file\n"
+                );
+                imported_without_warning(&gateway, &case, &other).await[0].clone()
+            }
+        };
+
+        let ids = imported_without_warning(&gateway, &case, &document).await;
+        assert_eq!(
+            ids,
+            vec![stored_id.clone()],
+            "case {case}: expected the stored key's id {stored_id:?}, got {ids:?}"
+        );
+        // The value that identified the record is unchanged and the row's columns are
+        // what it carries afterwards.
+        assert_stored(
+            &gateway,
+            &stored_id,
+            &expected(&value, "restated"),
+            &case,
+        )
+        .await;
+        // One logical key, one record: no phantom duplicate in the account's listing.
+        let held = account_key_ids(&gateway, &case).await;
+        assert_eq!(
+            held,
+            vec![stored_id.clone()],
+            "case {case}: expected the account to hold only {stored_id:?}, got {held:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn each_row_resolves_on_its_own_and_only_an_unknown_value_adds_a_key() {
+    // The rows differ in HOW MANY rows of one payload name a key the account already
+    // holds and WHERE those rows sit among the rows that do not.
+    //
+    // (case, which 1-based rows of the three-row document name an already-stored key)
+    let cases: Vec<(&str, Vec<usize>)> = vec![
+        ("no row names a stored key", Vec::new()),
+        ("the first row names a stored key", vec![1]),
+        ("the middle row names a stored key", vec![2]),
+        ("the last row names a stored key", vec![3]),
+        ("the outer two rows name a stored key", vec![1, 3]),
+        ("every row names a stored key", vec![1, 2, 3]),
+    ];
+
+    for (index, (case, already)) in cases.into_iter().enumerate() {
+        let gateway = Gateway::new();
+        let values: Vec<String> = (1..=3).map(|row| row_value(70 + index, row)).collect();
+
+        // The keys the account holds BEFORE the import, created one at a time under a
+        // name the import then re-states.
+        let mut stored: Vec<Option<String>> = Vec::new();
+        for (position, value) in values.iter().enumerate() {
+            if already.contains(&(position + 1)) {
+                let created = create_key(
+                    &gateway,
+                    case,
+                    serde_json::json!({ "name": format!("stored-{position}"), "value": value }),
+                )
+                .await;
+                stored.push(Some(string_member(&created, "id", case)));
+            } else {
+                stored.push(None);
+            }
+        }
+
+        let mut document = "key,name\n".to_string();
+        for (position, value) in values.iter().enumerate() {
+            document.push_str(&format!("{value},row-{position}\n"));
+        }
+        let ids = imported_without_warning(&gateway, case, &document).await;
+        assert_eq!(
+            ids.len(),
+            values.len(),
+            "case {case}: expected one id per row, got {ids:?}"
+        );
+        for (position, resolved) in stored.iter().enumerate() {
+            match resolved {
+                Some(stored_id) => assert_eq!(
+                    &ids[position], stored_id,
+                    "case {case}: expected row {} to resolve to {stored_id:?}, got {:?}",
+                    position + 1,
+                    ids[position]
+                ),
+                None => assert!(
+                    !stored.iter().flatten().any(|other| other == &ids[position]),
+                    "case {case}: expected row {} to add a key of its own, got the stored \
+                     id {:?}",
+                    position + 1,
+                    ids[position]
+                ),
+            }
+            assert_stored(
+                &gateway,
+                &ids[position],
+                &expected(&values[position], &format!("row-{position}")),
+                case,
+            )
+            .await;
+        }
+        // Exactly one record per declared value, however many the account already held.
+        let mut held = account_key_ids(&gateway, case).await;
+        held.sort();
+        let mut answered = ids.clone();
+        answered.sort();
+        assert_eq!(
+            held, answered,
+            "case {case}: expected the account to hold exactly the answered ids {answered:?}, \
+             got {held:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_resolving_row_carries_its_own_columns_onto_the_stored_key() {
+    let gateway = Gateway::new();
+
+    // Each stored key is created with every column the API key file declares set, so each
+    // row below both changes columns and leaves others as they were. The rows differ in
+    // WHICH column they re-state differently.
+    //
+    // (case, the data row, the record the import must leave)
+    let cases: Vec<(&str, &str, &str, Option<&str>, bool)> = vec![
+        (
+            "the same columns again",
+            "{value},stored,the stored key,true",
+            "stored",
+            Some("the stored key"),
+            true,
+        ),
+        (
+            "another name",
+            "{value},renamed,the stored key,true",
+            "renamed",
+            Some("the stored key"),
+            true,
+        ),
+        (
+            "another description",
+            "{value},stored,re-described,true",
+            "stored",
+            Some("re-described"),
+            true,
+        ),
+        (
+            "the key disabled",
+            "{value},stored,the stored key,FALSE",
+            "stored",
+            Some("the stored key"),
+            false,
+        ),
+        (
+            "an empty description cell",
+            "{value},stored,,true",
+            "stored",
+            None,
+            true,
+        ),
+    ];
+
+    for (index, (case, row, name, description, enabled)) in cases.into_iter().enumerate() {
+        let value = row_value(80 + index, 1);
+        let created = create_key(
+            &gateway,
+            case,
+            serde_json::json!({
+                "name": "stored",
+                "description": "the stored key",
+                "value": value,
+                "enabled": true,
+            }),
+        )
+        .await;
+        let stored_id = string_member(&created, "id", case);
+        let document = format!(
+            "key,name,description,Enabled\n{}\n",
+            row.replace("{value}", &value)
+        );
+        let ids = imported_without_warning(&gateway, case, &document).await;
+        assert_eq!(
+            ids,
+            vec![stored_id.clone()],
+            "case {case}: expected the stored key's id {stored_id:?}, got {ids:?}"
+        );
+        assert_stored(
+            &gateway,
+            &stored_id,
+            &Expected {
+                value: value.clone(),
+                name: name.to_string(),
+                description: description.map(str::to_owned),
+                enabled,
+            },
+            case,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn importing_one_document_again_answers_with_the_same_identifiers() {
+    // The INVARIANT: an import is idempotent in the identifiers it answers with and in
+    // what the account holds afterwards, however many times one document is sent. The
+    // rows differ in how many values the document declares, each on an account of its own
+    // so that what the account holds is exactly what the document declared.
+    for (index, rows) in [1usize, 2, 5].into_iter().enumerate() {
+        let gateway = Gateway::new();
+        let case = format!("a document of {rows} row(s) imported four times");
+        let values: Vec<String> = (1..=rows).map(|row| row_value(90 + index, row)).collect();
+        let mut document = "key,name\n".to_string();
+        for (position, value) in values.iter().enumerate() {
+            document.push_str(&format!("{value},row-{position}\n"));
+        }
+        let first = imported_without_warning(&gateway, &case, &document).await;
+        assert_eq!(
+            first.len(),
+            rows,
+            "case {case}: expected one id per row, got {first:?}"
+        );
+        for attempt in 2..=4 {
+            let again = imported_without_warning(&gateway, &case, &document).await;
+            assert_eq!(
+                again, first,
+                "case {case}: import {attempt} must answer with the first import's ids \
+                 {first:?}, got {again:?}"
+            );
+        }
+        for (position, id) in first.iter().enumerate() {
+            assert_stored(
+                &gateway,
+                id,
+                &expected(&values[position], &format!("row-{position}")),
+                &case,
+            )
+            .await;
+        }
+        let held = account_key_ids(&gateway, &case).await;
+        assert_eq!(
+            held.len(),
+            first.len(),
+            "case {case}: expected the account to hold {} key(s), got {held:?}",
+            first.len()
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_resolving_row_keeps_the_usage_plan_associations_the_stored_key_already_has() {
+    let gateway = Gateway::new();
+
+    let metering = create_usage_plan(
+        &gateway,
+        "the plan the first import meters on",
+        serde_json::json!({ "name": "metering" }),
+    )
+    .await;
+    let metering_id = string_member(&metering, "id", "the plan the first import meters on");
+    let second = create_usage_plan(
+        &gateway,
+        "a second plan",
+        serde_json::json!({ "name": "metering-too" }),
+    )
+    .await;
+    let second_id = string_member(&second, "id", "a second plan");
+
+    // The key reaches the account through an import that meters it on the first plan, so
+    // the association the rows below re-state is one this operation wrote itself.
+    let value = row_value(95, 1);
+    let case = "a row re-stating a metered key";
+    let document = format!("key,name,usageplanIds\n{value},metered,{metering_id}\n");
+    let stored_id = imported_without_warning(&gateway, case, &document).await[0].clone();
+
+    // The same row again: the key id does not move and the association it already has is
+    // still there exactly once.
+    for attempt in 2..=3 {
+        let again = imported_without_warning(&gateway, case, &document).await;
+        assert_eq!(
+            again,
+            vec![stored_id.clone()],
+            "case {case}: import {attempt} must answer with {stored_id:?}, got {again:?}"
+        );
+        let answer = get_usage_plan_key(&gateway, &metering_id, &stored_id).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case}: expected the association to stand, got {} with {:?}",
+            answer.status, answer.body
+        );
+        let metered = plan_key_ids(&gateway, &metering_id, case).await;
+        assert_eq!(
+            metered,
+            vec![stored_id.clone()],
+            "case {case}: expected the plan to meter {stored_id:?} once, got {metered:?}"
+        );
+    }
+
+    // A row naming a plan the stored key is NOT metered by adds that association to the
+    // same key rather than to a second one.
+    let case = "a row naming a plan the stored key is not metered by";
+    let again = imported_without_warning(
+        &gateway,
+        case,
+        &format!("key,name,usageplanIds\n{value},metered,{second_id}\n"),
+    )
+    .await;
+    assert_eq!(
+        again,
+        vec![stored_id.clone()],
+        "case {case}: expected the stored key's id {stored_id:?}, got {again:?}"
+    );
+    let metered = plan_key_ids(&gateway, &second_id, case).await;
+    assert_eq!(
+        metered,
+        vec![stored_id.clone()],
+        "case {case}: expected the second plan to meter {stored_id:?}, got {metered:?}"
+    );
+    let held = account_key_ids(&gateway, case).await;
+    assert_eq!(
+        held,
+        vec![stored_id.clone()],
+        "case {case}: expected the account to hold only {stored_id:?}, got {held:?}"
     );
 }
