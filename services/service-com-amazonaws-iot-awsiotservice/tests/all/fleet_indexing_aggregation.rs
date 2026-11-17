@@ -23,10 +23,14 @@
 //! * what ONE aggregation may cost is bounded in both dimensions a request chooses —
 //!   how many documents the scan examines and how much character matching the query
 //!   performs over them — and past either bound the request is REFUSED rather than
-//!   answered from a partial scan.
+//!   answered from a partial scan;
+//! * `GetStatistics` summarises one field of the things a query selects: the COUNT of
+//!   the selected things that carry a valid value for the aggregation field, plus the
+//!   arithmetic summary of those values where the index carries the field as a NUMBER
+//!   and nothing more where it does not.
 
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -47,6 +51,13 @@ const DECLARED_ATTRIBUTE_FIELD: &str = "attributes.zone";
 
 /// An attribute field the account declares nothing for.
 const UNDECLARED_ATTRIBUTE_FIELD: &str = "attributes.undeclared";
+
+/// How far out [`Emulator::hold_index_build`] pushes an index build's due instant.
+///
+/// A case about the BUILDING state asserts what a caller finds while the build is still
+/// owed, so the window has to be wider than anything the host's scheduling can consume
+/// between two calls — generous on purpose, since no case waits for it to pass.
+const HELD_BUILD: Duration = Duration::from_secs(3_600);
 
 /// One emulator: the shared engine plus a router with this service mounted.
 struct Emulator {
@@ -119,6 +130,20 @@ impl Emulator {
         build.active_at = SystemTime::now() - INDEX_BUILD_SPAN;
     }
 
+    /// Hold the thing index in the build the clock owes it, by pushing the recorded due
+    /// instant out by [`HELD_BUILD`] — the BUILDING state a caller finds straight after
+    /// the configuration change, with no case depending on how fast the host got from
+    /// one call to the next.
+    fn hold_index_build(&self) {
+        let state = self.engine.state::<ComAmazonawsIotAwsiotserviceState>();
+        let mut store = state.lock();
+        let build = store
+            .index_builds
+            .get_mut(THING_INDEX_NAME)
+            .expect("enabling the index records a build");
+        build.active_at = SystemTime::now() + HELD_BUILD;
+    }
+
     /// An emulator whose thing index exists and is ACTIVE.
     async fn with_active_index(case: &str) -> Self {
         let emulator = Self::new();
@@ -144,20 +169,25 @@ impl Emulator {
         );
     }
 
-    /// Register one thing of the type given, carrying the attributes given.
+    /// Register one thing of the type given, carrying the attributes given as
+    /// `(name, value)` pairs.
     async fn create_thing(
         &self,
         case: &str,
         thing_name: &str,
         thing_type_name: Option<&str>,
-        zone: Option<&str>,
+        attributes: &[(&str, &str)],
     ) {
         let mut body = json!({});
         if let Some(thing_type_name) = thing_type_name {
             body["thingTypeName"] = json!(thing_type_name);
         }
-        if let Some(zone) = zone {
-            body["attributePayload"] = json!({ "attributes": { "zone": zone } });
+        if !attributes.is_empty() {
+            let mut held = serde_json::Map::new();
+            for (name, value) in attributes {
+                held.insert((*name).to_string(), json!(value));
+            }
+            body["attributePayload"] = json!({ "attributes": Value::Object(held) });
         }
         let reply = self
             .dispatch("POST", &format!("/things/{thing_name}"), Some(&body))
@@ -466,21 +496,21 @@ async fn a_bucket_aggregation_counts_the_registry_the_query_selects() {
     // Three things of one type, two of another and one of none: the counts the
     // aggregation has to report are a property of this registry.
     emulator
-        .create_thing("buckets", "sensor-1", Some("sensor"), Some("north"))
+        .create_thing("buckets", "sensor-1", Some("sensor"), &[("zone", "north")])
         .await;
     emulator
-        .create_thing("buckets", "sensor-2", Some("sensor"), Some("north"))
+        .create_thing("buckets", "sensor-2", Some("sensor"), &[("zone", "north")])
         .await;
     emulator
-        .create_thing("buckets", "sensor-3", Some("sensor"), Some("south"))
+        .create_thing("buckets", "sensor-3", Some("sensor"), &[("zone", "south")])
         .await;
     emulator
-        .create_thing("buckets", "gateway-1", Some("gateway"), Some("south"))
+        .create_thing("buckets", "gateway-1", Some("gateway"), &[("zone", "south")])
         .await;
     emulator
-        .create_thing("buckets", "gateway-2", Some("gateway"), None)
+        .create_thing("buckets", "gateway-2", Some("gateway"), &[])
         .await;
-    emulator.create_thing("buckets", "spare-1", None, None).await;
+    emulator.create_thing("buckets", "spare-1", None, &[]).await;
 
     // The rows span what the rule generalises over: which field is aggregated (a managed
     // registry field and a declared attribute field), which things the query selects
@@ -633,6 +663,7 @@ async fn an_aggregation_over_an_absent_or_building_index_is_refused() {
 
     // Turned on, the index exists but is still building until the clock makes it active.
     emulator.enable_thing_index("building").await;
+    emulator.hold_index_build();
     let building = emulator.buckets(&request).await;
     assert_eq!(
         building.status,
@@ -789,4 +820,429 @@ fn an_aggregation_past_either_bound_is_refused() {
         Ok(1),
         "case a query nesting within the ceiling: expected the one thing it selects"
     );
+}
+
+/// A custom field the account declares as type `Number`, so a case can show the
+/// arithmetic statistics a NUMERIC field has and a text one does not. `Number` is one of
+/// the modelled `FieldType` values
+/// (`smithy_query(query="shape",shape="FieldType")`: `Number`, `String`, `Boolean`).
+const NUMERIC_ATTRIBUTE_FIELD: &str = "attributes.temperature";
+
+/// The attribute whose values [`NUMERIC_ATTRIBUTE_FIELD`] indexes, as `CreateThing`
+/// names it: the field is the attribute under the index's `attributes.` prefix.
+const NUMERIC_ATTRIBUTE: &str = "temperature";
+
+/// How far a computed statistic may be from the expected one: the arithmetic runs in
+/// `f64`, so a sum of squares or a variance is compared to within a rounding error of
+/// the figure's own size rather than bit for bit.
+const TOLERANCE: f64 = 1e-9;
+
+impl Emulator {
+    /// An emulator whose thing index exists, is ACTIVE and carries BOTH a text and a
+    /// numeric custom field, so one registry can be asked for the statistics of each.
+    async fn with_numeric_custom_field(case: &str) -> Self {
+        let emulator = Self::new();
+        let reply = emulator
+            .dispatch(
+                "POST",
+                "/indexing/config",
+                Some(&json!({
+                    "thingIndexingConfiguration": {
+                        "thingIndexingMode": "REGISTRY",
+                        "customFields": [
+                            { "name": DECLARED_ATTRIBUTE_FIELD, "type": "String" },
+                            { "name": NUMERIC_ATTRIBUTE_FIELD, "type": "Number" },
+                        ],
+                    }
+                })),
+            )
+            .await;
+        assert_eq!(
+            reply.status,
+            200,
+            "case {case}: expected UpdateIndexingConfiguration to answer 200, got {} body {}",
+            reply.status,
+            reply.text()
+        );
+        emulator.finish_index_build();
+        emulator
+    }
+
+    async fn statistics(&self, body: &Value) -> Reply {
+        self.dispatch("POST", "/indices/statistics", Some(body))
+            .await
+    }
+}
+
+impl Reply {
+    /// The `statistics` a `GetStatistics` answer carries.
+    fn statistics(&self) -> Value {
+        self.json()["statistics"].clone()
+    }
+}
+
+/// The arithmetic members of `Statistics` a NUMERIC field is summarised by, each named as
+/// the wire names it.
+const ARITHMETIC_STATISTICS: &[&str] = &[
+    "average",
+    "sum",
+    "minimum",
+    "maximum",
+    "sumOfSquares",
+    "variance",
+    "stdDeviation",
+];
+
+/// What the arithmetic summary of one case's values is, member for member.
+struct ExpectedSummary {
+    sum: f64,
+    average: f64,
+    minimum: f64,
+    maximum: f64,
+    sum_of_squares: f64,
+    variance: f64,
+    std_deviation: f64,
+}
+
+impl ExpectedSummary {
+    /// The summary as `(wire member, expected value)` pairs, in the order
+    /// [`ARITHMETIC_STATISTICS`] names them.
+    fn members(&self) -> Vec<(&'static str, f64)> {
+        vec![
+            ("average", self.average),
+            ("sum", self.sum),
+            ("minimum", self.minimum),
+            ("maximum", self.maximum),
+            ("sumOfSquares", self.sum_of_squares),
+            ("variance", self.variance),
+            ("stdDeviation", self.std_deviation),
+        ]
+    }
+}
+
+/// RULE: `GetStatistics` is computed over the things the query selects — the count of
+/// those carrying a valid value for the aggregation field, and the arithmetic summary of
+/// those values exactly where the index carries the field as a number.
+#[tokio::test]
+async fn statistics_summarise_the_field_of_the_things_the_query_selects() {
+    let emulator = Emulator::with_numeric_custom_field("statistics").await;
+    for thing_type_name in ["sensor", "gateway"] {
+        emulator.create_thing_type("statistics", thing_type_name).await;
+    }
+    // Four things carrying a numeric attribute, one carrying none and one with no type
+    // and no attributes: every figure asserted below is a property of THIS registry.
+    for (thing_name, thing_type_name, zone, temperature) in [
+        ("sensor-1", Some("sensor"), "north", Some("10")),
+        ("sensor-2", Some("sensor"), "north", Some("20")),
+        ("sensor-3", Some("sensor"), "south", Some("30")),
+        ("gateway-1", Some("gateway"), "south", Some("40")),
+    ] {
+        let mut attributes = vec![("zone", zone)];
+        if let Some(temperature) = temperature {
+            attributes.push((NUMERIC_ATTRIBUTE, temperature));
+        }
+        emulator
+            .create_thing("statistics", thing_name, thing_type_name, &attributes)
+            .await;
+    }
+    emulator
+        .create_thing("statistics", "gateway-2", Some("gateway"), &[])
+        .await;
+    emulator
+        .create_thing("statistics", "spare-1", None, &[])
+        .await;
+
+    /// One request and what this registry answers it with.
+    struct Case {
+        label: &'static str,
+        query: &'static str,
+        /// The `aggregationField`, or `None` for a request that names none.
+        field: Option<&'static str>,
+        count: i64,
+        /// The arithmetic summary, or `None` for a field that has none.
+        summary: Option<ExpectedSummary>,
+    }
+    // The rows differ along what the rule generalises over: which field is summarised (a
+    // numeric custom field, a numeric MANAGED field, a text managed field, a text custom
+    // field, and no field at all), which things the query selects (all of them, a name
+    // wildcard, an attribute value, exactly one, and none), and how many values the
+    // selection holds (several, one, none).
+    let cases = vec![
+        Case {
+            label: "a numeric custom field over every thing",
+            query: "thingName:*",
+            field: Some(NUMERIC_ATTRIBUTE_FIELD),
+            // Only the four things that CARRY the field are counted; 10, 20, 30, 40.
+            count: 4,
+            summary: Some(ExpectedSummary {
+                sum: 100.0,
+                average: 25.0,
+                minimum: 10.0,
+                maximum: 40.0,
+                sum_of_squares: 3_000.0,
+                variance: 125.0,
+                std_deviation: 125.0_f64.sqrt(),
+            }),
+        },
+        Case {
+            label: "a numeric custom field over the things one name wildcard selects",
+            query: "thingName:sensor-*",
+            field: Some(NUMERIC_ATTRIBUTE_FIELD),
+            // 10, 20, 30.
+            count: 3,
+            summary: Some(ExpectedSummary {
+                sum: 60.0,
+                average: 20.0,
+                minimum: 10.0,
+                maximum: 30.0,
+                sum_of_squares: 1_400.0,
+                variance: 1_400.0 / 3.0 - 400.0,
+                std_deviation: (1_400.0 / 3.0 - 400.0_f64).sqrt(),
+            }),
+        },
+        Case {
+            label: "a numeric custom field over the things one attribute value selects",
+            query: "attributes.zone:south",
+            field: Some(NUMERIC_ATTRIBUTE_FIELD),
+            // 30, 40.
+            count: 2,
+            summary: Some(ExpectedSummary {
+                sum: 70.0,
+                average: 35.0,
+                minimum: 30.0,
+                maximum: 40.0,
+                sum_of_squares: 2_500.0,
+                variance: 25.0,
+                std_deviation: 5.0,
+            }),
+        },
+        Case {
+            label: "a numeric custom field over exactly one thing",
+            query: "thingName:sensor-1",
+            field: Some(NUMERIC_ATTRIBUTE_FIELD),
+            count: 1,
+            summary: Some(ExpectedSummary {
+                sum: 10.0,
+                average: 10.0,
+                minimum: 10.0,
+                maximum: 10.0,
+                sum_of_squares: 100.0,
+                variance: 0.0,
+                std_deviation: 0.0,
+            }),
+        },
+        Case {
+            label: "a numeric MANAGED field over every thing",
+            query: "thingName:*",
+            field: Some("registry.version"),
+            // Every thing carries its registry version, which a create leaves at 1.
+            count: 6,
+            summary: Some(ExpectedSummary {
+                sum: 6.0,
+                average: 1.0,
+                minimum: 1.0,
+                maximum: 1.0,
+                sum_of_squares: 6.0,
+                variance: 0.0,
+                std_deviation: 0.0,
+            }),
+        },
+        Case {
+            label: "a numeric custom field no selected thing carries",
+            query: "thingName:spare-1",
+            field: Some(NUMERIC_ATTRIBUTE_FIELD),
+            count: 0,
+            summary: None,
+        },
+        Case {
+            label: "a numeric custom field over a query that selects no thing",
+            query: "thingName:absent-*",
+            field: Some(NUMERIC_ATTRIBUTE_FIELD),
+            count: 0,
+            summary: None,
+        },
+        Case {
+            label: "a TEXT managed field over every thing",
+            query: "thingName:*",
+            // Five things have a thing type; the sixth carries no value for the field.
+            field: Some("registry.thingTypeName"),
+            count: 5,
+            summary: None,
+        },
+        Case {
+            label: "a TEXT custom field over every thing",
+            query: "thingName:*",
+            field: Some(DECLARED_ATTRIBUTE_FIELD),
+            count: 4,
+            summary: None,
+        },
+        Case {
+            label: "a request naming no aggregation field",
+            query: "thingName:*",
+            field: None,
+            count: 6,
+            summary: None,
+        },
+    ];
+
+    for case in &cases {
+        let mut request = json!({ "queryString": case.query });
+        if let Some(field) = case.field {
+            request["aggregationField"] = json!(field);
+        }
+        let answer = emulator.statistics(&request).await;
+        assert_eq!(
+            answer.status,
+            200,
+            "case {}: expected 200, got {} body {}",
+            case.label,
+            answer.status,
+            answer.text()
+        );
+        let statistics = answer.statistics();
+        assert_eq!(
+            statistics["count"],
+            json!(case.count),
+            "case {}: expected count {}, got {statistics}",
+            case.label,
+            case.count
+        );
+        match case.summary.as_ref() {
+            Some(expected) => {
+                for (member, value) in expected.members() {
+                    let actual = statistics[member].as_f64();
+                    let within = actual.is_some_and(|actual| {
+                        (actual - value).abs() <= TOLERANCE * value.abs().max(1.0)
+                    });
+                    assert!(
+                        within,
+                        "case {}: expected {member} {value}, got {:?}",
+                        case.label, statistics[member]
+                    );
+                }
+            }
+            // A field with no numbers to summarise reports its count ALONE: a zero
+            // reported for a sum nothing added up would read as a computed figure.
+            None => {
+                for member in ARITHMETIC_STATISTICS {
+                    assert!(
+                        statistics[member].is_null(),
+                        "case {}: expected no {member}, got {}",
+                        case.label,
+                        statistics[member]
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// RULE: the statistics are read out of the INDEX and over a field it carries, so the
+/// index's own state and the request's field decide the refusal — and the same request is
+/// answered once the index is ACTIVE.
+#[tokio::test]
+async fn statistics_over_an_absent_index_or_an_unindexed_field_are_refused() {
+    let request = json!({
+        "queryString": "thingName:*",
+        "aggregationField": "registry.version",
+    });
+
+    // No indexing configured at all: there is no index to read statistics out of.
+    let emulator = Emulator::new();
+    let refused = emulator.statistics(&request).await;
+    assert_eq!(
+        refused.status,
+        404,
+        "case thing indexing OFF: expected 404, got {} body {}",
+        refused.status,
+        refused.text()
+    );
+    assert_eq!(
+        refused.error_code(),
+        "ResourceNotFoundException",
+        "case thing indexing OFF: got {}",
+        refused.text()
+    );
+
+    // Turned on, the index exists but is still building until the clock makes it active.
+    emulator.enable_thing_index("statistics while building").await;
+    emulator.hold_index_build();
+    let building = emulator.statistics(&request).await;
+    assert_eq!(
+        building.status,
+        400,
+        "case the index still building: expected 400, got {} body {}",
+        building.status,
+        building.text()
+    );
+    assert_eq!(
+        building.error_code(),
+        "IndexNotReadyException",
+        "case the index still building: got {}",
+        building.text()
+    );
+
+    // Once the build the clock owed is due, the same request is answered — over an empty
+    // registry, which is a count of zero rather than a refusal.
+    emulator.finish_index_build();
+    let answered = emulator.statistics(&request).await;
+    assert_eq!(
+        answered.status,
+        200,
+        "case the index ACTIVE: expected 200, got {} body {}",
+        answered.status,
+        answered.text()
+    );
+    assert_eq!(
+        answered.statistics()["count"],
+        json!(0),
+        "case the index ACTIVE over an empty registry: expected count 0, got {}",
+        answered.text()
+    );
+
+    // Each remaining row is one rule the request broke: a name that is no fleet index of
+    // this service, a field the index does not carry, and a string that is not a query.
+    let rows = vec![
+        (
+            "an index name this service does not serve",
+            json!({
+                "indexName": "AWS_Nothing",
+                "queryString": "thingName:*",
+                "aggregationField": "registry.version",
+            }),
+            "InvalidRequestException",
+        ),
+        (
+            "a field the index does not carry",
+            json!({
+                "queryString": "thingName:*",
+                "aggregationField": UNDECLARED_ATTRIBUTE_FIELD,
+            }),
+            "InvalidRequestException",
+        ),
+        (
+            "a query string that is not a query",
+            json!({
+                "queryString": "thingName:(",
+                "aggregationField": "registry.version",
+            }),
+            "InvalidQueryException",
+        ),
+    ];
+    for (label, request, expected) in &rows {
+        let refused = emulator.statistics(request).await;
+        assert_eq!(
+            refused.status,
+            400,
+            "case {label}: expected 400, got {} body {}",
+            refused.status,
+            refused.text()
+        );
+        assert_eq!(
+            &refused.error_code(),
+            expected,
+            "case {label}: expected {expected}, got {}",
+            refused.text()
+        );
+    }
 }

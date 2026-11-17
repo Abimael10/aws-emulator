@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetStatistics
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetStatistics`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetStatistics::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +151,191 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetStatistics` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetStatisticsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetStatisticsErrorModeled::InternalFailureException(InternalFailureException {
+                message: Some("the IoT emulator has no state store attached".to_string()),
+            })
+        })?;
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        // A name outside the set of indexes this service recognises is a request it
+        // cannot act on at all, which is a different refusal from an index the account
+        // does not have: the modelled `InvalidRequestException` ahead of any lookup.
+        // "The name of the index to search. The default value is AWS_Things", so a
+        // request naming none reads the thing index.
+        let index_name = input
+            .index_name
+            .clone()
+            .unwrap_or_else(|| crate::state::THING_INDEX_NAME.to_string());
+        if !crate::state::FLEET_INDEX_NAMES.contains(&index_name.as_str()) {
+            return Err(
+                GetStatisticsErrorModeled::InvalidRequestException(InvalidRequestException {
+                    message: Some(crate::state::unrecognized_index_name_message(&index_name)),
+                })
+                .into(),
+            );
+        }
+
+        // The statistics are over the things a QUERY selects, so a string that is not a
+        // query is refused with the modelled `InvalidQueryException` ("The query is
+        // invalid", HTTP 400) — the same reading of a `queryString` every operation that
+        // takes one shares.
+        if let Err(rejection) = crate::state::validate_query_string(&input.query_string) {
+            return Err(
+                GetStatisticsErrorModeled::InvalidQueryException(InvalidQueryException {
+                    message: Some(rejection.message()),
+                })
+                .into(),
+            );
+        }
+
+        // The index's own state, the type it carries the aggregated field as and the
+        // documents it holds are read under ONE lock, and the guard is released before
+        // anything is matched: the scan below is CPU-bound work whose size the request
+        // chooses, so it must not hold the store every other caller reads.
+        let (documents, numeric_field) = {
+            let store = state.lock();
+
+            // The index the statistics are read from decides whether the request can be
+            // answered at all: an account whose configuration has no such index has
+            // nothing to aggregate (the modelled `ResourceNotFoundException`, HTTP 404),
+            // and one whose index is still being built has the index but not yet its
+            // contents (the modelled `IndexNotReadyException`, HTTP 400).
+            match store.fleet_index_availability(&index_name, now) {
+                crate::state::FleetIndexAvailability::Missing => {
+                    return Err(GetStatisticsErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(
+                                crate::state::missing_fleet_index_for_aggregation_message(
+                                    &index_name,
+                                ),
+                            ),
+                        },
+                    )
+                    .into());
+                }
+                crate::state::FleetIndexAvailability::Building => {
+                    return Err(GetStatisticsErrorModeled::IndexNotReadyException(
+                        IndexNotReadyException {
+                            message: Some(crate::state::index_not_ready_message(
+                                &index_name,
+                                store.fleet_index_status(&index_name, now),
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                crate::state::FleetIndexAvailability::Ready => {}
+            }
+
+            // A field whose statistics are asked for has to be one the index carries:
+            // the fields the service manages plus the custom fields the account
+            // declared. That is the same rule — in the same wording — every other
+            // aggregation reads its field under, so the operations cannot drift. The
+            // TYPE the index carries it as is what decides which statistics there are:
+            // "If the aggregation field is of type String, only the count statistic is
+            // returned", the count being the one statistic that needs no arithmetic.
+            let numeric_field = match input.aggregation_field.as_deref() {
+                Some(aggregation_field) => {
+                    let Some(field_type) = store.indexed_field_type(&index_name, aggregation_field)
+                    else {
+                        let rejection = crate::state::AggregationFieldRejection::NotIndexed {
+                            aggregation_field: aggregation_field.to_string(),
+                            index_name: index_name.clone(),
+                        };
+                        return Err(GetStatisticsErrorModeled::InvalidRequestException(
+                            InvalidRequestException {
+                                message: Some(rejection.message()),
+                            },
+                        )
+                        .into());
+                    };
+                    field_type == crate::state::fleet_metrics::FIELD_TYPE_NUMBER
+                }
+                // A request naming no field asks about the things themselves rather than
+                // about a field of them: "You can specify "*" for the query string to get
+                // the count of all indexed things in your Amazon Web Services account",
+                // so such a request is answered with the count of the things the query
+                // selected and no arithmetic at all.
+                None => false,
+            };
+
+            (store.indexed_documents(&index_name), numeric_field)
+        };
+
+        // The answer is COMPUTED over the account's own records: the query selects the
+        // documents of the index ([`crate::state::documents_matching`]) and the
+        // statistics summarise the values they hold for one field
+        // ([`crate::state::field_statistics`]).
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetStatistics"))
+        // Matching every document against the query is CPU-bound work whose size the
+        // request chooses, so it runs on the blocking pool: `spawn_blocking(..).await` is
+        // a real await point, so one aggregation cannot starve the worker that serves
+        // every other request, and the scan's own budget bounds what it may cost at all.
+        let query_string = input.query_string.clone();
+        let aggregation_field = input.aggregation_field.clone();
+        let scanned = ::tokio::task::spawn_blocking(move || {
+            let selected = crate::state::documents_matching(documents, &query_string)?;
+            let statistics = match aggregation_field.as_deref() {
+                Some(aggregation_field) => {
+                    crate::state::field_statistics(&selected, aggregation_field, numeric_field)
+                }
+                None => crate::state::FieldStatistics {
+                    count: selected.len(),
+                    summary: None,
+                },
+            };
+            Ok::<crate::state::FieldStatistics, crate::state::ScanRefusal>(statistics)
+        })
+        .await;
+        let statistics = match scanned {
+            Ok(Ok(statistics)) => statistics,
+            // A request that would cost more than this emulator evaluates for one
+            // aggregation is refused with the modelled `InvalidRequestException` naming
+            // the bound it exceeded, rather than answered from a partial scan.
+            Ok(Err(refusal)) => {
+                return Err(
+                    GetStatisticsErrorModeled::InvalidRequestException(InvalidRequestException {
+                        message: Some(refusal.message()),
+                    })
+                    .into(),
+                );
+            }
+            // A panic or a cancellation on the pool says nothing about the request, so it
+            // is reported as the server fault it is rather than as an empty summary.
+            Err(error) => {
+                ::tracing::error!(
+                    operation = Self::NAME,
+                    error = %error,
+                    "the statistics aggregation did not complete"
+                );
+                return Err(GetStatisticsErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: Some("the statistics could not be computed".to_string()),
+                    },
+                )
+                .into());
+            }
+        };
+
+        // Only the statistics the aggregated field HAS are reported: the count always,
+        // and the arithmetic summary where the field carries numbers to summarise. A
+        // field that holds none — because it is text or a flag, or because no selected
+        // thing carries a value for it — reports its count alone rather than a zero that
+        // would read as a computed sum.
+        let summary = statistics.summary;
+        Ok(GetStatisticsOutput {
+            statistics: Some(Statistics {
+                count: i32::try_from(statistics.count).unwrap_or(i32::MAX),
+                average: summary.map(|summary| summary.average),
+                sum: summary.map(|summary| summary.sum),
+                minimum: summary.map(|summary| summary.minimum),
+                maximum: summary.map(|summary| summary.maximum),
+                sum_of_squares: summary.map(|summary| summary.sum_of_squares),
+                variance: summary.map(|summary| summary.variance),
+                std_deviation: summary.map(|summary| summary.std_deviation),
+            }),
+        })
     }
 }

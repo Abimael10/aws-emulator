@@ -3266,8 +3266,9 @@ pub use fleet_query::{validate_query_string, QueryStringRejection, UNPARSABLE_QU
 // the query string it evaluates.
 pub mod fleet_search;
 pub use fleet_search::{
-    documents_matching, terms_buckets, IndexedDocument, ScanRefusal, ATTRIBUTE_FIELD_PREFIX,
-    DEFAULT_MAX_BUCKETS, MAX_MATCH_STEPS, MAX_SCANNED_DOCUMENTS, MAX_WALK_DEPTH,
+    documents_matching, field_statistics, terms_buckets, FieldStatistics, IndexedDocument,
+    NumericSummary, ScanRefusal, ATTRIBUTE_FIELD_PREFIX, DEFAULT_MAX_BUCKETS, MAX_MATCH_STEPS,
+    MAX_SCANNED_DOCUMENTS, MAX_WALK_DEPTH,
 };
 
 // What a READER of the account's fleet-indexing configuration adds to what the writer

@@ -342,6 +342,125 @@ pub fn terms_buckets(
     ranked
 }
 
+/// The arithmetic summary of the numbers one field holds across the documents a query
+/// selected.
+///
+/// Every member is one of the modelled `Statistics` members that summarises NUMBERS
+/// (`smithy_query(query="shape",shape="Statistics")`), so a reader hands back what was
+/// computed here member for member and nothing is reported that was not.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NumericSummary {
+    /// `Statistics$sum` — "The sum of the aggregated field values".
+    pub sum: f64,
+    /// `Statistics$average` — "The average of the aggregated field values".
+    pub average: f64,
+    /// `Statistics$minimum` — "The minimum aggregated field value".
+    pub minimum: f64,
+    /// `Statistics$maximum` — "The maximum aggregated field value".
+    pub maximum: f64,
+    /// `Statistics$sumOfSquares` — "The sum of the squares of the aggregated field
+    /// values".
+    pub sum_of_squares: f64,
+    /// `Statistics$variance` — "The variance of the aggregated field values", over the
+    /// values themselves (the whole population the query selected), so a field holding
+    /// one value, or the same value repeatedly, has variance zero.
+    pub variance: f64,
+    /// `Statistics$stdDeviation` — "The standard deviation of the aggregated field
+    /// values", the root of [`NumericSummary::variance`].
+    pub std_deviation: f64,
+}
+
+/// What a `Statistics` aggregation over ONE field of the selected documents amounts to.
+///
+/// The count stands on its own because it is the one statistic a field of any type has
+/// — `Statistics$count` is "The count of things that match the query string criteria and
+/// contain a valid aggregation field value", which needs no arithmetic — while the
+/// arithmetic summary exists only where the field holds numbers to summarise.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FieldStatistics {
+    /// How many of the selected documents carry a value the field's type admits.
+    pub count: usize,
+    /// The arithmetic summary of the numbers they hold, or `None` when they hold none.
+    pub summary: Option<NumericSummary>,
+}
+
+/// The statistics of the values `field` holds across `documents`, where `numeric` says
+/// whether the index carries the field as a NUMBER.
+///
+/// A document carrying no value for the field is in no statistic at all, exactly as it
+/// is in no bucket of [`terms_buckets`]: the count is of the documents that carry a
+/// VALID value, which for a numeric field means one that reads as a finite number. A
+/// document carrying several values for one field (the groups a thing belongs to)
+/// counts once towards the count and contributes each of its values to the arithmetic,
+/// the same way it counts into the bucket of each.
+///
+/// A field the index carries as text or as a flag has no arithmetic summary — there is
+/// nothing to add up — so such a field answers with its count alone, whatever its values
+/// happen to look like.
+///
+/// CPU-BOUND, like [`documents_matching`] whose answer it summarises: a caller runs it
+/// off the async worker and with no store lock held.
+pub fn field_statistics(
+    documents: &[IndexedDocument],
+    field: &str,
+    numeric: bool,
+) -> FieldStatistics {
+    let mut count = 0usize;
+    let mut values: Vec<f64> = Vec::new();
+    for document in documents {
+        let Some(held) = document.get(field) else {
+            continue;
+        };
+        if !numeric {
+            count += 1;
+            continue;
+        }
+        let numbers = held
+            .iter()
+            .filter_map(|value| value.parse::<f64>().ok())
+            .filter(|number| number.is_finite());
+        let before = values.len();
+        values.extend(numbers);
+        if values.len() > before {
+            count += 1;
+        }
+    }
+    FieldStatistics {
+        count,
+        summary: summarise(&values),
+    }
+}
+
+/// The arithmetic summary of `values`, or `None` when there are none to summarise.
+///
+/// The variance is read off the deviations from the average rather than off the sum of
+/// squares, so values that are all equal summarise to variance zero instead of to the
+/// rounding error of a subtraction of two large sums; `sumOfSquares` is still the plain
+/// sum of the squares, which is what the member reports.
+fn summarise(values: &[f64]) -> Option<NumericSummary> {
+    if values.is_empty() {
+        return None;
+    }
+    let population = values.len() as f64;
+    let sum: f64 = values.iter().sum();
+    let average = sum / population;
+    let sum_of_squares: f64 = values.iter().map(|value| value * value).sum();
+    let variance: f64 = values
+        .iter()
+        .map(|value| (value - average) * (value - average))
+        .sum::<f64>()
+        / population;
+    Some(NumericSummary {
+        sum,
+        average,
+        minimum: values.iter().copied().fold(f64::INFINITY, f64::min),
+        maximum: values.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        sum_of_squares,
+        variance,
+        std_deviation: variance.sqrt(),
+    })
+}
+
 /// One bounded walk of a query's tokens against ONE document.
 ///
 /// The grammar is the one [`super::fleet_query`] reads: terms joined by `AND` / `OR`,
