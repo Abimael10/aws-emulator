@@ -165,7 +165,10 @@ fn outputs_of(xml: &str) -> BTreeMap<String, String> {
 }
 
 /// The output of `outputs`, or a panic naming the case and what was there instead.
-fn output(outputs: &BTreeMap<String, String>, key: &str, case: &str) -> String {
+///
+/// Visible to the other suites of this target: a sibling that reads a stack's outputs reads
+/// them through this one accessor rather than writing a second copy of it.
+pub(crate) fn output(outputs: &BTreeMap<String, String>, key: &str, case: &str) -> String {
     outputs
         .get(key)
         .cloned()
@@ -173,10 +176,16 @@ fn output(outputs: &BTreeMap<String, String>, key: &str, case: &str) -> String {
 }
 
 /// Whether `id` is an identifier of the form Amazon Cognito mints for a user pool of `region`:
-/// `UserPoolIdType`, `@pattern ^[\w-]+_[0-9a-zA-Z]+$`, whose first part is the pool's Region.
-fn is_minted_pool_id(id: &str, region: &str) -> bool {
-    id.strip_prefix(&format!("{region}_"))
-        .is_some_and(|minted| !minted.is_empty() && minted.chars().all(|c| c.is_ascii_alphanumeric()))
+/// `UserPoolIdType`, `@pattern ^[\w-]+_[0-9a-zA-Z]+$` with `@length(min: 1, max: 55)`, whose
+/// first part is the pool's Region.
+///
+/// Visible to the other suites of this target, so the predicate for a minted pool id is
+/// stated once wherever one is asserted on.
+pub(crate) fn is_minted_pool_id(id: &str, region: &str) -> bool {
+    id.chars().count() <= 55
+        && id.strip_prefix(&format!("{region}_")).is_some_and(|minted| {
+            !minted.is_empty() && minted.chars().all(|c| c.is_ascii_alphanumeric())
+        })
 }
 
 /// Whether `id` is an identifier of the form Amazon Cognito mints for an app client:
