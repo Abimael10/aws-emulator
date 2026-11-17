@@ -24,6 +24,18 @@
 //! the two unreadable-image classes it falls into (an address the store does not serve, bytes
 //! that are no image at all). Both managed runtimes that bundle an SDK are driven.
 //!
+//! The LAST test of the suite is the other half of the same seam, and the rule a pipeline
+//! written on it rests on: `Invoke`'s `FunctionError` is "if present, indicates that an error
+//! occurred during function execution", so it is answered ONLY for a run the function itself
+//! failed — a handler that reaches its end is answered HTTP 200 with that header ABSENT and its
+//! returned value as the payload, the JSON literal `null` where it returns no value, HOWEVER
+//! MANY modelled refusals its own in-handler SDK calls raised and it CAUGHT, because an
+//! exception the handler handles is not a failure of the function. The refused call is still the
+//! other service's own decision: a conditional write whose condition does not hold writes
+//! nothing, so the item a later reader sees is the one the write that was served left. Its rows
+//! differ along what that rule generalises over: whether the condition of the handler's own
+//! write holds (a first write of a key, a repeat of the same key, a write of another key).
+//!
 //! The suite RUNS a handler, so it takes the target's one invocation stream
 //! ([`crate::invoke_request_id::one_invocation_stream_at_a_time`]): this emulator serves at
 //! most `max_concurrent_runs` invocations at once for the whole process.
@@ -52,6 +64,14 @@ const ROLE: &str = "arn:aws:iam::000000000000:role/service-role/lambda-exec";
 /// The managed runtimes that bundle an SDK, one per language this suite drives.
 const NODE_RUNTIME: &str = "nodejs20.x";
 const PYTHON_RUNTIME: &str = "python3.12";
+
+/// The bounds a run of the functions this suite's first two tests create is held to: the ones
+/// they were written with, kept so those rows go on exercising them.
+const FUNCTION_TIMEOUT: i64 = 30;
+/// See [`FUNCTION_TIMEOUT`]; `MemorySize`'s own default, which is what naming none asks for
+/// (`smithy_query(query="doc",shape="CreateFunctionRequest",member="MemorySize")`: "The default
+/// value is 128 MB").
+const FUNCTION_MEMORY_SIZE: i64 = 128;
 
 /// How long a status the clock owes is waited for before the wait itself is the failure, and
 /// how long this suite leaves between two readings of it. Every wait looks again for the
@@ -278,7 +298,8 @@ async fn lambda(
 }
 
 /// Create a function whose `Runtime` is `runtime`, whose package holds `source` as `entry` and
-/// whose `Handler` is `handler`, then wait for the state an invocation needs.
+/// whose `Handler` is `handler`, with this suite's own bounds on a run, then wait for the state
+/// an invocation needs.
 async fn create_function(
     router: &MultiServiceRouter,
     case: &str,
@@ -287,6 +308,36 @@ async fn create_function(
     handler: &str,
     source: &str,
     runtime: &str,
+) {
+    create_bounded_function(
+        router,
+        case,
+        name,
+        entry,
+        handler,
+        source,
+        runtime,
+        FUNCTION_TIMEOUT,
+        FUNCTION_MEMORY_SIZE,
+    )
+    .await;
+}
+
+/// The same create, with the bounds a RUN is held to named by the caller: a suite that cares
+/// only that the handler finishes gives them generous room, because a run shares this process
+/// with every other test of this target and must not be ended by a limit the suite is not
+/// about.
+#[allow(clippy::too_many_arguments)]
+async fn create_bounded_function(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+    entry: &str,
+    handler: &str,
+    source: &str,
+    runtime: &str,
+    timeout: i64,
+    memory_size: i64,
 ) {
     let (status, _headers, created) = lambda(
         router,
@@ -297,7 +348,8 @@ async fn create_function(
             "Role": ROLE,
             "Runtime": runtime,
             "Handler": handler,
-            "Timeout": 30,
+            "Timeout": timeout,
+            "MemorySize": memory_size,
             "Code": {
                 "ZipFile": base64::engine::general_purpose::STANDARD
                     .encode(package(&[(entry, source)])),
@@ -974,4 +1026,232 @@ async fn a_python_handler_analyses_an_image_through_the_sdk_the_runtime_supplies
         json!([RED_LABEL, MONOCHROME_LABEL]),
         "case {case:?}: expected the measured labels recorded under the object's key, got {held}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The clean answer of a handler that CATCHES what its own call refused
+// ---------------------------------------------------------------------------
+
+/// The suffix the handler records what it CAUGHT under, so a refusal the handler swallowed is
+/// still readable through the store rather than only through the run's own log.
+const CAUGHT_SUFFIX: &str = "#caught";
+
+/// The attributes the swallowing handler writes beside the key.
+const LABELS_MEMBER: &str = "labels";
+const RUN_MEMBER: &str = "run";
+const CAUGHT_MEMBER: &str = "caught";
+
+/// The modelled DynamoDB error for a write whose condition does not hold, which is the class
+/// the handler catches (`smithy_query(query="operation",operation="PutItem")`).
+const CONDITION_FAILED: &str = "ConditionalCheckFailedException";
+
+/// The node runtime the swallowing handler runs on: the other managed node family beside the
+/// one the rest of this suite drives ([`NODE_RUNTIME`]), so both of the model's node families
+/// are exercised. The rule is a property of `Invoke` rather than of one runtime, and the python
+/// family is driven by the tests above.
+const SWALLOWING_RUNTIME: &str = "nodejs22.x";
+
+/// The bounds a run of the swallowing handler is held to. Nothing in this test is about either:
+/// what it asserts is that a CAUGHT refusal leaves the invocation clean, so both are given
+/// generous room — a run that imports two bundled SDK clients, on a host running every other
+/// test of this target at the same time, must not be ended by a limit this test is not about.
+/// The memory is the largest heap one run is given at all
+/// (`state::execution::MAX_CONCURRENT_RUN_MEMORY_MB` is four of it), so it is this module's own
+/// ceiling rather than a figure chosen here.
+const SWALLOWING_TIMEOUT: i64 = 120;
+/// See [`SWALLOWING_TIMEOUT`].
+const SWALLOWING_MEMORY_SIZE: i64 = 512;
+
+/// The handler of the swallowed-write rule: it logs the object key it was handed, asks the
+/// image analysis service what the object carries, then CONDITIONALLY records what it measured
+/// inside a try/catch, and ends with a bare `return` — so the invocation's answer is the same
+/// whether the condition held or not. The catch block records the CLASS of what it caught under
+/// a key of its own, so what the handler swallowed is readable through the store.
+const SWALLOWING_HANDLER: &str = r#"
+const { RekognitionClient, DetectLabelsCommand } = require('@aws-sdk/client-rekognition');
+const { DynamoDBClient, PutItemCommand } = require('@aws-sdk/client-dynamodb');
+
+const VISION = new RekognitionClient({});
+const ITEMS = new DynamoDBClient({});
+
+exports.handler = async (event) => {
+    const record = event.Records[0].s3;
+    const bucket = record.bucket.name;
+    const key = record.object.key;
+    console.log(key);
+    const measured = await VISION.send(new DetectLabelsCommand({
+        Image: { S3Object: { Bucket: bucket, Name: key } },
+        MaxLabels: event.max_labels,
+        MinConfidence: event.min_confidence,
+    }));
+    const names = (measured.Labels || []).map(function (label) { return label.Name; });
+    try {
+        await ITEMS.send(new PutItemCommand({
+            TableName: event.table,
+            Item: {
+                image_name: { S: key },
+                labels: { SS: names },
+                run: { S: event.run },
+            },
+            ConditionExpression: 'attribute_not_exists(image_name)',
+        }));
+    } catch (refused) {
+        console.log(refused);
+        await ITEMS.send(new PutItemCommand({
+            TableName: event.table,
+            Item: {
+                image_name: { S: key + event.caught_suffix },
+                caught: { S: refused.name },
+            },
+        }));
+    }
+    return;
+};
+"#;
+
+/// One upload the handler is invoked for: the object it names, the marker that run carries, and
+/// what the table holds afterwards.
+struct Upload {
+    case: &'static str,
+    key: &'static str,
+    run: &'static str,
+    /// The run marker the item carries AFTER the invocation: this row's own where the condition
+    /// held, and the earlier run's where it did not.
+    stored_run: &'static str,
+    /// The labels the frame at `key` measures to, which is what the served write recorded.
+    labels: &'static [&'static str],
+    /// The class the handler caught, where its write was refused.
+    caught: Option<&'static str>,
+}
+
+/// The rows, in the order they are driven: the first upload of a key, a REPEAT of it whose
+/// condition cannot hold, and another key whose condition holds again.
+const UPLOADS: &[Upload] = &[
+    Upload {
+        case: "the first upload of a key, whose condition holds",
+        key: FLAT_PNG_KEY,
+        run: "run-1",
+        stored_run: "run-1",
+        labels: &[RED_LABEL, MONOCHROME_LABEL],
+        caught: None,
+    },
+    Upload {
+        case: "a re-upload of the same key, whose condition cannot hold",
+        key: FLAT_PNG_KEY,
+        run: "run-2",
+        stored_run: "run-1",
+        labels: &[RED_LABEL, MONOCHROME_LABEL],
+        caught: Some(CONDITION_FAILED),
+    },
+    Upload {
+        case: "an upload of another key, whose condition holds again",
+        key: TWO_COLOUR_KEY,
+        run: "run-3",
+        stored_run: "run-3",
+        labels: &[RED_LABEL, BLUE_LABEL],
+        caught: None,
+    },
+];
+
+/// A handler that CATCHES the refusal its own conditional write raised reaches its end, so the
+/// invocation is answered clean — HTTP 200, no function-error signal, and the bare return's own
+/// `null` payload — and the refused write left the item exactly as the served write wrote it.
+#[tokio::test]
+async fn a_refusal_the_handler_catches_leaves_the_invocation_clean() {
+    let _stream = crate::invoke_request_id::one_invocation_stream_at_a_time().await;
+    let setup = "a node handler that swallows what its own conditional write refused";
+    let router = emulator();
+    staged(&router, setup).await;
+
+    let caller = "image-analysis-swallowing-caller";
+    create_bounded_function(
+        &router,
+        setup,
+        caller,
+        "index.js",
+        "index.handler",
+        SWALLOWING_HANDLER,
+        SWALLOWING_RUNTIME,
+        SWALLOWING_TIMEOUT,
+        SWALLOWING_MEMORY_SIZE,
+    )
+    .await;
+
+    for upload in UPLOADS {
+        let case = upload.case;
+        let (signal, payload) = invoke(
+            &router,
+            case,
+            caller,
+            &json!({
+                "Records": [{
+                    "s3": {
+                        "bucket": { "name": BUCKET },
+                        "object": { "key": upload.key },
+                    },
+                }],
+                "table": TABLE,
+                "run": upload.run,
+                "max_labels": 10,
+                "min_confidence": 70,
+                "caught_suffix": CAUGHT_SUFFIX,
+            }),
+        )
+        .await;
+        assert_eq!(
+            signal, None,
+            "case {case:?}: a handler that reached its end is no function error, got {signal:?} \
+             with {payload}"
+        );
+        assert_eq!(
+            payload,
+            Value::Null,
+            "case {case:?}: expected the payload of a handler that returns no value, got \
+             {payload}"
+        );
+
+        // What the TABLE holds, read back where a client reads it: the served write's own
+        // record, which a refused write of the same key did not touch.
+        let held = dynamodb(
+            &router,
+            case,
+            "GetItem",
+            &json!({
+                "TableName": TABLE,
+                "Key": { "image_name": { "S": upload.key } },
+                "ConsistentRead": true,
+            }),
+        )
+        .await;
+        let item = held["Item"].clone();
+        assert_eq!(
+            item[LABELS_MEMBER]["SS"],
+            json!(upload.labels),
+            "case {case:?}: expected the labels the analysis measured for this frame, got {item}"
+        );
+        assert_eq!(
+            item[RUN_MEMBER]["S"].as_str(),
+            Some(upload.stored_run),
+            "case {case:?}: expected the record the served write left, got {item}"
+        );
+
+        // And what the handler CAUGHT, which is the other service's own modelled class for a
+        // condition that did not hold — or nothing at all where the write was served.
+        let caught = dynamodb(
+            &router,
+            case,
+            "GetItem",
+            &json!({
+                "TableName": TABLE,
+                "Key": { "image_name": { "S": format!("{}{CAUGHT_SUFFIX}", upload.key) } },
+                "ConsistentRead": true,
+            }),
+        )
+        .await;
+        assert_eq!(
+            caught["Item"][CAUGHT_MEMBER]["S"].as_str(),
+            upload.caught,
+            "case {case:?}: expected the class the handler caught, got {caught}"
+        );
+    }
 }
