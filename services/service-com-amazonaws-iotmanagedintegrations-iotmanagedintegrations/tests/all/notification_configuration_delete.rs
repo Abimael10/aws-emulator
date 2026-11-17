@@ -5,16 +5,19 @@
 //! RULE: a delete REMOVES the notification configuration the caller's region holds for the
 //! `EventType` the URI names — answering the modelled 200 with no output members
 //! (`smithy_query(query="operation",operation="DeleteNotificationConfiguration")`: `DELETE
-//! /notification-configurations/{EventType}`, output `Unit`, success 200, errors including
-//! `ResourceNotFoundException` 404) — so every later read of that event type resolves
-//! nothing, the event type can be configured again, and an event type the region holds no
-//! configuration for is refused with that 404. A delete is regional, as every resource of
-//! this service is: it removes the record of the region the request is signed for and
-//! leaves another region's alone.
+//! /notification-configurations/{EventType}`, output `Unit`, success 200, `idempotent`
+//! true) — so every later read of that event type resolves nothing and the event type can
+//! be configured again. Being `@idempotent`, the delete promises only the post-condition
+//! "this region holds no configuration for this event type": a call for an event type that
+//! already satisfies it has nothing left to do and answers the same 200 with an empty body,
+//! never a refusal. A delete is regional, as every resource of this service is: it removes
+//! the record of the region the request is signed for and leaves another region's alone.
 //!
 //! The rows span the model's whole `EventType` value set and both ends of the round trip:
 //! create -> delete -> read, delete again, re-create, and a configuration of another region
-//! that the delete must not touch.
+//! that the delete must not touch — plus every way an event type can already hold nothing
+//! (never configured, configured and deleted, deleted repeatedly, configured only in
+//! another region).
 //!
 //! Every case drives the real restJson1 request path (`MultiServiceRouter::dispatch`), so
 //! the statuses and bodies asserted here are the ones a client sees.
@@ -179,11 +182,7 @@ async fn a_delete_removes_the_configuration_and_the_event_type_can_be_configured
             deleted.status, deleted.body
         );
         assert!(
-            deleted.body.is_null()
-                || deleted
-                    .body
-                    .as_object()
-                    .is_some_and(serde_json::Map::is_empty),
+            is_empty_body(&deleted.body),
             "case {event_type:?}: expected the delete to report no output members, got {:?}",
             deleted.body
         );
@@ -196,12 +195,20 @@ async fn a_delete_removes_the_configuration_and_the_event_type_can_be_configured
             gone.status, gone.body
         );
 
-        // A second delete of the same event type has nothing left to remove.
+        // A second delete of the same event type has nothing left to remove, and the
+        // post-condition it promises already holds, so it answers the same success.
         let again = call(&router, "DELETE", &path, None).await;
         assert_eq!(
-            again.status, 404,
-            "case {event_type:?}: expected a second delete to be refused, got {} with body {:?}",
+            again.status, 200,
+            "case {event_type:?}: expected a second delete to succeed as a no-op, got {} with \
+             body {:?}",
             again.status, again.body
+        );
+        assert!(
+            is_empty_body(&again.body),
+            "case {event_type:?}: expected the second delete to report no output members, got \
+             {:?}",
+            again.body
         );
 
         // The event type is free again, which is what "the record was removed" means to a
@@ -222,6 +229,115 @@ async fn a_delete_removes_the_configuration_and_the_event_type_can_be_configured
             recreated.status, recreated.body
         );
     }
+}
+
+/// True when the answer carried no output members: an empty body, or a body that is an
+/// empty JSON object. The modelled output is `Unit`, so both are "no members".
+fn is_empty_body(body: &Value) -> bool {
+    body.is_null() || body.as_object().is_some_and(serde_json::Map::is_empty)
+}
+
+/// RULE: a delete whose post-condition already holds succeeds as a no-op (200, no output
+/// members) rather than being refused, whatever made the event type unconfigured.
+///
+/// The rows differ along the reason the region holds nothing for the event type — never
+/// configured, configured then deleted, deleted several times over, held only by another
+/// region — and the never-configured row is driven over the model's whole `EventType` value
+/// set (`crate::ops::types::EVENT_TYPE_VALUES`).
+#[tokio::test]
+async fn a_delete_of_an_unconfigured_event_type_succeeds_as_a_no_op() {
+    let router = emulator();
+
+    let destination = "notification.delete.idempotent";
+    seed_destination(&router, "seed", REGION, destination).await;
+
+    // Never configured: every value the model admits, so no row depends on a particular
+    // event type, and three consecutive deletes of each, so repetition changes nothing.
+    for event_type in EVENT_TYPE_VALUES {
+        let path = format!("/notification-configurations/{event_type}");
+        for attempt in 1..=3 {
+            let case = format!("never configured/{event_type}/attempt {attempt}");
+            let reply = call(&router, "DELETE", &path, None).await;
+            assert_eq!(
+                reply.status, 200,
+                "case {case:?}: expected HTTP 200 from the delete, got {} with body {:?}",
+                reply.status, reply.body
+            );
+            assert!(
+                is_empty_body(&reply.body),
+                "case {case:?}: expected no output members and no error payload, got {:?}",
+                reply.body
+            );
+        }
+        // The no-op stored nothing: the event type still resolves to nothing afterwards.
+        let read = call(&router, "GET", &path, None).await;
+        assert_eq!(
+            read.status, 404,
+            "case {event_type:?}: expected the event type to still resolve to nothing after a \
+             no-op delete, got {} with body {:?}",
+            read.status, read.body
+        );
+    }
+
+    // Configured and then deleted, then deleted twice more: the first delete removes the
+    // record and each later one is the same success, so the second of two identical deletes
+    // reads exactly like the first.
+    let configured = EVENT_TYPE_VALUES[0];
+    let path = format!("/notification-configurations/{configured}");
+    create_configuration(&router, "deleted", REGION, configured, destination).await;
+    for attempt in 1..=3 {
+        let case = format!("configured then deleted/attempt {attempt}");
+        let reply = call(&router, "DELETE", &path, None).await;
+        assert_eq!(
+            reply.status, 200,
+            "case {case:?}: expected HTTP 200 from the delete, got {} with body {:?}",
+            reply.status, reply.body
+        );
+        assert!(
+            is_empty_body(&reply.body),
+            "case {case:?}: expected no output members and no error payload, got {:?}",
+            reply.body
+        );
+    }
+
+    // Configured only in another region: a notification configuration is regional, so this
+    // region holds nothing for that event type, its delete is the same no-op, and the owning
+    // region's record survives it.
+    let elsewhere = EVENT_TYPE_VALUES[1];
+    let other = "eu-central-1";
+    seed_destination(&router, "other region", other, destination).await;
+    create_configuration(&router, "other region", other, elsewhere, destination).await;
+    let reply = call(
+        &router,
+        "DELETE",
+        &format!("/notification-configurations/{elsewhere}"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        reply.status, 200,
+        "case \"other region only\": expected HTTP 200 from the delete, got {} with body {:?}",
+        reply.status, reply.body
+    );
+    assert!(
+        is_empty_body(&reply.body),
+        "case \"other region only\": expected no output members and no error payload, got {:?}",
+        reply.body
+    );
+    let owned = call_in(
+        &router,
+        other,
+        "GET",
+        &format!("/notification-configurations/{elsewhere}"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        owned.status, 200,
+        "case \"other region only\": expected the owning region to still resolve it, got {} \
+         with body {:?}",
+        owned.status, owned.body
+    );
 }
 
 /// RULE: a delete is regional — it removes the record of the region the request is signed

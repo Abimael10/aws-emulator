@@ -4,9 +4,12 @@
 //!
 //! Removes the notification configuration `crate::state`'s `notification_configurations`
 //! store holds for the region and `EventType` the URI names, so the reads that follow
-//! resolve nothing for that event type. An event type this region holds no configuration
-//! for is the modelled `ResourceNotFoundException`, stated the way every operation of this
-//! surface states it.
+//! resolve nothing for that event type. The delete is `@idempotent`: its post-condition is
+//! that the region holds no configuration for that event type, so a call for an event type
+//! the region already holds nothing for has nothing left to do and answers the modelled
+//! success (200, no output members) rather than a refusal. The declared
+//! `ResourceNotFoundException` is reserved for the reads and updates of this surface, which
+//! need a configuration to resolve before they can answer at all.
 //!
 //! ## Shape of an operation
 //!
@@ -205,21 +208,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .remove(&crate::state::RegionalName::new(&region, &input.event_type));
         drop(store);
 
-        if removed.is_none() {
-            audit(&akid, &region, &input.event_type, "not-found");
-            // The notification-configuration surface states an event type it holds nothing
-            // for with the BARE exception, carrying none of the shape's optional members, so
-            // a delete of an event type nothing is configured for reads exactly the way a
-            // read or an update of it does.
-            return Err(
-                DeleteNotificationConfigurationErrorModeled::ResourceNotFoundException(
-                    crate::state::bare_resource_not_found(),
-                )
-                .into(),
-            );
-        }
-
-        audit(&akid, &region, &input.event_type, "deleted");
+        // Both outcomes leave the region holding no configuration for this event type, which
+        // is all the delete promises, so both answer the modelled 200 with no output members;
+        // only the attribution distinguishes them.
+        audit(
+            &akid,
+            &region,
+            &input.event_type,
+            if removed.is_some() {
+                "deleted"
+            } else {
+                "already-absent"
+            },
+        );
         Ok(DeleteNotificationConfigurationOutput)
     }
 }

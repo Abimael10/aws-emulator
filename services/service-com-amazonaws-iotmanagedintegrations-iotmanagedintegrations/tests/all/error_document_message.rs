@@ -230,6 +230,10 @@ async fn an_unconfigured_event_type_reports_no_sentence_at_all() {
     // covered as soon as it is regenerated.
     for event_type in EVENT_TYPE_VALUES {
         let path = format!("/notification-configurations/{}", encode_label(event_type));
+        // The operations that have to RESOLVE a configuration before they can answer. The
+        // delete is not among them: it is `@idempotent`, so an event type the region holds
+        // nothing for is already in the state it promises and answers 200 with no document
+        // at all — `notification_configuration_delete` covers that path.
         for (operation, method, body) in [
             ("GetNotificationConfiguration", "GET", None),
             (
@@ -237,7 +241,6 @@ async fn an_unconfigured_event_type_reports_no_sentence_at_all() {
                 "PUT",
                 Some(json!({ "DestinationName": destination })),
             ),
-            ("DeleteNotificationConfiguration", "DELETE", None),
         ] {
             let case = format!("{operation}/{event_type}");
             let reply = call(&router, method, &path, body).await;
@@ -290,7 +293,6 @@ async fn a_deleted_or_out_of_region_configuration_reports_no_sentence_either() {
                 "PUT",
                 Some(json!({ "DestinationName": destination })),
             ),
-            ("DeleteNotificationConfiguration", "DELETE", None),
         ] {
             let case = format!("{operation}/{why}");
             let reply = call(&router, method, &path, body).await;
