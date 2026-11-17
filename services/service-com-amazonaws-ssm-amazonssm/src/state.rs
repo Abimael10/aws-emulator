@@ -203,6 +203,10 @@ pub mod document_platforms;
 /// narrow it, and the identity each one is reported by.
 pub mod document_listing;
 
+/// Which versions of ONE SSM document a listing of them walks, and the identity each
+/// version is reported by.
+pub mod document_version_listing;
+
 /// Which accounts an SSM document is shared with, and at which version of it.
 pub mod document_permissions;
 

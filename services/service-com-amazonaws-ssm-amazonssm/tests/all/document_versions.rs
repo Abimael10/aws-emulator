@@ -441,6 +441,21 @@ async fn content_a_version_already_holds_is_refused() {
             json!(contents.len().to_string()),
             "case {case}: a refused update appends no version, got {described}"
         );
+        // The history itself is unchanged, not just the latest version it ends at: the
+        // listing reports exactly the versions the accepted calls left, in order.
+        let listed = list_versions_ok(&router, case, &json!({ "Name": name })).await;
+        let numbers: Vec<&str> = reported(case, &listed)
+            .iter()
+            .map(|entry| entry["DocumentVersion"].as_str().unwrap_or_default())
+            .collect();
+        let held: Vec<String> = (1..=contents.len())
+            .map(|version| version.to_string())
+            .collect();
+        assert_eq!(
+            numbers,
+            held.iter().map(String::as_str).collect::<Vec<_>>(),
+            "case {case}: a refused update leaves the version history as it was, got {listed}"
+        );
     }
 }
 
