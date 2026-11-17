@@ -795,24 +795,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutObject<Eng> {
             return Err(PutObjectErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
         };
 
-        // A write addressed to a GENERAL PURPOSE bucket under a query parameter S3 serves
-        // only for directory buckets asks for functionality that bucket's endpoint does not
-        // implement, whatever the rest of the request carries: the refusal is the 501
-        // `NotImplemented` naming that parameter
-        // ([`crate::service::object_write::directory_bucket_only_query_parameter`] holds the
-        // catalog), answered before anything is stored so a rename a general purpose bucket
-        // cannot serve never lands as an ordinary write of the bytes it carried. The
-        // parameter is read off the request's own query string, because it is a
-        // discriminator this operation's members do not carry.
+        // A write addressed to a GENERAL PURPOSE bucket that asks, through a member S3 serves
+        // for directory buckets alone, for functionality that bucket's endpoint does not
+        // implement is refused whatever the rest of the request carries: the 501
+        // `NotImplemented` naming the element that asked — the header when the request carries
+        // one, otherwise the query parameter
+        // ([`crate::service::object_write::directory_bucket_only_refusal`] holds the rule) —
+        // answered before anything is stored, so a rename a general purpose bucket cannot
+        // serve never lands as an ordinary write of the bytes it carried. Both are read off
+        // the request itself, because they are discriminators this operation's members do not
+        // carry.
         if !bucket_record.is_directory() {
-            if let Some(parameter) =
-                crate::service::object_write::directory_bucket_only_query_parameter(
-                    ctx.parts().uri.query().unwrap_or_default(),
-                )
-            {
-                return Err(
-                    crate::scaffolded::Scaffolded::not_implemented_query_parameter(parameter),
-                );
+            if let Some(refusal) = crate::service::object_write::directory_bucket_only_refusal(
+                &ctx.parts().headers,
+                ctx.parts().uri.query().unwrap_or_default(),
+            ) {
+                return Err(refusal);
             }
         }
         let encryption = {

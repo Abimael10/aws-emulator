@@ -7,16 +7,16 @@
 //! request carries and the client token that makes a retry idempotent.
 //! Implemented here — this is the ONLY file to touch for this operation.
 //!
-//! What a rename addressed to a GENERAL PURPOSE bucket earns is a refusal of the
-//! `?renameObject` parameter itself rather than this operation's behaviour: S3 serves a
-//! rename for directory buckets alone, so the parameter implies functionality a general
-//! purpose bucket's endpoint does not implement and the request is refused with HTTP 501
-//! `NotImplemented` naming it
-//! ([`crate::service::object_write::DIRECTORY_BUCKET_ONLY_QUERY_PARAMETERS`], the catalog the
-//! object-write path is judged by too, since a request carrying the parameter without this
-//! operation's required members is shaped like an ordinary write). A bucket this emulator
-//! does not hold answers `NoSuchBucket` (HTTP 404), as the write path answers the same
-//! address.
+//! What a rename addressed to a GENERAL PURPOSE bucket earns is a refusal of the REQUEST
+//! ELEMENT that asked for the rename rather than this operation's behaviour: S3 serves a
+//! rename for directory buckets alone, so the `x-amz-rename-source` header this operation's
+//! one required source member arrives in implies functionality a general purpose bucket's
+//! endpoint does not implement, and the request is refused with HTTP 501 `NotImplemented`
+//! naming that header ([`crate::service::object_write::directory_bucket_only_refusal`], the one
+//! rule the object-write path is judged by too, since a request carrying the `?renameObject`
+//! parameter without this operation's required members is shaped like an ordinary write and
+//! the parameter is then all that asks). A bucket this emulator does not hold answers
+//! `NoSuchBucket` (HTTP 404), as the write path answers the same address.
 //!
 //! ## Shape of an operation
 //!
@@ -217,7 +217,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Without the store there is no object to rename, and neither modelled error
@@ -252,14 +252,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A rename addressed to a GENERAL PURPOSE bucket asks for functionality that
         // bucket's endpoint does not implement: this operation "renames an existing object in
         // a directory bucket that uses the S3 Express One Zone storage class" (its own
-        // documentation), and the `?renameObject` parameter that addresses it is therefore
-        // one a general purpose bucket serves nothing for — the 501 `NotImplemented` naming
-        // that parameter, which is the same answer the write the request would otherwise be
-        // read as gives it ([`crate::service::object_write`] holds the catalog both read).
-        // Judged on the bucket the store holds, so the two kinds of bucket are told apart by
-        // what this emulator recorded rather than by the shape of the name — and a bucket
-        // this emulator does not hold answers that instead, the way the write path answers it
-        // for the same address, since the kind of a bucket that is not there says nothing.
+        // documentation), so the `x-amz-rename-source` header that asks for one is a member a
+        // general purpose bucket serves nothing for — the 501 `NotImplemented` naming that
+        // header, which is the same answer the write the request would otherwise be read as
+        // gives the element that asked ([`crate::service::object_write`] holds the one rule
+        // both read). Judged on the bucket the store holds, so the two kinds of bucket are
+        // told apart by what this emulator recorded rather than by the shape of the name — and
+        // a bucket this emulator does not hold answers that instead, the way the write path
+        // answers it for the same address, since the kind of a bucket that is not there says
+        // nothing.
         let Some(bucket) = store.bucket(&input.bucket) else {
             return Err(crate::scaffolded::Scaffolded::unmodeled(
                 crate::state::NO_SUCH_BUCKET_CODE,
@@ -268,11 +269,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
         if !bucket.is_directory() {
-            return Err(
-                crate::scaffolded::Scaffolded::not_implemented_query_parameter(
-                    crate::service::object_write::RENAME_OBJECT_PARAMETER,
-                ),
-            );
+            if let Some(refusal) = crate::service::object_write::directory_bucket_only_refusal(
+                &ctx.parts().headers,
+                ctx.parts().uri.query().unwrap_or_default(),
+            ) {
+                return Err(refusal);
+            }
         }
 
         // The CLIENT TOKEN, before anything is read about the objects: "if you retry a

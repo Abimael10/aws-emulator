@@ -182,12 +182,37 @@ pub const RENAME_OBJECT_PARAMETER: &str = "renameObject";
 ///
 /// `RenameObject` "renames an existing object in a directory bucket that uses the S3 Express
 /// One Zone storage class" (its own documentation) and is addressed by the one parameter
-/// above, so a general purpose bucket's endpoint implements no functionality for it: the
-/// PARAMETER, not the value in it, is what cannot be served there — which is the 501
-/// `NotImplemented` S3 answers a query parameter it cannot honour with
+/// above, so a general purpose bucket's endpoint implements no functionality for it: where the
+/// parameter is all the request carries to ask for the rename, the PARAMETER, not the value in
+/// it, is what cannot be served there — which is the 501 `NotImplemented` S3 answers a query
+/// parameter it cannot honour with
 /// ([`crate::scaffolded::Scaffolded::not_implemented_query_parameter`]), the query-parameter
-/// sibling of the refusal a directory-bucket-only conditional HEADER earns.
+/// sibling of the refusal a directory-bucket-only HEADER earns
+/// ([`DIRECTORY_BUCKET_ONLY_HEADERS`], which is what a request carrying one is refused by
+/// instead).
 pub const DIRECTORY_BUCKET_ONLY_QUERY_PARAMETERS: [&str; 1] = [RENAME_OBJECT_PARAMETER];
+
+/// The header a rename names its SOURCE in: `x-amz-rename-source`, as the model binds the one
+/// member a request has to carry to ask for a rename at all
+/// (`smithy_query(query="operation",operation="RenameObject")` reports
+/// `RenameSource: {httpHeader: "x-amz-rename-source", required: true}`).
+pub const RENAME_SOURCE_HEADER: &str = "x-amz-rename-source";
+
+/// The headers of an object WRITE that S3 serves for DIRECTORY buckets alone.
+///
+/// A rename is asked for by `x-amz-rename-source`: the `@required` member above is the only
+/// one a request cannot leave out and still name a rename, and S3 renames "an existing object
+/// in a directory bucket that uses the S3 Express One Zone storage class" (`RenameObject`'s own
+/// documentation) — so a general purpose bucket's endpoint implements nothing for that header,
+/// whatever else the request carries.
+pub const DIRECTORY_BUCKET_ONLY_HEADERS: [&str; 1] = [RENAME_SOURCE_HEADER];
+
+/// The directory-bucket-only header `headers` carries, or `None` when it carries none.
+pub fn directory_bucket_only_header(headers: &::http::HeaderMap) -> Option<&'static str> {
+    DIRECTORY_BUCKET_ONLY_HEADERS
+        .into_iter()
+        .find(|header| headers.contains_key(*header))
+}
 
 /// The directory-bucket-only query parameter `query` carries, or `None` when it carries none
 /// — the one rule every object write addressed to a general purpose bucket is judged by,
@@ -203,6 +228,37 @@ pub fn directory_bucket_only_query_parameter(query: &str) -> Option<&'static str
     DIRECTORY_BUCKET_ONLY_QUERY_PARAMETERS
         .into_iter()
         .find(|parameter| crate::service::query_carries(query, parameter))
+}
+
+/// The refusal an object write addressed to a GENERAL PURPOSE bucket earns for asking, through
+/// a member S3 serves for directory buckets alone, for functionality that bucket's endpoint
+/// does not implement — or `None` for a request that asks for none of it.
+///
+/// Either way the answer is the 501 `NotImplemented` S3 publishes for functionality it does not
+/// implement for the resource addressed; what differs is the element the document names,
+/// because the sentence names only the CLASS of request element and the element is the only
+/// part of the refusal that says which one the caller must drop. So the refusal names what
+/// ASKED:
+///
+/// * the HEADER, when the request carries one S3 serves for directory buckets alone
+///   ([`DIRECTORY_BUCKET_ONLY_HEADERS`]) — a header is a member of the request, so it is what
+///   the caller has to stop sending, and it is what S3's own answer to a rename addressed to a
+///   general purpose bucket names even though the `?renameObject` parameter travels beside it;
+/// * otherwise the QUERY PARAMETER ([`DIRECTORY_BUCKET_ONLY_QUERY_PARAMETERS`]), which is then
+///   all that asks.
+///
+/// The ONE place that refusal is built for an object write, so a request carrying the same
+/// member is refused identically whichever operation its shape routes it to, and before
+/// anything is stored.
+pub fn directory_bucket_only_refusal<E>(
+    headers: &::http::HeaderMap,
+    query: &str,
+) -> Option<crate::scaffolded::Scaffolded<E>> {
+    if let Some(header) = directory_bucket_only_header(headers) {
+        return Some(crate::scaffolded::Scaffolded::not_implemented_header(header));
+    }
+    directory_bucket_only_query_parameter(query)
+        .map(crate::scaffolded::Scaffolded::not_implemented_query_parameter)
 }
 
 /// The server-side encryption settings a Zonal endpoint write into the directory bucket
