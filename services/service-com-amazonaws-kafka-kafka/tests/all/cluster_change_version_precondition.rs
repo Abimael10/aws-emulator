@@ -17,17 +17,31 @@
 //! version again and retry with that, against retry this same request once the
 //! cluster has settled — which is what makes the order part of the contract.
 //!
+//! Ahead of both sits the PARAMETER class: a quoted value that is not a version
+//! token the service ever issued is a request the service will not read at all, so
+//! it is refused as an invalid parameter before the cluster's own version or the
+//! state it is in is consulted — "fix the request" rather than "wait and retry it
+//! unchanged".
+//!
 //! The rows differ along what the rule generalises over: WHICH operation of the
 //! cluster-update family quotes the version (eight of them, over three different
 //! kinds of change), WHY the cluster would otherwise refuse (still being
-//! provisioned, or already applying a change it accepted), and — for the race the
-//! rule exists for — the pair of targets two concurrent callers ask for.
+//! provisioned, or already applying a change it accepted), HOW a quoted value
+//! fails to be a version token (its prefix, its case, its alphabet, its length),
+//! and — for the race the rule exists for — the pair of targets two concurrent
+//! callers ask for.
 //!
-//! The two refusal sentences are spelled out here as Amazon MSK words them rather
-//! than built from the service's own constants, so this suite pins the wording
-//! instead of agreeing with whatever the code says.
+//! The three refusal sentences are spelled out here as Amazon MSK words them
+//! rather than built from the service's own constants, so this suite pins the
+//! wording instead of agreeing with whatever the code says.
+
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
+
+// The service's own predicate for what IS one of its version tokens, so no row of
+// the table below can claim a shape the service would happily read.
+use service_com_amazonaws_kafka_kafka::state::is_current_version_token;
 
 use crate::kafka_harness::{pct, poll_until_active, ClusterRequest, Emulator, Reply};
 
@@ -43,6 +57,11 @@ const STATE_REFUSAL: &str =
 /// cluster's own, with the typographic apostrophe (U+2019) the service sends.
 const VERSION_REFUSAL: &str =
     "The version of the cluster isn\u{2019}t current. Check the current version and try again.";
+
+/// How it refuses a request whose quoted `CurrentVersion` is not a version token
+/// the service ever issued: the invalid-parameter class, fixed text end to end,
+/// carrying neither the submitted value nor anything of the cluster.
+const PARAMETER_REFUSAL: &str = "One or more of the parameters are not valid.";
 
 /// The member a stale-version refusal names as the parameter at fault, as the wire
 /// spells it on every request of the family.
@@ -236,6 +255,145 @@ async fn a_change_quoting_the_version_a_creating_cluster_holds_is_refused_on_its
             "case {case}: a refused change must start no cluster operation, got {}",
             after.body
         );
+    }
+}
+
+/// Every way a quoted `CurrentVersion` can fail to be a version token this service
+/// issues: `(case, value)`. The shapes come from the form the service mints — a
+/// `K` followed by 13 upper-case alphanumerics — so the rows cover its prefix, its
+/// case, its alphabet and its length, one character under the minted length
+/// included. Each row is checked against the service's own predicate, so the table
+/// cannot claim a shape the service would read as a version.
+fn unreadable_versions() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("prose", "not-a-version"),
+        ("a bare digit", "1"),
+        ("the token form in lower case", "k0000000000000"),
+        ("a character outside the token alphabet", "K000000000000-"),
+        ("one character short of the token form", "K000000000000"),
+    ]
+}
+
+/// How long the loop below keeps looking for a cluster the clock has not settled
+/// yet before it calls a row a failure: far longer than the span the service owes
+/// that transition, so the deadline says nothing about how fast the host runs.
+const UNSETTLED_CLUSTER_DEADLINE: Duration = Duration::from_secs(60);
+
+/// And how many clusters it stands up looking for one, so a row whose condition
+/// can never hold fails on a handful of attempts rather than on the deadline.
+const UNSETTLED_CLUSTER_ATTEMPTS: u32 = 8;
+
+/// RULE, over both halves: the PARAMETER class pre-empts them. A quoted value that
+/// is not a version token this service issues names no version of this cluster or
+/// of any other, so every operation of the family refuses it as an invalid
+/// parameter — the same fixed sentence, naming the member the version travelled in
+/// — even for a cluster that is in no state a change is accepted from and would
+/// otherwise be refused on its state. Quoting the version that cluster IS at, on
+/// the same cluster, is what the state gate answers, in its own fixed sentence
+/// naming the member the cluster was addressed by. Neither sentence carries a
+/// per-run value, and neither refusal changes anything.
+///
+/// The rows pair every operation of the family with a way a quoted value fails to
+/// be a token, cycling through the table so each operation and each shape appears:
+/// whichever operation and whichever shape, it is the request that is at fault and
+/// not the cluster, so the rule needs no cross product of the two to be pinned.
+#[tokio::test]
+async fn an_unreadable_version_pre_empts_the_state_gate_of_every_operation() {
+    let emulator = Emulator::new();
+    let shapes = unreadable_versions();
+    for (shape, unreadable) in &shapes {
+        assert!(
+            !is_current_version_token(unreadable),
+            "case {shape}: the row must be a value this service reads as no version token, got \
+             {unreadable:?}"
+        );
+    }
+    for (row, update) in updates().into_iter().enumerate() {
+        let (shape, unreadable) = shapes[row % shapes.len()];
+        let case = format!("{}/{shape}", update.operation);
+        // The state half of this row needs a cluster the clock has not settled
+        // yet. A cluster that settled first is no witness of it, so the row
+        // looks again with a new one until one is still unsettled when its own
+        // version is quoted, or the bounds above are reached.
+        let deadline = Instant::now() + UNSETTLED_CLUSTER_DEADLINE;
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let arn = emulator
+                .create_ok(&ClusterRequest::named(&format!(
+                    "unreadable-{}-{row}-{attempt}",
+                    update.operation.to_lowercase()
+                )))
+                .await;
+            let (state, version) = reported(&emulator, &arn, &case).await;
+
+            // The parameter class is decided from the request alone, so nothing
+            // about the cluster — its kind, its version, the state it is in —
+            // takes part in it.
+            let unreadable_reply = update.call(&emulator, &arn, unreadable).await;
+            assert_refusal(
+                &unreadable_reply,
+                &format!("{case}/a version this service cannot read"),
+                PARAMETER_REFUSAL,
+                VERSION_MEMBER,
+                unreadable,
+            );
+
+            // The same request, quoting the version the cluster IS at, is the one
+            // the state gate answers.
+            let own_reply = update.call(&emulator, &arn, &version).await;
+            if own_reply.status == 200 {
+                assert!(
+                    attempt < UNSETTLED_CLUSTER_ATTEMPTS && Instant::now() < deadline,
+                    "case {case}: no freshly created cluster was still unsettled when its own \
+                     version was quoted, in {attempt} attempt(s)"
+                );
+                continue;
+            }
+            assert_eq!(
+                state, "CREATING",
+                "case {case}: a cluster that refuses a change on its state was read as CREATING, \
+                 got {state}"
+            );
+            assert_refusal(
+                &own_reply,
+                &format!("{case}/the version the cluster is at"),
+                STATE_REFUSAL,
+                CLUSTER_MEMBER,
+                &version,
+            );
+
+            // Both sentences are fixed text: neither carries the state the cluster
+            // happens to be in, nor the ARN the request addressed it by.
+            for (label, message) in [
+                (
+                    "a version this service cannot read",
+                    unreadable_reply.error_message(),
+                ),
+                ("the version the cluster is at", own_reply.error_message()),
+            ] {
+                assert!(
+                    !message.contains(state.as_str()) && !message.contains(arn.as_str()),
+                    "case {case}/{label}: the refusal must carry neither the cluster's state \
+                     {state:?} nor its ARN {arn:?}, got {message:?}"
+                );
+            }
+
+            // And neither refusal started anything: the cluster is still at the
+            // version it was at, with no operation of its own in flight.
+            let after = emulator.describe(&arn).await;
+            assert_eq!(
+                (
+                    after.at("/clusterInfo/currentVersion").as_str(),
+                    after.at("/clusterInfo/activeOperationArn"),
+                ),
+                (Some(version.as_str()), &Value::Null),
+                "case {case}: a refused change must leave the cluster at its version with no \
+                 operation in flight, got {}",
+                after.body
+            );
+            break;
+        }
     }
 }
 
