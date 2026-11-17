@@ -166,6 +166,34 @@ pub fn approval_coverage_rejection(
     (!approves_by_name && !approves_by_rule).then_some(APPROVAL_COVERAGE_REQUIRED)
 }
 
+/// The member path a refusal of an update that replaces a baseline without naming it
+/// names: the `Name` of `UpdatePatchBaselineRequest`, in the spelling this service's
+/// refusals carry a member in — its modelled name with a lowercase first letter, the way
+/// `documentVersion` names `DocumentVersion`.
+const REPLACE_REQUIRED_MEMBER: &str = "name";
+
+/// How an update that asks to REPLACE a baseline without naming one is refused.
+///
+/// "If True, then all fields that are required by the CreatePatchBaseline operation are
+/// also required for this API request" (`UpdatePatchBaselineRequest$Replace`), and the one
+/// member `CreatePatchBaseline` requires is `Name` — so such a request is missing a member
+/// it was required to carry, and is stated as exactly that: the clause the boundary walk
+/// states over a member that must not be null, in the envelope this service's refusals
+/// carry, neither of which is spelled here.
+pub fn replace_requires_name_message() -> String {
+    let clause = format!(
+        "Value null at '{REPLACE_REQUIRED_MEMBER}' failed to satisfy constraint: {}",
+        ::service_common::validation_message::requirement(
+            ::aws_smithy_schema_server::constraints::ViolationKind::MissingRequiredMember
+        )
+    );
+    // The envelope answers `None` only for NO clause at all, and there is exactly one here,
+    // so the fallback is unreachable; it keeps the clause itself rather than panicking on an
+    // envelope that could not be worded.
+    ::service_common::validation_message::envelope_over(std::slice::from_ref(&clause))
+        .unwrap_or(clause)
+}
+
 // ---------------------------------------------------------------------------
 // Listing the baselines an endpoint holds
 // ---------------------------------------------------------------------------

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! What a read of one patch baseline reports, end to end: `CreatePatchBaseline` mints a
-//! baseline, `GetPatchBaseline` reports it, and
+//! What a write of one patch baseline persists and a read of it reports, end to end:
+//! `CreatePatchBaseline` mints a baseline, `UpdatePatchBaseline` writes it,
+//! `GetPatchBaseline` reports what the last write left behind, and
 //! `DescribeEffectivePatchesForPatchBaseline` reports the patches that baseline makes
 //! effective, each with the approval state the baseline gives it.
 //!
@@ -14,11 +15,15 @@
 //! The rule under test is that a read of a baseline reports, for the `BaselineId` the
 //! request names, exactly the members the write of that baseline persisted — with the
 //! documented default of every member the write left out — and refuses an id that names no
-//! baseline reachable through the endpoint. The suites are tables whose rows differ along
-//! what the rule generalises over: which optional members a write supplies, how many
-//! entries each list carries, the operating system, the Region the endpoint is, which
-//! spelling names the baseline (its own id or its full ARN), whether the baseline is the
-//! account's own or one Systems Manager predefined, and the way an id misses.
+//! baseline reachable through the endpoint. An update is such a write: it applies exactly
+//! the members the request supplies and leaves every other member as the last write of the
+//! baseline persisted, except under `Replace`, where a member the request leaves out is
+//! cleared to the value a create that named it nothing would carry. The suites are tables
+//! whose rows differ along what the rule generalises over: which optional members a write
+//! supplies, how many entries each list carries, the operating system, the Region the
+//! endpoint is, which spelling names the baseline (its own id or its full ARN), whether the
+//! baseline is the account's own or one Systems Manager predefined, whether an update
+//! replaces or merges, and the way an id misses.
 //!
 //! The effective-patch suites at the end pin the second half of that rule: which of the
 //! patches Patch Manager publishes for the baseline's operating system the baseline makes
@@ -729,6 +734,574 @@ async fn a_baseline_id_outside_the_modelled_member_is_refused() {
             "case {case}: a {} character id the pattern admits reaches the lookup, got \
              {status} {response}",
             baseline_id.len()
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// What an update of one baseline writes
+// ---------------------------------------------------------------------------
+
+/// The sentence a write that would leave a baseline approving no patch at all is refused
+/// with: fixed text naming the two attributes, and nothing of the request.
+const APPROVAL_COVERAGE_MESSAGE: &str = "Patch Baseline attribute: Approved Patches and \
+     Approval Rule, at least one must be non empty.";
+
+/// The sentence an update that asks to REPLACE a baseline without naming one is refused
+/// with: `Replace` makes every member `CreatePatchBaseline` requires required here too, and
+/// the one such member is `Name`, so the refusal is the clause this service states over a
+/// member that must not be null, in the envelope its refusals carry.
+const REPLACE_WITHOUT_NAME_MESSAGE: &str = "1 validation error detected: Value null at \
+     'name' failed to satisfy constraint: Member must not be null";
+
+/// Every member of a patch baseline an update may write, in the order the model lists them
+/// (`smithy_query(query="operation", operation="UpdatePatchBaseline")`). `Name` is the one
+/// `CreatePatchBaseline` also requires; the rest are the optional members `Replace` clears.
+const UPDATABLE_MEMBERS: &[&str] = &[
+    "Name",
+    "GlobalFilters",
+    "ApprovalRules",
+    "ApprovedPatches",
+    "ApprovedPatchesComplianceLevel",
+    "ApprovedPatchesEnableNonSecurity",
+    "RejectedPatches",
+    "RejectedPatchesAction",
+    "Description",
+    "Sources",
+    "AvailableSecurityUpdatesComplianceStatus",
+];
+
+/// The member a read reports that an update's own answer does not: a patch group is
+/// included in a baseline by registering it there, which is no part of this write.
+const READ_ONLY_MEMBER: &str = "PatchGroups";
+
+/// `UpdatePatchBaseline` at `region`'s endpoint for `baseline_id` with `body`'s members.
+async fn update(
+    router: &MultiServiceRouter,
+    region: &str,
+    baseline_id: &str,
+    body: &Value,
+) -> (u16, Value) {
+    let mut request = body.clone();
+    request["BaselineId"] = json!(baseline_id);
+    call_in_region(router, region, "UpdatePatchBaseline", &request).await
+}
+
+/// The write a successful update leaves behind: the members `update` supplied, and for every
+/// member it left out either what `created` persisted or — under `Replace` — nothing at all.
+///
+/// This is the rule stated in the test's own terms: "fields not specified in the request are
+/// left unchanged", and with `Replace` true "optional fields that aren't specified are set to
+/// null". The operating system is not an update member, so it stays whatever the create
+/// carried, and what the merged write leaves out is what [`expected_members`] reports at its
+/// documented default.
+fn merged_body(created: &Value, update: &Value) -> Value {
+    let replace = update["Replace"].as_bool().unwrap_or(false);
+    let mut merged = Map::new();
+    if let Some(operating_system) = created.get("OperatingSystem") {
+        merged.insert("OperatingSystem".to_string(), operating_system.clone());
+    }
+    for member in UPDATABLE_MEMBERS {
+        let supplied = match update.get(*member) {
+            Some(value) => Some(value),
+            None if replace => None,
+            None => created.get(*member),
+        };
+        if let Some(value) = supplied {
+            merged.insert((*member).to_string(), value.clone());
+        }
+    }
+    Value::Object(merged)
+}
+
+/// The epoch seconds a reported instant carries.
+fn instant(case: &str, reported: &Value, member: &str) -> f64 {
+    reported[member]
+        .as_f64()
+        .unwrap_or_else(|| panic!("case {case}: the answer reports a {member}, got {reported}"))
+}
+
+/// One row of the update table: what one create carried, what one update of it carries, at
+/// one Region.
+struct UpdateCase<'a> {
+    case: &'a str,
+    region: &'a str,
+    created: Value,
+    update: Value,
+}
+
+/// An update reports — and persists — the members it supplied, every other member as the
+/// last write of the baseline persisted it, and under `Replace` the documented default of
+/// every member it left out: whichever members the update carries, however many entries
+/// they hold, for whichever operating system and at whichever Region.
+#[tokio::test]
+async fn an_update_writes_the_members_it_supplies_and_leaves_the_rest() {
+    let cases = [
+        UpdateCase {
+            case: "nothing but the baseline's id",
+            region: REGION,
+            created: json!({
+                "Name": "Untouched.Baseline",
+                "ApprovedPatches": patch_ids(2_124_261, 1),
+            }),
+            update: json!({}),
+        },
+        UpdateCase {
+            case: "the name alone",
+            region: REGION,
+            created: json!({
+                "Name": "Before.Rename",
+                "Description": "a baseline whose description the update leaves alone",
+                "ApprovedPatches": patch_ids(1_000_000, 2),
+                "ApprovedPatchesComplianceLevel": "CRITICAL",
+            }),
+            update: json!({ "Name": "After.Rename" }),
+        },
+        UpdateCase {
+            case: "a description where the create carried none",
+            region: REGION,
+            created: json!({
+                "Name": "Describe.Me",
+                "OperatingSystem": "AMAZON_LINUX_2023",
+                "ApprovalRules": rule_group(1),
+            }),
+            update: json!({ "Description": "a description the update added" }),
+        },
+        UpdateCase {
+            case: "a longer approved-patch list and another compliance level",
+            region: REGION,
+            created: json!({
+                "Name": "Approvals.Grow",
+                "ApprovedPatches": patch_ids(2_000_000, 1),
+            }),
+            update: json!({
+                "ApprovedPatches": patch_ids(2_100_000, 3),
+                "ApprovedPatchesComplianceLevel": "MEDIUM",
+            }),
+        },
+        UpdateCase {
+            case: "a shorter rejected-patch list and another action",
+            region: REGION,
+            created: json!({
+                "Name": "Rejections.Shrink",
+                "ApprovedPatches": patch_ids(3_000_000, 1),
+                "RejectedPatches": patch_ids(3_100_000, 4),
+                "RejectedPatchesAction": "BLOCK",
+            }),
+            update: json!({
+                "RejectedPatches": patch_ids(3_200_000, 1),
+                "RejectedPatchesAction": "ALLOW_AS_DEPENDENCY",
+            }),
+        },
+        UpdateCase {
+            case: "a rule group where the create approved by name, clearing the name list",
+            region: REGION,
+            created: json!({
+                "Name": "Rules.Replace.Names",
+                "ApprovedPatches": patch_ids(4_000_000, 2),
+            }),
+            update: json!({
+                "ApprovalRules": rule_group(2),
+                "ApprovedPatches": [],
+            }),
+        },
+        UpdateCase {
+            case: "the global filters and the sources, on a Linux baseline",
+            region: REGION,
+            created: json!({
+                "Name": "Filters.And.Sources",
+                "OperatingSystem": "UBUNTU",
+                "ApprovalRules": rule_group(1),
+            }),
+            update: json!({
+                "GlobalFilters": {
+                    "PatchFilters": [{ "Key": "PRODUCT", "Values": ["Ubuntu22.04"] }],
+                },
+                "Sources": sources(2),
+            }),
+        },
+        UpdateCase {
+            case: "the two flags a Windows baseline carries",
+            region: REGION,
+            created: json!({
+                "Name": "Flags.Move",
+                "ApprovedPatches": patch_ids(5_000_000, 1),
+                "AvailableSecurityUpdatesComplianceStatus": "NON_COMPLIANT",
+            }),
+            update: json!({
+                "ApprovedPatchesEnableNonSecurity": true,
+                "AvailableSecurityUpdatesComplianceStatus": "COMPLIANT",
+            }),
+        },
+        UpdateCase {
+            case: "every member an update may carry, at another Region",
+            region: "eu-central-1",
+            created: json!({
+                "Name": "Everything.Before",
+                "OperatingSystem": "MACOS",
+                "Description": "the create's description",
+                "GlobalFilters": {
+                    "PatchFilters": [{ "Key": "PRODUCT", "Values": ["MacOS13.1"] }],
+                },
+                "ApprovalRules": rule_group(1),
+                "ApprovedPatches": patch_ids(6_000_000, 1),
+                "ApprovedPatchesComplianceLevel": "LOW",
+                "ApprovedPatchesEnableNonSecurity": false,
+                "RejectedPatches": patch_ids(6_100_000, 1),
+                "RejectedPatchesAction": "ALLOW_AS_DEPENDENCY",
+                "Sources": sources(1),
+                "AvailableSecurityUpdatesComplianceStatus": "COMPLIANT",
+            }),
+            update: json!({
+                "Name": "Everything.After",
+                "Description": "the update's description",
+                "GlobalFilters": {
+                    "PatchFilters": [{ "Key": "PRODUCT", "Values": ["MacOS14.0"] }],
+                },
+                "ApprovalRules": rule_group(3),
+                "ApprovedPatches": patch_ids(6_200_000, 2),
+                "ApprovedPatchesComplianceLevel": "INFORMATIONAL",
+                "ApprovedPatchesEnableNonSecurity": true,
+                "RejectedPatches": patch_ids(6_300_000, 3),
+                "RejectedPatchesAction": "BLOCK",
+                "Sources": sources(3),
+                "AvailableSecurityUpdatesComplianceStatus": "NON_COMPLIANT",
+            }),
+        },
+        UpdateCase {
+            case: "every list filled to its published ceiling",
+            region: "ap-southeast-1",
+            created: json!({
+                "Name": "Ceilings.Before",
+                "OperatingSystem": "SUSE",
+                "ApprovedPatches": patch_ids(7_000_000, 1),
+            }),
+            update: json!({
+                "ApprovedPatches": patch_ids(7_100_000, MAX_PATCH_IDS),
+                "RejectedPatches": patch_ids(7_200_000, MAX_PATCH_IDS),
+                "ApprovalRules": rule_group(MAX_PATCH_RULES),
+                "Sources": sources(MAX_SOURCES),
+            }),
+        },
+        UpdateCase {
+            case: "a merge asked for explicitly",
+            region: REGION,
+            created: json!({
+                "Name": "Explicit.Merge",
+                "Description": "a description an explicit merge keeps",
+                "ApprovedPatches": patch_ids(8_000_000, 2),
+            }),
+            update: json!({ "Name": "Explicit.Merge.Renamed", "Replace": false }),
+        },
+        UpdateCase {
+            case: "a replacing update carrying only the members a create must carry",
+            region: REGION,
+            created: json!({
+                "Name": "Replace.Before",
+                "OperatingSystem": "DEBIAN",
+                "Description": "a description the replacement clears",
+                "GlobalFilters": {
+                    "PatchFilters": [{ "Key": "PRODUCT", "Values": ["Debian12"] }],
+                },
+                "ApprovalRules": rule_group(2),
+                "ApprovedPatches": patch_ids(9_000_000, 2),
+                "ApprovedPatchesComplianceLevel": "CRITICAL",
+                "ApprovedPatchesEnableNonSecurity": true,
+                "RejectedPatches": patch_ids(9_100_000, 2),
+                "RejectedPatchesAction": "BLOCK",
+                "Sources": sources(2),
+                "AvailableSecurityUpdatesComplianceStatus": "NON_COMPLIANT",
+            }),
+            update: json!({
+                "Name": "Replace.After",
+                "ApprovedPatches": patch_ids(9_200_000, 1),
+                "Replace": true,
+            }),
+        },
+        UpdateCase {
+            case: "a replacing update approving by rule alone",
+            region: REGION,
+            created: json!({
+                "Name": "Replace.Rules.Before",
+                "Description": "a description the replacement clears",
+                "ApprovedPatches": patch_ids(10_000_000, 3),
+                "Sources": sources(1),
+            }),
+            update: json!({
+                "Name": "Replace.Rules.After",
+                "ApprovalRules": rule_group(1),
+                "Replace": true,
+            }),
+        },
+        UpdateCase {
+            case: "a replacing update carrying every member an update may carry",
+            region: REGION,
+            created: json!({
+                "Name": "Replace.All.Before",
+                "OperatingSystem": "REDHAT_ENTERPRISE_LINUX",
+                "ApprovedPatches": patch_ids(11_000_000, 1),
+            }),
+            update: json!({
+                "Name": "Replace.All.After",
+                "Description": "a description the replacement sets",
+                "GlobalFilters": {
+                    "PatchFilters": [{ "Key": "PRODUCT", "Values": ["RedhatEnterpriseLinux9"] }],
+                },
+                "ApprovalRules": rule_group(2),
+                "ApprovedPatches": patch_ids(11_100_000, 2),
+                "ApprovedPatchesComplianceLevel": "HIGH",
+                "ApprovedPatchesEnableNonSecurity": true,
+                "RejectedPatches": patch_ids(11_200_000, 1),
+                "RejectedPatchesAction": "BLOCK",
+                "Sources": sources(1),
+                "AvailableSecurityUpdatesComplianceStatus": "COMPLIANT",
+                "Replace": true,
+            }),
+        },
+    ];
+
+    for UpdateCase {
+        case,
+        region,
+        created,
+        update: requested,
+    } in &cases
+    {
+        let router = router();
+        let baseline_id = create_ok(&router, case, region, created).await;
+        let before = get_ok(&router, case, region, &baseline_id).await;
+
+        let (status, answered) = update(&router, region, &baseline_id, requested).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: UpdatePatchBaseline {requested} must succeed, got {status} {answered}"
+        );
+
+        // What the update answered and what a later read reports are the one baseline the
+        // update left behind.
+        let reread = get_ok(&router, case, region, &baseline_id).await;
+        for (member, expected) in expected_members(&merged_body(created, requested)) {
+            if member != READ_ONLY_MEMBER {
+                assert_eq!(
+                    answered[&member], expected,
+                    "case {case}: the update reports {member} as {expected}, got {}",
+                    answered[&member]
+                );
+            }
+            assert_eq!(
+                reread[&member], expected,
+                "case {case}: a read after the update reports {member} as {expected}, got {}",
+                reread[&member]
+            );
+        }
+
+        // The baseline's identity is not something an update writes: no member of the
+        // request carries the id or the operating system, and the create is what the created
+        // date records.
+        assert_eq!(
+            answered["BaselineId"].as_str(),
+            Some(baseline_id.as_str()),
+            "case {case}: the update reports the id it was given {baseline_id:?}, got {answered}"
+        );
+        assert_eq!(
+            reread["BaselineId"], answered["BaselineId"],
+            "case {case}: a read after the update reports the same id, got {reread}"
+        );
+        let created_at = instant(case, &before, "CreatedDate");
+        assert_eq!(
+            instant(case, &answered, "CreatedDate"),
+            created_at,
+            "case {case}: the update leaves the created date at {created_at}, got {answered}"
+        );
+        assert_eq!(
+            instant(case, &reread, "CreatedDate"),
+            created_at,
+            "case {case}: a read after the update reports the created date {created_at}, got \
+             {reread}"
+        );
+
+        // "The date when the patch baseline was last modified": the update wrote the
+        // baseline, so it was last written no earlier than it was created, and both reports
+        // of that instant are the one the update recorded.
+        let modified_at = instant(case, &answered, "ModifiedDate");
+        assert!(
+            modified_at >= created_at,
+            "case {case}: the baseline was last written at or after its create {created_at}, \
+             got {modified_at}"
+        );
+        assert_eq!(
+            instant(case, &reread, "ModifiedDate"),
+            modified_at,
+            "case {case}: a read after the update reports the instant the update recorded \
+             ({modified_at}), got {reread}"
+        );
+    }
+}
+
+/// An update of a `BaselineId` that names no baseline this endpoint can write reports the
+/// absent baseline and changes nothing — however the id misses.
+#[tokio::test]
+async fn an_update_of_a_baseline_this_endpoint_cannot_write_is_refused_as_absent() {
+    // An account that is not the one this endpoint serves.
+    const OTHER_ACCOUNT: &str = "210987654321";
+
+    let router = router();
+    let held = create_ok(
+        &router,
+        "the held baseline",
+        REGION,
+        &json!({
+            "Name": "Update.Held.Baseline",
+            "ApprovedPatches": patch_ids(12_000_000, 1),
+        }),
+    )
+    .await;
+    // A baseline Systems Manager predefines exists in every account and is Patch Manager's
+    // own rather than the account's: this endpoint holds no record of it to write.
+    let predefined =
+        predefined_baseline_id(&router, "the predefined baseline", REGION, "WINDOWS").await;
+
+    let cases: Vec<(&str, String)> = vec![
+        (
+            "a well-formed id at the published floor of the member",
+            "pb-00000000000000000".to_string(),
+        ),
+        (
+            "the ARN of the held baseline at another Region",
+            format!("arn:aws:ssm:eu-west-1:{ACCOUNT}:patchbaseline/{held}"),
+        ),
+        (
+            "the ARN of the held baseline in another account",
+            format!("arn:aws:ssm:{REGION}:{OTHER_ACCOUNT}:patchbaseline/{held}"),
+        ),
+        (
+            "an ARN whose resource is not a patch baseline",
+            format!("arn:aws:ssm:{REGION}:{ACCOUNT}:document/AWS-RunShellScript"),
+        ),
+        (
+            "an ARN of another service",
+            format!("arn:aws:ec2:{REGION}:{ACCOUNT}:instance/i-0123456789abcdef0"),
+        ),
+        (
+            "the ARN of the baseline Systems Manager predefines",
+            predefined.clone(),
+        ),
+    ];
+
+    for (case, baseline_id) in cases {
+        let before = get_ok(&router, case, REGION, &held).await;
+        let (status, response) = update(
+            &router,
+            REGION,
+            &baseline_id,
+            &json!({ "Name": "Never.Written" }),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&response).as_str()),
+            (400, "DoesNotExistException"),
+            "case {case}: expected 400 DoesNotExistException for {baseline_id:?}, got {status} \
+             {response}"
+        );
+        assert_eq!(
+            error_message(&response),
+            NOT_FOUND_MESSAGE,
+            "case {case}: expected the sentence Patch Manager words, got {response}"
+        );
+
+        // The refused update wrote nothing: the baseline this endpoint does hold reads
+        // exactly as it did before the call.
+        let after = get_ok(&router, case, REGION, &held).await;
+        assert_eq!(
+            after, before,
+            "case {case}: a refused update leaves the held baseline as it was ({before}), got \
+             {after}"
+        );
+    }
+}
+
+/// One row of the invalid-request table: an update refused on the request itself rather
+/// than on the baseline it names.
+struct RefusedUpdateCase<'a> {
+    case: &'a str,
+    created: Value,
+    update: Value,
+    message: &'a str,
+}
+
+/// An update whose members cannot hold together is refused as invalid and writes nothing: a
+/// replacement that names no baseline name, and any write that would leave the baseline
+/// approving no patch at all.
+#[tokio::test]
+async fn an_update_whose_members_cannot_hold_together_is_refused() {
+    let cases = [
+        RefusedUpdateCase {
+            case: "a replacement naming no baseline name",
+            created: json!({
+                "Name": "Replace.Needs.Name",
+                "ApprovedPatches": patch_ids(13_000_000, 1),
+            }),
+            update: json!({ "ApprovedPatches": patch_ids(13_100_000, 1), "Replace": true }),
+            message: REPLACE_WITHOUT_NAME_MESSAGE,
+        },
+        RefusedUpdateCase {
+            case: "clearing the only approved-patch list the baseline had",
+            created: json!({
+                "Name": "Approvals.By.Name",
+                "ApprovedPatches": patch_ids(14_000_000, 2),
+            }),
+            update: json!({ "ApprovedPatches": [] }),
+            message: APPROVAL_COVERAGE_MESSAGE,
+        },
+        RefusedUpdateCase {
+            case: "emptying the only rule group the baseline had",
+            created: json!({
+                "Name": "Approvals.By.Rule",
+                "ApprovalRules": rule_group(2),
+            }),
+            update: json!({ "ApprovalRules": { "PatchRules": [] } }),
+            message: APPROVAL_COVERAGE_MESSAGE,
+        },
+        RefusedUpdateCase {
+            case: "a replacement that approves nothing at all",
+            created: json!({
+                "Name": "Replace.Approves.Nothing",
+                "ApprovedPatches": patch_ids(15_000_000, 1),
+                "ApprovalRules": rule_group(1),
+            }),
+            update: json!({ "Name": "Replace.Approves.Nothing", "Replace": true }),
+            message: APPROVAL_COVERAGE_MESSAGE,
+        },
+    ];
+
+    for RefusedUpdateCase {
+        case,
+        created,
+        update: requested,
+        message,
+    } in &cases
+    {
+        let router = router();
+        let baseline_id = create_ok(&router, case, REGION, created).await;
+        let before = get_ok(&router, case, REGION, &baseline_id).await;
+
+        let (status, response) = update(&router, REGION, &baseline_id, requested).await;
+        assert_eq!(
+            (status, error_code(&response).as_str()),
+            (400, "ValidationException"),
+            "case {case}: expected 400 ValidationException for {requested}, got {status} \
+             {response}"
+        );
+        assert_eq!(
+            error_message(&response),
+            *message,
+            "case {case}: expected {message:?}, got {response}"
+        );
+
+        let after = get_ok(&router, case, REGION, &baseline_id).await;
+        assert_eq!(
+            after, before,
+            "case {case}: a refused update leaves the baseline as it was ({before}), got {after}"
         );
     }
 }

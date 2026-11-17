@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdatePatchBaseline
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdatePatchBaseline`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdatePatchBaseline::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -189,6 +180,30 @@ impl From<UpdatePatchBaselineErrorModeled> for UpdatePatchBaselineError {
     }
 }
 
+/// What one member of the updated baseline carries.
+///
+/// "Fields not specified in the request are left unchanged", so a member the request
+/// supplied is taken as given and a member it left out keeps `stored`. Under `Replace`,
+/// "optional fields that aren't specified are set to null", so a member the request left
+/// out carries `cleared` instead — the value a create that named that member nothing would
+/// have persisted, which is how a read reports a member nothing ever set.
+fn updated_member<T>(supplied: Option<T>, stored: T, cleared: T, replace: bool) -> T {
+    match supplied {
+        Some(value) => value,
+        None if replace => cleared,
+        None => stored,
+    }
+}
+
+/// [`updated_member`] for a member a read reports only when a write set it.
+///
+/// Such a member's own type is already the optional one, so the request supplies it exactly
+/// when it carries a value: a request that leaves it out leaves the stored value alone, and
+/// a replacing update clears it to the nothing a create that named it carried.
+fn updated_optional_member<T>(supplied: Option<T>, stored: Option<T>, replace: bool) -> Option<T> {
+    updated_member(supplied.map(Some), stored, None, replace)
+}
+
 /// The `UpdatePatchBaseline` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -225,18 +240,146 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdatePatchBaseline` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdatePatchBaselineErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `BaselineId` is required, and every member's length, pattern and value set — the
+        // name, the patch lists, the compliance levels, the rejected-patch action — is a
+        // MODELLED constraint the centralized walk has already refused anything outside of.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdatePatchBaselineErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the patch baseline store is unavailable".to_string()),
+            })
+        })?;
+
+        // "If True, then all fields that are required by the CreatePatchBaseline operation
+        // are also required for this API request": `Name` is the one member that create
+        // requires, so a replacing update naming none is refused as a missing required
+        // member — before anything is read, so such a request cannot touch the baseline.
+        let replace = input.replace.unwrap_or(false);
+        if replace && input.name.is_none() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::patch_baselines::replace_requires_name_message(),
+            ));
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // "The ID of the patch baseline to update", named by its own id or by its full ARN.
+        // Only a baseline the account created through this endpoint can be modified: one
+        // Systems Manager predefines is Patch Manager's own and this endpoint holds no
+        // record of it to write, and a value that names no baseline at all — an ARN of
+        // another service, account or Region among them — reaches no baseline either. This
+        // operation models no invalid-id refusal to tell those apart, so each reports the
+        // absent baseline, worded the way every operation of this service words one.
+        let held = store
+            .patch_baseline_query(&region, &input.baseline_id)
+            .and_then(|baseline_id| store.patch_baseline(&region, &baseline_id).cloned());
+        let Some(mut record) = held else {
+            return Err(UpdatePatchBaselineErrorModeled::DoesNotExistException(
+                DoesNotExistException {
+                    message: Some(
+                        crate::state::patch_baselines::PATCH_BASELINE_NOT_FOUND.to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // "Modifies an existing patch baseline. Fields not specified in the request are left
+        // unchanged": every member the request supplied is applied to the baseline the store
+        // holds, and every member it left out keeps the value that baseline holds — unless
+        // the update replaces the baseline, where a member left out is cleared to what a
+        // create that named it nothing would have persisted ([`updated_member`]).
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdatePatchBaseline"))
+        // The baseline's identity is not among them: no input member carries the id, the
+        // Region or the operating system the baseline applies to, so an update leaves all
+        // three as the create persisted them. Nor is the created date: an update records
+        // when the baseline was last written, which is now, and leaves when it was created.
+        if let Some(name) = input.name {
+            record.name = name;
+        }
+        record.global_filters =
+            updated_optional_member(input.global_filters, record.global_filters, replace);
+        record.approval_rules =
+            updated_optional_member(input.approval_rules, record.approval_rules, replace);
+        record.approved_patches = updated_member(
+            input.approved_patches,
+            record.approved_patches,
+            Vec::new(),
+            replace,
+        );
+        record.approved_patches_compliance_level = updated_member(
+            input.approved_patches_compliance_level,
+            record.approved_patches_compliance_level,
+            crate::state::patch_baselines::DEFAULT_APPROVED_PATCHES_COMPLIANCE_LEVEL.to_string(),
+            replace,
+        );
+        record.approved_patches_enable_non_security = updated_member(
+            input.approved_patches_enable_non_security,
+            record.approved_patches_enable_non_security,
+            crate::state::patch_baselines::DEFAULT_APPROVED_PATCHES_ENABLE_NON_SECURITY,
+            replace,
+        );
+        record.rejected_patches = updated_member(
+            input.rejected_patches,
+            record.rejected_patches,
+            Vec::new(),
+            replace,
+        );
+        record.rejected_patches_action = updated_member(
+            input.rejected_patches_action,
+            record.rejected_patches_action,
+            crate::state::patch_baselines::DEFAULT_REJECTED_PATCHES_ACTION.to_string(),
+            replace,
+        );
+        record.description =
+            updated_optional_member(input.description, record.description, replace);
+        record.sources = updated_member(input.sources, record.sources, Vec::new(), replace);
+        record.available_security_updates_compliance_status = updated_optional_member(
+            input.available_security_updates_compliance_status,
+            record.available_security_updates_compliance_status,
+            replace,
+        );
+        record.modified_date = now;
+
+        // A baseline approves patches by naming them or by a rule that selects them, and the
+        // two cannot both be empty — the same rule every write of a baseline is held to. It
+        // is decided on the baseline the update WOULD leave behind rather than on the request
+        // alone, because a member the request left out keeps whatever the baseline already
+        // approved. Checked BEFORE anything is written, so a baseline that could approve
+        // nothing cannot be updated into existence either.
+        if let Some(why) = crate::state::patch_baselines::approval_coverage_rejection(
+            Some(&record.approved_patches),
+            record.approval_rules.as_ref(),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation(why));
+        }
+
+        // What the update persisted is what this call reports and what a later read reports:
+        // the two patch selectors are sets, so a baseline that names neither reports the
+        // empty set of each rather than nothing at all, exactly as a read of it does.
+        let output = UpdatePatchBaselineOutput {
+            baseline_id: Some(record.baseline_id.clone()),
+            name: Some(record.name.clone()),
+            operating_system: Some(record.operating_system.clone()),
+            global_filters: Some(record.reported_global_filters()),
+            approval_rules: Some(record.reported_approval_rules()),
+            approved_patches: Some(record.approved_patches.clone()),
+            approved_patches_compliance_level: Some(
+                record.approved_patches_compliance_level.clone(),
+            ),
+            approved_patches_enable_non_security: Some(record.approved_patches_enable_non_security),
+            rejected_patches: Some(record.rejected_patches.clone()),
+            rejected_patches_action: Some(record.rejected_patches_action.clone()),
+            created_date: Some(::aws_smithy_types::DateTime::from(record.created_date)),
+            modified_date: Some(::aws_smithy_types::DateTime::from(record.modified_date)),
+            description: record.description.clone(),
+            sources: Some(record.sources.clone()),
+            available_security_updates_compliance_status: record
+                .available_security_updates_compliance_status
+                .clone(),
+        };
+        store.insert_patch_baseline(record);
+        Ok(output)
     }
 }
