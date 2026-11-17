@@ -14,6 +14,9 @@
 //! A LAMBDA destination carries no role, so it is validated against its own resource policy
 //! instead ([`crate::state::lambda_destination`]): a function that does not let CloudWatch Logs
 //! invoke it for this log group is refused the same way.
+//! A destination in ANOTHER Region than the log group is refused with
+//! `InvalidParameterException` as well ([`crate::state::cross_region_destination_message`]), a
+//! delivery across Regions being what a logical destination exists for.
 //! A put also RE-VALIDATES the filter's destination: a filter whose destination refused its
 //! last delivery ([`crate::state::subscription_delivery`]) is attempted again from the next
 //! ingested batch on, with no replay of the batches it missed. The put WRITES to the
@@ -275,7 +278,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // step ([`PutSubscriptionFilter::configure`]) and the guard is gone by the time the
         // health check it resolved is handed over below: a lock guard must not be held
         // across an in-process call into another service.
-        let health_check = self.configure(input, unassumable_role, unpermitted_destination)?;
+        let health_check =
+            self.configure(input, &region, unassumable_role, unpermitted_destination)?;
         // The put VALIDATES the destination: CloudWatch Logs writes one health-check record
         // to it, before any log event of this filter exists
         // ([`crate::state::subscription_delivery::health_check`]).
@@ -302,6 +306,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutSubscriptionFi
     fn configure(
         &self,
         input: PutSubscriptionFilterInput,
+        region: &str,
         unassumable_role: Option<String>,
         unpermitted_destination: Option<String>,
     ) -> Result<Option<crate::state::subscription_delivery::Delivery>, PutSubscriptionFilterError>
@@ -378,6 +383,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutSubscriptionFi
                     .collect::<Vec<_>>()
                     .join(", ")
             )));
+        }
+
+        // A subscription filter delivers to a destination in the Region that holds the log
+        // group it is attached to, so a destination elsewhere is a delivery this filter could
+        // never make: it is refused here, and nothing of the filter is stored
+        // ([`crate::state::cross_region_destination_message`]). The Region the log group is in
+        // is the one this request was made in, which is the Region its own ARN carries
+        // ([`crate::state::log_group_arn`]).
+        if let Some(message) =
+            crate::state::cross_region_destination_message(region, &input.destination_arn)
+        {
+            return Err(invalid(message.to_string()));
         }
 
         // A logical destination is authorized by the ACCESS POLICY attached to it and by

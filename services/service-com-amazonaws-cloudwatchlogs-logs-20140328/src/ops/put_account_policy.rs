@@ -216,10 +216,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries only request metadata: an account-level policy is not scoped to a
-        // Region in this store, so nothing here is read from the request's credential
-        // scope.
-        let _ = ctx;
+        // `ctx` carries request metadata: the Region the credential scope names, which is
+        // the Region this policy applies to the log groups of ("Account-level policies are
+        // Region-specific: a policy applies only to log groups in the Region where you create
+        // it") — so a subscription filter policy's destination is held to being in it, the way
+        // a per-group filter's is.
+        let region = crate::state::request_region(ctx.parts());
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             PutAccountPolicyError::from(PutAccountPolicyErrorModeled::ServiceUnavailableException(
@@ -291,9 +293,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // What the document must say is the contract of `policyDocument` for the type it
         // is put with; the checks, and the sentences they refuse with, live beside the
         // stored record in `crate::state`.
-        let policy =
-            crate::state::check_account_policy_document(&input.policy_type, &input.policy_document)
-                .map_err(invalid)?;
+        let policy = crate::state::check_account_policy_document(
+            &input.policy_type,
+            &region,
+            &input.policy_document,
+        )
+        .map_err(invalid)?;
 
         // "If you specify destinations such as log groups, Firehose streams, and S3
         // buckets, they must already exist." A log group destination is the half of that

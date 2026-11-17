@@ -1942,7 +1942,7 @@ pub const PARTITION_GLOBAL_REGIONS: [(&str, &str); 3] = [
 /// The partition segment of an ARN (`arn:<partition>:...`), or `None` for a value that is not
 /// an ARN at all. One split of an ARN's fields serves the whole crate ([`arn_parts`]).
 fn arn_partition(arn: &str) -> Option<&str> {
-    arn_parts(arn).map(|(partition, _service, _account, _resource)| partition)
+    arn_parts(arn).map(|(partition, _service, _region, _account, _resource)| partition)
 }
 
 /// The Region a delivery source for `resource_arn` can be created in, or `None` when the
@@ -2790,7 +2790,17 @@ pub fn regional_service_principal(region: &str) -> String {
 /// that is not an ARN. The resource segment is whatever follows the account, colons and
 /// slashes included, because a resource id carries its own separators.
 pub fn arn_service_and_resource(arn: &str) -> Option<(&str, &str)> {
-    arn_parts(arn).map(|(_partition, service, _account, resource)| (service, resource))
+    arn_parts(arn).map(|(_partition, service, _region, _account, resource)| (service, resource))
+}
+
+/// The Region segment of an ARN
+/// (`arn:<partition>:<service>:<region>:<account>:<resource>`), or `None` for a value that
+/// is not an ARN or that names no Region at all — the segment is empty in the ARN of a
+/// global service's resource, which is reached from every Region.
+pub fn arn_region(arn: &str) -> Option<&str> {
+    arn_parts(arn)
+        .map(|(_partition, _service, region, _account, _resource)| region)
+        .filter(|region| !region.is_empty())
 }
 
 /// The account segment of an ARN
@@ -2799,24 +2809,25 @@ pub fn arn_service_and_resource(arn: &str) -> Option<(&str, &str)> {
 /// identifier it was handed belongs to.
 pub fn arn_account_id(arn: &str) -> Option<&str> {
     arn_parts(arn)
-        .map(|(_partition, _service, account, _resource)| account)
+        .map(|(_partition, _service, _region, account, _resource)| account)
         .filter(|account| !account.is_empty())
 }
 
-/// The `(partition, service, account, resource)` segments of an ARN
+/// The `(partition, service, region, account, resource)` segments of an ARN
 /// (`arn:<partition>:<service>:<region>:<account>:<resource>`), or `None` for anything
 /// that is not an ARN.
-fn arn_parts(arn: &str) -> Option<(&str, &str, &str, &str)> {
+fn arn_parts(arn: &str) -> Option<(&str, &str, &str, &str, &str)> {
     let rest = arn.strip_prefix("arn:")?;
     // partition, service, region, account, then the whole resource segment.
     let mut segments = rest.splitn(5, ':');
     let partition = segments.next()?;
     let service = segments.next()?;
-    let _region = segments.next()?;
+    let region = segments.next()?;
     let account = segments.next()?;
     Some((
         partition,
         service,
+        region,
         account,
         segments.next().unwrap_or_default(),
     ))
@@ -2843,7 +2854,7 @@ pub const ROLE_ASSUMED_DESTINATION_VENDORS: [&str; 2] = ["kinesis", "firehose"];
 /// operation delivers to nothing in needs no role either: there is no delivery to
 /// authorise, and such a `destinationArn` is refused for the resource it names instead.
 pub fn subscription_role_required_vendor(arn: &str) -> Option<&str> {
-    let (_partition, vendor, _account, _resource) = arn_parts(arn)?;
+    let (_partition, vendor, _region, _account, _resource) = arn_parts(arn)?;
     ROLE_ASSUMED_DESTINATION_VENDORS
         .contains(&vendor)
         .then_some(vendor)
@@ -3043,6 +3054,35 @@ pub fn is_subscription_destination_arn(arn: &str) -> bool {
             .iter()
             .any(|(name, prefix)| service == *name && resource.starts_with(prefix))
     })
+}
+
+/// AWS's refusal sentence for a subscription delivery configured against a destination
+/// outside the Region the request was made in. FIXED text for the error class: it names
+/// neither the member it refuses, nor either Region, nor anything else from the request.
+pub const CROSS_REGION_DESTINATION_MESSAGE: &str =
+    "Logical destination should be in the same region as caller region";
+
+/// The refusal for a subscription delivery configured against a destination in ANOTHER
+/// Region ([`CROSS_REGION_DESTINATION_MESSAGE`]): a subscription filter delivers to a
+/// destination that lives in the Region holding the log groups it subscribes, so a
+/// destination ARN whose Region segment names a different one configures a delivery that
+/// could never be made. `None` when the destination is in the request's Region, or when its
+/// ARN names no Region at all ([`arn_region`]).
+///
+/// Reaching another Region is what a LOGICAL destination is for: that destination is itself
+/// created in the log group's Region, and the resource it forwards to
+/// (`PutDestination$targetArn`) is reached by the destination rather than by the filter, so a
+/// target elsewhere is outside this rule.
+///
+/// Shared by every member that configures such a delivery
+/// (`PutSubscriptionFilter$destinationArn` and the `DestinationArn` of an account-level
+/// subscription filter policy), so the rule and its wording cannot drift between them.
+pub fn cross_region_destination_message(
+    region: &str,
+    destination_arn: &str,
+) -> Option<&'static str> {
+    let destination_region = arn_region(destination_arn)?;
+    (destination_region != region).then_some(CROSS_REGION_DESTINATION_MESSAGE)
 }
 
 /// AWS's request-derived refusal message for a member the service parses as an ARN and

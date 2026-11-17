@@ -83,6 +83,7 @@ pub struct AccountPolicyShape {
 /// is judged by the caller of this function rather than here.
 pub fn check_account_policy_document(
     policy_type: &str,
+    region: &str,
     document: &str,
 ) -> Result<AccountPolicyShape, String> {
     if document.chars().count() > MAX_ACCOUNT_POLICY_DOCUMENT_CHARS {
@@ -100,7 +101,8 @@ pub fn check_account_policy_document(
             })
         }
         POLICY_TYPE_SUBSCRIPTION_FILTER => {
-            check_subscription_filter_policy_document(document).map(|()| AccountPolicyShape::default())
+            check_subscription_filter_policy_document(region, document)
+                .map(|()| AccountPolicyShape::default())
         }
         POLICY_TYPE_FIELD_INDEX => {
             check_field_index_policy_document(document).map(|_| AccountPolicyShape::default())
@@ -135,8 +137,13 @@ pub(super) fn policy_object(document: &str) -> Result<serde_json::Map<String, se
 /// "FilterPattern A filter pattern for subscribing to a filtered stream of log events" and
 /// "Distribution The method used to distribute log data to the destination". Each is held
 /// to the rule the log-group-level `PutSubscriptionFilter` holds the member of the same
-/// name to, so one destination is as acceptable account-wide as it is per group.
-pub(super) fn check_subscription_filter_policy_document(document: &str) -> Result<(), String> {
+/// name to, so one destination is as acceptable account-wide as it is per group — including
+/// the Region it has to be in, which for an account-level policy is the Region the policy,
+/// and so every log group it applies to, is in.
+pub(super) fn check_subscription_filter_policy_document(
+    region: &str,
+    document: &str,
+) -> Result<(), String> {
     let members = policy_object(document)?;
     let string = |name: &str| members.get(name).and_then(serde_json::Value::as_str);
     let Some(destination_arn) = string("DestinationArn") else {
@@ -166,6 +173,12 @@ pub(super) fn check_subscription_filter_policy_document(document: &str) -> Resul
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
+    }
+    // The same rule again: the policy subscribes the log groups of the Region it is put in,
+    // so a destination in another Region is a delivery none of them could make
+    // ([`cross_region_destination_message`]).
+    if let Some(message) = cross_region_destination_message(region, destination_arn) {
+        return Err(message.to_string());
     }
     if let Some(filter_pattern) = string("FilterPattern") {
         // The same reading a subscription filter's own put holds the member to.
