@@ -195,6 +195,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        if store.associated_vpc_count(&id) > 0 {
+            return Err(DeleteServiceNetworkErrorModeled::ConflictException(
+                crate::state::conflict(
+                    crate::state::ResourceKind::ServiceNetwork,
+                    &id,
+                    format!("ServiceNetwork {id} has vpc(s) associated"),
+                ),
+            )
+            .into());
+        }
         if let Some(removed) = store.service_networks.remove(&id) {
             let name_key =
                 crate::state::name_key(crate::state::KIND_SERVICE_NETWORK, &removed.name);

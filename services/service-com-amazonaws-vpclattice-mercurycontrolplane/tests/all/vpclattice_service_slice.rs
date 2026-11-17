@@ -31,6 +31,12 @@
 //! 9. The stores are bounded: the idempotency-token store evicts the oldest token, and a
 //!    create past the emulator's resource ceiling is the modelled
 //!    `ServiceQuotaExceededException` (402).
+//! 10. A VPC association links a persisted service network to the VPC the request names:
+//!     the create persists every member it was sent, mints an `snva-` id and its ARN, and
+//!     `GetServiceNetworkVpcAssociation` reads the record back in either identifier form.
+//! 11. A VPC is associated with one service network at most once (a second create of the
+//!     pair is a 409), and a service network reports the VPCs associated with it and
+//!     cannot be deleted while one still is.
 
 use std::sync::Arc;
 
@@ -1489,5 +1495,557 @@ async fn a_created_resource_reaches_active_after_the_transition_the_clock_owes_i
         "ACTIVE",
         "case association after the transition: expected ACTIVE, got {}",
         read_association.body
+    );
+}
+
+// --- the service-network/VPC association slice (rules 10 and 11) -----------------
+
+/// Associate a VPC with a service network: the create this operation is reached by.
+async fn create_vpc_association(lattice: &Lattice, body: serde_json::Value) -> Answer {
+    lattice
+        .call("POST", "/servicenetworkvpcassociations", Some(body))
+        .await
+}
+
+/// Read one VPC association back, by either modelled identifier form.
+async fn get_vpc_association(lattice: &Lattice, identifier: &str) -> Answer {
+    lattice
+        .call(
+            "GET",
+            &format!("/servicenetworkvpcassociations/{identifier}"),
+            None,
+        )
+        .await
+}
+
+/// A service network to associate VPCs with, answering its id.
+async fn vpc_network(lattice: &Lattice, name: &str) -> String {
+    let created = lattice
+        .create_service_network(serde_json::json!({ "name": name }))
+        .await;
+    assert_eq!(
+        created.status, 201,
+        "case create network {name}: expected 201, got {} / {}",
+        created.status, created.body
+    );
+    created.str_field("id")
+}
+
+/// The request body of a VPC association: the two required identifiers plus whatever
+/// optional members the case sends.
+fn vpc_association_body(
+    network_identifier: &str,
+    vpc_identifier: &str,
+    extra: &serde_json::Value,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "serviceNetworkIdentifier": network_identifier,
+        "vpcIdentifier": vpc_identifier,
+    });
+    if let Some(members) = extra.as_object() {
+        for (member, value) in members {
+            body[member] = value.clone();
+        }
+    }
+    body
+}
+
+/// What the response must report for an optional member the request sent: the value
+/// itself, and nothing at all for a security-group list that named no group — "security
+/// groups aren't added by default" (the member's own documentation), so an association
+/// without any reports no list rather than an empty one.
+fn expected_member(sent: &serde_json::Value) -> serde_json::Value {
+    match sent.as_array() {
+        Some(groups) if groups.is_empty() => serde_json::Value::Null,
+        _ => sent.clone(),
+    }
+}
+
+/// One row of the create table: the case, the VPC the request names, whether it names the
+/// service network by ARN rather than by id, and the optional members it sends.
+type VpcAssociationCase = (&'static str, &'static str, bool, serde_json::Value);
+
+/// The rows span what rule 10 generalises over: both modelled `vpcIdentifier` forms (an
+/// 8-character and a 17-character VPC id), both modelled service-network identifier forms,
+/// the size of `securityGroupIds` (none, an empty list, one, and the five the member's
+/// `@length` admits), each setting of `privateDnsEnabled`, `dnsOptions` with and without
+/// specified domains, and tags.
+fn vpc_association_cases() -> Vec<VpcAssociationCase> {
+    vec![
+        (
+            "the 8-character VPC id form, no optional member",
+            "vpc-0a1b2c3d",
+            false,
+            serde_json::json!({}),
+        ),
+        (
+            "the 17-character VPC id form, by service network ARN",
+            "vpc-0123456789abcdef0",
+            true,
+            serde_json::json!({ "privateDnsEnabled": true }),
+        ),
+        (
+            "one security group and private DNS off",
+            "vpc-00000001",
+            false,
+            serde_json::json!({
+                "securityGroupIds": ["sg-0a1b2c3d"],
+                "privateDnsEnabled": false,
+            }),
+        ),
+        (
+            "a security group list that names no group",
+            "vpc-00000002",
+            false,
+            serde_json::json!({ "securityGroupIds": [] }),
+        ),
+        (
+            // `SecurityGroupList` is modelled @length(0, 5) on this operation's member.
+            "the five security groups the member admits, and tags",
+            "vpc-00000003",
+            true,
+            serde_json::json!({
+                "securityGroupIds": [
+                    "sg-00000001",
+                    "sg-00000002",
+                    "sg-00000003",
+                    "sg-00000004",
+                    "sg-0123456789abcdef0",
+                ],
+                "tags": { "team": "payments", "env": "test" },
+            }),
+        ),
+        (
+            "dns options over the domains the caller specifies",
+            "vpc-00000004",
+            false,
+            serde_json::json!({
+                "privateDnsEnabled": true,
+                "dnsOptions": {
+                    // `PrivateDnsPreference` enumerates these values.
+                    "privateDnsPreference": "SPECIFIED_DOMAINS_ONLY",
+                    "privateDnsSpecifiedDomains": [
+                        "one.example.internal",
+                        "two.example.internal",
+                    ],
+                },
+            }),
+        ),
+        (
+            "dns options for all domains, with no specified domains",
+            "vpc-00000005",
+            false,
+            serde_json::json!({
+                "privateDnsEnabled": true,
+                "dnsOptions": { "privateDnsPreference": "ALL_DOMAINS" },
+            }),
+        ),
+    ]
+}
+
+/// Rule 10: the create persists the association and the Get reads it back, in either
+/// identifier form, for every row of the table.
+#[tokio::test]
+async fn creating_vpc_associations_persists_them_and_both_identifier_forms_read_them_back() {
+    let lattice = Lattice::new();
+    let network_id = vpc_network(&lattice, "vpc-assoc-net").await;
+    let network_arn = expected_arn(state::KIND_SERVICE_NETWORK, &network_id);
+
+    for (case, vpc, by_arn, extra) in vpc_association_cases() {
+        let identifier = if by_arn {
+            network_arn.clone()
+        } else {
+            network_id.clone()
+        };
+        let body = vpc_association_body(&identifier, vpc, &extra);
+        let created = create_vpc_association(&lattice, body.clone()).await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: expected 200, got {} / {}",
+            created.status, created.body
+        );
+
+        let id = created.str_field("id");
+        assert!(
+            is_lattice_id(&id, state::PREFIX_VPC_ASSOCIATION),
+            "case {case:?}: expected a modelled snva- id, got {id:?}"
+        );
+        let arn = created.str_field("arn");
+        assert_eq!(
+            arn,
+            expected_arn(state::KIND_VPC_ASSOCIATION, &id),
+            "case {case:?}: expected the ARN of the request's region over the minted id, \
+             got {arn:?}"
+        );
+        assert_eq!(
+            created.str_field("createdBy"),
+            state::account_id(),
+            "case {case:?}: createdBy is the caller's account, got {}",
+            created.body
+        );
+        let status = created.str_field("status");
+        assert_eq!(
+            status, "CREATE_IN_PROGRESS",
+            "case {case:?}: a just-created association is still creating, got {status:?}"
+        );
+        for member in ["securityGroupIds", "privateDnsEnabled", "dnsOptions"] {
+            assert_eq!(
+                created.body[member],
+                expected_member(&body[member]),
+                "case {case:?}: expected the create to report the persisted {member}, got {:?}",
+                created.body[member]
+            );
+        }
+
+        // The record reads back through the Get, under both modelled identifier forms.
+        for (form, read_identifier) in [("bare id", id.clone()), ("ARN", as_label(&arn))] {
+            let read = get_vpc_association(&lattice, &read_identifier).await;
+            assert_eq!(
+                read.status, 200,
+                "case {case:?} read by {form}: expected 200, got {} / {}",
+                read.status, read.body
+            );
+            assert_eq!(
+                read.str_field("id"),
+                id,
+                "case {case:?} read by {form}: expected the association {id}, got {}",
+                read.body
+            );
+            assert_eq!(
+                read.str_field("vpcId"),
+                vpc,
+                "case {case:?} read by {form}: expected the associated VPC {vpc}, got {}",
+                read.body
+            );
+            assert_eq!(
+                read.str_field("serviceNetworkId"),
+                network_id,
+                "case {case:?} read by {form}: expected the service network {network_id}, got {}",
+                read.body
+            );
+            assert_eq!(
+                read.str_field("serviceNetworkArn"),
+                network_arn,
+                "case {case:?} read by {form}: expected the service network's ARN, got {}",
+                read.body
+            );
+            assert_eq!(
+                read.str_field("serviceNetworkName"),
+                "vpc-assoc-net",
+                "case {case:?} read by {form}: expected the service network's name, got {}",
+                read.body
+            );
+            for member in ["arn", "createdBy", "securityGroupIds", "privateDnsEnabled", "dnsOptions"] {
+                assert_eq!(
+                    read.body[member], created.body[member],
+                    "case {case:?} read by {form}: expected the persisted {member} {:?}, got {:?}",
+                    created.body[member], read.body[member]
+                );
+            }
+            for member in ["createdAt", "lastUpdatedAt"] {
+                assert!(
+                    is_timestamp(&read.body[member]),
+                    "case {case:?} read by {form}: expected an instant at {member}, got {:?}",
+                    read.body[member]
+                );
+            }
+            assert!(
+                read.body["failureCode"].is_null() && read.body["failureMessage"].is_null(),
+                "case {case:?} read by {form}: an association that did not fail reports no \
+                 failure, got {}",
+                read.body
+            );
+        }
+    }
+
+    // Rule 11: the service network reports exactly the VPCs associated with it.
+    let network = lattice.get_service_network(&network_id).await;
+    let expected = vpc_association_cases().len();
+    assert_eq!(
+        network.body["numberOfAssociatedVPCs"],
+        serde_json::json!(expected),
+        "case the network's VPC count: expected the {expected} persisted associations, got {}",
+        network.body
+    );
+}
+
+/// Rule 11: a pair is associated once, an identifier naming nothing persisted is a 404,
+/// and a `clientToken` retry answers the association the first call made.
+#[tokio::test]
+async fn a_vpc_association_is_refused_when_the_pair_the_identifier_or_the_token_says_so() {
+    let lattice = Lattice::new();
+    let network_id = vpc_network(&lattice, "vpc-refusal-net").await;
+    let other_network_id = vpc_network(&lattice, "vpc-refusal-other").await;
+    let network_arn = expected_arn(state::KIND_SERVICE_NETWORK, &network_id);
+
+    let first = create_vpc_association(
+        &lattice,
+        vpc_association_body(&network_id, "vpc-0a0b0c0d", &serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(
+        first.status, 200,
+        "case the first association of the pair: expected 200, got {} / {}",
+        first.status, first.body
+    );
+    let first_id = first.str_field("id");
+
+    // The same pair again, named either way, is the conflict — never a second record.
+    for (case, identifier) in [
+        ("by the service network id", network_id.clone()),
+        ("by the service network ARN", network_arn.clone()),
+    ] {
+        let again = create_vpc_association(
+            &lattice,
+            vpc_association_body(&identifier, "vpc-0a0b0c0d", &serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(
+            again.status, 409,
+            "case a second association of the same pair {case}: expected 409, got {} / {}",
+            again.status, again.body
+        );
+        assert!(
+            again
+                .error_code
+                .as_deref()
+                .is_some_and(|code| code.contains("ConflictException")),
+            "case a second association of the same pair {case}: expected ConflictException, \
+             got {:?} / {}",
+            again.error_code,
+            again.body
+        );
+        let message = message_of(case, &again);
+        assert!(
+            message.contains(&network_arn) && message.contains("vpc-0a0b0c0d"),
+            "case a second association of the same pair {case}: the refusal names both sides \
+             it links, got {message:?}"
+        );
+    }
+
+    // The same VPC in ANOTHER service network is a different pair, so it is created.
+    let other = create_vpc_association(
+        &lattice,
+        vpc_association_body(&other_network_id, "vpc-0a0b0c0d", &serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(
+        other.status, 200,
+        "case the same VPC in another service network: expected 200, got {} / {}",
+        other.status, other.body
+    );
+    assert_ne!(
+        other.str_field("id"),
+        first_id,
+        "case the same VPC in another service network: expected a second association, got the \
+         first one back"
+    );
+
+    // An identifier that names no persisted service network, in each form a caller can
+    // send, is the modelled not-found over the identifier the request carried.
+    for (case, identifier) in [
+        ("a well-formed id naming nothing", "sn-00000000000000000".to_string()),
+        (
+            "a well-formed ARN naming nothing",
+            expected_arn(state::KIND_SERVICE_NETWORK, "sn-00000000000000000"),
+        ),
+        ("an identifier of no kind at all", "not-an-identifier".to_string()),
+        (
+            "the id of a resource of another kind",
+            expected_arn(state::KIND_SERVICE, "svc-00000000000000000"),
+        ),
+    ] {
+        let answer = create_vpc_association(
+            &lattice,
+            vpc_association_body(&identifier, "vpc-0e0f0a0b", &serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(
+            answer.status, 404,
+            "case {case:?}: expected 404, got {} / {}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            message_of(case, &answer),
+            format!("ServiceNetwork {identifier} cannot be found."),
+            "case {case:?}: expected the not-found message over the submitted identifier, got {}",
+            answer.body
+        );
+    }
+
+    // A retry carrying the token of a completed create answers that same association; the
+    // same token with different parameters is refused.
+    let token_body = vpc_association_body(
+        &network_id,
+        "vpc-0c0d0e0f",
+        &serde_json::json!({ "clientToken": "vpc-association-token" }),
+    );
+    let token_first = create_vpc_association(&lattice, token_body.clone()).await;
+    assert_eq!(
+        token_first.status, 200,
+        "case the first call of a clientToken: expected 200, got {} / {}",
+        token_first.status, token_first.body
+    );
+    let retry = create_vpc_association(&lattice, token_body).await;
+    assert_eq!(
+        retry.status, 200,
+        "case the retry of a clientToken: expected 200, got {} / {}",
+        retry.status, retry.body
+    );
+    assert_eq!(
+        retry.str_field("id"),
+        token_first.str_field("id"),
+        "case the retry of a clientToken: expected the first association back, got {}",
+        retry.body
+    );
+    let reused = create_vpc_association(
+        &lattice,
+        vpc_association_body(
+            &network_id,
+            "vpc-0f0e0d0c",
+            &serde_json::json!({ "clientToken": "vpc-association-token" }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        reused.status, 409,
+        "case a clientToken reused for another VPC: expected 409, got {} / {}",
+        reused.status, reused.body
+    );
+
+    // A read of an association this service never minted is the modelled not-found.
+    let unknown = "snva-00000000000000000";
+    let missing = get_vpc_association(&lattice, unknown).await;
+    assert_eq!(
+        missing.status, 404,
+        "case reading an association that was never created: expected 404, got {} / {}",
+        missing.status, missing.body
+    );
+    assert_eq!(
+        message_of("reading an association that was never created", &missing),
+        format!("Association {unknown} cannot be found."),
+        "case reading an association that was never created: expected the not-found message \
+         over the submitted identifier, got {}",
+        missing.body
+    );
+}
+
+/// Rule 10's clock-owed half: the association reaches `ACTIVE` on its own, with nothing
+/// but the clock moving, and a read never moves it back.
+#[tokio::test]
+async fn a_created_vpc_association_reaches_active_on_its_own() {
+    let lattice = Lattice::new();
+    let network_id = vpc_network(&lattice, "vpc-clock-net").await;
+    let created = create_vpc_association(
+        &lattice,
+        vpc_association_body(&network_id, "vpc-0b0b0b0b", &serde_json::json!({})),
+    )
+    .await;
+    let id = created.str_field("id");
+    assert_eq!(
+        created.str_field("status"),
+        "CREATE_IN_PROGRESS",
+        "case immediately after the create: expected CREATE_IN_PROGRESS, got {}",
+        created.body
+    );
+
+    // Wait for the CONDITION, not for a span: the transition is owed by the clock, so the
+    // read is repeated until it reports the terminal status or a generous deadline passes.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut status = created.str_field("status");
+    while status != "ACTIVE" && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        status = get_vpc_association(&lattice, &id).await.str_field("status");
+    }
+    assert_eq!(
+        status, "ACTIVE",
+        "case after the transition the clock owes it: expected ACTIVE, got {status:?}"
+    );
+
+    // Reading it again reports the same terminal status: a read changes nothing.
+    let again = get_vpc_association(&lattice, &id).await.str_field("status");
+    assert_eq!(
+        again, "ACTIVE",
+        "case a second read: expected the status to stay ACTIVE, got {again:?}"
+    );
+}
+
+/// Rule 11: a service network cannot be deleted while a VPC is associated with it, and the
+/// count it reports follows the store.
+#[tokio::test]
+async fn a_service_network_with_a_vpc_associated_cannot_be_deleted() {
+    let lattice = Lattice::new();
+    let network_id = vpc_network(&lattice, "vpc-delete-net").await;
+    let free_network_id = vpc_network(&lattice, "vpc-delete-free").await;
+
+    let before = lattice.get_service_network(&network_id).await;
+    assert_eq!(
+        before.body["numberOfAssociatedVPCs"],
+        serde_json::json!(0),
+        "case before any association: expected no associated VPC, got {}",
+        before.body
+    );
+
+    for (case, vpc) in [
+        ("the first VPC", "vpc-0d0d0d0d"),
+        ("a second VPC", "vpc-0e0e0e0e"),
+    ] {
+        let created = create_vpc_association(
+            &lattice,
+            vpc_association_body(&network_id, vpc, &serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(
+            created.status, 200,
+            "case associate {case}: expected 200, got {} / {}",
+            created.status, created.body
+        );
+    }
+
+    let after = lattice.get_service_network(&network_id).await;
+    assert_eq!(
+        after.body["numberOfAssociatedVPCs"],
+        serde_json::json!(2),
+        "case after two associations: expected both of them counted, got {}",
+        after.body
+    );
+
+    let refused = lattice
+        .call("DELETE", &format!("/servicenetworks/{network_id}"), None)
+        .await;
+    assert_eq!(
+        refused.status, 409,
+        "case deleting a network a VPC is associated with: expected 409, got {} / {}",
+        refused.status, refused.body
+    );
+    assert!(
+        refused
+            .error_code
+            .as_deref()
+            .is_some_and(|code| code.contains("ConflictException")),
+        "case deleting a network a VPC is associated with: expected ConflictException, got {:?} \
+         / {}",
+        refused.error_code,
+        refused.body
+    );
+    let still_there = lattice.get_service_network(&network_id).await;
+    assert_eq!(
+        still_there.status, 200,
+        "case after the refused delete: expected the network to still be there, got {} / {}",
+        still_there.status, still_there.body
+    );
+
+    // A service network no VPC is associated with still deletes.
+    let deleted = lattice
+        .call(
+            "DELETE",
+            &format!("/servicenetworks/{free_network_id}"),
+            None,
+        )
+        .await;
+    assert_eq!(
+        deleted.status, 204,
+        "case deleting a network with no association: expected 204, got {} / {}",
+        deleted.status, deleted.body
     );
 }

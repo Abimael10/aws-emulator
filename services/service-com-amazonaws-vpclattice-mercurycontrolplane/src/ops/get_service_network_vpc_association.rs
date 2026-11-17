@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetServiceNetworkVpcAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetServiceNetworkVpcAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetServiceNetworkVpcAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -143,6 +134,20 @@ impl From<GetServiceNetworkVpcAssociationErrorModeled> for GetServiceNetworkVpcA
     }
 }
 
+/// HTTP 404 for an identifier that names no persisted service-network/VPC association,
+/// built by the service's shared error construction
+/// ([`crate::state::resource_not_found`]): AWS's not-found message over the submitted
+/// identifier, and the kind's resource-type token.
+fn not_found(identifier: &str) -> GetServiceNetworkVpcAssociationError {
+    GetServiceNetworkVpcAssociationErrorModeled::ResourceNotFoundException(
+        crate::state::resource_not_found(
+            crate::state::ResourceKind::VpcAssociation,
+            identifier,
+        ),
+    )
+    .into()
+}
+
 /// The `GetServiceNetworkVpcAssociation` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -179,18 +184,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetServiceNetworkVpcAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetServiceNetworkVpcAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetServiceNetworkVpcAssociation"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetServiceNetworkVpcAssociationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the vpc-lattice state store is unavailable".to_string(),
+                        retry_after_seconds: None,
+                    },
+                )
+                .into(),
+            );
+        };
+        // `serviceNetworkVpcAssociationIdentifier` is modelled as either the bare id or
+        // the association's ARN.
+        let Some(id) = crate::state::id_from_identifier(
+            &input.service_network_vpc_association_identifier,
+            crate::state::PREFIX_VPC_ASSOCIATION,
+        ) else {
+            return Err(not_found(
+                &input.service_network_vpc_association_identifier,
+            ));
+        };
+        let now = std::time::SystemTime::now();
+        let store = state.lock();
+        let Some(association) = store.vpc_associations.get(&id) else {
+            return Err(not_found(
+                &input.service_network_vpc_association_identifier,
+            ));
+        };
+        Ok(GetServiceNetworkVpcAssociationOutput {
+            id: Some(association.id.clone()),
+            status: Some(association.status(now).to_string()),
+            arn: Some(association.arn.clone()),
+            created_by: Some(association.created_by.clone()),
+            created_at: Some(crate::state::timestamp(association.created_at)),
+            service_network_id: Some(association.service_network_id.clone()),
+            service_network_name: Some(association.service_network_name.clone()),
+            service_network_arn: Some(association.service_network_arn.clone()),
+            vpc_id: Some(association.vpc_id.clone()),
+            security_group_ids: association.security_group_ids.clone(),
+            private_dns_enabled: association.private_dns_enabled,
+            // `failureCode` and `failureMessage` report why an association FAILED, and
+            // nothing fails an association here: no create of this emulator answers one
+            // of the `*_FAILED` statuses, so there is no failure to report.
+            failure_message: None,
+            failure_code: None,
+            last_updated_at: Some(crate::state::timestamp(association.last_updated_at)),
+            dns_options: association.dns_options.clone(),
+        })
     }
 }

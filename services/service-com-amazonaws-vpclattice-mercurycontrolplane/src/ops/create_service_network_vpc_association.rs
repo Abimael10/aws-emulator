@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateServiceNetworkVpcAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateServiceNetworkVpcAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateServiceNetworkVpcAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -158,6 +149,36 @@ impl From<CreateServiceNetworkVpcAssociationErrorModeled> for CreateServiceNetwo
     }
 }
 
+/// HTTP 404 for an identifier that names no persisted resource of `kind`, built by the
+/// service's shared error construction ([`crate::state::resource_not_found`]): AWS's
+/// not-found message over the submitted identifier, and the kind's resource-type token.
+fn not_found(
+    identifier: &str,
+    kind: crate::state::ResourceKind,
+) -> CreateServiceNetworkVpcAssociationError {
+    CreateServiceNetworkVpcAssociationErrorModeled::ResourceNotFoundException(
+        crate::state::resource_not_found(kind, identifier),
+    )
+    .into()
+}
+
+/// The response for a stored association — every member this operation models, read back
+/// out of state, with the status the clock owes the record at `now`.
+fn output_of(
+    association: &crate::state::ServiceNetworkVpcAssociation,
+    now: std::time::SystemTime,
+) -> CreateServiceNetworkVpcAssociationOutput {
+    CreateServiceNetworkVpcAssociationOutput {
+        id: Some(association.id.clone()),
+        status: Some(association.status(now).to_string()),
+        arn: Some(association.arn.clone()),
+        created_by: Some(association.created_by.clone()),
+        security_group_ids: association.security_group_ids.clone(),
+        private_dns_enabled: association.private_dns_enabled,
+        dns_options: association.dns_options.clone(),
+    }
+}
+
 /// The `CreateServiceNetworkVpcAssociation` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -194,18 +215,161 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateServiceNetworkVpcAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateServiceNetworkVpcAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateServiceNetworkVpcAssociation"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateServiceNetworkVpcAssociationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the vpc-lattice state store is unavailable".to_string(),
+                        retry_after_seconds: None,
+                    },
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::region_of(ctx.parts());
+        let now = std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The modelled `TagMap` ceiling, which the boundary does not refuse here.
+        if let Err(violation) = crate::state::check_tag_count(input.tags.as_ref()) {
+            return Err(
+                CreateServiceNetworkVpcAssociationErrorModeled::ValidationException(
+                    crate::state::validation_exception(&[violation]),
+                )
+                .into(),
+            );
+        }
+
+        // `serviceNetworkIdentifier` is "the ID or ARN of the service network", so it
+        // resolves in either modelled form.
+        let requested_network = crate::state::id_from_identifier(
+            &input.service_network_identifier,
+            crate::state::PREFIX_SERVICE_NETWORK,
+        );
+
+        // `clientToken` is an @idempotencyToken: a retry carrying the token of a
+        // completed create answers with that same association — and, as that member's
+        // documentation says, "If the parameters aren't identical, the retry fails."
+        let token = input
+            .client_token
+            .as_deref()
+            .map(|token| crate::state::token_key(Self::NAME, token));
+        if let Some(existing) = token
+            .as_ref()
+            .and_then(|key| store.idempotency_tokens.get(key))
+            .and_then(|id| store.vpc_associations.get(id))
+        {
+            if requested_network.as_ref() != Some(&existing.service_network_id)
+                || input.vpc_identifier != existing.vpc_id
+            {
+                return Err(
+                    CreateServiceNetworkVpcAssociationErrorModeled::ConflictException(
+                        // No recording covers a clientToken replayed with different
+                        // parameters, so this message keeps its own wording; the
+                        // identifier of the conflicting association is in it and the
+                        // resourceType token comes from the shared path.
+                        crate::state::conflict(
+                            crate::state::ResourceKind::VpcAssociation,
+                            &existing.id,
+                            format!(
+                                "Association {} was already created with this clientToken for {} and {}.",
+                                existing.id, existing.service_network_arn, existing.vpc_id
+                            ),
+                        ),
+                    )
+                    .into(),
+                );
+            }
+            return Ok(output_of(existing, now));
+        }
+
+        // The service network must name something actually persisted.
+        let Some(network) = requested_network
+            .as_ref()
+            .and_then(|id| store.service_networks.get(id))
+            .cloned()
+        else {
+            return Err(not_found(
+                &input.service_network_identifier,
+                crate::state::ResourceKind::ServiceNetwork,
+            ));
+        };
+
+        // One VPC is associated with one service network at most once, so a second
+        // association of the same pair is refused instead of minting a duplicate; the
+        // message names both sides the association links, the way the service-association
+        // conflict names its two.
+        if let Some(existing) = store.vpc_association_of(&network.id, &input.vpc_identifier) {
+            return Err(
+                CreateServiceNetworkVpcAssociationErrorModeled::ConflictException(
+                    crate::state::conflict(
+                        crate::state::ResourceKind::VpcAssociation,
+                        &existing.id,
+                        crate::state::duplicate_association_message(
+                            &existing.service_network_arn,
+                            &existing.vpc_id,
+                        ),
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        // The emulator's own ceiling on stored associations, answered with the modelled
+        // 402 so a caller looping on create cannot grow this process without bound.
+        if store.vpc_associations.len() >= crate::state::MAX_VPC_ASSOCIATIONS {
+            return Err(
+                CreateServiceNetworkVpcAssociationErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "this account already holds the maximum of {} service network VPC associations",
+                            crate::state::MAX_VPC_ASSOCIATIONS
+                        ),
+                        resource_id: None,
+                        resource_type: crate::state::ResourceKind::VpcAssociation
+                            .wire_type()
+                            .to_string(),
+                        service_code: crate::state::ARN_SERVICE.to_string(),
+                        quota_code: "service-network-vpc-associations-per-account".to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let id = crate::state::mint_id(crate::state::PREFIX_VPC_ASSOCIATION);
+        let sequence = store.next_sequence();
+        let record = crate::state::ServiceNetworkVpcAssociation {
+            arn: crate::state::arn_for(&region, crate::state::KIND_VPC_ASSOCIATION, &id),
+            id: id.clone(),
+            created_by: crate::state::account_id().to_string(),
+            created_at: now,
+            last_updated_at: now,
+            // Association is asynchronous: CREATE_IN_PROGRESS until this stored due
+            // instant passes, then ACTIVE.
+            active_at: now + crate::state::CREATE_TRANSITION,
+            service_network_id: network.id.clone(),
+            service_network_arn: network.arn.clone(),
+            service_network_name: network.name.clone(),
+            vpc_id: input.vpc_identifier.clone(),
+            // "Security groups aren't added by default", so a create that sent none
+            // stores none rather than an empty list.
+            security_group_ids: input
+                .security_group_ids
+                .clone()
+                .filter(|groups| !groups.is_empty()),
+            private_dns_enabled: input.private_dns_enabled,
+            dns_options: input.dns_options.clone(),
+            tags: input.tags.clone().unwrap_or_default(),
+            sequence,
+        };
+
+        if let Some(key) = token {
+            store.idempotency_tokens.record(key, id.clone());
+        }
+        // Read back out of the store it was just written to, so the response is the
+        // persisted record and not a second copy of it.
+        let stored = store.vpc_associations.entry(id).or_insert(record);
+        Ok(output_of(stored, now))
     }
 }

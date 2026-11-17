@@ -201,10 +201,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             sharing_config: Some(SharingConfig {
                 enabled: Some(network.sharing_enabled),
             }),
-            // Counted from the persisted associations, never from a stored counter. VPC
-            // associations have no handler yet (CreateServiceNetworkVpcAssociation is
-            // still a 501), so none can be persisted and the count is 0.
-            number_of_associated_vp_cs: Some(0),
+            // Counted from the persisted associations, never from a stored counter.
+            number_of_associated_vp_cs: Some(store.associated_vpc_count(&id)),
             number_of_associated_services: Some(store.associated_service_count(&id)),
         })
     }

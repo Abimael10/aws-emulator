@@ -2,7 +2,8 @@
 
 //! Engine state for the com-amazonaws-vpclattice-mercurycontrolplane service.
 //!
-//! One store holds the service-network / service / service-association / listener /
+//! One store holds the service-network / service / service-association /
+//! VPC-association / listener /
 //! listener-rule / resource-policy slice, and the
 //! helpers every handler in `src/ops/` shares live here too: identifier resolution
 //! (bare id or ARN), id and ARN minting, the request's region, and the clock-owed
@@ -19,9 +20,15 @@
 //! three operations of the target slice share ([`target_health`](
 //! ComAmazonawsVpclatticeMercurycontrolplaneState::target_health), [`check_target_owner`],
 //! [`deregister_targets`](ComAmazonawsVpclatticeMercurycontrolplaneState::deregister_targets)).
+//!
+//! What a service-network/VPC association HOLDS, and how many of them a service network
+//! still has, live in the `vpc_associations` child module
+//! ([`ServiceNetworkVpcAssociation`], [`associated_vpc_count`](
+//! ComAmazonawsVpclatticeMercurycontrolplaneState::associated_vpc_count)).
 
 mod announced_dns;
 mod targets;
+mod vpc_associations;
 
 pub use announced_dns::{announced_dns_entry, announced_dns_name, AnnouncedService};
 pub use targets::{
@@ -30,6 +37,7 @@ pub use targets::{
     TARGET_FAILURE_TARGET_NOT_FOUND, TARGET_REASON_HEALTH_CHECK_DISABLED,
     TARGET_REASON_HEALTH_CHECK_NOT_SUPPORTED, TARGET_STATUS_DRAINING,
 };
+pub use vpc_associations::ServiceNetworkVpcAssociation;
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
@@ -52,6 +60,9 @@ pub const KIND_SERVICE_NETWORK: &str = "servicenetwork";
 pub const KIND_SERVICE: &str = "service";
 /// The ARN resource kind of a service-network/service association.
 pub const KIND_SERVICE_ASSOCIATION: &str = "servicenetworkserviceassociation";
+/// The ARN resource kind of a service-network/VPC association
+/// (`ServiceNetworkVpcAssociationArn`'s modelled pattern).
+pub const KIND_VPC_ASSOCIATION: &str = "servicenetworkvpcassociation";
 /// The ARN resource kind of a listener. A listener ARN nests under its service's:
 /// `…:service/svc-…/listener/listener-…` (`ListenerArn`'s modelled pattern).
 pub const KIND_LISTENER: &str = "listener";
@@ -71,6 +82,8 @@ pub const PREFIX_SERVICE_NETWORK: &str = "sn-";
 pub const PREFIX_SERVICE: &str = "svc-";
 /// The id prefix of a service-network/service association (`^snsa-[0-9a-z]{17}$`).
 pub const PREFIX_SERVICE_ASSOCIATION: &str = "snsa-";
+/// The id prefix of a service-network/VPC association (`^snva-[0-9a-z]{17}$`).
+pub const PREFIX_VPC_ASSOCIATION: &str = "snva-";
 /// The id prefix of a listener (`^listener-[0-9a-z]{17}$`).
 pub const PREFIX_LISTENER: &str = "listener-";
 /// The id prefix of a listener rule (`^rule-[0-9a-z]{17}$`).
@@ -106,6 +119,8 @@ pub enum ResourceKind {
     Service,
     /// A service-network/service association (`snsa-…`).
     ServiceAssociation,
+    /// A service-network/VPC association (`snva-…`).
+    VpcAssociation,
     /// A listener of a service (`listener-…`).
     Listener,
     /// A rule of a listener (`rule-…`).
@@ -118,7 +133,7 @@ pub enum ResourceKind {
 
 impl ResourceKind {
     /// How many kinds there are, so a per-kind cache can hold one slot each.
-    pub const COUNT: usize = 7;
+    pub const COUNT: usize = 8;
 
     /// This kind's slot in a per-kind array ([`Self::COUNT`] wide).
     pub const fn slot(self) -> usize {
@@ -130,6 +145,7 @@ impl ResourceKind {
             Self::Rule => 4,
             Self::TargetGroup => 5,
             Self::ResourceConfiguration => 6,
+            Self::VpcAssociation => 7,
         }
     }
 
@@ -140,6 +156,7 @@ impl ResourceKind {
             Self::ServiceNetwork => KIND_SERVICE_NETWORK,
             Self::Service => KIND_SERVICE,
             Self::ServiceAssociation => KIND_SERVICE_ASSOCIATION,
+            Self::VpcAssociation => KIND_VPC_ASSOCIATION,
             Self::Listener => KIND_LISTENER,
             Self::Rule => KIND_RULE,
             Self::TargetGroup => KIND_TARGET_GROUP,
@@ -153,6 +170,7 @@ impl ResourceKind {
             Self::ServiceNetwork => PREFIX_SERVICE_NETWORK,
             Self::Service => PREFIX_SERVICE,
             Self::ServiceAssociation => PREFIX_SERVICE_ASSOCIATION,
+            Self::VpcAssociation => PREFIX_VPC_ASSOCIATION,
             Self::Listener => PREFIX_LISTENER,
             Self::Rule => PREFIX_RULE,
             Self::TargetGroup => PREFIX_TARGET_GROUP,
@@ -175,6 +193,7 @@ impl ResourceKind {
             Self::ServiceNetwork => "SERVICE_NETWORK",
             Self::Service => "SERVICE",
             Self::ServiceAssociation => "SERVICE_NETWORK_SERVICE_ASSOCIATION",
+            Self::VpcAssociation => "SERVICE_NETWORK_VPC_ASSOCIATION",
             Self::Listener => "LISTENER",
             Self::Rule => "RULE",
             Self::TargetGroup => "TARGET_GROUP",
@@ -197,7 +216,7 @@ impl ResourceKind {
         match self {
             Self::ServiceNetwork => "ServiceNetwork",
             Self::Service => "Service",
-            Self::ServiceAssociation => "Association",
+            Self::ServiceAssociation | Self::VpcAssociation => "Association",
             Self::Listener => "Listener",
             Self::Rule => "Rule",
             Self::TargetGroup => "TargetGroup",
@@ -213,7 +232,7 @@ impl ResourceKind {
         match self {
             Self::ServiceNetwork => "service network",
             Self::Service => "service",
-            Self::ServiceAssociation => "association",
+            Self::ServiceAssociation | Self::VpcAssociation => "association",
             Self::Listener => "listener",
             Self::Rule => "rule",
             Self::TargetGroup => "target group",
@@ -246,7 +265,7 @@ impl ResourceKind {
             Self::Rule => Some(RULE_NAME_PATTERN),
             Self::TargetGroup => Some(TARGET_GROUP_NAME_PATTERN),
             Self::ResourceConfiguration => Some(RESOURCE_CONFIGURATION_NAME_PATTERN),
-            Self::ServiceAssociation => None,
+            Self::ServiceAssociation | Self::VpcAssociation => None,
         }
     }
 }
@@ -299,6 +318,10 @@ pub const MAX_SERVICES: usize = 1_000;
 /// reasoning, and `CreateServiceNetworkServiceAssociation` models the same
 /// `ServiceQuotaExceededException`.
 pub const MAX_SERVICE_ASSOCIATIONS: usize = 1_000;
+
+/// How many service-network/VPC associations this emulator will hold. Same reasoning, and
+/// `CreateServiceNetworkVpcAssociation` models the same `ServiceQuotaExceededException`.
+pub const MAX_VPC_ASSOCIATIONS: usize = 1_000;
 
 /// How many listeners this emulator will hold for one service. Same reasoning as the
 /// ceilings above, and `CreateListener` models the same `ServiceQuotaExceededException`.
@@ -1484,6 +1507,8 @@ pub struct ComAmazonawsVpclatticeMercurycontrolplaneState {
     pub services: HashMap<String, LatticeService>,
     /// Keyed by `snsa-…` id. At most [`MAX_SERVICE_ASSOCIATIONS`] entries.
     pub service_associations: HashMap<String, ServiceNetworkServiceAssociation>,
+    /// Keyed by `snva-…` id. At most [`MAX_VPC_ASSOCIATIONS`] entries.
+    pub vpc_associations: HashMap<String, ServiceNetworkVpcAssociation>,
     /// Keyed by `listener-…` id. At most [`MAX_LISTENERS_PER_SERVICE`] entries per
     /// service, and every listener of a deleted service goes with it
     /// ([`ComAmazonawsVpclatticeMercurycontrolplaneState::remove_listeners_of`]).
@@ -1937,6 +1962,7 @@ impl ComAmazonawsVpclatticeMercurycontrolplaneState {
             ResourceKind::ServiceNetwork => self.service_networks.contains_key(id),
             ResourceKind::Service => self.services.contains_key(id),
             ResourceKind::ServiceAssociation => self.service_associations.contains_key(id),
+            ResourceKind::VpcAssociation => self.vpc_associations.contains_key(id),
             ResourceKind::Listener => self.listeners.contains_key(id),
             ResourceKind::Rule => self.rules.contains_key(id),
             ResourceKind::TargetGroup => self.target_groups.contains_key(id),
@@ -2355,6 +2381,7 @@ pub fn check_resource_name(
 /// one slot per kind.
 fn compiled_pattern(kind: ResourceKind) -> Option<&'static ::fancy_regex::Regex> {
     static COMPILED: [::std::sync::OnceLock<::fancy_regex::Regex>; ResourceKind::COUNT] = [
+        ::std::sync::OnceLock::new(),
         ::std::sync::OnceLock::new(),
         ::std::sync::OnceLock::new(),
         ::std::sync::OnceLock::new(),
