@@ -103,12 +103,28 @@ pub const INVALID_PAGINATION_TOKEN_MESSAGE: &str = "Invalid pagination token";
 /// byte for byte.
 pub const INVALID_PARAMETERS_MESSAGE: &str = "Request has invalid parameters";
 
-/// The fixed text an analysis that needs a face to work on is refused with when the
-/// image it was given carries none — `CompareFaces` "returns an InvalidParameterException
-/// error" when "no faces are detected in the source or target images". It is AWS's
-/// wording for that class and interpolates nothing: neither which of the two images it
-/// was nor anything else from the request, both of which the caller already knows.
+/// The fixed text `CompareFaces` refuses an image carrying no comparable face with — it
+/// "returns an InvalidParameterException error" when "no faces are detected in the source
+/// or target images". That operation answers the condition with the class's generic
+/// sentence: it names neither which of the two images it was nor anything else from the
+/// request, both of which the caller already holds.
+///
+/// A search BY IMAGE words the same condition differently
+/// ([`NO_FACE_TO_SEARCH_BY_MESSAGE`]), which is why this is a wording per refusal and not
+/// one sentence for every operation that needs a face — as with the two wordings of a
+/// collection that does not exist above.
 pub const NO_FACE_IN_IMAGE_MESSAGE: &str = INVALID_PARAMETERS_MESSAGE;
+
+/// The fixed text a search BY IMAGE is refused with when the submitted image carries no
+/// face to search the collection by: "if no faces are detected in the input image,
+/// SearchFacesByImage returns an InvalidParameterException error"
+/// (`smithy_query(query="operation",operation="SearchFacesByImage")`). A search by image
+/// starts from the single largest face of the image, so an image that yields none leaves
+/// the operation nothing to search by, and the refusal reports that condition and the
+/// number of faces the operation needs. It interpolates nothing — no collection id,
+/// threshold, cap or count — so every refusal of this condition carries it byte for byte.
+pub const NO_FACE_TO_SEARCH_BY_MESSAGE: &str =
+    "There are no faces in the image. Should be at least 1.";
 
 /// The server fault a handler answers with when this service's store cannot be reached.
 pub fn store_unavailable() -> InternalServerError {
@@ -166,10 +182,16 @@ pub fn resource_arn_not_found(resource_arn: &str) -> ResourceNotFoundException {
     ResourceNotFoundException::with_message(format!("The resource {resource_arn} does not exist"))
 }
 
-/// A submitted image in which the analysis found no face to work on; see
+/// A submitted image in which a comparison found no face to work on; see
 /// [`NO_FACE_IN_IMAGE_MESSAGE`].
 pub fn no_face_in_image() -> InvalidParameterException {
     InvalidParameterException::with_message(NO_FACE_IN_IMAGE_MESSAGE)
+}
+
+/// A submitted image a search by image is left no face to search by from; see
+/// [`NO_FACE_TO_SEARCH_BY_MESSAGE`].
+pub fn no_face_to_search_by() -> InvalidParameterException {
+    InvalidParameterException::with_message(NO_FACE_TO_SEARCH_BY_MESSAGE)
 }
 
 /// A request whose parameters do not identify what the operation is to work on; see

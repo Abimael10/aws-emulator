@@ -63,6 +63,19 @@ const LATEST_FACE_MODEL_VERSION: &str = "7.0";
 /// order: nothing documents where its bar sits.
 const QUALITY_LEVELS: [&str; 4] = ["NONE", "LOW", "MEDIUM", "HIGH"];
 
+/// The `Message` a search by image is refused with when the submitted image leaves it no
+/// face to search by: "if no faces are detected in the input image, SearchFacesByImage
+/// returns an InvalidParameterException error"
+/// (`smithy_query(query="operation",operation="SearchFacesByImage")`), which the service
+/// words as this one sentence. It is entirely fixed text: nothing of the request or of the
+/// collection is interpolated into it.
+const NO_FACE_TO_SEARCH_BY_MESSAGE: &str = "There are no faces in the image. Should be at least 1.";
+
+/// The generic `Message` of the same modelled class, which `CompareFaces` answers an image
+/// with no comparable face with. The two refusals of one exception class are worded by the
+/// operation that answers them, so a search by image must not fall back to this one.
+const INVALID_PARAMETERS_MESSAGE: &str = "Request has invalid parameters";
+
 /// The upright portrait most cases index and search with.
 fn upright() -> Portrait {
     Portrait::one_face()
@@ -688,7 +701,7 @@ async fn the_quality_filter_only_narrows_what_is_searched() {
                     &reply,
                     400,
                     "InvalidParameterException",
-                    "Request has invalid parameters",
+                    NO_FACE_TO_SEARCH_BY_MESSAGE,
                 );
                 0
             };
@@ -793,7 +806,7 @@ async fn an_image_the_search_cannot_use_is_refused_with_the_reason() {
             &search(&router, "refusals", &submitted, json!({})).await,
             400,
             "InvalidParameterException",
-            "Request has invalid parameters",
+            NO_FACE_TO_SEARCH_BY_MESSAGE,
         );
     }
 
@@ -896,6 +909,150 @@ async fn searching_by_image_changes_nothing() {
         read_collection(&router).await,
         before,
         "a search must leave the collection exactly as it found it"
+    );
+}
+
+/// THE RULE: a search by image that is left no face to search by is refused with HTTP 400
+/// `InvalidParameterException` whose `Message` reports THAT condition
+/// ([`NO_FACE_TO_SEARCH_BY_MESSAGE`]), and that sentence is fixed text — it does not vary
+/// with the image, with the other members of the request, or with what the collection
+/// holds.
+///
+/// The table spans what the rule generalises over: how the image comes to carry no face
+/// (flat, dark, bright, a head drawn without features), its size and its encoder, the
+/// members the request carries beside the image (each published bound of the threshold and
+/// of the cap, the quality levels that filter nothing and that let the service choose), and
+/// whether the collection searched holds any face at all.
+#[tokio::test]
+async fn an_image_with_no_face_to_search_by_names_that_condition() {
+    let router = harness();
+    collection_of(&router, "named-refusal", &upright().png()).await;
+    // A collection holding no face at all: the image is refused for itself, so what the
+    // collection holds cannot change the answer.
+    create_collection(&router, "empty-refusal").await;
+
+    // Pictures the detector measures no face in, differing in tone, size and encoder.
+    let faceless: Vec<(&str, Vec<u8>)> = vec![
+        ("a flat mid-tone image", Portrait::blank(240, 240, 200).png()),
+        ("a dark wide image", Portrait::blank(320, 200, 20).png()),
+        ("a bright small image", Portrait::blank(64, 64, 250).png()),
+        (
+            "a flat image through a lossy encoder",
+            encode(
+                &Portrait::blank(200, 160, 150).render(),
+                image::ImageFormat::Jpeg,
+            ),
+        ),
+        (
+            "a head drawn without features",
+            Portrait::one_face().with_tones(110, 190, 190).png(),
+        ),
+    ];
+    // What a search carries beside the image, across the bounds the model publishes for
+    // each member.
+    let variants: Vec<(&str, Value)> = vec![
+        ("no other member", json!({})),
+        (
+            "the threshold at its published minimum",
+            json!({ "FaceMatchThreshold": PERCENT_MIN }),
+        ),
+        (
+            "the threshold at its published maximum",
+            json!({ "FaceMatchThreshold": PERCENT_MAX }),
+        ),
+        ("the cap at its published minimum", json!({ "MaxFaces": MAX_FACES_MIN })),
+        ("the cap at its published maximum", json!({ "MaxFaces": MAX_FACES_MAX })),
+        ("no filtering at all", json!({ "QualityFilter": "NONE" })),
+        (
+            "the quality bar left to the service",
+            json!({ "QualityFilter": "AUTO" }),
+        ),
+    ];
+    for (image_index, (image_case, submitted)) in faceless.iter().enumerate() {
+        for (variant_index, (variant_case, extra)) in variants.iter().enumerate() {
+            // Both collection states are covered without searching every pair twice.
+            let collection = if (image_index + variant_index) % 2 == 0 {
+                "named-refusal"
+            } else {
+                "empty-refusal"
+            };
+            let case = format!("{image_case} searched in {collection} with {variant_case}");
+            assert_refused(
+                &case,
+                &search(&router, collection, submitted, extra.clone()).await,
+                400,
+                "InvalidParameterException",
+                NO_FACE_TO_SEARCH_BY_MESSAGE,
+            );
+        }
+    }
+}
+
+/// The condition is the IMAGE's, so it is reported the same way whether the image arrived
+/// inline or was read out of the emulator's own Amazon S3.
+#[tokio::test]
+async fn the_no_face_refusal_is_the_same_for_an_s3_sourced_image() {
+    let router = harness_with_object_store();
+    assert_eq!(
+        s3(&router, &format!("/{BUCKET}"), &[]).await,
+        200,
+        "the image bucket must be created first"
+    );
+    collection_of(&router, "s3-refusal", &upright().png()).await;
+    let faceless = Portrait::blank(240, 240, 200).png();
+    assert_eq!(
+        s3(&router, &format!("/{BUCKET}/faceless.png"), &faceless).await,
+        200,
+        "the faceless object must be stored"
+    );
+    for (case, image) in [
+        ("the image inline", bytes_image(&faceless)),
+        (
+            "the image from S3",
+            json!({ "S3Object": { "Bucket": BUCKET, "Name": "faceless.png" } }),
+        ),
+    ] {
+        assert_refused(
+            case,
+            &search_image(&router, "s3-refusal", image, json!({})).await,
+            400,
+            "InvalidParameterException",
+            NO_FACE_TO_SEARCH_BY_MESSAGE,
+        );
+    }
+}
+
+/// The wording belongs to the REFUSAL, not to the modelled class: `CompareFaces` answers an
+/// image with no comparable face with the class's generic sentence, and a search by image
+/// answers the condition by name, on the very same pixels.
+#[tokio::test]
+async fn the_generic_class_wording_stays_with_the_refusal_that_uses_it() {
+    let router = harness();
+    let face = upright().png();
+    collection_of(&router, "wording", &face).await;
+    let faceless = Portrait::blank(240, 240, 200).png();
+
+    assert_refused(
+        "a search by a faceless image",
+        &search(&router, "wording", &faceless, json!({})).await,
+        400,
+        "InvalidParameterException",
+        NO_FACE_TO_SEARCH_BY_MESSAGE,
+    );
+    assert_refused(
+        "a comparison from the same faceless image",
+        &call(
+            &router,
+            "CompareFaces",
+            json!({
+                "SourceImage": bytes_image(&faceless),
+                "TargetImage": bytes_image(&face),
+            }),
+        )
+        .await,
+        400,
+        "InvalidParameterException",
+        INVALID_PARAMETERS_MESSAGE,
     );
 }
 

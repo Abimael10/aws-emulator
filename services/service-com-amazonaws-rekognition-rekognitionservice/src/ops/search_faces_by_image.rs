@@ -9,8 +9,10 @@
 //! searched for — the detector reports faces largest first, so it is the first of them. An
 //! image left with no such face is refused as a bad parameter, which is what the operation
 //! documents: "if no faces are detected in the input image, SearchFacesByImage returns an
-//! InvalidParameterException error". A collection the store does not hold is answered as
-//! not found before the image is read at all.
+//! InvalidParameterException error", and the refusal reports THAT condition rather than the
+//! class's generic sentence (`crate::state::modeled_error::no_face_to_search_by`). A
+//! collection the store does not hold is answered as not found before the image is read at
+//! all.
 //!
 //! What a match is, is MEASURED: each face `IndexFaces` stored kept the appearance the
 //! detector read off its own pixels (`crate::state::StoredFace::appearance`), so the
@@ -258,10 +260,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         detected.retain(|face| face.meets_quality_bar(bar));
 
         // "First detects the largest face in the image, and then searches the specified
-        // collection for matching faces" — the detector reports faces largest first.
+        // collection for matching faces" — the detector reports faces largest first. An
+        // image left with none is refused for that condition by name: the refusal reports
+        // that the image carries no face and that the search needs one, rather than the
+        // class's generic sentence, which says nothing about which parameter was wrong.
         let Some(searched) = detected.into_iter().next() else {
             return Err(SearchFacesByImageErrorModeled::InvalidParameterException(
-                crate::state::modeled_error::no_face_in_image(),
+                crate::state::modeled_error::no_face_to_search_by(),
             )
             .into());
         };
