@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end tests for the AgentCore identity plane's
-//! `GetWorkloadAccessTokenForUserId`.
+//! End-to-end tests for the AgentCore identity plane's `GetWorkloadAccessTokenForUserId`
+//! and `GetWorkloadAccessToken`.
 //!
 //! The rule under test: obtaining a workload access token MINTS one — a compact JWS whose
 //! claims are computed from the request (the workload identity the `workloadName`
@@ -11,6 +11,9 @@
 //! records the issuance so this service resolves a token it minted back to the workload
 //! and user it names until that instant and no longer. Every call mints its own token, and
 //! a request outside a modelled constraint is refused without recording anything.
+//!
+//! `GetWorkloadAccessToken` is the same mint for a workload acting for NO user, so its
+//! token names the workload identity alone and its issuance records no user.
 //!
 //! Every case drives real HTTP through the same `MultiServiceRouter` the emulator serves
 //! with, so the wire shape (route, status code, `restJson1` body, modelled error code) is
@@ -32,6 +35,10 @@ const ROUTE: &str = "/identities/GetWorkloadAccessTokenForUserId";
 /// The canonical account every ARN this emulator emits carries.
 const ACCOUNT: &str = "000000000000";
 
+/// `GetWorkloadAccessToken`: `POST /identities/GetWorkloadAccessToken` (source:
+/// smithy_query query="operation" operation="GetWorkloadAccessToken": `http`).
+const WORKLOAD_ROUTE: &str = "/identities/GetWorkloadAccessToken";
+
 /// The emulator, with request authentication off so a test signs nothing, plus the shared
 /// engine so a case can read the issuance the handler recorded.
 fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
@@ -50,9 +57,27 @@ async fn get_token(
     region: &str,
     body: Value,
 ) -> (u16, Value) {
+    post(router, region, ROUTE, body).await
+}
+
+/// The same for `GetWorkloadAccessToken`, the mint of a workload acting for no user.
+async fn get_workload_token(
+    router: &MultiServiceRouter,
+    region: &str,
+    body: Value,
+) -> (u16, Value) {
+    post(router, region, WORKLOAD_ROUTE, body).await
+}
+
+async fn post(
+    router: &MultiServiceRouter,
+    region: &str,
+    route: &str,
+    body: Value,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
-        .uri(format!("https://bedrock-agentcore.{region}.amazonaws.com{ROUTE}"))
+        .uri(format!("https://bedrock-agentcore.{region}.amazonaws.com{route}"))
         .header(
             "authorization",
             format!(
@@ -485,4 +510,243 @@ fn a_write_prunes_what_expired_and_holds_the_ceiling() {
         Some("ceiling.agent".to_string()),
         "case at the ceiling: expected the newest issuance to stay resolvable"
     );
+}
+
+/// `GetWorkloadAccessToken` mints a token for the workload itself: its claims name the
+/// workload identity the request addressed and the issuer of the region it was signed for,
+/// its subject is that workload rather than any user, and the issuance it records names no
+/// user and resolves until its own expiry and no longer.
+///
+/// Rows differ along the workload name (both published bounds of
+/// `WorkloadIdentityNameType`'s 3..255 length, and every character class its
+/// `^[A-Za-z0-9_.-]+$` pattern admits) and the signed region, which is what the issuing
+/// authority and the resource ARN are computed from (source: smithy_query query="operation"
+/// operation="GetWorkloadAccessToken").
+#[tokio::test]
+async fn a_token_minted_for_the_workload_itself_names_no_user() {
+    let (router, engine) = emulator();
+
+    let cases: Vec<(&str, &str, String)> = vec![
+        ("shortest-workload", "us-east-1", "abc".to_string()),
+        (
+            "every-character-class-the-pattern-admits",
+            "us-east-1",
+            "Agent_0.workload-9".to_string(),
+        ),
+        ("longest-workload", "eu-west-2", "w".repeat(255)),
+        (
+            "another-region-signs-another-issuer",
+            "ap-southeast-2",
+            "payments.agent".to_string(),
+        ),
+    ];
+
+    let mut minted: BTreeSet<String> = BTreeSet::new();
+    for (case, region, workload) in cases {
+        let before = SystemTime::now();
+        let (status, body) =
+            get_workload_token(&router, region, json!({"workloadName": workload})).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from GetWorkloadAccessToken, got {status} with \
+             {body:?}"
+        );
+        let token = text(&body, "workloadAccessToken").to_string();
+        // `WorkloadIdentityTokenType` is len 1..131072.
+        assert!(
+            (1..=131_072).contains(&token.len()),
+            "case {case:?}: expected a token inside the modelled 1..131072 length, got {} \
+             characters",
+            token.len()
+        );
+        assert!(
+            minted.insert(token.clone()),
+            "case {case:?}: expected a token no earlier call minted, got one that repeats"
+        );
+
+        let (header, claims) = read_token(case, &token);
+        assert_eq!(
+            text(&header, "alg"),
+            "none",
+            "case {case:?}: expected an unsecured JWS header, got {header:?}"
+        );
+        assert_eq!(
+            text(&claims, "iss"),
+            format!("https://bedrock-agentcore.{region}.amazonaws.com"),
+            "case {case:?}: expected the issuer of the signed region, got {claims:?}"
+        );
+        assert_eq!(
+            text(&claims, "aud"),
+            format!(
+                "arn:aws:bedrock-agentcore:{region}:{ACCOUNT}:workload-identity-directory/default/workload-identity/{workload}"
+            ),
+            "case {case:?}: expected the workload identity the request named, got {claims:?}"
+        );
+        assert_eq!(
+            text(&claims, "workloadName"),
+            workload,
+            "case {case:?}: expected the workload the request named, got {claims:?}"
+        );
+        // This call acts for the workload itself, so the token speaks for no user: its
+        // subject is the workload, never a user id.
+        assert_eq!(
+            text(&claims, "sub"),
+            workload,
+            "case {case:?}: expected the workload itself as the subject, got {claims:?}"
+        );
+
+        let ttl = i64::try_from(agentcore::state::WORKLOAD_ACCESS_TOKEN_TTL.as_secs())
+            .expect("the time-to-live fits an i64");
+        let issued_at = claims.get("iat").and_then(Value::as_i64).unwrap_or_default();
+        let expires_at = claims.get("exp").and_then(Value::as_i64).unwrap_or_default();
+        assert_eq!(
+            expires_at - issued_at,
+            ttl,
+            "case {case:?}: expected a window of {ttl} seconds, got {claims:?}"
+        );
+        let signed_at = i64::try_from(
+            before
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("the clock is past the epoch")
+                .as_secs(),
+        )
+        .expect("the current instant fits an i64");
+        assert!(
+            (signed_at..=signed_at + 60).contains(&issued_at),
+            "case {case:?}: expected the token to be issued at the instant of the call \
+             ({signed_at}), got {issued_at}"
+        );
+
+        // The issuance was recorded, naming the workload and NO user, and it resolves until
+        // its own expiry and no longer.
+        let at_issue = issuance(&engine, &token, before);
+        assert_eq!(
+            at_issue,
+            Some((workload.to_string(), None)),
+            "case {case:?}: expected the recorded issuance to name the workload and no user, \
+             got {at_issue:?}"
+        );
+        let again = issuance(&engine, &token, before);
+        assert_eq!(
+            again, at_issue,
+            "case {case:?}: expected resolving a token twice to answer alike, got {again:?}"
+        );
+        let past_expiry = issuance(
+            &engine,
+            &token,
+            before + agentcore::state::WORKLOAD_ACCESS_TOKEN_TTL + Duration::from_secs(1),
+        );
+        assert_eq!(
+            past_expiry, None,
+            "case {case:?}: expected the issuance to stop resolving once its window has run \
+             out, got {past_expiry:?}"
+        );
+    }
+}
+
+/// Two calls naming the same workload are two tokens, and the mint for the workload itself
+/// records a different issuance from the mint that acts for a user, even for one workload:
+/// the token is minted per call, never looked up, and whether it speaks for a user is what
+/// the call asked for.
+#[tokio::test]
+async fn the_workload_mint_and_the_user_mint_record_different_issuances() {
+    let (router, engine) = emulator();
+
+    let mut for_workload: Vec<String> = Vec::new();
+    for attempt in 1..=3 {
+        let (status, body) =
+            get_workload_token(&router, "us-east-1", json!({"workloadName": "repeat.agent"})).await;
+        assert_eq!(
+            status, 200,
+            "case attempt-{attempt}: expected HTTP 200, got {status} with {body:?}"
+        );
+        for_workload.push(text(&body, "workloadAccessToken").to_string());
+    }
+    let distinct: BTreeSet<&String> = for_workload.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        for_workload.len(),
+        "expected one token per call, got {} distinct of {}",
+        distinct.len(),
+        for_workload.len()
+    );
+
+    let (status, body) = get_token(
+        &router,
+        "us-east-1",
+        json!({"workloadName": "repeat.agent", "userId": "user-7"}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case the-user-mint: expected HTTP 200, got {status} with {body:?}"
+    );
+    let for_user = text(&body, "workloadAccessToken").to_string();
+    assert!(
+        !distinct.contains(&for_user),
+        "case the-user-mint: expected a token of its own, got one the workload mint handed out"
+    );
+
+    let now = SystemTime::now();
+    for (index, token) in for_workload.iter().enumerate() {
+        let held = issuance(&engine, token, now);
+        assert_eq!(
+            held,
+            Some(("repeat.agent".to_string(), None)),
+            "case token-{index}: expected an issuance naming the workload and no user, got \
+             {held:?}"
+        );
+    }
+    let held = issuance(&engine, &for_user, now);
+    assert_eq!(
+        held,
+        Some(("repeat.agent".to_string(), Some("user-7".to_string()))),
+        "case the-user-mint: expected the issuance to name the user the call acted for, got \
+         {held:?}"
+    );
+    assert_eq!(
+        issuance_count(&engine),
+        for_workload.len() + 1,
+        "expected every minted token to be recorded as its own issuance"
+    );
+}
+
+/// A `GetWorkloadAccessToken` request outside a modelled constraint is refused with a 400
+/// `ValidationException` and mints nothing: one case on each side of
+/// `WorkloadIdentityNameType`'s 3..255 length, one outside its `^[A-Za-z0-9_.-]+$` pattern,
+/// and one missing the required member.
+#[tokio::test]
+async fn the_workload_mint_refuses_input_outside_a_modelled_constraint_with_400() {
+    let (router, engine) = emulator();
+
+    let cases: Vec<(&str, Value)> = vec![
+        ("workload-name-below-its-length", json!({"workloadName": "ab"})),
+        (
+            "workload-name-past-its-length",
+            json!({"workloadName": "w".repeat(256)}),
+        ),
+        (
+            "workload-name-outside-its-pattern",
+            json!({"workloadName": "demo agent!"}),
+        ),
+        ("no-workload-name-at-all", json!({})),
+    ];
+
+    for (case, request) in cases {
+        let (status, body) = get_workload_token(&router, "us-east-1", request).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {body:?}"
+        );
+        assert_eq!(
+            issuance_count(&engine),
+            0,
+            "case {case:?}: a refused request must mint and record nothing"
+        );
+    }
 }
