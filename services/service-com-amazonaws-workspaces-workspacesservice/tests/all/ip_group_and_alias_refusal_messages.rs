@@ -25,7 +25,11 @@
 //! * a `GroupName` another stored group already holds — a fixed prefix plus the
 //!   name the request asked for, verbatim, and nothing else: in particular not the
 //!   `GroupId` of the group that holds the name, which is a value this emulator
-//!   minted rather than one the caller sent.
+//!   minted rather than one the caller sent;
+//! * a tag request whose `ResourceId` names no stored resource — the sentence for
+//!   the resource CLASS the identifier's form places it in, the same one from every
+//!   tagging operation, and the shape's documentation sentence only for an
+//!   identifier that is of no class at all.
 //!
 //! Every case drives a real `MultiServiceRouter` with this service mounted on one
 //! shared engine (the harness is [`crate::workspace_lifecycle`]'s), so each
@@ -34,7 +38,7 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_workspaces_workspacesservice::state::{
     message_ip_group_name_taken, MAX_IP_GROUP_TEXT_CHARS, MESSAGE_CONNECTION_ALIAS_NOT_FOUND,
-    MESSAGE_IP_GROUP_NOT_FOUND,
+    MESSAGE_IP_GROUP_NOT_FOUND, MESSAGE_TAG_IP_GROUP_NOT_FOUND, MESSAGE_TAG_RESOURCE_NOT_FOUND,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -144,6 +148,19 @@ fn the_class_sentences_are_the_recorded_ones() {
         MESSAGE_IP_GROUP_NOT_FOUND, "Ip Group Id is not found.",
         "case \"an IP group that is not held\": the class sentence must stay the recorded \
          one, got {MESSAGE_IP_GROUP_NOT_FOUND:?}"
+    );
+    assert_eq!(
+        MESSAGE_TAG_IP_GROUP_NOT_FOUND, "The specified Ip Group could not be found.",
+        "case \"a tag request about an IP group that is not held\": the class sentence must \
+         stay the recorded one, got {MESSAGE_TAG_IP_GROUP_NOT_FOUND:?}"
+    );
+    // The two IP-group sentences are the service's own, and they are DIFFERENT: a
+    // request that resolves a `GroupId` is worded one way, a tag request about the
+    // same missing group another.
+    assert_ne!(
+        MESSAGE_TAG_IP_GROUP_NOT_FOUND, MESSAGE_IP_GROUP_NOT_FOUND,
+        "case \"the two IP-group sentences\": each call path keeps its own recorded wording, \
+         got {MESSAGE_TAG_IP_GROUP_NOT_FOUND:?}"
     );
     // One row per shape of name, to show the template is prefix + the name and
     // nothing else.
@@ -443,4 +460,169 @@ async fn a_duplicate_group_name_is_refused_with_the_requested_name_and_no_minted
             "case {case:?}: deleting the holding group must answer 200, got {status} with {body}"
         );
     }
+}
+
+/// Every operation that resolves a tag request's kind-agnostic `ResourceId`, as the
+/// request it takes about one id.
+///
+/// The three come from the model — `CreateTags`, `DescribeTags` and `DeleteTags`
+/// each take a required `ResourceId` (`NonEmptyString`, `len 1..`) and model
+/// `ResourceNotFoundException` (`httpError 400`), per
+/// `smithy_query(query="operation", operation="CreateTags,DescribeTags,DeleteTags")`
+/// — so one absent resource is asked about through each of them and must be refused
+/// the same way.
+fn tag_requests(resource_id: &str) -> Vec<(&'static str, Value)> {
+    vec![
+        ("DescribeTags", json!({ "ResourceId": resource_id })),
+        (
+            "CreateTags",
+            json!({
+                "ResourceId": resource_id,
+                "Tags": [{ "Key": "owner", "Value": "platform" }],
+            }),
+        ),
+        (
+            "DeleteTags",
+            json!({ "ResourceId": resource_id, "TagKeys": ["owner"] }),
+        ),
+    ]
+}
+
+/// The identifier forms a tag request's `ResourceId` can carry, with the sentence
+/// the class each form names is refused with.
+///
+/// The forms are the model's identifier patterns, from
+/// `smithy_query(query="shape", shape="WorkspaceId,IpGroupId,ConnectionAliasId,DirectoryId,BundleId")`:
+/// `WorkspaceId` `^ws-[0-9a-z]{8,63}$`, `IpGroupId` `^wsipg-[0-9a-z]{8,63}$`,
+/// `ConnectionAliasId` `^wsca-[0-9a-z]{8,63}$`, `DirectoryId`
+/// `^(d-[0-9a-f]{8,63}$)|(wsd-[0-9a-z]{8,63}$)$` and `BundleId`
+/// `^wsb-[0-9a-z]{8,63}$`. Each class is asked about with the shortest and the
+/// longest suffix its pattern admits, so the row varies along length as well as
+/// class. A class this service words no not-found sentence for falls back to the
+/// error SHAPE's documentation sentence, which is the only place that text is a
+/// correct answer.
+fn tag_refusal_table() -> Vec<(String, String, &'static str)> {
+    let mut rows: Vec<(String, String, &'static str)> = Vec::new();
+    let classes: [(&str, &str, &'static str); 5] = [
+        (
+            "a WorkSpace",
+            "ws-",
+            "The specified WorkSpace could not be found.",
+        ),
+        (
+            "an IP access control group",
+            "wsipg-",
+            "The specified Ip Group could not be found.",
+        ),
+        (
+            "a connection alias",
+            "wsca-",
+            MESSAGE_CONNECTION_ALIAS_NOT_FOUND,
+        ),
+        // Taggable per `CreateTagsRequest$ResourceId`, but this service words no
+        // not-found sentence of its own for either class.
+        ("a registered directory", "d-", MESSAGE_TAG_RESOURCE_NOT_FOUND),
+        ("a custom bundle", "wsb-", MESSAGE_TAG_RESOURCE_NOT_FOUND),
+    ];
+    for (class, prefix, expected) in classes {
+        // `d-` admits hex digits only; the other prefixes admit `[0-9a-z]`, so a
+        // digit suffix is valid for every class and a letter suffix spans the rest.
+        rows.push((
+            format!("{class}, the shortest id its pattern admits"),
+            format!("{prefix}00000000"),
+            expected,
+        ));
+        let longest = if prefix == "d-" { "f" } else { "z" };
+        rows.push((
+            format!("{class}, the longest id its pattern admits"),
+            format!("{prefix}{}", longest.repeat(63)),
+            expected,
+        ));
+    }
+    // An identifier of no WorkSpaces resource class at all: nothing places it, so
+    // the fallback sentence is what it gets.
+    rows.push((
+        "an id of no WorkSpaces resource class".to_string(),
+        "not-a-resource".to_string(),
+        MESSAGE_TAG_RESOURCE_NOT_FOUND,
+    ));
+    rows.push((
+        "an id whose prefix resembles no class".to_string(),
+        "wsxyz-00000000".to_string(),
+        MESSAGE_TAG_RESOURCE_NOT_FOUND,
+    ));
+    rows
+}
+
+#[tokio::test]
+async fn a_tag_request_about_an_absent_resource_is_refused_with_its_class_sentence() {
+    let (router, _engine) = emulator_with_engine();
+
+    // A stored group no case names, so every refusal below is about the requested id
+    // naming nothing rather than about an empty store.
+    let bystander = create_group(&router, &json!({ "GroupName": "grp-tag-bystander" })).await;
+
+    let mut rows = tag_refusal_table();
+    // A group that WAS stored and was deleted is absent for a second reason, and is
+    // refused with the same class sentence: the wording follows the id's class, not
+    // the resource's history.
+    let deleted = create_group(&router, &json!({ "GroupName": "grp-tag-doomed" })).await;
+    let (status, body) = call(&router, "DeleteIpGroup", &json!({ "GroupId": &deleted })).await;
+    assert_eq!(
+        status, 200,
+        "case \"deleting a stored group\": must answer 200, got {status} with {body}"
+    );
+    rows.push((
+        "an IP access control group already deleted".to_string(),
+        deleted,
+        MESSAGE_TAG_IP_GROUP_NOT_FOUND,
+    ));
+
+    for (how, resource_id, expected) in &rows {
+        for (operation, request) in tag_requests(resource_id) {
+            let case = format!("{operation} on {how} ({resource_id})");
+            let (status, body) = call(&router, operation, &request).await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: the refusal is an HTTP 400, got {status} with {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "ResourceNotFoundException",
+                "case {case:?}: the refusal is a ResourceNotFoundException, got {body}"
+            );
+            let message = error_message(&body);
+            assert_eq!(
+                &message, expected,
+                "case {case:?}: every tagging operation refuses the class with its one \
+                 sentence, expected {expected:?}, got {message:?}"
+            );
+            // Request-independent: the identifier the caller sent reaches the
+            // shape's `ResourceId` member, never the prose.
+            assert!(
+                !message.contains(resource_id.as_str()),
+                "case {case:?}: the message must not carry the requested ResourceId, got \
+                 {message:?}"
+            );
+            assert_eq!(
+                body["ResourceId"].as_str(),
+                Some(resource_id.as_str()),
+                "case {case:?}: ResourceId names the resource the caller asked for, got {body}"
+            );
+        }
+    }
+
+    // None of those refusals touched the group that IS stored, and a tag request
+    // about it is served rather than refused.
+    let (status, body) = call(&router, "DescribeTags", &json!({ "ResourceId": &bystander })).await;
+    assert_eq!(
+        status, 200,
+        "case \"the bystander survives\": DescribeTags must answer 200, got {status} with {body}"
+    );
+    assert_eq!(
+        body["TagList"],
+        json!([]),
+        "case \"the bystander survives\": the stored group holds the tags its create wrote, \
+         got {body}"
+    );
 }

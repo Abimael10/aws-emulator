@@ -24,15 +24,64 @@
 
 use super::*;
 
-/// The message a tag request naming an id this service holds no resource for is
-/// refused with.
+/// The message a tag request naming an id of no WorkSpaces resource class is
+/// refused with: the shape's own sentence, for an id this service can place in no
+/// class.
+///
+/// The FALLBACK of [`message_tag_resource_not_found`], not the whole answer: an id
+/// whose form does identify a resource class is refused with that class's
+/// sentence. Entirely fixed text either way — the id the caller asked about
+/// travels in the error shape's own `ResourceId` member ("The ID of the resource
+/// that could not be found").
+pub const MESSAGE_TAG_RESOURCE_NOT_FOUND: &str = "The resource could not be found.";
+
+/// The message a tag request naming an IP access control group this service holds
+/// no record for is refused with.
+///
+/// The tagging operations and the operations that take an `IpGroupId` word the
+/// SAME condition differently: this is the sentence a tag request carries, while
+/// a request that resolves a `GroupId` carries
+/// [`MESSAGE_IP_GROUP_NOT_FOUND`]. Both are recorded WorkSpaces wording, and both
+/// are entirely fixed: the group the caller named appears in neither.
+pub const MESSAGE_TAG_IP_GROUP_NOT_FOUND: &str = "The specified Ip Group could not be found.";
+
+/// The resource CLASS each identifier form names, as the sentence a tag refusal
+/// about that class carries.
+///
+/// The forms are the ones the model's identifier shapes fix — from
+/// `smithy_query(query="shape", shape="WorkspaceId,IpGroupId,ConnectionAliasId")`:
+/// `WorkspaceId` is `^ws-[0-9a-z]{8,63}$`, `IpGroupId` is
+/// `^wsipg-[0-9a-z]{8,63}$` and `ConnectionAliasId` is `^wsca-[0-9a-z]{8,63}$`,
+/// so the text up to and including the first `-` is what places an id in a class.
+/// Each sentence is the one recorded for a `ResourceNotFoundException` about that
+/// class. The classes the model also calls taggable but for which no wording of
+/// this error is established — registered directories, images and custom bundles —
+/// are deliberately absent: they take the fallback rather than an invented
+/// sentence.
+const TAG_RESOURCE_CLASS_MESSAGES: &[(&str, &str)] = &[
+    ("ws-", MESSAGE_WORKSPACE_NOT_FOUND),
+    ("wsipg-", MESSAGE_TAG_IP_GROUP_NOT_FOUND),
+    ("wsca-", MESSAGE_CONNECTION_ALIAS_NOT_FOUND),
+];
+
+/// The sentence a tag request's `ResourceNotFoundException` carries for
+/// `resource_id`.
 ///
 /// `CreateTags`, `DescribeTags` and `DeleteTags` take a kind-agnostic
-/// `ResourceId`, so an id that resolves to nothing names no resource KIND the
-/// refusal could name either: the message is the sentence for the class, entirely
-/// fixed, and the id the caller asked about travels in the error shape's own
-/// `ResourceId` member ("The ID of the resource that could not be found").
-pub const MESSAGE_TAG_RESOURCE_NOT_FOUND: &str = "The resource could not be found.";
+/// `ResourceId`, but the identifier itself names the resource class it belongs to,
+/// and the service words the refusal for THAT class — so a caller can tell a
+/// missing IP access control group from any other missing WorkSpaces resource.
+/// An id of no class this service places falls back to
+/// [`MESSAGE_TAG_RESOURCE_NOT_FOUND`].
+///
+/// One function for all three operations, so the same condition cannot be reported
+/// two ways.
+pub fn message_tag_resource_not_found(resource_id: &str) -> &'static str {
+    TAG_RESOURCE_CLASS_MESSAGES
+        .iter()
+        .find(|(prefix, _)| resource_id.starts_with(prefix))
+        .map_or(MESSAGE_TAG_RESOURCE_NOT_FOUND, |(_, message)| *message)
+}
 
 /// Why a tag request could not be served, as the modelled error the handler
 /// answers with.

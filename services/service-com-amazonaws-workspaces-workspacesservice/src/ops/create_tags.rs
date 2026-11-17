@@ -178,15 +178,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         match written {
             Ok(()) => Ok(CreateTagsOutput {}),
-            // The message is the sentence for this error class, entirely fixed —
-            // the operation's `ResourceId` is kind-agnostic, so a refusal has no
-            // resource kind to name — and the id the caller asked about travels in
-            // the shape's own `ResourceId` member ("The ID of the resource that
-            // could not be found").
+            // The message is the sentence for the resource CLASS the requested id
+            // names (`crate::state::message_tag_resource_not_found`), entirely
+            // fixed: the id the caller asked about travels in the shape's own
+            // `ResourceId` member ("The ID of the resource that could not be
+            // found"), not in the sentence.
             Err(crate::state::TagRefusal::NotFound) => {
                 Err(CreateTagsErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(crate::state::MESSAGE_TAG_RESOURCE_NOT_FOUND.to_string()),
+                        message: Some(
+                            crate::state::message_tag_resource_not_found(&input.resource_id)
+                                .to_string(),
+                        ),
                         resource_id: Some(input.resource_id.clone()),
                     },
                 )

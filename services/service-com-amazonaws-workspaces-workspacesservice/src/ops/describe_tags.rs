@@ -161,13 +161,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(tags) => Ok(DescribeTagsOutput {
                 tag_list: Some(tags),
             }),
-            // The message is the sentence for this error class, entirely fixed —
-            // the operation's `ResourceId` is kind-agnostic, so a refusal has no
-            // resource kind to name — and the id the caller asked about travels in
-            // the shape's own `ResourceId` member.
+            // The message is the sentence for the resource CLASS the requested id
+            // names (`crate::state::message_tag_resource_not_found`), entirely
+            // fixed: the id the caller asked about travels in the shape's own
+            // `ResourceId` member, not in the sentence.
             None => Err(DescribeTagsErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(crate::state::MESSAGE_TAG_RESOURCE_NOT_FOUND.to_string()),
+                    message: Some(
+                        crate::state::message_tag_resource_not_found(&input.resource_id)
+                            .to_string(),
+                    ),
                     resource_id: Some(input.resource_id.clone()),
                 },
             )

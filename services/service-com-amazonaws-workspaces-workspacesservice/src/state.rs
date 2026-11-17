@@ -51,7 +51,10 @@
 
 mod tags;
 
-pub use tags::{TagRefusal, MESSAGE_TAG_RESOURCE_NOT_FOUND};
+pub use tags::{
+    message_tag_resource_not_found, TagRefusal, MESSAGE_TAG_IP_GROUP_NOT_FOUND,
+    MESSAGE_TAG_RESOURCE_NOT_FOUND,
+};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::IpAddr;

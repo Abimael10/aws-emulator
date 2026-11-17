@@ -21,14 +21,15 @@
 //!   leave it holding more is refused with `ResourceLimitExceededException` and writes
 //!   nothing.
 //! * An id that names no resource this emulator holds is refused with
-//!   `ResourceNotFoundException` by all three operations, with the requested id reported
-//!   in the error's own `ResourceId` member.
+//!   `ResourceNotFoundException` by all three operations, worded for the resource class
+//!   the identifier places it in, with the requested id reported in the error's own
+//!   `ResourceId` member.
 
 use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_workspaces_workspacesservice::state::{
-    MAX_TAGS_PER_RESOURCE, MESSAGE_TAG_RESOURCE_NOT_FOUND,
+    message_tag_resource_not_found, MAX_TAGS_PER_RESOURCE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -226,6 +227,10 @@ fn assert_no_output_members(case: &str, body: &Value) {
 }
 
 /// Assert `(status, body)` is the refusal of an id that names no stored resource.
+///
+/// The sentence is the one the service words for the resource CLASS the identifier
+/// places it in; which sentence belongs to which class is pinned on literals in
+/// [`crate::ip_group_and_alias_refusal_messages`].
 fn assert_not_found(case: &str, resource_id: &str, status: u16, body: &Value) {
     assert_eq!(
         status, 400,
@@ -238,8 +243,9 @@ fn assert_not_found(case: &str, resource_id: &str, status: u16, body: &Value) {
     );
     assert_eq!(
         body["Message"].as_str().or_else(|| body["message"].as_str()),
-        Some(MESSAGE_TAG_RESOURCE_NOT_FOUND),
-        "case {case:?}: expected the fixed not-found sentence, got {body}"
+        Some(message_tag_resource_not_found(resource_id)),
+        "case {case:?}: expected the fixed not-found sentence of the id's resource class, \
+         got {body}"
     );
     assert_eq!(
         body["ResourceId"].as_str(),
