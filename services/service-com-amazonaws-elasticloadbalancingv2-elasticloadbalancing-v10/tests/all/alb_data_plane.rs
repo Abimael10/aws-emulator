@@ -28,6 +28,17 @@
 //! The clock-owed moves (a load balancer's to `active`, a registration's to `healthy`) are
 //! placed on either side of now in the store rather than slept for, exactly as
 //! `provisioning_loop::seed_trust_store` places a trust store's.
+//!
+//! One condition is about the CONNECTION rather than the request, so it has a table of its
+//! own at the end of this suite: **a `source-ip` condition is met exactly when the address
+//! the connection came from lies in one of the CIDR blocks it names, and never because of an
+//! `X-Forwarded-For` the client supplied** — `SourceIpConditionConfig$Values` is "the source
+//! IP addresses, in CIDR format … the condition is satisfied if the source IP address of the
+//! request matches one of the CIDR blocks. This condition is not satisfied by the addresses
+//! in the X-Forwarded-For header". Those rows are driven over a REAL connection to the
+//! published address, because the address a request comes from exists only on one, and the
+//! blocks each row is judged against are written through `ModifyRule` and read back through
+//! `DescribeRules` first. A second table pins which VALUES name a block at all.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -36,7 +47,11 @@ use std::time::{Duration, SystemTime};
 use service_com_amazonaws_elasticloadbalancingv2_elasticloadbalancing_v10::state::ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State as ElbState;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::provisioning_loop::{action, call, create_http_target_group, emulator, members, p};
+use crate::alb_desync_mitigation_and_forwarded_for::{raw_exchange, CONNECTION_ADDRESS};
+use crate::provisioning_loop::{
+    action, call, create_http_target_group, emulator, members, p, Reply,
+};
+use crate::target_group_attributes_and_modification::unescaped;
 
 /// The host a client addresses the emulator's own endpoint by, which is the only address a
 /// client on the machine this emulator runs on can reach — and so the host the three
@@ -148,14 +163,15 @@ async fn create_listener(router: &MultiServiceRouter, lb_arn: &str) -> String {
         .unwrap_or_else(|| panic!("case create listener: no ListenerArn in {}", reply.body))
 }
 
-/// Add one rule at `priority` carrying `fields`, which must be accepted.
+/// Add one rule at `priority` carrying `fields`, which must be accepted. Answers the ARN
+/// the create minted, which is what a later `ModifyRule` of that rule names.
 async fn add_rule(
     router: &MultiServiceRouter,
     case: &str,
     listener_arn: &str,
     priority: i32,
     fields: &[(String, String)],
-) {
+) -> String {
     let mut form = action("CreateRule");
     form.push(p("ListenerArn", listener_arn));
     form.push(p("Priority", &priority.to_string()));
@@ -166,6 +182,9 @@ async fn add_rule(
         "case rule {case}: expected 200, got {} body {}",
         reply.status, reply.body
     );
+    reply
+        .text("RuleArn")
+        .unwrap_or_else(|| panic!("case rule {case}: no RuleArn in {}", reply.body))
 }
 
 /// A `fixed-response` action's fields, under `prefix`.
@@ -311,9 +330,9 @@ async fn deployment() -> Deployment {
     fields.extend(fixed_response("200", "v2", None));
     add_rule(&router, "query-string", &listener_arn, 70, &fields).await;
 
-    // A condition this plane cannot evaluate, in front of an action it can: a `source-ip`
-    // condition is about the CONNECTION's address, which a request served in-process does
-    // not carry, so the rule must be passed over rather than matched on a header.
+    // A `source-ip` condition in front of an action this plane can perform: it is about the
+    // CONNECTION's address, so a rule whose block does not hold the address this request
+    // came from must be passed over however the request itself claims to come from it.
     let mut fields = path_pattern("/ip");
     fields.push(p("Conditions.member.2.Field", "source-ip"));
     fields.push(p(
@@ -509,10 +528,10 @@ async fn a_listener_answers_a_request_from_the_rule_its_conditions_match() {
         },
         answers("a query parameter the rule matches", "GET", "/q?ver=2", 200, "v2"),
         answers("a query parameter it does not", "GET", "/q?ver=3", 404, DEFAULT_BODY),
-        // A condition this plane cannot evaluate leaves its rule unmatched rather than
-        // matching it on a value the request itself supplied: a `source-ip` condition is
-        // about the connection's address, which AWS documents the forwarded-for header
-        // does NOT satisfy, and a regex condition needs an engine this plane has none of.
+        // A `source-ip` condition is matched against the address the CONNECTION came from,
+        // which AWS documents the forwarded-for header does NOT satisfy, so a block holding
+        // no address of this machine leaves its rule unmatched however the request claims to
+        // come from it. A regex condition needs an engine this plane has none of.
         Row {
             headers: &[("x-forwarded-for", "10.1.2.3")],
             ..answers("a source-ip rule and a forwarded client address", "GET", "/ip", 404, DEFAULT_BODY)
@@ -797,4 +816,468 @@ fn target_group_arn(deployed: &Deployment) -> String {
         .get("dp-registered")
         .cloned()
         .expect("the fixture created the group")
+}
+
+/// The path the two source-ip rules below are both written for, and the body each of them
+/// answers with: the one the `source-ip` rule serves, and the one the fall-through behind it
+/// serves.
+const SOURCE_IP_PATH: &str = "/src";
+const BY_SOURCE_IP: &str = "by-source-ip";
+const FELL_THROUGH: &str = "fell-through";
+
+/// A load balancer whose HTTP:80 listener carries TWO rules for one path: a `source-ip` rule
+/// at the lower priority value, and a condition-free fall-through behind it. Which of the two
+/// answers is decided by the `source-ip` condition alone.
+struct SourceIpDeployment {
+    router: MultiServiceRouter,
+    /// The address the load balancer published, which every case below DIALS.
+    dns_name: String,
+    listener_arn: String,
+    /// The ARN of the `source-ip` rule, which each case re-points through `ModifyRule`.
+    rule_arn: String,
+}
+
+/// Build that load balancer, with the condition pointed at the address a client on this
+/// machine connects from. Every resource is written through the control plane's own
+/// operations.
+async fn source_ip_deployment(name: &str) -> SourceIpDeployment {
+    let (router, engine) = emulator();
+    let (lb_arn, dns_name) = create_load_balancer(&router, name).await;
+    let listener_arn = create_listener(&router, &lb_arn).await;
+
+    let mut fields = path_pattern(SOURCE_IP_PATH);
+    fields.push(p("Conditions.member.2.Field", "source-ip"));
+    fields.push(p(
+        "Conditions.member.2.SourceIpConfig.Values.member.1",
+        &format!("{CONNECTION_ADDRESS}/32"),
+    ));
+    fields.extend(fixed_response("200", BY_SOURCE_IP, None));
+    let rule_arn = add_rule(&router, "source-ip at 20", &listener_arn, 20, &fields).await;
+
+    let mut fields = path_pattern(SOURCE_IP_PATH);
+    fields.extend(fixed_response("200", FELL_THROUGH, None));
+    add_rule(&router, "the fall-through at 30", &listener_arn, 30, &fields).await;
+
+    // The move to `active` the clock owes the load balancer, placed rather than slept for.
+    settle(&engine, &lb_arn, SystemTime::now() - Duration::from_secs(1));
+
+    SourceIpDeployment {
+        router,
+        dns_name,
+        listener_arn,
+        rule_arn,
+    }
+}
+
+/// The source-ip condition's `Values`, as the fields of a `ModifyRule` request that leaves
+/// the rule's path condition and its action exactly as they were.
+fn source_ip_condition(values: &[&str]) -> Vec<(String, String)> {
+    let mut fields = path_pattern(SOURCE_IP_PATH);
+    fields.push(p("Conditions.member.2.Field", "source-ip"));
+    for (index, value) in values.iter().enumerate() {
+        fields.push(p(
+            &format!(
+                "Conditions.member.2.SourceIpConfig.Values.member.{}",
+                index + 1
+            ),
+            value,
+        ));
+    }
+    fields
+}
+
+/// Point the source-ip rule's condition at `values`, and answer what the call replied, so a
+/// case can assert either the acceptance or the refusal.
+async fn point_the_condition_at(deployed: &SourceIpDeployment, values: &[&str]) -> Reply {
+    let mut form = action("ModifyRule");
+    form.push(p("RuleArn", &deployed.rule_arn));
+    form.extend(source_ip_condition(values));
+    call(&deployed.router, &form).await
+}
+
+/// The source-ip rule as `DescribeRules` reports it, which is what a case reads a stored
+/// condition back out of.
+async fn described_source_ip_rule(deployed: &SourceIpDeployment) -> String {
+    let mut form = action("DescribeRules");
+    form.push(p("ListenerArn", &deployed.listener_arn));
+    let reply = call(&deployed.router, &form).await;
+    assert_eq!(
+        reply.status, 200,
+        "expected DescribeRules to answer 200, got {} body {}",
+        reply.status, reply.body
+    );
+    members(&reply.body, "Rules")
+        .into_iter()
+        .find(|rule| rule.contains(&deployed.rule_arn))
+        .unwrap_or_else(|| {
+            panic!(
+                "no rule {} in {}",
+                deployed.rule_arn, reply.body
+            )
+        })
+}
+
+/// Send one request for the shared path over a REAL connection to the published address,
+/// carrying one `X-Forwarded-For` field per entry of `forwarded`, and answer the body the
+/// load balancer served.
+async fn answered_on_the_connection(
+    deployed: &SourceIpDeployment,
+    case: &str,
+    forwarded: &[&str],
+) -> String {
+    let mut request = format!(
+        "GET {SOURCE_IP_PATH} HTTP/1.1\r\nHost: {}\r\n",
+        deployed.dns_name
+    );
+    for claimed in forwarded {
+        request.push_str(&format!("X-Forwarded-For: {claimed}\r\n"));
+    }
+    request.push_str("Connection: close\r\n\r\n");
+    let (status, raw) = raw_exchange(case, &deployed.dns_name, &request).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected one of the two rules to answer HTTP 200, got {status} in \
+         {raw:?}"
+    );
+    let served: Vec<&str> = [BY_SOURCE_IP, FELL_THROUGH]
+        .into_iter()
+        .filter(|body| raw.contains(body))
+        .collect();
+    assert_eq!(
+        served.len(),
+        1,
+        "case {case:?}: expected exactly one of the two rules' bodies, got {served:?} in \
+         {raw:?}"
+    );
+    served[0].to_string()
+}
+
+/// One row of the source-ip table: the blocks the condition is pointed at, what the client
+/// claims about its own address, and which of the two rules must then answer.
+struct SourceIp {
+    case: &'static str,
+    values: &'static [&'static str],
+    forwarded: &'static [&'static str],
+    body: &'static str,
+}
+
+/// The rows, spanning what the rule generalises over: a block holding exactly the address the
+/// connection comes from and blocks holding it with room to spare, a block of several that
+/// holds it, blocks that do not hold it, a block of the OTHER address family, and — against
+/// both a matching and a non-matching block — every form the client's own claim takes (an
+/// address inside the block, its own address, a chain of them, and none at all).
+fn source_ip_rows() -> Vec<SourceIp> {
+    // RFC 5737 reserves 192.0.2.0/24 and 198.51.100.0/24 for documentation, so no client of
+    // this emulator connects from either.
+    vec![
+        SourceIp {
+            case: "the connecting address as a /32",
+            values: &["127.0.0.1/32"],
+            forwarded: &[],
+            body: BY_SOURCE_IP,
+        },
+        SourceIp {
+            case: "a block that holds the connecting address",
+            values: &["127.0.0.0/8"],
+            forwarded: &[],
+            body: BY_SOURCE_IP,
+        },
+        SourceIp {
+            case: "the whole IPv4 space",
+            values: &["0.0.0.0/0"],
+            forwarded: &[],
+            body: BY_SOURCE_IP,
+        },
+        SourceIp {
+            case: "one block of several holds it",
+            values: &["192.0.2.0/24", "198.51.100.0/24", "127.0.0.1/32"],
+            forwarded: &[],
+            body: BY_SOURCE_IP,
+        },
+        SourceIp {
+            case: "a matching block, with the client claiming another address",
+            values: &["127.0.0.1/32"],
+            forwarded: &["192.0.2.7"],
+            body: BY_SOURCE_IP,
+        },
+        SourceIp {
+            case: "a block that does not hold the connecting address",
+            values: &["192.0.2.0/24"],
+            forwarded: &[],
+            body: FELL_THROUGH,
+        },
+        SourceIp {
+            case: "the client claims an address inside that block",
+            values: &["192.0.2.0/24"],
+            forwarded: &["192.0.2.7"],
+            body: FELL_THROUGH,
+        },
+        SourceIp {
+            case: "the client claims the address it connects from",
+            values: &["192.0.2.0/24"],
+            forwarded: &[CONNECTION_ADDRESS],
+            body: FELL_THROUGH,
+        },
+        SourceIp {
+            case: "the client claims a whole chain inside that block",
+            values: &["192.0.2.0/24"],
+            forwarded: &["192.0.2.7, 198.51.100.4", "192.0.2.9"],
+            body: FELL_THROUGH,
+        },
+        SourceIp {
+            case: "a block of several, none of which holds it",
+            values: &["192.0.2.0/24", "198.51.100.0/24"],
+            forwarded: &[],
+            body: FELL_THROUGH,
+        },
+        SourceIp {
+            case: "the whole IPv6 space, against an IPv4 connection",
+            values: &["::/0"],
+            forwarded: &[],
+            body: FELL_THROUGH,
+        },
+        SourceIp {
+            case: "the IPv6 loopback claimed by the client",
+            values: &["::1/128"],
+            forwarded: &["::1"],
+            body: FELL_THROUGH,
+        },
+        SourceIp {
+            case: "the /32 restored after all of them",
+            values: &["127.0.0.1/32"],
+            forwarded: &[],
+            body: BY_SOURCE_IP,
+        },
+    ]
+}
+
+/// RULE: a `source-ip` condition is met exactly when the address the CONNECTION came from
+/// lies in one of the CIDR blocks its `SourceIpConfig.Values` names — never because of an
+/// `X-Forwarded-For` the client supplied — and the rule carrying it wins over a rule at a
+/// higher priority value only while it is met.
+#[tokio::test]
+async fn a_source_ip_condition_is_met_by_the_connecting_address_and_never_by_x_forwarded_for() {
+    let deployed = source_ip_deployment("source-ip-alb").await;
+
+    for row in source_ip_rows() {
+        let reply = point_the_condition_at(&deployed, row.values).await;
+        assert_eq!(
+            reply.status, 200,
+            "case {:?}: expected ModifyRule to answer 200, got {} body {}",
+            row.case, reply.status, reply.body
+        );
+        // The blocks a case is driven against are the ones the control plane REPORTS, so no
+        // row rests on a condition a test believes it wrote.
+        let described = described_source_ip_rule(&deployed).await;
+        for value in row.values {
+            assert!(
+                described.contains(&format!("<member>{value}</member>")),
+                "case {:?}: expected DescribeRules to echo the block {value:?}, got \
+                 {described:?}",
+                row.case
+            );
+        }
+        let served = answered_on_the_connection(&deployed, row.case, row.forwarded).await;
+        assert_eq!(
+            served, row.body,
+            "case {:?}: expected the body {:?}, got {served:?}",
+            row.case, row.body
+        );
+    }
+}
+
+/// One row of the condition-value table: the value, and whether it names an address block at
+/// all.
+struct ConditionValue {
+    case: &'static str,
+    value: &'static str,
+    accepted: bool,
+}
+
+/// The values, spanning what the rule generalises over: each address family, each published
+/// prefix bound and one past it, a value carrying no prefix, a wildcard ("wildcards are not
+/// supported"), text that is no address, and the all-ones IPv4 address.
+fn condition_values() -> Vec<ConditionValue> {
+    vec![
+        ConditionValue {
+            case: "an IPv4 block",
+            value: "10.0.0.0/8",
+            accepted: true,
+        },
+        ConditionValue {
+            case: "the whole IPv4 space, the lowest prefix length",
+            value: "0.0.0.0/0",
+            accepted: true,
+        },
+        ConditionValue {
+            case: "one IPv4 address, the highest prefix length",
+            value: "203.0.113.4/32",
+            accepted: true,
+        },
+        ConditionValue {
+            case: "one past the highest IPv4 prefix length",
+            value: "10.0.0.0/33",
+            accepted: false,
+        },
+        ConditionValue {
+            case: "an IPv6 block",
+            value: "2001:db8::/32",
+            accepted: true,
+        },
+        ConditionValue {
+            case: "the whole IPv6 space, the lowest prefix length",
+            value: "::/0",
+            accepted: true,
+        },
+        ConditionValue {
+            case: "one IPv6 address, the highest prefix length",
+            value: "::1/128",
+            accepted: true,
+        },
+        ConditionValue {
+            case: "one past the highest IPv6 prefix length",
+            value: "::1/129",
+            accepted: false,
+        },
+        ConditionValue {
+            case: "an address carrying no prefix length",
+            value: "10.0.0.1",
+            accepted: false,
+        },
+        ConditionValue {
+            case: "a wildcard, which the member does not support",
+            value: "10.0.*.*/16",
+            accepted: false,
+        },
+        ConditionValue {
+            case: "text that is no address at all",
+            value: "everyone/0",
+            accepted: false,
+        },
+        ConditionValue {
+            case: "the all-ones address, which no connection comes from",
+            value: "255.255.255.255/32",
+            accepted: false,
+        },
+    ]
+}
+
+/// The refusal a value that is no address block earns, in Elastic Load Balancing's own
+/// wording. Read from the service's own one statement of it, so the suite and the handler
+/// cannot drift on the text.
+fn invalid_block_refusal(value: &str) -> String {
+    service_com_amazonaws_elasticloadbalancingv2_elasticloadbalancing_v10::state::invalid_cidr_block_message(value)
+}
+
+/// RULE: every value of a `source-ip` condition must name a CIDR block; one that does not is
+/// refused HTTP 400 `ValidationError` naming the value, by every operation that SETS a rule's
+/// conditions, and the stored rule is left exactly as it was.
+#[tokio::test]
+async fn a_source_ip_condition_value_that_is_no_cidr_block_is_refused_and_changes_nothing() {
+    let deployed = source_ip_deployment("source-ip-values-alb").await;
+    // The condition as the fixture stored it, which every refused call must leave in place.
+    let stored = format!("{CONNECTION_ADDRESS}/32");
+
+    for row in condition_values() {
+        let before = described_source_ip_rule(&deployed).await;
+        let reply = point_the_condition_at(&deployed, &[row.value]).await;
+        if row.accepted {
+            assert_eq!(
+                reply.status, 200,
+                "case {:?}: expected ModifyRule to accept {:?}, got {} body {}",
+                row.case, row.value, reply.status, reply.body
+            );
+            let described = described_source_ip_rule(&deployed).await;
+            assert!(
+                described.contains(&format!("<member>{}</member>", row.value)),
+                "case {:?}: expected the stored condition to carry {:?}, got {described:?}",
+                row.case,
+                row.value
+            );
+            // Back to the condition the next row is judged against, so one accepted row
+            // cannot decide the next one's "unchanged".
+            let restored = point_the_condition_at(&deployed, &[stored.as_str()]).await;
+            assert_eq!(
+                restored.status, 200,
+                "case {:?}: expected the fixture's own block to be accepted again, got {} \
+                 body {}",
+                row.case, restored.status, restored.body
+            );
+            continue;
+        }
+        assert_eq!(
+            reply.status, 400,
+            "case {:?}: expected ModifyRule to refuse {:?} with HTTP 400, got {} body {}",
+            row.case, row.value, reply.status, reply.body
+        );
+        assert_eq!(
+            reply.error_code(),
+            "ValidationError",
+            "case {:?}: expected the ValidationError code, got {:?} in {}",
+            row.case,
+            reply.error_code(),
+            reply.body
+        );
+        assert_eq!(
+            unescaped(&reply.text("Message").unwrap_or_default()),
+            invalid_block_refusal(row.value),
+            "case {:?}: expected the refusal to name the value, got {:?}",
+            row.case,
+            reply.text("Message")
+        );
+        // The refused call changed nothing: the rule reads back exactly as it did, and the
+        // listener still answers by the block it was already carrying.
+        let after = described_source_ip_rule(&deployed).await;
+        assert_eq!(
+            after, before,
+            "case {:?}: a refused call must leave the rule as it was, got {after:?}",
+            row.case
+        );
+        let served = answered_on_the_connection(&deployed, row.case, &[]).await;
+        assert_eq!(
+            served, BY_SOURCE_IP,
+            "case {:?}: expected the stored condition to still answer, got {served:?}",
+            row.case
+        );
+    }
+
+    // The same clause on the operation that FIRST stores a rule's conditions: the rule is
+    // not created, so the priority it named is still free afterwards.
+    let mut fields = source_ip_condition(&["255.255.255.255/32"]);
+    fields.extend(fixed_response("200", BY_SOURCE_IP, None));
+    let mut form = action("CreateRule");
+    form.push(p("ListenerArn", &deployed.listener_arn));
+    form.push(p("Priority", "40"));
+    form.extend(fields);
+    let reply = call(&deployed.router, &form).await;
+    assert_eq!(
+        reply.status, 400,
+        "case CreateRule with a value that is no block: expected HTTP 400, got {} body {}",
+        reply.status, reply.body
+    );
+    assert_eq!(
+        reply.error_code(),
+        "ValidationError",
+        "case CreateRule with a value that is no block: expected the ValidationError code, \
+         got {:?} in {}",
+        reply.error_code(),
+        reply.body
+    );
+    assert_eq!(
+        unescaped(&reply.text("Message").unwrap_or_default()),
+        invalid_block_refusal("255.255.255.255/32"),
+        "case CreateRule with a value that is no block: expected the refusal to name the \
+         value, got {:?}",
+        reply.text("Message")
+    );
+    let mut fields = path_pattern("/free");
+    fields.extend(fixed_response("200", FELL_THROUGH, None));
+    add_rule(
+        &deployed.router,
+        "the priority the refused create named",
+        &deployed.listener_arn,
+        40,
+        &fields,
+    )
+    .await;
 }

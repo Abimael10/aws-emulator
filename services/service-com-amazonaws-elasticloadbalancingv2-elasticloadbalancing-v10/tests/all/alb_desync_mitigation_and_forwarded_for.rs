@@ -60,7 +60,11 @@ const FORWARDED_FOR: &str = "x-forwarded-for";
 
 /// The address a client on the machine this emulator runs on reaches a load balancer's own
 /// socket from, which is what an `append` adds to the list the client supplied.
-const CONNECTION_ADDRESS: &str = "127.0.0.1";
+///
+/// `pub(crate)` because it is also the layer-3 peer address a `source-ip` rule condition is
+/// matched against, which `crate::alb_data_plane` drives: ONE reading of the address a
+/// request comes from, so the two suites cannot drift on it.
+pub(crate) const CONNECTION_ADDRESS: &str = "127.0.0.1";
 
 /// How long one dial and one exchange on the published address may take. Generous on purpose:
 /// everything waited for happens in this process, so a loaded host does not decide a verdict.
@@ -228,7 +232,11 @@ async fn written(deployed: &Deployed, case: &str, key: &str, value: &str) {
 ///
 /// Only the PORT is taken from the published authority: the core binds its listeners on
 /// loopback (`EMULATOR_BIND_ADDRESS`, `127.0.0.1` by default), so the dial is to this machine.
-async fn raw_exchange(case: &str, published: &str, request: &str) -> (u16, String) {
+///
+/// `pub(crate)` because a request whose verdict depends on the CONNECTION it arrived over —
+/// a `source-ip` rule condition, driven by `crate::alb_data_plane` — has to be sent over a
+/// real one: one dial for the crate, so no suite writes a second.
+pub(crate) async fn raw_exchange(case: &str, published: &str, request: &str) -> (u16, String) {
     let port = published
         .rsplit(':')
         .next()

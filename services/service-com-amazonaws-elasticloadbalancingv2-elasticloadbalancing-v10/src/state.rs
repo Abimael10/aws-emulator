@@ -78,6 +78,17 @@ pub mod rule_actions;
 
 pub use rule_actions::{check_redirect_actions, redirects_to_itself, REDIRECT_LOOP_MESSAGE};
 
+/// The address blocks a `source-ip` rule condition matches on: what makes one of its
+/// values a block, and the block a value names.
+///
+/// Public because the data plane that EVALUATES such a condition reads a stored value
+/// through the same parse (`crate::service::data_plane`).
+pub mod source_ip_conditions;
+
+pub use source_ip_conditions::{
+    check_source_ip_conditions, invalid_cidr_block_message, source_ip_block,
+};
+
 /// The health state machine of a target group's registrations: the states a read reports
 /// and the two spans the clock owes a registration.
 pub mod target_health;
@@ -3655,6 +3666,10 @@ pub fn check_rule_conditions(conditions: &[RuleCondition]) -> Result<(), String>
         }
         values += condition_values(condition);
     }
+    // And what a `source-ip` condition matches ON is an address block: a value that is no
+    // block names a set of source addresses no request could ever come from, so the
+    // condition it was written in could never be met ([`source_ip_conditions`]).
+    check_source_ip_conditions(conditions)?;
     if values > CONDITION_VALUES_PER_RULE {
         // AWS's own wording for this refusal, which states the published limit and names
         // neither the count the request carried nor the condition it sat in: "A rule can

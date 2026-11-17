@@ -104,6 +104,7 @@
 //! such a rule is answered [`ACTION_NOT_PERFORMED_STATUS`] rather than by letting the
 //! request through to the action behind it.
 
+use std::net::IpAddr;
 use std::time::SystemTime;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
@@ -647,6 +648,15 @@ pub(super) struct DataPlaneRequest {
     /// What the TLS connection this request arrived over negotiated, for one that arrived
     /// over TLS at all ([`ConnectionTls`]).
     pub(super) tls: ConnectionTls,
+    /// The address this load balancer RECEIVED the request from — the other end of the
+    /// connection, which is what a `source-ip` condition is evaluated against.
+    ///
+    /// It is the address a client reaches this emulator's sockets from for the load balancer
+    /// the client itself addressed ([`super::forwarded_for::CONNECTION_ADDRESS`]), and the
+    /// forwarding load balancer's own published address for each later hop of a chain,
+    /// because that is the address the next load balancer receives the request from. It is
+    /// never read off a header: a header is what the CLIENT wrote.
+    pub(super) source_address: String,
 }
 
 /// What the TLS handshake that carried a request negotiated, as the socket that ran it
@@ -724,6 +734,7 @@ impl DataPlaneRequest {
             headers,
             port: addressed_port(addressed),
             tls,
+            source_address: super::forwarded_for::CONNECTION_ADDRESS.to_string(),
         }
     }
 
@@ -942,6 +953,11 @@ pub async fn serve<Eng: Send + Sync + 'static>(
         // The host the CLIENT addressed, for a request this plane did not receive from the
         // client directly ([`DataPlaneRequest::addressed_the_published_name`]).
         request.addressed_the_published_name(&published_name);
+        // The address THIS load balancer received the request from, which is what a
+        // `source-ip` condition of its listener is evaluated against: the client's own
+        // address for the load balancer the client addressed, and the previous load
+        // balancer's for each later hop of a chain.
+        request.source_address = connecting_address.clone();
         // What this load balancer's own attribute collection has it REMOVE from the request
         // before anything behind it sees it ([`super::invalid_header_fields`]): the headers
         // whose names are no valid header field. Each load balancer in a chain reads its
@@ -1336,17 +1352,19 @@ fn conditions_met(
 /// matching is a match — and each is written the wildcard language
 /// [`matches_within`] reads.
 ///
-/// Two condition forms are NOT evaluated here, and each is left UNMET with a warning
-/// naming it rather than matched on a guess — so a rule passed over for one of them is
-/// traceable to the form, instead of looking like a rule the request simply did not match:
+/// ONE condition form is NOT evaluated here, and is left UNMET with a warning naming it
+/// rather than matched on a guess — so a rule passed over for it is traceable to the form
+/// instead of looking like a rule the request simply did not match: `RegexValues`, because
+/// this emulator has no regular-expression engine for that dialect, and a hand-written
+/// approximation of one would match the wrong requests silently.
 ///
-/// * `RegexValues`: this emulator has no regular-expression engine for that dialect, and a
-///   hand-written approximation of one would match the wrong requests silently;
-/// * `source-ip`: AWS evaluates it against the address of the CONNECTION, and documents
-///   that the addresses in `X-Forwarded-For` do not satisfy it (an `http-header` condition
-///   is how that header is matched). A request served in-process carries no connection
-///   address for this plane to read, and matching a request-supplied header instead would
-///   let any client satisfy a rule written to gate traffic by CIDR.
+/// A `source-ip` condition IS evaluated, against the address the CONNECTION came from
+/// ([`DataPlaneRequest::source_address`]) and never against `X-Forwarded-For`, whose
+/// addresses the member itself documents as not satisfying it ("this condition is not
+/// satisfied by the addresses in the X-Forwarded-For header. To search for addresses in the
+/// X-Forwarded-For header, use an HTTP header condition"): that header is what the CLIENT
+/// wrote, so matching it would let any client satisfy a rule written to gate traffic by
+/// CIDR.
 fn condition_met(
     condition: &RuleCondition,
     request: &DataPlaneRequest,
@@ -1440,16 +1458,33 @@ fn condition_met(
                         })
                 })
             }),
-        // "source-ip ... you must specify an IP address block in CIDR", evaluated against
-        // the address of the CONNECTION — which a request served in-process does not
-        // carry, so the condition is left unmet (see this function's own documentation).
+        // "source-ip … Matches on the source IP address", against "the source IP addresses,
+        // in CIDR format" the condition carries: it is satisfied when the address the
+        // connection came from is inside ONE of those blocks. The blocks are read through the
+        // ONE parse the operations that store them judge a value by
+        // ([`crate::state::source_ip_block`]), so a stored condition matches exactly the
+        // addresses the value it was accepted with names.
         SOURCE_IP_FIELD => {
-            tracing::warn!(
-                "the condition matches on the client's connection address, which a request \
-                 served in-process does not carry, so it is left unmet and its rule is \
-                 passed over"
-            );
-            false
+            let Ok(address) = request.source_address.parse::<IpAddr>() else {
+                tracing::warn!(
+                    "the address this request came from is not readable as an IP address, so \
+                     the condition is left unmet and its rule is passed over"
+                );
+                return false;
+            };
+            condition
+                .source_ip_config
+                .as_ref()
+                .and_then(|config| config.values.as_deref())
+                .unwrap_or_default()
+                .iter()
+                .any(|value| {
+                    // One step of the request's budget per block compared, so what one
+                    // request costs stays bounded however many blocks the rules carry.
+                    *budget = budget.saturating_sub(1);
+                    crate::state::source_ip_block(value)
+                        .is_some_and(|block| block.contains(&address))
+                })
         }
         // A field this service does not match on names no condition a rule could have
         // been created with.
