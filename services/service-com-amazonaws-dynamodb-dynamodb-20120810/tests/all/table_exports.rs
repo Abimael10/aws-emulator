@@ -351,6 +351,13 @@ async fn an_accepted_export_is_recorded_and_read_back() {
     set_recovery(&router, "Exported", true).await;
     let table_arn = state::table_arn(REGION, "Exported");
     let (_, latest) = restorable_window(&router, "Exported").await;
+    // What this table is METERED at, which is what an export of it is billed: the same
+    // figure `DescribeTable` reports as `TableSizeBytes`, read here from the table itself
+    // rather than restated, so the rule is asserted and not the number.
+    let metered_size = ok(&router, "DescribeTable", json!({"TableName": "Exported"}))
+        .await["Table"]["TableSizeBytes"]
+        .as_i64()
+        .unwrap_or_default();
 
     // Rows differ in the members the request carries: the format the items are written in
     // (`DYNAMODB_JSON`, the one of the two values the member declares whose item encoding
@@ -483,11 +490,22 @@ async fn an_accepted_export_is_recorded_and_read_back() {
         );
 
         // The reader answers from that one record, and the description it gives while the
-        // task runs is the one the write path gave.
-        let read = ok(&router, "DescribeExport", json!({"ExportArn": arn.clone()})).await;
+        // task runs is the one the write path gave — plus the kind of destination the
+        // record was written to, which only the catalogue's readers carry.
+        let read =
+            description(&ok(&router, "DescribeExport", json!({"ExportArn": arn.clone()})).await);
         assert_eq!(
-            description(&read),
-            reported,
+            read["DestinationType"],
+            json!("S3"),
+            "case {case:?}: the reader names the kind of destination the export was \
+             written to, got {read}"
+        );
+        let mut without_destination = read.clone();
+        if let Some(members) = without_destination.as_object_mut() {
+            members.remove("DestinationType");
+        }
+        assert_eq!(
+            without_destination, reported,
             "case {case:?}: DescribeExport reports the record the export wrote"
         );
         started_exports.push((case, arn, extra));
@@ -513,10 +531,11 @@ async fn an_accepted_export_is_recorded_and_read_back() {
             json!(items),
             "case {case:?}: the export reports the items the table held, got {finished}"
         );
-        assert!(
-            finished["BilledSizeBytes"].as_i64().unwrap_or_default() > 0,
-            "case {case:?}: an export of a table holding items has a billable size, got \
-             {finished}"
+        assert_eq!(
+            finished["BilledSizeBytes"],
+            json!(metered_size),
+            "case {case:?}: an export is billed the source table's metered size \
+             ({metered_size}), got {finished}"
         );
         let manifest = finished["ExportManifest"]
             .as_str()

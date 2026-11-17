@@ -29,6 +29,7 @@ pub struct ListExportsOutput {
 #[smithy_macros::smithy(shape = "com.amazonaws.dynamodb#ExportSummary")]
 #[derive(Debug, Clone, Default)]
 pub struct ExportSummary {
+    pub destination_type: Option<String>,
     pub export_arn: Option<String>,
     pub export_status: Option<String>,
     pub export_type: Option<String>,

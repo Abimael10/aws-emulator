@@ -322,10 +322,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // What ONE export renders is bounded before anything is rendered: the items it
             // would read and the item data they hold, against this emulator's own
             // per-export ceilings ([`crate::state::MAX_EXPORTED_ITEMS`],
-            // [`crate::state::MAX_EXPORTED_BYTES`]). A table larger than that is not
-            // refused by DynamoDB, so the refusal says whose ceiling it is.
+            // [`crate::state::MAX_EXPORTED_BYTES`]). Measured on the data the task would
+            // render, which is not what the record is BILLED for
+            // ([`crate::state::Export::billed_size_bytes`]). A table larger than that is
+            // not refused by DynamoDB, so the refusal says whose ceiling it is.
+            let rendered_bytes = exported.values().fold(0_i64, |total, item| {
+                total.saturating_add(crate::state::item_size(item))
+            });
             if export.item_count > crate::state::MAX_EXPORTED_ITEMS
-                || export.billed_size_bytes > crate::state::MAX_EXPORTED_BYTES
+                || rendered_bytes > crate::state::MAX_EXPORTED_BYTES
             {
                 return Err(ExportTableToPointInTimeErrorModeled::LimitExceededException(
                     LimitExceededException {

@@ -269,8 +269,14 @@ async fn every_member_of_a_recorded_export_is_reported() {
             json!(export.request.export_type),
             "case {case:?}: the reported type is the one recorded, got {reported}"
         );
-        // `ExportSummary` models exactly these three members, so a summary reports
-        // neither more nor fewer.
+        assert_eq!(
+            reported["DestinationType"],
+            json!("S3"),
+            "case {case:?}: a summary names the kind of destination the export was \
+             written to, got {reported}"
+        );
+        // A summary reports these four members, neither more nor fewer: the three
+        // `ExportSummary` models plus the destination kind the catalogue's readers carry.
         let mut members: Vec<String> = reported
             .as_object()
             .map(|summary| summary.keys().cloned().collect())
@@ -279,11 +285,12 @@ async fn every_member_of_a_recorded_export_is_reported() {
         assert_eq!(
             members,
             vec![
+                "DestinationType".to_string(),
                 "ExportArn".to_string(),
                 "ExportStatus".to_string(),
                 "ExportType".to_string()
             ],
-            "case {case:?}: a summary carries the members ExportSummary models, got {reported}"
+            "case {case:?}: a summary carries the members a listing reports, got {reported}"
         );
     }
 }

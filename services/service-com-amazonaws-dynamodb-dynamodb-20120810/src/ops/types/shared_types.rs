@@ -25,7 +25,8 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-dynamodb-dynamodb-20120
 /// fix. Everything else below — the member schemas, their indices, the write and read
 /// arms — mirrors what that macro emits for this union, member for member; only
 /// [`EMPTY_ATTRIBUTE_VALUE_MESSAGE`] and [`AMBIGUOUS_ATTRIBUTE_VALUE_MESSAGE`] replace
-/// its two `SerdeError::custom` texts.
+/// its two `SerdeError::custom` texts, and the read carries the nesting bound its own
+/// recursion needs ([`MAX_ATTRIBUTE_VALUE_READ_DEPTH`]).
 ///
 /// The cost of the copy: this declaration no longer tracks the model automatically, so
 /// a model change to `AttributeValue` (a renamed, added or `@jsonName`d member) has to
@@ -1116,6 +1117,7 @@ pub struct ExportDescription {
     pub export_format: Option<String>,
     pub billed_size_bytes: Option<i64>,
     pub item_count: Option<i64>,
+    pub destination_type: Option<String>,
     pub export_type: Option<String>,
     pub incremental_export_specification: Option<IncrementalExportSpecification>,
     pub filter_specification: Option<FilterSpecification>,

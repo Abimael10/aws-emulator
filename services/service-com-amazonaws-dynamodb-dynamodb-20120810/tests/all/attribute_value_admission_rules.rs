@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Two rules about the VALUE a request carries, each held wherever a value arrives.
+//! Three rules about the VALUE a request carries, each held wherever a value arrives.
 //!
 //! * The `NULL` member of an attribute value states the attribute's TYPE, and the only
 //!   value that states it is `true` ("An attribute of type Null. For example:
@@ -14,6 +14,11 @@
 //!   exponent is no 64-bit integer cannot be converted to a number at all. The rows walk
 //!   both published bounds, one past each of them, both limits of the integer the
 //!   exponent is read into and one past each of those.
+//! * A value's NESTING is bounded wherever it is read: one inside the documented quota
+//!   ("DynamoDB supports nested attributes up to 32 levels deep") is stored, and one past
+//!   it is refused with a 400 `ValidationException` and stores nothing — including one
+//!   nested far past every bound the read of a value is held to, which is answered rather
+//!   than walked. The rows walk both containers a value nests through.
 //!
 //! Everything is driven over the wire, so nothing is asserted that a client could not
 //! observe.
@@ -75,6 +80,76 @@ async fn seeded() -> smithy_server_runtime::MultiServiceRouter {
     )
     .await;
     router
+}
+
+#[tokio::test]
+async fn a_value_nested_past_what_the_read_descends_is_refused_and_stores_nothing() {
+    let router = seeded().await;
+
+    // Rows walk the nesting a request can carry, from inside the documented quota
+    // ("DynamoDB supports nested attributes up to 32 levels deep") to past every bound the
+    // read is held to: the one inside the quota is stored, each one past it is refused with
+    // a 400 `ValidationException`, and the deep ones are ANSWERED rather than driving the
+    // read down a stack until the process dies. The two containers a value nests through
+    // are both walked, since the read descends through each.
+    let rows: [(&str, usize, bool); 6] = [
+        ("a list inside the documented quota", 30, true),
+        ("a map inside the documented quota", 30, true),
+        ("a list one level past the quota", 33, false),
+        ("a map one level past the quota", 33, false),
+        ("a list past what the read descends", 200, false),
+        ("a map past what the read descends", 200, false),
+    ];
+
+    for (index, (case, levels, admitted)) in rows.into_iter().enumerate() {
+        let mut value = json!({"S": "bottom"});
+        for _ in 0..levels {
+            value = if case.starts_with("a list") {
+                json!({"L": [value]})
+            } else {
+                json!({"M": {"inner": value}})
+            };
+        }
+        let key = format!("deep-{index}");
+        let (status, answered) = call(
+            &router,
+            "PutItem",
+            json!({"TableName": TABLE, "Item": {"pk": {"S": &key}, "tree": value}}),
+        )
+        .await;
+        if admitted {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: a value inside the documented nesting quota is stored, got \
+                 {status} with {answered}"
+            );
+        } else {
+            assert_eq!(
+                (status, error_code(&answered).as_str()),
+                (400, "ValidationException"),
+                "case {case:?}: a value nested {levels} levels deep is refused, got {status} \
+                 with {answered}"
+            );
+            assert!(
+                !message(&answered).is_empty(),
+                "case {case:?}: the refusal states why, got {answered}"
+            );
+        }
+        // Whatever the answer, the store agrees with it: a refused write left nothing
+        // behind, and an admitted one is readable back.
+        let read = ok(
+            &router,
+            "GetItem",
+            json!({"TableName": TABLE, "Key": {"pk": {"S": &key}}}),
+        )
+        .await;
+        assert_eq!(
+            read["Item"].is_null(),
+            !admitted,
+            "case {case:?}: expected the item to be stored only where the write was \
+             admitted, got {read}"
+        );
+    }
 }
 
 #[tokio::test]

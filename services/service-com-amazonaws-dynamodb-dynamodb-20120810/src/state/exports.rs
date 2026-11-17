@@ -49,6 +49,26 @@ pub const DEFAULT_EXPORT_FORMAT: &str = "DYNAMODB_JSON";
 /// The other `ExportFormat` that member declares: Amazon Ion.
 pub const EXPORT_FORMAT_ION: &str = "ION";
 
+/// The `S3SseAlgorithm` in force on the destination of an export that pointed at no KMS
+/// key: "AES256 - server-side encryption with Amazon S3 managed keys"
+/// (`ExportDescription$S3SseAlgorithm`). An export's destination is server-side encrypted
+/// whatever the request asked for, so this is the encryption such an export landed under
+/// and therefore what its readers report ([`Export::s3_sse_algorithm`]).
+pub const DEFAULT_S3_SSE_ALGORITHM: &str = "AES256";
+
+/// The other value that member declares: "KMS - server-side encryption with KMS managed
+/// keys" (`ExportDescription$S3SseAlgorithm`), which is the encryption an export that
+/// pointed at a KMS key landed under.
+pub const S3_SSE_ALGORITHM_KMS: &str = "KMS";
+
+/// The kind of destination a recorded export was written to, which the export READERS
+/// report beside the destination itself ([`Export::destination_type`]).
+///
+/// `ExportTableToPointInTime` takes one destination, "the name of the Amazon S3 bucket to
+/// export the snapshot to" (`$S3Bucket`, required), so every export this catalogue holds
+/// landed in Amazon S3.
+pub const EXPORT_DESTINATION_S3: &str = "S3";
+
 /// How long a `ClientToken` stands for the export it first started: "A client token is
 /// valid for 8 hours after the first request that uses it is completed. After 8 hours,
 /// any request with the same client token is treated as a new request"
@@ -199,10 +219,15 @@ pub struct Export {
     /// `EndTime` a finished export reports.
     pub completes_at: SystemTime,
     /// "The number of items exported" (`ExportDescription$ItemCount`): the items the
-    /// table held at the instant the export read it.
+    /// table held at the instant the export read it, counted exactly — the export wrote
+    /// them, so it knows how many there were.
     pub item_count: i64,
     /// "The billable size of the table export" (`ExportDescription$BilledSizeBytes`): the
-    /// bytes of item data the table held at that same instant.
+    /// source table's METERED size when the export was taken — the figure that table
+    /// reports as `TableSizeBytes`, which "DynamoDB updates approximately every six
+    /// hours" ([`MeteredCounters`]) — rather than a byte sum of the items the task wrote.
+    /// So an export of a table whose metering has not run since its data was written
+    /// carries nothing billable, while the items it wrote are still counted above.
     pub billed_size_bytes: i64,
     /// Why this export's task did not write its data, where it did not: an export whose
     /// objects did not land reports `FAILED` and this reason once its span has elapsed,
@@ -216,9 +241,9 @@ impl Export {
     /// ([`PointInTimeRecovery::items_at`]), which are the items this export writes.
     ///
     /// Everything the record reports of the TABLE is read off it here, at the instant of
-    /// the request — its own id, and the items and item data of the point in time it is
-    /// taken at — so the record stands on its own once the table moves on, and the figures
-    /// it reports are the figures of the data it wrote.
+    /// the request — its own id, the items and item data of the point in time it is taken
+    /// at, and the metered size it is billed against — so the record stands on its own
+    /// once the table moves on.
     pub fn started(
         table: &Table,
         exported: &BTreeMap<ItemKey, Item>,
@@ -242,9 +267,7 @@ impl Export {
             started_at,
             completes_at: started_at + STATUS_TRANSITION,
             item_count: i64::try_from(exported.len()).unwrap_or(i64::MAX),
-            billed_size_bytes: exported
-                .values()
-                .fold(0_i64, |total, item| total.saturating_add(item_size(item))),
+            billed_size_bytes: table.reported_counters.size_bytes,
             // Nothing has been written yet, so nothing has failed yet: the caller records
             // the reason here if the write does not land.
             failure: None,
@@ -271,6 +294,32 @@ impl Export {
         (now >= self.completes_at).then_some(self.completes_at)
     }
 
+    /// The kind of destination this export's data was written to, which the catalogue's
+    /// READERS report beside the destination itself ([`EXPORT_DESTINATION_S3`]).
+    pub fn destination_type(&self) -> &'static str {
+        EXPORT_DESTINATION_S3
+    }
+
+    /// The encryption IN FORCE on the destination this export was written to, which is
+    /// what `ExportDescription$S3SseAlgorithm` reports.
+    ///
+    /// Resolved from what the request asked for rather than echoed from it: the algorithm
+    /// it named, else the KMS-managed encryption where it pointed at a KMS key
+    /// ([`S3_SSE_ALGORITHM_KMS`]) and otherwise the S3-managed encryption such a
+    /// destination carries by default ([`DEFAULT_S3_SSE_ALGORITHM`]) — so every reader
+    /// reports the encryption the data really landed under, for a request that named none
+    /// too.
+    pub fn s3_sse_algorithm(&self) -> &str {
+        match (
+            self.request.s3_sse_algorithm.as_deref(),
+            self.request.s3_sse_kms_key_id.as_deref(),
+        ) {
+            (Some(named), _) => named,
+            (None, Some(_)) => S3_SSE_ALGORITHM_KMS,
+            (None, None) => DEFAULT_S3_SSE_ALGORITHM,
+        }
+    }
+
     /// The export's own id: the last segment of its ARN, which is what names the folder
     /// the snapshot is written under ([`new_export_arn`]).
     pub fn export_id(&self) -> &str {
@@ -295,16 +344,30 @@ impl Export {
     }
 
     /// This export as `ListExports` reports it, as it stands at `now`: every member read
-    /// from the record.
+    /// from the record, the kind of destination it was written to included — a listing is
+    /// one of the catalogue's READERS ([`Self::described`]).
     pub fn summary(&self, now: SystemTime) -> ExportSummary {
         ExportSummary {
+            destination_type: Some(self.destination_type().to_string()),
             export_arn: Some(self.arn.clone()),
             export_status: Some(self.status(now).to_string()),
             export_type: Some(self.request.export_type.clone()),
         }
     }
 
-    /// This export as the two single-export operations report it, as it stands at `now`.
+    /// This export as the CATALOGUE's single-export reader reports it, as it stands at
+    /// `now`: the description the call that started it answered ([`Self::describe`]) plus
+    /// the kind of destination the recorded export was written to, which `DescribeExport`
+    /// and `ListExports` carry beside the destination itself and the response to the
+    /// starting call does not.
+    pub fn described(&self, now: SystemTime) -> ExportDescription {
+        ExportDescription {
+            destination_type: Some(self.destination_type().to_string()),
+            ..self.describe(now)
+        }
+    }
+
+    /// This export as the call that STARTED it reports it, as it stands at `now`.
     ///
     /// The figures a FINISHED export reports — its item count, its billable size and its
     /// manifest — are reported only once the task has finished writing them; while it
@@ -327,7 +390,9 @@ impl Export {
             s3_bucket: Some(self.request.s3_bucket.clone()),
             s3_bucket_owner: self.request.s3_bucket_owner.clone(),
             s3_prefix: self.request.s3_prefix.clone(),
-            s3_sse_algorithm: self.request.s3_sse_algorithm.clone(),
+            // The encryption the data landed under, which is not always the one the
+            // request named ([`Self::s3_sse_algorithm`]).
+            s3_sse_algorithm: Some(self.s3_sse_algorithm().to_string()),
             s3_sse_kms_key_id: self.request.s3_sse_kms_key_id.clone(),
             // "Status code for the result of the failed export"
             // (`ExportDescription$FailureCode`): reported for an export whose task did
@@ -337,6 +402,8 @@ impl Export {
             export_format: Some(self.request.export_format.clone()),
             billed_size_bytes: wrote.then_some(self.billed_size_bytes),
             item_count: wrote.then_some(self.item_count),
+            // Reported by the catalogue's readers only ([`Self::described`]).
+            destination_type: None,
             export_type: Some(self.request.export_type.clone()),
             // An incremental export is the only kind that carries one, and no stored
             // record is of that kind yet (the operation refuses it as unimplemented), so

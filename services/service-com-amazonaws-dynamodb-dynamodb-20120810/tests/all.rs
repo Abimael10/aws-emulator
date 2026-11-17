@@ -87,6 +87,8 @@ mod endpoint_front_door;
 mod export_conflicts_and_capacity_no_ops;
 #[path = "all/export_recovery_precondition.rs"]
 mod export_recovery_precondition;
+#[path = "all/export_reported_destination_and_figures.rs"]
+mod export_reported_destination_and_figures;
 #[path = "all/expression_defect_classification.rs"]
 mod expression_defect_classification;
 #[path = "all/expression_parameter_generations.rs"]

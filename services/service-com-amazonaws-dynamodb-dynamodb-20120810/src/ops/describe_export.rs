@@ -158,7 +158,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let export = store.export(&region, &input.export_arn).map_err(lift)?;
 
         Ok(DescribeExportOutput {
-            export_description: Some(export.describe(now)),
+            export_description: Some(export.described(now)),
         })
     }
 }

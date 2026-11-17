@@ -150,14 +150,20 @@ pub fn emulator_with_streams() -> MultiServiceRouter {
 /// resources: they exist only if that service serves them — so a suite about either mounts
 /// S3 beside DynamoDB, exactly as `core/router` assembles them.
 pub fn emulator_with_s3() -> MultiServiceRouter {
+    emulator_with_s3_and_engine().0
+}
+
+/// The same emulator, together with the shared engine it was built on — for a suite about
+/// the export or import surface that must also reach this service's STORED state.
+pub fn emulator_with_s3_and_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(Arc::clone(&engine)));
     router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
-        engine,
+        Arc::clone(&engine),
     ));
-    router
+    (router, engine)
 }
 
 /// An Amazon S3 client over this emulator's own in-process callback — the seam an export

@@ -206,7 +206,7 @@ fn manifest_summary_document(export: &Export, items: usize, files_key: &str) -> 
         "exportTime": rendered_instant(export.export_time),
         "s3Bucket": export.request.s3_bucket,
         "s3Prefix": export.request.s3_prefix,
-        "s3SseAlgorithm": export.request.s3_sse_algorithm,
+        "s3SseAlgorithm": export.s3_sse_algorithm(),
         "s3SseKmsKeyId": export.request.s3_sse_kms_key_id,
         "manifestFilesS3Key": files_key,
         "billedSizeBytes": export.billed_size_bytes,
