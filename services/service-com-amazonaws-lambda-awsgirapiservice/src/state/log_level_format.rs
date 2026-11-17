@@ -34,18 +34,18 @@ pub const LOG_LEVELS_NEED_JSON_MESSAGE: &str = "LogLevel is not supported when L
 ///
 /// The format judged is the one the stored configuration WILL carry: the format the
 /// configuration names, or — because the member has a documented default and a request may
-/// leave it out — [`DEFAULT_LOG_FORMAT`]. A configuration naming no level at all is
-/// accepted on either format, which is what leaves the plain-text format usable.
+/// leave it out — [`DEFAULT_LOG_FORMAT`], as [`super::configured_log_format`] reads it. A
+/// configuration naming no level at all is accepted on either format, which is what leaves
+/// the plain-text format usable.
 #[must_use]
 pub fn log_level_format_refusal(logging: Option<&LoggingConfig>) -> Option<&'static str> {
-    let logging = logging?;
-    let names_a_level =
-        logging.application_log_level.is_some() || logging.system_log_level.is_some();
-    let format = logging
-        .log_format
-        .as_deref()
-        .unwrap_or(DEFAULT_LOG_FORMAT);
-    (names_a_level && format != LOG_FORMAT_JSON).then_some(LOG_LEVELS_NEED_JSON_MESSAGE)
+    let names_a_level = logging.is_some_and(|logging| {
+        logging.application_log_level.is_some() || logging.system_log_level.is_some()
+    });
+    // The format judged is the one the stored configuration WILL carry, read through the one
+    // reading of this configuration ([`super::invocation_logs`]), so the format this refusal
+    // is taken against is the format the function would be delivered under.
+    (names_a_level && !delivers_json_records(logging)).then_some(LOG_LEVELS_NEED_JSON_MESSAGE)
 }
 
 #[cfg(test)]

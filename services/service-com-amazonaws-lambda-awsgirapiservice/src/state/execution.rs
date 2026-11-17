@@ -192,6 +192,10 @@ mod durable_sdk_guest;
 pub mod log_delivery;
 pub use log_delivery::{log_target, LogEvent, LogGrants, LogTarget};
 
+/// The FORM those records take: the platform frames of one run, rendered in the function's
+/// own `LoggingConfig$LogFormat`.
+mod log_records;
+
 /// The AWS SDK modules a node handler imports, reached through that same seam.
 mod node_sdk_guest;
 
@@ -1145,6 +1149,11 @@ fn answered(
         request_id,
         &invocation.executed_version,
         invocation.memory_size,
+        started,
+        // The FORM the records of this run take, which the function's own `LoggingConfig`
+        // decides ([`log_records`]): the same reading the runtime that rendered the
+        // handler's own records made, because both read it off this invocation's target.
+        json_log_records(invocation),
         &finished,
     );
     Invoked {
@@ -1329,22 +1338,60 @@ impl RunLog {
     }
 }
 
-fn run_log(request_id: &str, version: &str, memory_size: i32, finished: &Finished) -> RunLog {
+fn run_log(
+    request_id: &str,
+    version: &str,
+    memory_size: i32,
+    started: SystemTime,
+    json: bool,
+    finished: &Finished,
+) -> RunLog {
     let duration_ms = finished.elapsed.as_secs_f64() * 1_000.0;
-    let billed_ms = duration_ms.ceil().max(1.0);
+    // What the run is BILLED for, in whole milliseconds: the duration rounded up, and never
+    // less than the unit it is stated in. Taken from the measured elapsed time rather than
+    // from the figure above, so the two formats state one whole number.
+    let billed_ms =
+        i64::try_from(finished.elapsed.as_micros().div_ceil(1_000).max(1)).unwrap_or(i64::MAX);
     let used_mb = max_memory_used_mb(finished.max_memory_bytes, memory_size);
-    let mut lines = vec![format!("START RequestId: {request_id} Version: {version}")];
+    let ended = started.checked_add(finished.elapsed).unwrap_or(started);
+    let mut lines = vec![log_records::start(json, started, request_id, version)];
     let opened = lines.len();
     // One line of the log per RECORD the run wrote — the text of one call, line breaks of its
     // own included ([`outcome::Finished::log_records`]) — so what the handler reported in one
     // write is one event of the function's log group and not one event per line of it.
     lines.extend(finished.log_records.iter().cloned());
-    lines.push(format!("END RequestId: {request_id}"));
-    lines.push(format!(
-        "REPORT RequestId: {request_id}\tDuration: {duration_ms:.2} ms\tBilled Duration: \
-         {billed_ms:.0} ms\tMemory Size: {memory_size} MB\tMax Memory Used: {used_mb} MB"
+    lines.push(log_records::runtime_done(
+        json,
+        ended,
+        request_id,
+        &finished.completion,
+    ));
+    lines.push(log_records::report(
+        json,
+        ended,
+        request_id,
+        &finished.completion,
+        log_records::Report {
+            duration_ms,
+            billed_ms,
+            memory_size,
+            used_mb,
+        },
     ));
     RunLog { lines, opened }
+}
+
+/// Whether the records of this invocation's log are the structured ones: the function's own
+/// `LoggingConfig$LogFormat`, as the target the invocation was accepted with read it
+/// ([`log_delivery::log_target`]).
+///
+/// An invocation whose caller resolved no target at all logs to no group, and its records keep
+/// the runtime's plain-text framing — the format a function that names none carries.
+fn json_log_records(invocation: &Invocation) -> bool {
+    invocation
+        .logs
+        .as_ref()
+        .is_some_and(|target| target.log_format == super::LOG_FORMAT_JSON)
 }
 
 /// What the report states the run USED, in whole megabytes: the memory the engine measured
@@ -1450,6 +1497,19 @@ fn runtime_environment(invocation: &Invocation, started: SystemTime) -> BTreeMap
         (
             "AWS_LAMBDA_LOG_STREAM_NAME",
             log_stream_name(&invocation.executed_version, &invocation.request_id, started),
+        ),
+        // Which FORM the runtime renders this invocation's own records in: the function's
+        // `LoggingConfig$LogFormat`, which the runtime reads here because the records a
+        // handler writes are rendered where their level and message are known
+        // ([`bootstrap`], [`node::runtime`]) rather than by the delivery.
+        (
+            "AWS_LAMBDA_LOG_FORMAT",
+            if json_log_records(invocation) {
+                super::LOG_FORMAT_JSON
+            } else {
+                super::DEFAULT_LOG_FORMAT
+            }
+            .to_string(),
         ),
         ("AWS_REGION", invocation.region.clone()),
         ("AWS_DEFAULT_REGION", invocation.region.clone()),

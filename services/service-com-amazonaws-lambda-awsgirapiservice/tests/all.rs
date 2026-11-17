@@ -435,6 +435,8 @@ mod invocation_log_delivery;
 mod invocation_log_delivery_grant_carrier;
 #[path = "all/invocation_log_group_search.rs"]
 mod invocation_log_group_search;
+#[path = "all/invocation_log_record_format.rs"]
+mod invocation_log_record_format;
 #[path = "all/invocation_outcome_series.rs"]
 mod invocation_outcome_series;
 #[path = "all/invocation_refusal_diagnostics.rs"]

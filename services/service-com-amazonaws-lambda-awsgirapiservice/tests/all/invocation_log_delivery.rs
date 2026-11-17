@@ -255,6 +255,21 @@ pub(crate) const PYTHON_RUNTIME: &str = "python3.12";
 ///
 /// `pub(crate)` for the reason [`emulator`] is.
 pub(crate) async fn create_function(router: &MultiServiceRouter, function: &Created<'_>) {
+    create_function_logging(router, function, None).await;
+}
+
+/// The SAME create, with the whole `LoggingConfig` the function carries — for a suite that
+/// configures more of it than the group ([`crate::invocation_log_record_format`], whose
+/// functions carry a `LogFormat` and a level). The configuration REPLACES
+/// [`Created::log_group`] where one is given, so one create carries one configuration and
+/// there is one create path in this target.
+///
+/// `pub(crate)` for the reason [`emulator`] is.
+pub(crate) async fn create_function_logging(
+    router: &MultiServiceRouter,
+    function: &Created<'_>,
+    logging_config: Option<&Value>,
+) {
     let python = function.runtime.starts_with("python");
     let (handler, package) = if python {
         (
@@ -275,8 +290,10 @@ pub(crate) async fn create_function(router: &MultiServiceRouter, function: &Crea
         "Timeout": 10,
         "Code": { "ZipFile": base64::engine::general_purpose::STANDARD.encode(package) },
     });
-    if let Some(group) = function.log_group {
-        body["LoggingConfig"] = json!({ "LogGroup": group });
+    match (logging_config, function.log_group) {
+        (Some(logging), _) => body["LoggingConfig"] = logging.clone(),
+        (None, Some(group)) => body["LoggingConfig"] = json!({ "LogGroup": group }),
+        (None, None) => {}
     }
     let created = call(router, "POST", FUNCTIONS_URI, &body).await;
     assert_eq!(

@@ -22,8 +22,9 @@ use crate::ops::types::{
 };
 
 use super::{
-    code_location_url, configured_capacity_provider, configured_function_arn, configured_log_group,
-    event_payload, iso8601,
+    code_location_url, configured_application_log_level, configured_capacity_provider,
+    configured_function_arn, configured_log_format, configured_log_group,
+    configured_system_log_level, event_payload, iso8601,
     mint_durable_execution_id, mint_revision_id, resolved_image_uri, runtime_version_arn,
     service_managed_function_scaling_config, AliasRecord, AsyncInvocationOutcome,
     AsyncInvocationRecord, CapacityProviderVersion, CodeRecord, DurableExecutionRecord,
@@ -31,9 +32,9 @@ use super::{
     FunctionUrlConfigRecord,
     FunctionVersionRecord, PolicyRecord, ProvisionedConcurrencyRecord, RequestChainRecord,
     RuntimeManagementConfigRecord, ASYNC_DELIVERY_DELAY, ASYNC_NOT_DELIVERED_REASON,
-    ASYNC_RECURSION_STOPPED_REASON, DEFAULT_LOG_FORMAT, DEFAULT_LOG_LEVEL,
+    ASYNC_RECURSION_STOPPED_REASON,
     DURABLE_EXECUTION_ARN_INFIX, EVENT_TYPE_EXECUTION_STARTED, EXECUTION_STATUS_RUNNING,
-    LAST_UPDATE_STATUS_IN_PROGRESS, LAST_UPDATE_STATUS_SUCCESSFUL, LOG_FORMAT_JSON,
+    LAST_UPDATE_STATUS_IN_PROGRESS, LAST_UPDATE_STATUS_SUCCESSFUL,
     MAX_DURABLE_EXECUTIONS, MAX_QUEUED_ASYNC_INVOCATIONS,
     NO_CAPACITY_PROVIDER_MESSAGE, REPOSITORY_TYPE_ECR, REPOSITORY_TYPE_S3,
     S3_OBJECT_STORAGE_MODE_REFERENCE, SNAP_START_APPLY_ON_NONE,
@@ -918,35 +919,17 @@ impl FunctionRecord {
             // the JSON format reports both — the levels really in effect. A function on the
             // plain-text format reports whatever is stored for them and nothing defaulted,
             // because that format filters by no level at all.
+            //
+            // Every one of the four is read through [`crate::state::invocation_logs`], the one
+            // reading of this configuration, so what a read REPORTS and what a run's records
+            // are DELIVERED under cannot disagree.
             logging_config: {
-                let log_format = config
-                    .logging_config
-                    .as_ref()
-                    .and_then(|logging| logging.log_format.clone())
-                    .unwrap_or_else(|| DEFAULT_LOG_FORMAT.to_string());
-                let level = |configured: Option<String>| {
-                    configured.or_else(|| {
-                        (log_format == LOG_FORMAT_JSON).then(|| DEFAULT_LOG_LEVEL.to_string())
-                    })
-                };
+                let logging = config.logging_config.as_ref();
                 Some(LoggingConfig {
-                    application_log_level: level(
-                        config
-                            .logging_config
-                            .as_ref()
-                            .and_then(|logging| logging.application_log_level.clone()),
-                    ),
-                    system_log_level: level(
-                        config
-                            .logging_config
-                            .as_ref()
-                            .and_then(|logging| logging.system_log_level.clone()),
-                    ),
-                    log_group: Some(configured_log_group(
-                        config.logging_config.as_ref(),
-                        &config.name,
-                    )),
-                    log_format: Some(log_format),
+                    application_log_level: configured_application_log_level(logging),
+                    system_log_level: configured_system_log_level(logging),
+                    log_group: Some(configured_log_group(logging, &config.name)),
+                    log_format: Some(configured_log_format(logging).to_string()),
                 })
             },
             // The runtime version the function is pinned to. A container image carries no

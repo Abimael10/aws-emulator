@@ -93,32 +93,48 @@ pub struct LogGrants {
     pub put_log_events: bool,
 }
 
-/// Where one function's invocations are logged, and what its execution role may do there.
+/// Where one function's invocations are logged, in which form, and what its execution role
+/// may do there.
 #[derive(Debug, Clone)]
 pub struct LogTarget {
     /// The log group the function writes to: the one its `LoggingConfig` names, else the
     /// default one for its name.
     pub log_group: String,
+    /// The `LogFormat` its records are rendered in: the one its `LoggingConfig` names, else
+    /// the documented default. It is what decides whether a record of the run is one JSON
+    /// object or the runtime's plain-text framing ([`super::log_records`]).
+    pub log_format: &'static str,
+    /// The `ApplicationLogLevel` its application records are filtered at before Lambda sends
+    /// them here, or `None` for a function filtered at no level at all.
+    pub application_log_level: Option<String>,
     /// What the function's execution role may do to that group.
     pub grants: LogGrants,
 }
 
-/// Where the function `config` logs, and what its execution role may do there — read off the
-/// SAME shared engine the function's own store lives in, so the decision is made against the
-/// records IAM's handlers wrote.
+/// Where the function `config` logs, in which form, and what its execution role may do there
+/// — read off the SAME shared engine the function's own store lives in, so the decision is
+/// made against the records IAM's handlers wrote.
 #[must_use]
 pub fn log_target<Eng: Send + Sync + 'static>(
     engine: &Eng,
     region: &str,
     config: &crate::state::FunctionConfig,
 ) -> LogTarget {
-    // The ONE reading of where this function's invocations are logged, shared with what a
-    // READ of the function reports for its `LoggingConfig`.
-    let log_group =
-        crate::state::configured_log_group(config.logging_config.as_ref(), &config.name);
+    // The ONE reading of where this function's invocations are logged, in which form and
+    // under which level filter, shared with what a READ of the function reports for its
+    // `LoggingConfig`.
+    let logging = config.logging_config.as_ref();
+    let log_group = crate::state::configured_log_group(logging, &config.name);
     LogTarget {
         grants: grants(engine, region, &config.role, &log_group),
         log_group,
+        log_format: crate::state::configured_log_format(logging),
+        // A level filters records only where there are records to filter BY level: the level
+        // members are a feature of the structured format, so a function on the plain-text
+        // format is delivered under no filter at all whatever is stored for them.
+        application_log_level: crate::state::delivers_json_records(logging)
+            .then(|| crate::state::configured_application_log_level(logging))
+            .flatten(),
     }
 }
 
@@ -209,7 +225,8 @@ const MAX_EVENTS_PER_BATCH: usize = 10_000;
 /// its log budget is delivered in several calls rather than refused as one oversized request.
 const MAX_MESSAGE_BYTES_PER_BATCH: usize = 512 * 1024;
 
-/// Deliver one run's log: open the group and the stream, and put the run's events.
+/// Deliver one run's log: open the group and the stream, and put the records the function's
+/// application log level admits.
 ///
 /// Every call is made only while the role may make it — the decision the run was accepted
 /// with ([`LogTarget::grants`]) — and a call CloudWatch Logs refuses is not an invocation
@@ -228,7 +245,21 @@ pub(super) async fn deliver(
     log_stream: &str,
     events: &[LogEvent],
 ) {
-    if events.is_empty() {
+    // WHICH of the run's records Lambda sends here: `ApplicationLogLevel` is the filter on
+    // "the application logs for your function that Lambda sends to CloudWatch", so a record
+    // the function's level withholds is one this delivery never writes — and the frames of
+    // the run, which state no level, are written whatever the filter is
+    // ([`super::log_records::admitted_at`]).
+    let sent: Vec<&LogEvent> = events
+        .iter()
+        .filter(|event| {
+            super::log_records::admitted_at(
+                &event.message,
+                target.application_log_level.as_deref(),
+            )
+        })
+        .collect();
+    if sent.is_empty() {
         return;
     }
     let writer = aws.clone().signing_as(None);
@@ -250,7 +281,7 @@ pub(super) async fn deliver(
     }
     // One call per batch of the bounds above, in order, so the whole log reaches the stream
     // however many lines the run wrote — and no one call is larger than a batch may be.
-    for batch in batched(events) {
+    for batch in batched(&sent) {
         let carried: Vec<::serde_json::Value> = batch
             .iter()
             .map(|event| {
@@ -275,7 +306,7 @@ pub(super) async fn deliver(
 /// before it reaches here, so the last word on how much is delivered is the run's own log
 /// budget rather than this split.
 #[must_use]
-pub(super) fn batched(events: &[LogEvent]) -> Vec<&[LogEvent]> {
+pub(super) fn batched<'a>(events: &'a [&'a LogEvent]) -> Vec<&'a [&'a LogEvent]> {
     let mut batches = Vec::new();
     let mut from = 0;
     while from < events.len() {
@@ -437,7 +468,8 @@ mod tests {
                     message: "L".repeat(*length),
                 })
                 .collect();
-            let batches = batched(&events);
+            let sent: Vec<&LogEvent> = events.iter().collect();
+            let batches = batched(&sent);
             assert_eq!(
                 batches.len(),
                 *expected,

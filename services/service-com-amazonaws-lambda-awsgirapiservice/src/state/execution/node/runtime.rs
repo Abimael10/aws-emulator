@@ -714,12 +714,23 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
 
     var util = requireId('core:util');
 
+    // The value of `AWS_LAMBDA_LOG_FORMAT` whose records are STRUCTURED, which is the member
+    // `LoggingConfig.LogFormat` carries: "the format in which Lambda sends your function's
+    // application and system logs to CloudWatch. Select between plain text and structured
+    // JSON".
+    var JSON_LOG_FORMAT = 'JSON';
+
     // The frame a managed node runtime delivers a console line in, under the TEXT log
     // format: the instant it was written, the invocation it belongs to, the LEVEL of the
     // console method that wrote it, and the formatted text — four tab-separated fields, in
     // that order, which is what lets a client correlate a line to an invocation and filter
     // by level. It is the same frame the runtime's own `Invoke Error` record carries
     // ([`logInvokeError`]), so one runtime writes one kind of line.
+    //
+    // Under the STRUCTURED format the same record is ONE JSON object instead — the level,
+    // the message, the invocation and the instant as named members — because a function whose
+    // `LogFormat` is JSON has its application records delivered as records rather than as
+    // text ([`jsonRecords`]).
     //
     // A line written while NO invocation is bound — at module load, before a request
     // reaches the handler — belongs to no invocation, so it is delivered as the text it is
@@ -730,8 +741,23 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
             hostLog(text + '\n');
             return;
         }
+        if (jsonRecords()) {
+            hostLog(JSON.stringify({
+                timestamp: new Date().toISOString(),
+                level: level,
+                message: text,
+                requestId: state.requestId
+            }) + '\n');
+            return;
+        }
         hostLog(new Date().toISOString() + '\t' + state.requestId + '\t' + level + '\t'
             + text + '\n');
+    }
+
+    // Whether this invocation's records are the structured ones, which the invocation's own
+    // environment states as the function's configured `LogFormat`.
+    function jsonRecords() {
+        return state !== null && state.logFormat === JSON_LOG_FORMAT;
     }
 
     var console = {
@@ -1372,11 +1398,26 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
     // id, the ERROR level and the error document, which is where a client reads what a
     // failed invocation came to. Written once per invocation, because one invocation fails
     // once.
+    //
+    // Under the STRUCTURED format it is ONE JSON object like every other record of such a
+    // function, carrying the error's class, message and stack as named members.
     function logInvokeError(reported) {
         if (state === null || state.loggedError) {
             return;
         }
         state.loggedError = true;
+        if (jsonRecords()) {
+            hostLog(JSON.stringify({
+                timestamp: new Date().toISOString(),
+                level: 'ERROR',
+                message: reported.errorMessage,
+                requestId: state.requestId,
+                errorType: reported.errorType,
+                errorMessage: reported.errorMessage,
+                stackTrace: reported.trace
+            }) + '\n');
+            return;
+        }
         hostLog(new Date().toISOString() + '\t' + state.requestId + '\tERROR\tInvoke Error \t'
             + JSON.stringify({
                 errorType: reported.errorType,
@@ -1789,6 +1830,8 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
             callbackError: null,
             callbackValue: null,
             requestId: input.requestId,
+            // The FORM this invocation's records take, which its own environment states.
+            logFormat: input.environment.AWS_LAMBDA_LOG_FORMAT,
             esModuleHint: null,
             loggedError: false,
             rejections: []

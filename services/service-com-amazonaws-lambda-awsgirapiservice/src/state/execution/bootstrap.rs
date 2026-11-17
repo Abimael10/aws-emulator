@@ -29,7 +29,17 @@
 //! * `__lambda_prepare` — the INIT phase: it installs this runtime, imports the handler's
 //!   module and resolves its entry point, answering the empty string when the environment
 //!   is ready and an error document for an initialization that failed. None of that is the
-//!   handler's run, so none of it is bounded by the function's `Timeout`.
+//!   handler's run, so none of it is bounded by the function's `Timeout` — it is bounded by
+//!   the span an initialization is allowed instead. That bound is the HOST's and is in force
+//!   before this source is evaluated at all: the trace hook that spends the run's deadline,
+//!   step count and memory ceiling is installed before `__lambda_prepare` is called, and the
+//!   deadline it holds during this phase is the initialization span plus the function's
+//!   `Timeout` ([`super::python`], [`super::INIT_PHASE_LIMIT`]), with the host's own watch
+//!   sampling that deadline from outside the guest. So module-level code of the deployment
+//!   package — a busy loop, an unbounded allocation, a blocking construct — is stopped on
+//!   those bounds like any other guest frame, reaches no bound of its own and cannot wedge
+//!   the interpreter: the phase simply has a longer span than one invocation, not an
+//!   unbounded one.
 //! * `__lambda_bind` — the NEXT invocation's own request, put on the prepared environment:
 //!   the event, the request id, the ARN the call addressed, the client context, the tenant
 //!   and the environment the invocation runs with. It answers the empty string when the
@@ -121,6 +131,40 @@ sys.stderr = _LogStream()
 sys.stdin = None
 
 
+# The value of `AWS_LAMBDA_LOG_FORMAT` whose records are STRUCTURED, which is the member
+# `LoggingConfig.LogFormat` carries: "the format in which Lambda sends your function's
+# application and system logs to CloudWatch. Select between plain text and structured JSON".
+_JSON_LOG_FORMAT = "JSON"
+
+# How this runtime renders the records of the invocation it is serving: the format the
+# function is configured for, and the invocation every record names. Kept here because a
+# record is rendered wherever one is written — the logging handler below, and the report this
+# runtime writes for an unhandled exception.
+_LOGGING = {"json": False, "requestId": None}
+
+
+def _instant(created):
+    """``created``, a POSIX timestamp, in the form a record of this runtime states an
+    instant in: UTC to the millisecond.
+
+    The ONE rendering, so the instants a run reports cannot drift between the records the
+    logging handler writes and the report this runtime writes for an unhandled exception.
+    """
+
+    whole = int(created)
+    millis = min(999, int((created - whole) * 1000.0))
+    at = datetime.datetime.utcfromtimestamp(whole)
+    return "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ" % (
+        at.year,
+        at.month,
+        at.day,
+        at.hour,
+        at.minute,
+        at.second,
+        millis,
+    )
+
+
 class _LambdaLogFormatter(logging.Formatter):
     """How this runtime renders ONE logging record into the invocation's log.
 
@@ -136,26 +180,25 @@ class _LambdaLogFormatter(logging.Formatter):
         self._request_id = request_id
 
     def formatTime(self, record, datefmt=None):
-        whole = int(record.created)
-        millis = min(999, int((record.created - whole) * 1000.0))
-        at = datetime.datetime.utcfromtimestamp(whole)
-        return "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ" % (
-            at.year,
-            at.month,
-            at.day,
-            at.hour,
-            at.minute,
-            at.second,
-            millis,
+        return _instant(record.created)
+
+    def exception(self, record):
+        """The class, the message and the frames of the exception a record carries."""
+
+        if not record.exc_info:
+            return None
+        kind, raised, trace = record.exc_info
+        return (
+            getattr(kind, "__name__", str(kind)),
+            str(raised),
+            traceback.format_exception(kind, raised, trace),
         )
 
     def format(self, record):
         message = record.getMessage()
-        if record.exc_info:
-            rendered = traceback.format_exception(
-                record.exc_info[0], record.exc_info[1], record.exc_info[2]
-            )
-            message = "%s\n%s" % (message, "".join(rendered).rstrip("\n"))
+        failure = self.exception(record)
+        if failure is not None:
+            message = "%s\n%s" % (message, "".join(failure[2]).rstrip("\n"))
         return "[%s]\t%s\t%s\t%s" % (
             record.levelname,
             self.formatTime(record),
@@ -164,7 +207,34 @@ class _LambdaLogFormatter(logging.Formatter):
         )
 
 
-def _install_logging(request_id):
+class _LambdaJsonLogFormatter(_LambdaLogFormatter):
+    """The same record under the STRUCTURED log format: one JSON object.
+
+    A function whose `LogFormat` is JSON has its application records delivered as JSON
+    objects rather than in the text framing above, so a client reads the level, the message
+    and the invocation off named members instead of off tab-separated fields: the level is
+    the emitting logger's own level NAME, the message is the formatted line, the request id
+    is the invocation's, and the timestamp is the instant the record was created. A record
+    carrying an exception names its class and its frames beside them, which is what makes a
+    failure readable as a record rather than as free text.
+    """
+
+    def format(self, record):
+        document = {
+            "timestamp": self.formatTime(record),
+            "level": record.levelname,
+            "message": record.getMessage(),
+            "requestId": self._request_id,
+        }
+        failure = self.exception(record)
+        if failure is not None:
+            document["errorType"] = failure[0]
+            document["errorMessage"] = failure[1]
+            document["stackTrace"] = failure[2]
+        return json.dumps(document)
+
+
+def _install_logging(request_id, log_format):
     """Give the root logger the handler the managed runtime gives it.
 
     A record emitted through `logging` reaches no output on its own: with no handler on
@@ -174,6 +244,9 @@ def _install_logging(request_id):
     handler instead, which is what makes `logging.getLogger().setLevel(logging.INFO)`
     followed by `logger.info(...)` appear in the log — so this runtime installs one too,
     writing into the invocation's own output.
+
+    The FORMAT is the function's own, which the invocation's environment states: the text
+    framing of the managed runtime, or the structured record its JSON format delivers.
 
     The LEVEL is left exactly as the library's own default (a warning), because that is
     the level the managed runtime leaves the root logger at: what a record has to clear is
@@ -185,12 +258,22 @@ def _install_logging(request_id):
     twice.
     """
 
+    json_records = log_format == _JSON_LOG_FORMAT
+    _LOGGING["json"] = json_records
+    _LOGGING["requestId"] = request_id
     handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(_LambdaLogFormatter(request_id))
+    formatter = _LambdaJsonLogFormatter if json_records else _LambdaLogFormatter
+    handler.setFormatter(formatter(request_id))
     root = logging.getLogger()
     for installed in list(root.handlers):
         root.removeHandler(installed)
     root.addHandler(handler)
+
+
+def _configured_log_format(environment):
+    """The log format the invocation's own environment states, as the runtime reads it."""
+
+    return (environment or {}).get("AWS_LAMBDA_LOG_FORMAT") or ""
 
 
 class _PackageLoader:
@@ -418,7 +501,27 @@ def _report(error_type, error_message, stack_trace):
     error document, so the invocation's LOG carries what went wrong: the error's type and
     message, then the handler's own traceback. That is what a client reads out of the
     function's log group for a failed invocation.
+
+    Under the STRUCTURED log format the same report is ONE record instead of those lines:
+    the class, the message and the frames become the members of a single JSON object,
+    because a client that selected that format reads its function's log as records.
     """
+    if _LOGGING["json"]:
+        sys.stderr.write(
+            json.dumps(
+                {
+                    "timestamp": _instant(time.time()),
+                    "level": "ERROR",
+                    "message": "%s: %s" % (error_type, error_message),
+                    "requestId": _LOGGING["requestId"],
+                    "errorType": error_type,
+                    "errorMessage": error_message,
+                    "stackTrace": [frame.rstrip("\n") for frame in stack_trace],
+                }
+            )
+            + "\n"
+        )
+        return
     sys.stderr.write("[ERROR] %s: %s\n" % (error_type, error_message))
     sys.stderr.write("Traceback (most recent call last):\n")
     for frame in stack_trace:
@@ -525,7 +628,9 @@ def _prepare(request, library):
     time.sleep = _bounded_sleep
     # Before the handler's module is imported, which is where a module-level record is
     # emitted from.
-    _install_logging(request["requestId"])
+    _install_logging(
+        request["requestId"], _configured_log_format(request.get("environment"))
+    )
 
     handler = request["handler"]
     module_name, separator, attribute = handler.rpartition(".")
@@ -651,7 +756,9 @@ def _bind(request):
     environment = request.get("environment")
     if environment is not None:
         prepared["environment"] = environment
-    _install_logging(prepared["requestId"])
+    _install_logging(
+        prepared["requestId"], _configured_log_format(prepared.get("environment"))
+    )
     return None
 
 
