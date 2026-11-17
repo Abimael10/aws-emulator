@@ -17,7 +17,12 @@ pub struct GetSAMLProviderInput {
     pub saml_provider_arn: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.iam#GetSAMLProviderResponse")]
+/// `GetSAMLProvider`'s response.
+///
+/// Carries one member the on-disk model does not declare — `SAMLKeyHash`, which the service
+/// reports and the model carries `PrivateKeyList` in the place of — so the schema and the
+/// serializer come from `iam_schema_and_codec!` rather than from
+/// `#[smithy_macros::smithy(shape = ...)]`; that module's note has the whole reason.
 #[derive(Debug, Clone, Default)]
 pub struct GetSAMLProviderOutput {
     pub saml_provider_uuid: Option<String>,
@@ -27,7 +32,82 @@ pub struct GetSAMLProviderOutput {
     pub tags: Option<Vec<Tag>>,
     pub assertion_encryption_mode: Option<String>,
     pub private_key_list: Option<Vec<SAMLPrivateKey>>,
+    /// The signing keys the provider's metadata document publishes, paired with the issuer
+    /// that document names — the member the model does not declare.
+    pub saml_key_hash: Option<Vec<SAMLKeyHashEntry>>,
 }
+
+iam_schema_and_codec!(
+    GetSAMLProviderOutput,
+    GET_SAML_PROVIDER_OUTPUT_SCHEMA,
+    "com.amazonaws.iam#GetSAMLProviderResponse",
+    "com.amazonaws.iam",
+    "GetSAMLProviderResponse",
+    (M_SAML_PROVIDER_UUID, saml_provider_uuid, "SAMLProviderUUID", 0, string),
+    (
+        M_SAML_METADATA_DOCUMENT,
+        saml_metadata_document,
+        "SAMLMetadataDocument",
+        1,
+        string
+    ),
+    (M_CREATE_DATE, create_date, "CreateDate", 2, date_time),
+    (M_VALID_UNTIL, valid_until, "ValidUntil", 3, date_time),
+    (M_TAGS, tags, "Tags", 4, list_of_struct(Tag)),
+    (
+        M_ASSERTION_ENCRYPTION_MODE,
+        assertion_encryption_mode,
+        "AssertionEncryptionMode",
+        5,
+        string
+    ),
+    (
+        M_PRIVATE_KEY_LIST,
+        private_key_list,
+        "PrivateKeyList",
+        6,
+        list_of_struct(SAMLPrivateKey)
+    ),
+    (
+        M_SAML_KEY_HASH,
+        saml_key_hash,
+        "SAMLKeyHash",
+        7,
+        recorded(list_of_struct(SAMLKeyHashEntry))
+    ),
+);
+
+/// One entry of `GetSAMLProvider`'s `SAMLKeyHash`: an issuer and the hashes of the signing
+/// keys published for it.
+///
+/// A shape the on-disk model does not declare at all, so both it and its members sit in the
+/// recorded namespace (`recorded_member_wire::RECORDED_NAMESPACE`). The element name of a
+/// list item is decided by the list, so every entry travels as `<member>` whatever this
+/// shape is called.
+#[derive(Debug, Clone, Default)]
+pub struct SAMLKeyHashEntry {
+    /// The issuer the metadata document names — its entity descriptor's `entityID`.
+    pub issuer_url: Option<String>,
+    /// The hash of each signing key that document publishes for that issuer, in document
+    /// order.
+    pub key_hashes: Option<Vec<String>>,
+}
+
+iam_schema_and_codec!(
+    SAMLKeyHashEntry,
+    SAML_KEY_HASH_ENTRY_SCHEMA,
+    "com.amazonaws.iam.recorded#SAMLKeyHashEntry",
+    "com.amazonaws.iam.recorded",
+    "SAMLKeyHashEntry",
+    (M_ISSUER_URL, issuer_url, "IssuerURL", 0, recorded(string)),
+    (
+        M_KEY_HASHES,
+        key_hashes,
+        "KeyHashes",
+        1,
+        recorded(list_of_string)
+    ),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.iam#SAMLPrivateKey")]
 #[derive(Debug, Clone, Default)]

@@ -354,12 +354,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             provider.metadata_document = document;
         }
         if let Some(metadata) = replacement {
-            // The expiration is a property of the document, so replacing the document
-            // replaces it — including clearing it when the new document states none.
-            provider.valid_until = metadata.valid_until;
+            // The expiration and the published keys are properties of the document, so
+            // replacing the document replaces both — and a replacement stating no
+            // expiration leaves the provider with the default lifetime counted from when it
+            // was created, which is the provider's own instant and not this call's.
+            provider.valid_until =
+                crate::state::saml_provider_valid_until(provider.create_date, &metadata);
+            provider.key_hashes = crate::state::saml_key_hashes(&metadata);
         }
         if let Some(mode) = input.assertion_encryption_mode {
-            provider.assertion_encryption_mode = Some(mode);
+            provider.assertion_encryption_mode = mode;
         }
         let private_key_count = provider.private_keys.len();
 

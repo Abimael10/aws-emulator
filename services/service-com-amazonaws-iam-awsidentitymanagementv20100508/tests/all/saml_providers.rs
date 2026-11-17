@@ -12,21 +12,27 @@
 //! The rules under test are that a create PERSISTS the provider under an ARN DERIVED from
 //! its `Name` and the read REPORTS what was persisted — the metadata document byte for
 //! byte, the instant it was created, the expiration READ OUT of that document
-//! (`validUntil`), the encryption setting the request chose, the metadata of a private key
-//! it uploaded, and its tags sorted by key — while a document that describes no SAML 2.0
-//! identity provider, and a second create for a name the account already holds, are both
-//! refused with nothing persisted. Each suite is a TABLE whose rows differ along what
-//! those rules generalise over (how the metadata document spells its namespace and nests
-//! its entity, whether it states an expiration and in which form, the provider name's
+//! (`validUntil`, and the default lifetime when the document states none), the encryption
+//! setting the request chose (and the default when it chose none), the metadata of a
+//! private key it uploaded, and its tags sorted by key — while a document that describes no
+//! SAML 2.0 identity provider, and a second create for a name the account already holds,
+//! are both refused with nothing persisted. Each suite is a TABLE whose rows differ along
+//! what those rules generalise over (how the metadata document spells its namespace and
+//! nests its entity, whether it states an expiration and in which form, the provider name's
 //! alphabet, the encryption mode, whether a private key is uploaded, the tag count and the
 //! order the tags arrive in), so no single request is the specification.
+//!
+//! The members a provider reports that are DERIVED rather than stored verbatim — its key
+//! hashes, and the default expiration and encryption setting — are pinned by
+//! `tests/all/saml_provider_metadata.rs`, which owns the fixture documents that publish
+//! real keys.
 
 use std::collections::BTreeMap;
 
 use aws_smithy_types::DateTime;
 use aws_smithy_types::date_time::Format;
 
-use crate::role_lifecycle::{borrowed, optional, param, reported_tags};
+use crate::role_lifecycle::{borrowed, param, reported_tags};
 use crate::user_lifecycle::{account_id, call, element, elements, error_code, router};
 
 /// How a metadata document spells the SAML 2.0 metadata it carries. The SAME document
@@ -263,6 +269,36 @@ pub(crate) fn reported_instant(text: &str) -> DateTime {
         .unwrap_or_else(|error| panic!("{text:?} is not a wire date-time: {error}"))
 }
 
+/// How long a provider whose metadata document states NO expiration stays valid, counted
+/// from the instant it was created: 36500 days, the gap `GetSAMLProvider`'s own example
+/// answer reports between the `CreateDate` and the `ValidUntil` beside it.
+pub(crate) const DEFAULT_VALIDITY_SECONDS: i64 = 36_500 * 86_400;
+
+/// The expiration a provider created at `create_date` must report when the document it
+/// holds states `document_valid_until`: that instant when the document states one, and the
+/// default lifetime from the creation instant when it states none — a provider always has
+/// one.
+pub(crate) fn expected_expiration(
+    create_date: &str,
+    document_valid_until: Option<&str>,
+) -> DateTime {
+    match document_valid_until {
+        Some(until) => reported_instant(until),
+        None => DateTime::from_secs(
+            reported_instant(create_date)
+                .secs()
+                .saturating_add(DEFAULT_VALIDITY_SECONDS),
+        ),
+    }
+}
+
+/// The encryption setting a provider must report when the calls that wrote it chose
+/// `chosen`: that mode, and the permissive member of `assertionEncryptionModeType` when no
+/// call chose one — a provider always reports a setting.
+pub(crate) fn expected_encryption_mode(chosen: Option<&str>) -> &str {
+    chosen.unwrap_or("Allowed")
+}
+
 /// `privateKeyIdType` (which both `SAMLProviderUUID` and `SAMLPrivateKey$KeyId` target)
 /// is len 22..64 with pattern `^[A-Z0-9]+$` (`smithy_query(query="shape",
 /// shape="privateKeyIdType")`).
@@ -357,30 +393,22 @@ async fn a_created_saml_provider_round_trips_through_get_saml_provider() {
             "case {:?}: the read must report a CreateDate, got {read}",
             case.name
         );
-        // `ValidUntil` is the document's `validUntil`: reported when the document states
-        // one, and absent when it states none.
-        match case.expected_valid_until {
-            None => assert_eq!(
-                optional(&read, "ValidUntil"),
-                None,
-                "case {:?}: a document stating no expiration must report none, got {read}",
-                case.name
-            ),
-            Some(until) => {
-                let reported = element(&read, "ValidUntil");
-                assert_eq!(
-                    reported_instant(&reported),
-                    reported_instant(until),
-                    "case {:?}: ValidUntil must be the document's validUntil {until:?}, got \
-                     {reported:?}",
-                    case.name
-                );
-            }
-        }
+        // `ValidUntil` is the document's `validUntil` when it states one, and the default
+        // lifetime from the creation instant when it states none: a provider always reports
+        // an expiration.
+        let reported = element(&read, "ValidUntil");
+        let expiration = expected_expiration(&create_date, case.expected_valid_until);
         assert_eq!(
-            optional(&read, "AssertionEncryptionMode").as_deref(),
-            case.encryption_mode,
-            "case {:?}: the read must report the encryption mode the create chose, got {read}",
+            reported_instant(&reported),
+            expiration,
+            "case {:?}: expected ValidUntil {expiration:?}, got {reported:?}",
+            case.name
+        );
+        assert_eq!(
+            element(&read, "AssertionEncryptionMode"),
+            expected_encryption_mode(case.encryption_mode),
+            "case {:?}: the read must report the encryption mode the create chose, or the\
+             default when it chose none, got {read}",
             case.name
         );
         // One uploaded key is one entry of `PrivateKeyList`, carrying the id it was given
@@ -528,8 +556,8 @@ async fn a_second_create_for_a_held_name_is_refused_and_changes_nothing() {
             case.name
         );
         assert_eq!(
-            optional(&read, "AssertionEncryptionMode").as_deref(),
-            case.encryption_mode,
+            element(&read, "AssertionEncryptionMode"),
+            expected_encryption_mode(case.encryption_mode),
             "case {:?}: a refused create must leave the held encryption mode alone, got {read}",
             case.name
         );

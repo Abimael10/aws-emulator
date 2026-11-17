@@ -222,13 +222,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             saml_provider_uuid: Some(provider.provider_uuid.clone()),
             saml_metadata_document: Some(provider.metadata_document.clone()),
             create_date: Some(provider.create_date),
-            valid_until: provider.valid_until,
+            valid_until: Some(provider.valid_until),
             // "A list of tags that are attached to the specified IAM SAML provider"
             // (`$Tags`): the set the provider carries, reported whether or not it carries
             // any (`crate::state::reported_tags`).
             tags: crate::state::reported_tags(provider.tags.clone()),
-            assertion_encryption_mode: provider.assertion_encryption_mode.clone(),
+            assertion_encryption_mode: Some(provider.assertion_encryption_mode.clone()),
             private_key_list: Some(provider.private_keys.clone()),
+            // The signing keys the provider's metadata document publishes, each identified
+            // by the hash derived when that document was uploaded
+            // (`crate::state::saml_key_hashes`), paired with the issuer the document names
+            // — so a client can tell WHICH key the provider trusts without the document.
+            saml_key_hash: Some(provider.key_hashes.clone()),
         })
     }
 }

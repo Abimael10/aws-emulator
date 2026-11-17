@@ -58,6 +58,11 @@ data-encoding = "2"
 # one the authenticator app that scanned the device shows, so it comes from a library of that
 # algorithm rather than from an implementation of it here.
 totp-lite = "2.0"
+# Hashes a SAML provider's published signing key into the identifier that names that key
+# (`GetSAMLProvider`'s `SAMLKeyHash`), the SHA-1 of its `subjectPublicKey` bits RFC 5280
+# §4.2.1.2 derives a key identifier from, and computes the HMAC-SHA-1 the MFA suite's pass
+# codes are built from.
+sha1 = "0.10"
 # Hashes a console password into the salted verifier the account holds in place of it, so
 # `ChangePassword` can check the caller's current password without the password being kept.
 sha2 = { workspace = true }
@@ -84,7 +89,6 @@ rcgen = "0.13"
 # HMAC-SHA-1 of the time step over the device's seed — rather than from the TOTP library the
 # service computes with, so a wrong algorithm in the service cannot be the reason a row passes.
 hmac = "0.12"
-sha1 = "0.10"
 
 [lints]
 workspace = true

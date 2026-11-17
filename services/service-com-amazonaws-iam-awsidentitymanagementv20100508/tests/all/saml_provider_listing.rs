@@ -12,10 +12,9 @@
 //!
 //! The rule under test is that the listing reports EVERY provider the account holds,
 //! exactly once, as the subset of attributes `SAMLProviderListEntry` declares — the ARN
-//! that names it, the instant it was created and the expiration its metadata document
-//! states — each agreeing with what `GetSAMLProvider` reports for the same provider, and
-//! that it is a read: it reports no other attribute of a provider and changes nothing a
-//! later caller sees.
+//! that names it, the instant it was created and its expiration — each agreeing with what
+//! `GetSAMLProvider` reports for the same provider, and that it is a read: it reports no
+//! other attribute of a provider and changes nothing a later caller sees.
 //!
 //! Each suite is a TABLE whose rows differ along what that rule generalises over: how many
 //! providers the account holds (from none upwards), the provider name's alphabet and its
@@ -26,7 +25,10 @@
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::role_lifecycle::{borrowed, optional, param};
-use crate::saml_providers::{MetadataForm, expected_arn, metadata_document, reported_instant};
+use crate::saml_providers::{
+    MetadataForm, expected_arn, expected_encryption_mode, expected_expiration, metadata_document,
+    reported_instant,
+};
 use crate::user_lifecycle::{call, element, elements, router};
 
 /// One provider the account is made to hold, with the members the row exercises.
@@ -300,8 +302,9 @@ async fn every_held_provider_is_reported_exactly_once_at_every_count() {
 }
 
 /// Each entry reports the stored record: its `CreateDate` is the one `GetSAMLProvider`
-/// reports for the same provider, and its `ValidUntil` is the expiration the provider's
-/// metadata document states — present exactly when the document states one.
+/// reports for the same provider, and its `ValidUntil` is the expiration that provider
+/// reports — the document's `validUntil` when it states one, the default lifetime from the
+/// creation instant when it states none.
 #[tokio::test]
 async fn each_entry_agrees_with_get_saml_provider() {
     let router = router();
@@ -337,34 +340,27 @@ async fn each_entry_agrees_with_get_saml_provider() {
             case.name,
             entry.create_date
         );
-        match case.expected_valid_until {
-            None => assert_eq!(
-                entry.valid_until, None,
-                "case {:?}: a provider whose document states no expiration must report none, \
-                 got {:?}",
-                case.name, entry.valid_until
-            ),
-            Some(until) => {
-                let reported = entry
-                    .valid_until
-                    .as_deref()
-                    .unwrap_or_else(|| panic!("case {:?}: expected a ValidUntil", case.name));
-                assert_eq!(
-                    reported_instant(reported),
-                    reported_instant(until),
-                    "case {:?}: the entry's ValidUntil must be the document's validUntil \
-                     {until:?}, got {reported:?}",
-                    case.name
-                );
-                assert_eq!(
-                    reported_instant(reported),
-                    reported_instant(&element(&read, "ValidUntil")),
-                    "case {:?}: the entry's ValidUntil must be the one the read reports, got \
-                     {reported:?}",
-                    case.name
-                );
-            }
-        }
+        // The entry's `ValidUntil` is the provider's own expiration: the document's
+        // `validUntil` when it states one, and the default lifetime from the creation
+        // instant when it states none — the same value the read reports.
+        let reported = entry
+            .valid_until
+            .as_deref()
+            .unwrap_or_else(|| panic!("case {:?}: expected a ValidUntil, got {entry:?}", case.name));
+        let expiration = expected_expiration(&entry.create_date, case.expected_valid_until);
+        assert_eq!(
+            reported_instant(reported),
+            expiration,
+            "case {:?}: expected the entry's ValidUntil to be {expiration:?}, got {reported:?}",
+            case.name
+        );
+        assert_eq!(
+            reported_instant(reported),
+            reported_instant(&element(&read, "ValidUntil")),
+            "case {:?}: the entry's ValidUntil must be the one the read reports, got \
+             {reported:?}",
+            case.name
+        );
     }
 }
 
@@ -446,8 +442,8 @@ async fn listing_changes_nothing_a_later_caller_sees() {
             case.name
         );
         assert_eq!(
-            optional(&read, "AssertionEncryptionMode").as_deref(),
-            case.encryption_mode,
+            element(&read, "AssertionEncryptionMode"),
+            expected_encryption_mode(case.encryption_mode),
             "case {:?}: a listing must leave the held encryption mode alone, got {read}",
             case.name
         );

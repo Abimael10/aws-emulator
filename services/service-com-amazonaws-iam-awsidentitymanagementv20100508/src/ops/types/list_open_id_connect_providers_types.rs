@@ -22,9 +22,33 @@ pub struct ListOpenIDConnectProvidersOutput {
     pub open_id_connect_provider_list: Option<Vec<OpenIDConnectProviderListEntry>>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.iam#OpenIDConnectProviderListEntry")]
+/// One entry of `ListOpenIDConnectProviders`' `OpenIDConnectProviderList`.
+///
+/// Carries one member the on-disk model does not declare —
+/// `IsTrustedIdentityPropagationEnabled`, which the service reports on every entry — so the
+/// schema and the serializer come from `iam_schema_and_codec!` rather than from
+/// `#[smithy_macros::smithy(shape = ...)]`; that module's note has the whole reason.
 #[derive(Debug, Clone, Default)]
 pub struct OpenIDConnectProviderListEntry {
     pub arn: Option<String>,
+    /// Whether the provider is enabled for trusted identity propagation — the member the
+    /// model does not declare.
+    pub is_trusted_identity_propagation_enabled: Option<bool>,
 }
+
+iam_schema_and_codec!(
+    OpenIDConnectProviderListEntry,
+    OPEN_ID_CONNECT_PROVIDER_LIST_ENTRY_SCHEMA,
+    "com.amazonaws.iam#OpenIDConnectProviderListEntry",
+    "com.amazonaws.iam",
+    "OpenIDConnectProviderListEntry",
+    (M_ARN, arn, "Arn", 0, string),
+    (
+        M_IS_TRUSTED_IDENTITY_PROPAGATION_ENABLED,
+        is_trusted_identity_propagation_enabled,
+        "IsTrustedIdentityPropagationEnabled",
+        1,
+        recorded(boolean)
+    ),
+);
 

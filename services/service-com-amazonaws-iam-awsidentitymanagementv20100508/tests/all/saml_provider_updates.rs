@@ -40,8 +40,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::role_lifecycle::{borrowed, optional, param, reported_tags};
 use crate::saml_providers::{
-    MetadataForm, METADATA_NAMESPACE, assert_private_key_id_shape, expected_arn, filler,
-    metadata_document, reported_instant,
+    MetadataForm, METADATA_NAMESPACE, assert_private_key_id_shape, expected_arn,
+    expected_encryption_mode, expected_expiration, filler, metadata_document, reported_instant,
 };
 use crate::user_lifecycle::{call, element, elements, error_code, router};
 
@@ -179,9 +179,12 @@ struct UpdateCase {
     add_key: bool,
     /// Whether the update names the key the provider already holds in `RemovePrivateKey`.
     remove_held_key: bool,
-    /// The instant the read must report as `ValidUntil` afterwards, in the `Z` form.
+    /// The instant the read must report as `ValidUntil` afterwards, in the `Z` form, when
+    /// the document the update leaves states one; `None` when it states none, where the
+    /// read must report the default lifetime from the provider's creation instant.
     expected_valid_until: Option<&'static str>,
-    /// The encryption mode the read must report afterwards.
+    /// The encryption mode the read must report afterwards, or `None` when no call chose
+    /// one and the read must report the default.
     expected_mode: Option<&'static str>,
     /// How many private keys the provider must hold afterwards.
     expected_keys: usize,
@@ -233,9 +236,9 @@ fn update_cases() -> Vec<UpdateCase> {
             expected_keys: 0,
         },
         UpdateCase {
-            // The replacement document states NO expiration, so the provider stops
-            // reporting one: `ValidUntil` is the document's `validUntil`, not a value that
-            // outlives the document it came from.
+            // The replacement document states NO expiration, so the provider's expiration
+            // is no longer the one the replaced document stated: it falls back to the
+            // default lifetime a provider whose document states none carries.
             name: "ExpiryClearedByNewDocument",
             initial_valid_until: Some("2030-05-05T05:05:05Z"),
             initial_mode: Some("Allowed"),
@@ -425,31 +428,25 @@ async fn an_update_applies_the_members_it_supplies_and_leaves_the_rest_held() {
             case.name,
             after.document
         );
-        match case.expected_valid_until {
-            None => assert_eq!(
-                after.valid_until, None,
-                "case {:?}: a provider whose document states no expiration must report none, \
-                 got {:?}",
-                case.name, after.valid_until
-            ),
-            Some(until) => {
-                let value = after.valid_until.clone().unwrap_or_else(|| {
-                    panic!("case {:?}: expected ValidUntil {until:?}, got none", case.name)
-                });
-                assert_eq!(
-                    reported_instant(&value),
-                    reported_instant(until),
-                    "case {:?}: expected ValidUntil {until:?}, got {value:?}",
-                    case.name
-                );
-            }
-        }
+        // `ValidUntil` is the expiration the document the update left states, and the
+        // default lifetime from the provider's creation instant when that document states
+        // none — the provider always reports one.
+        let value = after.valid_until.clone().unwrap_or_else(|| {
+            panic!("case {:?}: expected a ValidUntil, got {after:?}", case.name)
+        });
+        let expiration = expected_expiration(&after.create_date, case.expected_valid_until);
+        assert_eq!(
+            reported_instant(&value),
+            expiration,
+            "case {:?}: expected ValidUntil {expiration:?}, got {value:?}",
+            case.name
+        );
         assert_eq!(
             after.encryption_mode.as_deref(),
-            case.expected_mode,
+            Some(expected_encryption_mode(case.expected_mode)),
             "case {:?}: expected AssertionEncryptionMode {:?}, got {:?}",
             case.name,
-            case.expected_mode,
+            expected_encryption_mode(case.expected_mode),
             after.encryption_mode
         );
         assert_eq!(

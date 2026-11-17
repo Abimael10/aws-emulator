@@ -22,11 +22,37 @@ pub struct ListSAMLProvidersOutput {
     pub saml_provider_list: Option<Vec<SAMLProviderListEntry>>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.iam#SAMLProviderListEntry")]
+/// One entry of `ListSAMLProviders`' `SAMLProviderList`.
+///
+/// Carries one member the on-disk model does not declare —
+/// `IsTrustedIdentityPropagationEnabled`, which the service reports on every entry — so the
+/// schema and the serializer come from `iam_schema_and_codec!` rather than from
+/// `#[smithy_macros::smithy(shape = ...)]`; that module's note has the whole reason.
 #[derive(Debug, Clone, Default)]
 pub struct SAMLProviderListEntry {
     pub arn: Option<String>,
     pub valid_until: Option<::aws_smithy_types::DateTime>,
     pub create_date: Option<::aws_smithy_types::DateTime>,
+    /// Whether the provider is enabled for trusted identity propagation — the member the
+    /// model does not declare.
+    pub is_trusted_identity_propagation_enabled: Option<bool>,
 }
+
+iam_schema_and_codec!(
+    SAMLProviderListEntry,
+    SAML_PROVIDER_LIST_ENTRY_SCHEMA,
+    "com.amazonaws.iam#SAMLProviderListEntry",
+    "com.amazonaws.iam",
+    "SAMLProviderListEntry",
+    (M_ARN, arn, "Arn", 0, string),
+    (M_VALID_UNTIL, valid_until, "ValidUntil", 1, date_time),
+    (M_CREATE_DATE, create_date, "CreateDate", 2, date_time),
+    (
+        M_IS_TRUSTED_IDENTITY_PROPAGATION_ENABLED,
+        is_trusted_identity_propagation_enabled,
+        "IsTrustedIdentityPropagationEnabled",
+        3,
+        recorded(boolean)
+    ),
+);
 

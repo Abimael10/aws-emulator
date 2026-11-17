@@ -174,15 +174,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //
         // "IAM resource-listing operations return a subset of the available attributes for
         // the resource. For example, this operation does not return tags": the subset is
-        // what `OpenIDConnectProviderListEntry` declares (`smithy_query(query="shape",
-        // shape="OpenIDConnectProviderListEntry")`) — the ARN alone — taken from the key
-        // the record is held under, which is the handle `GetOpenIDConnectProvider` reads
-        // the same provider back by.
+        // the ARN each record is held under — the handle `GetOpenIDConnectProvider` reads
+        // the same provider back by — beside the trusted-identity-propagation flag the
+        // service reports on every entry.
         let open_id_connect_provider_list: Vec<OpenIDConnectProviderListEntry> = store
             .open_id_connect_providers
             .keys()
             .map(|arn| OpenIDConnectProviderListEntry {
                 arn: Some(arn.clone()),
+                // Reported on every entry, so a caller enumerating providers learns it
+                // without a per-provider read. No operation this service models turns it
+                // on (`crate::state::TRUSTED_IDENTITY_PROPAGATION_ENABLED`).
+                is_trusted_identity_propagation_enabled: Some(
+                    crate::state::TRUSTED_IDENTITY_PROPAGATION_ENABLED,
+                ),
             })
             .collect();
 

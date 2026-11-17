@@ -14,7 +14,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ops::types::{
     AttachedPermissionsBoundary, DelegationRequest, Group, InstanceProfile, LoginProfile,
-    ParameterDefinition, Policy, PolicyVersion, Role, RoleTemplateVersion, SAMLPrivateKey,
+    ParameterDefinition, Policy, PolicyVersion, Role, RoleTemplateVersion, SAMLKeyHashEntry,
+    SAMLPrivateKey,
     ServerCertificateMetadata, ServiceSpecificCredentialMetadata, SigningCertificate, Tag,
     UpdateAccountPasswordPolicyInput, User,
 };
@@ -27,6 +28,7 @@ pub mod credential_report;
 pub mod emulator_clock;
 pub mod entity_path;
 pub mod entity_references;
+pub mod identity_provider_metadata;
 pub mod input_formats;
 pub mod member_forms;
 pub mod mfa_devices;
@@ -55,6 +57,7 @@ pub use credential_report::*;
 pub use emulator_clock::*;
 pub use entity_path::*;
 pub use entity_references::*;
+pub use identity_provider_metadata::*;
 pub use input_formats::*;
 pub use member_forms::*;
 pub use mfa_devices::*;
@@ -469,6 +472,38 @@ pub const XML_SIGNATURE_NAMESPACE: &str = "http://www.w3.org/2000/09/xmldsig#";
 /// The element of that vocabulary carrying one key as the base64 of a DER X.509
 /// certificate (same recommendation, §4.4.4).
 const XML_SIGNATURE_CERTIFICATE: &str = "X509Certificate";
+
+/// The metadata element that publishes ONE of an entity's keys and names what that key is
+/// for (OASIS "Metadata for SAML V2.0" §2.4.1.1).
+const SAML_KEY_DESCRIPTOR: &str = "KeyDescriptor";
+
+/// The attribute of that element naming the key's purpose. It is OPTIONAL, and "the absence
+/// of this attribute signifies that the contained key may be used for both encryption and
+/// signing" (same section), so a descriptor carrying no `use` publishes a signing key as
+/// much as one that says so.
+const SAML_KEY_USE_ATTRIBUTE: &str = "use";
+
+/// The value of that attribute naming a key the entity SIGNS its messages with — the keys a
+/// reader of the metadata verifies a message from the provider against.
+const SAML_KEY_USE_SIGNING: &str = "signing";
+
+/// How far above an `X509Certificate` element its `KeyDescriptor` sits, counting the
+/// element itself: the signature vocabulary fixes the nesting at `KeyDescriptor` >
+/// `KeyInfo` > `X509Data` > `X509Certificate` (W3C "XML Signature Syntax and Processing"
+/// §4.4.4), so a key's descriptor is exactly this far up and the walk that looks for it
+/// takes a fixed number of steps however deeply a document nests anything else around it.
+const SAML_KEY_DESCRIPTOR_ANCESTRY: usize = 4;
+
+/// How many distinct signing keys one SAML metadata document is read for.
+///
+/// Reading a document is work a REQUEST sizes — `SAMLMetadataDocumentType` admits ten
+/// million characters, which is room for a great many key elements — so the keys read out
+/// of one bound both the work the read costs and the state the provider holds for it. No
+/// published rule bounds how many keys a document may publish, and a deployment publishes
+/// one or two signing keys (a second while it rotates), so a document carrying more than
+/// this has the further ones left unread rather than letting one request choose how much
+/// work reading it is.
+pub const MAX_SIGNING_KEYS_PER_SAML_METADATA: usize = 10;
 
 /// The prefix of a minted `SAMLProviderUUID`. `privateKeyIdType` (which
 /// `GetSAMLProvider$SAMLProviderUUID` targets) is len 22..64 with pattern
@@ -1324,15 +1359,19 @@ pub struct SamlProviderRecord {
     pub create_date: ::aws_smithy_types::DateTime,
     /// "The expiration date and time for the SAML provider"
     /// (`GetSAMLProvider$ValidUntil`) — the `validUntil` of the metadata document
-    /// ([`parse_saml_metadata`]), so it is a property of the document the request
-    /// carried. `None` when the document states no expiration.
-    pub valid_until: Option<::aws_smithy_types::DateTime>,
+    /// ([`parse_saml_metadata`]), or the default lifetime a document stating none leaves
+    /// the provider with ([`saml_provider_valid_until`]). Either way the provider has one,
+    /// settled when the document was uploaded rather than when it is read.
+    pub valid_until: ::aws_smithy_types::DateTime,
     /// "The encryption setting for the SAML provider"
     /// (`GetSAMLProvider$AssertionEncryptionMode`), one value of
-    /// `assertionEncryptionModeType`. `None` when no call has set one: the model
-    /// declares no default for the member, so nothing is reported until a request
-    /// chooses a value.
-    pub assertion_encryption_mode: Option<String>,
+    /// `assertionEncryptionModeType`: the one the last call that named a mode chose, and
+    /// [`DEFAULT_ASSERTION_ENCRYPTION_MODE`] when no call has named one.
+    pub assertion_encryption_mode: String,
+    /// The hashes of the signing keys the metadata document publishes, paired with the
+    /// issuer it names ([`saml_key_hashes`]): derived when the document is uploaded, so a
+    /// read reports the keys of the document the provider currently holds.
+    pub key_hashes: Vec<SAMLKeyHashEntry>,
     /// "The private key metadata for the SAML provider"
     /// (`GetSAMLProvider$PrivateKeyList`), in the order the keys were uploaded. At most
     /// [`MAX_PRIVATE_KEYS_PER_SAML_PROVIDER`] of them, the maximum `privateKeyList`
@@ -4652,9 +4691,11 @@ pub struct SamlMetadata {
     /// (`CreateSAMLProvider$SAMLMetadataDocument`, OASIS "Metadata for SAML V2.0" §2.3),
     /// which is the name the provider's own messages carry as their `Issuer`.
     pub entity_id: String,
-    /// The "keys" the document publishes: the base64 of each DER X.509 certificate its
-    /// `X509Certificate` elements carry, in document order. These are the certificates a
-    /// reader of this metadata checks a message from the provider against, so a document
+    /// The "keys" the document publishes for SIGNING: the base64 of each DER X.509
+    /// certificate an `X509Certificate` element inside a signing `KeyDescriptor` carries,
+    /// in document order, once per distinct certificate and at most
+    /// [`MAX_SIGNING_KEYS_PER_SAML_METADATA`] of them. These are the certificates a reader
+    /// of this metadata checks a message from the provider against, so a document
     /// publishing none can verify nothing.
     pub signing_certificates: Vec<String>,
 }
@@ -4708,18 +4749,37 @@ pub fn parse_saml_metadata(document: &str) -> Option<SamlMetadata> {
         .attribute(SAML_ENTITY_ID_ATTRIBUTE)
         .unwrap_or_default()
         .to_string();
-    // The keys the document publishes, each an `X509Certificate` of the XML signature
-    // namespace (W3C "XML Signature Syntax and Processing" §4.4.4), with the whitespace a
-    // PEM-wrapped body carries removed so the value is the base64 the element means.
+    // The keys the document publishes for SIGNING, each an `X509Certificate` of the XML
+    // signature namespace (W3C "XML Signature Syntax and Processing" §4.4.4), with the
+    // whitespace a PEM-wrapped body carries removed so the value is the base64 the element
+    // means. A key published for ENCRYPTION only is not one of them: a reader of this
+    // metadata verifies a message from the provider against its SIGNING keys, and a
+    // `KeyDescriptor` says which a key is (OASIS "Metadata for SAML V2.0" §2.4.1.1) —
+    // where saying nothing means both. One key is one entry however many descriptors
+    // publish it, because what the entry identifies is the KEY.
+    //
+    // Reading one document is work a REQUEST sizes, so every step of it is bounded by the
+    // document rather than by the square of it: membership is asked of a set rather than of
+    // the keys collected so far, the set holds at most
+    // [`MAX_SIGNING_KEYS_PER_SAML_METADATA`] entries because the walk stops once that many
+    // distinct keys are read, and the descriptor above a key is looked for a fixed number
+    // of steps up ([`publishes_signing_key`]) rather than along however deep the document
+    // nests.
+    let mut read_keys: BTreeSet<String> = BTreeSet::new();
     let signing_certificates: Vec<String> = entity
         .descendants()
         .filter(|node| {
             node.tag_name().namespace() == Some(XML_SIGNATURE_NAMESPACE)
                 && node.tag_name().name() == XML_SIGNATURE_CERTIFICATE
+                && publishes_signing_key(node)
         })
         .filter_map(|node| node.text())
         .map(|text| text.split_whitespace().collect::<String>())
         .filter(|text| !text.is_empty())
+        // `contains` before `insert` so a key the document repeats is not COPIED again to
+        // be rejected: `insert` would answer the same, after cloning the whole body.
+        .filter(|text| !read_keys.contains(text.as_str()) && read_keys.insert(text.clone()))
+        .take(MAX_SIGNING_KEYS_PER_SAML_METADATA)
         .collect();
     // "Expiration information": `validUntil` on the root descriptor, or on the entity
     // descriptor itself when the root is a group that carries none. It is an
@@ -4737,6 +4797,36 @@ pub fn parse_saml_metadata(document: &str) -> Option<SamlMetadata> {
         entity_id,
         signing_certificates,
     })
+}
+
+/// Whether the `X509Certificate` node `certificate` publishes one of the entity's SIGNING
+/// keys.
+///
+/// A key sits inside a `KeyDescriptor`, whose optional `use` says what the key is for, and
+/// "the absence of this attribute signifies that the contained key may be used for both
+/// encryption and signing" (OASIS "Metadata for SAML V2.0" §2.4.1.1) — so a descriptor
+/// saying nothing, or saying `signing`, publishes a signing key, and one saying anything
+/// else does not. A key published outside any descriptor is not one of the entity's
+/// published keys at all.
+///
+/// The descriptor is looked for a FIXED number of steps up
+/// ([`SAML_KEY_DESCRIPTOR_ANCESTRY`]), never along the whole ancestry: the vocabulary fixes
+/// how far above a key its descriptor sits, so the cost of reading a document stays
+/// proportional to the document rather than to the keys in it times the depth it nests
+/// them at — a product a request would otherwise choose both factors of.
+fn publishes_signing_key(certificate: &::roxmltree::Node<'_, '_>) -> bool {
+    certificate
+        .ancestors()
+        .take(SAML_KEY_DESCRIPTOR_ANCESTRY)
+        .find(|node| {
+            node.tag_name().namespace() == Some(SAML_METADATA_NAMESPACE)
+                && node.tag_name().name() == SAML_KEY_DESCRIPTOR
+        })
+        .is_some_and(|descriptor| {
+            descriptor
+                .attribute(SAML_KEY_USE_ATTRIBUTE)
+                .is_none_or(|purpose| purpose == SAML_KEY_USE_SIGNING)
+        })
 }
 
 /// The message IAM refuses an operation taking a `SAMLMetadataDocument` with when the

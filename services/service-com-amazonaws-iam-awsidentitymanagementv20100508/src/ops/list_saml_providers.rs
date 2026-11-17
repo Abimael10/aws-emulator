@@ -185,10 +185,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .iter()
             .map(|(arn, provider)| SAMLProviderListEntry {
                 arn: Some(arn.clone()),
-                // Reported only when the provider HAS an expiration, which is the one the
-                // metadata document it was created with states.
-                valid_until: provider.valid_until,
+                // The provider's own expiration, the one `GetSAMLProvider` reports for it:
+                // the metadata document's `validUntil`, or the default lifetime a document
+                // stating none leaves the provider with.
+                valid_until: Some(provider.valid_until),
                 create_date: Some(provider.create_date),
+                // Reported on every entry, so a caller enumerating providers learns it
+                // without a per-provider read. No operation this service models turns it
+                // on (`crate::state::TRUSTED_IDENTITY_PROPAGATION_ENABLED`).
+                is_trusted_identity_propagation_enabled: Some(
+                    crate::state::TRUSTED_IDENTITY_PROPAGATION_ENABLED,
+                ),
             })
             .collect();
 

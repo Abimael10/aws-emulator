@@ -30,8 +30,10 @@ use std::collections::BTreeMap;
 
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::role_lifecycle::{borrowed, optional, param, reported_tags};
-use crate::saml_providers::{MetadataForm, expected_arn, metadata_document};
+use crate::role_lifecycle::{borrowed, param, reported_tags};
+use crate::saml_providers::{
+    MetadataForm, expected_arn, expected_encryption_mode, metadata_document,
+};
 use crate::user_lifecycle::{call, element, elements, error_code, router};
 
 /// How many characters a provider name may carry: `SAMLProviderNameType` is len 1..128
@@ -213,8 +215,8 @@ async fn assert_reads_back(router: &MultiServiceRouter, case: &DeletionCase, arn
         case.name
     );
     assert_eq!(
-        optional(&read, "AssertionEncryptionMode").as_deref(),
-        case.encryption_mode,
+        element(&read, "AssertionEncryptionMode"),
+        expected_encryption_mode(case.encryption_mode),
         "case {:?}: deleting another provider must leave the held encryption mode alone, got \
          {read}",
         case.name

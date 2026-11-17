@@ -345,6 +345,8 @@ mod role_trust_policy_account_principals;
 mod saml_provider_deletion;
 #[path = "all/saml_provider_listing.rs"]
 mod saml_provider_listing;
+#[path = "all/saml_provider_metadata.rs"]
+mod saml_provider_metadata;
 #[path = "all/saml_provider_tag_updates.rs"]
 mod saml_provider_tag_updates;
 #[path = "all/saml_provider_tags.rs"]

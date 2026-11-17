@@ -312,14 +312,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 provider_uuid,
                 metadata_document: input.saml_metadata_document,
                 create_date: created,
-                // The provider's expiration is the document's, so it is a property of what
-                // the request carried rather than a value invented here.
-                valid_until: metadata.valid_until,
-                // Reported only when a request chose one: `assertionEncryptionModeType`
-                // declares no default (`smithy_query(query="shape",
-                // shape="assertionEncryptionModeType")`), and the boundary validator has
-                // already refused any value outside the set it declares.
-                assertion_encryption_mode: input.assertion_encryption_mode,
+                // The provider's expiration is the document's when the document states one,
+                // and otherwise the default lifetime every provider gets — a property of
+                // what the request carried and when it arrived rather than of any later
+                // read.
+                valid_until: crate::state::saml_provider_valid_until(created, &metadata),
+                // A provider always reports an encryption setting, so a request that names
+                // no mode leaves it with the default
+                // (`crate::state::DEFAULT_ASSERTION_ENCRYPTION_MODE`); the boundary
+                // validator has already refused any value outside the set
+                // `assertionEncryptionModeType` declares.
+                assertion_encryption_mode: input
+                    .assertion_encryption_mode
+                    .unwrap_or_else(|| {
+                        crate::state::DEFAULT_ASSERTION_ENCRYPTION_MODE.to_string()
+                    }),
+                // The keys the document publishes, hashed once here so every read reports
+                // the same identities for the document the provider holds.
+                key_hashes: crate::state::saml_key_hashes(&metadata),
                 private_keys,
                 tags: tags.clone(),
             },
