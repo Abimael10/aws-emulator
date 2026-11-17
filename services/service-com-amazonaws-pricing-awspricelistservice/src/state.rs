@@ -27,6 +27,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
+/// The hardware and platform attributes a compute-instance product publishes beside the
+/// ones that identify its SKU, derived per instance type.
+mod instance_shapes;
+
+use instance_shapes::instance_shape_attributes;
+
 /// The `FormatVersion` this catalog is published in.
 ///
 /// `DescribeServices`/`GetProducts` document exactly one valid value for the member
@@ -1175,9 +1181,11 @@ fn product_from_draft(service_code: &str, draft: ProductDraft) -> Product {
 /// The `aws_v1` product-offer document for one product: the `product` block with its
 /// attributes, and every term type that prices it.
 ///
-/// The document's `version` is the stamp of the instant it was PUBLISHED at, not of the
-/// date its prices take effect on — the two are stated separately, as `publicationDate`
-/// and each term's `effectiveDate`.
+/// The document names the publication it is served under
+/// ([`catalog_publication_date`]): its `publicationDate`, the `version` stamp of that
+/// instant, and the `effectiveDate` each term reports its prices as applying from all
+/// name the same publication, so a client that orders or caches offers by any of them
+/// sees one consistent publication.
 fn offer_document(service_code: &str, draft: &ProductDraft) -> String {
     let mut terms = serde_json::Map::new();
     terms.insert(
@@ -1201,8 +1209,8 @@ fn offer_document(service_code: &str, draft: &ProductDraft) -> String {
         },
         "serviceCode": service_code,
         "terms": terms,
-        "version": version_stamp(CATALOG_PUBLICATION_DATE),
-        "publicationDate": CATALOG_PUBLICATION_DATE,
+        "version": version_stamp(catalog_publication_date()),
+        "publicationDate": catalog_publication_date(),
     })
     .to_string()
 }
@@ -1224,7 +1232,7 @@ fn on_demand_term(draft: &ProductDraft) -> serde_json::Map<String, serde_json::V
         serde_json::json!({
             "sku": sku,
             "offerTermCode": ON_DEMAND_TERM_CODE,
-            "effectiveDate": CATALOG_EFFECTIVE_DATE,
+            "effectiveDate": catalog_publication_date(),
             "termAttributes": {},
             "priceDimensions": dimensions,
         }),
@@ -1268,7 +1276,7 @@ fn reserved_terms(draft: &ProductDraft) -> serde_json::Map<String, serde_json::V
             serde_json::json!({
                 "sku": sku,
                 "offerTermCode": term.offer_term_code,
-                "effectiveDate": CATALOG_EFFECTIVE_DATE,
+                "effectiveDate": catalog_publication_date(),
                 "termAttributes": {
                     "LeaseContractLength": format!("{}yr", term.lease_years),
                     "OfferingClass": term.offering_class,
@@ -1295,16 +1303,23 @@ fn on_demand_description(draft: &ProductDraft, rate_e10: u64) -> String {
     }
 }
 
-/// The sentence the Price List API puts on a RESERVED term's usage dimension: the rate
-/// the reservation is billed at, then the usage the reservation applies to.
+/// The sentence the Price List API puts on a RESERVED term's usage dimension: the usage
+/// the reservation applies to. A reservation of a compute instance applies to the
+/// PLATFORM and instance type it was bought for, and the hourly rate it is billed at is
+/// the dimension's own `pricePerUnit` rather than part of the sentence; anything else
+/// states the rate the reservation is billed at and the usage it applies to.
 fn reserved_description(draft: &ProductDraft, rate_e10: u64) -> String {
-    let rate = display_rate(rate_e10);
     match compute_instance(draft) {
         Some((operating_system, instance_type)) => format!(
-            "USD {rate} per {}, {instance_type} reserved instance applied",
+            "{}, {instance_type} reserved instance applied",
             reserved_platform(operating_system)
         ),
-        None => format!("USD {rate} per {} of {}", draft.unit, usage_of(draft)),
+        None => format!(
+            "USD {} per {} of {}",
+            display_rate(rate_e10),
+            draft.unit,
+            usage_of(draft)
+        ),
     }
 }
 
@@ -1504,14 +1519,51 @@ fn epoch_secs(instant: SystemTime) -> i64 {
     }
 }
 
-/// The instant the seeded catalog's offer documents were published at: the stamp their
-/// `version` names and the `publicationDate` they report — a publication instant with a
-/// time of day, not the date their prices take effect on.
-const CATALOG_PUBLICATION_DATE: &str = "2024-01-09T16:52:41Z";
+/// The publication the catalog's offer documents are served under: the start of the
+/// month in effect when the catalog was built.
+///
+/// The Price List API republishes the offer files for each month and dates that
+/// publication at the month's first instant, which is what a document's `publicationDate`
+/// and its `version` stamp name and what every term in it reports as the `effectiveDate`
+/// its prices apply from. It is therefore read from the CLOCK — a client that picks the
+/// rate in effect for the current month, or keys a cache on `(version, effectiveDate)`,
+/// reads the publication it is being served, not one fixed when this code was written.
+///
+/// The catalog is built once per process ([`SEEDED_CATALOG`]), so this is resolved once
+/// with it and every document the process serves agrees with every other.
+fn catalog_publication_date() -> &'static str {
+    &CATALOG_PUBLICATION_DATE
+}
 
-/// The date the prices in the seeded catalog's offer documents take effect from, which
-/// each term reports as its `effectiveDate`.
-const CATALOG_EFFECTIVE_DATE: &str = "2024-01-01T00:00:00Z";
+/// The current publication, resolved on first use beside the catalog it dates.
+static CATALOG_PUBLICATION_DATE: ::std::sync::LazyLock<String> =
+    ::std::sync::LazyLock::new(|| month_start_text(SystemTime::now()));
+
+/// The RFC 3339 instant the month containing `instant` begins at.
+///
+/// A publication is dated at the start of its month, so only the year and the month of
+/// the instant are read; the day, the time of day and any sub-second part are replaced by
+/// the month's first instant.
+fn month_start_text(instant: SystemTime) -> String {
+    let formatted = ::aws_smithy_types::DateTime::from(instant)
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_default();
+    formatted
+        .get(..MONTH_PREFIX_LENGTH)
+        .filter(|month| month.len() == MONTH_PREFIX_LENGTH)
+        .map_or_else(
+            || EPOCH_MONTH_START.to_string(),
+            |month| format!("{month}-01T00:00:00Z"),
+        )
+}
+
+/// The `yyyy-mm` prefix of an RFC 3339 instant, which is what names the month a
+/// publication belongs to.
+const MONTH_PREFIX_LENGTH: usize = 7;
+
+/// The month start reported for an instant that cannot be formatted, so a document is
+/// always dated at the first instant of SOME month rather than at no date at all.
+const EPOCH_MONTH_START: &str = "1970-01-01T00:00:00Z";
 
 /// One published version of a price-list file set.
 ///
@@ -2433,7 +2485,41 @@ fn ec2_products() -> Vec<Product> {
                 .collect(),
         };
         for instance in instance_types {
+            // The attributes of the instance's own hardware and platform, which every
+            // SKU of that type publishes whatever tenancy or capacity status it prices.
+            let shape = instance_shape_attributes(instance);
             for capacity in CAPACITY_SEEDS {
+                let mut pairs = vec![
+                    ("capacitystatus", capacity.capacity_status.to_string()),
+                    ("currentGeneration", instance.current_generation.to_string()),
+                    ("instanceFamily", instance.instance_family.to_string()),
+                    ("instanceType", instance.instance_type.to_string()),
+                    ("licenseModel", plan.license_model.to_string()),
+                    ("location", region.location.to_string()),
+                    ("locationType", AWS_REGION_LOCATION_TYPE.to_string()),
+                    ("memory", instance.memory.to_string()),
+                    (
+                        "normalizationSizeFactor",
+                        normalization_size_factor(instance.instance_type),
+                    ),
+                    ("operatingSystem", plan.operating_system.to_string()),
+                    ("operation", plan.operation.to_string()),
+                    ("physicalProcessor", instance.physical_processor.to_string()),
+                    ("preInstalledSw", "NA".to_string()),
+                    ("regionCode", region.code.to_string()),
+                    ("servicecode", EC2_SERVICE_CODE.to_string()),
+                    ("servicename", EC2_SERVICE_NAME.to_string()),
+                    ("tenancy", capacity.tenancy.to_string()),
+                    (
+                        "usagetype",
+                        format!(
+                            "{}{}:{}",
+                            region.usage_prefix, capacity.usage_kind, instance.instance_type
+                        ),
+                    ),
+                    ("vcpu", instance.vcpu.to_string()),
+                ];
+                pairs.extend(shape.iter().cloned());
                 let draft = ProductDraft {
                     sku: sku(&[
                         instance.instance_type,
@@ -2451,36 +2537,7 @@ fn ec2_products() -> Vec<Product> {
                     // AWS prices a compute instance both on demand and under a
                     // reservation, so its offer document carries both term types.
                     reserved: true,
-                    attributes: attributes(vec![
-                        ("capacitystatus", capacity.capacity_status.to_string()),
-                        ("currentGeneration", instance.current_generation.to_string()),
-                        ("instanceFamily", instance.instance_family.to_string()),
-                        ("instanceType", instance.instance_type.to_string()),
-                        ("licenseModel", plan.license_model.to_string()),
-                        ("location", region.location.to_string()),
-                        ("locationType", AWS_REGION_LOCATION_TYPE.to_string()),
-                        ("memory", instance.memory.to_string()),
-                        (
-                            "normalizationSizeFactor",
-                            normalization_size_factor(instance.instance_type),
-                        ),
-                        ("operatingSystem", plan.operating_system.to_string()),
-                        ("operation", plan.operation.to_string()),
-                        ("physicalProcessor", instance.physical_processor.to_string()),
-                        ("preInstalledSw", "NA".to_string()),
-                        ("regionCode", region.code.to_string()),
-                        ("servicecode", EC2_SERVICE_CODE.to_string()),
-                        ("servicename", EC2_SERVICE_NAME.to_string()),
-                        ("tenancy", capacity.tenancy.to_string()),
-                        (
-                            "usagetype",
-                            format!(
-                                "{}{}:{}",
-                                region.usage_prefix, capacity.usage_kind, instance.instance_type
-                            ),
-                        ),
-                        ("vcpu", instance.vcpu.to_string()),
-                    ]),
+                    attributes: attributes(pairs),
                 };
                 products.push(product_from_draft(EC2_SERVICE_CODE, draft));
             }
