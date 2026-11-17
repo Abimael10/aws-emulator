@@ -19,6 +19,13 @@
 //!   as a malformed STAGE declaration naming the repeated stage, while the same action name
 //!   in two differently-named stages is accepted.
 //!
+//! And the rule that ties this resolution to the surface a client discovers it through: the
+//! published set is ONE set, so an identity `ListActionTypes` reports is one a declaration
+//! may name and an identity a declaration may name is one some page of the listing reports
+//! — save for the identities `ActionType`'s required artifact counts cannot carry — and the
+//! artifact bound an entry of that listing publishes is the bound a declaration naming it
+//! is held to.
+//!
 //! Every refusal is also shown to change nothing: the stored declaration keeps the version
 //! and the structure it had.
 //!
@@ -623,4 +630,429 @@ async fn a_declaration_naming_two_stages_alike_is_refused() {
         message, "Stage name 'Source' is used more than once",
         "expected the sentence this refusal states, got {message:?}"
     );
+}
+
+// ---- The catalog a declaration resolves against IS the catalog a listing reports ------
+
+/// The four `ActionTypeId` members of one identity, as a row below names it.
+type Identity = (&'static str, &'static str, &'static str, &'static str);
+
+/// One row of [`an_action_type_is_reported_exactly_when_a_declaration_may_name_it`]: the
+/// case, the identity, whether the listing reports it and whether a declaration may name
+/// it.
+type PublishedRow = (&'static str, Identity, bool, bool);
+
+/// Every action type `ListActionTypes` reports for `body`, paged to the end with the
+/// opaque cursor the operation hands back.
+async fn listed(emulator: &Emulator, body: &Value) -> Vec<Value> {
+    let mut all = Vec::new();
+    let mut token: Option<String> = None;
+    loop {
+        let mut page = body.clone();
+        if let Some(token) = &token {
+            page["nextToken"] = json!(token);
+        }
+        let answer = emulator.ok("ListActionTypes", &page).await;
+        all.extend(
+            answer["actionTypes"]
+                .as_array()
+                .unwrap_or_else(|| panic!("actionTypes is a list, got {answer}"))
+                .clone(),
+        );
+        match answer.get("nextToken").and_then(Value::as_str) {
+            Some(next) => token = Some(next.to_string()),
+            None => break all,
+        }
+    }
+}
+
+/// The four `ActionTypeId` members of one reported entry.
+fn identity(entry: &Value) -> (String, String, String, String) {
+    let id = &entry["id"];
+    let member = |name: &str| {
+        id[name]
+            .as_str()
+            .unwrap_or_else(|| panic!("an entry reports its {name}, got {entry}"))
+            .to_string()
+    };
+    (
+        member("category"),
+        member("owner"),
+        member("provider"),
+        member("version"),
+    )
+}
+
+/// How many of `reported` carry the identity `(category, owner, provider, version)`.
+fn occurrences(reported: &[Value], id: (&str, &str, &str, &str)) -> usize {
+    reported
+        .iter()
+        .filter(|entry| {
+            let (category, owner, provider, version) = identity(entry);
+            (
+                category.as_str(),
+                owner.as_str(),
+                provider.as_str(),
+                version.as_str(),
+            ) == id
+        })
+        .count()
+}
+
+/// A two-stage declaration whose ONE action under test is an action of
+/// `(category, owner, provider, version)` declaring `inputs` input artifacts and `outputs`
+/// output artifacts.
+///
+/// A `Source` action may only appear in the first stage, so an action under test of that
+/// category takes the first stage and a `Custom`-owned build acts behind it; every other
+/// category acts in the second stage, behind a `Custom`-owned source producing exactly the
+/// artifacts it consumes. The fixture action is `Custom`-owned in both shapes — an owner
+/// whose catalog is open, which therefore publishes no bound of its own — so no row is ever
+/// refused for the stage it was not about.
+fn declaration_naming(id: (&str, &str, &str, &str), inputs: usize, outputs: usize) -> Value {
+    let consumed: Vec<String> = (0..inputs).map(|index| format!("Src{index}")).collect();
+    let produced: Vec<String> = (0..outputs).map(|index| format!("Out{index}")).collect();
+    let consumed_refs: Vec<&str> = consumed.iter().map(String::as_str).collect();
+    let produced_refs: Vec<&str> = produced.iter().map(String::as_str).collect();
+    let (category, owner, provider, version) = id;
+    let under_test = acting_stage(
+        if category == "Source" { "Source" } else { "Act" },
+        "Work",
+        action_type(category, owner, provider, version),
+        &consumed_refs,
+        &produced_refs,
+    );
+    if category == "Source" {
+        json!([
+            under_test,
+            acting_stage(
+                "Act",
+                "Compile",
+                action_type("Build", "Custom", "MyBuilder", "1"),
+                &[],
+                &[],
+            ),
+        ])
+    } else {
+        json!([
+            acting_stage(
+                "Source",
+                "Src",
+                action_type("Source", "Custom", "MySource", "1"),
+                &[],
+                &consumed_refs,
+            ),
+            under_test,
+        ])
+    }
+}
+
+/// RULE: the identities the service publishes are ONE set, so an identity `ListActionTypes`
+/// reports is one a pipeline declaration may name and an identity a declaration may name is
+/// one some page of the listing reports — save for the identities `ActionType`'s required
+/// artifact counts cannot carry, which are declarable and reported by no page.
+#[tokio::test]
+async fn an_action_type_is_reported_exactly_when_a_declaration_may_name_it() {
+    // (case, id, reported by the listing, a declaration may name it).
+    //
+    // Source for the identities: the page `ActionTypeId$provider` and `ActionTypeId$owner`
+    // both link to, "Valid action types and providers in CodePipeline"
+    // (reference-pipeline-structure.html#actions-valid-providers). The rows span the
+    // categories, both owners whose catalog the service publishes, providers published in
+    // two categories at once (`ECRBuildAndPublish`, `InspectorScan`), the two providers
+    // whose documented parameter table is longer than
+    // `ActionConfigurationPropertyList`'s `@length(max: 10)` and which therefore publish
+    // their identity and artifact bounds alone, every identity whose documented artifact
+    // count is above `ArtifactDetails`'s modelled maximum of 5 — and a provider nothing
+    // publishes at all.
+    let rows: [PublishedRow; 18] = [
+        (
+            "a deploy provider with a documented parameter table",
+            ("Deploy", "AWS", "AppConfig", "1"),
+            true,
+            true,
+        ),
+        (
+            "a deploy provider whose parameters name organizational targets",
+            ("Deploy", "AWS", "CloudFormationStackInstances", "1"),
+            true,
+            true,
+        ),
+        (
+            "a deploy provider whose documented table is longer than the modelled list",
+            ("Deploy", "AWS", "CloudFormationStackSet", "1"),
+            true,
+            true,
+        ),
+        (
+            "another provider whose documented table is longer than the modelled list",
+            ("Deploy", "AWS", "CodeDeployToECS", "1"),
+            true,
+            true,
+        ),
+        (
+            "a deploy provider that applies manifests to a cluster",
+            ("Deploy", "AWS", "EKS", "1"),
+            true,
+            true,
+        ),
+        (
+            "a deploy provider that creates a product version",
+            ("Deploy", "AWS", "ServiceCatalog", "1"),
+            true,
+            true,
+        ),
+        (
+            "a provider published in the Build category",
+            ("Build", "AWS", "ECRBuildAndPublish", "1"),
+            true,
+            true,
+        ),
+        (
+            "the same provider published in the Invoke category",
+            ("Invoke", "AWS", "ECRBuildAndPublish", "1"),
+            true,
+            true,
+        ),
+        (
+            "a scan provider published in the Invoke category",
+            ("Invoke", "AWS", "InspectorScan", "1"),
+            true,
+            true,
+        ),
+        (
+            "the same scan provider published in the Test category",
+            ("Test", "AWS", "InspectorScan", "1"),
+            true,
+            true,
+        ),
+        (
+            "an entry this report did not cite",
+            ("Deploy", "AWS", "CodeDeploy", "1"),
+            true,
+            true,
+        ),
+        (
+            "a source entry, which acts in the first stage",
+            ("Source", "AWS", "CodeCommit", "1"),
+            true,
+            true,
+        ),
+        (
+            "a partner integration, the other owner the service publishes",
+            ("Test", "ThirdParty", "GhostInspector", "1"),
+            true,
+            true,
+        ),
+        (
+            "ten documented input artifacts, above the modelled maximum",
+            ("Deploy", "AWS", "CloudFormation", "1"),
+            false,
+            true,
+        ),
+        (
+            "the compute action, above that maximum too, in Build",
+            ("Build", "AWS", "Commands", "1"),
+            false,
+            true,
+        ),
+        (
+            "the compute action in its own category",
+            ("Compute", "AWS", "Commands", "1"),
+            false,
+            true,
+        ),
+        (
+            "the compute action in Test",
+            ("Test", "AWS", "Commands", "1"),
+            false,
+            true,
+        ),
+        (
+            "a provider nothing publishes",
+            ("Deploy", "AWS", "NoSuchProvider", "1"),
+            false,
+            false,
+        ),
+    ];
+
+    let emulator = emulator_with_fixture().await;
+    let unfiltered = listed(&emulator, &json!({})).await;
+
+    for (case, id, reported, declarable) in rows {
+        let found = occurrences(&unfiltered, id);
+        assert_eq!(
+            found,
+            usize::from(reported),
+            "case {case:?} ({id:?}): the listing reports a published identity once and an \
+             unreportable one never, got {found} occurrence(s) among {} entries",
+            unfiltered.len()
+        );
+
+        // The owner filter narrows that same catalog, so it answers the same about this id.
+        let filtered = listed(&emulator, &json!({"actionOwnerFilter": id.1})).await;
+        let found = occurrences(&filtered, id);
+        assert_eq!(
+            found,
+            usize::from(reported),
+            "case {case:?} ({id:?}): the {} slice answers as the whole listing does, got \
+             {found} occurrence(s) among {} entries",
+            id.1,
+            filtered.len()
+        );
+
+        // And the declaration validator resolves against the same published set.
+        let body = json!({"pipeline": pipeline(FIXTURE, declaration_naming(id, 0, 0))});
+        if declarable {
+            let (status, answer) = emulator.call(DECLARATION_OPERATIONS[1], &body).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?} ({id:?}): a published action type may be declared, got \
+                 {status} with {answer}"
+            );
+        } else {
+            let (status, code, message) =
+                refusal(&emulator, DECLARATION_OPERATIONS[1], &body).await;
+            assert_eq!(
+                (status, code.as_str()),
+                (400, BAD_ACTION),
+                "case {case:?} ({id:?}): expected a 400 {BAD_ACTION}, got {status} {code} \
+                 ({message:?})"
+            );
+            assert!(
+                message.contains("is not available in region 'US_EAST_1'"),
+                "case {case:?} ({id:?}): the refusal names the Region the id is not \
+                 published in, got {message:?}"
+            );
+        }
+    }
+}
+
+/// RULE as an INVARIANT over the WHOLE published catalog: the artifact bound an entry of
+/// the listing PUBLISHES is the bound a declaration naming it is held to. Both figures are
+/// read off the listing's own answer, so the two surfaces are compared with each other
+/// rather than each with a figure written here, and an entry added later is covered too.
+#[tokio::test]
+async fn the_bound_an_entry_publishes_is_the_bound_a_declaration_is_held_to() {
+    let emulator = emulator_with_fixture().await;
+    let reported = listed(&emulator, &json!({})).await;
+    assert!(
+        reported.len() > 1,
+        "the service publishes a catalog of its own to hold declarations to, got {reported:?}"
+    );
+
+    for entry in &reported {
+        let (category, owner, provider, version) = identity(entry);
+        let id = (
+            category.as_str(),
+            owner.as_str(),
+            provider.as_str(),
+            version.as_str(),
+        );
+        let case = format!("{category}/{owner}/{provider}/{version}");
+        let maximum = |member: &str| {
+            let count = entry[member]["maximumCount"].as_i64().unwrap_or_else(|| {
+                panic!("case {case}: {member} reports a maximum, got {entry}")
+            });
+            usize::try_from(count)
+                .unwrap_or_else(|_| panic!("case {case}: {member} reports a count, got {entry}"))
+        };
+        let inputs = maximum("inputArtifactDetails");
+        let outputs = maximum("outputArtifactDetails");
+
+        // An action at the published maximum on both lists is stored.
+        let body =
+            json!({"pipeline": pipeline(FIXTURE, declaration_naming(id, inputs, outputs))});
+        let (status, answer) = emulator.call(DECLARATION_OPERATIONS[1], &body).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: an action declaring the published maximum ({inputs} in, \
+             {outputs} out) is stored, got {status} with {answer}"
+        );
+
+        // One past it, on each list in turn: refused, naming the bound that was published.
+        for (artifacts, over_inputs) in [("input", true), ("output", false)] {
+            let declaration = declaration_naming(
+                id,
+                inputs + usize::from(over_inputs),
+                outputs + usize::from(!over_inputs),
+            );
+            let body = json!({"pipeline": pipeline(FIXTURE, declaration)});
+            let (status, code, message) =
+                refusal(&emulator, DECLARATION_OPERATIONS[1], &body).await;
+            assert_eq!(
+                (status, code.as_str()),
+                (400, BAD_ACTION),
+                "case {case}: one {artifacts} artifact past the published maximum is \
+                 refused, got {status} {code} ({message:?})"
+            );
+            let bound = if over_inputs { inputs } else { outputs };
+            let clause = format!("allows at most {bound} {artifacts} artifact(s)");
+            assert!(
+                message.contains(&clause),
+                "case {case}: the refusal states the bound the listing published: expected \
+                 a message carrying {clause:?}, got {message:?}"
+            );
+        }
+    }
+}
+
+/// RULE: `actionOwnerFilter` narrows ONE listing to one owner's slice of it — in that
+/// listing's own order, with the account's own registration in its place in it, and with no
+/// identity reported twice.
+#[tokio::test]
+async fn each_owner_filter_reports_that_owners_slice_of_one_listing() {
+    let emulator = Emulator::new();
+    // A registration of the account's own, so the `Custom` slice is a slice of something
+    // and the merged order is exercised rather than an empty list compared with an empty
+    // list.
+    emulator
+        .ok(
+            "CreateCustomActionType",
+            &json!({
+                "category": "Build",
+                "provider": "Rowsmith",
+                "version": "1",
+                "inputArtifactDetails": {"minimumCount": 0, "maximumCount": 1},
+                "outputArtifactDetails": {"minimumCount": 0, "maximumCount": 1},
+            }),
+        )
+        .await;
+
+    let all: Vec<(String, String, String, String)> = listed(&emulator, &json!({}))
+        .await
+        .iter()
+        .map(identity)
+        .collect();
+    let mut unique = all.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        all.len(),
+        "the listing reports no identity twice, got {all:?}"
+    );
+
+    for owner in ["AWS", "ThirdParty", "Custom"] {
+        let slice: Vec<(String, String, String, String)> =
+            listed(&emulator, &json!({"actionOwnerFilter": owner}))
+                .await
+                .iter()
+                .map(identity)
+                .collect();
+        let expected: Vec<(String, String, String, String)> = all
+            .iter()
+            .filter(|identity| identity.1 == owner)
+            .cloned()
+            .collect();
+        assert!(
+            !slice.is_empty(),
+            "case {owner}: the service publishes action types of this owner, got {all:?}"
+        );
+        assert_eq!(
+            slice, expected,
+            "case {owner}: the filter reports this owner's slice of the one listing, in its \
+             order, got {slice:?}"
+        );
+    }
 }

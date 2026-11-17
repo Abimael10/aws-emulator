@@ -12,10 +12,11 @@
 //!
 //! * an `actionTypeId` whose `owner` is `AWS` names an action type the SERVICE publishes,
 //!   and that set is closed — [`super::BUILT_IN_ACTION_TYPES`] is the catalog
-//!   `ListActionTypes` reports for that owner, together with the published identities that
-//!   catalog carries no detail for ([`AWS_ACTION_TYPES_WITHOUT_DETAIL`]) — so a
-//!   `category`/`provider`/`version` combination neither of them carries names no action
-//!   type at all and the declaration cannot be run. (`Custom` and `ThirdParty` ids are
+//!   `ListActionTypes` reports for that owner, and it IS the published set but for the few
+//!   identities `ActionType`'s required artifact counts cannot carry
+//!   ([`AWS_ACTION_TYPES_WITHOUT_DETAIL`]) — so a `category`/`provider`/`version`
+//!   combination neither of them carries names no action type at all and the declaration
+//!   cannot be run. (`Custom` and `ThirdParty` ids are
 //!   resolved against registrations this account or a partner makes, which a declaration
 //!   may name before the registration is read back, so an id of either owner the catalog
 //!   does not carry is not refused here.)
@@ -52,41 +53,37 @@ pub const ACTION_OWNER_AWS: &str = "AWS";
 /// these actions publish ([`BUILT_IN_ACTION_TYPES`] states the same for its entries).
 const BUILT_IN_ACTION_TYPE_VERSION: &str = "1";
 
-/// The `AWS`-owned `(category, provider)` pairs the documented provider list names whose
-/// per-provider DETAIL [`BUILT_IN_ACTION_TYPES`] does not carry.
+/// The `AWS`-owned `(category, provider)` pairs the documented provider list names that
+/// [`BUILT_IN_ACTION_TYPES`] cannot hold an entry for.
 ///
 /// Source: the page `ActionTypeId$provider` and `ActionTypeId$owner` both link to, "Valid
 /// action types and providers in CodePipeline"
 /// (<https://docs.aws.amazon.com/codepipeline/latest/userguide/reference-pipeline-structure.html#actions-valid-providers>),
-/// which is where the catalog's own entries come from. These are the ones that page names
-/// and the catalog leaves out, because the artifact counts they document exceed what
-/// `MaximumArtifactCount` can carry (the CloudFormation deploy action's ten input
-/// artifacts, the `Commands` action's) or because the action's work has no detail this
-/// emulator publishes for it.
+/// which is where the catalog's own entries come from.
 ///
-/// They are a list of their own rather than catalog entries BECAUSE the catalog is what
-/// `ListActionTypes` reports: an entry there has to carry an `ActionType`'s required
-/// members, including artifact counts inside `MaximumArtifactCount`'s modelled range, which
-/// is exactly what these providers cannot state. So they RESOLVE — a declaration naming one
-/// declares a real action type — and nothing else about them is stated here, which is why
-/// an action of one is held to no artifact bound of this service's. The two tables are
-/// disjoint, which [`action_type_is_published`] does not depend on and this crate's
-/// declaration suite asserts.
-pub const AWS_ACTION_TYPES_WITHOUT_DETAIL: [(&str, &str); 14] = [
+/// ONE bound decides what is here rather than in the catalog: `ActionType` declares
+/// `inputArtifactDetails` and `outputArtifactDetails` as REQUIRED members whose counts are
+/// modelled `@range(min: 0, max: 5)` (`smithy_query query="shape"
+/// shape="ActionType,ArtifactDetails"`), and each provider here documents a count above it
+/// — the CloudFormation deploy action's ten input artifacts, and the `Commands` action's,
+/// in each of the three categories it is published in. The bound a declared action is
+/// judged against is the catalog's own ([`validate_action_type`]), so an entry for one of
+/// these would publish a maximum that refuses a declaration the real service accepts.
+/// Published by no page and refused by no bound is the lesser of the two wrongs, so these
+/// identities are published here: a declaration naming one names a real action type, and
+/// this service holds its artifact lists to no bound of its own.
+///
+/// Every OTHER published identity is a catalog entry, including the providers whose
+/// documented parameter table is longer than `ActionConfigurationPropertyList` can carry:
+/// that member is optional, so such an entry reports its identity and its artifact bounds
+/// (see [`super::built_in_catalog`]'s note on both bounds). The two tables are disjoint,
+/// which [`action_type_is_published`] does not depend on and this crate's declaration suite
+/// asserts.
+pub const AWS_ACTION_TYPES_WITHOUT_DETAIL: [(&str, &str); 4] = [
     ("Build", "Commands"),
-    ("Build", "ECRBuildAndPublish"),
     ("Compute", "Commands"),
-    ("Deploy", "AppConfig"),
     ("Deploy", "CloudFormation"),
-    ("Deploy", "CloudFormationStackInstances"),
-    ("Deploy", "CloudFormationStackSet"),
-    ("Deploy", "CodeDeployToECS"),
-    ("Deploy", "EKS"),
-    ("Deploy", "ServiceCatalog"),
-    ("Invoke", "ECRBuildAndPublish"),
-    ("Invoke", "InspectorScan"),
     ("Test", "Commands"),
-    ("Test", "InspectorScan"),
 ];
 
 /// Whether the service publishes an action type with this identity at all — the catalog

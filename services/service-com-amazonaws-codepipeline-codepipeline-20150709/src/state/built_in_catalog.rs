@@ -43,12 +43,30 @@
 //!   documents it as the member that "is used with `PollForJobs`" "[w]hen creating a custom
 //!   action" — none of these action types is run by a job worker of the caller's account.
 //!
-//! One further choice, stated rather than hidden, because the model does not state it: a
-//! provider whose documented artifact count exceeds `MaximumArtifactCount`'s modelled
-//! `@range(max: 5)` (the CloudFormation deploy action's ten input artifacts, the
-//! `Commands` action's) is left OUT of this table rather than reported with a count the
-//! model cannot carry — [`super::AWS_ACTION_TYPES_WITHOUT_DETAIL`] is where those
-//! published identities live instead.
+//! # This table IS the set the service publishes
+//!
+//! One set of `AWS`-owned action types is published, and this table is it: an entry here
+//! is what `ListActionTypes` reports and what a pipeline declaration may name
+//! ([`super::action_type_is_published`]). An identity published for a declaration but
+//! reported by no listing is one a client cannot discover and can still declare, so a
+//! published provider is entered HERE rather than in a second list whenever `ActionType`
+//! can carry what its reference page documents.
+//!
+//! Two modelled bounds decide what "can carry" means, and each is answered differently:
+//!
+//! * `inputArtifactDetails` and `outputArtifactDetails` are REQUIRED members whose two
+//!   counts are modelled `@range(min: 0, max: 5)`, so a provider whose documented count is
+//!   above that (the CloudFormation deploy action's ten input artifacts, the `Commands`
+//!   action's) could only be entered here under a bound that refuses a declaration the real
+//!   service accepts — the bound an action is judged against is this table's
+//!   ([`super::validate_action_type`]). Those identities stay OUT of this table and are
+//!   published by [`super::AWS_ACTION_TYPES_WITHOUT_DETAIL`] alone, which holds an action
+//!   of theirs to no artifact bound of this service's;
+//! * `actionConfigurationProperties` is OPTIONAL and modelled `@length(min: 0, max: 10)`,
+//!   so a provider whose documented parameter table is longer than ten rows IS entered
+//!   here — with its identity and its artifact bounds, and no parameter table. A table cut
+//!   to ten of its rows would tell a client the parameters it dropped do not exist, which
+//!   is worse than a table it does not claim to carry.
 //!
 //! # Which rows are the catalog's own words
 //!
@@ -72,6 +90,11 @@
 //! [`BuiltInActionType::record`] substitutes the Region the catalog is being read for
 //! (`ListActionTypes$regionFilter`, or the Region the request itself was signed for).
 //! A partner's own pages carry no Region and name none.
+//!
+//! A provider whose reference page states no console page for the resource its action acts
+//! on carries no template at all. These URLs are REPORTED to a console that follows them,
+//! so an entry publishes a link its provider publishes or publishes none; it does not
+//! publish a link composed here.
 //!
 //! The URL templates below are REPORTED, never followed: each is the text of a modelled
 //! member (`ActionTypeSettings$entityUrlTemplate` is documented as "[t]he URL returned to
@@ -266,7 +289,7 @@ const fn entry(
 ///
 /// See this module's note for where every member of every entry comes from. Every version
 /// is `1`, the only version these actions publish.
-pub const BUILT_IN_ACTION_TYPES: [BuiltInActionType; 17] = [
+pub const BUILT_IN_ACTION_TYPES: [BuiltInActionType; 27] = [
     // ---- Approval -------------------------------------------------------------------
     BuiltInActionType {
         // The manual-approval action takes and produces no artifact, and its three
@@ -304,7 +327,109 @@ pub const BUILT_IN_ACTION_TYPES: [BuiltInActionType; 17] = [
         configuration_properties: CODEBUILD_PROPERTIES,
         ..entry("Build", "AWS", "CodeBuild", "1", (1, 5), (0, 5))
     },
+    BuiltInActionType {
+        configuration_properties: ECR_BUILD_AND_PUBLISH_PROPERTIES,
+        ..entry("Build", "AWS", "ECRBuildAndPublish", "1", (1, 1), (0, 0))
+    },
     // ---- Deploy ---------------------------------------------------------------------
+    BuiltInActionType {
+        // The deployment is made of a configuration the input artifact carries, into the
+        // application, environment and configuration profile the parameters name.
+        configuration_properties: &[
+            property(
+                "Application",
+                "The AppConfig application the configuration is deployed in",
+                true,
+                false,
+            ),
+            property(
+                "Environment",
+                "The AppConfig environment the configuration is deployed to",
+                true,
+                false,
+            ),
+            property(
+                "ConfigurationProfile",
+                "The AppConfig configuration profile that is deployed",
+                true,
+                false,
+            ),
+            property(
+                "DeploymentStrategy",
+                "The AppConfig deployment strategy the deployment follows",
+                true,
+                false,
+            ),
+            property(
+                "InputArtifactConfigurationPath",
+                "The path to the configuration inside the input artifact",
+                true,
+                false,
+            ),
+        ],
+        ..entry("Deploy", "AWS", "AppConfig", "1", (1, 1), (0, 0))
+    },
+    BuiltInActionType {
+        configuration_properties: &[
+            property(
+                "StackSetName",
+                "The stack set the stack instances are created in",
+                true,
+                false,
+            ),
+            property(
+                "DeploymentTargets",
+                "The accounts or organizational units the instances are created in",
+                false,
+                false,
+            ),
+            property(
+                "Regions",
+                "The Regions the stack instances are created in",
+                false,
+                false,
+            ),
+            property(
+                "ParameterOverrides",
+                "The stack set parameters overridden for these instances",
+                false,
+                false,
+            ),
+            property(
+                "FailureTolerancePercentage",
+                "The percentage of instances that may fail before the operation stops",
+                false,
+                false,
+            ),
+            property(
+                "MaxConcurrentPercentage",
+                "The percentage of accounts the operation deploys to at once",
+                false,
+                false,
+            ),
+        ],
+        ..entry(
+            "Deploy",
+            "AWS",
+            "CloudFormationStackInstances",
+            "1",
+            (0, 1),
+            (0, 0),
+        )
+    },
+    // The stack-set action's documented parameter table is longer than
+    // `ActionConfigurationPropertyList`'s `@length(max: 10)` (the stack set's own members,
+    // the permission model and its two roles, the deployment targets and Regions, and the
+    // concurrency figures), so this entry publishes the identity and the artifact bounds
+    // and no table: see this module's note on that bound.
+    entry(
+        "Deploy",
+        "AWS",
+        "CloudFormationStackSet",
+        "1",
+        (0, 1),
+        (0, 0),
+    ),
     BuiltInActionType {
         entity_url_template: Some(
             "https://console.aws.amazon.com/codesuite/codedeploy/applications/{Config:ApplicationName}/deployment-groups/{Config:DeploymentGroupName}?region={region}",
@@ -325,6 +450,13 @@ pub const BUILT_IN_ACTION_TYPES: [BuiltInActionType; 17] = [
         ],
         ..entry("Deploy", "AWS", "CodeDeploy", "1", (1, 1), (0, 0))
     },
+    // The ECS blue/green action's documented parameter table is longer than
+    // `ActionConfigurationPropertyList`'s `@length(max: 10)` (the CodeDeploy application
+    // and deployment group, the task definition and AppSpec artifacts and their paths, and
+    // an artifact and container name for each image it replaces), so this entry publishes
+    // the identity and the artifact bounds and no table: see this module's note on that
+    // bound.
+    entry("Deploy", "AWS", "CodeDeployToECS", "1", (1, 5), (0, 0)),
     BuiltInActionType {
         entity_url_template: Some(
             "https://console.aws.amazon.com/ecs/home?region={region}#/clusters/{Config:ClusterName}/services/{Config:ServiceName}/details",
@@ -356,6 +488,62 @@ pub const BUILT_IN_ACTION_TYPES: [BuiltInActionType; 17] = [
             ),
         ],
         ..entry("Deploy", "AWS", "ECS", "1", (1, 1), (0, 0))
+    },
+    BuiltInActionType {
+        // The action applies the Kubernetes manifests, or the Helm chart, that the input
+        // artifact carries to a cluster; the network parameters are how it reaches a
+        // cluster whose endpoint is private.
+        configuration_properties: &[
+            property(
+                "ClusterName",
+                "The Amazon EKS cluster the manifests or chart are applied to",
+                true,
+                false,
+            ),
+            property(
+                "Namespace",
+                "The Kubernetes namespace the resources are applied in",
+                false,
+                false,
+            ),
+            property(
+                "ManifestFilePaths",
+                "The paths to the Kubernetes manifests in the input artifact",
+                false,
+                false,
+            ),
+            property(
+                "HelmChartLocation",
+                "The path to the Helm chart in the input artifact",
+                false,
+                false,
+            ),
+            property(
+                "HelmReleaseName",
+                "The name of the Helm release the chart is installed as",
+                false,
+                false,
+            ),
+            property(
+                "HelmValuesFiles",
+                "The paths to the Helm values files in the input artifact",
+                false,
+                false,
+            ),
+            property(
+                "SubnetIds",
+                "The subnets the action reaches a private cluster through",
+                false,
+                false,
+            ),
+            property(
+                "SecurityGroupIds",
+                "The security groups the action reaches a private cluster with",
+                false,
+                false,
+            ),
+        ],
+        ..entry("Deploy", "AWS", "EKS", "1", (1, 1), (0, 0))
     },
     BuiltInActionType {
         entity_url_template: Some(
@@ -442,7 +630,59 @@ pub const BUILT_IN_ACTION_TYPES: [BuiltInActionType; 17] = [
         ],
         ..entry("Deploy", "AWS", "S3", "1", (1, 1), (0, 0))
     },
+    BuiltInActionType {
+        // The action creates a new version of a Service Catalog product from the template
+        // the input artifact carries, described either by the parameters below or by a
+        // configuration file inside that artifact.
+        configuration_properties: &[
+            property(
+                "ProductId",
+                "The Service Catalog product the new version is created for",
+                true,
+                false,
+            ),
+            property(
+                "ProductType",
+                "The type of product the new version describes",
+                false,
+                false,
+            ),
+            property(
+                "ProductVersionName",
+                "The name the new product version is created under",
+                false,
+                false,
+            ),
+            property(
+                "ProductVersionDescription",
+                "The description the new product version carries",
+                false,
+                false,
+            ),
+            property(
+                "TemplateFilePath",
+                "The path to the product template in the input artifact",
+                false,
+                false,
+            ),
+            property(
+                "ConfigurationFilePath",
+                "The path to the product configuration file in the input artifact",
+                false,
+                false,
+            ),
+        ],
+        ..entry("Deploy", "AWS", "ServiceCatalog", "1", (1, 1), (0, 0))
+    },
     // ---- Invoke ---------------------------------------------------------------------
+    BuiltInActionType {
+        configuration_properties: ECR_BUILD_AND_PUBLISH_PROPERTIES,
+        ..entry("Invoke", "AWS", "ECRBuildAndPublish", "1", (1, 1), (0, 0))
+    },
+    BuiltInActionType {
+        configuration_properties: INSPECTOR_SCAN_PROPERTIES,
+        ..entry("Invoke", "AWS", "InspectorScan", "1", (1, 1), (0, 1))
+    },
     BuiltInActionType {
         entity_url_template: Some(
             "https://console.aws.amazon.com/lambda/home?region={region}#/functions/{Config:FunctionName}",
@@ -707,6 +947,10 @@ pub const BUILT_IN_ACTION_TYPES: [BuiltInActionType; 17] = [
         ..entry("Test", "AWS", "DeviceFarm", "1", (1, 1), (0, 0))
     },
     BuiltInActionType {
+        configuration_properties: INSPECTOR_SCAN_PROPERTIES,
+        ..entry("Test", "AWS", "InspectorScan", "1", (1, 1), (0, 1))
+    },
+    BuiltInActionType {
         // A partner test integration: the account's pipeline calls the partner's service
         // with the caller's own credential for it, which is why the token is secret. The
         // partner's own pages are the deep links, and its sign-up page is where a user
@@ -766,6 +1010,87 @@ const CODEBUILD_PROPERTIES: &[BuiltInConfigurationProperty] = &[
     property(
         "EnvironmentVariables",
         "The environment variables the build runs with, as a JSON array",
+        false,
+        false,
+    ),
+];
+
+/// The ECR build-and-publish action's configuration parameters, shared by the two
+/// categories it is published in (`Build` and `Invoke`): one provider, one documented
+/// parameter list.
+const ECR_BUILD_AND_PUBLISH_PROPERTIES: &[BuiltInConfigurationProperty] = &[
+    property(
+        "ECRRepositoryName",
+        "The Amazon ECR repository the built image is pushed to",
+        true,
+        false,
+    ),
+    property(
+        "DockerFilePath",
+        "The path to the Dockerfile in the input artifact",
+        false,
+        false,
+    ),
+    property(
+        "ImageTags",
+        "The tags the pushed image is published under",
+        false,
+        false,
+    ),
+    property(
+        "RegistryType",
+        "Whether the repository is a private or a public registry",
+        false,
+        false,
+    ),
+];
+
+/// The Amazon Inspector scan action's configuration parameters, shared by the two
+/// categories it is published in (`Invoke` and `Test`): one provider, one documented
+/// parameter list.
+///
+/// The run mode decides what the scan reads, and the four thresholds how many findings of
+/// each severity fail the action.
+const INSPECTOR_SCAN_PROPERTIES: &[BuiltInConfigurationProperty] = &[
+    property(
+        "InspectorRunMode",
+        "Whether the scan reads the source in the input artifact or a container image",
+        true,
+        false,
+    ),
+    property(
+        "ECRRepositoryName",
+        "The Amazon ECR repository holding the image a container scan reads",
+        false,
+        false,
+    ),
+    property(
+        "ImageTag",
+        "The tag of the image a container scan reads",
+        false,
+        false,
+    ),
+    property(
+        "CriticalThreshold",
+        "How many critical findings fail the action",
+        false,
+        false,
+    ),
+    property(
+        "HighThreshold",
+        "How many high findings fail the action",
+        false,
+        false,
+    ),
+    property(
+        "MediumThreshold",
+        "How many medium findings fail the action",
+        false,
+        false,
+    ),
+    property(
+        "LowThreshold",
+        "How many low findings fail the action",
         false,
         false,
     ),
