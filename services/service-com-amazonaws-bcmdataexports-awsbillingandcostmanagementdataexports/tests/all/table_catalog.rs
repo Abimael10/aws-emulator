@@ -285,10 +285,10 @@ const KNOWN_COLUMNS: &[(&str, &[(&str, &str)])] = &[
             ("account_id", "String"),
             ("account_name", "String"),
             ("estimated_monthly_savings_after_discount", "Double"),
-            ("recommendation_lookback_period_in_days", "Double"),
+            ("recommendation_lookback_period_in_days", "Integer"),
             ("last_refresh_timestamp", "Timestamp"),
             ("restart_needed", "Boolean"),
-            ("tags", "Map"),
+            ("tags", "Map<String, String>"),
         ],
     ),
     (

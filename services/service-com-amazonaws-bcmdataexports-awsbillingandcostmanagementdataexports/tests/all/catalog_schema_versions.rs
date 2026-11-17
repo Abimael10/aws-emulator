@@ -43,31 +43,36 @@ use serde_json::{json, Value};
 use super::export_lifecycle::Client;
 
 /// The table the FOCUS 1.0 specification is published for.
-const FOCUS_1_0: &str = "FOCUS_1_0_AWS";
+///
+/// The table names below are `pub(crate)` because more than one suite of this target names
+/// the catalog's tables (see `catalog_published_text`), and the catalog's names have one
+/// definition per target.
+pub(crate) const FOCUS_1_0: &str = "FOCUS_1_0_AWS";
 
 /// The superseded preview table, which publishes the same FOCUS 1.0 specification.
-const FOCUS_1_0_PREVIEW: &str = "FOCUS_1_0_AWS_PREVIEW";
+pub(crate) const FOCUS_1_0_PREVIEW: &str = "FOCUS_1_0_AWS_PREVIEW";
 
 /// The table the FOCUS 1.2 specification is published for.
-const FOCUS_1_2: &str = "FOCUS_1_2_AWS";
+pub(crate) const FOCUS_1_2: &str = "FOCUS_1_2_AWS";
 
 /// The curated view over the cost and usage data.
-const DASHBOARD: &str = "COST_AND_USAGE_DASHBOARD";
+pub(crate) const DASHBOARD: &str = "COST_AND_USAGE_DASHBOARD";
 
 /// The table the view above aggregates.
-const COST_AND_USAGE_REPORT: &str = "COST_AND_USAGE_REPORT";
+pub(crate) const COST_AND_USAGE_REPORT: &str = "COST_AND_USAGE_REPORT";
 
 /// The table the cost optimization recommendations are published for.
-const RECOMMENDATIONS: &str = "COST_OPTIMIZATION_RECOMMENDATIONS";
+pub(crate) const RECOMMENDATIONS: &str = "COST_OPTIMIZATION_RECOMMENDATIONS";
 
 /// The table the carbon emissions estimates are published for.
-const CARBON_EMISSIONS: &str = "CARBON_EMISSIONS";
+pub(crate) const CARBON_EMISSIONS: &str = "CARBON_EMISSIONS";
 
 /// `(column, the FOCUS 1.0 text, the FOCUS 1.2 text)` for every column the 1.2
 /// specification re-words over 1.0 (AWS Data Exports table dictionary, as recorded for
-/// `GetTable` on each table). The rows span the three families the revision touches: a
-/// period's limits become its BOUNDS, the commitment-discount family drops "-based", and
-/// the charge classifications and the effective cost are re-defined.
+/// `GetTable` on each table). The rows span the families the revision touches: a period's
+/// limits become its BOUNDS, the commitment-discount family drops "-based", the SKU a
+/// charge is measured against becomes a METERED SKU, a SKU identifier becomes one the
+/// PROVIDER assigns, and the charge classifications and the effective cost are re-defined.
 const REVISED_BY_FOCUS_1_2: &[(&str, &str, &str)] = &[
     (
         "BillingPeriodEnd",
@@ -86,8 +91,28 @@ const REVISED_BY_FOCUS_1_2: &[(&str, &str, &str)] = &[
     ),
     (
         "ChargePeriodStart",
-        "The inclusive start date and time of a charge period.",
+        "The inclusive start date and time within a charge period.",
         "The inclusive start bound of a charge period.",
+    ),
+    (
+        "ConsumedQuantity",
+        "The volume of a given SKU associated with a resource or service used, based on the Consumed Unit.",
+        "The volume of a metered SKU associated with a resource or service used, based on the Consumed Unit.",
+    ),
+    (
+        "ConsumedUnit",
+        "Provider-specified measurement unit indicating how a provider measures usage of a given SKU associated with a resource or service.",
+        "The provider-specified measurement unit indicating how a provider measures usage of a metered SKU associated with a resource or service.",
+    ),
+    (
+        "SkuId",
+        "A unique identifier that defines a provider-supported construct for organizing properties that are common across one or more SKU Prices.",
+        "The identifier assigned to a SKU by the provider.",
+    ),
+    (
+        "SkuPriceId",
+        "A unique identifier that defines the unit price used to calculate the charge.",
+        "The identifier assigned to a SKU Price by the provider.",
     ),
     (
         "ChargeCategory",
@@ -158,7 +183,11 @@ const RENAMED_BY_THE_DASHBOARD: &[(&str, &str)] = &[
 /// `(table, column, the Description the dictionary publishes for it)` — rows spanning
 /// every table of the catalog and the column families the issue cited, plus columns it did
 /// not cite (AWS Data Exports table dictionary, as recorded for `GetTable`).
-const PUBLISHED_DESCRIPTIONS: &[(&str, &str, &str)] = &[
+///
+/// `pub(crate)` because the suite that covers the catalog's published VALUES asserts the
+/// same rule over these rows beside its own (see `catalog_published_text`): one published
+/// sentence is written down once per test target.
+pub(crate) const PUBLISHED_DESCRIPTIONS: &[(&str, &str, &str)] = &[
     // The carbon emissions table: the product measured and the place the usage came from,
     // published as a Region code and as the human-readable location that code stands for.
     (
@@ -169,12 +198,12 @@ const PUBLISHED_DESCRIPTIONS: &[(&str, &str, &str)] = &[
     (
         CARBON_EMISSIONS,
         "region_code",
-        "Describes the Region code where the usage originated from.",
+        "A Region is a physical location around the world where data centers are clustered. AWS calls each group of logical data centers an Availability Zone (AZ). Each AWS Region consists of multiple, isolated, and physically separate AZs within a geographic area. The Region code attribute specifies where the AWS service is available. For example, us-east-1.",
     ),
     (
         CARBON_EMISSIONS,
         "location",
-        "Describes the human-readable location where the usage originated from, corresponding to the region_code.",
+        "Describes the human-readable location where the usage originated from, corresponding to the region_code. For example, US East (N. Virginia).",
     ),
     // The cost and usage table: the unblended pair, worded as the dictionary words the
     // blended pair, and the usage amount with the caveats the dictionary ships with it.
@@ -186,7 +215,7 @@ const PUBLISHED_DESCRIPTIONS: &[(&str, &str, &str)] = &[
     (
         COST_AND_USAGE_REPORT,
         "line_item_unblended_rate",
-        "In consolidated billing for accounts using Reserved Instances, the UnblendedRate is the rate associated with an individual account's service usage.",
+        "In consolidated billing for accounts using AWS Organizations, the unblended rate is the rate associated with an individual account's service usage.\nFor Amazon EC2 and Amazon RDS line items that have an RI discount applied to them, the UnblendedRate is zero. Line items with an RI discount have a LineItemType of DiscountedUsage.",
     ),
     (
         COST_AND_USAGE_REPORT,
@@ -246,12 +275,12 @@ const PUBLISHED_DESCRIPTIONS: &[(&str, &str, &str)] = &[
     (
         FOCUS_1_2,
         "CommitmentDiscountQuantity",
-        "The amount of a commitment discount purchased or accounted for in commitment discount related rows.",
+        "The amount of a commitment discount purchased or accounted for in commitment discount related rows that is denominated in Commitment Discount Units.",
     ),
     (
         FOCUS_1_2,
         "CommitmentDiscountUnit",
-        "The provider-specified measurement unit indicating the quantity of units of a commitment discount purchased or accounted for in commitment discount related rows.",
+        "The provider-specified measurement unit indicating how a provider measures the Commitment Discount Quantity of a commitment discount.",
     ),
 ];
 
@@ -270,14 +299,18 @@ const RECOMMENDATION_SAVINGS_COLUMNS: &[&str] = &[
 ];
 
 /// One reported column.
+///
+/// `pub(crate)` because more than one suite of this target reads a reported schema's kinds
+/// of data beside its text (see `catalog_published_text`), and one reader of a `Column` is
+/// enough.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ReportedColumn {
-    data_type: String,
-    description: String,
+pub(crate) struct ReportedColumn {
+    pub(crate) data_type: String,
+    pub(crate) description: String,
 }
 
 /// The schema `GetTable` reports for `table`, as `name -> (Type, Description)`.
-async fn schema_of(client: &Client, table: &str) -> BTreeMap<String, ReportedColumn> {
+pub(crate) async fn schema_of(client: &Client, table: &str) -> BTreeMap<String, ReportedColumn> {
     let body = client.ok("GetTable", &json!({ "TableName": table })).await;
     body.get("Schema")
         .and_then(Value::as_array)

@@ -160,8 +160,9 @@ const PUBLISHED_TYPES: &[(&str, &str, &str)] = &[
     ),
     (COST_AND_USAGE_REPORT, "cost_category", "Map"),
     (COST_AND_USAGE_REPORT, "bill_invoice_id", "String"),
-    // The recommendations dictionary: money, percentages and the lookback day count are
-    // all Double, a flag is Boolean and the resource's tags are a key-value map.
+    // The recommendations dictionary: money and percentages are Double, the lookback day
+    // count is a whole number of days, a flag is Boolean and the resource's tags are a
+    // key-value map that names its key and value types.
     (
         RECOMMENDATIONS,
         "estimated_monthly_cost_before_discount",
@@ -185,9 +186,9 @@ const PUBLISHED_TYPES: &[(&str, &str, &str)] = &[
     (
         RECOMMENDATIONS,
         "recommendation_lookback_period_in_days",
-        "Double",
+        "Integer",
     ),
-    (RECOMMENDATIONS, "tags", "Map"),
+    (RECOMMENDATIONS, "tags", "Map<String, String>"),
     (RECOMMENDATIONS, "restart_needed", "Boolean"),
     // Entries the issue did not cite.
     (RECOMMENDATIONS, "account_id", "String"),

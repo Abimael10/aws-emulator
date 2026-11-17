@@ -7,7 +7,8 @@
 //! table or column that showed the defect:
 //!
 //! 1. A column's `Type` names the KIND of data it stores, in the dictionary's mixed-case
-//!    vocabulary — `String`, `Number`, `Double`, `Timestamp`, `Boolean`, `Map` — and
+//!    vocabulary — `String`, `Number`, `Double`, `Integer`, `Timestamp`, `Boolean`, `Map`,
+//!    `Map<String, String>` — and
 //!    every column carries the dictionary's `Description` for it, within the modelled
 //!    bound. No column reports a storage-engine type name (`STRING`,
 //!    `MAP<STRING,STRING>`). Which token a column carries is ITS schema's: the cost and
@@ -46,9 +47,11 @@ const COLUMN_TYPE_VOCABULARY: &[&str] = &[
     "String",
     "Number",
     "Double",
+    "Integer",
     "Timestamp",
     "Boolean",
     "Map",
+    "Map<String, String>",
 ];
 
 /// `Column$Description`, `Column$Type` and `Column$Name` all target `GenericString`:
@@ -137,14 +140,14 @@ const PUBLISHED_COLUMNS: &[(&str, &[(&str, &str)])] = &[
         &[
             ("implementation_effort", "String"),
             ("rollback_possible", "Boolean"),
-            // The recommendations dictionary publishes every numeric column — money,
-            // percentages and the lookback day count alike — as `Double`, and the
-            // resource's tags as a key-value map: tokens of its own, not the cost and
-            // usage dictionary's.
-            ("recommendation_lookback_period_in_days", "Double"),
+            // The recommendations dictionary publishes its money and percentage columns as
+            // `Double`, the lookback day count as the whole number of days it is, and the
+            // resource's tags as a key-value map NAMING its key and value types: tokens of
+            // its own, not the cost and usage dictionary's.
+            ("recommendation_lookback_period_in_days", "Integer"),
             ("estimated_monthly_cost_before_discount", "Double"),
             ("estimated_savings_percentage_after_discount", "Double"),
-            ("tags", "Map"),
+            ("tags", "Map<String, String>"),
         ],
     ),
     (
