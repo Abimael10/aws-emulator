@@ -4594,13 +4594,17 @@ impl RateRefusal {
     #[must_use]
     pub fn message(&self) -> String {
         match self {
+            // The rate missing the floor states the rate that was asked for and
+            // the floor it missed: the floor is the rate the limit includes at
+            // no additional cost, which the limit reports as its
+            // `FreeLimitValue` — "the default (free) limit value, in requests
+            // per second (RPS). This is the rate included at no additional
+            // cost" (this service's model) — so the sentence names that bound
+            // by the name the limit reports it under.
             Self::BelowFreeRate {
                 requested,
                 free_rate,
-            } => format!(
-                "The requested limit value {requested} is below the default limit of \
-                 {free_rate} requests per second for this limit."
-            ),
+            } => format!("Requested value {requested} is below the free limit of {free_rate}"),
             // The quota excess states the rate that was asked for and the
             // ceiling it passed, and nothing else: the caller raises the
             // ceiling in Service Quotas rather than in this API, so there is no

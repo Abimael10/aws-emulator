@@ -454,6 +454,99 @@ async fn a_rate_outside_the_accounts_range_is_refused_and_stores_nothing() {
 }
 
 #[tokio::test]
+async fn a_rate_under_the_floor_is_refused_naming_the_rate_asked_for_and_the_free_limit() {
+    let (router, engine) = router_and_engine();
+
+    for limit in LIMITS {
+        // The floor of the range is the rate the limit INCLUDES, which every
+        // reader of the limit reports as its `FreeLimitValue` — "the default
+        // (free) limit value, in requests per second (RPS). This is the rate
+        // included at no additional cost" (this service's model) — so the bound
+        // the refusal has to name is read off the limit itself rather than
+        // taken from this suite's table alone.
+        let published = read_back(
+            &router,
+            &format!("{} before anything is provisioned", limit.category),
+            limit.category,
+        )
+        .await;
+        let free = published
+            .get("FreeLimitValue")
+            .and_then(Value::as_i64)
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {:?}: a limit must report its free value: {published}",
+                    limit.category
+                )
+            });
+
+        // A granted increase opens the range, so a rate ABOVE the floor can be
+        // put in force: the floor a refusal names is the limit's free value and
+        // not the rate the account currently holds, which this makes visible by
+        // asking for a sub-floor rate while a HIGHER rate is provisioned.
+        granted_increase(&engine, limit, limit.included + GRANTED_INCREASE);
+        let in_force = free + 2;
+        let (status, answered) = provision(&router, limit.category, in_force).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: the rate in force while the sub-floor rows run is stored first, got \
+             {status} with {answered}",
+            limit.category
+        );
+
+        // Each row is a rate under the floor, differing along how far under it
+        // reaches: one step, and the lowest rate the modelled integer holds.
+        // The rates in between — no rate at all and a negative one — are the
+        // rows `a_rate_outside_the_accounts_range_is_refused_and_stores_nothing`
+        // above already drives over every category, so they are not repeated.
+        for (position, requested) in [
+            ("one step under the free limit", free - 1),
+            (
+                "the lowest rate the modelled integer holds",
+                i64::from(i32::MIN),
+            ),
+        ] {
+            let case = format!("{} asked for {requested} ({position})", limit.category);
+            let (status, payload) = provision(&router, limit.category, requested).await;
+            assert_eq!(
+                (status, error_code(&payload)),
+                (400, "InvalidParameterException"),
+                "case {case:?}: expected a 400 InvalidParameterException, got {status} \
+                 with {payload}"
+            );
+            let message = error_message(&payload);
+            let expected = below_included_message(requested, free);
+            assert_eq!(
+                message, expected,
+                "case {case:?}: expected {expected:?}, got {message:?}"
+            );
+
+            // A caller that reads the bound out of the sentence gets the
+            // limit's free value, so the sentence ends with that bound and
+            // nothing after it.
+            let stated_bound = message
+                .rsplit(' ')
+                .next()
+                .and_then(|word| word.parse::<i64>().ok());
+            assert_eq!(
+                stated_bound,
+                Some(free),
+                "case {case:?}: the refusal must end with the free limit {free}, got {message:?}"
+            );
+
+            // The refusal is judged before anything is written, so the rate in
+            // force is the one the account already held.
+            let after = read_back(&router, &case, limit.category).await;
+            assert_eq!(
+                after,
+                rendered(limit, in_force),
+                "case {case:?}: a refused update must leave the limit unchanged, got {after}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn an_account_with_no_increase_has_the_included_rate_as_its_ceiling() {
     let (router, _engine) = router_and_engine();
 
@@ -745,12 +838,11 @@ async fn a_category_neighbouring_a_published_one_identifies_no_limit() {
     }
 }
 
-/// What a refusal says for a rate below the limit's included rate.
+/// What a refusal says for a rate below the limit's included rate: the rate
+/// that was asked for and the included rate it missed, which the limit reports
+/// as its `FreeLimitValue`.
 fn below_included_message(requested: i64, included: i64) -> String {
-    format!(
-        "The requested limit value {requested} is below the default limit of {included} \
-         requests per second for this limit."
-    )
+    format!("Requested value {requested} is below the free limit of {included}")
 }
 
 /// What a refusal says for a rate above the account's Service Quotas ceiling
