@@ -21,14 +21,18 @@
 //! socket is opened, no host name is resolved and nothing leaves the process. The
 //! credentials are the callback's own, which sign the hop and never appear in a response.
 //!
-//! An ask that does not answer an endpoint is an ask this emulator could not make: there was
-//! no EC2 in this process (the assembled emulator mounts every service, so this is a process
-//! running Network Firewall alone), or EC2 refused the create — because the subnet or the VPC
-//! names nothing of this account, or for any other reason. This service holds nothing of the
-//! placement beyond the ids the request carried and it does not resolve a placement against
-//! EC2 (no refusal of this service's is grounded in what EC2 answered), so nothing is refused
-//! here either: the attachment falls back to an id this service mints, which no EC2 holds and
-//! no route can resolve, and the attempt is traced at `warn`.
+//! Whether a placement EXISTS is EC2's answer too: a firewall endpoint can only be
+//! instantiated in a VPC and subnets the calling account holds, so the ids a request carries
+//! are resolved against EC2 ([`resolve`]) before anything is stored, and the operation that
+//! asked refuses a request naming one this account cannot reach.
+//!
+//! An ask EC2 does not answer at all is an ask this emulator could not make: there was no EC2
+//! in this process (the assembled emulator mounts every service, so this is a process running
+//! Network Firewall alone), or the call failed for a reason that is not "this account has no
+//! such resource". Nothing is resolved then, and nothing is refused — a refusal of this
+//! service's is grounded in what EC2 ANSWERED, and an ask that went unanswered grounds none.
+//! An endpoint EC2 creates none for leaves its attachment carrying an id this service mints,
+//! which no EC2 holds and no route can resolve, and the attempt is traced at `warn`.
 //!
 //! Nothing here holds this service's store: every function takes the values it needs and is
 //! awaited with no guard held, so an endpoint can never be created or deleted behind a lock.
@@ -62,6 +66,120 @@ pub fn new_endpoint_service_id() -> String {
 /// — "the name of the service", whose `vpce` label carries the owner's own service id).
 pub fn endpoint_service_name(region: &str, service_id: &str) -> String {
     format!("com.amazonaws.vpce.{region}.{service_id}")
+}
+
+/// The error code Amazon EC2 answers a read naming a VPC id no VPC of the account has with
+/// (`InvalidVpcID.NotFound`), which is what says the VPC is not one this account can reach
+/// rather than that the ask failed.
+const VPC_NOT_FOUND_CODE: &str = "InvalidVpcID.NotFound";
+
+/// The same for a subnet id no subnet of the account has (`InvalidSubnetID.NotFound`).
+const SUBNET_NOT_FOUND_CODE: &str = "InvalidSubnetID.NotFound";
+
+/// What Amazon EC2 answered about the placement a firewall's endpoints would be instantiated
+/// in — the VPC the firewall filters in and the subnets each endpoint sits in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Placement {
+    /// EC2 holds every resource the placement names for this account in this Region.
+    Reachable,
+    /// EC2 holds no VPC of this account with the id the request named.
+    VpcUnreachable,
+    /// EC2 holds no subnet of this account for at least one of the ids the request named.
+    SubnetsUnreachable,
+    /// EC2 answered nothing about the placement, so it is resolved neither way (see the
+    /// module docs).
+    Unanswered,
+}
+
+/// Resolve a placement against Amazon EC2: whether this account can reach `vpc_id` (when the
+/// request named one) and every subnet of `subnet_ids`.
+///
+/// The VPC is resolved FIRST and answered on its own, because a subnet is a resource OF a VPC:
+/// a request whose VPC this account cannot reach has named no subnet of its own either, so
+/// what is wrong with it is the VPC. Only then are the subnets resolved, together in one read.
+///
+/// A read naming an id the account has no such resource for is REFUSED by EC2 rather than
+/// given an absent row ([`VPC_NOT_FOUND_CODE`], [`SUBNET_NOT_FOUND_CODE`]), so that code is
+/// what says "unreachable"; any other failure, and no EC2 to ask at all, is
+/// [`Placement::Unanswered`] and resolves nothing. `subnet_ids` is bounded by the callers,
+/// which hold a request to one subnet per Availability Zone before they reach here.
+pub async fn resolve(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    vpc_id: Option<&str>,
+    subnet_ids: &[String],
+) -> Placement {
+    let Some(client) = ec2_client(ctx, region) else {
+        unresolved("there is no Amazon EC2 in this process to ask");
+        return Placement::Unanswered;
+    };
+    if let Some(vpc_id) = vpc_id {
+        match client.describe_vpcs().vpc_ids(vpc_id).send().await {
+            // EC2 refuses a read naming a VPC it holds none of, so an answer with no row for
+            // the id asked about is the same answer as that refusal.
+            Ok(output) => {
+                if !output.vpcs().iter().any(|vpc| vpc.vpc_id() == Some(vpc_id)) {
+                    return Placement::VpcUnreachable;
+                }
+            }
+            Err(error) => {
+                return answered_not_found(&error, VPC_NOT_FOUND_CODE, Placement::VpcUnreachable)
+            }
+        }
+    }
+    if subnet_ids.is_empty() {
+        return Placement::Reachable;
+    }
+    match client
+        .describe_subnets()
+        .set_subnet_ids(Some(subnet_ids.to_vec()))
+        .send()
+        .await
+    {
+        Ok(output) => {
+            let held: ::std::collections::HashSet<&str> = output
+                .subnets()
+                .iter()
+                .filter_map(::aws_sdk_ec2::types::Subnet::subnet_id)
+                .collect();
+            if subnet_ids.iter().any(|id| !held.contains(id.as_str())) {
+                Placement::SubnetsUnreachable
+            } else {
+                Placement::Reachable
+            }
+        }
+        Err(error) => {
+            answered_not_found(&error, SUBNET_NOT_FOUND_CODE, Placement::SubnetsUnreachable)
+        }
+    }
+}
+
+/// Read one failed placement read: `unreachable` where EC2 answered `not_found_code` — the
+/// code it refuses a read naming a resource this account does not have with — and
+/// [`Placement::Unanswered`] for anything else, which resolves nothing and is traced.
+fn answered_not_found<E: ::aws_sdk_ec2::error::ProvideErrorMetadata>(
+    error: &E,
+    not_found_code: &str,
+    unreachable: Placement,
+) -> Placement {
+    if error.code() == Some(not_found_code) {
+        return unreachable;
+    }
+    unresolved(&format!("Amazon EC2 answered {:?}", error.code()));
+    Placement::Unanswered
+}
+
+/// Trace a placement Amazon EC2 answered nothing about, which is a placement this service
+/// resolves neither way (see the module docs).
+///
+/// At `warn`: a deployment where this ask does not answer is one where no placement can be
+/// resolved, which is worth seeing. `why` is this service's own text, never a caller value.
+fn unresolved(why: &str) {
+    ::tracing::warn!(
+        why = %why,
+        "the VPC and subnets a firewall's endpoints would be instantiated in were not resolved \
+         in Amazon EC2"
+    );
 }
 
 /// Ask Amazon EC2 to instantiate the firewall endpoint for `subnet_id`, and answer the id it

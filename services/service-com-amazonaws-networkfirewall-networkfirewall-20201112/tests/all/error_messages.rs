@@ -417,13 +417,15 @@ async fn a_rejected_update_token_carries_one_constant_message() {
 }
 
 /// RULE: a refusal whose message IS built from the request takes one parseable
-/// shape — a fixed stem naming the referenced resource KIND and the defect, then
+/// shape — a fixed stem naming what the reference pointed at and the defect, then
 /// the offending value in `, parameter: [...]` brackets — and never names the
 /// input member the value arrived in.
 ///
 /// Rows span both reference lists of a firewall policy document, a firewall's
 /// policy reference, stateless and stateful rule-group ARNs, and ARNs for names
-/// and regions the emulator never minted.
+/// and regions the emulator never minted. The stem's subject is a fact about the
+/// referenced resource: a rule group reference names its ARN, a firewall policy
+/// reference the policy.
 #[tokio::test]
 async fn a_reference_to_an_absent_arn_names_the_kind_and_brackets_the_arn() {
     let harness = Harness::new();
@@ -485,7 +487,7 @@ async fn a_reference_to_an_absent_arn_names_the_kind_and_brackets_the_arn() {
                 "VpcId": "vpc-0123abcd",
                 "SubnetMappings": [{ "SubnetId": "subnet-ref" }],
             }),
-            "firewall policy ARN does not exist".to_string(),
+            "firewall policy does not exist".to_string(),
             format!("arn:aws:network-firewall:{REGION}:{ACCOUNT}:firewall-policy/nope"),
         ),
     ];

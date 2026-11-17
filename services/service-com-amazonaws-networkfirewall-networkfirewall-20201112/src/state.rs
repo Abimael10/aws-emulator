@@ -1639,19 +1639,28 @@ pub fn capacity_exceeded_message(group: &RuleGroup, required: i32) -> String {
     )
 }
 
-/// The refusal for a reference naming an ARN no stored resource of `kind`
-/// carries: the stem names the referenced resource KIND and the defect — never
-/// the input member the reference arrived in — and the offending ARN rides in the
-/// parameter brackets (see [`parameter_message`]).
-pub fn missing_arn_message(kind: &str, arn: &str) -> String {
-    parameter_message(&format!("{kind} ARN does not exist"), arn)
+/// The refusal for a reference naming an ARN no stored resource carries:
+/// `referenced` — how this service names what the reference pointed at — then
+/// `does not exist`, never the input member the reference arrived in, and the
+/// offending ARN rides in the parameter brackets (see [`parameter_message`]).
+///
+/// What the stem's subject is, is a fact about the REFERENCED resource rather
+/// than one spelling for every kind: a firewall policy reference is refused
+/// naming the resource ([`REFERENCED_FIREWALL_POLICY`]) and a rule group
+/// reference naming its ARN ([`REFERENCED_RULE_GROUP`]), each as this service
+/// words that refusal.
+pub fn missing_arn_message(referenced: &str, arn: &str) -> String {
+    parameter_message(&format!("{referenced} does not exist"), arn)
 }
 
-/// How [`missing_arn_message`] and friends name a rule group.
-pub const KIND_RULE_GROUP: &str = "rule group";
+/// How [`missing_arn_message`] names a rule group a reference did not resolve
+/// to: the rule group's ARN.
+pub const REFERENCED_RULE_GROUP: &str = "rule group ARN";
 
-/// How [`missing_arn_message`] and friends name a firewall policy.
-pub const KIND_FIREWALL_POLICY: &str = "firewall policy";
+/// How [`missing_arn_message`] names a firewall policy a reference did not
+/// resolve to: the firewall policy itself, the ARN it was named by riding in the
+/// parameter brackets instead.
+pub const REFERENCED_FIREWALL_POLICY: &str = "firewall policy";
 
 /// The status of one firewall endpoint, as persisted.
 #[derive(Debug, Clone)]
@@ -1918,6 +1927,28 @@ pub const FIREWALL_POLICY_CHANGE_PROTECTION_MEMBER: &str = "FirewallPolicyChange
 /// What a subnet-association change naming no subnet is refused with: the
 /// request asks for no association at all, which no mapping can satisfy.
 pub const NO_SUBNETS_MESSAGE: &str = "Specify at least one subnet.";
+
+/// What a request naming a VPC the calling account cannot reach is refused with.
+///
+/// A firewall is created IN a VPC ("the unique identifier of the VPC where
+/// Network Firewall should create the firewall", `CreateFirewall$VpcId`), and a
+/// VPC that is not one of the account's own is a request that "references ... a
+/// resource that isn't valid in the context of the request" —
+/// `InvalidRequestException` (client, HTTP 400). The text is fixed for this error
+/// class: it names neither the VPC nor its id, in the same resource-agnostic
+/// family as [`RESOURCE_NOT_FOUND_MESSAGE`], so nothing from the request appears
+/// in it.
+pub const VPC_INACCESSIBLE_MESSAGE: &str = "Given VPC is inaccessible from account";
+
+/// What a request naming subnets the calling account cannot reach is refused
+/// with — the subnet side of [`VPC_INACCESSIBLE_MESSAGE`], and fixed text in the
+/// same way: one sentence covering one subnet or several, carrying no id.
+///
+/// "Network Firewall creates a firewall endpoint in each subnet"
+/// (`CreateFirewall$SubnetMappings`), so a subnet the account cannot reach is a
+/// subnet no endpoint can be instantiated in.
+pub const SUBNETS_INACCESSIBLE_MESSAGE: &str =
+    "Given subnet(s) is/are inaccessible from account";
 
 /// What a subnet disassociation that would empty a firewall's mapping set is
 /// refused with, naming the subnets it would have removed.
@@ -2820,7 +2851,7 @@ impl ComAmazonawsNetworkfirewallNetworkfirewall20201112State {
                 // referenced KIND and the defect, then the offending ARN in
                 // parameter brackets. The input member the reference arrived in
                 // is not part of it.
-                return Some(missing_arn_message(KIND_RULE_GROUP, arn));
+                return Some(missing_arn_message(REFERENCED_RULE_GROUP, arn));
             };
             // Every type other than STATELESS is a stateful rule group, which is
             // the same split the store's keys are built on.

@@ -1625,6 +1625,26 @@ async fn a_discovered_resource_is_associable() {
     let (router, engine) = emulator();
     associate_admin(&router).await;
 
+    // The firewall's placement is Amazon EC2's: Network Firewall resolves the VPC and the
+    // subnets a create names against EC2 and refuses a placement this account cannot reach,
+    // so the network is created there first and the create below names the ids EC2 minted.
+    let vpc = element(
+        "vpc",
+        &ec2_ok("vpc", &router, "CreateVpc", &[p("CidrBlock", "10.0.0.0/16")]).await,
+        "vpcId",
+    );
+    let subnet = element(
+        "subnet",
+        &ec2_ok(
+            "subnet",
+            &router,
+            "CreateSubnet",
+            &[p("VpcId", &vpc), p("CidrBlock", "10.0.1.0/24")],
+        )
+        .await,
+        "subnetId",
+    );
+
     let policy = network_firewall(
         &router,
         "CreateFirewallPolicy",
@@ -1647,8 +1667,8 @@ async fn a_discovered_resource_is_associable() {
         &json!({
             "FirewallName": "fms-associable-firewall",
             "FirewallPolicyArn": policy_arn,
-            "VpcId": "vpc-0123456789abcdef0",
-            "SubnetMappings": [{ "SubnetId": "subnet-0123456789abcdef0" }],
+            "VpcId": vpc,
+            "SubnetMappings": [{ "SubnetId": subnet }],
         }),
     )
     .await;

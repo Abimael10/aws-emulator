@@ -416,7 +416,7 @@ async fn refused_policy_associations_change_nothing() {
             }),
             code: "InvalidRequestException",
             message: Some(
-                "firewall policy ARN does not exist, parameter: \
+                "firewall policy does not exist, parameter: \
                  [arn:aws:network-firewall:eu-west-1:000000000000:firewall-policy/absent]",
             ),
         },

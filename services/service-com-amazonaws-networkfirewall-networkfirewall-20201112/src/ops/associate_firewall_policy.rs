@@ -269,7 +269,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(AssociateFirewallPolicyErrorModeled::InvalidRequestException(
                 InvalidRequestException {
                     message: Some(crate::state::missing_arn_message(
-                        crate::state::KIND_FIREWALL_POLICY,
+                        crate::state::REFERENCED_FIREWALL_POLICY,
                         &input.firewall_policy_arn,
                     )),
                 },

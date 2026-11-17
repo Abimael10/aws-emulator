@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateFirewall
-//! IMPLEMENTED for VPC-attached firewalls: asks Amazon EC2 to instantiate the firewall
-//! endpoint of each subnet mapping (`crate::state::firewall_endpoints`), stores a
-//! `FirewallRecord` carrying the endpoints EC2 minted, associates it with an existing
-//! firewall policy, and reports the firewall and its status from that record. Transit
-//! gateway-attached and proxy-mode firewalls are not implemented and still answer 501.
+//! IMPLEMENTED for VPC-attached firewalls: resolves the VPC and subnets the request names
+//! against Amazon EC2 and refuses a placement this account cannot reach, asks EC2 to
+//! instantiate the firewall endpoint of each subnet mapping
+//! (`crate::state::firewall_endpoints`), stores a `FirewallRecord` carrying the endpoints EC2
+//! minted, associates it with an existing firewall policy, and reports the firewall and its
+//! status from that record. Transit gateway-attached and proxy-mode firewalls are not
+//! implemented and still answer 501.
 //!
 //! ## Shape of an operation
 //!
@@ -318,6 +320,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let region = crate::state::request_region(ctx);
+        let subnet_ids: Vec<String> = subnet_mappings
+            .iter()
+            .map(|mapping| mapping.subnet_id.clone())
+            .collect();
+        // A firewall goes in a VPC and its endpoints in that VPC's subnets, and whether this
+        // account can reach either is Amazon EC2's answer, not this service's: the placement
+        // is resolved THERE before anything is created or stored, so a request naming a VPC
+        // or a subnet this account does not hold is refused rather than served with a
+        // firewall nothing can route to (see `crate::state::firewall_endpoints`). The VPC is
+        // answered first, a subnet being a resource of the VPC it sits in.
+        match endpoints::resolve(ctx, &region, Some(&vpc_id), &subnet_ids).await {
+            endpoints::Placement::VpcUnreachable => {
+                return Err(CreateFirewallErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(crate::state::VPC_INACCESSIBLE_MESSAGE.to_string()),
+                    },
+                )
+                .into())
+            }
+            endpoints::Placement::SubnetsUnreachable => {
+                return Err(CreateFirewallErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(crate::state::SUBNETS_INACCESSIBLE_MESSAGE.to_string()),
+                    },
+                )
+                .into())
+            }
+            // A placement EC2 holds, or one it answered nothing about, which resolves
+            // neither way and refuses nothing.
+            endpoints::Placement::Reachable | endpoints::Placement::Unanswered => {}
+        }
+
         // "In each configured subnet, Network Firewall instantiates a firewall endpoint to
         // handle network traffic" (`Attachment`), and that endpoint is a Gateway Load
         // Balancer VPC endpoint in the caller's VPC — Amazon EC2's resource. So it is
@@ -326,10 +360,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (see `crate::state::firewall_endpoints`).
         let endpoint_service_id = endpoints::new_endpoint_service_id();
         let service_name = endpoints::endpoint_service_name(&region, &endpoint_service_id);
-        let subnet_ids: Vec<String> = subnet_mappings
-            .iter()
-            .map(|mapping| mapping.subnet_id.clone())
-            .collect();
         let mut instantiated =
             endpoints::instantiate_all(ctx, &region, &vpc_id, &service_name, &subnet_ids).await;
 
@@ -409,7 +439,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateFirewall<En
             return Err(CreateFirewallErrorModeled::InvalidRequestException(
                 InvalidRequestException {
                     message: Some(crate::state::missing_arn_message(
-                        crate::state::KIND_FIREWALL_POLICY,
+                        crate::state::REFERENCED_FIREWALL_POLICY,
                         &input.firewall_policy_arn,
                     )),
                 },

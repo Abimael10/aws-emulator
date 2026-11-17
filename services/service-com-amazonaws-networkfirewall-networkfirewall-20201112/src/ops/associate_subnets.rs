@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateSubnets
-//! IMPLEMENTED: adds the requested subnets to the stored `FirewallRecord`'s
-//! `SubnetMappings`, giving each newly named subnet its own Availability Zone and a
-//! firewall endpoint that starts out `CREATING` — instantiated in Amazon EC2
+//! IMPLEMENTED: resolves the subnets the request names against Amazon EC2 and refuses one
+//! this account cannot reach, then adds the requested subnets to the stored
+//! `FirewallRecord`'s `SubnetMappings`, giving each newly named subnet its own Availability
+//! Zone and a firewall endpoint that starts out `CREATING` — instantiated in Amazon EC2
 //! (`crate::state::firewall_endpoints`), so it can be routed to — and re-mints the
 //! firewall's
 //! `UpdateToken` when the mapping set changed — so a following `DescribeFirewall`
@@ -213,6 +214,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let placement = Self::placement(&*self.engine, &region, &input)?;
         let mut instantiated = match placement {
             Some((vpc_id, service_name, subnet_ids)) => {
+                // A firewall endpoint can only be instantiated in a subnet this account
+                // holds, and whether it does is Amazon EC2's answer rather than this
+                // service's: the subnets the association would add are resolved THERE first,
+                // and one this account cannot reach is refused before any endpoint is created
+                // or any mapping stored. The firewall's own VPC is not re-resolved here — it
+                // is the VPC the create already placed this firewall in, not a value this
+                // request named.
+                if endpoints::resolve(ctx, &region, None, &subnet_ids).await
+                    == endpoints::Placement::SubnetsUnreachable
+                {
+                    return Err(AssociateSubnetsErrorModeled::InvalidRequestException(
+                        InvalidRequestException {
+                            message: Some(
+                                crate::state::SUBNETS_INACCESSIBLE_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                }
                 endpoints::instantiate_all(ctx, &region, &vpc_id, &service_name, &subnet_ids).await
             }
             None => ::std::collections::HashMap::new(),

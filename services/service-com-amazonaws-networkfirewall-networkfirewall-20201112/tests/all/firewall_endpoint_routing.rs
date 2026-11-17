@@ -395,29 +395,24 @@ async fn a_firewall_endpoint_is_an_ec2_endpoint_a_route_can_target() {
 }
 
 /// RULE: an attachment reports an endpoint Amazon EC2 holds exactly where EC2 created one —
-/// so a placement EC2 resolves to nothing yields no endpoint at all, and the id such an
-/// attachment reports is refused as a route target by EC2 itself.
+/// so a subnet this account reaches but EC2 can place no endpoint of this firewall in yields
+/// no endpoint at all, and the id such an attachment reports is refused as a route target by
+/// EC2 itself.
 ///
-/// The table spans the ways a placement fails to resolve: a subnet id nothing holds, a subnet
-/// of another VPC, a VPC nothing holds, and a list that mixes a subnet that resolves with one
-/// that does not — the last row showing the two outcomes side by side on one firewall. The
-/// create itself is not refused: this service resolves no placement against EC2 (it holds
-/// nothing of one beyond the ids the request carried), which is what every other suite of
-/// this crate, running with no EC2 mounted, relies on.
+/// The table spans the placements that are the account's own — so the create is served — and
+/// that EC2 still instantiates no endpoint in: a subnet of ANOTHER VPC than the one the
+/// firewall names, and a list that mixes the firewall's own subnet with such a foreign one,
+/// which shows the two outcomes side by side on one firewall. A placement naming a VPC or a
+/// subnet this account does not hold at all is refused before any of this (see
+/// `placement_reachability`).
 #[tokio::test]
 async fn an_attachment_reports_an_endpoint_only_where_ec2_created_one() {
-    /// Which part of the placement a row makes unresolvable.
+    /// Which subnets of the account the row asks the firewall to be placed in.
     enum Placement {
-        /// A form-valid subnet id no account ever minted (`subnet-` and 17 hexadecimal
-        /// characters, the `AzSubnet` pattern `^subnet-[0-9a-f]+$`).
-        UnknownSubnet,
         /// A subnet that exists, but in another VPC than the one the firewall names.
         ForeignSubnet,
-        /// A form-valid VPC id no account ever minted (the `VpcId` pattern
-        /// `^vpc-[0-9a-f]+$`).
-        UnknownVpc,
-        /// The firewall's own subnet first, then one nothing holds.
-        ResolvingThenUnknown,
+        /// The firewall's own subnet first, then one of another VPC.
+        OwnThenForeign,
     }
     struct Case {
         name: &'static str,
@@ -425,15 +420,7 @@ async fn an_attachment_reports_an_endpoint_only_where_ec2_created_one() {
         subnet_cidr: &'static str,
         placement: Placement,
     }
-    let unknown_subnet = "subnet-0000000000bad0bad";
-    let unknown_vpc = "vpc-0000000000bad0bad";
     let cases = [
-        Case {
-            name: "unknown-subnet",
-            vpc_cidr: "10.31.0.0/16",
-            subnet_cidr: "10.31.1.0/24",
-            placement: Placement::UnknownSubnet,
-        },
         Case {
             name: "foreign-subnet",
             vpc_cidr: "10.32.0.0/16",
@@ -441,16 +428,10 @@ async fn an_attachment_reports_an_endpoint_only_where_ec2_created_one() {
             placement: Placement::ForeignSubnet,
         },
         Case {
-            name: "unknown-vpc",
-            vpc_cidr: "10.33.0.0/16",
-            subnet_cidr: "10.33.1.0/24",
-            placement: Placement::UnknownVpc,
-        },
-        Case {
-            name: "resolving-then-unknown",
+            name: "own-then-foreign",
             vpc_cidr: "10.34.0.0/16",
             subnet_cidr: "10.34.1.0/24",
-            placement: Placement::ResolvingThenUnknown,
+            placement: Placement::OwnThenForeign,
         },
     ];
 
@@ -465,24 +446,17 @@ async fn an_attachment_reports_an_endpoint_only_where_ec2_created_one() {
         // one of the firewall's OWN VPC, which is none of them unless the row says so.
         let (vpc_id, subnet_ids, resolving): (String, Vec<String>, Vec<String>) =
             match case.placement {
-                Placement::UnknownSubnet => (
-                    network.vpc_id.clone(),
-                    vec![unknown_subnet.to_string()],
-                    Vec::new(),
-                ),
                 Placement::ForeignSubnet => (
                     network.vpc_id.clone(),
                     elsewhere.subnet_ids.clone(),
                     Vec::new(),
                 ),
-                Placement::UnknownVpc => (
-                    unknown_vpc.to_string(),
-                    network.subnet_ids.clone(),
-                    Vec::new(),
-                ),
-                Placement::ResolvingThenUnknown => (
+                Placement::OwnThenForeign => (
                     network.vpc_id.clone(),
-                    vec![network.subnet_ids[0].clone(), unknown_subnet.to_string()],
+                    vec![
+                        network.subnet_ids[0].clone(),
+                        elsewhere.subnet_ids[0].clone(),
+                    ],
                     vec![network.subnet_ids[0].clone()],
                 ),
             };

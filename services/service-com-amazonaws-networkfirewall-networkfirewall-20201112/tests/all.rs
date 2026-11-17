@@ -31,6 +31,8 @@ mod harness;
 mod last_mapping_refusal_scope;
 #[path = "all/logging_configuration.rs"]
 mod logging_configuration;
+#[path = "all/placement_reachability.rs"]
+mod placement_reachability;
 #[path = "all/request_validation_errors.rs"]
 mod request_validation_errors;
 #[path = "all/read_tag_projection.rs"]
