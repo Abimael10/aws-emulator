@@ -12,9 +12,18 @@
 //! How a stored record becomes the members a response reports lives in
 //! [`projection`], re-exported here: every operation that reports a file system or an
 //! access point projects it the same way.
+//!
+//! The mount-target slice — the record, its Availability Zone and address rules, and the
+//! projection every response reporting a mount target is built from — lives in
+//! [`mount_targets`], and the network a mount target is placed in is resolved against the
+//! service that OWNS it in [`ec2_network`]. Both are re-exported here too.
 
+mod ec2_network;
+mod mount_targets;
 mod projection;
 
+pub use ec2_network::*;
+pub use mount_targets::*;
 pub use projection::*;
 
 use std::collections::{HashMap, VecDeque};
@@ -291,6 +300,10 @@ pub struct ComAmazonawsS3filesS3filesState {
     /// Every access point, keyed by its minted `fsap-` id.
     /// [`AccessPoint::file_system_id`] binds one to its parent.
     pub access_points: HashMap<String, AccessPoint>,
+    /// Every mount target, keyed by its minted `fsmt-` id.
+    /// [`MountTarget::file_system_id`] binds one to the file system it is an endpoint
+    /// for.
+    pub mount_targets: HashMap<String, MountTarget>,
     /// Monotonic creation counter. It orders list pages and backs the opaque
     /// `nextToken`, so a cursor keeps resuming correctly across deletes.
     next_sequence: u64,
@@ -368,6 +381,13 @@ impl ComAmazonawsS3filesS3filesState {
             settle_status(
                 &mut access_point.status,
                 access_point.available_due_at,
+                now,
+            );
+        }
+        for mount_target in self.mount_targets.values_mut() {
+            settle_status(
+                &mut mount_target.status,
+                mount_target.available_due_at,
                 now,
             );
         }

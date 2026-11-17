@@ -33,6 +33,17 @@ hex = { workspace = true }
 # the transport and the credentials, so the SDK's own HTTPS stack and runtime are left
 # out.
 aws-sdk-s3 = { version = "1", default-features = false }
+# The AWS SDK for EC2, driven over the same in-process callback: the subnet a
+# `CreateMountTarget` places a mount target in — and that subnet's VPC, Availability Zone,
+# address range and default security group — are EC2's resources, so
+# `src/state/ec2_network.rs` asks EC2 what the account has rather than deciding it here.
+aws-sdk-ec2 = { version = "1", default-features = false }
+# `ipnet`: the ONE reading of a subnet's CIDR block — which addresses it can assign to a
+# mount target's network interface, and whether an address a request named lies inside it.
+ipnet = "2"
+# `arn::region_label`: the ONE reading of a caller-supplied Region as a Region LABEL, which
+# is what the endpoint the EC2 call above is made at is built from.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -40,6 +51,11 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The EC2 service, mounted beside this one in the mount-target test harness: that a mount
+# target is placed in a subnet the account really has can only be driven end to end with
+# the owner of subnets on the same engine. DEV-ONLY: this crate depends on no other
+# service's crate outside its tests.
+service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 
 [lints]
 workspace = true

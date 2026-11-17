@@ -23,6 +23,8 @@ mod creation_token_single_use;
 mod file_system_lifecycle;
 #[path = "all/file_system_policy.rs"]
 mod file_system_policy;
+#[path = "all/mount_targets.rs"]
+mod mount_targets;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/response_projection.rs"]

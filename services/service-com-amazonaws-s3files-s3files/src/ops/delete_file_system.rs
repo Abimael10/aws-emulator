@@ -5,9 +5,11 @@
 //! Removes the file system `fileSystemId` names from [`crate::state`], so the next
 //! `GetFileSystem` answers 404 and `ListFileSystems` no longer reports it.
 //!
-//! A file system that still has children is refused with the modelled
-//! `ConflictException` unless `forceDelete` is true, which removes the children with
-//! it.
+//! A file system that still has a MOUNT TARGET is refused with the modelled
+//! `ConflictException` until that endpoint is deleted on its own — `forceDelete` does not
+//! lift it, because that member is about data pending export to S3 rather than about the
+//! resources the file system holds. One that still has access points is refused unless
+//! `forceDelete` is true, which removes them with it.
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
@@ -173,11 +175,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A file system in use is not deleted out from under its children: the request
-        // is refused with the modelled conflict unless the caller asked for the
-        // children to go too.
-        let children = store.access_point_ids_of(&file_system_id);
-        if !children.is_empty() && input.force_delete != Some(true) {
+        // A file system in use is not deleted out from under its children, and the two
+        // kinds of child part here. A mount target is the file system's network endpoint
+        // and has to be deleted on its own first: the refusal stands whatever
+        // `forceDelete` says, because that member is about "data pending export to S3"
+        // (`DeleteFileSystemRequest$forceDelete`), not about the resources the file system
+        // holds. An access point still goes with the file system when the caller asked for
+        // its children to go too.
+        if !store.mount_target_ids_of(&file_system_id).is_empty() {
+            return Err(DeleteFileSystemErrorModeled::ConflictException(
+                crate::state::file_system_has_mount_targets(&file_system_id),
+            )
+            .into());
+        }
+        let access_points = store.access_point_ids_of(&file_system_id);
+        if !access_points.is_empty() && input.force_delete != Some(true) {
             return Err(DeleteFileSystemErrorModeled::ConflictException(
                 crate::state::conflict(
                     &file_system_id,
@@ -185,20 +197,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     format!(
                         "file system {file_system_id} still has {} access point(s); \
                          delete them or retry with forceDelete=true",
-                        children.len()
+                        access_points.len()
                     ),
                 ),
             )
             .into());
         }
 
-        for access_point_id in &children {
+        for access_point_id in &access_points {
             store.access_points.remove(access_point_id);
         }
         store.file_systems.remove(&file_system_id);
         // The idempotency records of the removed resources can no longer replay
         // anything, so they go with them.
-        let mut gone = children;
+        let mut gone = access_points;
         gone.push(file_system_id);
         store.forget_client_tokens_for(&gone);
 
