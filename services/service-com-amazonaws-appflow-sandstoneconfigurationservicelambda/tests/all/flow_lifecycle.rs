@@ -1642,6 +1642,484 @@ fn every_reported_status_is_a_value_the_model_declares() {
     );
 }
 
+/// Every operation whose input ADDRESSES a flow by name, as the model binds it
+/// (`smithy_query(query="operation", operation="DescribeFlow,StartFlow,StopFlow,\
+/// UpdateFlow,DeleteFlow,CancelFlowExecutions,DescribeFlowExecutionRecords")` — each one's
+/// input carries `flowName` and each models `ResourceNotFoundException` at 404).
+///
+/// This is the whole class the one absence sentence covers, so a sentence that drifted in
+/// any single handler fails here rather than only where a check happened to look.
+const FLOW_ADDRESSING_CALLS: [(&str, &str); 7] = [
+    ("DescribeFlow", "/describe-flow"),
+    ("StartFlow", "/start-flow"),
+    ("StopFlow", "/stop-flow"),
+    ("UpdateFlow", "/update-flow"),
+    ("DeleteFlow", "/delete-flow"),
+    ("CancelFlowExecutions", "/cancel-flow-executions"),
+    (
+        "DescribeFlowExecutionRecords",
+        "/describe-flow-execution-records",
+    ),
+];
+
+/// A flow definition for `flow_name` built around `trigger`, so one table row can name a
+/// trigger type and nothing else.
+///
+/// An event-triggered flow is defined over the connectors AppFlow drives events with (the
+/// fixture Marketo profile into EventBridge); every other trigger type runs between two
+/// fixture Amazon S3 locations.
+fn flow_with_trigger(flow_name: &str, trigger: &Value) -> Value {
+    if trigger.get("triggerType").and_then(Value::as_str) == Some("Event") {
+        json!({
+            "flowName": flow_name,
+            "triggerConfig": trigger,
+            "sourceFlowConfig": marketo_source("Leads"),
+            "destinationFlowConfigList": [event_bridge_destination("appflow-leads")],
+            "tasks": [map_task("leadId", "lead_id")]
+        })
+    } else {
+        json!({
+            "flowName": flow_name,
+            "triggerConfig": trigger,
+            "sourceFlowConfig": s3_source("delete-in"),
+            "destinationFlowConfigList": [s3_destination("delete-out")],
+            "tasks": [map_task("id", "id")]
+        })
+    }
+}
+
+/// The request body a call to `path` carries while addressing `flow_name`: the name alone,
+/// except for the one operation whose input is a whole definition, which the request
+/// boundary refuses without it.
+fn request_addressing(path: &str, flow_name: &str) -> Value {
+    if path == "/update-flow" {
+        flow_with_trigger(flow_name, &on_demand_trigger())
+    } else {
+        json!({ "flowName": flow_name })
+    }
+}
+
+/// A flow the account does not hold is ONE absence, whichever call addressed it and
+/// however it came to be absent: every operation that names a flow answers 404 /
+/// `ResourceNotFoundException` with the same sentence, which ends in the name the request
+/// used, verbatim.
+///
+/// The rows differ along how the flow came to be missing (never created, or taken away by
+/// a delete) and along the form of the name — including the punctuation `FlowName`'s
+/// pattern admits (`smithy_query(query="shape", shape="FlowName")`), which must survive
+/// into the sentence unchanged.
+#[tokio::test]
+async fn every_call_addressing_a_missing_flow_states_one_absence_sentence() {
+    for (case, flow_name, created_then_deleted) in [
+        ("a name nothing ever created", "absent-lifecycle-flow", false),
+        (
+            "a name whose flow a forced delete took away",
+            "removed-lifecycle-flow",
+            true,
+        ),
+        (
+            "a punctuated name nothing created",
+            "Flow.7#edge_case-1",
+            false,
+        ),
+        (
+            "a punctuated name whose flow a forced delete took away",
+            "Flow.8@edge_case-2",
+            true,
+        ),
+    ] {
+        let router = appflow();
+        if created_then_deleted {
+            let created = call(
+                &router,
+                "/create-flow",
+                &flow_with_trigger(flow_name, &on_demand_trigger()),
+            )
+            .await;
+            assert!(
+                created.is_ok(),
+                "case {case:?}: expected CreateFlow to succeed, got {} {:?}",
+                created.status,
+                created.body
+            );
+            let deleted = call(
+                &router,
+                "/delete-flow",
+                &json!({ "flowName": flow_name, "forceDelete": true }),
+            )
+            .await;
+            assert!(
+                deleted.is_ok(),
+                "case {case:?}: expected the forced delete to succeed, got {} {:?}",
+                deleted.status,
+                deleted.body
+            );
+        }
+
+        for (operation, path) in FLOW_ADDRESSING_CALLS {
+            let answer = call(&router, path, &request_addressing(path, flow_name)).await;
+            assert_eq!(
+                (answer.status, answer.error.as_str()),
+                (404, "ResourceNotFoundException"),
+                "case {case:?} via {operation}: expected the absence to be reported, got {} {:?}",
+                answer.status,
+                answer.body
+            );
+            assert_eq!(
+                answer.string("message"),
+                format!("There is no flow with the name {flow_name}"),
+                "case {case:?} via {operation}: expected AppFlow's absence sentence, got {:?}",
+                answer.body
+            );
+        }
+    }
+}
+
+/// One row of the unforced-delete table: the state the flow is in when the delete is
+/// attempted, and whether that delete is served.
+struct DeleteCase {
+    case: &'static str,
+    trigger: Value,
+    /// The calls that put the flow in the state under test, in order.
+    prime: &'static [&'static str],
+    /// The `forceDelete` the request carries, or `None` to leave the member out so the
+    /// modelled default applies (`smithy_query(query="operation", operation="DeleteFlow")`
+    /// — `forceDelete` defaults to false).
+    force_delete: Option<bool>,
+    /// The status the flow reports just before the delete.
+    status: &'static str,
+    /// Whether the delete removes the flow.
+    deleted: bool,
+}
+
+/// The unforced-delete table. The rows differ along the trigger that decides whether a
+/// flow is armed at all, the state the flow has been driven into, and whether the caller
+/// opted in to destroying a flow that is in use — the three things the rule turns on.
+fn delete_cases() -> Vec<DeleteCase> {
+    vec![
+        DeleteCase {
+            case: "a schedule nobody armed",
+            trigger: scheduled_trigger("rate(6hours)"),
+            prime: &[],
+            force_delete: None,
+            status: "Draft",
+            deleted: true,
+        },
+        DeleteCase {
+            case: "an armed schedule",
+            trigger: scheduled_trigger("rate(6hours)"),
+            prime: &["/start-flow"],
+            force_delete: None,
+            status: "Active",
+            deleted: false,
+        },
+        DeleteCase {
+            case: "an armed schedule, with the delete forced",
+            trigger: scheduled_trigger("rate(6hours)"),
+            prime: &["/start-flow"],
+            force_delete: Some(true),
+            status: "Active",
+            deleted: true,
+        },
+        DeleteCase {
+            case: "a schedule that was disarmed again",
+            trigger: scheduled_trigger("rate(6hours)"),
+            prime: &["/start-flow", "/stop-flow"],
+            force_delete: Some(false),
+            status: "Suspended",
+            deleted: true,
+        },
+        DeleteCase {
+            case: "a flow that runs only on demand",
+            trigger: on_demand_trigger(),
+            prime: &[],
+            force_delete: Some(false),
+            status: "Active",
+            deleted: false,
+        },
+        DeleteCase {
+            case: "a flow that runs only on demand, with the delete forced",
+            trigger: on_demand_trigger(),
+            prime: &[],
+            force_delete: Some(true),
+            status: "Active",
+            deleted: true,
+        },
+        DeleteCase {
+            case: "an event trigger nobody armed",
+            trigger: event_trigger(),
+            prime: &[],
+            force_delete: None,
+            status: "Draft",
+            deleted: true,
+        },
+        DeleteCase {
+            case: "an armed event trigger",
+            trigger: event_trigger(),
+            prime: &["/start-flow"],
+            force_delete: None,
+            status: "Active",
+            deleted: false,
+        },
+    ]
+}
+
+/// A delete of a flow that is ACTIVE is served only when the caller asked for it to be
+/// forced; without that opt-in it is refused as a state conflict and the flow is left
+/// exactly as it was, while a flow that is not active is deleted either way.
+#[tokio::test]
+async fn a_delete_of_an_active_flow_needs_the_force_opt_in() {
+    let flow_name = "delete-guard-flow";
+    for row in delete_cases() {
+        let case = row.case;
+        let router = appflow();
+        let created = call(&router, "/create-flow", &flow_with_trigger(flow_name, &row.trigger)).await;
+        assert!(
+            created.is_ok(),
+            "case {case:?}: expected CreateFlow to succeed, got {} {:?}",
+            created.status,
+            created.body
+        );
+        for path in row.prime {
+            let primed = call(&router, path, &json!({ "flowName": flow_name })).await;
+            assert!(
+                primed.is_ok(),
+                "case {case:?}: expected {path} to succeed while reaching the state under test, \
+                 got {} {:?}",
+                primed.status,
+                primed.body
+            );
+        }
+        let before = call(&router, "/describe-flow", &json!({ "flowName": flow_name })).await;
+        assert_eq!(
+            before.string("flowStatus"),
+            row.status,
+            "case {case:?}: expected the flow to be {} before the delete, got {:?}",
+            row.status,
+            before.body
+        );
+
+        let mut request = json!({ "flowName": flow_name });
+        if let Some(force_delete) = row.force_delete {
+            request["forceDelete"] = Value::Bool(force_delete);
+        }
+        let answer = call(&router, "/delete-flow", &request).await;
+
+        if row.deleted {
+            assert_eq!(
+                answer.status, 200,
+                "case {case:?}: expected the delete to be served, got {} {:?}",
+                answer.status, answer.body
+            );
+            // The removal is what the delete did: every later read of the flow reports
+            // the one absence, and the account lists no flow at all.
+            let described = call(&router, "/describe-flow", &json!({ "flowName": flow_name })).await;
+            assert_eq!(
+                (described.status, described.string("message")),
+                (404, format!("There is no flow with the name {flow_name}").as_str()),
+                "case {case:?}: expected the deleted flow to be gone, got {} {:?}",
+                described.status,
+                described.body
+            );
+            let listed = call(&router, "/list-flows", &json!({})).await;
+            assert_eq!(
+                listed.get("flows").as_array().map(Vec::len),
+                Some(0),
+                "case {case:?}: expected the account to hold no flow, got {:?}",
+                listed.get("flows")
+            );
+        } else {
+            assert_eq!(
+                (answer.status, answer.error.as_str()),
+                (409, "ConflictException"),
+                "case {case:?}: expected the unforced delete to be refused, got {} {:?}",
+                answer.status,
+                answer.body
+            );
+            assert_eq!(
+                answer.string("message"),
+                format!(
+                    "Conflict executing request: Flow is in active state, please set forceDelete \
+                     to true or deactivate the flow: {flow_name}"
+                ),
+                "case {case:?}: expected AppFlow's conflict sentence, got {:?}",
+                answer.body
+            );
+            // The refused delete changed nothing: the flow is still readable, in the
+            // status it was in, and the same call forced now succeeds.
+            let after = call(&router, "/describe-flow", &json!({ "flowName": flow_name })).await;
+            assert_eq!(
+                after.string("flowStatus"),
+                row.status,
+                "case {case:?}: expected the refused delete to leave the flow at {}, got {:?}",
+                row.status,
+                after.body
+            );
+            let forced = call(
+                &router,
+                "/delete-flow",
+                &json!({ "flowName": flow_name, "forceDelete": true }),
+            )
+            .await;
+            assert!(
+                forced.is_ok(),
+                "case {case:?}: expected the forced delete to be served, got {} {:?}",
+                forced.status,
+                forced.body
+            );
+        }
+    }
+}
+
+/// One row of the deactivation table: the state the flow is in when `StopFlow` is called,
+/// and whether there is an armed trigger left for it to disarm.
+struct StopCase {
+    case: &'static str,
+    trigger: Value,
+    /// The calls that put the flow in the state under test, in order.
+    prime: &'static [&'static str],
+    /// The status the flow reports just before the deactivation.
+    status: &'static str,
+    /// Whether the deactivation is served.
+    deactivated: bool,
+}
+
+/// The deactivation table. The rows differ along the trigger type (a flow that runs
+/// itself, on a schedule or on an event, against one that runs only on demand) and along
+/// whether that trigger is armed when the call arrives.
+fn stop_cases() -> Vec<StopCase> {
+    vec![
+        StopCase {
+            case: "an armed schedule",
+            trigger: scheduled_trigger("rate(15minutes)"),
+            prime: &["/start-flow"],
+            status: "Active",
+            deactivated: true,
+        },
+        StopCase {
+            case: "an armed event trigger",
+            trigger: event_trigger(),
+            prime: &["/start-flow"],
+            status: "Active",
+            deactivated: true,
+        },
+        StopCase {
+            case: "an armed schedule that was disarmed and armed again",
+            trigger: scheduled_trigger("rate(15minutes)"),
+            prime: &["/start-flow", "/stop-flow", "/start-flow"],
+            status: "Active",
+            deactivated: true,
+        },
+        StopCase {
+            case: "a schedule nobody armed",
+            trigger: scheduled_trigger("rate(15minutes)"),
+            prime: &[],
+            status: "Draft",
+            deactivated: false,
+        },
+        StopCase {
+            case: "a schedule already disarmed",
+            trigger: scheduled_trigger("rate(15minutes)"),
+            prime: &["/start-flow", "/stop-flow"],
+            status: "Suspended",
+            deactivated: false,
+        },
+        StopCase {
+            case: "an event trigger nobody armed",
+            trigger: event_trigger(),
+            prime: &[],
+            status: "Draft",
+            deactivated: false,
+        },
+        StopCase {
+            case: "a flow that runs only on demand",
+            trigger: on_demand_trigger(),
+            prime: &[],
+            status: "Active",
+            deactivated: false,
+        },
+    ]
+}
+
+/// Deactivating a flow disarms the trigger that runs it: a flow with an armed trigger is
+/// left `Suspended` and says so, and a flow with no armed trigger to disarm is refused as
+/// a state conflict with its status untouched.
+#[tokio::test]
+async fn deactivating_a_flow_disarms_an_armed_trigger_or_conflicts() {
+    let flow_name = "deactivation-flow";
+    for row in stop_cases() {
+        let case = row.case;
+        let router = appflow();
+        let created = call(&router, "/create-flow", &flow_with_trigger(flow_name, &row.trigger)).await;
+        assert!(
+            created.is_ok(),
+            "case {case:?}: expected CreateFlow to succeed, got {} {:?}",
+            created.status,
+            created.body
+        );
+        let flow_arn = created.string("flowArn").to_string();
+        for path in row.prime {
+            let primed = call(&router, path, &json!({ "flowName": flow_name })).await;
+            assert!(
+                primed.is_ok(),
+                "case {case:?}: expected {path} to succeed while reaching the state under test, \
+                 got {} {:?}",
+                primed.status,
+                primed.body
+            );
+        }
+        let before = call(&router, "/describe-flow", &json!({ "flowName": flow_name })).await;
+        assert_eq!(
+            before.string("flowStatus"),
+            row.status,
+            "case {case:?}: expected the flow to be {} before the deactivation, got {:?}",
+            row.status,
+            before.body
+        );
+
+        let answer = call(&router, "/stop-flow", &json!({ "flowName": flow_name })).await;
+        let expected_after = if row.deactivated {
+            assert_eq!(
+                answer.status, 200,
+                "case {case:?}: expected the deactivation to be served, got {} {:?}",
+                answer.status, answer.body
+            );
+            assert_eq!(
+                (answer.string("flowStatus"), answer.string("flowArn")),
+                ("Suspended", flow_arn.as_str()),
+                "case {case:?}: expected the deactivated flow and its ARN, got {:?}",
+                answer.body
+            );
+            "Suspended"
+        } else {
+            assert_eq!(
+                (answer.status, answer.error.as_str()),
+                (409, "ConflictException"),
+                "case {case:?}: expected the deactivation to be refused, got {} {:?}",
+                answer.status,
+                answer.body
+            );
+            assert_eq!(
+                answer.string("message"),
+                format!("Conflict executing request: Flow is already deactivated: {flow_name}"),
+                "case {case:?}: expected AppFlow's conflict sentence, got {:?}",
+                answer.body
+            );
+            row.status
+        };
+
+        // Read back through DescribeFlow: the status StopFlow reported, or — for a refused
+        // call — the one the flow was already in.
+        let after = call(&router, "/describe-flow", &json!({ "flowName": flow_name })).await;
+        assert_eq!(
+            after.string("flowStatus"),
+            expected_after,
+            "case {case:?}: expected DescribeFlow to report {expected_after}, got {:?}",
+            after.body
+        );
+    }
+}
+
 /// Two definitions carrying the same map entries are the SAME definition, whatever order
 /// those entries sit in: the descriptor the idempotency check compares is canonical.
 ///
