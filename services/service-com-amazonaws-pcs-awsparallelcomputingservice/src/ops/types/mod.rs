@@ -28,6 +28,7 @@ pub mod list_compute_node_groups_types;
 pub mod list_queues_types;
 pub mod list_tags_for_resource_types;
 pub mod register_compute_node_group_instance_types;
+pub mod resource_not_found_wire;
 pub mod shared_types;
 pub mod tag_resource_types;
 pub mod untag_resource_types;
@@ -63,6 +64,8 @@ pub use list_queues_types::*;
 pub use list_tags_for_resource_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use register_compute_node_group_instance_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use resource_not_found_wire::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use shared_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

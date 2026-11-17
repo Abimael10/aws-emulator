@@ -21,7 +21,14 @@
 //!    operations that resolve them, and the two identifier forms the `*Identifier` patterns
 //!    allow. A call naming no CLUSTER is refused about the caller instead, which is
 //!    `crate::cluster_scoped_refusals`.
-//! 3. `RegisterComputeNodeGroupInstance` is how a compute node Amazon EC2 instance PCS
+//! 3. a resource a request addressed by ARN and the service cannot find is
+//!    `ResourceNotFoundException` carrying the service's fixed sentence for the
+//!    ARN-addressed path and the ARN the request supplied, in a `resourceArn` member. The
+//!    rows span the three ARN-addressed operations and the ARN forms the member's
+//!    `@pattern` admits — partition, region, account, and the resource part naming each
+//!    kind of resource. An identifier-addressed refusal carries no such member: the two
+//!    paths are not collapsed into one.
+//! 4. `RegisterComputeNodeGroupInstance` is how a compute node Amazon EC2 instance PCS
 //!    launched collects its Slurm bootstrap material — "this API action isn't intended for
 //!    you to use" (its own documentation) — so a caller that cannot be attributed to such
 //!    an instance is denied `AccessDeniedException` and handed none of that material.
@@ -50,6 +57,15 @@ use super::cluster_lifecycle::{call, emulator, wait_past_the_owed_transition};
 /// re-validates against.
 const RESOURCE_NAME_CONSTRAINT: &str =
     "Member must satisfy regular expression pattern: (?!pcs_)^[A-Za-z][A-Za-z0-9-]+";
+
+/// The region the harness's credentials sign for (`super::cluster_lifecycle`), which the
+/// ARN rows below carry unless a row varies it.
+const REGION: &str = "us-east-1";
+
+/// The sentence PCS states for an ARN that names no resource it holds — the ARN-addressed
+/// lookup the tagging operations take, as against the identifier-addressed lookups, whose
+/// sentence names the kind of resource.
+const ARN_ADDRESSED_NOT_FOUND: &str = "Resource cannot be found.";
 
 /// The awsJson1_0 error code, without the namespace the envelope may prefix.
 fn error_code(payload: &Value) -> String {
@@ -378,6 +394,125 @@ async fn a_not_found_names_the_identifier_it_could_not_resolve_and_its_kind() {
              {refused}"
         );
     }
+}
+
+#[tokio::test]
+async fn an_arn_addressed_not_found_reports_the_arn_the_request_carried() {
+    let router = emulator();
+
+    // Each row is an ARN that names no resource this emulator holds, well formed for the
+    // member: `resourceArn` targets `Arn`, `@length(1..1011)` plus
+    // `@pattern(^arn:aws.*:pcs:.*:[0-9]{12}:.*/[a-z0-9_\-]+$)`
+    // (`smithy_query(query="operation", operation="TagResource")`). The rows differ in the
+    // parts that expression leaves free — the partition, the region, the account, and the
+    // resource part naming each kind of resource PCS holds and one it does not.
+    let account = engine::EMULATOR_ACCOUNT_ID;
+    let absent: Vec<(&str, String)> = vec![
+        (
+            "a cluster, by its generated id",
+            format!("arn:aws:pcs:{REGION}:{account}:cluster/pcs_0123456789abcdef"),
+        ),
+        (
+            "a queue nested under a cluster",
+            format!(
+                "arn:aws:pcs:{REGION}:{account}:cluster/pcs_0123456789abcdef/queue/pcs_1111111111111111"
+            ),
+        ),
+        (
+            "a compute node group nested under a cluster",
+            format!(
+                "arn:aws:pcs:{REGION}:{account}:cluster/pcs_0123456789abcdef/computenodegroup/pcs_2222222222222222"
+            ),
+        ),
+        (
+            "another partition and another region",
+            format!("arn:aws-cn:pcs:cn-north-1:{account}:cluster/pcs_3333333333333333"),
+        ),
+        (
+            "another account",
+            format!("arn:aws:pcs:{REGION}:000000000000:cluster/pcs_4444444444444444"),
+        ),
+        (
+            "a resource part naming a kind PCS does not define",
+            format!("arn:aws:pcs:{REGION}:{account}:widget/pcs_5555555555555555"),
+        ),
+        (
+            "a resource name rather than a generated id",
+            format!("arn:aws:pcs:{REGION}:{account}:cluster/never-created"),
+        ),
+    ];
+
+    for (case, arn) in &absent {
+        for (operation, request) in [
+            (
+                "TagResource",
+                json!({"resourceArn": arn, "tags": {"env": "prod"}}),
+            ),
+            ("ListTagsForResource", json!({"resourceArn": arn})),
+            (
+                "UntagResource",
+                json!({"resourceArn": arn, "tagKeys": ["env"]}),
+            ),
+        ] {
+            let (status, refused) = call(&router, operation, &request).await;
+            assert_eq!(
+                (status, error_code(&refused).as_str()),
+                (CLIENT_ERROR_STATUS, "ResourceNotFoundException"),
+                "case {operation} on {case:?}: expected the client-error status with \
+                 ResourceNotFoundException, got {status} with {refused}"
+            );
+            // The sentence of the ARN-addressed path is fixed: it names neither the kind of
+            // resource nor the ARN, whatever the ARN was.
+            assert_eq!(
+                refused["message"].as_str(),
+                Some(ARN_ADDRESSED_NOT_FOUND),
+                "case {operation} on {case:?}: expected {ARN_ADDRESSED_NOT_FOUND:?}, got \
+                 {refused}"
+            );
+            // The ARN is the one value of the request such a refusal reports, echoed
+            // exactly as supplied.
+            assert_eq!(
+                refused["resourceArn"].as_str(),
+                Some(arn.as_str()),
+                "case {operation} on {case:?}: expected the request's own ARN, got {refused}"
+            );
+            // The ARN-addressed path names neither the resource nor its kind: the two
+            // modelled members are `@required`, so they travel empty rather than absent.
+            assert_eq!(
+                (
+                    refused["resourceId"].as_str(),
+                    refused["resourceType"].as_str()
+                ),
+                (Some(""), Some("")),
+                "case {operation} on {case:?}: expected neither modelled member to be \
+                 populated, got {refused}"
+            );
+        }
+    }
+
+    // The identifier-addressed path is untouched: it names the kind of resource, reports
+    // the identifier in the modelled members, and carries no ARN — the caller supplied
+    // none.
+    let (status, refused) = call(
+        &router,
+        "GetCluster",
+        &json!({"clusterIdentifier": "no-such-cluster"}),
+    )
+    .await;
+    assert_eq!(
+        (status, error_code(&refused).as_str()),
+        (CLIENT_ERROR_STATUS, "ResourceNotFoundException"),
+        "case an identifier-addressed lookup: got {status} with {refused}"
+    );
+    assert_eq!(
+        refused["message"].as_str(),
+        Some("AWS PCS couldn't find the cluster you specified."),
+        "case an identifier-addressed lookup: got {refused}"
+    );
+    assert!(
+        refused.get("resourceArn").is_none(),
+        "case an identifier-addressed lookup: expected no ARN member, got {refused}"
+    );
 }
 
 #[tokio::test]

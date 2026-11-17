@@ -136,10 +136,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
         // An ARN naming no resource this service holds: the refusal states the service's
-        // own sentence for the ARN-keyed path and names neither the resource nor its kind.
+        // own sentence for the ARN-keyed path, naming neither the resource nor its kind,
+        // and reports the ARN the request addressed the resource by.
         let not_found = || {
             ListTagsForResourceErrorModeled::ResourceNotFoundException(
-                crate::state::arn_not_found(),
+                crate::state::arn_not_found(&input.resource_arn),
             )
         };
 

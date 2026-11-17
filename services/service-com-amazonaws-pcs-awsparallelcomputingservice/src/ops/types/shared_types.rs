@@ -11,13 +11,10 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-pcs-awsparallelcomputingservice.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.pcs#ResourceNotFoundException")]
-#[derive(Debug, Clone, Default)]
-pub struct ResourceNotFoundException {
-    pub message: String,
-    pub resource_id: String,
-    pub resource_type: String,
-}
+// `ResourceNotFoundException` is NOT declared here: the wire carries a member on it that
+// this model does not declare (the ARN an ARN-addressed refusal reports), which the derive
+// cannot express, so the shape, its schema and its serializer are written out in
+// `resource_not_found_wire`.
 
 #[smithy_macros::smithy(shape = "com.amazonaws.pcs#ServiceQuotaExceededException")]
 #[derive(Debug, Clone, Default)]

@@ -1098,6 +1098,9 @@ pub fn not_found(kind: ResourceKind, identifier: &str) -> ResourceNotFoundExcept
         message: format!("AWS PCS couldn't find the {} you specified.", kind.noun),
         resource_id: identifier.to_string(),
         resource_type: kind.identifier_label.to_string(),
+        // No ARN: this request addressed its subject by identifier, so there is no ARN of
+        // the caller's to report back ([`arn_not_found`]).
+        resource_arn: None,
     }
 }
 
@@ -1105,16 +1108,21 @@ pub fn not_found(kind: ResourceKind, identifier: &str) -> ResourceNotFoundExcept
 /// operations take — that names no resource this service holds.
 ///
 /// The ARN-keyed path states the service's own fixed sentence for a resource that cannot
-/// be found and names NEITHER the resource nor its kind: the ARN the caller sent carries
-/// both already, so the refusal adds nothing by repeating them, where the
-/// identifier-keyed path ([`not_found`]) reports both because an identifier carries
-/// neither. The two members are modelled `@required`, so they travel empty rather than
-/// absent.
-pub fn arn_not_found() -> ResourceNotFoundException {
+/// be found and names NEITHER the resource nor its kind in the sentence: the refusal
+/// reports instead the ARN the request addressed the resource by, exactly as it supplied
+/// it, which is the one value of the request such a refusal carries — a caller tagging
+/// many resources in a loop reads it to attribute the failure to the call that made it.
+/// The identifier-keyed path ([`not_found`]) names the kind of resource and the identifier
+/// because an identifier alone identifies neither. `resourceId` and `resourceType` are
+/// modelled `@required`, so they travel empty rather than absent, and `resourceArn` is the
+/// member the model does not declare
+/// ([`crate::ops::types::resource_not_found_wire`]).
+pub fn arn_not_found(resource_arn: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: "Resource cannot be found.".to_string(),
         resource_id: String::new(),
         resource_type: String::new(),
+        resource_arn: Some(resource_arn.to_string()),
     }
 }
 
