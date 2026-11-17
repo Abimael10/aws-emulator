@@ -177,7 +177,10 @@ fn filter(name: &str, values: &[&str]) -> Params {
 async fn a_described_template_is_the_template_the_store_holds() {
     let (router, engine) = crate::ec2_query::emulator();
     let created = create_every_template(&router).await;
-    let expected_created_by = ::engine::emulator_arn("iam", "", "root");
+    // "The principal that created the launch template" (`LaunchTemplate$CreatedBy`): the IAM
+    // identity this emulator's credential speaks for, read from the ONE definition of it the
+    // account contract holds — the same principal STS reports as the caller.
+    let expected_created_by = ::service_common::caller_principal::ambient_user_arn();
 
     for (seed, (name, launch_template_id)) in seeds().iter().zip(created.iter()) {
         let (status, body) = describe(&router, &[p("LaunchTemplateId.1", launch_template_id.as_str())]).await;

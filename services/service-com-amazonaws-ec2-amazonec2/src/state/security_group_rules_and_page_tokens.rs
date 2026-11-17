@@ -110,6 +110,16 @@ pub enum PageTokenRule {
     /// therefore follow the token rather than stop at a short page — which is the whole
     /// reason this is modelled instead of assumed away.
     WhenThePageHeldItems,
+    /// A token whenever the caller's `MaxResults` FILLED the page, without looking ahead: a
+    /// full page means "there may be more", so the token is due on it even when nothing
+    /// follows, and a page the limit did not fill is the end of the walk and carries none.
+    ///
+    /// Recorded behaviour, not something the model states: a paged `DescribeFlowLogs` read
+    /// answers a `NextToken` on a page its `MaxResults` filled, and the page that token
+    /// leads to carries the flow logs that remain — none, and no token, when the full page
+    /// was the last one. So a caller must follow the token rather than stop once it has as
+    /// many items as it asked for.
+    WhenThePageFilled,
 }
 
 /// One page of `ordered`, and the `NextToken` that page carries.
@@ -205,6 +215,7 @@ pub(super) fn page_and_position<'a, T>(
     let due = match rule {
         PageTokenRule::WhenAnotherItemFollows => rest.len() > page.len(),
         PageTokenRule::WhenThePageHeldItems => !page.is_empty(),
+        PageTokenRule::WhenThePageFilled => page.len() == limit,
     };
     // `page.last()` is `None` only for an empty page, which no rule above mints a token
     // for: there is no item for the cursor to name.
@@ -1373,8 +1384,8 @@ impl ComAmazonawsEc2Amazonec2State {
     ///
     /// Everything the service itself owns is derived here rather than taken from the
     /// caller — the id, the MAC address built from it, the owning account, the private DNS
-    /// name of each address and the `available` status of an unattached interface — so two
-    /// writers cannot report the same interface differently.
+    /// name of its primary address and the `available` status of an unattached interface — so
+    /// two writers cannot report the same interface differently.
     ///
     /// The addresses the interface takes leave the subnet: "`AvailableIpAddressCount` - The
     /// number of IPv4 addresses in the subnet that are available"
@@ -1410,7 +1421,15 @@ impl ComAmazonawsEc2Amazonec2State {
                 // No Elastic IP address is associated until something associates one.
                 association: None,
                 primary: Some(index == 0),
-                private_dns_name: Some(private_dns_name(address, &spec.region)),
+                // A resolved private DNS name belongs to the interface's PRIMARY address
+                // ([`private_dns_name`]): a secondary address reports the member with no
+                // name in it, so a caller that tells the primary address from a secondary
+                // one by the presence of a name reads the addresses the interface has.
+                private_dns_name: Some(if index == 0 {
+                    private_dns_name(address, &spec.region)
+                } else {
+                    String::new()
+                }),
                 private_ip_address: Some(address.clone()),
             })
             .collect();

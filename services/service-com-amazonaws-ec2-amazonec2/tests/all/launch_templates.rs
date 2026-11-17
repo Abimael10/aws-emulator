@@ -193,7 +193,10 @@ fn rows() -> Vec<Row> {
 #[tokio::test]
 async fn a_created_launch_template_is_stored_reported_and_then_deleted() {
     let (router, engine) = super::ec2_query::emulator();
-    let created_by = engine::emulator_arn("iam", "", "root");
+    // "The principal that created the launch template" (`LaunchTemplate$CreatedBy`): the IAM
+    // identity this emulator's credential speaks for, read from the ONE definition of it the
+    // account contract holds — the same principal STS reports as the caller.
+    let created_by = ::service_common::caller_principal::ambient_user_arn();
 
     for row in rows() {
         let case = row.case;
@@ -985,7 +988,7 @@ mod describe_launch_template_versions {
                     version_number: *number,
                     version_description: Some(format!("version {number}")),
                     create_time: SystemTime::now() - Duration::from_secs(*age_seconds),
-                    created_by: ::engine::emulator_arn("iam", "", "root"),
+                    created_by: ::service_common::caller_principal::ambient_user_arn(),
                     default_version: *number == default,
                     data: data.clone(),
                 },
@@ -1027,7 +1030,8 @@ mod describe_launch_template_versions {
     #[tokio::test]
     async fn a_created_template_round_trips_through_describe_launch_template_versions() {
         let (router, engine) = crate::ec2_query::emulator();
-        let created_by = ::engine::emulator_arn("iam", "", "root");
+        // The IAM identity this emulator's credential speaks for, as above.
+        let created_by = ::service_common::caller_principal::ambient_user_arn();
 
         // Rows differ along the launch parameters the one version holds: how many there are,
         // which members they are, and whether they are scalars, nested members or lists.

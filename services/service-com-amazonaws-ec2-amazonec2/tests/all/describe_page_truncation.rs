@@ -11,9 +11,13 @@
 //! answer the token the same way for every describe, which is why the operation is a
 //! column of the table rather than an assumption:
 //!
-//! * `DescribeSubnets`, `DescribeVolumes` and `DescribeFlowLogs` answer a token while a
+//! * `DescribeSubnets` and `DescribeVolumes` answer a token while a
 //!   further item follows the page, so the last page of a walk carries none
 //!   ([`ec2::state::PageTokenRule::WhenAnotherItemFollows`]);
+//! * `DescribeFlowLogs` answers a token on every page `MaxResults` FILLED, whether or not
+//!   an item follows it, so a walk whose last page of items was full ends on the empty page
+//!   that page's token leads to ([`ec2::state::PageTokenRule::WhenThePageFilled`]) — the
+//!   behaviour a paged read of that operation was recorded answering;
 //! * `DescribeSecurityGroups` answers a token on every page that held groups, whether or
 //!   not `MaxResults` filled it, and the walk ends on the trailing EMPTY page that token
 //!   leads to ([`ec2::state::PageTokenRule::WhenThePageHeldItems`]) — the behaviour a
@@ -56,11 +60,20 @@ const PAGING_ROWS: [(&str, usize, usize); 6] = [
 ///
 /// Under [`ec2::state::PageTokenRule::WhenThePageHeldItems`] the walk takes one page MORE
 /// than it has pages of items, because the last page that held items carries a token and
-/// the page that token leads to is empty.
+/// the page that token leads to is empty. Under
+/// [`ec2::state::PageTokenRule::WhenThePageFilled`] it takes that extra page only when the
+/// last page of items was FULL, which is when the page size divides the count.
 fn expected_pages(rule: ec2::state::PageTokenRule, count: usize, page_size: usize) -> usize {
     let full = count.div_ceil(page_size);
     match rule {
         ec2::state::PageTokenRule::WhenAnotherItemFollows => full.max(1),
+        ec2::state::PageTokenRule::WhenThePageFilled => {
+            if count > 0 && count.is_multiple_of(page_size) {
+                full + 1
+            } else {
+                full.max(1)
+            }
+        }
         ec2::state::PageTokenRule::WhenThePageHeldItems => full + 1,
     }
 }
@@ -166,6 +179,8 @@ async fn walk(router: &MultiServiceRouter, walked: &Walk<'_>) -> (Vec<String>, u
             // A further item follows this page exactly while the walk has not reported
             // every item of the scope yet.
             ec2::state::PageTokenRule::WhenAnotherItemFollows => reported.len() < count,
+            // The page the caller's `MaxResults` filled, whether or not an item follows it.
+            ec2::state::PageTokenRule::WhenThePageFilled => held == page_size,
             ec2::state::PageTokenRule::WhenThePageHeldItems => held > 0,
         };
         assert_eq!(
@@ -382,11 +397,11 @@ async fn describe_volumes_ends_a_walk_when_no_volume_follows_the_page() {
 }
 
 #[tokio::test]
-async fn describe_flow_logs_ends_a_walk_when_no_flow_log_follows_the_page() {
+async fn describe_flow_logs_ends_a_walk_on_the_page_max_results_did_not_fill() {
     assert_table(
         "DescribeFlowLogs",
         "flowLogId",
-        ec2::state::PageTokenRule::WhenAnotherItemFollows,
+        ec2::state::PageTokenRule::WhenThePageFilled,
         seed_flow_logs,
     )
     .await;

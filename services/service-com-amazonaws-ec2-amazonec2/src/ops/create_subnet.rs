@@ -375,6 +375,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "the subnet just created could not be read back",
             ));
         };
+        // The DHCP option set in force for it, handed to the response renderer for the same
+        // reason `DescribeSubnets` hands it over: the elements that report it are ones this
+        // checkout's model declares no member for
+        // ([`crate::service::recorded_response_members`]), so the value is resolved here,
+        // where the store is, and written there.
+        crate::service::recorded_response_members::hold_subnet_dhcp_options(
+            store
+                .dhcp_options_in_force_for_subnet(&subnet_id)
+                .map(|dhcp_options_id| (subnet_id.clone(), dhcp_options_id)),
+        );
         Ok(CreateSubnetOutput {
             subnet: Some(subnet),
         })

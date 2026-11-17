@@ -4574,6 +4574,15 @@ impl ComAmazonawsEc2Amazonec2State {
     pub fn insert_flow_log(&mut self, spec: FlowLogSpec) -> String {
         let payload_bytes = flow_log_payload_bytes(&spec);
         let flow_log_id = self.next_id(FLOW_LOG_ID_PREFIX);
+        // The destination options this flow log is delivered under, every member at the
+        // value in force for it.
+        let (file_format, hive_compatible_partitions, per_hour_partition) =
+            flow_log_destination_options_in_force(spec.destination_options.as_ref());
+        let destination_options = DestinationOptionsResponse {
+            file_format: Some(file_format),
+            hive_compatible_partitions: Some(hive_compatible_partitions),
+            per_hour_partition: Some(per_hour_partition),
+        };
         let view = FlowLog {
             creation_time: Some(system_time_to_date_time(spec.created_at)),
             // "The status of the logs delivery (SUCCESS | FAILED)"
@@ -4604,7 +4613,13 @@ impl ComAmazonawsEc2Amazonec2State {
             ),
             tags: Some(spec.tags),
             max_aggregation_interval: Some(spec.max_aggregation_interval),
-            destination_options: spec.destination_options,
+            // "The destination options" (`FlowLog$DestinationOptions`) — reported for EVERY
+            // flow log, at the values they are in force with: a create that named none, or
+            // left a member of them out, gets each at the default its own documentation
+            // gives it ([`flow_log_destination_options_in_force`], the same reading that
+            // decides whether two creates ask for one flow log). Derived HERE, so no writer
+            // can store a flow log whose delivery format a client cannot read.
+            destination_options: Some(destination_options),
             tag_field_specifications: spec.tag_field_specifications,
         };
         self.add_stored_bytes(payload_bytes);

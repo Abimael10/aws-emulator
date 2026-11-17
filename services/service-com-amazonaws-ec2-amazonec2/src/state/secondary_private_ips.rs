@@ -88,17 +88,20 @@ impl ComAmazonawsEc2Amazonec2State {
     ///
     /// The same bookkeeping [`Self::insert_network_interface`] does for the addresses an
     /// interface is created with, for addresses added to one that already exists: each
-    /// address gets the private DNS name the Region builds for it
-    /// ([`private_dns_name`]), leaves the one in-use pool
+    /// address leaves the one in-use pool
     /// ([`Self::private_ip_in_use`] reads it), is charged against the store's byte budget
     /// the way [`network_interface_payload_bytes`] counts it, and comes off the subnet's
     /// `AvailableIpAddressCount`. [`Self::release_secondary_private_ip`] is the exact
     /// reverse.
+    ///
+    /// A private DNS name is the PRIMARY address's ([`private_dns_name`]), so an address
+    /// recorded here — a secondary one by definition — carries the member EMPTY, exactly as
+    /// [`Self::insert_network_interface`] records the secondary addresses an interface is
+    /// created with.
     pub fn assign_secondary_private_ips(
         &mut self,
         network_interface_id: &str,
         addresses: &[String],
-        region: &str,
     ) -> bool {
         let Some(interface) = self.network_interfaces.get_mut(network_interface_id) else {
             return false;
@@ -113,7 +116,9 @@ impl ComAmazonawsEc2Amazonec2State {
                 // An address an assignment adds is a SECONDARY address: the interface keeps
                 // the primary one it already had.
                 primary: Some(false),
-                private_dns_name: Some(private_dns_name(address, region)),
+                // The interface's resolved private DNS name names its primary address; a
+                // secondary address reports the member with no name in it.
+                private_dns_name: Some(String::new()),
                 private_ip_address: Some(address.clone()),
             });
         }
@@ -192,13 +197,10 @@ impl ComAmazonawsEc2Amazonec2State {
     /// holding what it held, or an address is held by nothing for the lifetime of the store.
     /// An address only ever moves off an interface that held it as a SECONDARY address, so
     /// putting it back as one restores exactly what was taken.
-    pub fn restore_secondary_private_ips(&mut self, moved: &[(String, String)], region: &str) {
+    pub fn restore_secondary_private_ips(&mut self, moved: &[(String, String)]) {
         for (network_interface_id, address) in moved {
-            let _ = self.assign_secondary_private_ips(
-                network_interface_id,
-                ::std::slice::from_ref(address),
-                region,
-            );
+            let _ = self
+                .assign_secondary_private_ips(network_interface_id, ::std::slice::from_ref(address));
         }
     }
 }

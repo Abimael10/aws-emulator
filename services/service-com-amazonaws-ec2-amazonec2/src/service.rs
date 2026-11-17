@@ -894,6 +894,10 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for FinishedEnvelope<Eng> {
             // either ([`parameter_refusals`]): cleared before the walk that fills it, so one
             // call's refusal can never be worded from another call's input.
             parameter_refusals::forget_input_being_read();
+            // Same for the subnet option sets a projection hands the response renderer
+            // ([`recorded_response_members`]): cleared before the call that fills the slot,
+            // so one call's reported subnets can never carry another call's answer.
+            recorded_response_members::forget_any_held_subnet_options();
             let mut response = self.served(svc, req, ctx).await;
             stamp_envelope(&mut response);
             // The AUDIT leg, after the response the caller gets has been finished and

@@ -311,17 +311,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // than inheriting it from the container `crate::state` happens to hold.
         selected.sort_by(|left, right| left.flow_log_id.cmp(&right.flow_log_id));
 
-        // That order is both the stable paging order and the cursor, so a token naming the
-        // id the next page starts at always advances.
-        let from = match start_at.as_deref() {
-            None => 0,
-            Some(cursor) => selected.partition_point(|flow_log| {
-                let id = flow_log.flow_log_id.as_deref().unwrap_or_default();
-                id < cursor
-            }),
-        };
-        let page = selected.get(from..).unwrap_or_default();
-
         // "The maximum number of items to return for this request"
         // (`DescribeFlowLogsRequest$MaxResults`). A request that names none gets the largest
         // page this operation serves, so the `NextToken` path below behaves the same whether
@@ -333,21 +322,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or(DEFAULT_MAX_RESULTS)
             .min(DEFAULT_MAX_RESULTS);
 
-        // "The token to request the next page of items" — null when there is no next page
-        // (`DescribeFlowLogsResult$NextToken`): a token only when a flow log follows this
-        // page.
-        let next_token = page
-            .get(limit)
-            .and_then(|flow_log| flow_log.flow_log_id.as_deref())
-            .map(crate::state::encode_page_token);
+        // The cursor paging every describe of this crate shares, under the rule EC2 was
+        // recorded answering this operation with: a token is due whenever the page was
+        // FILLED, so a caller that asked for a page size and got it is told to ask again
+        // instead of reading a full page as the last one
+        // ([`crate::state::PageTokenRule::WhenThePageFilled`]).
+        let (page, next_token) = crate::state::page_from_cursor(
+            &selected,
+            start_at.as_deref(),
+            Some(limit),
+            crate::state::PageTokenRule::WhenThePageFilled,
+            |flow_log| flow_log.flow_log_id.as_deref().unwrap_or_default(),
+        );
 
         Ok(DescribeFlowLogsOutput {
-            flow_logs: Some(
-                page.iter()
-                    .take(limit)
-                    .map(|flow_log| (*flow_log).clone())
-                    .collect(),
-            ),
+            flow_logs: Some(page.iter().map(|flow_log| (*flow_log).clone()).collect()),
             next_token,
         })
     }

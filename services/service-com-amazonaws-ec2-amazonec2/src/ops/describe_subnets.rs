@@ -294,6 +294,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             |subnet| subnet.subnet_id.as_deref().unwrap_or_default(),
         );
 
+        // The DHCP option set in force for each subnet this page reports, handed to the
+        // response renderer: a subnet inherits the set its VPC is associated with, and the
+        // elements that report it are ones this checkout's model declares no member for
+        // ([`crate::service::recorded_response_members`]), so the value is resolved HERE,
+        // where the store is, and written there.
+        crate::service::recorded_response_members::hold_subnet_dhcp_options(
+            page.iter().filter_map(|subnet| {
+                let subnet_id = subnet.subnet_id.clone()?;
+                let dhcp_options_id = store.dhcp_options_in_force_for_subnet(&subnet_id)?;
+                Some((subnet_id, dhcp_options_id))
+            }),
+        );
+
         Ok(DescribeSubnetsOutput {
             subnets: Some(page.iter().map(|subnet| (*subnet).clone()).collect()),
             next_token,

@@ -281,9 +281,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let spec = LaunchTemplateSpec {
             name: input.launch_template_name.clone(),
-            // The emulator serves one account, whose root principal is the only one that
-            // can have created anything in it.
-            created_by: ::engine::emulator_arn("iam", "", "root"),
+            // "The principal that created the launch template" (`LaunchTemplate$CreatedBy`):
+            // the IAM principal this call speaks for, which is the one IAM user this
+            // emulator's long-term credential belongs to
+            // ([`::service_common::caller_principal::ambient_user_arn`], the same identity
+            // STS reports as the caller) — not the account root, which signs nothing here.
+            created_by: ::service_common::caller_principal::ambient_user_arn(),
             create_time: ::std::time::SystemTime::now(),
             tags,
             operator,

@@ -272,9 +272,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let versions_held = record.versions.len();
         let spec = LaunchTemplateVersionSpec {
-            // The emulator serves one account, whose root principal is the only one that can
-            // have created anything in it.
-            created_by: ::engine::emulator_arn("iam", "", "root"),
+            // "The principal that created the version" (`LaunchTemplateVersion$CreatedBy`):
+            // the IAM principal this call speaks for, the same identity the template's own
+            // `CreatedBy` carries ([`::service_common::caller_principal::ambient_user_arn`])
+            // — not the account root, which signs nothing here.
+            created_by: ::service_common::caller_principal::ambient_user_arn(),
             create_time: ::std::time::SystemTime::now(),
             version_description: input.version_description.clone(),
             data,

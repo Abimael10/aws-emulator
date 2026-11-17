@@ -11,7 +11,9 @@
 //! answers it with `<verifiedAccessInstanceTransitGatewayAttachmentSet>` — present and
 //! empty for an instance with no transit-gateway attachment — and a recorded
 //! `DescribeInstanceTypes` answers every instance type with `<cpuBurstModel>` and every
-//! `networkInfo` with `<trafficMirroringSupport>`. The generated serializer walks
+//! `networkInfo` with `<trafficMirroringSupport>`, and a recorded `DescribeSubnets` answers
+//! every subnet with the `<dhcpOptionsId>` it inherits from its VPC and the
+//! `<dhcpOptionsSource>` naming where that set came from. The generated serializer walks
 //! the model's members and only those, so those elements are missing from this emulator's
 //! responses: a client that reads `dhcpOptionsSource` to decide whether a VPC's DHCP
 //! options are its own or the account's reads nothing, and a strict deserializer that
@@ -36,33 +38,87 @@
 //! instance" (`AttachVolume`) means — and, for an instance type, the burstable performance
 //! and the network adapter the type itself reports.
 //!
-//! # What it does NOT reach
+//! # What it does NOT derive here
 //!
-//! An element whose value is NOT a function of the reported record or of the record it was
-//! reported under — a subnet's inherited DHCP option set id, which has to be resolved from
-//! the subnet's VPC — needs the store, and a protocol has none. Those are left to the
-//! projection that owns them.
+//! An element whose value is NOT a function of the reported record — a subnet's inherited
+//! DHCP option set id, which has to be resolved from the subnet's VPC — needs the store, and
+//! a protocol has none. The PROJECTION that owns the value resolves it and hands it here
+//! ([`hold_subnet_dhcp_options`]), because writing an element the model does not declare is
+//! still only possible at this seam.
 
 use ::aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use ::aws_smithy_schema::{Schema, ShapeId, ShapeType};
 use ::aws_smithy_types::{BigDecimal, BigInteger, DateTime, Document};
+use ::std::cell::RefCell;
+use ::std::collections::BTreeMap;
 
 /// The namespace every shape of this service's model lives in, so an element is only ever
 /// written onto a shape of EC2's own.
 const EC2_NAMESPACE: &str = "com.amazonaws.ec2";
 
-/// The scope a VPC's DHCP option set comes from, as `dhcpOptionsSource` names it: the VPC
-/// itself, which is where every DHCP option set this store associates is associated
+/// The scope a reported VPC's DHCP option set comes from, as `dhcpOptionsSource` names it:
+/// the VPC itself, which is where every DHCP option set this store associates is associated
 /// ([`crate::state::ComAmazonawsEc2Amazonec2State::insert_vpc`] gives the VPC the Region's
-/// default set as its OWN association). The other scope the element reports — an
-/// account-level default set, which no operation of this service creates — is why the
-/// element exists at all, and why it is written from the association the VPC holds rather
-/// than as a fact of every VPC.
+/// default set as its OWN association) — and so also the scope a SUBNET of that VPC names
+/// for the set it inherits from it. The other scope the element reports — an account-level
+/// default set, which no operation of this service creates — is why the element exists at
+/// all, and why it is written from the association that was found rather than as a fact of
+/// every VPC.
 const DHCP_OPTIONS_SOURCE_VPC: &str = "vpc";
 
 /// The Smithy member name a VPC's DHCP option set id is written under, which is what says
 /// the VPC has an association for `dhcpOptionsSource` to name the scope of.
 const DHCP_OPTIONS_ID_MEMBER: &str = "DhcpOptionsId";
+
+/// The Smithy member name a subnet's own id is written under, which is what says the
+/// structure being walked IS a reported subnet — and the key the option set in force for it
+/// was held under.
+const SUBNET_ID_MEMBER: &str = "SubnetId";
+
+thread_local! {
+    /// The DHCP option set in force for each subnet THIS response reports, keyed by
+    /// `SubnetId`.
+    ///
+    /// A subnet inherits the option set its VPC is associated with, which is a fact of the
+    /// STORE rather than of the subnet record being written, so the projection that reports
+    /// the subnet resolves it ([`hold_subnet_dhcp_options`]) and this seam — the only place
+    /// an element the model does not declare can be written — writes it.
+    ///
+    /// # The invariant this rests on
+    ///
+    /// The same one `super::management_events` holds its outcome under, from the other side:
+    /// a handler fills this slot while building its output, and the response that output is
+    /// rendered into is serialized on this thread with nothing awaited in between
+    /// (`smithy_server_runtime::run_operation_http`). The run about to serve a call clears
+    /// the slot first ([`forget_any_held_subnet_options`]), and an empty slot means the
+    /// element is simply not written — never a value carried over from another call.
+    static SUBNET_DHCP_OPTIONS: RefCell<BTreeMap<String, String>> =
+        const { RefCell::new(BTreeMap::new()) };
+}
+
+/// Hold the DHCP option set in force for each subnet the response being built reports, as
+/// `(SubnetId, DhcpOptionsId)` pairs read out of the store by the projection that reports
+/// them ([`crate::state::ComAmazonawsEc2Amazonec2State::dhcp_options_in_force_for_subnet`]).
+///
+/// Replaces whatever was held, so one call's answer never leaks into another's. A subnet
+/// left out of `entries` is reported without the elements below, there being no option set
+/// of this account's to name.
+pub fn hold_subnet_dhcp_options(entries: impl IntoIterator<Item = (String, String)>) {
+    let held: BTreeMap<String, String> = entries.into_iter().collect();
+    SUBNET_DHCP_OPTIONS.with(|slot| *slot.borrow_mut() = held);
+}
+
+/// Drop whatever subnet option sets this thread may still hold: they belong to no call the
+/// run about to start serves.
+pub fn forget_any_held_subnet_options() {
+    SUBNET_DHCP_OPTIONS.with(|slot| slot.borrow_mut().clear());
+}
+
+/// The DHCP option set held for the subnet `subnet_id`, or `None` when the projection held
+/// none for it.
+fn held_subnet_dhcp_options(subnet_id: &str) -> Option<String> {
+    SUBNET_DHCP_OPTIONS.with(|slot| slot.borrow().get(subnet_id).cloned())
+}
 
 /// The Smithy member name a Verified Access instance's own id is written under, which is
 /// what says the structure being walked IS such an instance.
@@ -159,6 +215,32 @@ static NETWORK_INFO_TRAFFIC_MIRRORING_SUPPORT: Schema = Schema::new_member(
 static VPC_DHCP_OPTIONS_SOURCE: Schema = Schema::new_member(
     ShapeId::from_static(
         "com.amazonaws.ec2#Vpc$dhcpOptionsSource",
+        EC2_NAMESPACE,
+        "dhcpOptionsSource",
+    ),
+    ShapeType::String,
+    "dhcpOptionsSource",
+    0,
+);
+
+/// `<dhcpOptionsId>` on a reported SUBNET — a member schema for the same reason as
+/// [`VPC_DHCP_OPTIONS_SOURCE`]: `com.amazonaws.ec2#Subnet` declares neither this member nor
+/// the source below, where the VPC's own shape declares the id.
+static SUBNET_DHCP_OPTIONS_ID: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.ec2#Subnet$dhcpOptionsId",
+        EC2_NAMESPACE,
+        "dhcpOptionsId",
+    ),
+    ShapeType::String,
+    "dhcpOptionsId",
+    0,
+);
+
+/// `<dhcpOptionsSource>` on a reported SUBNET, naming where the set above came from.
+static SUBNET_DHCP_OPTIONS_SOURCE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.ec2#Subnet$dhcpOptionsSource",
         EC2_NAMESPACE,
         "dhcpOptionsSource",
     ),
@@ -311,6 +393,9 @@ struct WrittenMembers {
     /// Whether the structure wrote a DHCP option set id of its own — the set associated
     /// WITH IT, which is the scope `dhcpOptionsSource` reports.
     dhcp_options_id: bool,
+    /// The subnet id the structure wrote for itself, which is what says it IS a reported
+    /// subnet and which subnet's inherited option set is written on it.
+    subnet_id: Option<String>,
     /// Whether the structure wrote a Verified Access instance id of its own, which is the
     /// id the attachment set below belongs to.
     verified_access_instance_id: bool,
@@ -359,6 +444,7 @@ fn recorded_writer_for(schema: &Schema) -> Option<RecordedWriter> {
     }
     match schema.shape_id().shape_name() {
         "Vpc" => Some(write_vpc_recorded_members),
+        "Subnet" => Some(write_subnet_recorded_members),
         "VerifiedAccessInstance" => Some(write_verified_access_instance_recorded_members),
         "VolumeAttachment" => Some(write_volume_attachment_recorded_members),
         "InstanceTypeInfo" => Some(write_instance_type_recorded_members),
@@ -532,6 +618,29 @@ fn write_vpc_recorded_members(
         return Ok(());
     }
     s.write_string(&VPC_DHCP_OPTIONS_SOURCE, DHCP_OPTIONS_SOURCE_VPC)
+}
+
+/// A reported SUBNET's recorded elements: the DHCP option set in force for it and the scope
+/// that set came from.
+///
+/// A subnet holds no option set of its own — the one in force for it is the one its VPC is
+/// associated with — so the value is the one the projection reporting this subnet read out of
+/// the store for it ([`hold_subnet_dhcp_options`]). Written only for a structure that wrote a
+/// subnet id of its own, and only when an option set was held for that id: a subnet whose VPC
+/// is associated with none has no set to report and no scope to name.
+fn write_subnet_recorded_members(
+    s: &mut dyn ShapeSerializer,
+    written: &WrittenMembers,
+    _zone: &EnclosingRecord,
+) -> Result<(), SerdeError> {
+    let Some(subnet_id) = written.subnet_id.as_deref() else {
+        return Ok(());
+    };
+    let Some(dhcp_options_id) = held_subnet_dhcp_options(subnet_id) else {
+        return Ok(());
+    };
+    s.write_string(&SUBNET_DHCP_OPTIONS_ID, &dhcp_options_id)?;
+    s.write_string(&SUBNET_DHCP_OPTIONS_SOURCE, DHCP_OPTIONS_SOURCE_VPC)
 }
 
 /// A reported Verified Access instance's recorded elements: the transit-gateway attachments
@@ -728,6 +837,7 @@ impl ShapeSerializer for RecordedMemberSerializer<'_> {
             if schema.shape_id().namespace() == EC2_NAMESPACE {
                 match schema.shape_id().shape_name() {
                     DHCP_OPTIONS_ID_MEMBER => written.dhcp_options_id = true,
+                    SUBNET_ID_MEMBER => written.subnet_id = Some(value.to_string()),
                     VERIFIED_ACCESS_INSTANCE_ID_MEMBER => {
                         written.verified_access_instance_id = true;
                     }

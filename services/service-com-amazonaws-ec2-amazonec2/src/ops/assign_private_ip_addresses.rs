@@ -267,9 +267,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let state_handle = state::require_service_state(&*self.engine)?;
-        // The Region the request was signed for, which is what the private DNS name of each
-        // assigned address is built from — the same reading `CreateNetworkInterface` takes.
-        let region = state::request_region(ctx.parts());
+        // `ctx` carries request metadata only, and nothing about a secondary private address
+        // is a fact of the Region the request was signed for: a resolved private DNS name
+        // belongs to the interface's PRIMARY address, which this operation never assigns.
+        let _ = ctx;
         let mut store = state_handle.lock();
         // The clock-owed transitions every path that reads an interface and its subnet
         // applies, whether or not anybody called.
@@ -426,15 +427,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 moved.push((holder.clone(), address.clone()));
                 continue;
             }
-            store.restore_secondary_private_ips(&moved, &region);
+            store.restore_secondary_private_ips(&moved);
             store.release_private_ips(&minted);
             return Err(state::internal_error(
                 "a network interface checked a moment ago no longer holds the address \
                  the request reassigns",
             ));
         }
-        if !store.assign_secondary_private_ips(network_interface_id, &to_record, &region) {
-            store.restore_secondary_private_ips(&moved, &region);
+        if !store.assign_secondary_private_ips(network_interface_id, &to_record) {
+            store.restore_secondary_private_ips(&moved);
             store.release_private_ips(&minted);
             return Err(state::internal_error(
                 "the network interface checked a moment ago could not be read back",

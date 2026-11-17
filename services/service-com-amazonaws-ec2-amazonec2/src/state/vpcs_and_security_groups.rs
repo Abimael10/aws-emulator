@@ -472,6 +472,19 @@ impl ComAmazonawsEc2Amazonec2State {
         Some(association)
     }
 
+    /// The DHCP option set in force for the subnet `subnet_id`, as its `dopt-` id — `None`
+    /// when this store holds no such subnet, or no VPC for it, or that VPC has no option set
+    /// associated.
+    ///
+    /// A subnet holds no option set of its own: the set in force for it is the one its VPC
+    /// is associated with (`Vpc$DhcpOptionsId`, which `AssociateDhcpOptions` moves). So it is
+    /// READ off that VPC here rather than copied onto the subnet, and a later association
+    /// changes what every subnet of the VPC reports without any record being rewritten.
+    pub fn dhcp_options_in_force_for_subnet(&self, subnet_id: &str) -> Option<String> {
+        let vpc_id = self.subnets.get(subnet_id)?.vpc_id.as_deref()?;
+        self.vpcs.get(vpc_id)?.dhcp_options_id.clone()
+    }
+
     /// Whether another IPv6 CIDR block association fits inside the ceiling this store keeps
     /// for ONE subnet ([`MAX_IPV6_ASSOCIATIONS_PER_SUBNET`]).
     ///
