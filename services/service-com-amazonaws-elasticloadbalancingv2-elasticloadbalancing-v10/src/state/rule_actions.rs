@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! What a REDIRECT action's target URI is read as, and what makes one an action this
-//! service refuses.
+//! What a REDIRECT action's target URI is read as, what a FORWARD action's weights have to
+//! leave selectable, and what makes one an action this service refuses.
 //!
 //! A redirect action names the components of the URI the client is sent to — "A URI
 //! consists of the following components: protocol://hostname:port/path?query" — and the
@@ -11,9 +11,17 @@
 //! for a component the request did not modify, and whether the action modifies anything
 //! at all.
 //!
-//! Judged wherever a redirect action is SET — a rule's actions and a listener's default
-//! actions, on the create that first stores them and on the modification that replaces
-//! them — so one reading of the clause serves every operation that takes one.
+//! A forward action is the other action with a clause of its own: it "distributes requests
+//! among multiple target groups" by the `Weight` each of them carries — "[t]he weight. The
+//! range is 0 to 999" — and those weights are RELATIVE to one another, so the share a group
+//! receives is its weight over the total. A total of zero therefore selects NO target group
+//! at all, which is a forward that can never forward, and the service refuses it rather than
+//! storing a routing action nothing can be routed by ([`check_forward_weights`]).
+//!
+//! Judged wherever an action is SET — a rule's actions and a listener's default actions, on
+//! the create that first stores them and on the modification that replaces them — so one
+//! reading of each clause serves every operation that takes one, and a refused request
+//! leaves the stored actions exactly as they were.
 
 use crate::ops::types::Action;
 
@@ -173,6 +181,52 @@ pub fn redirects_to_itself(actions: &[Action]) -> bool {
 /// not named at all, or named as a keyword that retains it.
 fn unmodified(component: Option<&str>, keywords: &[&str]) -> bool {
     component.is_none_or(|value| keywords.contains(&value))
+}
+
+/// The refusal a forward action whose target groups leave nothing to select earns.
+///
+/// Fixed text: the rule is about the WEIGHTS of the action as a whole — their total — so
+/// there is no one value of the request to name in it.
+pub const FORWARD_WEIGHTS_MESSAGE: &str =
+    "The sum of the weights of target groups must be greater than 0";
+
+/// Enforce that every forward action of `actions` can select a target group: the weights of
+/// the groups it names total above zero.
+///
+/// `TargetGroupTuple$Weight` is "[t]he weight. The range is 0 to 999" and the weights of a
+/// forward's groups are relative to one another, so a group's share of the action's requests
+/// is its weight over the total ([`crate::service::target_group_selection`]). A total of zero
+/// gives every group a share of nothing, which is a routing action no request can be routed
+/// by, so it is refused and the stored actions are left as they were.
+///
+/// The groups and weights are read through the ONE reading of a forward's two spellings
+/// (`crate::state::reported_forward_config`), including the weight a tuple that states none
+/// is carried at, so the distribution this judges is exactly the one a read reports and the
+/// data plane performs. A forward naming no target group at all has no distribution to judge
+/// and is left to the rules that are about naming one.
+pub fn check_forward_weights(actions: &[Action]) -> Result<(), String> {
+    for action in actions
+        .iter()
+        .filter(|action| action.r#type == super::FORWARD_ACTION_TYPE)
+    {
+        let Some(config) = super::reported_forward_config(action) else {
+            continue;
+        };
+        let groups = config.target_groups.unwrap_or_default();
+        if groups.is_empty() {
+            continue;
+        }
+        let total: i64 = groups
+            .iter()
+            .filter_map(|group| group.weight)
+            .filter(|weight| *weight > 0)
+            .map(i64::from)
+            .sum();
+        if total <= 0 {
+            return Err(FORWARD_WEIGHTS_MESSAGE.to_string());
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -374,5 +428,127 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// One forward action over the groups `groups` names, each at the weight it states —
+    /// `None` leaving the member out, which carries the group at the service's own weight.
+    fn forward(groups: &[(&str, Option<i32>)]) -> Vec<Action> {
+        vec![Action {
+            r#type: super::super::FORWARD_ACTION_TYPE.to_string(),
+            forward_config: Some(crate::ops::types::ForwardActionConfig {
+                target_groups: Some(
+                    groups
+                        .iter()
+                        .map(|(arn, weight)| crate::ops::types::TargetGroupTuple {
+                            target_group_arn: Some((*arn).to_string()),
+                            weight: *weight,
+                        })
+                        .collect(),
+                ),
+                target_group_stickiness_config: None,
+            }),
+            ..Action::default()
+        }]
+    }
+
+    /// A forward is accepted exactly when the weights of the groups it names total above
+    /// zero, however many groups it names and whichever spelling names them.
+    #[test]
+    fn a_forward_is_refused_when_its_weights_leave_no_group_to_select() {
+        // Each row: the case, the action, and whether it is accepted. The rows span what the
+        // rule generalises over — the number of groups (one, two, three), where the zero
+        // weights sit, an unstated weight, both published bounds of the documented range,
+        // and the single-group spelling that states no weight at all.
+        let single = vec![Action {
+            r#type: super::super::FORWARD_ACTION_TYPE.to_string(),
+            target_group_arn: Some("tg-only".to_string()),
+            ..Action::default()
+        }];
+        let rows: Vec<(&str, Vec<Action>, bool)> = vec![
+            ("the single-group spelling, which states no weight", single, true),
+            ("one group at an unstated weight", forward(&[("tg-a", None)]), true),
+            (
+                "one group at the lowest published weight",
+                forward(&[("tg-a", Some(0))]),
+                false,
+            ),
+            (
+                "one group at the highest published weight",
+                forward(&[("tg-a", Some(999))]),
+                true,
+            ),
+            (
+                "two groups, one of them at zero",
+                forward(&[("tg-a", Some(0)), ("tg-b", Some(1))]),
+                true,
+            ),
+            (
+                "the mirror: the zero weight named second",
+                forward(&[("tg-a", Some(1)), ("tg-b", Some(0))]),
+                true,
+            ),
+            (
+                "two groups, both at zero",
+                forward(&[("tg-a", Some(0)), ("tg-b", Some(0))]),
+                false,
+            ),
+            (
+                "three groups, all at zero",
+                forward(&[("tg-a", Some(0)), ("tg-b", Some(0)), ("tg-c", Some(0))]),
+                false,
+            ),
+            (
+                "three groups, the last one carrying the whole distribution",
+                forward(&[("tg-a", Some(0)), ("tg-b", Some(0)), ("tg-c", Some(999))]),
+                true,
+            ),
+            (
+                "a group whose weight is left out beside one at zero",
+                forward(&[("tg-a", None), ("tg-b", Some(0))]),
+                true,
+            ),
+            (
+                "a weight no write admits, which lends the total no share",
+                forward(&[("tg-a", Some(-5))]),
+                false,
+            ),
+            ("no action at all", Vec::new(), true),
+        ];
+        for (case, actions, accepted) in rows {
+            let answer = check_forward_weights(&actions);
+            assert_eq!(
+                answer.is_ok(),
+                accepted,
+                "case {case:?}: expected accepted={accepted}, got {answer:?}"
+            );
+            if !accepted {
+                assert_eq!(
+                    answer.as_ref().err().map(String::as_str),
+                    Some(FORWARD_WEIGHTS_MESSAGE),
+                    "case {case:?}: expected the refusal a forward with nothing to select \
+                     earns, got {answer:?}"
+                );
+            }
+        }
+    }
+
+    /// An action of another type is judged by none of this: a fixed response carries no
+    /// distribution, whatever else the action holds.
+    #[test]
+    fn an_action_that_forwards_nothing_is_not_judged_by_the_weights() {
+        let actions = vec![Action {
+            r#type: "fixed-response".to_string(),
+            fixed_response_config: Some(crate::ops::types::FixedResponseActionConfig {
+                status_code: "200".to_string(),
+                content_type: None,
+                message_body: None,
+            }),
+            ..Action::default()
+        }];
+        let answer = check_forward_weights(&actions);
+        assert!(
+            answer.is_ok(),
+            "case a fixed response: expected accepted, got {answer:?}"
+        );
     }
 }

@@ -76,7 +76,10 @@ pub use pagination::{invalid_marker_message, paginate, PageError, PageTokenKey, 
 /// (`crate::service::data_plane`).
 pub mod rule_actions;
 
-pub use rule_actions::{check_redirect_actions, redirects_to_itself, REDIRECT_LOOP_MESSAGE};
+pub use rule_actions::{
+    check_forward_weights, check_redirect_actions, redirects_to_itself, FORWARD_WEIGHTS_MESSAGE,
+    REDIRECT_LOOP_MESSAGE,
+};
 
 /// The address blocks a `source-ip` rule condition matches on: what makes one of its
 /// values a block, and the block a value names.

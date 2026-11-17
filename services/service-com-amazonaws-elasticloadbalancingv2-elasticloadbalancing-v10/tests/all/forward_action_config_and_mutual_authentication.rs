@@ -47,7 +47,11 @@ const DEFAULT_WEIGHT: i32 = 1;
 /// The two published bounds of that documented weight range, which two rows below carry so
 /// a weight the request named is reported as named rather than as the default. The model
 /// types the member as a plain integer with no range trait, so a value outside the range is
-/// stored as given rather than refused — there is no refusal here to assert.
+/// stored as given rather than refused — there is no refusal of a single weight to assert
+/// here. The lowest bound is carried BESIDE a positive weight, because the weights of a
+/// forward are relative to one another: an action whose weights total zero selects no target
+/// group at all and is refused wherever it is set, which
+/// `all/weighted_forward_and_target_group_stickiness.rs` pins.
 const LOWEST_WEIGHT: i32 = 0;
 const HIGHEST_WEIGHT: i32 = 999;
 
@@ -133,12 +137,12 @@ const FORWARD_ROWS: &[ForwardRow] = &[
         reports_duration: None,
     },
     ForwardRow {
-        case: "a forward configuring one target group at the lowest published weight",
+        case: "a forward configuring the lowest published weight beside the default one",
         shorthand: None,
-        configured: &[(2, Some(LOWEST_WEIGHT))],
+        configured: &[(2, Some(LOWEST_WEIGHT)), (1, Some(DEFAULT_WEIGHT))],
         stickiness: None,
-        reports: &[(2, LOWEST_WEIGHT)],
-        reports_shorthand: Some(2),
+        reports: &[(2, LOWEST_WEIGHT), (1, DEFAULT_WEIGHT)],
+        reports_shorthand: None,
         reports_enabled: false,
         reports_duration: None,
     },

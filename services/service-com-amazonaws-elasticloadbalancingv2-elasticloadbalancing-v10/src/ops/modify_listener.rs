@@ -329,6 +329,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
+        // And a forward's weights leave a target group to select, judged on the default
+        // actions this call LEAVES the listener with — so a modification cannot drain every
+        // group of a forward at once and leave the listener with nothing to forward to.
+        // Recorded behaviour: this service's own `ValidationError`, and the listener keeps
+        // the weights it held.
+        crate::state::check_forward_weights(&updated.default_actions)
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+
         // "You must modify at least one of the following components to avoid a redirect
         // loop: protocol, hostname, port, or path" — judged on the default actions this
         // call LEAVES the listener with, so a modification cannot turn an accepted redirect
