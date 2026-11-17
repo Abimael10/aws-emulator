@@ -4202,6 +4202,20 @@ pub fn account_property_namespace(key: &str) -> Option<&str> {
     names_one_property.then_some(namespace)
 }
 
+/// How a write carrying a key that is not qualified as `Namespace/PropertyName` is refused:
+/// the `InvalidInputException` message, whose fixed text is `Property key must be in format
+/// Namespace/PropertyName: ` followed by the submitted key.
+///
+/// The key this names is one the model's own constraints ADMIT — the published pattern does
+/// not require the separator — so the rule it broke is the one
+/// [`account_property_namespace`] reads, which this operation states in prose rather than in
+/// a constraint, and the refusal is therefore the modelled one for "an invalid … value …
+/// supplied for an input parameter" rather than the code a value outside a modelled bound is
+/// answered under.
+pub fn unqualified_account_property_key(key: &str) -> String {
+    format!("Property key must be in format Namespace/PropertyName: {key}")
+}
+
 /// One account-property NAMESPACE this service serves, with the properties it carries and
 /// the value an account holds for each before anything has been written.
 ///

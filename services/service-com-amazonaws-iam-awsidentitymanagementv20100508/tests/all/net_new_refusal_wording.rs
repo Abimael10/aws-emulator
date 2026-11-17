@@ -882,9 +882,11 @@ async fn a_policy_version_read_names_the_version_it_was_addressed_by() {
 }
 
 /// RULE 6b: an account-property KEY outside its published form is refused under the code IAM
-/// answers a value it cannot accept with, carrying the constraint envelope AWS states for a
-/// map whose KEYS failed — one clause naming the map member, the key shape's whole declared
-/// set of constraints in one bracket, and nothing of the key.
+/// answers a value outside a MODELLED constraint with, carrying the constraint envelope AWS
+/// states for a map whose KEYS failed — one clause naming the map member, the key shape's
+/// whole declared set of constraints in one bracket, and nothing of the key — while a key the
+/// modelled form ADMITS that breaks a rule stated in prose is refused under the one
+/// client-input error the operation models.
 #[tokio::test]
 async fn an_account_property_key_outside_its_published_form_is_refused() {
     let router = router();
@@ -920,9 +922,11 @@ async fn an_account_property_key_outside_its_published_form_is_refused() {
         .await;
     }
 
-    // A key under a namespace the service does not serve is a different rule, and is
-    // answered under the same code — what a client branches on is one code for a value this
-    // service cannot accept.
+    // A key under a namespace the service does not serve is a DIFFERENT rule: such a key
+    // satisfies every modelled constraint and breaks only what this operation states in
+    // prose, so it is answered under the one client-input error the operation models
+    // (`InvalidInput`) rather than under the code a value outside a modelled constraint
+    // gets.
     let params = vec![
         param("Properties.entry.1.key", "NotAServedNamespace/Enabled"),
         param("Properties.entry.1.value", "true"),
@@ -932,8 +936,25 @@ async fn an_account_property_key_outside_its_published_form_is_refused() {
         "a key under an unserved namespace",
         "PutAccountProperties",
         &params,
-        VALUE_REFUSAL_CODE,
+        "InvalidInput",
         "Unsupported namespace: NotAServedNamespace",
+    )
+    .await;
+
+    // And a key the modelled constraints admit but that names no property at all: the
+    // published pattern requires no separator, so the format rule is prose and its
+    // refusal is the modelled one too.
+    let params = vec![
+        param("Properties.entry.1.key", "NoSeparatorHere"),
+        param("Properties.entry.1.value", "true"),
+    ];
+    assert_refused(
+        &router,
+        "a key carrying no namespace separator",
+        "PutAccountProperties",
+        &params,
+        "InvalidInput",
+        "Property key must be in format Namespace/PropertyName: NoSeparatorHere",
     )
     .await;
 }

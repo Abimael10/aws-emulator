@@ -215,9 +215,11 @@ async fn a_fresh_account_reports_the_default_properties() {
 
 /// RULE: a namespace names an account-wide feature the service itself offers, so a
 /// key under a namespace the service does not serve configures nothing: the write
-/// is refused — HTTP 400 under the code IAM answers a value it cannot accept with
-/// (`ValidationError`) — naming that namespace, and nothing it carried is persisted, so
-/// a later read never reports a property the service does not serve.
+/// is refused — HTTP 400 under this operation's own modelled client-input error
+/// (`InvalidInput`), since such a key satisfies every modelled constraint and breaks
+/// only a rule the operation states in prose — naming that namespace, and nothing it
+/// carried is persisted, so a later read never reports a property the service does
+/// not serve.
 #[tokio::test]
 async fn a_write_under_a_namespace_the_service_does_not_serve_is_refused() {
     // Rows span the ways a namespace can fail to be one this service serves: a name
@@ -265,8 +267,8 @@ async fn a_write_under_a_namespace_the_service_does_not_serve_is_refused() {
             );
             assert_eq!(
                 error_code(&body),
-                "ValidationError",
-                "case {case:?}: expected ValidationError, got {:?}",
+                "InvalidInput",
+                "case {case:?}: expected InvalidInput, got {:?}",
                 error_code(&body)
             );
             assert_eq!(
@@ -372,11 +374,11 @@ async fn setting_a_property_replaces_its_value_and_leaves_the_others_alone() {
 }
 
 /// RULE: "all keys must belong to the same namespace", so a write whose keys span
-/// more than one namespace is refused as a whole — HTTP 400 under the code IAM answers
-/// a value it cannot accept with (`ValidationError`) — and persists
-/// none of its pairs. The request's shape is taken before the namespace it names is
-/// looked up, so a spanning request is refused for spanning whichever namespaces it
-/// spans.
+/// more than one namespace is refused as a whole — HTTP 400 under this operation's own
+/// modelled client-input error (`InvalidInput`), the refusal for a request the model's
+/// constraints admit and a rule stated in prose forbids — and persists none of its
+/// pairs. The request's shape is taken before the namespace it names is looked up, so
+/// a spanning request is refused for spanning whichever namespaces it spans.
 #[tokio::test]
 async fn a_write_whose_keys_span_two_namespaces_is_refused() {
     // Rows differ in how many namespaces are spanned, in the pair count, and in
@@ -411,8 +413,8 @@ async fn a_write_whose_keys_span_two_namespaces_is_refused() {
         );
         assert_eq!(
             error_code(&body),
-            "ValidationError",
-            "case {case:?}: expected ValidationError, got {:?}",
+            "InvalidInput",
+            "case {case:?}: expected InvalidInput, got {:?}",
             error_code(&body)
         );
         let reported = current_properties(&router, &case).await;
@@ -424,22 +426,112 @@ async fn a_write_whose_keys_span_two_namespaces_is_refused() {
     }
 }
 
-/// RULE: a key is `Namespace/PropertyName` — "exactly one `/` separating the
-/// namespace from the property name", neither part empty — inside the published
-/// length and alphabet of its modelled type, so a key outside that shape names no
-/// property and the write carrying it is refused, persisting nothing.
+/// RULE: a request that satisfies every constraint the model declares and breaks a
+/// rule this operation states only in prose is refused with the one client-input
+/// error the operation MODELS — `InvalidInputException`, HTTP 400, wire code
+/// `InvalidInput` — and not with the code a value outside a modelled constraint is
+/// answered under. Here that rule is the key format: a key is
+/// `Namespace/PropertyName`, "exactly one `/` separating the namespace from the
+/// property name", neither part empty, while the key type's published pattern
+/// (`^[A-Za-z][A-Za-z0-9/_-]*$`) requires no separator at all — so an unqualified key
+/// is shape-valid and is refused as an invalid VALUE, naming the key, with nothing
+/// persisted.
 #[tokio::test]
-async fn a_key_outside_the_published_key_shape_is_refused() {
-    // Rows: no separator, a trailing separator, two separators, a leading
-    // separator, a character outside the published alphabet, a non-letter first
-    // character, and one character past the published 50-character bound.
-    let malformed: &[&str] = &[
+async fn a_key_the_key_shape_admits_but_that_names_no_property_is_refused_as_invalid_input() {
+    // Rows span the ways a key inside the published length and alphabet can still
+    // name no property: no separator at all, a trailing separator, two separators,
+    // adjacent separators, the shortest key the alphabet admits, a key of the whole
+    // alphabet with no separator, and an unqualified key at the published
+    // 50-character maximum.
+    let unqualified: &[&str] = &[
         "NoSeparator",
         "RoleManager/",
         "RoleManager/Nested/Property",
+        "RoleManager//Enabled",
+        "A",
+        "Role_Manager-9",
+        "RoleManagerEnabled/",
+    ];
+    let longest_unqualified = "B".repeat(50);
+    assert_eq!(
+        longest_unqualified.chars().count(),
+        50,
+        "the longest row must be exactly the published 50"
+    );
+
+    for key in unqualified
+        .iter()
+        .map(|key| (*key).to_string())
+        .chain([longest_unqualified])
+    {
+        // Every row must be one the MODEL admits: 1..50 characters of
+        // `^[A-Za-z][A-Za-z0-9/_-]*$`, so what it breaks is the prose rule alone.
+        assert!(
+            (1..=50).contains(&key.chars().count())
+                && key.starts_with(|first: char| first.is_ascii_alphabetic())
+                && key
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "/_-".contains(c)),
+            "case {key:?}: this row must satisfy the published key shape"
+        );
+
+        let router = router();
+        let held = vec![param(&served_key("Held"), "kept")];
+        put_properties_ok(&router, "the fixture property", &held).await;
+
+        // Rows also differ in whether the unqualified key travels alone or beside a
+        // well-formed one.
+        for properties in [
+            vec![param(&key, "value")],
+            vec![
+                param(&served_key("Held"), "changed"),
+                param(&key, "value"),
+            ],
+        ] {
+            let case = format!("{properties:?}");
+            let (status, body) = put_properties(&router, &properties).await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected 400, got {status}: {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "InvalidInput",
+                "case {case:?}: expected InvalidInput, got {:?}",
+                error_code(&body)
+            );
+            assert_eq!(
+                element(&body, "Message"),
+                format!("Property key must be in format Namespace/PropertyName: {key}"),
+                "case {case:?}: unexpected message, got {:?}",
+                element(&body, "Message")
+            );
+            let reported = current_properties(&router, &case).await;
+            assert_eq!(
+                reported,
+                with_defaults(&held),
+                "case {case:?}: a refused write persists nothing, got {reported:?}"
+            );
+        }
+    }
+}
+
+/// RULE: a key outside the published length or alphabet of its modelled type
+/// (`accountPropertyKeyType`: length 1..50, pattern `^[A-Za-z][A-Za-z0-9/_-]*$`) is a
+/// value outside a MODELLED constraint, so it keeps the code the framework answers
+/// one with (`ValidationError`) rather than the operation's modelled client-input
+/// error, and the write carrying it persists nothing.
+#[tokio::test]
+async fn a_key_outside_the_published_key_shape_is_refused() {
+    // Rows: a leading separator, a character outside the published alphabet, a
+    // space, a non-letter first character, and one character past the published
+    // 50-character bound.
+    let malformed: &[&str] = &[
         "/RoleManager",
+        "Role!Manager/Enabled",
         "Role Manager/Enabled",
         "9RoleManager/Enabled",
+        "_RoleManager/Enabled",
     ];
     let over_long = served_key(&"B".repeat(50 - SERVED_NAMESPACE.len()));
     assert_eq!(
@@ -618,8 +710,8 @@ async fn a_write_past_the_bound_on_the_held_properties_is_refused() {
         );
         assert_eq!(
             error_code(&body),
-            "ValidationError",
-            "case {case:?}: expected ValidationError, got {:?}",
+            "InvalidInput",
+            "case {case:?}: expected InvalidInput, got {:?}",
             error_code(&body)
         );
         let held = current_properties(&filled, &case).await;

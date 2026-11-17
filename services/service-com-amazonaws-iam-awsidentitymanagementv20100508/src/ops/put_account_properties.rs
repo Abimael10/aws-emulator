@@ -177,17 +177,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A key is within the published length and alphabet of
         // `accountPropertyKeyType`, and is in the format "Namespace/PropertyName"
         // with "exactly one / separating the namespace from the property name", so a
-        // key outside either is a value this service cannot accept. A map key's own
-        // constraints are outside the framework's constraint walk, so this is where they
-        // are taken; both rules live once in `crate::state`, and each refusal names the
-        // key and the rule it broke.
+        // key outside either is a value this service cannot accept. Both rules live
+        // once in `crate::state`, and each refusal names the key and the rule it broke.
         //
-        // Every refusal of a VALUE this request carried is answered under the code IAM
-        // answers one with — `ValidationError`, through
-        // [`crate::scaffolded::Scaffolded::validation_error`] — rather than through the
-        // modelled `InvalidInputException`, whose `awsQueryError` trait renders
-        // `<Code>InvalidInput</Code>`: the code is what a client branches on, and these
-        // two account-property calls answer the former.
+        // The two rules are answered under DIFFERENT codes, because they are different
+        // refusals:
+        //
+        // * The key SHAPE is `accountPropertyKeyType`'s own `@length` and `@pattern`.
+        //   A map KEY's constraints are outside the framework's constraint walk, so
+        //   this is where they are taken — and a value outside a MODELLED constraint is
+        //   answered under the code that walk answers one with
+        //   (`ValidationError`, [`crate::scaffolded::Scaffolded::validation_error`]), so
+        //   one logical failure does not answer under two codes depending on which
+        //   member carried it.
+        // * The `Namespace/PropertyName` format is stated in this member's prose, not
+        //   as a constraint: the published pattern admits a key with no separator at
+        //   all. A request that satisfies every modelled constraint and breaks a rule
+        //   the operation states only in prose is refused with the one client-input
+        //   error this operation MODELS — `InvalidInputException`, "an invalid or
+        //   out-of-range value was supplied for an input parameter", HTTP 400, rendered
+        //   `<Code>InvalidInput</Code>` by its `awsQueryError` trait — which is the case
+        //   a client built from the model has a handler for.
         let mut namespaces = ::std::collections::BTreeSet::new();
         for key in supplied.keys() {
             if !crate::state::is_account_property_key_shape(key) {
@@ -196,9 +206,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ));
             }
             let Some(namespace) = crate::state::account_property_namespace(key) else {
-                return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-                    "Property key must be in format Namespace/PropertyName: {key}"
-                )));
+                return Err(invalid_input(
+                    crate::state::unqualified_account_property_key(key),
+                ));
             };
             namespaces.insert(namespace);
         }
@@ -207,10 +217,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refused as a whole and writes nothing. Namespaces compare exactly: the key
         // alphabet admits both cases and nothing documents a case-insensitive
         // namespace, so two spellings are two namespaces, as the keys themselves are
-        // stored verbatim.
+        // stored verbatim. Another rule stated in prose over keys the model's own
+        // constraints admit, so the modelled refusal again.
         if namespaces.len() > 1 {
             let spanned: Vec<&str> = namespaces.into_iter().collect();
-            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+            return Err(invalid_input(format!(
                 "All account property keys must belong to the same namespace, \
                  but the request spans {}",
                 spanned.join(", ")
@@ -227,7 +238,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .iter()
             .find(|namespace| !crate::state::is_served_account_property_namespace(namespace))
         {
-            return Err(crate::scaffolded::Scaffolded::validation_error(
+            return Err(invalid_input(
                 crate::state::unsupported_account_property_namespace(namespace),
             ));
         }
@@ -250,7 +261,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .count()
             + supplied.len();
         if would_hold > crate::state::MAX_ACCOUNT_PROPERTIES_PER_ACCOUNT {
-            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+            return Err(invalid_input(format!(
                 "Cannot hold more than {} account properties, and this request \
                  would hold {would_hold}",
                 crate::state::MAX_ACCOUNT_PROPERTIES_PER_ACCOUNT
@@ -262,4 +273,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         Ok(PutAccountPropertiesOutput {})
     }
+}
+
+/// Refuse this request through the one client-input error it models:
+/// `InvalidInputException` — "the request was rejected because an invalid or
+/// out-of-range value was supplied for an input parameter" — which the model binds to
+/// HTTP 400 and, through its `awsQueryError` trait, to `<Code>InvalidInput</Code>`.
+///
+/// This is the channel for a rule the operation states in PROSE over values the model's
+/// own constraints admit: the `Namespace/PropertyName` format of a key, the one namespace
+/// a request may span, the namespaces this service serves, and the bound on the set an
+/// account holds. A value outside a MODELLED constraint is a different refusal and keeps
+/// the code the framework's constraint walk answers it under.
+fn invalid_input(message: String) -> PutAccountPropertiesError {
+    PutAccountPropertiesErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+    })
+    .into()
 }
