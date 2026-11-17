@@ -629,7 +629,7 @@ impl Cluster {
                     "this emulator serves at most {MAX_DATABASES_PER_CLUSTER} databases per cluster"
                 )));
             }
-            self.databases.insert(name.to_string(), Database::open()?);
+            self.databases.insert(name.to_string(), Database::open(name)?);
         }
         Ok(self
             .databases
@@ -1001,6 +1001,10 @@ const BYTEA_HEX_PREFIX: &[u8] = br"\x";
 #[derive(Debug)]
 pub struct Database {
     conn: Connection,
+    /// The NAME this database is held under, which is the catalog name a statement reading
+    /// the relations that describe it reports (`postgres::catalog`). `""` for the
+    /// connection's default database, the one a request that names none addresses.
+    name: String,
     /// What the declaration gave each sequence-carrying column of this database,
     /// keyed by (table, column), both lower-cased.
     ///
@@ -1079,7 +1083,10 @@ impl Database {
 
     /// An empty database, CONFINED before it can run anything: see the module
     /// docs for the whole list. This is the only place a connection is created.
-    pub fn open() -> Result<Self, SqlError> {
+    ///
+    /// `name` is the name the database is held under, which is what a statement reading
+    /// the catalog relations that describe this database reports as its catalog.
+    pub fn open(name: &str) -> Result<Self, SqlError> {
         let mut conn = Connection::open_in_memory().map_err(SqlError::unavailable)?;
 
         // Memory, value size, statement size and complexity. Set first, so they
@@ -1179,6 +1186,7 @@ impl Database {
             .map_err(SqlError::unavailable)?;
         Ok(Self {
             conn,
+            name: name.to_string(),
             sequence_columns: HashMap::new(),
             version: next_version(),
             declared: false,
@@ -1190,7 +1198,7 @@ impl Database {
     /// byte-identical to the source database, and bounded by the same
     /// `max_page_count` as every other database here.
     pub fn snapshot(&self) -> Result<Self, SqlError> {
-        let mut copy = Self::open()?;
+        let mut copy = Self::open(&self.name)?;
         {
             let backup = rusqlite::backup::Backup::new(&self.conn, &mut copy.conn)
                 .map_err(SqlError::unavailable)?;
@@ -1420,6 +1428,7 @@ impl Database {
         // `postgres::plan_upsert`).
         let plan = {
             let catalog = postgres::Catalog {
+                database: &self.name,
                 key_columns: &|table: &str| conflict_key_columns(&self.conn, table),
                 column_type: &|column: &str| declared_column_type(&self.conn, column),
             };
@@ -3654,7 +3663,7 @@ mod tests {
     /// cannot see it.
     #[test]
     fn the_engine_heap_ceiling_refuses_an_allocation_heavy_statement() {
-        let mut database = Database::open().expect("a confined database opens");
+        let mut database = Database::open("probe").expect("a confined database opens");
         database
             .run_within(
                 &mut RequestBudget::new(),

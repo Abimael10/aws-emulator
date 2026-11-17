@@ -18,8 +18,9 @@
 //! * the credentials the secret holds have to be a user of the cluster: the database
 //!   refuses a login it has no user for, and the Data API passes that refusal through
 //!   ([`credentials_that_are_not_the_clusters_are_refused_by_the_database`]);
-//! * every operation is authorized against `rds-data:<OperationName>` on the cluster
-//!   before it resolves anything, so an identity no policy grants it is refused 403
+//! * every operation is authorized against `rds-data:<OperationName>` on the cluster and
+//!   against `secretsmanager:GetSecretValue` on the secret it authenticates with, before it
+//!   resolves anything, so an identity no policy grants either is refused 403
 //!   ([`every_operation_is_authorized_against_the_cluster_first`]).
 //!
 //! Every resource a case needs is created through its OWNER's own operations — the
@@ -721,26 +722,36 @@ fn access_denied(user: &str, with_password: bool) -> String {
 
 /// RULE: every operation of this service evaluates the identity-based IAM policies in
 /// force on the principal its credentials name against `rds-data:<OperationName>` on the
-/// CLUSTER the request addressed, before it resolves the cluster or the secret and before
-/// anything runs. A request no statement allows falls to IAM's implicit deny and is
-/// answered HTTP 403 `AccessDeniedException` naming the principal, the action and the
-/// cluster; one a matching `Allow` covers reaches the operation's own answer; an explicit
-/// `Deny` refuses whatever the grants say.
+/// CLUSTER the request addressed, and against `secretsmanager:GetSecretValue` on the SECRET
+/// it authenticates with, before it resolves either of them and before anything runs — "the
+/// user must also have permission to access the secret" (Amazon RDS User Guide,
+/// "Authorizing access to the Data API"). A request no statement allows falls to IAM's
+/// implicit deny and is answered HTTP 403 `AccessDeniedException` naming the principal, the
+/// action and the resource that action is about; one a matching `Allow` covers reaches the
+/// operation's own answer; an explicit `Deny` refuses whatever the grants say.
 ///
 /// The rows differ along the document in force (none at all, an allow of exactly the
 /// action, an allow of the whole service, an allow scoped to another cluster, a deny
-/// beside the allow) and along the operation called.
+/// beside the allow, a caller granted nothing of Secrets Manager and one granted the read
+/// of another secret) and along the operation called.
 #[tokio::test]
 async fn every_operation_is_authorized_against_the_cluster_first() {
     let cloud = Cloud::new();
     let (cluster, secret) = cloud.create_cluster("authorized-cluster", true).await;
     let (user_arn, access_key_id) = cloud.create_user("data-api-caller").await;
     let action = "rds-data:ExecuteStatement";
+    let secret_read = "secretsmanager:GetSecretValue";
 
+    // Every document below that grants the action on the cluster also entitles the caller
+    // to the SECRET the call authenticates with, because a call needs both: the leg that
+    // decides the secret is asserted on its own after this table.
     let allow = |resource: &str| {
         json!({
             "Version": "2012-10-17",
-            "Statement": [{"Effect": "Allow", "Action": action, "Resource": resource}],
+            "Statement": [
+                {"Effect": "Allow", "Action": action, "Resource": resource},
+                {"Effect": "Allow", "Action": secret_read, "Resource": secret},
+            ],
         })
     };
     // (case, the document in force — `None` for a principal carrying none, the refusal
@@ -762,7 +773,10 @@ async fn every_operation_is_authorized_against_the_cluster_first() {
             "an allow of every action of this service",
             Some(json!({
                 "Version": "2012-10-17",
-                "Statement": [{"Effect": "Allow", "Action": "rds-data:*", "Resource": "*"}],
+                "Statement": [
+                    {"Effect": "Allow", "Action": "rds-data:*", "Resource": "*"},
+                    {"Effect": "Allow", "Action": secret_read, "Resource": secret},
+                ],
             })),
             None,
         ),
@@ -795,6 +809,7 @@ async fn every_operation_is_authorized_against_the_cluster_first() {
                 "Version": "2012-10-17",
                 "Statement": [
                     {"Effect": "Allow", "Action": "rds-data:*", "Resource": "*"},
+                    {"Effect": "Allow", "Action": secret_read, "Resource": secret},
                     {"Effect": "Deny", "Action": action, "Resource": "*"},
                 ],
             })),
@@ -855,6 +870,63 @@ async fn every_operation_is_authorized_against_the_cluster_first() {
                 );
             }
         }
+    }
+
+    // The SECRET a call authenticates with is authorized too, and on its own: a caller the
+    // policies in force let do everything of this service, and nothing of the secret,
+    // cannot make the call — and the refusal names that action and that secret, so the
+    // grant to repair is readable off it. The rows differ along what the document grants of
+    // Secrets Manager: nothing at all, and the read scoped to ANOTHER secret.
+    let elsewhere = format!("arn:aws:secretsmanager:{REGION}:000000000000:secret:other-AbCdEf");
+    for (case, document) in [
+        (
+            "a caller granted nothing of Secrets Manager",
+            json!({
+                "Version": "2012-10-17",
+                "Statement": [{"Effect": "Allow", "Action": "rds-data:*", "Resource": "*"}],
+            }),
+        ),
+        (
+            "a caller granted the read of another secret",
+            json!({
+                "Version": "2012-10-17",
+                "Statement": [
+                    {"Effect": "Allow", "Action": "rds-data:*", "Resource": "*"},
+                    {"Effect": "Allow", "Action": secret_read, "Resource": elsewhere},
+                ],
+            }),
+        ),
+    ] {
+        cloud.put_user_policy("data-api-caller", &document).await;
+        let (status, body) = cloud
+            .call_as(
+                &access_key_id,
+                "/Execute",
+                json!({
+                    "resourceArn": cluster,
+                    "secretArn": secret,
+                    "database": DATABASE,
+                    "sql": "SELECT 1",
+                }),
+            )
+            .await;
+        assert_eq!(
+            status, 403,
+            "case {case}: expected HTTP 403, got {status} {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "AccessDeniedException",
+            "case {case}: expected AccessDeniedException, got {body}"
+        );
+        assert_eq!(
+            message(&body),
+            format!(
+                "User: {user_arn} is not authorized to perform: {secret_read} on resource: \
+                 {secret} because no identity-based policy allows the {secret_read} action"
+            ),
+            "case {case}: expected IAM's own wording about the secret, got {body}"
+        );
     }
 
     // The same gate on every other operation of the service: the user carries no policy

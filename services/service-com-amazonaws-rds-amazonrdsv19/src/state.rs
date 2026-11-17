@@ -209,7 +209,8 @@ pub use custom_engine_versions::{
 pub use db_proxies::{
     check_target_group_name, check_user_auth_config, db_proxy_already_exists_message,
     db_proxy_not_found_message, default_connection_pool_config, merged_connection_pool_config,
-    user_auth_config_to_info, DbProxyRecord, DbProxyTargetGroupRecord,
+    subnets_span_several_vpcs_message, unreadable_secret_description, user_auth_config_to_info,
+    DbProxyRecord, DbProxyTargetGroupRecord,
     DbProxyTargetRecord, ProxyTargetKey, ProxyTargetRow, RegisteredDatabase,
     DB_PROXY_TARGET_ALREADY_REGISTERED_MESSAGE, DEFAULT_AUTH_SCHEME_NONE,
     DEFAULT_CONNECTION_BORROW_TIMEOUT, DEFAULT_DB_PROXY_TARGET_GROUP,
@@ -220,6 +221,7 @@ pub use db_proxies::{
     ENGINE_FAMILY_SQLSERVER, MAX_SESSION_PINNING_FILTERS,
     MAX_USER_AUTH_CONFIGS, MISSING_DB_PROXY_TARGETS_MESSAGE,
     MISSING_DB_PROXY_TARGET_IDENTIFIER_MESSAGE, NETWORK_TYPE_IPV4, TARGET_ROLE_READ_ONLY,
+    TARGET_HEALTH_REASON_AUTH_FAILURE, TARGET_HEALTH_REASON_UNREACHABLE,
     TARGET_ROLE_READ_WRITE, TARGET_STATE_AVAILABLE, TARGET_STATE_REGISTERING,
     TARGET_STATE_UNAVAILABLE, TARGET_TYPE_RDS_INSTANCE, TARGET_TYPE_TRACKED_CLUSTER,
 };
@@ -273,6 +275,10 @@ pub mod data_plane;
 // The subnets a request NAMES, resolved against the service that owns them: a subnet's
 // Availability Zone is Amazon EC2's fact, and this is the one place this crate asks for it.
 pub mod ec2_subnets;
+// Whether the role a proxy reads its `Auth` secrets with may read them, asked of IAM: what
+// decides whether a proxy target can authenticate to the database behind it.
+pub mod proxy_secret_access;
+pub use proxy_secret_access::{unreadable_auth_secret, PROXY_SECRET_READ_ACTION};
 // The account's `default` DB subnet group: the group RDS provides with the account's
 // default VPC, and the default-VPC network it reports, read from the owner of subnets.
 pub mod default_subnet_group;
@@ -1648,12 +1654,22 @@ impl ComAmazonawsRdsAmazonrdsv19State {
     /// member instance — the writer first, as the cluster reports its members — computed
     /// from the cluster's CURRENT membership, so a member added or removed after the
     /// registration is reported exactly as the cluster reports it.
-    fn proxy_target_rows(&self, region: &str, target: &DbProxyTargetRecord) -> Vec<ProxyTargetRow> {
+    /// `unreadable_secret` is the `Auth` secret the proxy may not read, as the CALLER
+    /// established it against IAM for this report ([`proxy_secret_access`]): the health of
+    /// every target of a proxy that cannot read its credentials is the same, because it is
+    /// the proxy's login that fails and not one database.
+    fn proxy_target_rows(
+        &self,
+        region: &str,
+        target: &DbProxyTargetRecord,
+        unreadable_secret: Option<&str>,
+    ) -> Vec<ProxyTargetRow> {
         let now = Instant::now();
         let mut rows = vec![ProxyTargetRow::registration(
             target,
             self.registered_database(region, target),
             now,
+            unreadable_secret,
         )];
         if target.is_cluster {
             if let Some(cluster) = self
@@ -1673,6 +1689,7 @@ impl ComAmazonawsRdsAmazonrdsv19State {
                         // `cluster_members` reports the writer first, which is the member
                         // `DBClusterMembers` reports `IsClusterWriter` for.
                         position == 0,
+                        unreadable_secret,
                         in_force,
                     ));
                 }
@@ -1685,12 +1702,15 @@ impl ComAmazonawsRdsAmazonrdsv19State {
     /// cluster the registration names and, for a tracked cluster, the member instances the
     /// proxy reaches through it — the database every target that registration contributes
     /// to the report reports, keyed as [`ProxyTargetKey`] documents.
+    ///
+    /// WHICH databases a registration reaches does not depend on their health, so this asks
+    /// for the rows with nothing established about the proxy's credentials.
     pub fn proxy_reached_databases(
         &self,
         region: &str,
         registration: &DbProxyTargetRecord,
     ) -> Vec<ProxyTargetKey> {
-        self.proxy_target_rows(region, registration)
+        self.proxy_target_rows(region, registration, None)
             .iter()
             .map(ProxyTargetRow::database_key)
             .collect()
@@ -1712,11 +1732,12 @@ impl ComAmazonawsRdsAmazonrdsv19State {
         &self,
         region: &str,
         registrations: &[DbProxyTargetRecord],
+        unreadable_secret: Option<&str>,
     ) -> Vec<(String, crate::ops::types::DBProxyTarget)> {
         let mut seen: BTreeSet<String> = BTreeSet::new();
         registrations
             .iter()
-            .flat_map(|target| self.proxy_target_rows(region, target))
+            .flat_map(|target| self.proxy_target_rows(region, target, unreadable_secret))
             .map(|row| (row.page_key(), row))
             .filter(|(key, _)| seen.insert(key.clone()))
             .map(|(key, row)| (key, row.to_wire()))

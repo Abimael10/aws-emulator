@@ -1616,8 +1616,10 @@ async fn proxy_targets_are_registered_reported_and_deregistered() {
         "IdleClientTimeout takes its documented default: {created}"
     );
 
-    // A proxy that is still coming up cannot take a registration; one that is up can.
-    expect_error(
+    // A proxy that is still coming up TAKES a registration — it exists and keeps it — and
+    // the target it makes reports the state its health lifecycle starts in until the proxy
+    // is ready to pool its connections.
+    let early = expect_ok(
         "a registration before the proxy is available",
         call(
             &router,
@@ -1628,8 +1630,26 @@ async fn proxy_targets_are_registered_reported_and_deregistered() {
             ],
         )
         .await,
-        400,
-        "InvalidDBProxyStateFault",
+    );
+    assert_eq!(
+        text(&early, "State"),
+        "REGISTERING",
+        "a registration made while the proxy is still coming up is not in force yet: {early}"
+    );
+    // Taken back off, so the registrations the rest of this test makes start from a group
+    // that holds none: a deregistration is served while the proxy is coming up for the same
+    // reason the registration was.
+    expect_ok(
+        "deregister it again before the proxy is available",
+        call(
+            &router,
+            "DeregisterDBProxyTargets",
+            &[
+                ("DBProxyName", "emu-proxy"),
+                ("DBInstanceIdentifiers.member.1", "emu-proxy-instance"),
+            ],
+        )
+        .await,
     );
     wait_for_settle();
     let reported = expect_ok(

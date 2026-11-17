@@ -175,44 +175,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
         };
-        let mut store = state.lock();
-        // A report materialises the transitions the clock already made due: the ones owed
-        // at this instant whether or not anybody called.
-        store.settle_due_transitions(&region);
-
-        // RDS is regional: only the region the request was signed for is in scope.
-        let Some(proxy) = store
-            .db_proxies
-            .get(&(region.clone(), input.db_proxy_name.clone()))
-        else {
-            return Err(DescribeDBProxyTargetsErrorModeled::DBProxyNotFoundFault(
-                DBProxyNotFoundFault {
-                    message: Some(crate::state::db_proxy_not_found_message(
-                        &input.db_proxy_name,
-                    )),
-                },
-            )
-            .into());
+        // WHAT THE PROXY IS: its registrations, and the role and `Auth` the credentials it
+        // logs in with are read with. Read under the store's guard and carried past it,
+        // because whether that role may read those secrets is a question for IAM, which
+        // cannot be asked while the guard is held.
+        let (role_arn, auth) = {
+            let mut store = state.lock();
+            // A report materialises the transitions the clock already made due: the ones
+            // owed at this instant whether or not anybody called.
+            store.settle_due_transitions(&region);
+            let proxy = require_proxy(
+                &store,
+                &region,
+                &input.db_proxy_name,
+                input.target_group_name.as_deref(),
+            )?;
+            (proxy.role_arn.clone(), proxy.auth.clone())
         };
-        if let Err(message) =
-            crate::state::check_target_group_name(input.target_group_name.as_deref())
-        {
-            return Err(
-                DescribeDBProxyTargetsErrorModeled::DBProxyTargetGroupNotFoundFault(
-                    DBProxyTargetGroupNotFoundFault {
-                        message: Some(message),
-                    },
-                )
-                .into(),
-            );
-        }
 
+        // The health a target reports is the health of the proxy's connection to it, and a
+        // proxy that may not read the secret its `Auth` names has no credentials to log in
+        // with: the permissions in force on its role NOW decide it, so the question is put
+        // to IAM on every report rather than answered from something stored when the target
+        // was registered — a grant repaired after the registration heals the target, as it
+        // does in AWS (`crate::state::proxy_secret_access`).
+        let unreadable_secret =
+            crate::state::unreadable_auth_secret(ctx, &region, &role_arn, &auth).await;
+
+        let mut store = state.lock();
+        // The guard was released while the proxy's role was read, so the proxy is resolved
+        // AGAIN against what the store holds now: a delete accepted in the meantime leaves
+        // no proxy to report targets for.
+        store.settle_due_transitions(&region);
+        let registrations = require_proxy(
+            &store,
+            &region,
+            &input.db_proxy_name,
+            input.target_group_name.as_deref(),
+        )?
+        .targets
+        .clone();
         // The registrations are reported in registration order, each keyed by the
         // database it names so a page boundary is a stable cursor; a registered DB cluster
         // is TRACKED, so it contributes the targets of the DB instances the proxy reaches
         // through it beside its own.
         let targets: Vec<(String, DBProxyTarget)> =
-            store.proxy_report_targets(&region, &proxy.targets.clone());
+            store.proxy_report_targets(&region, &registrations, unreadable_secret.as_deref());
+        drop(store);
 
         // A `Marker` is placed in the report's own order and the page resumes BEYOND it; a
         // token this codec could not have produced is refused: see `crate::state::paginate`.
@@ -223,4 +232,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             marker: page.next_marker,
         })
     }
+}
+
+/// The proxy the request names, in the region it was signed for, and the one target group
+/// that proxy has.
+///
+/// Both refusals are the ones this operation models for a name that resolves nothing, and
+/// they are stated once: the report resolves the proxy twice — before the question put to
+/// IAM and after it — so a proxy deleted in between answers the same fault either way.
+fn require_proxy<'store>(
+    store: &'store crate::state::ComAmazonawsRdsAmazonrdsv19State,
+    region: &str,
+    db_proxy_name: &str,
+    target_group_name: Option<&str>,
+) -> Result<&'store crate::state::DbProxyRecord, DescribeDBProxyTargetsError> {
+    let Some(proxy) = store
+        .db_proxies
+        .get(&(region.to_string(), db_proxy_name.to_string()))
+    else {
+        return Err(DescribeDBProxyTargetsErrorModeled::DBProxyNotFoundFault(
+            DBProxyNotFoundFault {
+                message: Some(crate::state::db_proxy_not_found_message(db_proxy_name)),
+            },
+        )
+        .into());
+    };
+    if let Err(message) = crate::state::check_target_group_name(target_group_name) {
+        return Err(
+            DescribeDBProxyTargetsErrorModeled::DBProxyTargetGroupNotFoundFault(
+                DBProxyTargetGroupNotFoundFault {
+                    message: Some(message),
+                },
+            )
+            .into(),
+        );
+    }
+    Ok(proxy)
 }

@@ -205,7 +205,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
-        if proxy.status != crate::state::DB_PROXY_STATUS_AVAILABLE {
+        // A proxy whose DELETE has been accepted is on its way out of this service, and
+        // takes its target group with it: there is nothing left to deregister a target
+        // from, which is the state `InvalidDBProxyStateFault` reports. A proxy that is
+        // still coming up, or applying a modification, HAS its target group and serves the
+        // deregistration.
+        if proxy.is_deleting() {
             return Err(
                 DeregisterDBProxyTargetsErrorModeled::InvalidDBProxyStateFault(
                     InvalidDBProxyStateFault {

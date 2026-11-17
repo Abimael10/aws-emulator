@@ -62,7 +62,7 @@ use sqlparser::ast::{
     AssignmentTarget, BinaryOperator, CastKind, ColumnDef, ColumnOption, ColumnOptionDef,
     ConflictTarget, DataType, DoUpdate, ExactNumberInfo, Expr, Function, FunctionArg,
     FunctionArgExpr, FunctionArguments, Ident, ObjectName, ObjectNamePart, ObjectType, OnConflict,
-    OnConflictAction, OnInsert, SelectItem, SetExpr, Statement, TableConstraint, TableFactor,
+    OnConflictAction, OnInsert, Query, SelectItem, SetExpr, Statement, TableConstraint, TableFactor,
     TableObject, Value, visit_expressions, visit_expressions_mut,
 };
 use sqlparser::dialect::{Dialect, MySqlDialect, PostgreSqlDialect};
@@ -74,6 +74,9 @@ use super::{MAX_DECLARED_ARGUMENT, SqlError};
 
 /// How a name the caller wrote is rendered for the engine.
 mod names;
+
+/// The schema a name is resolved in, and the catalog relations that describe the database.
+mod catalog;
 
 /// The precision a type with no length limit reports: the largest length the
 /// member can carry, which is what a client reads as "unlimited".
@@ -754,6 +757,12 @@ pub fn plan(sql: &str, catalog: &Catalog<'_>) -> Result<Plan, SqlError> {
         ));
     }
     let mut statement = statements.remove(0);
+    // The SCHEMA every name in the statement is qualified by is resolved FIRST, against the
+    // one schema of stored objects this data plane has: a `public.` qualification selects
+    // what the bare name does, and a relation of the catalog schema becomes the query over
+    // the engine's own schema that answers it, so everything below reads the statement the
+    // engine will run (`catalog`).
+    catalog::resolve_schemas(&mut statement, catalog.database);
     // The types the statement's own text gives its result columns are read from
     // the parse BEFORE it is rewritten, because the rewrite replaces a cast's
     // PostgreSQL target type with the engine type that holds its values.
@@ -1087,6 +1096,9 @@ pub(super) const CHARACTER_VALUE_TYPE: &str = "text";
 /// Supplied by the caller, because a database is what holds a schema and this module
 /// holds none.
 pub struct Catalog<'a> {
+    /// The DATABASE the statement runs against, which is the catalog name the relations
+    /// describing it report ([`catalog`]).
+    pub database: &'a str,
     /// The columns of the key a table's own declaration says a duplicate-key
     /// condition is raised against (see [`plan_upsert`]).
     pub key_columns: &'a dyn Fn(&str) -> Vec<String>,
@@ -1614,6 +1626,17 @@ fn parse_expression(sql: &str) -> Option<Expr> {
         .try_with_sql(sql)
         .ok()?;
     parser.parse_expr().ok()
+}
+
+/// Parse one QUERY this module built, back into the tree the statement carries — the same
+/// reading [`parse_expression`] does of an expression, and under the same bound, for a
+/// rewrite that replaces a relation with the query that answers it ([`catalog`]).
+fn parse_query(sql: &str) -> Option<Box<Query>> {
+    let mut parser = Parser::new(&PostgreSqlDialect {})
+        .with_recursion_limit(MAX_PARSE_DEPTH)
+        .try_with_sql(sql)
+        .ok()?;
+    parser.parse_query().ok()
 }
 
 /// The engine type that holds a PostgreSQL value of this type.

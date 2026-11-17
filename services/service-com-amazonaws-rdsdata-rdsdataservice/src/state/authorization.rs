@@ -67,6 +67,17 @@ use ::service_common::iam_authorization::{self as iam, Decision};
 /// service's own `arnNamespace` (`smithy_query(query="service_info")`).
 pub const ACTION_PREFIX: &str = "rds-data";
 
+/// The IAM action reading the credentials out of a secret requires: "Required
+/// permissions: `secretsmanager:GetSecretValue`" (Secrets Manager's `GetSecretValue`).
+///
+/// A Data API call authenticates with the SECRET the caller names, so reading that secret
+/// is part of the call: "the user must also have permission to access the secret" (Amazon
+/// RDS User Guide, "Authorizing access to the Data API" — its own example policy grants
+/// `secretsmanager:GetSecretValue` on the secret beside the `rds-data` actions). So the
+/// read is authorized against the CALLER's policies, exactly as the action on the cluster
+/// is, and a caller no document in force entitles to that secret cannot make the call.
+pub const SECRET_READ_ACTION: &str = "secretsmanager:GetSecretValue";
+
 /// What a refusal names as the principal of a request whose session credential has
 /// already expired: that credential speaks for nobody, and the key it presented is not
 /// quoted back.
@@ -87,12 +98,36 @@ pub fn authorize<Eng: Send + Sync + 'static>(
     operation: &str,
     resource: &str,
 ) -> Result<(), String> {
-    let action = format!("{ACTION_PREFIX}:{operation}");
+    decide(engine, ctx, &format!("{ACTION_PREFIX}:{operation}"), resource)
+}
+
+/// Decide the READ of the secret `secret_arn` names for the identity this request signed
+/// as — the other half of what authorizes a Data API call ([`SECRET_READ_ACTION`]).
+///
+/// The same decision, from the same documents, against the secret's own ARN as the request
+/// CARRIED it: a grant scoped to one secret admits a call authenticating with that secret
+/// and no other.
+pub fn authorize_secret_read<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    secret_arn: &str,
+) -> Result<(), String> {
+    decide(engine, ctx, SECRET_READ_ACTION, secret_arn)
+}
+
+/// Decide `action` on `resource` for the identity this request signed as: the ONE reading
+/// of the documents in force, which both legs of the authorization above go through.
+fn decide<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    action: &str,
+    resource: &str,
+) -> Result<(), String> {
     let caller = caller(engine, ctx);
     // The principal spellings travel with the request because that is what a statement's
     // `Principal` element would be matched against; an identity-based document states no
     // such element, so the decision below rests on the action and the resource.
-    let request = iam::Request::new(&action, resource, &caller.principals);
+    let request = iam::Request::new(action, resource, &caller.principals);
     let identity_said = iam::identity_decision(&caller.documents, &request);
     // Taken FIRST, so an explicit `Deny` in a document that CAN be read refuses the
     // request whatever else the principal carries — including a grant this emulator
@@ -100,7 +135,7 @@ pub fn authorize<Eng: Send + Sync + 'static>(
     if identity_said == Decision::Denied {
         return Err(not_authorized(
             &caller.arn,
-            &action,
+            action,
             resource,
             "with an explicit deny in an identity-based policy",
         ));
@@ -110,7 +145,7 @@ pub fn authorize<Eng: Send + Sync + 'static>(
     if !granted {
         return Err(not_authorized(
             &caller.arn,
-            &action,
+            action,
             resource,
             &format!("because no identity-based policy allows the {action} action"),
         ));
@@ -126,7 +161,7 @@ pub fn authorize<Eng: Send + Sync + 'static>(
                 format!("because no permissions boundary allows the {action} action")
             }
         };
-        return Err(not_authorized(&caller.arn, &action, resource, &reason));
+        return Err(not_authorized(&caller.arn, action, resource, &reason));
     }
     Ok(())
 }

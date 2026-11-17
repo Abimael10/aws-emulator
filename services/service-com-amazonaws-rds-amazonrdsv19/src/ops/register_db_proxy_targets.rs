@@ -202,46 +202,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
         };
+        // WHAT THE PROXY IS, before anything is registered against it: a registration is
+        // refused on the proxy's own state, and the health the targets it makes report
+        // depends on when the proxy is ready and on whether it can read the credentials it
+        // would log in with. The second of those is a question for IAM, which cannot be
+        // asked while the store's guard is held, so the proxy is read under the guard, the
+        // guard is released, and the registration is then made against what the store holds
+        // afterwards.
+        let proxy_facts = {
+            let mut store = state.lock();
+            store.settle_due_transitions(&region);
+            let proxy = require_registrable_proxy(
+                &store,
+                &region,
+                &input.db_proxy_name,
+                input.target_group_name.as_deref(),
+            )?;
+            ProxyFacts {
+                available_at: proxy.available_at(),
+                role_arn: proxy.role_arn.clone(),
+                auth: proxy.auth.clone(),
+            }
+        };
+        // Whether the proxy can read the credentials it would log in with: asked of IAM
+        // with no guard held, because it is a call to another service
+        // (`crate::state::proxy_secret_access`).
+        let unreadable_secret = crate::state::unreadable_auth_secret(
+            ctx,
+            &region,
+            &proxy_facts.role_arn,
+            &proxy_facts.auth,
+        )
+        .await;
+        let proxy_available_at = proxy_facts.available_at;
+
         let mut store = state.lock();
         store.settle_due_transitions(&region);
 
-        // RDS is regional: only the region the request was signed for is in scope.
+        // The guard was released while the proxy's role was read, so the proxy is resolved
+        // again against what the store holds NOW: a delete accepted in the meantime leaves
+        // nothing to register against.
         let key = (region.clone(), input.db_proxy_name.clone());
-        let Some(proxy) = store.db_proxies.get(&key) else {
-            return Err(RegisterDBProxyTargetsErrorModeled::DBProxyNotFoundFault(
-                DBProxyNotFoundFault {
-                    message: Some(crate::state::db_proxy_not_found_message(
-                        &input.db_proxy_name,
-                    )),
-                },
-            )
-            .into());
-        };
-        if let Err(message) =
-            crate::state::check_target_group_name(input.target_group_name.as_deref())
-        {
-            return Err(
-                RegisterDBProxyTargetsErrorModeled::DBProxyTargetGroupNotFoundFault(
-                    DBProxyTargetGroupNotFoundFault {
-                        message: Some(message),
-                    },
-                )
-                .into(),
-            );
-        }
-        // A proxy that is still coming up cannot take a registration: the state the clock
-        // has yet to settle is real.
-        if proxy.status != crate::state::DB_PROXY_STATUS_AVAILABLE {
-            return Err(RegisterDBProxyTargetsErrorModeled::InvalidDBProxyStateFault(
-                InvalidDBProxyStateFault {
-                    message: Some(format!(
-                        "DB proxy {} is in state {} and cannot take a target registration",
-                        input.db_proxy_name, proxy.status
-                    )),
-                },
-            )
-            .into());
-        }
+        require_registrable_proxy(
+            &store,
+            &region,
+            &input.db_proxy_name,
+            input.target_group_name.as_deref(),
+        )?;
 
         // Every database the request names is resolved BEFORE anything is registered, so a
         // request naming one that does not exist leaves the proxy's target group exactly as
@@ -267,7 +274,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .any(|held| held.identifier == identifier && !held.is_cluster)
             {
                 requested.push(crate::state::DbProxyTargetRecord::registering(
-                    identifier, false,
+                    identifier,
+                    false,
+                    proxy_available_at,
                 ));
             }
         }
@@ -289,7 +298,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .any(|held| held.identifier == identifier && held.is_cluster)
             {
                 requested.push(crate::state::DbProxyTargetRecord::registering(
-                    identifier, true,
+                    identifier,
+                    true,
+                    proxy_available_at,
                 ));
             }
         }
@@ -365,7 +376,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // projected from the database behind it — a registered DB cluster is tracked, so
         // its answer carries the DB instances the proxy reaches through it too.
         let db_proxy_targets: Vec<DBProxyTarget> = store
-            .proxy_report_targets(&region, &reporting)
+            .proxy_report_targets(&region, &reporting, unreadable_secret.as_deref())
             .into_iter()
             .map(|(_, target)| target)
             .collect();
@@ -385,4 +396,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             db_proxy_targets: Some(db_proxy_targets),
         })
     }
+}
+
+/// What the proxy a registration is being made against reports, read under the store's
+/// guard and carried past it: when the proxy itself is ready, and the role and `Auth` the
+/// credentials it logs in with are read with.
+struct ProxyFacts {
+    /// [`crate::state::DbProxyRecord::available_at`].
+    available_at: ::std::time::Instant,
+    /// `RoleArn`.
+    role_arn: String,
+    /// `Auth`, as the proxy reports it.
+    auth: Vec<UserAuthConfigInfo>,
+}
+
+/// The proxy a registration can be made against: the one the request names, in the region
+/// it was signed for, with the one target group that proxy has.
+///
+/// Every refusal of this operation that is about the proxy rather than about a database is
+/// stated here, once: the call resolves the proxy twice — before the question put to IAM
+/// about its role and after it — so a proxy deleted in between is refused in the same words
+/// either way.
+///
+/// A proxy whose DELETE has been accepted is on its way out of this service: there is
+/// nothing left for a registration to be made against, which is the state
+/// `InvalidDBProxyStateFault` reports. A proxy that is still coming up, or applying a
+/// modification, is NOT refused — it exists and keeps the registration, and the target it
+/// makes reports its own health lifecycle ("`registering` > `unavailable` > `available`",
+/// `TargetHealth$State`) until the proxy is ready to pool its connections.
+fn require_registrable_proxy<'store>(
+    store: &'store crate::state::ComAmazonawsRdsAmazonrdsv19State,
+    region: &str,
+    db_proxy_name: &str,
+    target_group_name: Option<&str>,
+) -> Result<&'store crate::state::DbProxyRecord, RegisterDBProxyTargetsError> {
+    // RDS is regional: only the region the request was signed for is in scope.
+    let Some(proxy) = store
+        .db_proxies
+        .get(&(region.to_string(), db_proxy_name.to_string()))
+    else {
+        return Err(RegisterDBProxyTargetsErrorModeled::DBProxyNotFoundFault(
+            DBProxyNotFoundFault {
+                message: Some(crate::state::db_proxy_not_found_message(db_proxy_name)),
+            },
+        )
+        .into());
+    };
+    if let Err(message) = crate::state::check_target_group_name(target_group_name) {
+        return Err(
+            RegisterDBProxyTargetsErrorModeled::DBProxyTargetGroupNotFoundFault(
+                DBProxyTargetGroupNotFoundFault {
+                    message: Some(message),
+                },
+            )
+            .into(),
+        );
+    }
+    if proxy.is_deleting() {
+        return Err(RegisterDBProxyTargetsErrorModeled::InvalidDBProxyStateFault(
+            InvalidDBProxyStateFault {
+                message: Some(format!(
+                    "DB proxy {db_proxy_name} is in state {} and cannot take a target \
+                     registration",
+                    proxy.status
+                )),
+            },
+        )
+        .into());
+    }
+    Ok(proxy)
 }

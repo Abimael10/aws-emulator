@@ -223,6 +223,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A proxy is placed IN a VPC: it listens in the subnets the request names, and
+        // those subnets have to be subnets of ONE VPC for there to be a VPC to place it in.
+        // WHICH VPC each subnet belongs to is the fact of the service that owns subnets, so
+        // it is read off EC2's records (`crate::state::ec2_subnets`) before anything is
+        // written — a request spanning several is refused with no proxy left behind, and
+        // the one VPC they do share is what the proxy reports. A hop that could not be
+        // answered establishes no VPC at all, so it refuses nothing.
+        let zones = crate::state::subnet_zones(ctx, &region, &input.vpc_subnet_ids).await;
+        let vpcs = zones.vpcs(input.vpc_subnet_ids.iter().map(String::as_str));
+        if vpcs.len() > 1 {
+            return Err(CreateDBProxyError::invalid_parameter_combination(
+                crate::state::subnets_span_several_vpcs_message(vpcs.iter().map(String::as_str)),
+            ));
+        }
+        let vpc_id = vpcs.into_iter().next();
+
         // No store means this service was mounted on an engine it has no state in, so it
         // cannot serve the operation at all. Unreachable with the engine the router builds;
         // 501 is the honest answer, never a fabricated proxy.
@@ -275,6 +291,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             auth: crate::state::user_auth_config_to_info(auth),
             role_arn: input.role_arn,
             vpc_subnet_ids: input.vpc_subnet_ids,
+            vpc_id,
             vpc_security_group_ids: security_groups,
             // `RequireTLS` / `DebugLogging` each turn something on that the request asks
             // for, so a proxy created without them has it off.

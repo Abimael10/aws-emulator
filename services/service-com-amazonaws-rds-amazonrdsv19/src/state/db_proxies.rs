@@ -224,6 +224,12 @@ pub const TARGET_STATE_UNAVAILABLE: &str = "UNAVAILABLE";
 /// unavailable.
 pub const TARGET_HEALTH_REASON_UNREACHABLE: &str = "UNREACHABLE";
 
+/// `TargetHealthReason` — "`AUTH_FAILURE`", why a target the proxy cannot authenticate to
+/// its database for is unavailable: a proxy logs in with the credentials in the Secrets
+/// Manager secret its `Auth` names, read with the IAM role `RoleArn` names, so a role that
+/// may not read that secret leaves the proxy with no credentials to log in with.
+pub const TARGET_HEALTH_REASON_AUTH_FAILURE: &str = "AUTH_FAILURE";
+
 /// `TargetType` — "`RDS_INSTANCE`", the kind of database a registered DB instance is.
 pub const TARGET_TYPE_RDS_INSTANCE: &str = "RDS_INSTANCE";
 
@@ -374,6 +380,37 @@ pub fn check_target_group_name(requested: Option<&str>) -> Result<(), String> {
     }
 }
 
+/// The sentence a target reports as the DESCRIPTION of its `AUTH_FAILURE`: which secret the
+/// proxy could not read, so a client can see the grant to repair from the target alone.
+///
+/// A description belongs to a health state that is not `AVAILABLE` ("If the `State` is
+/// `AVAILABLE`, a description is not included", `TargetHealth$Description`), and this is the
+/// one this service words for a proxy whose role withholds the read of its `Auth` secret.
+pub fn unreadable_secret_description(secret_arn: &str) -> String {
+    format!(
+        "The proxy's IAM role is not authorized to retrieve the secret {secret_arn} from \
+         Secrets Manager."
+    )
+}
+
+/// What `CreateDBProxy` refuses a `VpcSubnetIds` set whose subnets lie in more than one VPC
+/// with.
+///
+/// A proxy is placed IN a VPC — it has one `VpcId`, and the subnets it is given are the
+/// subnets of that VPC it listens in — so a set spanning several names no VPC to place it
+/// in. Amazon RDS validates the set as the request's own parameters rather than as a
+/// subnet fault, so the refusal is the Query API's `InvalidParameterCombination`, and its
+/// sentence states the VPCs the subnets were found in inside brackets after the fixed text.
+pub fn subnets_span_several_vpcs_message<'ids>(
+    vpc_ids: impl IntoIterator<Item = &'ids str>,
+) -> String {
+    let found: Vec<&str> = vpc_ids.into_iter().collect();
+    format!(
+        "Subnets must belong to only one VPC but found multiple VPCs: [{}]",
+        found.join(", ")
+    )
+}
+
 /// The one target group a proxy has, as this service persists it.
 ///
 /// "Currently, each target group is associated with exactly one RDS DB instance or Aurora
@@ -424,13 +461,15 @@ pub struct DbProxyTargetRecord {
 impl DbProxyTargetRecord {
     /// The registration of `identifier` this call makes: in force
     /// [`STATUS_TRANSITION_DELAY`] from now, which is the span this service takes to put
-    /// one into force. The span is never zero, so the caller that registered a target
+    /// one into force, and never before `proxy_available_at` — a target is reached through
+    /// the proxy, so it cannot be healthy while the proxy that pools its connections is
+    /// still coming up. The span is never zero, so the caller that registered a target
     /// still observes the `registering` state its health lifecycle starts in.
-    pub fn registering(identifier: String, is_cluster: bool) -> Self {
+    pub fn registering(identifier: String, is_cluster: bool, proxy_available_at: Instant) -> Self {
         Self {
             identifier,
             is_cluster,
-            healthy_at: Instant::now() + STATUS_TRANSITION_DELAY,
+            healthy_at: (Instant::now() + STATUS_TRANSITION_DELAY).max(proxy_available_at),
         }
     }
 
@@ -457,6 +496,11 @@ pub struct DbProxyRecord {
     pub role_arn: String,
     /// `VpcSubnetIds`.
     pub vpc_subnet_ids: Vec<String>,
+    /// `VpcId`: the VPC the proxy's subnets belong to, as the service that owns subnets
+    /// answered for them when the proxy was created. `None` where that question could not
+    /// be answered, which is reported as no VPC rather than one of this service's
+    /// choosing.
+    pub vpc_id: Option<String>,
     /// `VpcSecurityGroupIds`.
     pub vpc_security_group_ids: Vec<String>,
     /// `RequireTLS`.
@@ -508,6 +552,20 @@ impl DbProxyRecord {
     /// records name the same predicate.
     pub fn is_deleting(&self) -> bool {
         self.status == DB_PROXY_STATUS_DELETING
+    }
+
+    /// The instant from which the proxy is ready to pool connections: NOW for one already
+    /// reporting [`DB_PROXY_STATUS_AVAILABLE`], else the instant the clock owes it that
+    /// status at.
+    ///
+    /// What a TARGET's health waits for, because a target is reached through the proxy: the
+    /// registration a caller makes against a proxy that is still coming up comes into force
+    /// no earlier than the proxy itself does.
+    pub fn available_at(&self) -> Instant {
+        match self.pending_status.as_ref() {
+            Some(pending) => pending.due_at,
+            None => Instant::now(),
+        }
     }
 
     /// Accept a modification: the change is already applied to the record, and the proxy
@@ -599,16 +657,16 @@ impl DbProxyRecord {
             .position(|target| target.identifier == identifier && target.is_cluster == is_cluster)
     }
 
-    /// Project the stored record onto the modelled `DBProxy` shape. `VpcId` is left out
-    /// rather than invented: this service holds no VPC, so a proxy it stores belongs to
-    /// none it could name.
+    /// Project the stored record onto the modelled `DBProxy` shape. `VpcId` is the VPC EC2
+    /// reported for the proxy's subnets, never invented: a proxy whose subnets could not be
+    /// resolved belongs to no VPC this service could name.
     pub fn to_wire(&self) -> DBProxy {
         DBProxy {
             db_proxy_name: Some(self.name.clone()),
             db_proxy_arn: Some(self.arn()),
             status: Some(self.status.clone()),
             engine_family: Some(self.engine_family.clone()),
-            vpc_id: None,
+            vpc_id: self.vpc_id.clone(),
             vpc_security_group_ids: Some(self.vpc_security_group_ids.clone()),
             vpc_subnet_ids: Some(self.vpc_subnet_ids.clone()),
             default_auth_scheme: Some(self.default_auth_scheme.clone()),
@@ -664,6 +722,9 @@ pub struct ProxyTargetRow {
     /// What the database behind the target reports, read from that database's own record,
     /// or `None` when this service no longer holds it.
     database: Option<RegisteredDatabase>,
+    /// The `Auth` secret the proxy may not read, as the report this row belongs to
+    /// established it ([`super::proxy_secret_access`]).
+    unreadable_secret: Option<String>,
     /// Whether the registration behind the target is in force (see
     /// [`DbProxyTargetRecord::is_in_force`]).
     in_force: bool,
@@ -680,6 +741,7 @@ impl ProxyTargetRow {
         target: &DbProxyTargetRecord,
         database: Option<RegisteredDatabase>,
         now: Instant,
+        unreadable_secret: Option<&str>,
     ) -> Self {
         Self {
             identifier: target.identifier.clone(),
@@ -694,6 +756,7 @@ impl ProxyTargetRow {
             tracked_cluster_id: target.is_cluster.then(|| target.identifier.clone()),
             role: TARGET_ROLE_READ_WRITE,
             database,
+            unreadable_secret: unreadable_secret.map(str::to_string),
             in_force: target.is_in_force(now),
         }
     }
@@ -714,6 +777,7 @@ impl ProxyTargetRow {
         identifier: &str,
         database: Option<RegisteredDatabase>,
         writes: bool,
+        unreadable_secret: Option<&str>,
         in_force: bool,
     ) -> Self {
         Self {
@@ -726,6 +790,7 @@ impl ProxyTargetRow {
                 TARGET_ROLE_READ_ONLY
             },
             database,
+            unreadable_secret: unreadable_secret.map(str::to_string),
             in_force,
         }
     }
@@ -761,18 +826,28 @@ impl ProxyTargetRow {
                 port: Some(database.port),
                 r#type,
                 role,
-                // A registration this service has not finished putting in force is still
+                // A proxy logs in to the database with the credentials in the secret its
+                // `Auth` names: one it may not read leaves the target unavailable for that
+                // reason, and no passage of time puts the registration in force. Otherwise
+                // a registration this service has not finished putting in force is still
                 // `registering`; only the clock moves it on, and "if the State is
                 // AVAILABLE, a description is not included"
                 // (`TargetHealth$Description`).
-                target_health: Some(TargetHealth {
-                    state: Some(if self.in_force {
-                        TARGET_STATE_AVAILABLE.to_string()
-                    } else {
-                        TARGET_STATE_REGISTERING.to_string()
-                    }),
-                    reason: None,
-                    description: None,
+                target_health: Some(match self.unreadable_secret {
+                    Some(secret_arn) => TargetHealth {
+                        state: Some(TARGET_STATE_UNAVAILABLE.to_string()),
+                        reason: Some(TARGET_HEALTH_REASON_AUTH_FAILURE.to_string()),
+                        description: Some(unreadable_secret_description(&secret_arn)),
+                    },
+                    None => TargetHealth {
+                        state: Some(if self.in_force {
+                            TARGET_STATE_AVAILABLE.to_string()
+                        } else {
+                            TARGET_STATE_REGISTERING.to_string()
+                        }),
+                        reason: None,
+                        description: None,
+                    },
                 }),
             },
             None => DBProxyTarget {

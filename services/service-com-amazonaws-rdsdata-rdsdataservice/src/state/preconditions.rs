@@ -157,6 +157,14 @@ pub async fn admit<Eng: Send + Sync + 'static>(
     let addressed = require_shape(call)?;
     super::authorization::authorize(engine, ctx, call.operation, call.resource_arn)
         .map_err(Refusal::AccessDenied)?;
+    // A call authenticates with the SECRET it names, so reading that secret is part of
+    // what the CALLER is authorized for: a caller whose policies do not entitle it to the
+    // secret cannot make the call, whatever it may do on the cluster
+    // (`super::authorization::SECRET_READ_ACTION`). Decided here, beside the action on the
+    // cluster and before anything is resolved, so a refused caller learns nothing about
+    // the cluster, the secret or the statement.
+    super::authorization::authorize_secret_read(engine, ctx, call.secret_arn)
+        .map_err(Refusal::AccessDenied)?;
     // The databases this service already holds for the cluster are read BEFORE anything
     // is awaited, so the chain takes this service's own lock once and never holds it
     // across an await point.
