@@ -15981,6 +15981,7 @@ version = "0.1.0"
 dependencies = [
  "aes",
  "aes-gcm",
+ "automod",
  "aws-credential-types",
  "aws-emulator-build-support",
  "aws-emulator-emulator-telemetry",

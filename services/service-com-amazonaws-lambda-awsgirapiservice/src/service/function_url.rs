@@ -45,8 +45,8 @@
 //! speaks for nobody, so the only `Principal` element that can name it is the wildcard — which
 //! is what makes such an endpoint PUBLIC exactly while the function's resource-based policy
 //! grants the invocation to everyone. A policy whose grants all name a principal, and a
-//! function with no policy at all, admit no anonymous caller and refuse it
-//! `403 {"Message":"Forbidden"}`.
+//! function with no policy at all, admit no anonymous caller and refuse it the URL
+//! authorizer's whole `403` document ([`AUTHORIZER_FORBIDDEN_MESSAGE`]).
 
 //! ## What this plane reads of the configuration, and what it does not
 //!
@@ -1070,13 +1070,15 @@ fn refusal_document(body: ::serde_json::Value, error_type: &str) -> RtResponse {
     response
 }
 
-/// The refusal an endpoint gives a caller it does not admit: `403 {"Message":"Forbidden"}`,
-/// naming the class of the refusal and the request it refused.
+/// The refusal the URL's OWN AUTHORIZER gives a caller the authorization decision does not
+/// admit: the whole fixed document [`AUTHORIZER_FORBIDDEN_MESSAGE`], naming the class of the
+/// refusal and the request it refused.
 ///
 /// The member is spelled `Message` here and `message` on the failures above because that is
 /// how the two are answered — the authorization refusal of a Lambda front door carries the
-/// capitalised member and the fixed sentence [`FORBIDDEN_MESSAGE`], with nothing of the
-/// request or the policy named in it.
+/// capitalised member and a sentence that is fixed WHOLE, with nothing of the request, the
+/// caller or the policy named in it: the authorizer says that the request was not authorized
+/// and where an operator reads up on why, and never which grant was missing.
 ///
 /// Two headers name the refusal, exactly as a served answer names the request it answered
 /// ([`served`]): the CLASS of the failure, which for a caller no policy admits is the common
@@ -1086,14 +1088,28 @@ fn refusal_document(body: ::serde_json::Value, error_type: &str) -> RtResponse {
 /// plane minted for the request; a refusal taken before a request reached the plane names a
 /// fresh one, because a front door assigns one to every request it answers.
 ///
-/// It is the ONE wording of that refusal for every caller the endpoint turns away without
-/// saying more — the AUTHORIZATION this plane takes on the function's own policy
-/// ([`FunctionUrlPlane::admits_the_caller`]), and the AUTHENTICATION of a caller that
-/// presented no signature at all, through the seam that words a refusal taken before this
-/// plane could run ([`super::function_url_refusal`]). A caller whose SIGNATURE is what did
-/// not hold is told that much beside it ([`signature_refused`]).
+/// It is the ONE wording of every AUTHORIZATION refusal this plane takes on the function's
+/// own policy ([`FunctionUrlPlane::admits_the_caller`]). A caller the emulator did not
+/// AUTHENTICATE never reached an authorization decision at all, so it reads the front door's
+/// own shorter refusal instead ([`unauthenticated`]), and a caller whose SIGNATURE is what
+/// did not hold is told that much beside it ([`signature_refused`]).
 pub(super) fn forbidden(request_id: Option<&str>) -> RtResponse {
-    let mut response = refused(request_id);
+    access_denied(request_id, AUTHORIZER_FORBIDDEN_MESSAGE)
+}
+
+/// The refusal a caller the emulator did not AUTHENTICATE reads, through the seam that words
+/// a refusal taken before this plane could run ([`super::function_url_refusal`]): the front
+/// door's own [`FORBIDDEN_MESSAGE`], which names nothing of the request and, unlike the
+/// authorizer's above, points at no troubleshooting — no authorization decision was reached
+/// for a request that presented no credential the emulator could judge.
+pub(super) fn unauthenticated() -> RtResponse {
+    access_denied(None, FORBIDDEN_MESSAGE)
+}
+
+/// One `403` of this endpoint that is a decision about WHO the caller is: the sentence it
+/// carries, and the class every such refusal belongs to ([`FORBIDDEN_ERROR_TYPE`]).
+fn access_denied(request_id: Option<&str>, message: &str) -> RtResponse {
+    let mut response = refused(request_id, message);
     response
         .headers_mut()
         .insert(ERROR_TYPE_HEADER, FORBIDDEN_ERROR_TYPE);
@@ -1101,16 +1117,17 @@ pub(super) fn forbidden(request_id: Option<&str>) -> RtResponse {
 }
 
 /// The refusal the endpoint gives a PREFLIGHT whose origin or method the URL's own `Cors`
-/// settings do not admit ([`cors`]): the same `403` sentence, naming the request it refused
-/// and NOT the access error above — a preflight the configuration does not cover is the CORS
-/// layer's own answer rather than a decision about who the caller is.
+/// settings do not admit ([`cors`]): the front door's own `403` sentence, naming the request
+/// it refused and NOT the access error above — a preflight the configuration does not cover
+/// is the CORS layer's own answer rather than a decision about who the caller is, so it
+/// carries neither that class nor the authorizer's pointer at authorization troubleshooting.
 pub(super) fn refused_preflight() -> RtResponse {
-    refused(None)
+    refused(None, FORBIDDEN_MESSAGE)
 }
 
-/// The `403 {"Message":"Forbidden"}` body and the request id both refusals carry.
-fn refused(request_id: Option<&str>) -> RtResponse {
-    let body = ::serde_json::json!({ FORBIDDEN_MEMBER: FORBIDDEN_MESSAGE }).to_string();
+/// The `403` body `message` is answered in, and the request id every refusal carries.
+fn refused(request_id: Option<&str>, message: &str) -> RtResponse {
+    let body = ::serde_json::json!({ FORBIDDEN_MEMBER: message }).to_string();
     let mut response = RtResponse::new(plane_status(FORBIDDEN_STATUS), SdkBody::from(body));
     let named = request_id.map_or_else(crate::state::mint_request_id, str::to_string);
     response
@@ -1130,10 +1147,22 @@ const ERROR_TYPE_HEADER: &str = "x-amzn-errortype";
 /// error, which is the failure an authorization decision that admitted nobody is.
 const FORBIDDEN_ERROR_TYPE: &str = "AccessDeniedException";
 
-/// The status and the sentence a caller the endpoint does not admit is refused with.
+/// The status and the sentence a caller the endpoint's own front door turns away is refused
+/// with, before any authorization decision is reached for it.
 const FORBIDDEN_STATUS: u16 = 403;
 /// See [`FORBIDDEN_STATUS`].
 const FORBIDDEN_MESSAGE: &str = "Forbidden";
+
+/// The whole sentence the URL's own AUTHORIZER refuses a caller the authorization decision
+/// does not admit with: the word above and the fixed troubleshooting pointer AWS appends to
+/// it, which is where an operator reading a refused request's body is sent to find out why a
+/// function URL did not admit a caller
+/// (<https://docs.aws.amazon.com/lambda/latest/dg/urls-auth.html>, the page the sentence
+/// names). Fixed WHOLE: no part of it is taken from the request, the caller or the policy
+/// that did not admit it.
+const AUTHORIZER_FORBIDDEN_MESSAGE: &str =
+    "Forbidden. For troubleshooting Function URL authorization issues, see: \
+     https://docs.aws.amazon.com/lambda/latest/dg/urls-auth.html";
 
 /// A status this plane answers with. Every call site passes a constant or a status
 /// [`mapped_result`] already held to the HTTP range, so the conversion cannot fail.

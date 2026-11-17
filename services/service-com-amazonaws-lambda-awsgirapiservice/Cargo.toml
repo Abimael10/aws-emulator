@@ -297,6 +297,9 @@ libc = "0.2"
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# The one integration-test target is rooted at tests/all/main.rs, which declares one module
+# per suite file under tests/all/ rather than listing them by hand.
+automod = { workspace = true }
 # The VPC, subnets and security groups a function's attachment is asserted against are
 # created through Amazon EC2's OWN API in the VPC-attachment tests, and the interfaces
 # Lambda stood up are read back through its `DescribeNetworkInterfaces`: this is the client

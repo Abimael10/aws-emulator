@@ -12,8 +12,8 @@
 //! * a request presenting NO credential is authenticated by nothing and speaks for nobody, so
 //!   the only `Principal` element that can name it is the wildcard — a policy whose grants all
 //!   name a principal, a grant of another action, a grant scoped to the other `AuthType`, and
-//!   no policy at all each admit it nowhere, and it is refused `403 {"Message":"Forbidden"}`
-//!   with nothing of the function run for it;
+//!   no policy at all each admit it nowhere, and it is refused the URL authorizer's own `403`
+//!   document with nothing of the function run for it;
 //! * a request PRESENTING a credential is served by the mounting that declares the SigV4
 //!   scheme, so the emulator verifies that credential and a signature it cannot verify is
 //!   turned away before the endpoint decides anything; a verified credential then speaks for
@@ -38,7 +38,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::function_url_data_plane::{
-    control, given_configured_url, given_function, grant, router_on, send, Answer, Endpoint,
+    control, given_configured_url, given_function, grant, router_on, send, statement, Answer,
+    Endpoint,
 };
 
 /// Where the function operations are bound (`POST /2015-03-31/functions`).
@@ -55,8 +56,21 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
      Credential=emulator-test-key/20260101/us-east-1/lambda/aws4_request, \
      SignedHeaders=host, Signature=not-verified";
 
-/// The body Lambda's own front door answers a caller it does not admit with.
-const FORBIDDEN_BODY: &str = r#"{"Message":"Forbidden"}"#;
+/// The body the URL's own AUTHORIZER answers a caller the authorization decision does not
+/// admit with: the one sentence this target states once
+/// ([`crate::function_url_data_plane::AUTHORIZER_FORBIDDEN_MESSAGE`]), in the member the
+/// refusal carries it in. The document and the class of request it covers are asserted in
+/// `function_url_authorizer_refusal`.
+fn authorizer_forbidden_body() -> String {
+    json!({ "Message": crate::function_url_data_plane::AUTHORIZER_FORBIDDEN_MESSAGE }).to_string()
+}
+
+/// The body Lambda's own front door answers a caller it did not AUTHENTICATE with, from the
+/// sentence this target states once
+/// ([`crate::function_url_data_plane::FRONT_DOOR_FORBIDDEN_MESSAGE`]).
+fn front_door_forbidden_body() -> String {
+    json!({ "Message": crate::function_url_data_plane::FRONT_DOOR_FORBIDDEN_MESSAGE }).to_string()
+}
 
 /// The class that refusal names in `x-amzn-ErrorType`: the common AWS access error, which is
 /// what AWS answers a function URL request no policy admits.
@@ -82,16 +96,6 @@ const INVOKE_FUNCTION_URL: &str = "lambda:InvokeFunctionUrl";
 
 /// The action the Lambda API's `Invoke` is granted under, which is NOT the endpoint's.
 const INVOKE_FUNCTION: &str = "lambda:InvokeFunction";
-
-/// One statement `AddPermission` is asked for.
-fn statement(sid: &str, action: &str, principal: &str, auth_type: &str) -> Value {
-    json!({
-        "StatementId": sid,
-        "Action": action,
-        "Principal": principal,
-        "FunctionUrlAuthType": auth_type,
-    })
-}
 
 /// One request to `endpoint`, carrying a credential or carrying none.
 async fn request(
@@ -121,8 +125,8 @@ struct Row {
 }
 
 /// RULE: a `NONE` function URL admits exactly the caller the function's resource-based policy
-/// allows the endpoint's own action for, and refuses every other caller Lambda's own
-/// `403 {"Message":"Forbidden"}` with nothing of the function run.
+/// allows the endpoint's own action for, and refuses every other caller with the URL
+/// authorizer's own `403` document and nothing of the function run.
 #[tokio::test]
 async fn a_none_endpoint_admits_the_caller_its_policy_names() {
     let engine = Arc::new(engine::InMemoryEngine::new());
@@ -225,7 +229,7 @@ async fn a_none_endpoint_admits_the_caller_its_policy_names() {
         } else {
             assert_eq!(
                 answer.text(),
-                FORBIDDEN_BODY,
+                authorizer_forbidden_body(),
                 "case {:?}: expected the endpoint's refusal and nothing of the function, got {}",
                 row.case,
                 answer.summary()
@@ -299,7 +303,7 @@ async fn the_policy_of_the_qualifier_the_url_is_attached_to_decides() {
     let refused = request(&router, &endpoint, false).await;
     assert_eq!(
         (refused.status, refused.text()),
-        (403, FORBIDDEN_BODY.to_string()),
+        (403, authorizer_forbidden_body()),
         "case \"a function-level grant on an alias-attached URL\": expected the refusal, got {}",
         refused.summary()
     );
@@ -362,8 +366,8 @@ async fn a_credential_presented_to_a_public_endpoint_is_verified() {
     .await;
     assert_eq!(
         (unverifiable.status, unverifiable.text()),
-        (403, FORBIDDEN_BODY.to_string()),
-        "case \"a credential that does not verify\": expected the endpoint's refusal, got {}",
+        (403, front_door_forbidden_body()),
+        "case \"a credential that does not verify\": expected the front door's refusal, got {}",
         unverifiable.summary()
     );
 

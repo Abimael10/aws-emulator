@@ -59,6 +59,21 @@ const HANDLER: &str = "lambda_function.lambda_handler";
 /// the CLOCK, so nothing here sleeps on the emulator's behalf.
 const SLACK: Duration = Duration::from_millis(200);
 
+/// The whole sentence the URL's own authorizer refuses an unadmitted caller with: the word
+/// the front door refuses with and the fixed troubleshooting pointer AWS appends to it for an
+/// authorization decision taken at a function URL
+/// (<https://docs.aws.amazon.com/lambda/latest/dg/urls-auth.html>, the page it names). Stated
+/// once for this whole test target, and asserted over the class it covers in
+/// `function_url_authorizer_refusal`.
+pub(crate) const AUTHORIZER_FORBIDDEN_MESSAGE: &str =
+    "Forbidden. For troubleshooting Function URL authorization issues, see: \
+     https://docs.aws.amazon.com/lambda/latest/dg/urls-auth.html";
+
+/// The sentence the FRONT DOOR refuses a caller it did not AUTHENTICATE with: that caller
+/// reached no authorization decision, so it is told nothing of authorization. Stated once
+/// beside the authorizer's above, so the two cannot drift independently.
+pub(crate) const FRONT_DOOR_FORBIDDEN_MESSAGE: &str = "Forbidden";
+
 /// The account id every emulator ARN carries (`engine::EMULATOR_ACCOUNT_ID`).
 const ACCOUNT: &str = "000000000000";
 
@@ -225,6 +240,18 @@ async fn given_url(
         .await;
     }
     endpoint
+}
+
+/// One statement `AddPermission` is asked for: the action `action` granted to `principal`
+/// for the function-URL `auth_type`, under the statement id `sid`. Stated once for this whole
+/// test target, beside the call that asks for it.
+pub(crate) fn statement(sid: &str, action: &str, principal: &str, auth_type: &str) -> Value {
+    json!({
+        "StatementId": sid,
+        "Action": action,
+        "Principal": principal,
+        "FunctionUrlAuthType": auth_type,
+    })
 }
 
 /// `AddPermission` on the function `function` names, at `qualifier`.
@@ -1157,7 +1184,7 @@ async fn a_none_endpoint_admits_the_public_only_while_the_policy_grants_it() {
             let document = answer.json();
             assert_eq!(
                 document,
-                json!({ "Message": "Forbidden" }),
+                json!({ "Message": AUTHORIZER_FORBIDDEN_MESSAGE }),
                 "case {case:?}: expected the endpoint's refusal, got {}",
                 answer.text()
             );

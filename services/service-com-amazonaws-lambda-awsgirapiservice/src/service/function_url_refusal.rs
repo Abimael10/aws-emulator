@@ -7,9 +7,11 @@
 //! only", so the mounting that serves it declares the SigV4 scheme and the emulator refuses
 //! an unsigned request — or one whose signature does not verify — before the plane runs
 //! ([`super::function_url`]). What a CLIENT of that endpoint is then told is the front
-//! door's: the sentence AWS's Lambda front door answers a caller it does not admit with,
-//! `403 {"Message":"Forbidden"}`, which is the same answer that endpoint gives a caller its
-//! resource-based policy does not admit.
+//! door's: the sentence AWS's Lambda front door answers a caller it did not authenticate
+//! with, `403 {"Message":"Forbidden"}`. It is the front door's own wording and not the URL
+//! AUTHORIZER's: a request carrying no credential the emulator could judge reached no
+//! authorization decision, so it is told nothing of authorization — the longer document the
+//! authorizer refuses an unadmitted caller with is [`super::function_url::forbidden`]'s.
 //!
 //! The emulator's authentication layer words its refusal in the structural vocabulary of an
 //! API error instead (an error code and a `message` member), because that is the right answer
@@ -130,7 +132,7 @@ impl<Eng: Send + Sync + 'static> ErasedServiceDefinition for FunctionUrlRefusals
 impl<Eng: Send + Sync + 'static> FunctionUrlRefusals<Eng> {
     fn unadmitted(&self, req: &RtRequest, code: &str) -> RtResponse {
         if !presented_a_signature(req) {
-            return super::function_url::forbidden(None);
+            return super::function_url::unauthenticated();
         }
         let serving = self.inner.identity().signing_name();
         if scoped_elsewhere(req, serving) {
@@ -155,7 +157,7 @@ impl<Eng: Send + Sync + 'static> FunctionUrlRefusals<Eng> {
             }
             // Every other way a signature does not hold: the caller reads the front door's
             // own refusal, rather than a reason this emulator worded for it.
-            _ => super::function_url::forbidden(None),
+            _ => super::function_url::unauthenticated(),
         }
     }
 }
