@@ -258,6 +258,34 @@ const TEMPLATES: &[PolicyTemplate] = &[
             resources: &["arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/${keyId}"],
         }],
     },
+    // `SSMParameterReadPolicy` ("gives permission to read a parameter from Systems Manager
+    // Parameter Store") is granted in TWO statements, as the published template states it:
+    // listing the parameters of the account is not addressable per parameter, so that one
+    // action is granted over every resource, while reading a parameter's value and its history
+    // is granted over the one parameter the `ParameterName` parameter names. The parameter name
+    // is appended to the `parameter/` prefix the published template writes, so a name the
+    // declaration states WITHOUT a leading slash — which is the form this template is for —
+    // scopes the grant to exactly that parameter.
+    PolicyTemplate {
+        name: "SSMParameterReadPolicy",
+        statements: &[
+            Statement {
+                actions: &["ssm:DescribeParameters"],
+                resources: EVERY_RESOURCE,
+            },
+            Statement {
+                actions: &[
+                    "ssm:GetParameters",
+                    "ssm:GetParameter",
+                    "ssm:GetParameterHistory",
+                ],
+                resources: &[
+                    "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/\
+                     ${parameterName}",
+                ],
+            },
+        ],
+    },
     PolicyTemplate {
         name: "AWSSecretsManagerGetSecretValuePolicy",
         statements: &[Statement {

@@ -844,10 +844,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // CloudFormation has already refused for a reference it could not resolve: that
         // refusal is the one diagnostic for every property whose value it took away, and
         // reporting a property as missing instead would name the symptom rather than the
-        // cause.
+        // cause. A property whose value has merely not LANDED yet — one reading an attribute
+        // of a resource this operation is about to create — is a property the declaration
+        // carries, and the stage is given it as such
+        // ([`crate::state::StoredStack::declarations_to_validate`]).
         let property_failure = (input.disable_validation != Some(true)
             && unresolved_cross_stack.is_none())
-            .then(|| crate::state::property_validation::failure(&stack.current_resources()))
+            .then(|| {
+                crate::state::property_validation::failure(&stack.declarations_to_validate())
+            })
             .flatten();
         let refused_before_validation = transform_failure.or(unresolved_cross_stack);
         // The OTHER pre-deployment validation stage, over the same `DisableValidation`

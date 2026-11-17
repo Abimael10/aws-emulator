@@ -952,6 +952,81 @@ impl StoredStack {
         }
     }
 
+    /// The declarations of the deployment in flight as the PRE-DEPLOYMENT property validation
+    /// judges them: the resolved property document of each resource, with every property
+    /// whose stated value reads an attribute nothing publishes YET carried as the member it
+    /// still is.
+    ///
+    /// The document a deployment holds for a resource is the request the owning service is
+    /// asked to create it with, so a value this service cannot evaluate is not in it
+    /// ([`template::resolve_properties`] drops it). A value that reads an attribute of a
+    /// resource the SAME operation creates is not one it cannot evaluate, though: it is one
+    /// whose value has not landed yet — the `Data` a custom resource's provider answers with,
+    /// or a value the owning service fills in as it brings a resource up — and the deployment
+    /// resolves the declaration once more, against the records as they then stand, before the
+    /// resource that reads it is created ([`Self::resolve_deferred_declarations`]). So the
+    /// stage that judges a declaration against its type's contract
+    /// ([`super::property_validation`]) is given those members back: a property the
+    /// declaration STATES is one it carries, whether or not its value is in hand, and a read
+    /// that is still unresolved once the records are settled is reported then, on the resource
+    /// that reads it, as the attribute error it is.
+    ///
+    /// The value put back is no value of this service's invention — nothing deploys this
+    /// document, and nothing reads a value out of it: what the stage asks of it is which
+    /// members the declaration carries.
+    pub fn declarations_to_validate(&self) -> Vec<StoredResource> {
+        let mut records = self.current_resources();
+        let Some((declared, parameters)) = self.template_scope() else {
+            return records;
+        };
+        let (imports, stack_outputs) = match &self.pending_deployment {
+            Some(deployment) => (deployment.imports.clone(), deployment.stack_outputs.clone()),
+            None => (self.imports.clone(), super::stack_outputs::Values::new()),
+        };
+        let in_force: BTreeMap<String, StoredResource> = records
+            .iter()
+            .map(|resource| (resource.logical_id.clone(), resource.clone()))
+            .collect();
+        let parameter_types = ssm_parameters::parameter_types_in_force(&declared);
+        let mut budget = template::Budget::new();
+        let deferred = template::deferred_property_reads(
+            &declared,
+            &template::Scope {
+                stack: template::StackScope {
+                    region: &self.region,
+                    stack_name: &self.stack_name,
+                    stack_id: &self.stack_id,
+                    notification_arns: &self.notification_arns,
+                },
+                parameters: &parameters,
+                parameter_types: &parameter_types,
+                resources: &in_force,
+                mappings: &declared.mappings,
+                conditions: &declared.conditions,
+                imports: &imports,
+                stack_outputs: &stack_outputs,
+            },
+            &mut budget,
+        );
+        for record in records.iter_mut() {
+            let Some(names) = deferred.get(&record.logical_id) else {
+                continue;
+            };
+            if !record.properties.is_object() {
+                record.properties = ::serde_json::Value::Object(::serde_json::Map::new());
+            }
+            let Some(document) = record.properties.as_object_mut() else {
+                continue;
+            };
+            for name in names {
+                document
+                    .entry(name.clone())
+                    .or_insert(::serde_json::Value::Null);
+            }
+        }
+        records
+    }
+
     /// The stack's `Description`: the template's own `Description`, which is where
     /// CloudFormation takes both `Stack$Description` and
     /// `StackSummary$TemplateDescription` from.

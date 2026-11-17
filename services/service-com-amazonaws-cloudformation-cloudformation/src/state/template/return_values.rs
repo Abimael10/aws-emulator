@@ -1718,6 +1718,115 @@ pub fn unresolved_attributes(
     unresolved
 }
 
+/// The properties of each resource of `template` whose stated value READS an attribute that
+/// is not published YET, keyed by logical id.
+///
+/// Such a property has a value — the one the resource it names will publish — and the
+/// deployment resolves it before the resource carrying it is created
+/// ([`crate::state::StoredStack::resolve_deferred_declarations`], driven by
+/// [`crate::state::provisioning::deferred`]). What it does NOT have is a value yet: the
+/// attributes a resource publishes are the ones its record carries, and a resource whose own
+/// creation is still in flight — a custom resource, whose attributes are the `Data` its
+/// provider answers with, or a resource whose owning service fills them in as it brings it up
+/// — publishes none of them at the instant the template is deployed. So the resolved document
+/// a deployment holds for it carries no such member at all, and anything that judges that
+/// document against the type's contract has to know which members are missing from it only
+/// because their value has not landed ([`crate::state::property_validation`]).
+///
+/// Judged by the SAME relation [`unresolved_attributes`] reads — an attribute the record of
+/// the resource it is read off does not carry — over a walk of the same shape and the same
+/// budget. The difference is only WHEN each is asked: this one before the deployment starts,
+/// where an unpublished attribute is one still to come, and that one once the records are
+/// settled, where it is one the resource does not have.
+pub fn deferred_property_reads(
+    template: &Template,
+    scope: &Scope<'_>,
+    budget: &mut Budget,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let mut deferred: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for declared in &template.resources {
+        let Value::Object(members) = &declared.properties else {
+            continue;
+        };
+        let names: BTreeSet<String> = members
+            .iter()
+            .filter(|(_, value)| reads_an_unpublished_attribute(value, scope, 0, budget))
+            .map(|(name, _)| name.clone())
+            .collect();
+        if !names.is_empty() {
+            deferred.insert(declared.logical_id.clone(), names);
+        }
+    }
+    deferred
+}
+
+/// Whether `value` READS an attribute that is not published yet, in either spelling an
+/// attribute is read in: an `Fn::GetAtt`, and the `${Name.Attribute}` of an `Fn::Sub` source,
+/// "which is an `Fn::GetAtt` by another spelling"
+/// ([`super::substitution_names`] reads the variables of one).
+///
+/// Walked over the same document shape every other evaluation walks, and charged to the same
+/// budget, so a declaration cannot drive this deeper or longer than its own evaluation.
+fn reads_an_unpublished_attribute(
+    value: &Value,
+    scope: &Scope<'_>,
+    depth: usize,
+    budget: &mut Budget,
+) -> bool {
+    if depth > MAX_INTRINSIC_DEPTH || budget.spend(1).is_none() {
+        return false;
+    }
+    match value {
+        Value::Object(members) => {
+            if let Some(argument) = members.get("Fn::GetAtt").filter(|_| members.len() == 1) {
+                if let Some((logical_id, attribute)) = named_attribute(argument) {
+                    if is_unpublished(scope, &logical_id, &attribute) {
+                        return true;
+                    }
+                }
+            }
+            if let Some(argument) = members.get(FN_SUB).filter(|_| members.len() == 1) {
+                let source = match argument {
+                    Value::String(source) => Some(source.as_str()),
+                    Value::Array(arguments) => arguments.first().and_then(Value::as_str),
+                    _ => None,
+                };
+                if let Some(source) = source {
+                    for (name, path) in super::substitution_names(source) {
+                        let Some(attribute) = path
+                            .as_deref()
+                            .and_then(|path| path.split_once('.'))
+                            .map(|(_, attribute)| attribute.to_string())
+                        else {
+                            continue;
+                        };
+                        if is_unpublished(scope, &name, &attribute) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            members
+                .values()
+                .any(|member| reads_an_unpublished_attribute(member, scope, depth + 1, budget))
+        }
+        Value::Array(items) => items
+            .iter()
+            .any(|item| reads_an_unpublished_attribute(item, scope, depth + 1, budget)),
+        _ => false,
+    }
+}
+
+/// Whether the resource `logical_id` of `scope` carries no attribute `attribute` — `false`
+/// for a logical id the scope does not know at all, which is a reference to nothing rather
+/// than to an attribute nothing publishes.
+fn is_unpublished(scope: &Scope<'_>, logical_id: &str, attribute: &str) -> bool {
+    scope
+        .resources
+        .get(logical_id)
+        .is_some_and(|resource| !publishes_attribute(&resource.attributes, attribute))
+}
+
 /// The FIRST `Fn::GetAtt` of `value` naming an attribute the resource it names does not
 /// publish, as `(logical id, attribute)`.
 ///
@@ -1737,11 +1846,7 @@ fn missing_attribute(
         Value::Object(members) => {
             if let Some(argument) = members.get("Fn::GetAtt").filter(|_| members.len() == 1) {
                 if let Some((logical_id, attribute)) = named_attribute(argument) {
-                    let published = scope
-                        .resources
-                        .get(&logical_id)
-                        .map(|resource| publishes_attribute(&resource.attributes, &attribute));
-                    if published == Some(false) {
+                    if is_unpublished(scope, &logical_id, &attribute) {
                         return Some((logical_id, attribute));
                     }
                 }

@@ -548,6 +548,10 @@ mod sam_layer_version_references;
 mod sam_object_event_source;
 #[path = "all/sam_policies_shorthand.rs"]
 mod sam_policies_shorthand;
+// What the role the transform generates carries in the PROCESSED template: one expanded
+// `Policies` entry per entry the declaration states.
+#[path = "all/sam_processed_template_role_policies.rs"]
+mod sam_processed_template_role_policies;
 #[path = "all/sam_transform.rs"]
 mod sam_transform;
 #[path = "all/scan_and_registry_reads.rs"]

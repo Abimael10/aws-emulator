@@ -1332,7 +1332,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // refusal is the one diagnostic for every property whose value it took away.
             let property_failure = (input.disable_validation != Some(true)
                 && unresolved_cross_stack.is_none())
-                .then(|| crate::state::property_validation::failure(&stack.current_resources()))
+                .then(|| {
+                    crate::state::property_validation::failure(&stack.declarations_to_validate())
+                })
                 .flatten();
             if let Some(failure) = &property_failure {
                 stack.record_validation_failure(

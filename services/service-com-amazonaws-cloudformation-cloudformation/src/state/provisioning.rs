@@ -2103,6 +2103,44 @@ pub async fn reconcile(
             outcome.resources.push(resource);
             continue;
         }
+        // A resource whose declaration READS something a resource it depends on has not
+        // published yet is not acted on in this pass at all — whether this deployment would
+        // create it or the stack already has it. A CUSTOM RESOURCE's attributes are the `Data`
+        // its provider answers with, so a declaration naming one through `Fn::GetAtt` carries
+        // no value until THAT request's answer is in hand: acting on it now would ask the
+        // owning service for the previous answer's value, or for a document the template does
+        // not describe. It is held at a wait of its own
+        // ([`super::stabilising::Awaited::Deferred`]) and acted on by the pass that runs when
+        // those waits release ([`deferred::resume`]) — which is the order CloudFormation
+        // deploys a stack's resources in: "a resource that depends on another is scheduled only
+        // once that one has finished".
+        if awaits_a_dependency(&resource.logical_id, &stack.dependencies, &unpublished) {
+            unpublished.insert(resource.logical_id.clone());
+            // The record the stack already has, so a withheld resource keeps its identity and
+            // what its owning service reported about it while it waits; the declaration it is
+            // acted on with is resolved again by the pass that resumes it
+            // ([`super::StoredStack::resolve_deferred_declarations`]).
+            let held = previous
+                .iter()
+                .find(|existing| already_deployed(existing) && is_same_resource(existing, &resource));
+            let reported_state = match held {
+                Some(existing) => {
+                    carry_forward(existing, &mut resource);
+                    super::resource_status::UPDATE_IN_PROGRESS
+                }
+                None => super::resource_status::CREATE_IN_PROGRESS,
+            };
+            outcome.stabilising.push(Stabilising {
+                awaited: super::stabilising::Awaited::Deferred,
+                logical_id: resource.logical_id.clone(),
+                resource_type: resource.resource_type.clone(),
+                physical_resource_id: resource.physical_resource_id.clone(),
+                reported_state: reported_state.to_string(),
+                provider_request: None,
+            });
+            outcome.resources.push(resource);
+            continue;
+        }
         if let Some(existing) = previous
             .iter()
             .find(|existing| already_deployed(existing) && is_same_resource(existing, &resource))
@@ -2585,28 +2623,6 @@ pub async fn reconcile(
                     continue;
                 }
             }
-            outcome.resources.push(resource);
-            continue;
-        }
-        // A resource whose declaration reads something a resource it DEPENDS ON has not
-        // published yet is not created in this pass. A CUSTOM RESOURCE's attributes are the
-        // `Data` its provider answers with, so a declaration naming one through `Fn::GetAtt`
-        // is not resolved until that answer is in hand, and creating the resource now would
-        // ask its owning service for something the template does not describe. It is held at
-        // a wait of its own ([`super::stabilising::Awaited::Deferred`]) and created by the
-        // pass that runs when those waits release ([`deferred::resume`]) — which is the
-        // order CloudFormation creates a stack's resources in: "a resource that depends on
-        // another is scheduled only once that one has finished".
-        if awaits_a_dependency(&resource.logical_id, &stack.dependencies, &unpublished) {
-            unpublished.insert(resource.logical_id.clone());
-            outcome.stabilising.push(Stabilising {
-                awaited: super::stabilising::Awaited::Deferred,
-                logical_id: resource.logical_id.clone(),
-                resource_type: resource.resource_type.clone(),
-                physical_resource_id: resource.physical_resource_id.clone(),
-                reported_state: super::resource_status::CREATE_IN_PROGRESS.to_string(),
-                provider_request: None,
-            });
             outcome.resources.push(resource);
             continue;
         }

@@ -68,6 +68,13 @@ struct Resumption {
     /// The waits that are over because the resource they hold cannot be created: the
     /// declaration reads an attribute nothing publishes, or the wait ran out.
     failed: Vec<(super::super::stabilising::StabilisationBarrier, String)>,
+    /// The records the stack ALREADY has for the resources this pass acts on: what a
+    /// withheld resource the stack already holds is reconciled against, so a declaration
+    /// whose value has now landed is APPLIED to the resource that exists rather than created
+    /// a second time ([`reconcile`] reads the same relation for a deployment's own walk).
+    /// Only those resources, because what a walk's `previous` set does not re-declare it
+    /// removes.
+    deployed: Vec<StoredResource>,
 }
 
 /// Create the resources the deployments in flight on the stacks of `region` WITHHELD, now
@@ -126,7 +133,7 @@ async fn resume_pass(
             region,
             &resumption.provenance,
             resumption.create,
-            &[],
+            &resumption.deployed,
             None,
             Policies::Honoured,
         ))
@@ -298,6 +305,20 @@ fn resumption_of(
             }
         }
     }
+    // ...and the records the stack ALREADY holds for exactly those resources: a withheld
+    // resource the stack has is one whose declaration this pass APPLIES to it, which is what
+    // the walk reads its previous record for. Nothing else is in the set: what a walk's
+    // previous set does not re-declare, it removes.
+    let deployed: Vec<StoredResource> = stack
+        .resources
+        .iter()
+        .map(|held| held.resource.clone())
+        .filter(|held| {
+            resumed
+                .iter()
+                .any(|barrier| barrier.logical_id == held.logical_id)
+        })
+        .collect();
     // This pass's creations are CLAIMED while the lock is still held, so a pass running
     // beside it leaves them alone — the one place that mark is set, beside the one place it
     // is read above.
@@ -316,6 +337,7 @@ fn resumption_of(
         create,
         resumed,
         failed,
+        deployed,
     })
 }
 
