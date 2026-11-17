@@ -94,13 +94,18 @@ const SECRET_STRING: &str = "SecretString";
 const CURRENT_STAGE: &str = "AWSCURRENT";
 
 /// The head of the diagnostic a reference that cannot be honoured fails its resource with.
-const UNRESOLVED: &str = "Unable to resolve the dynamic reference";
+///
+/// `pub(crate)` so a sibling suite reading the same rule for another carrier compares against
+/// this one text rather than a second copy of it, which could drift from it.
+pub(crate) const UNRESOLVED: &str = "Unable to resolve the dynamic reference";
 
 /// The WHOLE reason a reference naming a `json-key` the secret's `SecretString` associates no
 /// value with fails its resource with: one fixed sentence, carrying nothing of the reference,
 /// the secret or the property, so a client classifying a deploy failure by its reason compares
 /// against a constant.
-const NO_VALUE_FOR_THE_JSON_KEY: &str =
+///
+/// `pub(crate)` for the reason [`UNRESOLVED`] is.
+pub(crate) const NO_VALUE_FOR_THE_JSON_KEY: &str =
     "Could not find a value associated with JSONKey in SecretString";
 
 /// The two stable halves of the refusal the OWNING SERVICE answers a resolved value it will

@@ -178,7 +178,10 @@ pub(crate) async fn ssm(
 }
 
 /// One Lambda restJson1 call, as its status, its headers and its parsed body.
-async fn lambda(
+///
+/// `pub(crate)` so a suite that reads or invokes a function a stack deployed calls this one
+/// rather than adding another copy: a suite that writes its own drifts from the others.
+pub(crate) async fn lambda(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,
@@ -204,7 +207,9 @@ async fn lambda(
 }
 
 /// What `GetFunctionConfiguration` reports for one function, with the status it answered.
-async fn reported_configuration(router: &MultiServiceRouter, name: &str) -> (u16, Value) {
+///
+/// `pub(crate)` for the reason [`lambda`] is.
+pub(crate) async fn reported_configuration(router: &MultiServiceRouter, name: &str) -> (u16, Value) {
     let (status, _, configuration) = lambda(
         router,
         "GET",
@@ -216,7 +221,9 @@ async fn reported_configuration(router: &MultiServiceRouter, name: &str) -> (u16
 }
 
 /// The environment variables one reported configuration carries, as the map a client reads.
-fn reported_environment(configuration: &Value) -> BTreeMap<String, String> {
+///
+/// `pub(crate)` for the reason [`lambda`] is.
+pub(crate) fn reported_environment(configuration: &Value) -> BTreeMap<String, String> {
     configuration
         .get("Environment")
         .and_then(|environment| environment.get("Variables"))
@@ -234,7 +241,9 @@ fn reported_environment(configuration: &Value) -> BTreeMap<String, String> {
 
 /// A trust policy letting Lambda assume the role, which is what an execution role has to carry
 /// for that service to be handed it.
-fn trust_policy() -> Value {
+///
+/// `pub(crate)` for the reason [`lambda`] is.
+pub(crate) fn trust_policy() -> Value {
     json!({
         "Version": "2012-10-17",
         "Statement": [{
