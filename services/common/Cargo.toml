@@ -69,6 +69,11 @@ aws-sdk-firehose = { version = "1", default-features = false }
 # the envelope rendered there is built from — taken from the SDK rather than re-declared,
 # for the same reason and with the same features left out.
 aws-sdk-dynamodbstreams = { version = "1", default-features = false }
+# `kms_key`: the in-process AWS KMS client a service RESOLVING a caller-supplied key
+# identifier asks `DescribeKey` through — whether this account and Region hold a key that
+# identifier names — built once here for every such service, with the same features left
+# out for the same reason.
+aws-sdk-kms = { version = "1", default-features = false }
 # `resolve_route_key` / `ROOT_PATH_SEGMENT`: the framework's own routing-key rule,
 # which this crate narrows rather than replaces.
 emulator-server = { workspace = true }

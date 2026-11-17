@@ -25,14 +25,16 @@
 //! serializes it through the model's `ValidationException` schema. `super`'s
 //! `InModelledEnvelope` is what puts it in front of every operation.
 //!
-//! # The one refusal that is NOT a `ValidationException`
+//! # The refusals that are NOT a `ValidationException`
 //!
-//! A tag map carrying more entries than `TagMap` admits is a bad request BODY rather
-//! than a member-level constraint failure, and Aurora DSQL answers it
-//! [`BAD_REQUEST_CODE`] with [`BAD_REQUEST_MESSAGE`] — an error its REST frontend
-//! answers before any operation's own errors are reachable, so there is no modelled
-//! shape to serialize. [`refusal_for`] declines it and the framework's refusal path,
-//! worded by `super`'s `override_refusal` from these same helpers, answers it.
+//! Two classes of bad request BODY are not member-level constraint failures, and Aurora
+//! DSQL answers both [`BAD_REQUEST_CODE`] — an error its REST frontend answers before any
+//! operation's own errors are reachable, so there is no modelled shape to serialize:
+//! a tag map carrying more entries than `TagMap` admits ([`BAD_REQUEST_MESSAGE`]), and a
+//! tag key or value outside the character set both tag shapes' `@pattern` admits
+//! ([`crate::state::TAG_CHARACTER_SET_MESSAGE`]). [`refusal_for`] declines each of them and
+//! the framework's refusal path, worded by `super`'s `override_refusal` from these same
+//! helpers, answers it.
 
 use ::aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use ::aws_smithy_schema::serde::SerdeError;
@@ -57,7 +59,7 @@ const TAG_MAP_MEMBER: &str = "tags";
 /// The error code Aurora DSQL refuses a malformed request body with, and the
 /// sentence it carries. Not a modelled shape: the service's REST frontend
 /// answers it before any operation's own errors are reachable.
-pub(super) const BAD_REQUEST_CODE: &str = "BadRequestException";
+pub(super) const BAD_REQUEST_CODE: &str = crate::state::BAD_REQUEST_CODE;
 /// See [`BAD_REQUEST_CODE`].
 const BAD_REQUEST_MESSAGE: &str = "Invalid request body";
 
@@ -77,11 +79,18 @@ const REASON_CANNOT_PARSE: &str = "cannotParse";
 
 /// How this service states a set of constraint violations.
 ///
-/// Two refusals, told apart by WHAT failed:
+/// Three refusals, told apart by WHAT failed:
 ///
 /// * a tag map over [`TAG_MAP_MAX_ENTRIES`] is a bad request body, so the answer
 ///   is [`BAD_REQUEST_CODE`] with [`BAD_REQUEST_MESSAGE`] — the whole batch is
 ///   refused and none of it is applied;
+/// * a tag key or value outside the character set both tag shapes' `@pattern`
+///   admits is the same class of bad body, answered with that same code and the
+///   sentence that class carries
+///   ([`crate::state::TAG_CHARACTER_SET_MESSAGE`]) — the one the handlers word a
+///   tag KEY with, which the walk below does not reach (codegen captures a map's
+///   value constraints, not its keys), so a request is refused the same way
+///   whichever half of the pair failed;
 /// * everything else is a `ValidationException` whose message is the AWS
 ///   envelope built from the member and its modelled constraint. DSQL's
 ///   construction states the requirement ONLY: it does not echo the rejected
@@ -99,6 +108,12 @@ pub(super) fn refused_for(violations: &[Violation]) -> Refused {
             message: BAD_REQUEST_MESSAGE.to_string(),
         };
     }
+    if violations.iter().any(is_outside_the_tag_character_set) {
+        return Refused {
+            code: BAD_REQUEST_CODE.to_string(),
+            message: crate::state::TAG_CHARACTER_SET_MESSAGE.to_string(),
+        };
+    }
     Refused {
         code: VALIDATION_EXCEPTION_CODE.to_string(),
         message: validation_envelope(violations),
@@ -109,6 +124,20 @@ pub(super) fn refused_for(violations: &[Violation]) -> Refused {
 fn is_tag_map_overflow(violation: &Violation) -> bool {
     violation.path.rsplit('.').next() == Some(TAG_MAP_MEMBER)
         && matches!(violation.kind, ViolationKind::MaxLength(max) if max == TAG_MAP_MAX_ENTRIES)
+}
+
+/// Whether `violation` is a tag key or value that left the character set its shape's
+/// `@pattern` admits.
+///
+/// The pattern is the only one declared anywhere under either member that carries
+/// caller-supplied tag text — the `tags` map's values and the `tagKeys` list's
+/// elements, each reported at a path that STARTS with that member
+/// (`tags.<key>`, `tagKeys.<n>.member`) — so a pattern violation under one of them is
+/// that character set and nothing else.
+fn is_outside_the_tag_character_set(violation: &Violation) -> bool {
+    let member = violation.path.split('.').next().unwrap_or_default();
+    matches!(violation.kind, ViolationKind::Pattern(_))
+        && (member == TAG_MAP_MEMBER || member == crate::state::TAG_KEYS_MEMBER)
 }
 
 /// `1 validation error detected: <clause>` / `N validation errors detected:
@@ -248,10 +277,13 @@ fn refusal_for<O: Operation>(
 }
 
 /// `violations` as the modelled `ValidationException` for fields that did not
-/// validate, or `None` when there is none to state — an empty set, or the tag-map
-/// overflow [`refused_for`] answers as a bad request body instead.
+/// validate, or `None` when there is none to state — an empty set, and the two tag
+/// refusals [`refused_for`] answers as a bad request body instead.
 fn fields_that_did_not_validate(violations: &[Violation]) -> Option<ValidationException> {
-    if violations.is_empty() || violations.iter().any(is_tag_map_overflow) {
+    if violations.is_empty()
+        || violations.iter().any(is_tag_map_overflow)
+        || violations.iter().any(is_outside_the_tag_character_set)
+    {
         return None;
     }
     Some(ValidationException {
@@ -358,6 +390,39 @@ mod tests {
             refused_for(&[overflow]).code,
             BAD_REQUEST_CODE,
             "case a tag map over its maximum: must be the bad-request body code"
+        );
+    }
+
+    /// A tag key or value outside its character set is the same class of bad body,
+    /// stated with the sentence that class carries — wherever under the two tag
+    /// members the walk reports it, and not for another member's pattern.
+    #[test]
+    fn a_tag_outside_its_character_set_is_the_bad_request_body_sentence() {
+        let pattern = ViolationKind::Pattern("^[a-zA-Z0-9_.:/=+\\-@ ]*$".to_string());
+        for path in ["tags.bad!key", "tags", "tagKeys.1.member"] {
+            let outside = violation(path, pattern.clone());
+            assert!(
+                fields_that_did_not_validate(std::slice::from_ref(&outside)).is_none(),
+                "case {path:?}: must not be a ValidationException"
+            );
+            let refused = refused_for(std::slice::from_ref(&outside));
+            assert_eq!(
+                refused.code, BAD_REQUEST_CODE,
+                "case {path:?}: expected the bad-request body code, got {:?}",
+                refused.code
+            );
+            assert_eq!(
+                refused.message,
+                crate::state::TAG_CHARACTER_SET_MESSAGE,
+                "case {path:?}: expected the character-set sentence, got {:?}",
+                refused.message
+            );
+        }
+        let elsewhere = violation("identifier", pattern);
+        assert_eq!(
+            refused_for(std::slice::from_ref(&elsewhere)).code,
+            VALIDATION_EXCEPTION_CODE,
+            "case a pattern on another member: must stay a ValidationException"
         );
     }
 

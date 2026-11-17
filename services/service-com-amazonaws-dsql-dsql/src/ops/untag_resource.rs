@@ -183,6 +183,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // A key outside the character set `TagKey`'s pattern admits names no tag this
+        // service could be holding, so a request carrying one is refused in full on
+        // the same terms the writes are refused on, with the sentence that class
+        // carries — ahead of the ARN read, exactly as `TagResource` refuses it, so one
+        // rule is one refusal on both operations. Checked here as well as in the
+        // boundary walk, because the walk reports it as a bare pattern violation.
+        crate::state::validate_tag_character_set(input.tag_keys.iter().map(String::as_str))?;
+
         // The ARN is read BEFORE anything is looked up: `Arn`'s modelled pattern is
         // only `^arn:.+$`, so a value naming no Aurora DSQL resource at all reaches
         // this handler, and that is a bad request rather than a resource that happens

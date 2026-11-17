@@ -3,14 +3,22 @@
 //! What a created Aurora DSQL change data capture (CDC) stream settles into, end
 //! to end over the wire.
 //!
-//! RULE: a stream's delivery target being unusable is stream STATE, not a refusal
-//! of the create — so `CreateStream` is served, and the clock settles the stream
-//! into `ACTIVE` only when the services that OWN its `targetDefinition` answered
-//! for it. When one of them answers that it does not, the stream settles into
-//! `FAILED` and `GetStream` reports a `statusReason` whose `error` is the
-//! `StreamFailureErrorCode` that answer names, beside the instant the status was
-//! reached. A target nothing answered about is left to settle `ACTIVE`: a failure
-//! has to be grounded in what the owner of the target said about it.
+//! RULE: a stream's delivery DESTINATION being unusable is stream STATE, not a
+//! refusal of the create — so `CreateStream` is served, and the clock settles the
+//! stream into `ACTIVE` only when the service that OWNS the destination its
+//! `targetDefinition` names answered for it. When it answers that it does not, the
+//! stream settles into `FAILED` and `GetStream` reports a `statusReason` whose
+//! `error` is the `StreamFailureErrorCode` that answer names, beside the instant the
+//! status was reached. A destination nothing answered about is left to settle
+//! `ACTIVE`: a failure has to be grounded in what the owner of the destination said
+//! about it.
+//!
+//! SECOND RULE, asserted by the last suite here: the other half of a target is not
+//! like that. The delivery RUNS AS the `roleArn` the target names, so that role is
+//! resolved against this account's IAM at request time and a value IAM holds no role
+//! under — or a role whose trust policy does not admit this service — is REFUSED
+//! (HTTP 400 `ValidationException`, `reason` `fieldValidationFailed`, one `fieldList`
+//! entry naming the role field) and no stream is minted at all.
 //!
 //! The emulator here holds Aurora DSQL beside the two services a target names —
 //! Amazon Kinesis, which owns the data stream it addresses, and IAM, which holds
@@ -19,18 +27,18 @@
 //! services' own APIs. Every call goes the whole way round through
 //! `MultiServiceRouter::dispatch`.
 //!
-//! The table asserts the rule over a CLASS of targets rather than one request: a
+//! The tables assert the rules over a CLASS of targets rather than one request: a
 //! destination the delivery service holds, one it never held, one written for
-//! another Region and one written for another account; a role whose trust policy
-//! admits this service, one admitting another service, one under a path, and one
-//! IAM holds nothing under — and a row where BOTH halves are unusable, which pins
-//! which of them the stream reports.
+//! another Region and one written for another account; and a role whose trust policy
+//! admits this service, one admitting it under an IAM path, one admitting another
+//! service only, and one IAM holds nothing under — crossed, for the refusal, with a
+//! destination that is itself unusable, which pins which half of the target decides.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_dsql_dsql::ops::types::STREAM_FAILURE_ERROR_CODE_VALUES;
 use service_com_amazonaws_dsql_dsql::state::{
-    STREAM_FAILURE_KINESIS_STREAM_NOT_FOUND, STREAM_FAILURE_ROLE_ACCESS_DENIED,
-    STREAM_STATUS_ACTIVE, STREAM_STATUS_CREATING, STREAM_STATUS_DELETING, STREAM_STATUS_FAILED,
+    STREAM_FAILURE_KINESIS_STREAM_NOT_FOUND, STREAM_STATUS_ACTIVE, STREAM_STATUS_CREATING,
+    STREAM_STATUS_DELETING, STREAM_STATUS_FAILED,
 };
 
 use crate::harness::{wait_for_the_clock, xml_text, Answer, Dsql};
@@ -120,13 +128,6 @@ fn target_cases() -> Vec<TargetCase> {
             reason: None,
         },
         TargetCase {
-            name: "the same destination, a role IAM holds nothing under",
-            destination: Destination::Held,
-            pass: Pass::IamHoldsNoSuchRole,
-            settles_into: STREAM_STATUS_ACTIVE,
-            reason: None,
-        },
-        TargetCase {
             name: "a destination nothing ever created",
             destination: Destination::Absent,
             pass: Pass::TrustingThisService,
@@ -146,20 +147,6 @@ fn target_cases() -> Vec<TargetCase> {
             pass: Pass::TrustingThisService,
             settles_into: STREAM_STATUS_FAILED,
             reason: Some(STREAM_FAILURE_KINESIS_STREAM_NOT_FOUND),
-        },
-        TargetCase {
-            name: "a held destination, a role trusting another service",
-            destination: Destination::Held,
-            pass: Pass::TrustingAnotherService,
-            settles_into: STREAM_STATUS_FAILED,
-            reason: Some(STREAM_FAILURE_ROLE_ACCESS_DENIED),
-        },
-        TargetCase {
-            name: "neither half usable: the role is what the stream reports",
-            destination: Destination::Absent,
-            pass: Pass::TrustingAnotherService,
-            settles_into: STREAM_STATUS_FAILED,
-            reason: Some(STREAM_FAILURE_ROLE_ACCESS_DENIED),
         },
     ]
 }
@@ -558,4 +545,143 @@ async fn a_failed_stream_is_listed_and_can_be_deleted() {
         "the clock must remove the deleted stream, got {} {:?}",
         gone.status, gone.body
     );
+}
+
+/// The `ValidationExceptionReason` a member-value refusal carries
+/// (`smithy_query(query="shape", shape="ValidationExceptionReason")`).
+const REASON_FIELD_VALIDATION_FAILED: &str = "fieldValidationFailed";
+
+/// The field name the refusal's one `fieldList` entry carries for the role member of
+/// a `targetDefinition` — the spelling this API uses for that field.
+const ROLE_ARN_FIELD: &str = "role-arn";
+
+/// The sentence a role this service cannot deliver under is refused with: fixed text
+/// around the one variable part, the role ARN echoed from the request.
+fn unusable_role_message(role_arn: &str) -> String {
+    format!(
+        "Aurora DSQL can't access the specified IAM role {role_arn} because the role doesn't \
+         exist or doesn't allow Aurora DSQL access. Create the role or modify its trust policy \
+         to grant Aurora DSQL access."
+    )
+}
+
+/// RULE: the role a `targetDefinition` names is resolved against this account's IAM
+/// at request time, so a value IAM holds no role under and a role whose trust policy
+/// does not admit this service are both REFUSED — whichever destination the target
+/// names beside it — while a role IAM answered for is served.
+#[tokio::test]
+async fn a_role_this_service_cannot_assume_refuses_the_create() {
+    let dsql = Dsql::with_delivery_services(REGION);
+    let targets = given_targets(&dsql).await;
+
+    // The role halves, and whether IAM's answer about each one admits this service.
+    let roles = [
+        ("a role whose trust policy admits this service", Pass::TrustingThisService, true),
+        (
+            "the same, written under an IAM path",
+            Pass::TrustingThisServiceUnderAPath,
+            true,
+        ),
+        (
+            "a role whose trust policy admits another service only",
+            Pass::TrustingAnotherService,
+            false,
+        ),
+        (
+            "a role IAM holds nothing under",
+            Pass::IamHoldsNoSuchRole,
+            false,
+        ),
+    ];
+    // Crossed with the destination beside it, including one that is itself unusable:
+    // the role decides, so such a request is refused rather than served as a stream
+    // that would settle FAILED.
+    let destinations = [
+        ("a destination the delivery service holds", Destination::Held),
+        ("a destination nothing ever created", Destination::Absent),
+    ];
+
+    let clusters = dsql
+        .create_settled_many(roles.len() * destinations.len())
+        .await;
+    let mut cluster = clusters.iter();
+
+    for (role_name, pass, usable) in roles {
+        for (destination_name, destination) in destinations {
+            let case = format!("{role_name}, with {destination_name}");
+            let host = cluster.next().expect("one cluster per row");
+            let role_arn = targets.role_arn(pass);
+            let answer = dsql
+                .create_stream(
+                    host,
+                    json!({
+                        "format": "JSON",
+                        "ordering": "UNORDERED",
+                        "targetDefinition": json!({"kinesis": {
+                            "streamArn": targets.stream_arn(destination),
+                            "roleArn": role_arn,
+                        }}),
+                    }),
+                )
+                .await;
+
+            if usable {
+                assert_eq!(
+                    answer.status, 200,
+                    "case {case:?}: a role IAM answered for must be served, got {} {:?}",
+                    answer.status, answer.body
+                );
+                continue;
+            }
+
+            assert_eq!(
+                answer.status, 400,
+                "case {case:?}: a role this service cannot assume must be refused 400, got {} {:?}",
+                answer.status, answer.body
+            );
+            assert_eq!(
+                answer.error.as_deref(),
+                Some("ValidationException"),
+                "case {case:?}: the wire code must be ValidationException, got {:?}",
+                answer.error
+            );
+            assert_eq!(
+                answer.message(),
+                unusable_role_message(&role_arn),
+                "case {case:?}: expected {:?}, got {:?}",
+                unusable_role_message(&role_arn),
+                answer.message()
+            );
+            assert_eq!(
+                answer.str("reason"),
+                REASON_FIELD_VALIDATION_FAILED,
+                "case {case:?}: a member-value refusal reports \
+                 {REASON_FIELD_VALIDATION_FAILED}, got {:?}",
+                answer.body
+            );
+            assert_eq!(
+                answer.get("fieldList"),
+                json!([{
+                    "name": ROLE_ARN_FIELD,
+                    "message": unusable_role_message(&role_arn),
+                }]),
+                "case {case:?}: expected one entry naming {ROLE_ARN_FIELD}, got {:?}",
+                answer.get("fieldList")
+            );
+
+            // Nothing was minted: the cluster holds no stream at all, so the refusal
+            // is not a stream that merely reports a failure.
+            let listed = dsql.list_streams(host, "").await;
+            assert_eq!(
+                listed
+                    .get("streams")
+                    .as_array()
+                    .map(Vec::len)
+                    .unwrap_or_default(),
+                0,
+                "case {case:?}: a refused create must leave the cluster with no stream, got {:?}",
+                listed.get("streams")
+            );
+        }
+    }
 }

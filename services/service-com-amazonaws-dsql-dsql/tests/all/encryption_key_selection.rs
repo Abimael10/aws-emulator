@@ -16,12 +16,20 @@
 //! prefix) — which are ordinary customer keys, because the reserved value is
 //! reserved only as itself.
 //!
+//! SECOND RULE, asserted by the last suite here: a value that names a customer key
+//! has to name one that EXISTS. The member admits an ARN, an id or an alias and none
+//! of those says whether a key is there, so the value is resolved against AWS KMS —
+//! the service that owns keys — and a value KMS holds no key for is refused HTTP 400
+//! before any `encryptionDetails` is recorded, on `CreateCluster` and on
+//! `UpdateCluster` alike. A refused call changes nothing: the cluster keeps the
+//! encryption it had and takes the next mutation straight away.
+//!
 //! Every call goes through the `Dsql` harness in `tests/all/harness.rs`, this
 //! crate's one test client.
 
 use serde_json::{json, Value};
 
-use crate::harness::{wait_for_the_clock, Answer, Dsql};
+use crate::harness::{account_of, wait_for_the_clock, Answer, Dsql};
 
 /// The reserved value that switches a cluster to the key owned by Amazon Web
 /// Services, and the two `EncryptionType` values a cluster can report.
@@ -306,4 +314,271 @@ async fn the_key_choice_round_trips_in_both_directions() {
             "step {step} ({key:?}): an update without kmsEncryptionKey must not change the key"
         );
     }
+}
+
+/// The Region the key-resolution table below is driven in.
+const KEY_REGION: &str = "us-east-1";
+
+/// The alias name the suite creates for the key KMS holds. `AliasNameType` is
+/// `^[a-zA-Z0-9:/_-]+$` and an alias name begins `alias/`
+/// (`smithy_query(query="operation", operation="CreateAlias")` of the KMS model).
+const HELD_ALIAS: &str = "alias/dsql-held";
+
+/// A Region that is NOT [`KEY_REGION`], for the row whose key ARN names another
+/// Region: that Region's endpoint holds no such key.
+const ANOTHER_REGION: &str = "eu-central-1";
+
+/// The key AWS KMS holds for the rows that name a held key, in every form the
+/// `kmsEncryptionKey` member admits — each one read off what KMS itself answered
+/// rather than written as a literal.
+struct HeldKey {
+    key_id: String,
+    key_arn: String,
+    alias_arn: String,
+}
+
+/// One KMS key and one alias of it, created through that service's own API.
+async fn given_a_kms_key(dsql: &Dsql) -> HeldKey {
+    let created = dsql
+        .rpc("kms", "TrentService", "CreateKey", json!({}))
+        .await;
+    assert_eq!(
+        created.status, 200,
+        "the key must be created in KMS first, got {} {:?}",
+        created.status, created.body
+    );
+    let metadata = created.get("KeyMetadata");
+    let key_id = metadata
+        .get("KeyId")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("CreateKey must answer a KeyId, got {metadata:?}"))
+        .to_string();
+    let key_arn = metadata
+        .get("Arn")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("CreateKey must answer the key's ARN, got {metadata:?}"))
+        .to_string();
+
+    let aliased = dsql
+        .rpc(
+            "kms",
+            "TrentService",
+            "CreateAlias",
+            json!({"AliasName": HELD_ALIAS, "TargetKeyId": key_id}),
+        )
+        .await;
+    assert_eq!(
+        aliased.status, 200,
+        "the alias must be created in KMS first, got {} {:?}",
+        aliased.status, aliased.body
+    );
+    // An alias ARN names the alias at one endpoint, so it is assembled from the
+    // account the key ARN KMS minted carries.
+    let alias_arn = format!(
+        "arn:aws:kms:{KEY_REGION}:{}:{HELD_ALIAS}",
+        account_of(&key_arn)
+    );
+    HeldKey {
+        key_id,
+        key_arn,
+        alias_arn,
+    }
+}
+
+/// One `kmsEncryptionKey` value and whether the key it names is one the account
+/// holds — so a row says what the call must answer without restating it.
+struct ResolutionCase {
+    name: &'static str,
+    key: String,
+    /// Whether the value names a key the write may record: a key KMS answered for,
+    /// or the reserved value, which names no customer key at all.
+    recordable: bool,
+}
+
+/// The table: every form the member admits, for a key KMS HOLDS and for one it holds
+/// nothing under, plus the reserved value — which is never resolved because it names
+/// no customer key.
+fn resolution_cases(held: &HeldKey) -> Vec<ResolutionCase> {
+    let account = account_of(&held.key_arn);
+    vec![
+        ResolutionCase {
+            name: "the key id of a key KMS holds",
+            key: held.key_id.clone(),
+            recordable: true,
+        },
+        ResolutionCase {
+            name: "the ARN of that same key",
+            key: held.key_arn.clone(),
+            recordable: true,
+        },
+        ResolutionCase {
+            name: "an alias of that same key",
+            key: HELD_ALIAS.to_string(),
+            recordable: true,
+        },
+        ResolutionCase {
+            name: "the ARN of that same alias",
+            key: held.alias_arn.clone(),
+            recordable: true,
+        },
+        ResolutionCase {
+            name: "the reserved value, which names no customer key",
+            key: RESERVED_AWS_OWNED.to_string(),
+            recordable: true,
+        },
+        ResolutionCase {
+            name: "a key id KMS holds nothing under",
+            key: "12345678-1234-1234-1234-123456789012".to_string(),
+            recordable: false,
+        },
+        ResolutionCase {
+            name: "an alias nothing ever created",
+            key: "alias/dsql-never-created".to_string(),
+            recordable: false,
+        },
+        ResolutionCase {
+            name: "a well-formed key ARN of this Region naming no key",
+            key: format!("arn:aws:kms:{KEY_REGION}:{account}:key/absent-key"),
+            recordable: false,
+        },
+        ResolutionCase {
+            name: "the held key's id written as an ARN of another Region",
+            key: format!(
+                "arn:aws:kms:{ANOTHER_REGION}:{account}:key/{}",
+                held.key_id
+            ),
+            recordable: false,
+        },
+    ]
+}
+
+/// The sentence a value naming no key is refused with: fixed text around the one
+/// variable part, the identifier exactly as the request supplied it.
+fn key_not_found(identifier: &str) -> String {
+    format!(
+        "AWS KMS key {identifier} not found. Verify the key ID or ARN and ensure the key \
+         exists in your AWS account and Region."
+    )
+}
+
+/// Assert one refusal of a key that does not exist.
+fn assert_key_not_found(case: &str, answer: &Answer, key: &str) {
+    assert_eq!(
+        answer.status, 400,
+        "case {case:?}: a key KMS holds nothing under is refused 400, got {} {:?}",
+        answer.status, answer.body
+    );
+    assert_eq!(
+        answer.error.as_deref(),
+        Some("ValidationException"),
+        "case {case:?}: the wire code must be ValidationException, got {:?}",
+        answer.error
+    );
+    assert_eq!(
+        answer.message(),
+        key_not_found(key),
+        "case {case:?}: expected {:?}, got {:?}",
+        key_not_found(key),
+        answer.message()
+    );
+}
+
+/// RULE: a `kmsEncryptionKey` that names a customer key is resolved against KMS
+/// before anything is recorded — a value KMS answered for is accepted, and one it
+/// holds no key under is refused HTTP 400 with the sentence that class carries,
+/// leaving the cluster's encryption exactly as it was and leaving the cluster ready
+/// to take the next mutation.
+#[tokio::test]
+async fn a_kms_encryption_key_is_resolved_before_it_is_recorded() {
+    let dsql = Dsql::with_key_service(KEY_REGION);
+    let held = given_a_kms_key(&dsql).await;
+    let cases = resolution_cases(&held);
+
+    // One cluster per row, all created before the single wait, each on the
+    // Amazon-owned key — so a refused update is visible as "still Amazon-owned".
+    let clusters = dsql.create_settled_many(cases.len()).await;
+    let before = dsql.list("?max-results=100").await;
+    let clusters_before = before
+        .get("clusters")
+        .as_array()
+        .map(Vec::len)
+        .unwrap_or_default();
+
+    for (case, cluster) in cases.iter().zip(&clusters) {
+        // CreateCluster: the key is resolved before the cluster is minted.
+        let created = dsql
+            .create(json!({
+                "deletionProtectionEnabled": false,
+                "kmsEncryptionKey": case.key,
+            }))
+            .await;
+        if case.recordable {
+            assert_eq!(
+                created.status, 200,
+                "case {:?}: CreateCluster must accept a key KMS answered for, got {} {:?}",
+                case.name, created.status, created.body
+            );
+        } else {
+            let name = format!("CreateCluster with {}", case.name);
+            assert_key_not_found(&name, &created, &case.key);
+            assert!(
+                created.str("identifier").is_empty(),
+                "case {name:?}: a refused create must hand back no cluster, got {:?}",
+                created.body
+            );
+        }
+
+        // UpdateCluster: the same resolution, ahead of the stored encryptionDetails.
+        let updated = dsql
+            .update(cluster, json!({"kmsEncryptionKey": case.key}))
+            .await;
+        if case.recordable {
+            assert_eq!(
+                updated.status, 200,
+                "case {:?}: UpdateCluster must accept a key KMS answered for, got {} {:?}",
+                case.name, updated.status, updated.body
+            );
+            continue;
+        }
+
+        let name = format!("UpdateCluster with {}", case.name);
+        assert_key_not_found(&name, &updated, &case.key);
+
+        // The cluster is untouched: it reports the encryption it had, so no read
+        // claims protection by a key that is not there.
+        let read = dsql.get(cluster).await;
+        assert_eq!(
+            encryption(&read),
+            (AWS_OWNED.to_string(), None),
+            "case {name:?}: a refused key must leave the cluster on the Amazon-owned key, got {:?}",
+            read.get("encryptionDetails")
+        );
+
+        // And nothing is in flight: the next configuration change is served rather
+        // than conflicting with an update the service never applied.
+        let next = dsql
+            .update(cluster, json!({"deletionProtectionEnabled": true}))
+            .await;
+        assert_eq!(
+            next.status, 200,
+            "case {name:?}: the next UpdateCluster must be served, got {} {:?}",
+            next.status, next.body
+        );
+    }
+
+    // Every refused create minted nothing, so the store grew only by the accepted
+    // rows.
+    let accepted = cases.iter().filter(|case| case.recordable).count();
+    let after = dsql.list("?max-results=100").await;
+    let clusters_after = after
+        .get("clusters")
+        .as_array()
+        .map(Vec::len)
+        .unwrap_or_default();
+    assert_eq!(
+        clusters_after,
+        clusters_before + accepted,
+        "the store must grow by the {accepted} accepted creates alone, got {:?}",
+        after.get("clusters")
+    );
 }

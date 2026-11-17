@@ -81,6 +81,11 @@ use crate::ops::types::{
     ValidationException, ValidationExceptionField,
 };
 
+/// Whether the customer managed key a cluster's `kmsEncryptionKey` names EXISTS —
+/// the question every operation that accepts that member asks, of the component
+/// that owns keys, before it records an encryption configuration.
+pub mod kms_key;
+
 /// The `ClusterStatus` values this service drives a cluster through, spelled as
 /// the enum spells them on the wire (`smithy_query(query="shape",
 /// shape="ClusterStatus")`: CREATING | ACTIVE | IDLE | INACTIVE | UPDATING |
@@ -128,17 +133,17 @@ pub const STREAM_STATUS_FAILED: &str = "FAILED";
 /// KINESIS_KMS_ACCESS_DENIED | KINESIS_OVERSIZE_RECORD | CLUSTER_CMK_INACCESSIBLE
 /// | INTERNAL_ERROR).
 ///
-/// The three below are the ones an owning service ANSWERS about a target: the
-/// delivery service reporting that it holds no such stream or that it refuses
-/// access to it, and this account's IAM reporting that the role the target names
-/// does not admit this service. The rest are about DELIVERING a record (a
-/// throughput ceiling, an oversize record) or about a store this service does not
-/// ask, and no answer grounds them, so nothing reports them.
+/// The two below are the ones the service that OWNS a stream's DESTINATION answers
+/// about it: the delivery service reporting that it holds no such stream, or that it
+/// refuses access to it. The rest are about DELIVERING a record (a throughput
+/// ceiling, an oversize record), about a store this service does not ask, or about a
+/// delivery role — which is resolved at request time, so a stream is never created
+/// against a role this service cannot assume
+/// (`crate::ops::create_stream`) — and no answer grounds them, so nothing reports
+/// them.
 pub const STREAM_FAILURE_KINESIS_STREAM_NOT_FOUND: &str = "KINESIS_STREAM_NOT_FOUND";
 /// See [`STREAM_FAILURE_KINESIS_STREAM_NOT_FOUND`].
 pub const STREAM_FAILURE_KINESIS_ACCESS_DENIED: &str = "KINESIS_ACCESS_DENIED";
-/// See [`STREAM_FAILURE_KINESIS_STREAM_NOT_FOUND`].
-pub const STREAM_FAILURE_ROLE_ACCESS_DENIED: &str = "ROLE_ACCESS_DENIED";
 
 /// `EncryptionType` values (`smithy_query(query="shape", shape="EncryptionType")`).
 pub const ENCRYPTION_AWS_OWNED: &str = "AWS_OWNED_KMS_KEY";
@@ -2444,6 +2449,64 @@ where
         )),
         None => Ok(()),
     }
+}
+
+/// The special characters a caller-supplied tag key or value may carry, beside
+/// letters, digits and the space.
+///
+/// The character set is the one both tag shapes' modelled pattern spells
+/// (`smithy_query(query="shape", shape="TagKey,TagValue")`:
+/// `^[a-zA-Z0-9_.:/=+\-@ ]*$`), so a key and a value are held to the same set — and
+/// to the set the boundary constraint walk holds a tag VALUE to, which is where that
+/// pattern is already enforced.
+const TAG_SPECIAL_CHARACTERS: &str = "_.:/=+-@ ";
+
+/// The sentence a tag outside that character set is refused with, in full.
+///
+/// FIXED text for the error class: nothing of the refused request is interpolated
+/// into it, not the key or value that failed and not the member it arrived in.
+pub const TAG_CHARACTER_SET_MESSAGE: &str = "Tags can only contain letters, numbers, spaces, and \
+     the following special characters: _ . : / = + - @";
+
+/// The wire error code a request BODY Aurora DSQL will not take is refused with,
+/// and the status it carries.
+///
+/// Not a modelled shape: the service's REST frontend answers this class — a tag map
+/// over its modelled entry count, and a tag key or value outside
+/// [`TAG_SPECIAL_CHARACTERS`]'s character set — before any operation's own errors
+/// are reachable, so the body carries the sentence for the class and nothing else.
+pub const BAD_REQUEST_CODE: &str = "BadRequestException";
+/// See [`BAD_REQUEST_CODE`].
+pub const BAD_REQUEST_STATUS: u16 = 400;
+
+/// Whether `value` is built only from the characters a tag key or value admits.
+pub fn is_within_the_tag_character_set(value: &str) -> bool {
+    value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || TAG_SPECIAL_CHARACTERS.contains(c))
+}
+
+/// Check the tag keys and values a request carries against that character set,
+/// refusing the WHOLE request when any one of them leaves it.
+///
+/// Every operation that accepts caller-supplied tags runs this before it writes
+/// anything, so a refused call leaves the addressed resource exactly as it was and
+/// mints nothing. The refusal is the frontend's [`BAD_REQUEST_CODE`] carrying
+/// [`TAG_CHARACTER_SET_MESSAGE`] — the same answer `crate::service`'s refusal path
+/// gives for the tag VALUES the boundary walk itself catches, so one request cannot
+/// be refused two ways depending on which half of the pair failed.
+pub fn validate_tag_character_set<'a, E, V>(
+    values: V,
+) -> Result<(), crate::scaffolded::Scaffolded<E>>
+where
+    V: IntoIterator<Item = &'a str>,
+{
+    if values.into_iter().all(is_within_the_tag_character_set) {
+        return Ok(());
+    }
+    Err(crate::scaffolded::Scaffolded::bad_request(
+        TAG_CHARACTER_SET_MESSAGE,
+    ))
 }
 
 /// The `ValidationExceptionReason` for input this service could not read as the

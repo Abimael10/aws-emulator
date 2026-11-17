@@ -505,6 +505,10 @@ pub mod iot_jobs;
 /// through, so that hop — and the fact that it opens no socket — is configured once rather
 /// than per service.
 pub mod kinesis_client;
+/// The ONE reading of a caller-supplied AWS KMS key identifier — whether this account and
+/// Region hold a key it resolves to — for every service that resolves such a value before it
+/// stores an encryption configuration.
+pub mod kms_key;
 /// The ONE reading of an ISO 8601 DURATION a service is handed as a caller-supplied
 /// string, for every service whose API takes a span that way — so two services asked how
 /// long a duration is cannot answer differently.

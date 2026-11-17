@@ -6,17 +6,26 @@
 //! lowercase-ULID `streamIdentifier`, the ARN derived from it, the cluster and
 //! the cluster's own region, `CREATING` with the clock owing it its settled
 //! status, and the target, ordering, format and tags the caller asked for. The
-//! target's `roleArn` has to be a role this account can pass.
+//! target's `roleArn` has to be a role this account can pass, and one this
+//! service can deliver under.
 //!
-//! ## Which status the clock then owes the stream
+//! ## What is refused, and what is stream state
 //!
-//! "The stream captures database changes and delivers them to the specified
-//! target destination" — so a target this service cannot deliver to is stream
-//! STATE and not a refusal of the create: `StreamStatus` carries `FAILED` and
-//! `GetStream` reports the `StreamFailureErrorCode` behind it as a
-//! `statusReason`. The target is therefore RESOLVED against the services that own
-//! it ([`target_failure`]) and the answer decides which status the clock owes the
-//! stream, `ACTIVE` or `FAILED`; the create itself is served either way.
+//! The two halves of a `targetDefinition` are resolved against the services that
+//! OWN them, and the two answers are not the same kind of answer:
+//!
+//! * the ROLE is what the delivery RUNS AS, so a value this account's IAM holds no
+//!   role under, or a role whose trust policy does not admit this service, is
+//!   refused at request time with the modelled `ValidationException` naming that
+//!   field ([`unusable_role`]) and no stream is minted;
+//! * the DESTINATION is where the changes go — "The stream captures database
+//!   changes and delivers them to the specified target destination" — so one this
+//!   service cannot write to is stream STATE and not a refusal of the create:
+//!   `StreamStatus` carries `FAILED` and `GetStream` reports the
+//!   `StreamFailureErrorCode` behind it as a `statusReason`. The destination is
+//!   therefore RESOLVED against the service that owns it
+//!   ([`destination_failure`]) and the answer decides which status the clock owes
+//!   the stream, `ACTIVE` or `FAILED`; the create itself is served either way.
 //!
 //! ## Where the pass-role decision is taken
 //!
@@ -236,6 +245,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateStreamErrorModeled::AccessDeniedException(denial).into());
         }
 
+        // And the role the target names has to BE a role this service can deliver
+        // under: it is resolved against this account's IAM before any stream is
+        // minted ([`unusable_role`]), because a stream whose delivery role does not
+        // exist, or whose trust policy does not admit this service, could never
+        // deliver anything. Reached with no store guard held, like the destination
+        // resolution below.
+        if let Some(invalid) = unusable_role(ctx, &input.target_definition, &region).await {
+            return Err(CreateStreamErrorModeled::ValidationException(invalid).into());
+        }
+
         // The cluster identifier's whole FORM is `ClusterId`'s `^[a-z0-9]{26}$`,
         // which the boundary constraint walk decides before this handler runs, so
         // every value that reaches here is a well-formed identifier and the lookup
@@ -243,8 +262,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //
         // The `tags` a create carries are written exactly as `TagResource` writes
         // them, so they are held to the same rule: a key under the prefix AWS
-        // reserves for its own tags is not the caller's to write, and the request is
-        // refused with the modelled 400 before any stream is minted.
+        // reserves for its own tags is not the caller's to write, and a key or value
+        // outside the character set both tag shapes' `@pattern` admits is not a tag
+        // this service can hold — so the request is refused before any stream is
+        // minted.
+        crate::state::validate_tag_character_set(
+            input
+                .tags
+                .iter()
+                .flat_map(|tags| tags.iter())
+                .flat_map(|(key, value)| [key.as_str(), value.as_str()]),
+        )?;
         if let Err(invalid) = crate::state::validate_tag_keys(
             crate::state::TAGS_MEMBER,
             input
@@ -255,12 +283,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateStreamErrorModeled::ValidationException(invalid).into());
         }
 
-        // Whether this stream's delivery target can be delivered to is settled
-        // BEFORE this service's own store is reached: resolving the target is a
-        // READ of the services that own it ([`target_failure`]), it touches no
-        // state of theirs or of this one, and the store guard taken below is
+        // Whether this stream's delivery DESTINATION can be delivered to is settled
+        // BEFORE this service's own store is reached: resolving the destination is a
+        // READ of the service that owns it ([`destination_failure`]), it touches no
+        // state of its or of this one, and the store guard taken below is
         // never held across an await.
-        let target_failure = target_failure(ctx, &input.target_definition, &region).await;
+        let target_failure = destination_failure(ctx, &input.target_definition, &region).await;
 
         let now = std::time::SystemTime::now();
         let mut state = state.lock();
@@ -382,9 +410,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             target_definition: input.target_definition.clone(),
             tags: input.tags.clone().unwrap_or_default().into_iter().collect(),
             // The clock, not a later caller, owes this stream its settled status:
-            // `ACTIVE` for a target this service can deliver to, and `FAILED`
-            // carrying the code the target's owner answered with for one it
-            // cannot ([`target_failure`]).
+            // `ACTIVE` for a destination this service can deliver to, and `FAILED`
+            // carrying the code the destination's owner answered with for one it
+            // cannot ([`destination_failure`]).
             pending: Some(crate::state::PendingTransition {
                 due_at: now + crate::state::SETTLE_AFTER,
                 next_status: match target_failure {
@@ -503,55 +531,113 @@ fn cross_account_denial(target: &TargetDefinition) -> Option<AccessDeniedExcepti
 /// write the captured changes to the destination beside it.
 const SERVICE_PRINCIPAL: &str = "dsql.amazonaws.com";
 
+/// The name this service reports for the role member of a `targetDefinition` in the
+/// `fieldList` of a refusal about it — the spelling the API uses for that field,
+/// which is the kebab-cased `roleArn` ([`ROLE_ARN_MEMBER`]).
+const ROLE_ARN_FIELD: &str = "role-arn";
+
+/// The sentence a `targetDefinition` naming a role this service cannot deliver
+/// under is refused with.
+///
+/// Fixed text for the error class — "Aurora DSQL can't access the specified IAM role
+/// " and " because the role doesn't exist or doesn't allow Aurora DSQL access. Create
+/// the role or modify its trust policy to grant Aurora DSQL access." — around the ONE
+/// variable part, the role ARN echoed from the target the request carried.
+fn unusable_role_message(role_arn: &str) -> String {
+    format!(
+        "Aurora DSQL can't access the specified IAM role {role_arn} because the role doesn't \
+         exist or doesn't allow Aurora DSQL access. Create the role or modify its trust policy \
+         to grant Aurora DSQL access."
+    )
+}
+
+/// The refusal a target naming a role this service cannot deliver under earns, or
+/// `None` when the role is one IAM answered for.
+///
+/// Delivery RUNS AS the role the target names, so the role is resolved against this
+/// account's IAM before the stream is minted: a value IAM holds no role under, and
+/// one whose trust policy does not admit this service, name a role this service could
+/// never assume, and the create is refused rather than served — which is why this is
+/// a refusal of the request where an unusable DESTINATION is stream state
+/// ([`destination_failure`]).
+///
+/// The reading itself is [`::service_common::iam_role::role_is_unassumable`], the
+/// tree's one question about a role a service has to assume, so the refusal is
+/// grounded in what IAM ANSWERED: a value naming no role of this account (whether
+/// such a role may be passed at all is [`cross_account_denial`]'s decision, taken
+/// ahead of this one), an answer this emulator could not read, and an emulator with
+/// no IAM mounted to ask establish nothing about the role and refuse nothing.
+///
+/// The modelled `ValidationException` names the field the caller has to fix beside
+/// the sentence, both `@required` members of a `fieldList` entry
+/// (`smithy_query(query="shape", shape="ValidationExceptionField")`), and carries the
+/// `fieldValidationFailed` reason every member-level refusal of this service carries.
+///
+/// Awaited with NO store guard held.
+async fn unusable_role(
+    ctx: &OperationContext<'_>,
+    target: &TargetDefinition,
+    request_region: &str,
+) -> Option<ValidationException> {
+    let role_arn = target_role_arn(target);
+    if !::service_common::iam_role::role_is_unassumable(
+        ctx,
+        request_region,
+        role_arn,
+        SERVICE_PRINCIPAL,
+    )
+    .await
+    {
+        return None;
+    }
+    let message = unusable_role_message(role_arn);
+    Some(ValidationException {
+        message: message.clone(),
+        reason: crate::state::VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: ROLE_ARN_FIELD.to_string(),
+            message,
+        }]),
+    })
+}
+
 /// The ARN vendor field of the Kinesis data stream a target names
 /// (`KinesisStreamArn`'s pattern fixes it:
 /// `^arn:aws[a-zA-Z-]*:kinesis:[a-z0-9-]*:[0-9]{12}:stream/[a-zA-Z0-9+=,.@_/\-]+$`,
 /// `smithy_query(query="shape", shape="KinesisTargetDefinition")`).
 const KINESIS_ARN_VENDOR: &str = "kinesis";
 
-/// The `StreamFailureErrorCode` the stream's delivery target was found unusable
+/// The `StreamFailureErrorCode` the stream's delivery DESTINATION was found unusable
 /// with, or `None` when nothing answered that it is.
 ///
-/// A delivery target this service cannot write to is stream STATE rather than a
-/// refusal of the create: `StreamStatus` carries `FAILED` and `GetStream` reports
-/// the `statusReason` behind it, so the create is served and the stream settles
-/// into the failed status carrying that code
+/// A destination this service cannot write to is stream STATE rather than a refusal
+/// of the create: `StreamStatus` carries `FAILED` and `GetStream` reports the
+/// `statusReason` behind it, so the create is served and the stream settles into the
+/// failed status carrying that code
 /// (`smithy_query(query="shape", shape="StreamStatus,StatusReason")`). That is
 /// what a client polling `GetStream` after `CreateStream` learns an unusable
-/// target from.
+/// destination from. The ROLE is the other half of a target and is not read here: a
+/// role this service cannot deliver under is refused at request time
+/// ([`unusable_role`]).
 ///
-/// Every code answered here is one the service that OWNS the target gave about
-/// it, never one derived from the caller's own request: the role is resolved
-/// against this account's IAM records and the destination against the delivery
-/// service's own streams. Both are reached the way any emulated service reaches
-/// another — an AWS SDK client over the emulator's own in-process callback
-/// ([`::service_common::kinesis_client`], [`::service_common::iam_role`]) — so
-/// nothing here opens a socket, resolves a name or reads an ambient credential.
+/// Every code answered here is one the service that OWNS the destination gave about
+/// it, never one derived from the caller's own request: the destination is resolved
+/// against the delivery service's own streams, reached the way any emulated service
+/// reaches another — an AWS SDK client over the emulator's own in-process callback
+/// ([`::service_common::kinesis_client`]) — so nothing here opens a socket, resolves
+/// a name or reads an ambient credential.
 ///
 /// `None` — leave the stream to settle `ACTIVE` — wherever nothing is KNOWN about
-/// the target: an emulator with no IAM or no delivery service mounted to ask, an
-/// answer this could not read, and a role this account's IAM holds nothing under.
-/// A failure has to be grounded in what the owner of the target said about it,
-/// for the reason [`::service_common::iam_role::held_role_is_unassumable`] gives.
+/// the destination: an emulator with no delivery service mounted to ask, and an
+/// answer this could not read. A failure has to be grounded in what the owner of the
+/// destination said about it.
 ///
 /// Awaited with NO store guard held.
-async fn target_failure(
+async fn destination_failure(
     ctx: &OperationContext<'_>,
     target: &TargetDefinition,
     request_region: &str,
 ) -> Option<&'static str> {
-    // The role comes first: the delivery runs UNDER it, so a role this service
-    // cannot assume reaches no destination whichever destination the union names.
-    if ::service_common::iam_role::held_role_is_unassumable(
-        ctx,
-        request_region,
-        target_role_arn(target),
-        SERVICE_PRINCIPAL,
-    )
-    .await
-    {
-        return Some(crate::state::STREAM_FAILURE_ROLE_ACCESS_DENIED);
-    }
     match target {
         TargetDefinition::Kinesis(kinesis) => {
             kinesis_failure(ctx, &kinesis.stream_arn, request_region).await

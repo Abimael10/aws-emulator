@@ -109,6 +109,27 @@ impl Dsql {
         }
     }
 
+    /// An emulator holding Aurora DSQL beside AWS KMS, which owns the keys a
+    /// cluster's `kmsEncryptionKey` names. One engine and one router, the shape
+    /// `core/router/src/lib.rs` mounts every service in — so a create or an update
+    /// resolves its key against the very keys and aliases a client created through
+    /// that service's own API rather than against a second copy of them.
+    pub fn with_key_service(region: &str) -> Self {
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let mut router = MultiServiceRouter::new();
+        router.set_request_authentication(false);
+        router.register_service(service_com_amazonaws_dsql_dsql::EmulatedService::new(
+            Arc::clone(&engine),
+        ));
+        router.register_service(
+            service_com_amazonaws_kms_trentservice::EmulatedService::new(Arc::clone(&engine)),
+        );
+        Self {
+            router,
+            region: region.to_string(),
+        }
+    }
+
     /// One `awsJson1_1` RPC against the service whose signing name is
     /// `signing_name` and whose target prefix is `target_prefix` — how a client
     /// calls Amazon Kinesis (`Kinesis_20131202`). The credential scope is what

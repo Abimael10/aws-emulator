@@ -25,9 +25,11 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 # Encodes the opaque `nextToken` cursor ListClusters pages with.
 hex = { workspace = true }
-# `kinesis_client` / `iam_role` / `arn`: the shared in-process clients a CreateStream
-# resolves its `targetDefinition` through — the delivery service's own streams and this
-# account's IAM records — and the one reading of a caller-supplied ARN's Region.
+# `kinesis_client` / `iam_role` / `kms_key` / `arn`: the shared in-process clients and
+# readings this service resolves a caller-supplied reference through — the delivery service's
+# own streams and this account's IAM records for a `CreateStream` target, the account's KMS
+# keys for a cluster's `kmsEncryptionKey` — and the one reading of a caller-supplied ARN's
+# Region.
 service-common = { path = "../common" }
 
 [build-dependencies]
@@ -42,6 +44,10 @@ tokio = { workspace = true, features = ["time"] }
 # through those services' own APIs.
 service-com-amazonaws-kinesis-kinesis-20131202 = { workspace = true }
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# AWS KMS, mounted beside Aurora DSQL on the same terms, so the encryption-key suites
+# resolve a `kmsEncryptionKey` against the very keys and aliases a client created through
+# that service's own API.
+service-com-amazonaws-kms-trentservice = { workspace = true }
 # Percent-encodes the form fields the IAM query-protocol requests in that suite carry.
 percent-encoding = "2.3"
 

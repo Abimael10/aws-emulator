@@ -24,10 +24,14 @@
 //! for any resource that exists, including one the clock still owes its terminal
 //! status.
 //!
-//! The one tag key a caller may not write is one under the prefix AWS reserves for
-//! its own tags ([`crate::state::validate_tag_keys`]): such a request is refused in
-//! full with the modelled 400 `ValidationException` and leaves the resource's tags
-//! unchanged.
+//! A caller-supplied tag has two ways of being one this service cannot hold, and
+//! both refuse the request in full, leaving the resource's tags unchanged: a key
+//! under the prefix AWS reserves for its own tags
+//! ([`crate::state::validate_tag_keys`]), answered with the modelled 400
+//! `ValidationException`, and a key or value outside the character set both tag
+//! shapes' `@pattern` admits
+//! ([`crate::state::validate_tag_character_set`]), answered with the 400 this
+//! service's frontend gives a request body it will not take.
 //!
 //! ## Shape of an operation
 //!
@@ -192,6 +196,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(internal_server_error());
         };
+
+        // A tag key or value outside the character set both tag shapes' `@pattern`
+        // admits is not a tag this service can hold: the whole request is refused,
+        // before any resource is resolved or any pair applied. The boundary walk
+        // catches a VALUE that leaves the set (codegen captures a map's value
+        // constraints) and `crate::service`'s refusal path words it; a KEY it does not
+        // reach at all, so the pair is checked here, in the one place that words it.
+        crate::state::validate_tag_character_set(
+            input
+                .tags
+                .iter()
+                .flat_map(|(key, value)| [key.as_str(), value.as_str()]),
+        )?;
 
         // `Arn`'s modelled pattern is only `^arn:.+$`, so an ARN naming another
         // service's resource reaches this handler. That is a bad request rather than

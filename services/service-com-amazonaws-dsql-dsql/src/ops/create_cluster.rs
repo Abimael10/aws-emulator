@@ -25,7 +25,9 @@
 //! — one that would leave nobody able to replace it
 //! (`state::validate_cluster_policy`, the check `PutClusterPolicy` applies to the
 //! same document) — or one granting to an identity this account's IAM does not hold
-//! (`state::unresolved_policy_principal`, the same).
+//! (`state::unresolved_policy_principal`, the same), and so is a `kmsEncryptionKey`
+//! naming a key KMS holds none of (`state::kms_key`, the check `UpdateCluster`
+//! applies to the same member).
 //!
 //! ## Shape of an operation
 //!
@@ -233,6 +235,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
         let now = std::time::SystemTime::now();
 
+        // The key this cluster's data would be encrypted under has to BE a key: the
+        // member admits an ARN, an id or an alias and none of those says whether a key
+        // exists, so the value is resolved against KMS — the component that owns keys —
+        // before any cluster is minted (`crate::state::kms_key`). Reached with no store
+        // guard held, like the policy-principal resolution below.
+        if let Some(kms_encryption_key) = input.kms_encryption_key.as_deref() {
+            if let Some(invalid) = crate::state::kms_key::unresolved_encryption_key(
+                ctx,
+                &region,
+                kms_encryption_key,
+            )
+            .await
+            {
+                return Err(CreateClusterErrorModeled::ValidationException(invalid).into());
+            }
+        }
+
         // The request's own members are read against the store while it is held; the
         // store is RELEASED again before the document's principals are resolved
         // below, which is a call out to this account's IAM.
@@ -265,8 +284,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
             // The `tags` a create carries are written exactly as `TagResource` writes
             // them, so they are held to the same rule: a key under the prefix AWS
-            // reserves for its own tags is not the caller's to write, and the request is
-            // refused with the modelled 400 before any cluster is minted.
+            // reserves for its own tags is not the caller's to write, and a key or
+            // value outside the character set both tag shapes' `@pattern` admits is
+            // not a tag this service can hold — so the request is refused before any
+            // cluster is minted.
+            crate::state::validate_tag_character_set(
+                input
+                    .tags
+                    .iter()
+                    .flat_map(|tags| tags.iter())
+                    .flat_map(|(key, value)| [key.as_str(), value.as_str()]),
+            )?;
             if let Err(invalid) = crate::state::validate_tag_keys(
                 crate::state::TAGS_MEMBER,
                 input

@@ -13,9 +13,10 @@
 //! a cluster in a status that does not accept a mutation -> `ConflictException` (409),
 //! except that a cluster waiting in `PENDING_SETUP` takes a request asking for
 //! NOTHING BUT the configuration change that completes its peering;
-//! a `multiRegionProperties.witnessRegion` naming the cluster's OWN Region, or a
+//! a `multiRegionProperties.witnessRegion` naming the cluster's OWN Region, a
 //! `multiRegionProperties.clusters` naming more peers than
-//! `state::MAX_MULTI_REGION_PEERS` ->
+//! `state::MAX_MULTI_REGION_PEERS`, or a `kmsEncryptionKey` naming a key KMS holds
+//! none of (`state::kms_key`) ->
 //! `ValidationException` (400), with the cluster left unchanged.
 //! A repeat of the same `clientToken` with the same parameters is the same request,
 //! so it answers from the cluster the first call acted on — ahead of that status
@@ -222,6 +223,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx);
         let now = std::time::SystemTime::now();
+
+        // The key the cluster's data would be re-encrypted under has to BE a key: the
+        // member admits an ARN, an id or an alias and none of those says whether a key
+        // exists, so the value is resolved against KMS — the component that owns keys —
+        // BEFORE `encryptionDetails` records it (`crate::state::kms_key`). A
+        // configuration the service never accepted must not reach the stored cluster,
+        // because every later read of that cluster would then report encryption against
+        // a key that is not there. Reached with no store guard held, so it comes ahead
+        // of the lock below.
+        if let Some(kms_encryption_key) = input.kms_encryption_key.as_deref() {
+            if let Some(invalid) = crate::state::kms_key::unresolved_encryption_key(
+                ctx,
+                &region,
+                kms_encryption_key,
+            )
+            .await
+            {
+                return Err(UpdateClusterErrorModeled::ValidationException(invalid).into());
+            }
+        }
+
         let mut state = state.lock();
         state.settle(now);
 

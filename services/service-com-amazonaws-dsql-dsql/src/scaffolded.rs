@@ -236,6 +236,66 @@ impl SerializableStruct for NotFoundException {
     }
 }
 
+/// The `message` member of the synthetic `BadRequestException` error shape.
+static BAD_REQUEST_EXCEPTION_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#BadRequestException$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message");
+
+/// Schema for the synthetic `BadRequestException` error shape.
+///
+/// In the `smithy.framework` namespace for the same reason as the shapes above: this is
+/// NOT a shape this service's model declares — the request BODY this answers is refused
+/// by the service's REST frontend, ahead of any operation's own errors — so it must not
+/// collide with a modeled one.
+pub static BAD_REQUEST_EXCEPTION_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#BadRequestException",
+        "smithy.framework",
+        "BadRequestException",
+    ),
+    ShapeType::Structure,
+    &[&BAD_REQUEST_EXCEPTION_MESSAGE],
+);
+
+/// The payload of a `BadRequestException`: the sentence for the class of body that was
+/// refused.
+#[derive(Debug, Clone)]
+pub struct BadRequestException {
+    pub message: String,
+}
+
+impl BadRequestException {
+    /// A `BadRequestException` carrying `message`.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for BadRequestException {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "BadRequestException: {}", self.message)
+    }
+}
+
+impl std::error::Error for BadRequestException {}
+
+impl SerializableStruct for BadRequestException {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&BAD_REQUEST_EXCEPTION_MESSAGE, self.message.as_str())?;
+        Ok(())
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -264,6 +324,18 @@ pub enum Scaffolded<E> {
     /// `crate::state::TAGGING_NOT_FOUND_MESSAGE` is its sentence. Every other not-found
     /// of this service is the modelled 404, which names the resource it could not find.
     NotFoundException(NotFoundException),
+    /// The request BODY is one Aurora DSQL will not take. Renders as HTTP 400 with the
+    /// wire code `crate::state::BAD_REQUEST_CODE` and the sentence for the class alone.
+    ///
+    /// Reach for this ONLY where the recorded behaviour of this service answers that
+    /// code rather than a modelled error: the tag map refusals its REST frontend takes
+    /// before any operation's own errors are reachable — a map over `TagMap`'s entry
+    /// count, which `crate::service`'s refusal path words, and a tag key or value
+    /// outside the character set both tag shapes' pattern admits, which
+    /// `crate::state::validate_tag_character_set` words. Every other bad request of this
+    /// service is the modelled `ValidationException`, which carries a `reason` a client
+    /// branches on.
+    BadRequestException(BadRequestException),
 }
 
 impl<E> Scaffolded<E> {
@@ -296,6 +368,12 @@ impl<E> Scaffolded<E> {
     pub fn not_found(message: impl Into<String>) -> Self {
         Self::NotFoundException(NotFoundException::new(message))
     }
+
+    /// Refuse the request BODY with HTTP 400 and the frontend's own code. See
+    /// [`Scaffolded::BadRequestException`].
+    pub fn bad_request(message: impl Into<String>) -> Self {
+        Self::BadRequestException(BadRequestException::new(message))
+    }
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
@@ -305,6 +383,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
             Self::Modeled(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
             Self::NotFoundException(e) => write!(f, "{e}"),
+            Self::BadRequestException(e) => write!(f, "{e}"),
         }
     }
 }
@@ -318,6 +397,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
             Self::Modeled(e) => e.source(),
             Self::ValidationException(e) => e.source(),
             Self::NotFoundException(e) => e.source(),
+            Self::BadRequestException(e) => e.source(),
         }
     }
 }
@@ -333,6 +413,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.as_serializable(),
             Self::ValidationException(e) => e,
             Self::NotFoundException(e) => e,
+            Self::BadRequestException(e) => e,
         }
     }
 
@@ -342,6 +423,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.variant_schema(),
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
             Self::NotFoundException(_) => &NOT_FOUND_EXCEPTION_SCHEMA,
+            Self::BadRequestException(_) => &BAD_REQUEST_EXCEPTION_SCHEMA,
         }
     }
 
@@ -355,6 +437,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.shape_name(),
             Self::ValidationException(_) => "ValidationException",
             Self::NotFoundException(_) => crate::state::TAGGING_NOT_FOUND_CODE,
+            Self::BadRequestException(_) => crate::state::BAD_REQUEST_CODE,
         }
     }
 
@@ -369,6 +452,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::ValidationException(_) => 400,
             // A not-found is a 404 whichever code names it.
             Self::NotFoundException(_) => crate::state::TAGGING_NOT_FOUND_STATUS,
+            Self::BadRequestException(_) => crate::state::BAD_REQUEST_STATUS,
         }
     }
 
@@ -382,6 +466,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // Same reason: the synthetic shape carries no `awsQueryError` trait.
             Self::ValidationException(_) => None,
             Self::NotFoundException(_) => None,
+            Self::BadRequestException(_) => None,
         }
     }
 }
