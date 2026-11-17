@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteReplicationConfigurationTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteReplicationConfigurationTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Removes one replication configuration template of the account from this service's
+//! state.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteReplicationConfigurationTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Application Migration Service is account-scoped: the one-time `InitializeService`
+//! call initializes the account a request acts on, and this operation — which models
+//! `UninitializedAccountException` — refuses with it while the account is uninitialized,
+//! ahead of the per-resource lookup, so an uninitialized account is told that rather
+//! than that the id names nothing. An id the initialized account holds no template
+//! under is the modelled `ResourceNotFoundException` (404).
+//!
+//! The removal is ONE state mutation under the store's lock — the lookup and the removal
+//! in the same call — so callers racing to delete the same id serialise: exactly one of
+//! them takes the record away and concludes with the modelled no-content answer, and
+//! every other one is told the id names nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -78,12 +83,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-mgn-applicationmigratio
 // here — hence the `DeleteReplicationConfigurationTemplateError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.mgn#DeleteReplicationConfigurationTemplate")]
+// `extra_errors` widens the accepted set with a shape the SERVICE models but this
+// operation does not list: `InternalServerException` (HTTP 500) is the only honest
+// answer when the engine carries no store for this service.
+#[smithy_macros::operation_error(
+    "com.amazonaws.mgn#DeleteReplicationConfigurationTemplate",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum DeleteReplicationConfigurationTemplateErrorModeled {
     ConflictException(ConflictException),
     ResourceNotFoundException(ResourceNotFoundException),
     UninitializedAccountException(UninitializedAccountException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -137,18 +149,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteReplicationConfigurationTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteReplicationConfigurationTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteReplicationConfigurationTemplate"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteReplicationConfigurationTemplateErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+        })?;
+        // The operation carries no `accountID` member, so it acts on the account the
+        // request was signed for.
+        let account = crate::state::account_key(None);
+        let template_id = input.replication_configuration_template_id.clone();
+        let mut store = state.lock();
+
+        // The account gate is evaluated ahead of the per-resource lookup, so an
+        // uninitialized account is told so even for an id nothing holds.
+        if !store.is_initialized(&account) {
+            crate::state::audit(
+                ctx.parts(),
+                Self::NAME,
+                &account,
+                &template_id,
+                "refused: UninitializedAccountException",
+            );
+            return Err(
+                DeleteReplicationConfigurationTemplateErrorModeled::UninitializedAccountException(
+                    crate::state::uninitialized_account(),
+                )
+                .into(),
+            );
+        }
+
+        // The removal is keyed by the account AND the id, exactly as the lookup behind
+        // it is: the store is keyed by id alone, so an unscoped removal would reach
+        // another account's record. The lookup and the removal are ONE call under this
+        // lock, so of several callers naming the same id exactly one is answered the
+        // record and the rest are told it names nothing.
+        if store
+            .remove_replication_configuration_template(&account, &template_id)
+            .is_none()
+        {
+            crate::state::audit(
+                ctx.parts(),
+                Self::NAME,
+                &account,
+                &template_id,
+                "refused: ResourceNotFoundException",
+            );
+            return Err(
+                DeleteReplicationConfigurationTemplateErrorModeled::ResourceNotFoundException(
+                    crate::state::replication_configuration_template_not_found(&template_id),
+                )
+                .into(),
+            );
+        }
+        crate::state::audit(ctx.parts(), Self::NAME, &account, &template_id, "deleted");
+
+        Ok(DeleteReplicationConfigurationTemplateOutput {})
     }
 }

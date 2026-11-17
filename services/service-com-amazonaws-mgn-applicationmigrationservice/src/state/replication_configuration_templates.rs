@@ -113,6 +113,18 @@ impl ComAmazonawsMgnApplicationmigrationserviceState {
             .collect()
     }
 
+    /// The template `template_id` names within `account_id`, or `None` — a template of
+    /// another account is not visible to this one.
+    pub fn replication_configuration_template_of(
+        &self,
+        account_id: &str,
+        template_id: &str,
+    ) -> Option<&ReplicationConfigurationTemplate> {
+        self.replication_configuration_templates
+            .get(template_id)
+            .filter(|template| template.account_id == account_id)
+    }
+
     /// A fresh `replicationConfigurationTemplateID` no stored template holds.
     pub fn mint_replication_configuration_template_id(&self) -> String {
         loop {
@@ -175,6 +187,28 @@ impl ComAmazonawsMgnApplicationmigrationserviceState {
         self.replication_configuration_templates.insert(id, template);
         true
     }
+
+    /// Drop one of `account_id`'s templates from the store and from the creation order,
+    /// answering the removed record, or `None` when the id names no template of this
+    /// account.
+    ///
+    /// The account key is REQUIRED, exactly as it is on the read accessor above: the map
+    /// is keyed by id alone, so a removal that took only the request-controlled
+    /// `replicationConfigurationTemplateID` could destroy another account's record.
+    ///
+    /// Lookup and removal happen in this ONE method, so the store decides a single winner
+    /// among callers racing to remove the same id: whichever call takes the lock first
+    /// gets the record back, and every later one gets `None`.
+    pub fn remove_replication_configuration_template(
+        &mut self,
+        account_id: &str,
+        template_id: &str,
+    ) -> Option<ReplicationConfigurationTemplate> {
+        self.replication_configuration_template_of(account_id, template_id)?;
+        self.replication_configuration_template_order
+            .retain(|id| id != template_id);
+        self.replication_configuration_templates.remove(template_id)
+    }
 }
 
 /// The ARN of a replication configuration template:
@@ -196,6 +230,27 @@ pub fn replication_configuration_template_not_stored() -> InternalServerExceptio
         retry_after_seconds: 0,
     }
 }
+
+/// The modelled refusal for a `replicationConfigurationTemplateID` the account holds no
+/// record of.
+pub fn replication_configuration_template_not_found(
+    template_id: &str,
+) -> ResourceNotFoundException {
+    resource_not_found_named(
+        REPLICATION_CONFIGURATION_TEMPLATE_RESOURCE_TYPE,
+        REPLICATION_CONFIGURATION_TEMPLATE_RESOURCE_NAME,
+        template_id,
+    )
+}
+
+/// The `resourceType` a replication-configuration-template refusal names: the modelled
+/// shape `com.amazonaws.mgn#ReplicationConfigurationTemplate`, as the API names the kind.
+const REPLICATION_CONFIGURATION_TEMPLATE_RESOURCE_TYPE: &str = "ReplicationConfigurationTemplate";
+
+/// How a refusal's SENTENCE words this kind: the API spells it out in words wherever it
+/// talks about the resource ("Deletes a single Replication Configuration Template by
+/// ID"), and that is the spelling the not-found message carries.
+const REPLICATION_CONFIGURATION_TEMPLATE_RESOURCE_NAME: &str = "Replication Configuration Template";
 
 /// The modelled refusal when the emulator's own
 /// [`REPLICATION_CONFIGURATION_TEMPLATE_QUOTA`] is reached:

@@ -1382,9 +1382,22 @@ pub fn application_not_found(application_id: &str) -> ResourceNotFoundException 
 /// same kind and belongs in an ARN, not here. The message is composed from that type
 /// name and the id the request asked for, so it names what was missing and which one.
 fn resource_not_found(resource_type: &str, resource_id: &str) -> ResourceNotFoundException {
+    resource_not_found_named(resource_type, resource_type, resource_id)
+}
+
+/// [`resource_not_found`] for a kind whose SENTENCE spells the kind differently from the
+/// member: `resource_name` is how the API words the kind in prose (the resource's name
+/// in words, as the documentation and the console spell it), `resource_type` the modelled
+/// shape name the `resourceType` member carries. For a kind the API words as one word
+/// the two coincide, which is what [`resource_not_found`] passes.
+fn resource_not_found_named(
+    resource_type: &str,
+    resource_name: &str,
+    resource_id: &str,
+) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(format!(
-            "{resource_type} with Id: '{resource_id}' was not found"
+            "{resource_name} with Id: '{resource_id}' was not found"
         )),
         code: None,
         resource_id: Some(resource_id.to_string()),
