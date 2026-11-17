@@ -46,6 +46,14 @@
 //! constraints are enforced here, by the same validating walk the centralized request
 //! validation runs.
 //!
+//! A service-owned member of a stored attachment still FOLLOWS the caller-supplied content
+//! an amendment wrote, through the one merge every write of the attachment list goes
+//! through ([`crate::state::merged_file_details`]): `FileName` and `FileType` follow the
+//! `FileURI`, and `CreatedBy`/`CreatedAt` belong to the FILE, so an entry an amendment
+//! points at a file the application does not already carry records the calling principal
+//! and this call's instant, while an entry naming a `FileURI` the application already
+//! carries keeps the principal and instant the call that attached it recorded.
+//!
 //! The members the model leaves unconstrained carry this service's own bounds, so no
 //! request and no sequence of requests can grow one record without limit: at least
 //! [`crate::state::MIN_AMENDMENTS_PER_REQUEST`] and at most
@@ -484,10 +492,18 @@ fn amendments_length_clause(count: usize) -> Option<String> {
 ///
 /// The caller applies amendments to a COPY of the stored application, so a refusal here
 /// leaves the store untouched however many amendments were applied before it.
+///
+/// `created_by` and `now_millis` are the calling principal and this call's instant, which
+/// an amendment that attaches a file the application does not already carry records on that
+/// entry — the upload facts of an attachment belong to the FILE, so they are written by the
+/// one merge every write of the list goes through
+/// ([`crate::state::merged_file_details`]).
 fn apply_amendment(
     application: &mut crate::state::BenefitApplication,
     position: usize,
     amendment: &Amendment,
+    created_by: &str,
+    now_millis: i64,
 ) -> Result<(), AmendmentRefusal> {
     let unamendable = || {
         AmendmentRefusal::new(
@@ -600,7 +616,7 @@ fn apply_amendment(
             let count = application.file_details.len();
             let file = application
                 .file_details
-                .get_mut(index)
+                .get(index)
                 .ok_or_else(|| refused_path(element_count_requirement(FIELD_FILE_DETAILS, count)))?;
             let mut supplied = file_input(file);
             match member {
@@ -625,18 +641,34 @@ fn apply_amendment(
             ) {
                 return Err(refused_value(clause));
             }
-            // `FileName` and `FileType` follow the URI, exactly as they do for an
-            // attachment the create or the update stored
-            // ([`crate::state::file_detail`]), so a write that moved the URI derives them
-            // again — and a write to anything else leaves every member the URI governs
-            // exactly as it was. `CreatedBy` and `CreatedAt` record WHO attached the file
-            // and WHEN rather than what was attached, so no amendment touches them.
-            if supplied.file_uri != file.file_uri {
-                file.file_name = crate::state::file_name_of(&supplied.file_uri);
-                file.file_type = crate::state::file_type_of(&supplied.file_uri);
-                file.file_uri = supplied.file_uri;
-            }
-            file.business_use_case = supplied.business_use_case;
+            // The stored list follows the caller-supplied content of its entries through
+            // the ONE merge every write of the list goes through
+            // ([`crate::state::merged_file_details`]): `FileName` and `FileType` follow the
+            // URI, exactly as they do for an attachment the create or the update stored
+            // ([`crate::state::file_detail`]), and `CreatedBy`/`CreatedAt` record WHO
+            // uploaded a file and WHEN, so they belong to the FILE — an entry naming a
+            // `FileURI` the application already carries keeps the principal and instant the
+            // call that attached it recorded, and an entry pointed at a file the
+            // application does not already carry records this caller and this instant.
+            let supplied = application
+                .file_details
+                .iter()
+                .enumerate()
+                .map(|(element, stored)| {
+                    if element == index {
+                        supplied.clone()
+                    } else {
+                        file_input(stored)
+                    }
+                })
+                .collect::<Vec<_>>();
+            let merged = crate::state::merged_file_details(
+                &application.file_details,
+                &supplied,
+                created_by,
+                now_millis,
+            );
+            application.file_details = merged;
         }
         _ => return Err(unamendable()),
     }
@@ -716,7 +748,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         // The catalog this write would land in is resolved FIRST, and the
         // partner-entitlement gate applies to a request whose catalog resolved — see
         // [`crate::state::write_request_refusal`]. It takes the store lock itself, so it
@@ -772,6 +803,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(refused("clientToken", &clause));
         }
 
+        // The caller this amendment is made by, which is the uploading principal an
+        // amendment that attaches a file the application does not already carry records on
+        // it — read the way every write path of this service reads it (see
+        // [`crate::state::caller_principal`]).
+        let principal = crate::state::caller_principal(ctx);
         let now = crate::state::now_millis();
 
         let mut store = state.lock();
@@ -878,7 +914,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // applied changes nothing at all.
         let mut amended = application.clone();
         for (position, amendment) in input.amendments.iter().enumerate() {
-            if let Err(refusal) = apply_amendment(&mut amended, position, amendment) {
+            if let Err(refusal) = apply_amendment(&mut amended, position, amendment, &principal, now)
+            {
                 return Err(refused(&refusal.member, &refusal.clause));
             }
         }

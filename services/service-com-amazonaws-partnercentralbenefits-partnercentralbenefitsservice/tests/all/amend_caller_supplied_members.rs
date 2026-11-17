@@ -22,6 +22,18 @@
 //! segment, JSON-path form), how many amendments one request carries, and each published
 //! length bound of the member the path names plus one past it — including this service's
 //! own bound where the model constrains the member not at all.
+//!
+//! The last two tests cover what a stored attachment's SERVICE-OWNED members do once an
+//! amendment wrote the caller-supplied content they follow: `FileName` and `FileType`
+//! follow the `FileURI`, while `CreatedBy` and `CreatedAt` report "the identifier of the
+//! user who uploaded the file" and "the timestamp when the file was uploaded"
+//! (`smithy_query(query="shape",shape="FileDetail")`) and so belong to the FILE rather than
+//! to the request that last wrote the list or to the position the file holds in it — the
+//! rule `tests/all/file_upload_facts.rs` drives on the create and the update paths, driven
+//! here on the amendment. No assertion on an instant depends on how fast the host runs: an
+//! instant a call recorded is pinned to a window bounded below by an instant already stored
+//! and above by the record's own `UpdatedAt`, and a carried instant is compared for
+//! equality with the one the read before the amendment reported.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_partnercentralbenefits_partnercentralbenefitsservice::state::{
@@ -30,7 +42,9 @@ use service_com_amazonaws_partnercentralbenefits_partnercentralbenefitsservice::
 
 use crate::amend_benefit_application::{amend_body, amendment, clause, message_of};
 use crate::application_status_gates::reach;
-use crate::benefit_application_lifecycle::{error_code, text, Harness, CATALOG};
+use crate::benefit_application_lifecycle::{
+    error_code, instant, text, Harness, ACCESS_KEY_ID, CATALOG,
+};
 
 /// The modelled `@pattern` of `ContactEmail`, without the `^`/`$` anchors this service
 /// states a pattern requirement without — from
@@ -314,15 +328,41 @@ async fn every_caller_supplied_member_of_a_contact_or_an_attachment_can_be_amend
                 "case {case:?}: an amendment must not change {untouched}, got {after:?}"
             );
         }
-        // Who attached each file and when is the service's own record of the attachment,
-        // so amending the file's caller-supplied content leaves both as they were.
+        // Who uploaded a stored file and when belongs to the FILE, so an entry whose
+        // `FileURI` this amendment left keeps the uploader and upload time recorded for it
+        // exactly as they were, while an entry the amendment pointed at another file
+        // carries that other file's upload facts: this caller, at the instant this
+        // amendment wrote the record. Every write here is signed by the one caller, so
+        // what the second case reports is pinned exactly — against a DIFFERENT calling
+        // principal — by `an_amendment_records_the_upload_facts_of_the_file_it_attached`
+        // below.
         for file in ["0", "1"] {
-            for recorded in ["CreatedBy", "CreatedAt"] {
-                let path = format!("FileDetails.{file}.{recorded}");
+            let uri = format!("FileDetails.{file}.FileURI");
+            let uploader = format!("FileDetails.{file}.CreatedBy");
+            let uploaded = format!("FileDetails.{file}.CreatedAt");
+            assert_eq!(
+                at(&after, &uploader),
+                at(&before, &uploader),
+                "case {case:?}: every attachment of this record was uploaded by the one \
+                 calling principal, so {uploader} must not change, got {after:?}"
+            );
+            if at(&after, &uri) == at(&before, &uri) {
                 assert_eq!(
-                    at(&after, &path),
-                    at(&before, &path),
-                    "case {case:?}: an amendment must not change {path}, got {after:?}"
+                    at(&after, &uploaded),
+                    at(&before, &uploaded),
+                    "case {case:?}: the file at position {file} stayed attached, so \
+                     {uploaded} must not change, got {after:?}"
+                );
+            } else {
+                let element = format!("FileDetails.{file}");
+                let now = instant(case, at(&after, &element), "CreatedAt");
+                let replaced = instant(case, at(&before, &element), "CreatedAt");
+                let wrote = instant(case, &after, "UpdatedAt");
+                assert!(
+                    (replaced..=wrote).contains(&now),
+                    "case {case:?}: position {file} was pointed at a file the application \
+                     did not carry, so {uploaded} is the instant this amendment recorded, \
+                     between {replaced} and {wrote}, got {now} in {after:?}"
                 );
             }
         }
@@ -725,4 +765,406 @@ async fn a_submitted_applications_contacts_and_attachments_are_amendable() {
         "case \"the amendment of a submitted application\": the status must not move, \
          got {after:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The upload facts of an attachment an amendment pointed at another file
+// ---------------------------------------------------------------------------
+
+/// The access key id the amendments in the two tests below are signed with: a caller other
+/// than the one that created the application, so an upload fact an amendment recorded is
+/// observably different from the one the create recorded.
+const AMENDER_KEY: &str = "AKIDAMENDER";
+
+/// One attachment as a request names it: its `FileURI` and the `BusinessUseCase` beside it.
+type SuppliedFile = (&'static str, &'static str);
+
+/// The attachment `plan.pdf`.
+const PLAN: SuppliedFile = ("s3://partner-bucket/proposals/plan.pdf", "funding request");
+
+/// A second attachment, of the same file type.
+const EXTRA: SuppliedFile = (
+    "s3://partner-bucket/proposals/extra.pdf",
+    "supporting detail",
+);
+
+/// A third attachment, of another file type.
+const NOTES: SuppliedFile = ("s3://partner-bucket/proposals/notes.docx", "background");
+
+/// A file no seed below attaches, so an amendment naming it points an attachment at a file
+/// the application does not already carry.
+const FRESH: SuppliedFile = ("s3://partner-bucket/proposals/budget.xlsx", "budget");
+
+/// The `FileDetails` list a request carries for `files`, as the modelled `FileInput`
+/// members.
+fn file_inputs(files: &[SuppliedFile]) -> Value {
+    Value::Array(
+        files
+            .iter()
+            .map(|(uri, use_case)| json!({ "FileURI": uri, "BusinessUseCase": use_case }))
+            .collect(),
+    )
+}
+
+/// The last path segment of a `FileURI`, which is the `FileName` the service derives from
+/// it.
+fn last_segment(uri: &str) -> &str {
+    uri.rsplit('/').next().unwrap_or(uri)
+}
+
+/// The `FileDetails` one read reports, in the order the service reported them.
+fn stored_files(case: &str, application: &Value) -> Vec<Value> {
+    match &application["FileDetails"] {
+        Value::Array(files) => files.clone(),
+        Value::Null => Vec::new(),
+        other => panic!("case {case:?}: expected a FileDetails list, got {other:?}"),
+    }
+}
+
+/// Call one operation signed by `access_key_id`, asserting it answered 200.
+async fn ok_as(
+    harness: &Harness,
+    case: &str,
+    access_key_id: &str,
+    operation: &str,
+    body: &Value,
+) -> Value {
+    let (status, out) = harness.call_as(access_key_id, operation, body).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected {operation} to answer 200, got {status} {out:?}"
+    );
+    out
+}
+
+/// Create one draft application carrying `files`, signed by `access_key_id`, and return
+/// its id.
+async fn seed_files(
+    harness: &Harness,
+    case: &str,
+    access_key_id: &str,
+    token: &str,
+    files: &[SuppliedFile],
+) -> String {
+    let benefit_id = text(case, &harness.active_benefit().await, "Id");
+    let created = ok_as(
+        harness,
+        case,
+        access_key_id,
+        "CreateBenefitApplication",
+        &json!({
+            "Catalog": CATALOG,
+            "ClientToken": token,
+            "BenefitIdentifier": benefit_id,
+            "Name": "amended-upload-facts-subject",
+            "FileDetails": file_inputs(files),
+        }),
+    )
+    .await;
+    text(case, &created, "Id")
+}
+
+/// The principal this service reports for the caller signing as `access_key_id`, observed
+/// through a file that caller attached itself rather than restated here.
+async fn principal_of(harness: &Harness, access_key_id: &str, token: &str) -> String {
+    let case = format!("the principal of {access_key_id}");
+    let id = seed_files(harness, &case, access_key_id, token, &[PLAN]).await;
+    let application = ok_as(
+        harness,
+        &case,
+        access_key_id,
+        "GetBenefitApplication",
+        &json!({ "Catalog": CATALOG, "Identifier": id }),
+    )
+    .await;
+    text(&case, &stored_files(&case, &application)[0], "CreatedBy")
+}
+
+/// What one position of the amended list must report: its `FileURI`, and the attachment
+/// whose recorded upload facts it carries — `Some(uri)` for a file the application already
+/// carried under that URI, whose principal and instant stay exactly as they were, and
+/// `None` for a file it did not carry, which this amendment uploaded.
+type ExpectedFile = (&'static str, Option<&'static str>);
+
+/// An amendment that points an attachment at a file the application does not already carry
+/// records the amending caller and this call's instant on that entry, while every entry
+/// naming a file the application already carries keeps the uploader and upload time
+/// recorded for it.
+///
+/// Each row runs on its own freshly created application, created by one caller and amended
+/// by another, so a rewritten `CreatedBy` is visible as well as a rewritten `CreatedAt`.
+#[tokio::test]
+async fn an_amendment_records_the_upload_facts_of_the_file_it_attached() {
+    let harness = Harness::new();
+    let creator = principal_of(&harness, ACCESS_KEY_ID, "tok-amend-facts-creator").await;
+    let amender = principal_of(&harness, AMENDER_KEY, "tok-amend-facts-amender").await;
+    assert_ne!(
+        creator, amender,
+        "the two callers must report different principals, or the rule is untestable"
+    );
+
+    /// One row: the case, the files the create attaches, the amended `FieldPath`, its
+    /// `NewValue`, and what every position of the amended list must then report.
+    type Row = (
+        &'static str,
+        Vec<SuppliedFile>,
+        &'static str,
+        &'static str,
+        Vec<ExpectedFile>,
+    );
+    let rows: Vec<Row> = vec![
+        (
+            "the only attachment pointed at a file the application does not carry",
+            vec![PLAN],
+            "FileDetails.0.FileURI",
+            FRESH.0,
+            vec![(FRESH.0, None)],
+        ),
+        (
+            "the same replacement with the position written as a subscript",
+            vec![PLAN],
+            "FileDetails[0].FileURI",
+            FRESH.0,
+            vec![(FRESH.0, None)],
+        ),
+        (
+            "the second of two attachments replaced, in JSON-path form",
+            vec![PLAN, EXTRA],
+            "$.FileDetails[1].FileURI",
+            FRESH.0,
+            vec![(PLAN.0, Some(PLAN.0)), (FRESH.0, None)],
+        ),
+        (
+            "the middle of three attachments replaced",
+            vec![PLAN, EXTRA, NOTES],
+            "FileDetails.1.FileURI",
+            FRESH.0,
+            vec![
+                (PLAN.0, Some(PLAN.0)),
+                (FRESH.0, None),
+                (NOTES.0, Some(NOTES.0)),
+            ],
+        ),
+        (
+            "an attachment pointed at the file another position already carries",
+            vec![PLAN, EXTRA],
+            "FileDetails.0.FileURI",
+            EXTRA.0,
+            // The application carries that file once, so the first entry naming it keeps
+            // its upload facts and the second records this call: the rule follows the
+            // FILE, not the position.
+            vec![(EXTRA.0, Some(EXTRA.0)), (EXTRA.0, None)],
+        ),
+        (
+            "the attachment pointed at the file it already carries",
+            vec![PLAN],
+            "FileDetails.0.FileURI",
+            PLAN.0,
+            vec![(PLAN.0, Some(PLAN.0))],
+        ),
+        (
+            "an attachment's business use case rewritten",
+            vec![PLAN, EXTRA],
+            "FileDetails.1.BusinessUseCase",
+            "a corrected use case",
+            vec![(PLAN.0, Some(PLAN.0)), (EXTRA.0, Some(EXTRA.0))],
+        ),
+        (
+            "a member of the application outside the attachment list",
+            vec![PLAN, EXTRA],
+            "Name",
+            "amended-name",
+            vec![(PLAN.0, Some(PLAN.0)), (EXTRA.0, Some(EXTRA.0))],
+        ),
+    ];
+
+    for (row, (case, seeded, field_path, new_value, expected)) in rows.iter().enumerate() {
+        let id = seed_files(
+            &harness,
+            case,
+            ACCESS_KEY_ID,
+            &format!("tok-amend-facts-seed-{row}"),
+            seeded,
+        )
+        .await;
+        let before = harness.get(case, &id).await;
+        let attached = stored_files(case, &before);
+        // The instant the application came into existence, which no later write moves, so
+        // it is the earliest instant any upload of this record can carry.
+        let seeded_at = instant(case, &before, "CreatedAt");
+
+        ok_as(
+            &harness,
+            case,
+            AMENDER_KEY,
+            "AmendBenefitApplication",
+            &amend_body(
+                &id,
+                &text(case, &before, "Revision"),
+                &format!("tok-amend-facts-{row}"),
+                json!([amendment(field_path, new_value)]),
+            ),
+        )
+        .await;
+
+        let after = harness.get(case, &id).await;
+        let after_updated = instant(case, &after, "UpdatedAt");
+        let stored = stored_files(case, &after);
+        assert_eq!(
+            stored.len(),
+            expected.len(),
+            "case {case:?}: expected {} attachments after the amendment, got {stored:?}",
+            expected.len()
+        );
+
+        for (index, (uri, carried)) in expected.iter().enumerate() {
+            let file = &stored[index];
+            assert_eq!(
+                file["FileURI"],
+                json!(uri),
+                "case {case:?}: expected {uri:?} at position {index}, got {file:?}"
+            );
+            assert_eq!(
+                file["FileName"],
+                json!(last_segment(uri)),
+                "case {case:?}: expected the file name {:?} at position {index}, got {file:?}",
+                last_segment(uri)
+            );
+
+            let created_by = text(case, file, "CreatedBy");
+            let created_at = instant(case, file, "CreatedAt");
+            match carried {
+                Some(source) => {
+                    // The application already carried this file, so its upload facts are
+                    // the ones the create recorded: the creating principal, and the very
+                    // instant the read before the amendment reported for that file.
+                    let was = attached
+                        .iter()
+                        .find(|stored| stored["FileURI"] == json!(source))
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "case {case:?}: {source:?} must have been attached, got \
+                                 {attached:?}"
+                            )
+                        });
+                    let uploaded_at = instant(case, was, "CreatedAt");
+                    assert_eq!(
+                        created_by, creator,
+                        "case {case:?}: position {index} must keep the uploading principal \
+                         {creator:?}, got {created_by:?} in {file:?}"
+                    );
+                    assert_eq!(
+                        created_at, uploaded_at,
+                        "case {case:?}: position {index} must keep the upload instant \
+                         {uploaded_at}, got {created_at} in {file:?}"
+                    );
+                }
+                None => {
+                    // The application did not carry this file, so this amendment uploaded
+                    // it: the amending principal, at the instant this call wrote the
+                    // record — inside the window the record's own `UpdatedAt` marks out.
+                    assert_eq!(
+                        created_by, amender,
+                        "case {case:?}: position {index} must record the uploading principal \
+                         {amender:?}, got {created_by:?} in {file:?}"
+                    );
+                    assert!(
+                        (seeded_at..=after_updated).contains(&created_at),
+                        "case {case:?}: position {index} must record an upload instant this \
+                         amendment made, between {seeded_at} and {after_updated}, got \
+                         {created_at} in {file:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// A chain of amendments, each by a different caller, never rewrites the upload facts of a
+/// file that stays attached: the entry for the file the create attached reports the same
+/// `CreatedBy` and `CreatedAt` after every one of them, while the entry beside it is
+/// pointed at one file after another and each of those reports the caller that attached it.
+#[tokio::test]
+async fn repeated_amendments_leave_an_attached_files_upload_facts_alone() {
+    let harness = Harness::new();
+    let case = "a file carried through a chain of amendments";
+    let id = seed_files(
+        &harness,
+        case,
+        ACCESS_KEY_ID,
+        "tok-amend-chain-seed",
+        &[PLAN, EXTRA],
+    )
+    .await;
+    let first = harness.get(case, &id).await;
+    let attached = stored_files(case, &first);
+    let uploaded_by = text(case, &attached[0], "CreatedBy");
+    let uploaded_at = instant(case, &attached[0], "CreatedAt");
+
+    // (the caller signing the amendment, the file it points the second attachment at)
+    let writes: [(&str, SuppliedFile); 3] = [
+        ("AKIDAMENDERONE", NOTES),
+        ("AKIDAMENDERTWO", FRESH),
+        ("AKIDAMENDERTHREE", EXTRA),
+    ];
+
+    for (write, (caller, (uri, _))) in writes.iter().enumerate() {
+        let before = harness.get(case, &id).await;
+        ok_as(
+            &harness,
+            case,
+            caller,
+            "AmendBenefitApplication",
+            &amend_body(
+                &id,
+                &text(case, &before, "Revision"),
+                &format!("tok-amend-chain-{write}"),
+                json!([amendment("FileDetails.1.FileURI", uri)]),
+            ),
+        )
+        .await;
+
+        let after = harness.get(case, &id).await;
+        let after_updated = instant(case, &after, "UpdatedAt");
+        let stored = stored_files(case, &after);
+        assert_eq!(
+            stored.len(),
+            2,
+            "case {case:?}: amendment {write} must leave two attachments, got {stored:?}"
+        );
+
+        let plan = &stored[0];
+        assert_eq!(
+            text(case, plan, "CreatedBy"),
+            uploaded_by,
+            "case {case:?}: amendment {write} must keep the uploading principal \
+             {uploaded_by:?}, got {plan:?}"
+        );
+        assert_eq!(
+            instant(case, plan, "CreatedAt"),
+            uploaded_at,
+            "case {case:?}: amendment {write} must keep the upload instant {uploaded_at}, \
+             got {plan:?}"
+        );
+
+        let attached_now = &stored[1];
+        assert_eq!(
+            attached_now["FileURI"],
+            json!(uri),
+            "case {case:?}: amendment {write} must attach {uri:?}, got {attached_now:?}"
+        );
+        assert_ne!(
+            text(case, attached_now, "CreatedBy"),
+            uploaded_by,
+            "case {case:?}: amendment {write} attached a file the application did not carry, \
+             so that entry must not report the creating principal {uploaded_by:?}, got \
+             {attached_now:?}"
+        );
+        let created_at = instant(case, attached_now, "CreatedAt");
+        assert!(
+            (uploaded_at..=after_updated).contains(&created_at),
+            "case {case:?}: amendment {write} must record an upload instant it made, between \
+             {uploaded_at} and {after_updated}, got {created_at} in {attached_now:?}"
+        );
+    }
 }
