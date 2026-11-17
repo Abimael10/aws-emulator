@@ -66,15 +66,17 @@ use crate::ops::types as wire;
 const ID_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
 
 /// How many characters an id of a resource the ACCOUNT holds carries: an api, a VPC
-/// link, a custom domain name, a portal, a portal product, and the pages and mappings
-/// nested in those. It is also the shortest the portal and portal-product members admit
-/// (`__stringMin10Max30PatternAZ09`: len 10..30, pattern `^[a-z0-9]+$`), so an id of this
-/// length satisfies that constraint by construction.
+/// link, a custom domain name, a portal, a portal product — and the pages of a portal
+/// product, whose id members are MODELLED with a length of their own
+/// (`__stringMin10Max30PatternAZ09`: len 10..30, pattern `^[a-z0-9]+$`), which an id of
+/// this length satisfies by construction where the short nested form would not.
 const ACCOUNT_ID_LEN: u32 = 10;
 
-/// How many characters the id of a resource NESTED INSIDE AN API carries — an
-/// authorizer, a model, a deployment, a route response, an integration response: a short
-/// opaque token, which is the form API Gateway v2 answers for those resources.
+/// How many characters the id of a resource NESTED INSIDE ANOTHER RESOURCE carries — a
+/// child of an api (an authorizer, a model, a deployment, a route response, an
+/// integration response) or of a custom domain name (an api mapping, a routing rule): a
+/// short opaque token, which is the form API Gateway v2 answers for a child resource
+/// whose id member targets the unconstrained `Id` shape.
 const NESTED_ID_LEN: u32 = 6;
 
 /// How many characters the id of a route or an integration carries: one more than
@@ -151,10 +153,11 @@ impl IdKind {
     /// How many characters an id of this kind carries.
     ///
     /// `Id` is unconstrained in the model, so the LENGTH of a minted id is this service's
-    /// convention per kind of resource: [`ACCOUNT_ID_LEN`] for a resource the account
-    /// holds and for the pages and mappings nested in one, and the short opaque form —
-    /// [`NESTED_ID_LEN`], [`ROUTE_ID_LEN`] for a route and an integration — for a
-    /// resource nested inside an api, which is the form API Gateway v2 answers for those.
+    /// convention per kind of resource: the short opaque form — [`NESTED_ID_LEN`], and
+    /// [`ROUTE_ID_LEN`] for a route and an integration — for a resource nested inside
+    /// another one, which is the form API Gateway v2 answers for a child resource, and
+    /// [`ACCOUNT_ID_LEN`] for a resource the account holds directly and for the pages of a
+    /// portal product, whose id members carry a modelled length of 10 at the least.
     const fn id_len(self) -> u32 {
         match self {
             IdKind::Api
@@ -163,15 +166,15 @@ impl IdKind {
             | IdKind::VpcLink
             | IdKind::DomainName
             | IdKind::ProductPage
-            | IdKind::ProductRestEndpointPage
-            | IdKind::ApiMapping
-            | IdKind::RoutingRule => ACCOUNT_ID_LEN,
+            | IdKind::ProductRestEndpointPage => ACCOUNT_ID_LEN,
             IdKind::Route | IdKind::Integration => ROUTE_ID_LEN,
             IdKind::Model
             | IdKind::Deployment
             | IdKind::Authorizer
             | IdKind::RouteResponse
-            | IdKind::IntegrationResponse => NESTED_ID_LEN,
+            | IdKind::IntegrationResponse
+            | IdKind::ApiMapping
+            | IdKind::RoutingRule => NESTED_ID_LEN,
         }
     }
 }
@@ -3507,7 +3510,7 @@ impl DomainName {
             .collect()
     }
 
-    /// Mint a fresh `RoutingRuleId` for this domain name: [`ACCOUNT_ID_LEN`] lowercase
+    /// Mint a fresh `RoutingRuleId` for this domain name: [`NESTED_ID_LEN`] lowercase
     /// alphanumerics, never one this domain name already minted, and never one another
     /// domain name minted either — the domain name's own id is the SCOPE the id is drawn
     /// within.
@@ -3534,7 +3537,7 @@ impl DomainName {
 }
 
 impl DomainName {
-    /// Mint a fresh `ApiMappingId` for this domain name: [`ACCOUNT_ID_LEN`] lowercase
+    /// Mint a fresh `ApiMappingId` for this domain name: [`NESTED_ID_LEN`] lowercase
     /// alphanumerics, never one this domain name already minted, and never one another
     /// domain name minted either — the domain name's own id is the SCOPE the id is drawn
     /// within.

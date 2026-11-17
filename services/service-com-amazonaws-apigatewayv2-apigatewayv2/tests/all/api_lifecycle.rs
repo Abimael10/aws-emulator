@@ -22,14 +22,15 @@ use smithy_server_runtime::MultiServiceRouter;
 /// `us-east-1` default, so an `ApiEndpoint` built from a hardcoded region fails.
 pub(crate) const REGION: &str = "eu-west-1";
 
-/// How many characters the id of a resource the ACCOUNT holds carries (and of the pages
-/// and mappings nested in one). `Id` is an unconstrained string in the model, so the
-/// length of a minted id is this service's own convention per kind of resource.
+/// How many characters the id of a resource the ACCOUNT holds carries, and of the pages
+/// of a portal product, whose id members are modelled with a length of 10 at the least
+/// (`__stringMin10Max30PatternAZ09`). `Id` is an unconstrained string in the model, so
+/// the length of a minted id is this service's own convention per kind of resource.
 const ACCOUNT_ID_LEN: usize = 10;
 
-/// How many characters the id of a resource nested inside an api carries: the short
-/// opaque form API Gateway v2 answers for an authorizer, a model, a deployment, a route
-/// response and an integration response.
+/// How many characters the id of a resource nested inside another resource carries: the
+/// short opaque form API Gateway v2 answers for an authorizer, a model, a deployment, a
+/// route response, an integration response, an api mapping and a routing rule.
 const NESTED_ID_LEN: usize = 6;
 
 /// How many characters a `RouteId` and an `IntegrationId` carry: one more than
@@ -564,11 +565,10 @@ pub(crate) fn minted_id_len(kind: &str) -> usize {
     let lowered = kind.to_ascii_lowercase();
     match lowered.strip_suffix("id").unwrap_or(&lowered) {
         "api" | "portal" | "portalproduct" | "productpage" | "productrestendpointpage"
-        | "vpclink" | "domainname" | "apimapping" | "routingrule" => ACCOUNT_ID_LEN,
+        | "vpclink" | "domainname" => ACCOUNT_ID_LEN,
         "route" | "integration" => ROUTE_ID_LEN,
-        "model" | "deployment" | "authorizer" | "routeresponse" | "integrationresponse" => {
-            NESTED_ID_LEN
-        }
+        "model" | "deployment" | "authorizer" | "routeresponse" | "integrationresponse"
+        | "apimapping" | "routingrule" => NESTED_ID_LEN,
         other => panic!("this suite knows no minted-id length for {other:?}"),
     }
 }
