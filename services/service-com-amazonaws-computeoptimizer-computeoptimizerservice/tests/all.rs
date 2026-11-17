@@ -15,6 +15,8 @@
 mod analysis_due_export_agreement;
 #[path = "all/analysis_due_gate.rs"]
 mod analysis_due_gate;
+#[path = "all/auto_scaling_group_preferred_resource_options.rs"]
+mod auto_scaling_group_preferred_resource_options;
 #[path = "all/auto_scaling_group_recommendations.rs"]
 mod auto_scaling_group_recommendations;
 #[path = "all/auto_scaling_group_recommendations_export.rs"]

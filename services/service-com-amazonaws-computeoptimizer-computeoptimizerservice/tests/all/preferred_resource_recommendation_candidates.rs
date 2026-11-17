@@ -29,14 +29,13 @@
 use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
-    EXPORT_JOB_STEP, JOB_STATUS_COMPLETE, JOB_STATUS_FAILED,
-};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
-    call, cell, create_bucket, csv_rows, effective_for, emulator_with_engine, export_destination,
-    get_object, make_analysis_due, opt_in, put_preference, ACCOUNT,
+    admits, analysed_emulator, call, cell, create_bucket, effective_for,
+    exported_recommendation_rows, group_recommendations, narrowed_group_options,
+    preferred_resource_entry, put_preference, reported_group_options, store_for_each_group,
+    strings, ACCOUNT,
 };
 
 /// The destination bucket the export fixture writes to. Compute Optimizer does not create it,
@@ -51,78 +50,10 @@ const ARN_COLUMN: &str = "InstanceArn";
 /// instance to, i.e. the column that shows which candidates the preference left.
 const OPTION_COLUMN: &str = "RecommendationOptionsInstanceType";
 
-/// How many times the export fixture looks at an export job before giving up, one of the
-/// job's own lifecycle steps apart: a deadline far past the two steps a job takes, because
-/// what the fixture waits for is the job reaching its terminal status rather than a span of
-/// the clock.
-const JOB_POLLS: usize = 60;
-
 /// The account-level scope an Amazon EC2 instance preference is written at: "the value must be
 /// a 12-digit Amazon Web Services account ID" (`Scope$value`).
 fn account_scope() -> Value {
     json!({"name": "AccountId", "value": ACCOUNT})
-}
-
-/// The prefix a preferred-resource value matches instance types by: "You can specify the exact
-/// resource type value, such as m5.large, or use wild card expressions, such as m5"
-/// (`PreferredResource$includeList`), so a value names every instance type its text is a
-/// prefix of, and a trailing `*` is the same expression written out.
-fn prefix_of(value: &str) -> &str {
-    value.strip_suffix('*').unwrap_or(value)
-}
-
-/// Whether an include list of `included` and an exclude list of `excluded` leave
-/// `instance_type` a recommendation candidate: it has to be named by the include list — or by
-/// no include list at all, which includes every supported resource — and not by the exclude
-/// list.
-fn admits(included: &[&str], excluded: &[&str], instance_type: &str) -> bool {
-    let names = |values: &[&str]| {
-        values
-            .iter()
-            .any(|value| instance_type.starts_with(prefix_of(value)))
-    };
-    (included.is_empty() || names(included)) && !names(excluded)
-}
-
-/// The `preferredResources` entry an include list of `included` and an exclude list of
-/// `excluded` are written as, or `None` where both are empty — which is no preference at all,
-/// since "you must specify either an includeList or excludeList".
-fn entry(included: &[&str], excluded: &[&str]) -> Option<Value> {
-    if included.is_empty() && excluded.is_empty() {
-        return None;
-    }
-    // "Compute Optimizer only supports the customization of Ec2InstanceTypes"
-    // (`PreferredResource$name`).
-    let mut written = json!({"name": "Ec2InstanceTypes"});
-    if !included.is_empty() {
-        written["includeList"] = json!(included);
-    }
-    if !excluded.is_empty() {
-        written["excludeList"] = json!(excluded);
-    }
-    Some(written)
-}
-
-/// An emulator whose account is opted in and whose analysis is due, so every recommendation
-/// reader reports the analysis this service holds.
-async fn analysed_emulator() -> MultiServiceRouter {
-    let (router, engine) = emulator_with_engine();
-    opt_in(&router).await;
-    make_analysis_due(&engine);
-    router
-}
-
-/// The strings a reported list member holds.
-fn reported_list(member: &Value) -> Vec<String> {
-    member
-        .as_array()
-        .map(|values| {
-            values
-                .iter()
-                .map(|value| value.as_str().unwrap_or_default().to_string())
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// Read every instance recommendation, asserting the call was served.
@@ -246,7 +177,7 @@ async fn an_instance_recommendation_reports_only_the_candidates_the_preference_l
     for (case, included, excluded) in rows {
         // A fresh emulator per row: what each row reads is its own write, not the last row's.
         let router = analysed_emulator().await;
-        if let Some(written) = entry(included, excluded) {
+        if let Some(written) = preferred_resource_entry(included, excluded) {
             put_preference(
                 &router,
                 &json!({
@@ -283,13 +214,12 @@ async fn an_instance_recommendation_reports_only_the_candidates_the_preference_l
         // generated under and where the effective-preference reader resolves them.
         for (arn, types) in &reported {
             let recommendation = recommendation_for(case, &body, arn);
-            let stated = reported_list(
+            let stated = strings(
                 &recommendation["effectiveRecommendationPreferences"]["preferredResources"][0]
                     ["effectiveIncludeList"],
             );
             let in_force = effective_for(&router, arn).await;
-            let resolved =
-                reported_list(&in_force["preferredResources"][0]["effectiveIncludeList"]);
+            let resolved = strings(&in_force["preferredResources"][0]["effectiveIncludeList"]);
             assert_eq!(
                 stated, resolved,
                 "case {case:?}: expected {arn} to state the candidate set its effective \
@@ -340,7 +270,7 @@ async fn every_reader_of_the_analysis_honours_the_stored_preference() {
         // row exports from its own store.
         let router = analysed_emulator().await;
         create_bucket(&router, BUCKET).await;
-        if let Some(written) = entry(included, excluded) {
+        if let Some(written) = preferred_resource_entry(included, excluded) {
             put_preference(
                 &router,
                 &json!({
@@ -410,63 +340,22 @@ async fn every_reader_of_the_analysis_honours_the_stored_preference() {
     }
 }
 
-/// Export the account's instance recommendations, poll the job to its terminal status — the
-/// documented export-then-download workflow — and answer the option instance types the file
-/// holds, keyed by instance ARN.
+/// The option instance types the EXPORT of the account's instance recommendations holds, keyed
+/// by instance ARN — the file the shared export-then-download workflow
+/// ([`exported_recommendation_rows`]) leaves, read through the column naming one option's
+/// instance type.
 async fn exported_option_types(
     router: &MultiServiceRouter,
     case: &str,
 ) -> BTreeMap<String, Vec<String>> {
-    let request = json!({
-        "s3DestinationConfig": {"bucket": BUCKET, "keyPrefix": "options"},
-        "fieldsToExport": [ARN_COLUMN, OPTION_COLUMN],
-    });
-    let (status, body) = call(router, "ExportEC2InstanceRecommendations", request.clone()).await;
-    assert_eq!(
-        status, 200,
-        "case {case:?}: expected {request} to be accepted, got {status}: {body}"
-    );
-    let job_id = body["jobId"]
-        .as_str()
-        .unwrap_or_else(|| panic!("case {case:?}: an accepted export answers a job id, got {body}"))
-        .to_string();
-    let (bucket, key, _) = export_destination(case, &body);
-
-    let mut status = String::new();
-    for _ in 0..JOB_POLLS {
-        let (code, reported) = call(
-            router,
-            "DescribeRecommendationExportJobs",
-            json!({"jobIds": [job_id]}),
-        )
-        .await;
-        assert_eq!(
-            code, 200,
-            "case {case:?}: reading job {job_id}: got {code}: {reported}"
-        );
-        status = reported["recommendationExportJobs"][0]["status"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
-        if status == JOB_STATUS_COMPLETE || status == JOB_STATUS_FAILED {
-            break;
-        }
-        tokio::time::sleep(EXPORT_JOB_STEP).await;
-    }
-    assert_eq!(
-        status, JOB_STATUS_COMPLETE,
-        "case {case:?}: the export job never completed, last status {status:?}"
-    );
-
-    let (code, object) = get_object(router, &bucket, &key).await;
-    assert_eq!(
-        code, 200,
-        "case {case:?}: downloading {key}: got {code}: {}",
-        String::from_utf8_lossy(&object)
-    );
-    let document = String::from_utf8(object)
-        .unwrap_or_else(|error| panic!("case {case:?}: the export file is text: {error}"));
-    let rows = csv_rows(&document);
+    let rows = exported_recommendation_rows(
+        router,
+        case,
+        "ExportEC2InstanceRecommendations",
+        BUCKET,
+        &[ARN_COLUMN, OPTION_COLUMN],
+    )
+    .await;
     let (header, data) = rows
         .split_first()
         .unwrap_or_else(|| panic!("case {case:?}: the export file carries a header row"));
@@ -480,62 +369,6 @@ async fn exported_option_types(
         }
     }
     held
-}
-
-/// Read every Auto Scaling group recommendation, asserting the call was served.
-async fn group_recommendations(router: &MultiServiceRouter, case: &str) -> Value {
-    let request = json!({"maxResults": 100});
-    let (status, body) = call(
-        router,
-        "GetAutoScalingGroupRecommendations",
-        request.clone(),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "case {case:?}: expected 200 from {request}, got {status}: {body}"
-    );
-    body
-}
-
-/// The instance types of every option a group recommendation reports, keyed by group ARN: one
-/// list per option, since a configuration runs one instance type or several
-/// (`AutoScalingGroupConfiguration$instanceType` / `$mixedInstanceTypes`).
-fn reported_group_options(case: &str, body: &Value) -> BTreeMap<String, Vec<Vec<String>>> {
-    body["autoScalingGroupRecommendations"]
-        .as_array()
-        .unwrap_or_else(|| {
-            panic!("case {case:?}: autoScalingGroupRecommendations must be a list, got {body}")
-        })
-        .iter()
-        .map(|recommendation| {
-            let arn = recommendation["autoScalingGroupArn"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string();
-            let options = recommendation["recommendationOptions"]
-                .as_array()
-                .map(|options| {
-                    options
-                        .iter()
-                        .map(|option| {
-                            let configuration = &option["configuration"];
-                            let mixed = reported_list(&configuration["mixedInstanceTypes"]);
-                            if mixed.is_empty() {
-                                vec![configuration["instanceType"]
-                                    .as_str()
-                                    .unwrap_or_default()
-                                    .to_string()]
-                            } else {
-                                mixed
-                            }
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            (arn, options)
-        })
-        .collect()
 }
 
 /// The same narrowing applies to an Auto Scaling group's candidate configurations, the other
@@ -571,41 +404,18 @@ async fn a_group_recommendation_reports_only_the_configurations_the_preference_l
     );
 
     let mut saw_narrowed = false;
+    let arns: Vec<String> = baseline.keys().cloned().collect();
     for (case, included, excluded) in rows {
         let router = analysed_emulator().await;
-        if let Some(written) = entry(included, excluded) {
-            for arn in baseline.keys() {
-                put_preference(
-                    &router,
-                    &json!({
-                        "resourceType": "AutoScalingGroup",
-                        "scope": {"name": "ResourceArn", "value": arn},
-                        "preferredResources": [written.clone()],
-                    }),
-                )
-                .await;
-            }
+        if let Some(written) = preferred_resource_entry(included, excluded) {
+            store_for_each_group(&router, &arns, &written).await;
         }
 
         let reported = reported_group_options(
             case,
             &group_recommendations(&router, case).await,
         );
-        let expected: BTreeMap<String, Vec<Vec<String>>> = baseline
-            .iter()
-            .map(|(arn, options)| {
-                let left: Vec<Vec<String>> = options
-                    .iter()
-                    .filter(|types| {
-                        types
-                            .iter()
-                            .all(|instance_type| admits(included, excluded, instance_type))
-                    })
-                    .cloned()
-                    .collect();
-                (arn.clone(), left)
-            })
-            .collect();
+        let expected = narrowed_group_options(&baseline, included, excluded);
         assert_eq!(
             reported, expected,
             "case {case:?}: expected the configurations {expected:?}, got {reported:?}"

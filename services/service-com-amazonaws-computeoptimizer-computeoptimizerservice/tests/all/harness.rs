@@ -32,7 +32,8 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::ops::types::RESOURCE_TYPE_VALUES;
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
-    service_state, EBS_METRIC_NAMESPACE, EBS_VOLUME_DIMENSION, METRIC_STATISTIC_MAXIMUM,
+    service_state, EBS_METRIC_NAMESPACE, EBS_VOLUME_DIMENSION, EXPORT_JOB_STEP,
+    JOB_STATUS_COMPLETE, JOB_STATUS_FAILED, METRIC_STATISTIC_MAXIMUM,
     RESOURCE_TYPE_AUTO_SCALING_GROUP, SCOPE_ACCOUNT_ID, SCOPE_RESOURCE_ARN, ANALYSIS_DELAY,
 };
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::EmulatedService;
@@ -610,6 +611,81 @@ pub(crate) async fn get_object(
     object_request(router, "GET", &format!("/{bucket}/{key}")).await
 }
 
+/// How many times [`exported_recommendation_rows`] looks at an export job before giving up, one
+/// of the job's own lifecycle steps apart: a deadline far past the steps a job takes, because
+/// what it waits for is the job reaching its terminal status rather than a span of the clock.
+const JOB_POLLS: usize = 60;
+
+/// Export one recommendation surface and answer the exported FILE as rows of cells, header row
+/// first.
+///
+/// The documented export-then-download workflow, performed the way a client performs it:
+/// `operation` (an `Export*Recommendations`) is called with `fields` as its `fieldsToExport` and
+/// `bucket` — which the caller created over Amazon S3 first ([`create_bucket`]) — as its
+/// destination, the job is polled to its TERMINAL status, and the object the job names is
+/// downloaded over Amazon S3's own `GetObject` and read with the same `csv` codec it is written
+/// with. Shared so no export suite differs from another on the workflow, on how long it waits or
+/// on how it reads the file; polling waits for the job's own status rather than for a span of the
+/// clock, so nothing built on it depends on how fast the host runs.
+pub(crate) async fn exported_recommendation_rows(
+    router: &MultiServiceRouter,
+    case: &str,
+    operation: &str,
+    bucket: &str,
+    fields: &[&str],
+) -> Vec<Vec<String>> {
+    let request = json!({
+        "s3DestinationConfig": {"bucket": bucket, "keyPrefix": "options"},
+        "fieldsToExport": fields,
+    });
+    let (status, body) = call(router, operation, request.clone()).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected {request} to be accepted, got {status}: {body}"
+    );
+    let job_id = body["jobId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: an accepted export answers a job id, got {body}"))
+        .to_string();
+    let (bucket, key, _) = export_destination(case, &body);
+
+    let mut status = String::new();
+    for _ in 0..JOB_POLLS {
+        let (code, reported) = call(
+            router,
+            "DescribeRecommendationExportJobs",
+            json!({"jobIds": [job_id]}),
+        )
+        .await;
+        assert_eq!(
+            code, 200,
+            "case {case:?}: reading job {job_id}: got {code}: {reported}"
+        );
+        status = reported["recommendationExportJobs"][0]["status"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if status == JOB_STATUS_COMPLETE || status == JOB_STATUS_FAILED {
+            break;
+        }
+        tokio::time::sleep(EXPORT_JOB_STEP).await;
+    }
+    assert_eq!(
+        status, JOB_STATUS_COMPLETE,
+        "case {case:?}: the export job never completed, last status {status:?}"
+    );
+
+    let (code, object) = get_object(router, &bucket, &key).await;
+    assert_eq!(
+        code, 200,
+        "case {case:?}: downloading {key}: got {code}: {}",
+        String::from_utf8_lossy(&object)
+    );
+    let document = String::from_utf8(object)
+        .unwrap_or_else(|error| panic!("case {case:?}: the export file is text: {error}"));
+    csv_rows(&document)
+}
+
 /// `DELETE /<bucket>` — Amazon S3's `DeleteBucket`, for a suite that has to take the
 /// destination of an export away again.
 pub(crate) async fn delete_bucket(router: &MultiServiceRouter, bucket: &str) -> u16 {
@@ -1029,4 +1105,163 @@ pub(crate) async fn effective_for(router: &MultiServiceRouter, resource_arn: &st
         "effective preferences for {resource_arn}: expected 200, got {status}: {body}"
     );
     body
+}
+
+/// The prefix a preferred-resource value matches instance types by: "You can specify the exact
+/// resource type value, such as m5.large, or use wild card expressions, such as m5"
+/// (`PreferredResource$includeList`), so a value names every instance type its text is a prefix
+/// of, and a trailing `*` is the same expression written out.
+fn prefix_of(value: &str) -> &str {
+    value.strip_suffix('*').unwrap_or(value)
+}
+
+/// Whether an include list of `included` and an exclude list of `excluded` leave `instance_type`
+/// a recommendation candidate: it has to be named by the include list — or by no include list at
+/// all, which includes every supported resource — and not by the exclude list.
+///
+/// The ORACLE every preferred-resource suite narrows a baseline with, computed here from the
+/// written lists rather than read out of the emulator, so no suite can borrow the behaviour it
+/// is checking.
+pub(crate) fn admits(included: &[&str], excluded: &[&str], instance_type: &str) -> bool {
+    let names = |values: &[&str]| {
+        values
+            .iter()
+            .any(|value| instance_type.starts_with(prefix_of(value)))
+    };
+    (included.is_empty() || names(included)) && !names(excluded)
+}
+
+/// The `preferredResources` entry an include list of `included` and an exclude list of
+/// `excluded` are written as, or `None` where both are empty — which is no preference at all,
+/// since "you must specify either an includeList or excludeList".
+pub(crate) fn preferred_resource_entry(included: &[&str], excluded: &[&str]) -> Option<Value> {
+    if included.is_empty() && excluded.is_empty() {
+        return None;
+    }
+    // "Compute Optimizer only supports the customization of Ec2InstanceTypes"
+    // (`PreferredResource$name`).
+    let mut written = json!({"name": "Ec2InstanceTypes"});
+    if !included.is_empty() {
+        written["includeList"] = json!(included);
+    }
+    if !excluded.is_empty() {
+        written["excludeList"] = json!(excluded);
+    }
+    Some(written)
+}
+
+/// An emulator whose account is opted in and whose analysis is due, so every recommendation
+/// reader reports the analysis this service holds.
+///
+/// The enrollment instant is moved back a span ([`make_analysis_due`]) instead of slept for, so
+/// a suite built on it does not depend on how fast the host runs.
+pub(crate) async fn analysed_emulator() -> MultiServiceRouter {
+    let (router, engine) = emulator_with_engine();
+    opt_in(&router).await;
+    make_analysis_due(&engine);
+    router
+}
+
+/// Store the `preferredResources` preference `written` for every group in `arns`, at the scope
+/// an Auto Scaling group preference is written at — "you can create recommendation preferences
+/// for Auto Scaling groups only at the resource level by specifying a scope name of ResourceArn
+/// and a scope value of the Auto Scaling group Amazon Resource Name (ARN)"
+/// (`PutRecommendationPreferences$scope`).
+pub(crate) async fn store_for_each_group(
+    router: &MultiServiceRouter,
+    arns: &[String],
+    written: &Value,
+) {
+    for arn in arns {
+        put_preference(
+            router,
+            &json!({
+                "resourceType": RESOURCE_TYPE_AUTO_SCALING_GROUP,
+                "scope": {"name": SCOPE_RESOURCE_ARN, "value": arn},
+                "preferredResources": [written.clone()],
+            }),
+        )
+        .await;
+    }
+}
+
+/// Read every Auto Scaling group recommendation, asserting the call was served.
+pub(crate) async fn group_recommendations(router: &MultiServiceRouter, case: &str) -> Value {
+    let request = json!({"maxResults": 100});
+    let (status, body) = call(router, "GetAutoScalingGroupRecommendations", request.clone()).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected 200 from {request}, got {status}: {body}"
+    );
+    body
+}
+
+/// The instance types of every option a group recommendation reports, keyed by group ARN: one
+/// list per option, since a configuration runs one instance type or several
+/// (`AutoScalingGroupConfiguration$instanceType` / `$mixedInstanceTypes`).
+pub(crate) fn reported_group_options(
+    case: &str,
+    body: &Value,
+) -> BTreeMap<String, Vec<Vec<String>>> {
+    body["autoScalingGroupRecommendations"]
+        .as_array()
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: autoScalingGroupRecommendations must be a list, got {body}")
+        })
+        .iter()
+        .map(|recommendation| {
+            let arn = recommendation["autoScalingGroupArn"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let options = recommendation["recommendationOptions"]
+                .as_array()
+                .map(|options| {
+                    options
+                        .iter()
+                        .map(|option| {
+                            let configuration = &option["configuration"];
+                            let mixed = strings(&configuration["mixedInstanceTypes"]);
+                            if mixed.is_empty() {
+                                vec![configuration["instanceType"]
+                                    .as_str()
+                                    .unwrap_or_default()
+                                    .to_string()]
+                            } else {
+                                mixed
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            (arn, options)
+        })
+        .collect()
+}
+
+/// The configurations a stored preferred-resource preference leaves of `baseline`: every option
+/// whose instance types the lists all admit ([`admits`]), in the order the analysis ranks them.
+///
+/// A configuration is a candidate only where EVERY instance type it runs is one, since one
+/// running an excluded type would consider that type.
+pub(crate) fn narrowed_group_options(
+    baseline: &BTreeMap<String, Vec<Vec<String>>>,
+    included: &[&str],
+    excluded: &[&str],
+) -> BTreeMap<String, Vec<Vec<String>>> {
+    baseline
+        .iter()
+        .map(|(arn, options)| {
+            let left: Vec<Vec<String>> = options
+                .iter()
+                .filter(|types| {
+                    types
+                        .iter()
+                        .all(|instance_type| admits(included, excluded, instance_type))
+                })
+                .cloned()
+                .collect();
+            (arn.clone(), left)
+        })
+        .collect()
 }
