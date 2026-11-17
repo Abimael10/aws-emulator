@@ -37,6 +37,9 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use serde_json::{json, Value};
+use service_com_amazonaws_lambda_awsgirapiservice::state::execution::{
+    run_budget, run_heap_bytes, ABANDON_GRACE, HOST_WAIT_CEILING,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::event_source_mapping_role_access::{allow, given_role};
@@ -251,6 +254,39 @@ pub(crate) const NODE_RUNTIME: &str = "nodejs20.x";
 /// The runtime whose own error report one row asserts.
 pub(crate) const PYTHON_RUNTIME: &str = "python3.12";
 
+/// The `Timeout` every function this fixture creates carries, in the seconds the member is
+/// stated in.
+///
+/// No suite over the delivery of a log asserts anything about this bound, so it is given all
+/// the room there is to give rather than a value picked by hand: a run is waited for at most
+/// `state::execution::HOST_WAIT_CEILING`, of which `state::execution::ABANDON_GRACE` is the
+/// span a caller still gives a run past its own budget, so this is the longest budget whose
+/// run the caller waits out in full. A tighter one would turn the HOST's speed into an
+/// invocation FAILURE — a test binary runs its suites together, so a run's wall clock covers
+/// the other suites' work as well as its own, and a handler cut off on that bound is a failed
+/// attempt rather than a slow one.
+pub(crate) fn function_timeout_seconds() -> i32 {
+    let seconds = HOST_WAIT_CEILING.saturating_sub(ABANDON_GRACE).as_secs();
+    i32::try_from(seconds).unwrap_or(i32::MAX).max(1)
+}
+
+/// The `MemorySize` every function this fixture creates carries, in the MB the member is
+/// stated in: the smallest value that gives a run the whole per-run ceiling this emulator
+/// allows (`state::execution::run_heap_bytes`, which clamps every larger `MemorySize` to it).
+///
+/// For the reason [`function_timeout_seconds`] is generous, and against a bound that is read
+/// from the whole PROCESS as well as from the run: a run is stopped for memory once this
+/// process is past its own resident ceiling AND has grown, since the run began, by more than
+/// the run's own ceiling allows it to add — and in a test binary running many suites at once
+/// that growth is the other suites' and none of the run's own. A function given the per-run
+/// ceiling is the furthest such growth can be put out of reach of a run that allocates
+/// almost nothing, as every row of these suites does.
+pub(crate) fn function_memory_size_mb() -> i32 {
+    const BYTES_PER_MB: usize = 1024 * 1024;
+    let megabytes = run_heap_bytes(i32::MAX) / BYTES_PER_MB;
+    i32::try_from(megabytes).unwrap_or(i32::MAX).max(1)
+}
+
 /// Create `function` and wait until it reports `Active`.
 ///
 /// `pub(crate)` for the reason [`emulator`] is.
@@ -287,7 +323,8 @@ pub(crate) async fn create_function_logging(
         "Role": function.role,
         "Runtime": function.runtime,
         "Handler": handler,
-        "Timeout": 10,
+        "Timeout": function_timeout_seconds(),
+        "MemorySize": function_memory_size_mb(),
         "Code": { "ZipFile": base64::engine::general_purpose::STANDARD.encode(package) },
     });
     match (logging_config, function.log_group) {
@@ -948,4 +985,107 @@ async fn an_asynchronous_run_is_logged_and_a_dry_run_is_not() {
         lines[2].starts_with("END RequestId: ") && lines[3].starts_with("REPORT RequestId: "),
         "case {case:?}: expected the log to close on END and then REPORT, got {lines:?}"
     );
+}
+
+/// Every function this fixture creates carries the run bounds of [`function_timeout_seconds`]
+/// and [`function_memory_size_mb`], read back through `GetFunctionConfiguration` — the one
+/// surface a client reads them from — so neither bound can be tightened back into a limit the
+/// HOST's own load decides.
+///
+/// No row of these suites is about either bound: what they assert is where a log goes, and a
+/// run of a handler that writes a line or two reaches neither. A run cut off on a tight one is
+/// a FAILED invocation — reported as a run that timed out or whose runtime was killed — so a
+/// suite that runs handlers beside the other suites of its test binary would pass or fail by
+/// how much wall clock and how much of this process's memory those other suites happened to
+/// be taking.
+///
+/// The rows are the two shapes of function the fixture creates — the default group and one the
+/// configuration names — and each runtime it uploads a package for, because the bounds are the
+/// function's and belong to neither.
+#[tokio::test]
+async fn every_function_of_these_suites_is_created_with_room_for_the_hosts_own_load() {
+    const PYTHON_SOURCE: &str = "def lambda_handler(event, context):\n    return {}\n";
+    const NODE_SOURCE: &str = "exports.handler = async () => ({ ok: true });";
+    let rows: [(&str, &str, &str, Option<&str>); 3] = [
+        ("the default group, python", PYTHON_RUNTIME, PYTHON_SOURCE, None),
+        ("the default group, node", NODE_RUNTIME, NODE_SOURCE, None),
+        (
+            "a group the configuration names",
+            NODE_RUNTIME,
+            NODE_SOURCE,
+            Some("/aws/lambda/bounds-named-elsewhere"),
+        ),
+    ];
+    for (index, (case, runtime, source, log_group)) in rows.iter().enumerate() {
+        let router = emulator();
+        let name = format!("log-bounds-{index}");
+        create_function(
+            &router,
+            &Created {
+                case,
+                name: &name,
+                source,
+                runtime,
+                role: UNKNOWN_ROLE,
+                log_group: *log_group,
+            },
+        )
+        .await;
+        let read = call(
+            &router,
+            "GET",
+            &format!("{FUNCTIONS_URI}/{name}/configuration"),
+            &Value::Null,
+        )
+        .await;
+        assert_eq!(
+            read.status, 200,
+            "case {case:?}: GetFunctionConfiguration answered {} {}",
+            read.status,
+            read.text()
+        );
+        let configuration = read.json();
+        let memory_size = configuration["MemorySize"]
+            .as_i64()
+            .and_then(|size| i32::try_from(size).ok())
+            .unwrap_or_default();
+        let timeout = configuration["Timeout"]
+            .as_i64()
+            .and_then(|seconds| i32::try_from(seconds).ok())
+            .unwrap_or_default();
+
+        // What the create asked for is what the service reports: the bounds a run is judged
+        // against are the ones a client reads off the function, not ones the create quietly
+        // clamped or dropped.
+        assert_eq!(
+            (memory_size, timeout),
+            (function_memory_size_mb(), function_timeout_seconds()),
+            "case {case:?}: GetFunctionConfiguration must report the bounds {name:?} was created \
+             with, got {}",
+            read.text()
+        );
+
+        // The memory bound: the run holds the whole per-run ceiling, which is what no larger
+        // `MemorySize` can add to.
+        assert_eq!(
+            run_heap_bytes(memory_size),
+            run_heap_bytes(i32::MAX),
+            "case {case:?}: a run of {name:?} must hold the per-run ceiling, so this process's \
+             own growth cannot reach it; MemorySize {memory_size} gives it {} bytes against the \
+             ceiling's {}",
+            run_heap_bytes(memory_size),
+            run_heap_bytes(i32::MAX)
+        );
+
+        // And the wall clock: every second the host waits for a run but the grace it gives one
+        // past its budget.
+        let budget = run_budget(timeout, memory_size);
+        let least = HOST_WAIT_CEILING.saturating_sub(ABANDON_GRACE);
+        assert!(
+            budget.wall_clock >= least,
+            "case {case:?}: a run of {name:?} must be given at least {least:?} of wall clock, \
+             got {:?} from Timeout {timeout}",
+            budget.wall_clock
+        );
+    }
 }

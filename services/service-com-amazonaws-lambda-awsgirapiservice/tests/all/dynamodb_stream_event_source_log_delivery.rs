@@ -41,16 +41,25 @@
 //! WHICH attempt the mapping reports once a batch has been logged, over a mapping that gave up
 //! on the batch before it.
 //!
-//! No step waits a span of its own choosing and no assertion reads the clock: each row opens one
-//! deadline ([`ROW_BUDGET`]) and every look-again below shares it — the last of them, the
-//! mapping's own report, holding a share of it back ([`REPORT_RESERVE`]) so the wait before it
-//! cannot spend the row's whole patience — so the row is as patient as the emulator's own run
-//! limits allow and still terminates.
+//! No step waits a span of its own choosing and no assertion reads the clock: each WRITE opens
+//! one deadline ([`ROW_BUDGET`]) for the chain it starts and every look-again after it shares
+//! that one — the last of them, the mapping's own report, holding a share back
+//! ([`REPORT_RESERVE`]) so the wait before it cannot spend the whole patience — so the row is as
+//! patient as the emulator's own run limits allow and still terminates. The deadline is opened
+//! by the write rather than before the fixture the write needs, so none of it is spent standing
+//! a table, a function and a mapping up, and a chain that follows an attempt the mapping gave up
+//! on opens its own.
 //!
 //! Nothing here waits a span of its own choosing: every state a row needs is waited for by
 //! looking again until THE STATE IT ASSERTS holds, the mapping's own report of its last
 //! attempt included — a member every pass the poller makes overwrites — so no assertion depends
-//! on how fast the host runs or on which pass happened to report first.
+//! on how fast the host runs or on which pass happened to report first. The two bounds that
+//! could still turn the host's load into a FAILED attempt — the wall clock one run may spend
+//! and the memory it may hold — are the function's own, and the fixture that creates these
+//! functions gives both all the room the emulator has to give
+//! ([`crate::invocation_log_delivery::function_timeout_seconds`],
+//! [`crate::invocation_log_delivery::function_memory_size_mb`]), because no row here is about
+//! either.
 //!
 //! Every test here RUNS handlers, so each takes the target's one invocation stream
 //! ([`crate::invoke_request_id::one_invocation_stream_at_a_time`]): this emulator serves at
@@ -72,22 +81,25 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::dynamodb_stream_event_source_delivery::{
     dynamodb, given_table, results_until, KEY, LATEST, NEW_AND_OLD_IMAGES, TRIM_HORIZON,
 };
-use crate::event_source_mappings::{given_enabled_mapping, router_on, LOOK_AGAIN};
+use crate::event_source_mappings::{
+    get_mapping, given_enabled_mapping, router_on, CLOCK_BUDGET, LOOK_AGAIN,
+};
 use crate::invocation_log_delivery::{
     create_function, events, groups, streams, Created, PYTHON_RUNTIME,
 };
 
-/// How long ONE row is given for every state the clock owes it together — the mapping's poller
-/// taking its batches, the invocations running, their logs reaching the group and the mapping
-/// reporting the attempt that consumed the batch.
+/// How long the chain ONE write starts is given for every state the clock owes it together —
+/// the mapping's poller taking its batches, the invocations running, their logs reaching the
+/// group and the mapping reporting the attempt that consumed the batch.
 ///
 /// PATIENCE, not a weakened expectation: every assertion below is unchanged, and the steps SHARE
-/// this one deadline rather than each taking a span of its own, so the row is as patient as it
+/// this one deadline rather than each taking a span of its own, so the wait is as patient as it
 /// can be and still terminates well inside the time a test may take. The bound is taken from
 /// what the EMULATOR itself allows an invocation rather than picked here — the wait for a share
 /// of the run capacity ([`PERMIT_WAIT`]) and the wait for the run's own answer
 /// ([`HOST_WAIT_CEILING`]), for each of the two batches a row can be delivered in — with room on
-/// top, because a whole-workspace run shares its cores with every other suite.
+/// top, because a whole-workspace run shares its cores with every other suite. It is opened by
+/// the write, so none of it is spent on the fixture that write needs.
 const ROW_BUDGET: Duration = PERMIT_WAIT
     .saturating_add(HOST_WAIT_CEILING)
     .saturating_mul(2)
@@ -422,15 +434,19 @@ fn removed_row() -> Row {
 /// handler's own line for every record the writes produced is in the function's group — and
 /// that the mapping reports the attempt that produced them.
 ///
-/// Every state the clock owes the row is waited for against ONE deadline opened by its caller,
-/// so the steps share the row's patience instead of each taking a span of its own.
+/// Every state the clock owes the row AFTER the write is waited for against ONE deadline
+/// ([`ROW_BUDGET`]), so those steps share the row's patience instead of each taking a span of
+/// its own. The deadline is opened by the WRITE, the one client action the chain follows from,
+/// rather than before the fixture the chain needs: standing a table, a function and a mapping
+/// up is work the clock owes too, each piece of it already waited for by looking again
+/// (`crate::event_source_mappings::CLOCK_BUDGET`), and patience spent there is patience the
+/// delivery never had.
 async fn assert_delivered_and_logged(
     router: &MultiServiceRouter,
     row: &Row,
     function: &str,
     table: &str,
     stream_arn: &str,
-    deadline: Instant,
 ) {
     let case = row.case;
     let source = logging_handler();
@@ -459,8 +475,10 @@ async fn assert_delivered_and_logged(
     )
     .await;
 
-    // The ONE client action: the items are written where a client writes them.
+    // The ONE client action: the items are written where a client writes them. Everything
+    // after it is the mapping's own work, and the row's patience is for THAT.
     write_items(router, case, table, row).await;
+    let deadline = Instant::now() + ROW_BUDGET;
 
     // Where the log has to be: the group the function's configuration names, else the default
     // its own documentation gives.
@@ -469,13 +487,19 @@ async fn assert_delivered_and_logged(
         .map_or_else(|| format!("{DEFAULT_GROUP_PREFIX}{function}"), str::to_string);
     let wanted = expected_lines(row);
     let lines = logged(router, case, &group, &wanted, log_deadline(deadline)).await;
-    for line in &wanted {
-        assert!(
-            lines.iter().any(|written| written.contains(line)),
-            "case {case:?}: the handler's line {line:?} must be delivered to {group:?}, got \
-             {lines:?}"
-        );
-    }
+    let missing: Vec<&String> = wanted
+        .iter()
+        .filter(|line| !lines.iter().any(|written| written.contains(line.as_str())))
+        .collect();
+    // What the mapping says about its own last attempt is read only to SAY why a delivery that
+    // did not arrive did not arrive — a run the host cut off is reported there — so the row
+    // that fails names the cause instead of only the lines it did not find.
+    assert!(
+        missing.is_empty(),
+        "case {case:?}: the handler's lines {missing:?} must be delivered to {group:?}, got \
+         {lines:?}; the mapping reports {}",
+        get_mapping(router, &uuid).await.text()
+    );
     // The group the lines are in is the one the rule names, reported by CloudWatch Logs itself
     // rather than inferred from the read above.
     let named = groups(router, case, &group).await;
@@ -504,7 +528,6 @@ async fn assert_delivered_and_logged(
 /// `label` keeps one test's table and function names apart from another's; every row runs on an
 /// engine of its own.
 async fn assert_row_on_a_stream_enabled_table(label: &str, row: &Row) {
-    let deadline = Instant::now() + ROW_BUDGET;
     let router = emulator();
     let name = format!("ddb-stream-log-{label}");
     let stream_arn = given_table(&router, row.case, &name, Some(row.view_type)).await;
@@ -513,7 +536,7 @@ async fn assert_row_on_a_stream_enabled_table(label: &str, row: &Row) {
         "case {:?}: the table created with a stream must report its LatestStreamArn",
         row.case
     );
-    assert_delivered_and_logged(&router, row, &name, &name, &stream_arn, deadline).await;
+    assert_delivered_and_logged(&router, row, &name, &name, &stream_arn).await;
 }
 
 /// RULE: a change a table's stream captures is handed to the function of the mapping that polls
@@ -555,7 +578,6 @@ async fn a_removed_item_is_delivered_and_logged_to_the_functions_group() {
 #[tokio::test]
 async fn a_stream_enabled_after_the_create_is_consumed_by_its_mapping() {
     let _stream = crate::invoke_request_id::one_invocation_stream_at_a_time().await;
-    let deadline = Instant::now() + ROW_BUDGET;
     let row = Row {
         case: "a stream UpdateTable enabled on a table created without one",
         view_type: NEW_AND_OLD_IMAGES,
@@ -592,14 +614,14 @@ async fn a_stream_enabled_after_the_create_is_consumed_by_its_mapping() {
         "case {:?}: UpdateTable answered {status} {updated}",
         row.case
     );
-    let stream_arn = await_stream_arn(&router, row.case, table, deadline).await;
+    let stream_arn = await_stream_arn(&router, row.case, table, Instant::now() + CLOCK_BUDGET).await;
     assert!(
         stream_arn.starts_with(STREAM_ARN_PREFIX),
         "case {:?}: the enabled stream must be reported as an ARN, got {stream_arn:?}",
         row.case
     );
 
-    assert_delivered_and_logged(&router, &row, function, table, &stream_arn, deadline).await;
+    assert_delivered_and_logged(&router, &row, function, table, &stream_arn).await;
 }
 
 /// RULE, over the remaining dimension of what the pair reports: `LastProcessingResult` is "the
@@ -616,7 +638,6 @@ async fn a_stream_enabled_after_the_create_is_consumed_by_its_mapping() {
 #[tokio::test]
 async fn the_attempt_that_consumed_the_batch_is_what_the_mapping_reports() {
     let _stream = crate::invoke_request_id::one_invocation_stream_at_a_time().await;
-    let deadline = Instant::now() + ROW_BUDGET;
     let case = "a batch given up on, then one consumed, read one record per batch";
     let router = emulator();
     let name = "ddb-stream-log-given-up";
@@ -650,6 +671,8 @@ async fn the_attempt_that_consumed_the_batch_is_what_the_mapping_reports() {
 
     // The record the handler refuses: the one attempt the mapping gives that batch is spent on
     // it, so the mapping reports the attempt it gave up on and reads on from past the record.
+    // Each write opens the patience for the chain it starts, so the attempt that is given up on
+    // does not spend the patience of the delivery behind it.
     let refused_key = format!("{REFUSED}-0");
     put_item(&router, case, name, &refused_key, "written").await;
     let given_up = results_until(
@@ -657,7 +680,7 @@ async fn the_attempt_that_consumed_the_batch_is_what_the_mapping_reports() {
         case,
         &uuid,
         LAST_PROCESSING_RESULT_FUNCTION_CALL_FAILED,
-        deadline,
+        Instant::now() + ROW_BUDGET,
     )
     .await;
     assert_eq!(
@@ -671,6 +694,7 @@ async fn the_attempt_that_consumed_the_batch_is_what_the_mapping_reports() {
     // function's group exactly as it is for a mapping that gave up on nothing.
     let key = item_key(0);
     put_item(&router, case, name, &key, "written").await;
+    let deadline = Instant::now() + ROW_BUDGET;
     let group = format!("{DEFAULT_GROUP_PREFIX}{name}");
     let wanted = expected_line(INSERT, &key);
     let lines = logged(
