@@ -40,9 +40,14 @@
 
 use serde_json::json;
 
+// The ONE spelling of an S3 bucket's ARN this test binary names a bucket by, and the ONE
+// policy-document wrapper it carries a statement in, both already written in sibling suites
+// — so this suite's grants and theirs cannot drift on either shape.
+use super::bucket_analytics_configuration::bucket_arn;
 use super::object_event_notifications::{
     queue_arn, Emulator, LAMBDA_ROLE, PACKAGE_ZIP_FILE, REGION, XMLNS,
 };
+use super::sse_kms_data_key_authorization::policy as policy_document;
 
 /// The error code S3 answers a container it could not validate with, and the status it is
 /// rendered with ("InvalidArgument - Invalid Argument", HTTP 400, from Amazon S3's list of
@@ -622,7 +627,6 @@ async fn create_fifo_queue(emulator: &Emulator, name: &str) -> String {
 /// `arn:aws:s3:::<bucket>`, with no Region or account "because a bucket name is globally
 /// unique".
 fn queue_policy(grant: Grant, queue_arn: &str, bucket: &str) -> Option<String> {
-    let bucket_arn = |bucket: &str| format!("arn:aws:s3:::{bucket}");
     let mut statement = match grant {
         Grant::None => return None,
         Grant::ThisBucket => json!({
@@ -670,7 +674,7 @@ fn queue_policy(grant: Grant, queue_arn: &str, bucket: &str) -> Option<String> {
         }),
     };
     statement["Resource"] = json!(queue_arn);
-    Some(json!({ "Version": "2012-10-17", "Statement": [statement] }).to_string())
+    Some(policy_document(vec![statement]))
 }
 
 /// Create the Lambda function named `name`, so a configuration naming it resolves, and add
@@ -711,7 +715,6 @@ async fn create_function(emulator: &Emulator, name: &str, bucket: &str, grant: G
 /// S3 bucket's ARN is `arn:aws:s3:::<bucket>`, which carries no Region or account "because
 /// a bucket name is globally unique".
 async fn add_permission(emulator: &Emulator, name: &str, bucket: &str, grant: Grant) {
-    let bucket_arn = |bucket: &str| format!("arn:aws:s3:::{bucket}");
     let mut statement = match grant {
         Grant::None => return,
         Grant::ThisBucket => json!({
@@ -994,6 +997,286 @@ async fn a_configuration_is_recorded_only_once_every_destination_it_names_resolv
             on_baseline.is_empty(),
             "case {case:?}: the baseline queue was configured with validation skipped and is \
              named by no later container, so it must stay empty, got {on_baseline:?}"
+        );
+    }
+}
+
+/// One access policy that DOES let Amazon S3 send this bucket's notifications to the queue,
+/// in a form a queue policy may be written in.
+///
+/// The decision is the IAM one — may the `s3.amazonaws.com` service principal perform
+/// `sqs:SendMessage` on this queue for a notification of this bucket? — so what varies across
+/// the rows is how the statement says so: which condition key narrows it and under which
+/// operator, whether its `Action` names the one action or a set or a wildcard, and whether its
+/// `Resource` names the queue or every resource.
+struct Granting {
+    case: &'static str,
+    /// Built from the ARN Amazon SQS keyed the queue by and the name of the publishing
+    /// bucket.
+    document: fn(&str, &str) -> String,
+}
+
+/// The granting documents the rule is read over.
+///
+/// `aws:SourceArn` and `aws:SourceAccount` are the condition keys AWS documents for a queue
+/// policy that admits Amazon S3 — the publishing bucket ([`bucket_arn`]) and the account that
+/// owns it — and `ArnEquals`/`ArnLike`/`StringEquals` are the operators such a clause is
+/// written under. The first row is the grant the table above already describes
+/// ([`Grant::ThisBucket`]), built through that one builder so the two tables cannot spell it
+/// two ways.
+fn granting_documents() -> Vec<Granting> {
+    vec![
+        Granting {
+            case: "narrowed to this bucket by ArnLike aws:SourceArn",
+            document: |queue_arn, bucket| {
+                queue_policy(Grant::ThisBucket, queue_arn, bucket)
+                    .expect("Grant::ThisBucket is a statement, so it is a document")
+            },
+        },
+        Granting {
+            case: "narrowed to this bucket by ArnEquals aws:SourceArn",
+            document: |queue_arn, bucket| {
+                policy_document(vec![json!({
+                    "Sid": "s3-publish-arnequals",
+                    "Effect": "Allow",
+                    "Principal": {"Service": "s3.amazonaws.com"},
+                    "Action": "sqs:SendMessage",
+                    "Resource": queue_arn,
+                    "Condition": {"ArnEquals": {"aws:SourceArn": bucket_arn(bucket)}},
+                })])
+            },
+        },
+        Granting {
+            case: "narrowed to the account that owns the bucket by StringEquals \
+                   aws:SourceAccount",
+            document: |queue_arn, _bucket| {
+                policy_document(vec![json!({
+                    "Sid": "s3-publish-source-account",
+                    "Effect": "Allow",
+                    "Principal": {"Service": "s3.amazonaws.com"},
+                    "Action": "sqs:SendMessage",
+                    "Resource": queue_arn,
+                    "Condition": {"StringEquals": {
+                        "aws:SourceAccount": ::engine::emulator_account_id(),
+                    }},
+                })])
+            },
+        },
+        Granting {
+            case: "an Action set that includes the send",
+            document: |queue_arn, bucket| {
+                policy_document(vec![json!({
+                    "Sid": "s3-publish-action-set",
+                    "Effect": "Allow",
+                    "Principal": {"Service": "s3.amazonaws.com"},
+                    "Action": ["sqs:GetQueueUrl", "sqs:SendMessage"],
+                    "Resource": queue_arn,
+                    "Condition": {"ArnLike": {"aws:SourceArn": bucket_arn(bucket)}},
+                })])
+            },
+        },
+        Granting {
+            case: "an Action wildcard over the whole queue service",
+            document: |queue_arn, bucket| {
+                policy_document(vec![json!({
+                    "Sid": "s3-publish-action-wildcard",
+                    "Effect": "Allow",
+                    "Principal": {"Service": "s3.amazonaws.com"},
+                    "Action": "sqs:*",
+                    "Resource": queue_arn,
+                    "Condition": {"ArnLike": {"aws:SourceArn": bucket_arn(bucket)}},
+                })])
+            },
+        },
+        Granting {
+            case: "a Resource wildcard and a SourceArn wildcard over every bucket",
+            document: |_queue_arn, _bucket| {
+                policy_document(vec![json!({
+                    "Sid": "s3-publish-resource-wildcard",
+                    "Effect": "Allow",
+                    "Principal": {"Service": "s3.amazonaws.com"},
+                    "Action": "sqs:SendMessage",
+                    "Resource": "*",
+                    "Condition": {"ArnLike": {"aws:SourceArn": "arn:aws:s3:::*"}},
+                })])
+            },
+        },
+    ]
+}
+
+/// The container naming the one queue destination `arn`, notified about [`CONFIGURED_EVENT`].
+fn one_queue_container(arn: &str) -> String {
+    format!(
+        "<NotificationConfiguration xmlns=\"{XMLNS}\"><QueueConfiguration><Id>ev</Id>\
+         <Queue>{arn}</Queue><Event>{CONFIGURED_EVENT}</Event></QueueConfiguration>\
+         </NotificationConfiguration>"
+    )
+}
+
+/// The destination's OWN resource policy, as it stands when the call is made, is what decides
+/// the put — so the very same request is refused while the policy grants Amazon S3 nothing,
+/// accepted once it grants the publish, and refused again once that grant no longer applies,
+/// with nothing recorded by either refusal.
+///
+/// This is the half of the rule a single call cannot show: the request is byte-for-byte
+/// identical across the three calls of every row, and only the document on the destination
+/// changes between them, which is what makes the decision the DESTINATION's and not the
+/// request's. The rows differ along how the granting statement says so
+/// ([`granting_documents`]).
+#[tokio::test]
+async fn the_same_container_is_refused_or_recorded_by_the_destination_policy_in_force() {
+    let emulator = Emulator::new();
+    for (index, row) in granting_documents().iter().enumerate() {
+        let case = row.case;
+        let bucket = format!("destination-grant-{index}");
+        let queue = format!("destination-grant-queue-{index}");
+        emulator.create_bucket(&bucket).await;
+        // A queue with NO access policy at all, which grants Amazon S3 nothing.
+        let (url, arn) = emulator.create_queue_without_policy(&queue).await;
+        let body = one_queue_container(&arn);
+
+        // 1. Refused while the queue's policy does not let S3 publish to it, and the bucket
+        //    — which carried no configuration at all — still carries none.
+        let refused = put_notification(&emulator, &bucket, &body, false).await;
+        assert_eq!(
+            refused.status, INVALID_ARGUMENT_STATUS,
+            "case {case:?}: a container naming a queue that grants Amazon S3 nothing must be \
+             refused with HTTP {INVALID_ARGUMENT_STATUS}, got {} with {}",
+            refused.status,
+            refused.text()
+        );
+        assert!(
+            elements(&refused.text(), "Code").contains(&INVALID_ARGUMENT.to_string()),
+            "case {case:?}: expected the refusal's Code to be {INVALID_ARGUMENT:?}, got {}",
+            refused.text()
+        );
+        assert!(
+            elements(&refused.text(), "Message").contains(&UNABLE_TO_VALIDATE.to_string()),
+            "case {case:?}: expected the refusal's Message to be {UNABLE_TO_VALIDATE:?}, got {}",
+            refused.text()
+        );
+        assert_eq!(
+            elements(&refused.text(), "ArgumentName1"),
+            vec![arn.clone()],
+            "case {case:?}: the refusal must name the destination it could not validate, got {}",
+            refused.text()
+        );
+        assert_eq!(
+            elements(&refused.text(), "ArgumentValue1"),
+            vec![QUEUE_UNPERMITTED.to_string()],
+            "case {case:?}: the refusal must give the reason {QUEUE_UNPERMITTED:?}, got {}",
+            refused.text()
+        );
+        let read = emulator
+            .s3_xml("GET", &format!("/{bucket}?notification"), "")
+            .await;
+        assert_eq!(
+            read.status,
+            200,
+            "case {case:?}: reading the configuration back must succeed, got {} with {}",
+            read.status,
+            read.text()
+        );
+        assert!(
+            elements(&read.text(), "Queue").is_empty(),
+            "case {case:?}: a refused put records nothing, so the bucket must still carry no \
+             queue configuration, got {}",
+            read.text()
+        );
+        let on_queue = emulator.nothing_delivered(&url).await;
+        assert!(
+            on_queue.is_empty(),
+            "case {case:?}: a queue whose policy does not admit Amazon S3 must be sent nothing \
+             at all, got {on_queue:?}"
+        );
+
+        // 2. The grant, written through Amazon SQS's own operation — and the IDENTICAL call
+        //    now succeeds, the read reports the destination, and the queue carries the test
+        //    notification that validated it.
+        emulator
+            .set_queue_policy(&url, &(row.document)(&arn, &bucket))
+            .await;
+        let accepted = put_notification(&emulator, &bucket, &body, false).await;
+        assert_eq!(
+            accepted.status,
+            200,
+            "case {case:?}: the identical container must be recorded once the queue's policy \
+             lets Amazon S3 send to it, got {} with {}",
+            accepted.status,
+            accepted.text()
+        );
+        let read = emulator
+            .s3_xml("GET", &format!("/{bucket}?notification"), "")
+            .await;
+        assert_eq!(
+            elements(&read.text(), "Queue"),
+            vec![arn.clone()],
+            "case {case:?}: the accepted container must be what the bucket reports, got {}",
+            read.text()
+        );
+        let test_event = emulator
+            .delivered(&url)
+            .await
+            .unwrap_or_else(|| panic!("case {case:?}: the validated queue must carry the test \
+                                       notification"));
+        assert_eq!(
+            test_event["Event"].as_str(),
+            Some(TEST_EVENT),
+            "case {case:?}: expected the test notification's Event {TEST_EVENT:?}, got \
+             {test_event}"
+        );
+        assert_eq!(
+            test_event["Bucket"].as_str(),
+            Some(bucket.as_str()),
+            "case {case:?}: expected the test notification to name {bucket:?}, got {test_event}"
+        );
+
+        // 3. And back: a policy whose grant applies to another bucket refuses the same
+        //    container again, and the configuration recorded at step 2 is left alone.
+        let revoked = queue_policy(Grant::OtherBucket, &arn, &bucket)
+            .expect("Grant::OtherBucket is a statement, so it is a document");
+        emulator.set_queue_policy(&url, &revoked).await;
+        let refused_again = put_notification(&emulator, &bucket, &body, false).await;
+        assert_eq!(
+            refused_again.status, INVALID_ARGUMENT_STATUS,
+            "case {case:?}: once the grant no longer applies to this bucket the identical \
+             container must be refused again with HTTP {INVALID_ARGUMENT_STATUS}, got {} with {}",
+            refused_again.status,
+            refused_again.text()
+        );
+        assert!(
+            elements(&refused_again.text(), "Code").contains(&INVALID_ARGUMENT.to_string()),
+            "case {case:?}: expected the second refusal's Code to be {INVALID_ARGUMENT:?}, got {}",
+            refused_again.text()
+        );
+        assert!(
+            elements(&refused_again.text(), "Message").contains(&UNABLE_TO_VALIDATE.to_string()),
+            "case {case:?}: expected the second refusal's Message to be {UNABLE_TO_VALIDATE:?}, \
+             got {}",
+            refused_again.text()
+        );
+        assert_eq!(
+            elements(&refused_again.text(), "ArgumentName1"),
+            vec![arn.clone()],
+            "case {case:?}: the second refusal must name the destination it could not validate, \
+             got {}",
+            refused_again.text()
+        );
+        assert_eq!(
+            elements(&refused_again.text(), "ArgumentValue1"),
+            vec![QUEUE_UNPERMITTED.to_string()],
+            "case {case:?}: the second refusal must give the reason {QUEUE_UNPERMITTED:?}, got {}",
+            refused_again.text()
+        );
+        let read = emulator
+            .s3_xml("GET", &format!("/{bucket}?notification"), "")
+            .await;
+        assert_eq!(
+            elements(&read.text(), "Queue"),
+            vec![arn.clone()],
+            "case {case:?}: a refused put changes nothing, so the bucket must still report the \
+             configuration it already carried, got {}",
+            read.text()
         );
     }
 }
