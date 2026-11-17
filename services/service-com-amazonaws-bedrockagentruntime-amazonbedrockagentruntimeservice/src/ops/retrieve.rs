@@ -41,8 +41,7 @@
 //! A leg this emulator cannot compute is REFUSED with the modelled `ValidationException`,
 //! because a plausible-looking success is worse than an error: a retrieval that ignored
 //! the member would report chunks the caller asked to have filtered, masked or withheld.
-//! Those legs are an `IMAGE` query (no image embedding runs here), `userContext` (access
-//! control filtering needs the per-document ACLs nothing in this emulator holds),
+//! Those legs are an `IMAGE` query (no image embedding runs here),
 //! `guardrailConfiguration` (no guardrail policy is evaluated here, so no intervention
 //! can be reported), `implicitFilterConfiguration` (the filter a model would have
 //! generated from the query would only narrow the answer) and a `rerankingConfiguration`
@@ -53,6 +52,13 @@
 //! `overrideSearchType` IS served: `HYBRID` and `SEMANTIC` name the same ordering here,
 //! because the vectors the ingestion wrote are term-frequency vectors and their
 //! nearest-neighbour order already is the lexical one.
+//!
+//! `userContext` IS served too: it names the identity a retrieval's results are narrowed
+//! to the authorized documents of, and that narrowing withholds nothing here, because no
+//! document of a knowledge base is ingested with an access control list and a document no
+//! ACL names is withheld from nobody (the rule is stated once, in
+//! [`crate::state::knowledge_base_retrieval`]). So a retrieval for one identity reports
+//! every chunk the query, the filter and `numberOfResults` admit, as it does for any other.
 //!
 //! ## Shape of an operation
 //!
@@ -219,15 +225,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // cannot compute is refused whatever the stores hold, and that refusal depends on
         // the request alone, so it says nothing about which knowledge bases exist.
         let query = query_text(&input.retrieval_query)?;
-        if input.user_context.is_some() {
-            return Err(refuse(
-                "userContext: this service applies no per-document access control to a \
-                 retrieval, so a retrieval for one user cannot be narrowed to the \
-                 documents that user may read; omit userContext to retrieve over every \
-                 ingested document"
-                    .to_string(),
-            ));
-        }
         if input.guardrail_configuration.is_some() {
             return Err(refuse(
                 "guardrailConfiguration: this service evaluates no guardrail policy on a \

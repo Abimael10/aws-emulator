@@ -37,14 +37,19 @@
 //! A leg this emulator cannot compute is REFUSED with the modelled `ValidationException`
 //! (HTTP 400), because a plausible-looking success is worse than an error: a retrieval that
 //! ignored the member would report items the caller asked to have filtered, reordered or
-//! withheld. Those legs are `userContext` (access-control filtering needs per-document ACLs
-//! nothing here holds), `policyConfiguration` (no guardrail policy is evaluated, so neither
-//! an intervention nor its absence can be reported), `memoryConfiguration` (this emulator
-//! holds no AgentCore memory to read), `retrievalInstructionConfiguration` (it names a
-//! build-time instruction resource nothing here applies), a reranking model (no reranker
-//! runs, so the order one would put the items in cannot be computed) and a Mantle
+//! withheld. Those legs are `policyConfiguration` (no guardrail policy is evaluated, so
+//! neither an intervention nor its absence can be reported), `memoryConfiguration` (this
+//! emulator holds no AgentCore memory to read), `retrievalInstructionConfiguration` (it
+//! names a build-time instruction resource nothing here applies), a reranking model (no
+//! reranker runs, so the order one would put the items in cannot be computed) and a Mantle
 //! foundation model (not a model this emulator publishes). `nextToken` is refused too: this
 //! service hands out none, so no value of it names a position in a retrieval.
+//!
+//! `userContext` IS served: it names the identity the items are narrowed to the authorized
+//! documents of, and that narrowing withholds nothing here, because no document of a
+//! knowledge base is ingested with an access control list and a document no ACL names is
+//! withheld from nobody (the rule is stated once, in
+//! [`crate::state::knowledge_base_retrieval`]).
 //!
 //! This operation is hand-authored rather than generated: its output is a `@streaming`
 //! union, which the op-stub generator declines (`src/ops/SKIPPED_STUBS.md`) and whose
@@ -415,13 +420,6 @@ const MODEL_MEMBER: &str = "agenticRetrieveConfiguration.foundationModelConfigur
 /// The first leg of the request this service cannot compute, as the sentence the modelled
 /// `ValidationException` states. See the module docs for why each one is refused.
 fn unservable_leg(input: &AgenticRetrieveStreamInput) -> Result<(), AgenticRetrieveStreamError> {
-    if input.user_context.is_some() {
-        return Err(validation(
-            "userContext: this service applies no per-document access control to a \
-             retrieval, so the items it reports cannot be narrowed to the documents one \
-             user may read; omit userContext to retrieve over every ingested document",
-        ));
-    }
     if input.next_token.is_some() {
         return Err(validation(
             "nextToken: this service reports every item it found in one page and hands out \

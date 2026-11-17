@@ -39,9 +39,6 @@ use sha2::{Digest, Sha256};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_bedrockagent_amazonbedrockagentbuildtimelambda::state::ingestion_index as index_fields;
-use service_com_amazonaws_bedrockagent_amazonbedrockagentbuildtimelambda::state::{
-    INGESTION_JOB_RUN_SPAN, INGESTION_JOB_START_SPAN,
-};
 use service_com_amazonaws_bedrockagentruntime_amazonbedrockagentruntimeservice::state::retrieval_filter::{
     MAX_FILTER_DEPTH, MAX_FILTER_NODES,
 };
@@ -68,9 +65,16 @@ const EMBEDDING_DIMENSION: i32 = 1024;
 /// The `dataType` of the index: the one value the modelled `DataType` enum admits.
 const VECTOR_DATA_TYPE: &str = "float32";
 
-/// A margin over a span the clock owes, so a test waiting for a transition is not racing
-/// the instant it comes due.
-const MARGIN: Duration = Duration::from_millis(150);
+/// The terminal `IngestionJobStatus` a job that finished reports.
+const INGESTION_JOB_COMPLETE: &str = "COMPLETE";
+
+/// How long a setup waits for an ingestion job to reach [`INGESTION_JOB_COMPLETE`]: far
+/// above the spans the Bedrock Agent plane's clock owes a job it accepted
+/// (`INGESTION_JOB_START_SPAN` + `INGESTION_JOB_RUN_SPAN`), so a loaded host converges too.
+const INGESTION_DEADLINE: Duration = Duration::from_secs(90);
+
+/// How long one poll waits before looking again.
+const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// The three metadata keys a retrieval result of an S3 data source carries.
 const RESULT_METADATA_KEYS: [&str; 3] = [
@@ -249,30 +253,37 @@ impl Emulator {
             .to_string()
     }
 
-    /// Run one ingestion job to completion: start it, wait out the spans the clock owes
-    /// it, and assert the plane reports it `COMPLETE`.
+    /// Run one ingestion job to completion: start it, then look again until the plane
+    /// reports it `COMPLETE` — the CONDITION every test here depends on, rather than a fixed
+    /// wait, so a loaded host converges too.
     pub(crate) async fn ingest(&self, knowledge_base_id: &str, data_source_id: &str) {
         let job = self.start_ingestion(knowledge_base_id, data_source_id).await;
-        tokio::time::sleep(INGESTION_JOB_START_SPAN + INGESTION_JOB_RUN_SPAN + MARGIN).await;
-        let (status, body) = call(
-            &self.router,
-            "GET",
-            &format!(
-                "/knowledgebases/{knowledge_base_id}/datasources/{data_source_id}\
-                 /ingestionjobs/{job}"
-            ),
-            Value::Null,
-        )
-        .await;
-        assert_eq!(
-            status, 200,
-            "setup: expected GetIngestionJob -> 200, got {status} {body:?}"
-        );
-        assert_eq!(
-            body["ingestionJob"]["status"].as_str(),
-            Some("COMPLETE"),
-            "setup: expected the ingestion job to have completed, got {body:?}"
-        );
+        let deadline = std::time::Instant::now() + INGESTION_DEADLINE;
+        loop {
+            let (status, body) = call(
+                &self.router,
+                "GET",
+                &format!(
+                    "/knowledgebases/{knowledge_base_id}/datasources/{data_source_id}\
+                     /ingestionjobs/{job}"
+                ),
+                Value::Null,
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "setup: expected GetIngestionJob -> 200, got {status} {body:?}"
+            );
+            if body["ingestionJob"]["status"].as_str() == Some(INGESTION_JOB_COMPLETE) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "setup: expected the ingestion job to reach {INGESTION_JOB_COMPLETE:?}, got \
+                 {body:?}"
+            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
     }
 
     /// Retrieve from `identifier`, answering the raw `(status, body)`.
@@ -841,6 +852,163 @@ async fn only_what_an_ingestion_job_has_recorded_is_retrievable() {
     );
 }
 
+/// Identities a retrieval is scoped to, spanning what the modelled `UserContext` admits:
+/// its one member `userId` is a required `String` under no further constraint
+/// (`smithy_query(query="shape",shape="UserContext")`), so the rows differ in length, in
+/// character class and in the form the identity provider that issued one hands it out in.
+pub(crate) const IDENTITIES: [(&str, &str); 5] = [
+    ("a short login name", "alice"),
+    (
+        "an identity-pool UUID",
+        "7f3c1b22-9d0e-4b87-9b1f-6e4b1a2c5d90",
+    ),
+    ("an email address", "carol.danvers@example.com"),
+    (
+        "a federated principal and its session",
+        "AROAEXAMPLEID:analyst-session",
+    ),
+    (
+        "an identifier far longer than a login name",
+        "u-0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab",
+    ),
+];
+
+/// RULE: `userContext` names the identity a retrieval's results are narrowed to the
+/// authorized documents of, and that narrowing is decided against the access control list a
+/// document was ingested with. No ingestion of this emulator records one, and a document no
+/// ACL names is withheld from nobody — so a retrieval carrying an identity is SERVED, and
+/// answers exactly what the same retrieval carrying none answers, whichever identity it
+/// names and however the request bounds or filters the results. The member narrows nothing
+/// and refuses nothing: a knowledge base this plane does not hold is still the modelled
+/// `ResourceNotFoundException` (404) for a request that carries one.
+#[tokio::test]
+async fn a_retrieval_scoped_to_an_identity_is_served_like_the_unscoped_one() {
+    let emulator = Emulator::new("identity-index");
+    let bucket = "retrieval-identity-docs";
+    emulator.put_object(bucket, "codes.txt", LAUNCH_CODES);
+    emulator.put_object(bucket, "menu.txt", CAFETERIA);
+    emulator.put_object(bucket, "inventory.txt", INVENTORY);
+    let knowledge_base = emulator
+        .knowledge_base("identity-kb", "identity-index")
+        .await;
+    let data_source = emulator
+        .data_source(&knowledge_base, "s3-docs", bucket, None)
+        .await;
+    emulator.ingest(&knowledge_base, &data_source).await;
+
+    let ingested: Vec<String> = ["codes.txt", "inventory.txt", "menu.txt"]
+        .iter()
+        .map(|key| format!("s3://{bucket}/{key}"))
+        .collect();
+
+    // (case, the search configuration, how many results it reports). The rows differ along
+    // what the rule generalises over beside the identity: the result bound and the filter,
+    // both of which DO narrow a retrieval, so the comparison below is between two
+    // retrievals that report something rather than between two empty answers.
+    let shapes: Vec<(&str, Value, usize)> = vec![
+        (
+            "the whole ingested corpus",
+            json!({ "numberOfResults": 100 }),
+            ingested.len(),
+        ),
+        ("one result allowed", json!({ "numberOfResults": 1 }), 1),
+        (
+            "narrowed to the data source the chunks came from",
+            json!({
+                "numberOfResults": 100,
+                "filter": {
+                    "equals": {
+                        "key": index_fields::DATA_SOURCE_ID_METADATA_KEY,
+                        "value": data_source,
+                    },
+                },
+            }),
+            ingested.len(),
+        ),
+    ];
+
+    for (shape, configuration, reported) in shapes {
+        let request = |identity: Option<&str>| {
+            let mut body = json!({
+                "retrievalQuery": { "text": "launch code lunch battery" },
+                "retrievalConfiguration": {
+                    "vectorSearchConfiguration": configuration.clone(),
+                },
+            });
+            if let Some(user_id) = identity {
+                body["userContext"] = json!({ "userId": user_id });
+            }
+            body
+        };
+
+        let unscoped = emulator.results(shape, &knowledge_base, request(None)).await;
+        assert_eq!(
+            unscoped.len(),
+            reported,
+            "case {shape:?}: expected the retrieval carrying no identity to report \
+             {reported} of the ingested documents, got {unscoped:?}"
+        );
+        if reported == ingested.len() {
+            assert_eq!(
+                citations(shape, &unscoped),
+                ingested,
+                "case {shape:?}: expected every ingested document to be retrievable"
+            );
+        }
+
+        for (identity, user_id) in IDENTITIES {
+            let case = format!("{identity}, {shape}");
+            let scoped = emulator
+                .results(&case, &knowledge_base, request(Some(user_id)))
+                .await;
+            assert_eq!(
+                scoped, unscoped,
+                "case {case:?}: expected the retrieval scoped to an identity to report what \
+                 the unscoped one reports, got {scoped:?}"
+            );
+        }
+    }
+
+    // The existence of the knowledge base is still what decides a request carrying an
+    // identity: it is answered with this plane's not-found refusal, naming the identifier,
+    // and never with a refusal of the member.
+    let unknown: Vec<(&str, String)> = vec![
+        ("a bare id nothing created", "KB0NOTHELD".to_string()),
+        (
+            "an ARN for an id nothing created",
+            format!("arn:aws:bedrock:{REGION}:000000000000:knowledge-base/KB0NOTHELD"),
+        ),
+    ];
+    for (addressed, identifier) in unknown {
+        for (identity, user_id) in IDENTITIES {
+            let case = format!("{identity} retrieving from {addressed}");
+            let (status, body) = emulator
+                .retrieve(
+                    &identifier,
+                    json!({
+                        "retrievalQuery": { "text": "launch code" },
+                        "userContext": { "userId": user_id },
+                    }),
+                )
+                .await;
+            assert_eq!(
+                status, 404,
+                "case {case:?}: expected 404 for {identifier:?}, got {status} {body:?}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "ResourceNotFoundException",
+                "case {case:?}: expected the modelled not-found error, got {body:?}"
+            );
+            assert_eq!(
+                body["message"].as_str(),
+                Some(format!("Knowledge Base with id {identifier} does not exist").as_str()),
+                "case {case:?}: expected the refusal to name the identifier, got {body:?}"
+            );
+        }
+    }
+}
+
 /// RULE: a retrieval addressed to a knowledge base the Bedrock Agent plane does not hold
 /// answers the modelled `ResourceNotFoundException` (404) naming the identifier the
 /// request carried — never a 501, and never an empty success.
@@ -1240,14 +1408,6 @@ async fn a_leg_this_service_cannot_compute_is_refused_not_ignored() {
                 },
             }),
             "retrievalQuery.type",
-        ),
-        (
-            "a userContext, which asks for per-document access control",
-            json!({
-                "retrievalQuery": { "text": "launch code" },
-                "userContext": { "userId": "alice" },
-            }),
-            "userContext",
         ),
         (
             "a guardrailConfiguration, which asks for a guardrail policy",

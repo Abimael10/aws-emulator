@@ -37,6 +37,24 @@
 //!
 //! A vector a caller wrote into a bound index themselves carries none of those fields: it
 //! is not a chunk of this knowledge base, so no retrieval reports it.
+//!
+//! # What `userContext` narrows
+//!
+//! `userContext` names the identity a request asks to have its answer narrowed to the
+//! authorized documents of, and that narrowing is decided against the access control list
+//! recorded with a document when it was ingested. A document is withheld from an identity
+//! only on the strength of an ACL that does not admit it, and no ingestion of this emulator
+//! records one: the fields a document is taken in with are the ones
+//! `agent_state::ingestion_index` names, and none of them is an ACL. Every ingested document
+//! is therefore restricted to nobody, the narrowing the member asks for admits all of them,
+//! and the member is SERVED — a request carrying it is answered exactly as the same request
+//! for any other identity is, and exactly as the same request carrying no identity is. It is
+//! never refused: refusing it would refuse the identity-scoped retrieval the member is
+//! documented for, and would refuse it ahead of everything else the request is answered
+//! from, so a knowledge base this plane does not hold would be reported as a bad request
+//! rather than as the missing resource it is ([`knowledge_base_not_found_message`]). Every
+//! operation of this service that models the member reads it this way, so one rule decides
+//! them all.
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;

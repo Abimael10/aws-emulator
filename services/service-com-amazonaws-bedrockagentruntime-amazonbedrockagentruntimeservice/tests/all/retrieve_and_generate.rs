@@ -29,7 +29,7 @@ use service_com_amazonaws_bedrockagent_amazonbedrockagentbuildtimelambda::state:
 use service_com_amazonaws_bedrockagentruntime_amazonbedrockagentruntimeservice::state as agent_runtime_state;
 use service_com_amazonaws_bedrockruntime_amazonbedrockfrontendservice::state as runtime_state;
 
-use crate::knowledge_base_retrieval::{collapsed, Emulator};
+use crate::knowledge_base_retrieval::{collapsed, Emulator, IDENTITIES};
 use crate::sessions::{call, error_code, is_model_uuid, REGION};
 
 /// A text model the Bedrock Runtime plane of this emulator publishes
@@ -266,6 +266,7 @@ struct Served {
 }
 
 /// One cited segment of a served response.
+#[derive(Debug, PartialEq, Eq)]
 struct Cited {
     start: usize,
     end: usize,
@@ -616,6 +617,53 @@ async fn a_session_is_opened_by_the_service_and_continued_by_the_id_it_handed_ba
     );
 }
 
+/// RULE: `userContext` names the identity the passages a response cites are narrowed to the
+/// authorized documents of, and that narrowing is decided against the access control list a
+/// document was ingested with. No ingestion of this emulator records one, and a document no
+/// ACL names is withheld from nobody — so a request carrying an identity is SERVED and
+/// answers the response the same request carrying none answers: the same text, cited from
+/// the same passages, whichever identity it names.
+#[tokio::test]
+async fn a_generation_scoped_to_an_identity_is_served_like_the_unscoped_one() {
+    let knowledge = Knowledge::new("generation-identity").await;
+
+    let request = |identity: Option<&str>| {
+        let mut body = knowledge.request("hydraulic pump", json!({}));
+        if let Some(user_id) = identity {
+            body["userContext"] = json!({ "userId": user_id });
+        }
+        body
+    };
+
+    let unscoped = knowledge.served("no identity", request(None)).await;
+    assert!(
+        !unscoped.cited.is_empty(),
+        "case \"no identity\": expected the response to cite the ingested passages, got {:?}",
+        unscoped.text
+    );
+
+    for (case, user_id) in IDENTITIES {
+        let served = knowledge.served(case, request(Some(user_id))).await;
+        assert_eq!(
+            served.text, unscoped.text,
+            "case {case:?}: expected the response scoped to an identity to be the one the \
+             unscoped request answers, got {:?}",
+            served.text
+        );
+        assert_eq!(
+            served.cited, unscoped.cited,
+            "case {case:?}: expected the same passages to be cited, got {:?}",
+            served.cited
+        );
+        // Each call opens a session of its own, so the responses are compared and the
+        // session ids are not.
+        assert_ne!(
+            served.session_id, unscoped.session_id,
+            "case {case:?}: expected a request naming no session to open one of its own"
+        );
+    }
+}
+
 /// RULE: a request naming a leg this service cannot compute, or a resource it does not hold,
 /// is refused with the modelled error for that class — never with a success that ignored the
 /// member and never with the 501 of an unimplemented operation.
@@ -634,17 +682,6 @@ async fn a_leg_this_service_cannot_compute_is_refused() {
             400,
             "ValidationException",
             "input.text".to_string(),
-        ),
-        (
-            "a userContext, which asks for per-document access control",
-            {
-                let mut body = knowledge.request("hydraulic pump", json!({}));
-                body["userContext"] = json!({ "userId": "alice" });
-                body
-            },
-            400,
-            "ValidationException",
-            "userContext".to_string(),
         ),
         (
             "a promptTemplate, which is what a model would be asked",

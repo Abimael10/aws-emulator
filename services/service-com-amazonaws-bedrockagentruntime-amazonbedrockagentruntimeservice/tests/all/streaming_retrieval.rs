@@ -28,7 +28,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::agent_and_flow_invocations::{decode_frames, frame_names, Frame, EVENT_STREAM};
-use crate::knowledge_base_retrieval::{collapsed, Emulator};
+use crate::knowledge_base_retrieval::{collapsed, Emulator, IDENTITIES};
 use crate::sessions::REGION;
 
 /// The S3 bucket the suite's sources live in.
@@ -602,6 +602,107 @@ async fn an_agentic_retrieval_streams_the_chunks_the_knowledge_base_holds() {
     }
 }
 
+/// The `(member, payload)` of every frame of a stream, so two streams are compared by what
+/// they carry rather than by their bytes.
+fn frame_payloads(case: &str, reply: &StreamReply) -> Vec<(String, Value)> {
+    reply
+        .frames(case)
+        .into_iter()
+        .map(|frame| (frame.name, frame.payload))
+        .collect()
+}
+
+/// RULE: `userContext` names the identity a retrieval is narrowed to the authorized
+/// documents of, and that narrowing is decided against the access control list a document
+/// was ingested with. No ingestion of this emulator records one, and a document no ACL names
+/// is withheld from nobody — so a request carrying an identity is SERVED on both streaming
+/// routes and streams exactly what the same request carrying none streams, whichever
+/// identity it names.
+#[tokio::test]
+async fn a_streamed_retrieval_scoped_to_an_identity_is_served_like_the_unscoped_one() {
+    let knowledge = Knowledge::new("streaming-identity").await;
+    let held = knowledge.knowledge_base_id.clone();
+    let query = "hydraulic pump service interval";
+
+    let agentic_body = |identity: Option<&str>| {
+        let mut extra = json!({ "generateResponse": false });
+        if let Some(user_id) = identity {
+            extra["userContext"] = json!({ "userId": user_id });
+        }
+        agentic_request(query, json!([retriever(&held, None)]), extra)
+    };
+    let generate_body = |identity: Option<&str>| {
+        let mut extra = json!({});
+        if let Some(user_id) = identity {
+            extra["userContext"] = json!({ "userId": user_id });
+        }
+        generate_request(query, &held, extra)
+    };
+
+    let agentic_unscoped = knowledge.agentic(agentic_body(None)).await;
+    assert_eq!(
+        agentic_unscoped.status,
+        200,
+        "case \"no identity on AgenticRetrieveStream\": expected 200, got {} {:?}",
+        agentic_unscoped.status,
+        String::from_utf8_lossy(&agentic_unscoped.body)
+    );
+    let agentic_unscoped = frame_payloads("no identity on AgenticRetrieveStream", &agentic_unscoped);
+    assert!(
+        agentic_unscoped
+            .iter()
+            .any(|(_, payload)| payload["results"].as_array().is_some_and(|items| !items.is_empty())),
+        "case \"no identity on AgenticRetrieveStream\": expected the stream to report the \
+         chunks the knowledge base holds, got {agentic_unscoped:?}"
+    );
+
+    let generate_unscoped = knowledge.generate_stream(generate_body(None)).await;
+    assert_eq!(
+        generate_unscoped.status,
+        200,
+        "case \"no identity on RetrieveAndGenerateStream\": expected 200, got {} {:?}",
+        generate_unscoped.status,
+        String::from_utf8_lossy(&generate_unscoped.body)
+    );
+    let generate_unscoped =
+        frame_payloads("no identity on RetrieveAndGenerateStream", &generate_unscoped);
+    assert!(
+        generate_unscoped.len() > 1,
+        "case \"no identity on RetrieveAndGenerateStream\": expected the answer and the \
+         citations it quotes, got {generate_unscoped:?}"
+    );
+
+    for (identity, user_id) in IDENTITIES {
+        for (route, unscoped, reply) in [
+            (
+                "AgenticRetrieveStream",
+                &agentic_unscoped,
+                knowledge.agentic(agentic_body(Some(user_id))).await,
+            ),
+            (
+                "RetrieveAndGenerateStream",
+                &generate_unscoped,
+                knowledge.generate_stream(generate_body(Some(user_id))).await,
+            ),
+        ] {
+            let case = format!("{identity} on {route}");
+            assert_eq!(
+                reply.status,
+                200,
+                "case {case:?}: expected the identity-scoped retrieval to be served, got {} {:?}",
+                reply.status,
+                String::from_utf8_lossy(&reply.body)
+            );
+            let scoped = frame_payloads(&case, &reply);
+            assert_eq!(
+                &scoped, unscoped,
+                "case {case:?}: expected the stream scoped to an identity to carry what the \
+                 unscoped one carries, got {scoped:?}"
+            );
+        }
+    }
+}
+
 /// RULE: a leg of an agentic retrieval this emulator cannot compute is refused with the
 /// modelled `ValidationException` (400) naming the member, never served with the member
 /// ignored.
@@ -613,11 +714,6 @@ async fn an_agentic_retrieval_leg_this_service_cannot_compute_is_refused() {
 
     // (case, the members merged into the request, the member the refusal must name)
     let rows: Vec<(&str, Value, &str)> = vec![
-        (
-            "a user context, which would narrow the items by per-document ACLs",
-            json!({ "userContext": { "userId": "u-1" } }),
-            "userContext",
-        ),
         (
             "a resume token no page of this service handed out",
             json!({ "nextToken": "cursor" }),

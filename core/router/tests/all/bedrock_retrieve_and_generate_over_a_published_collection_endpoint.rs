@@ -940,19 +940,6 @@ async fn an_unservable_knowledge_base_query_is_answered_with_its_modelled_error(
                 body
             },
         ),
-        (
-            Refusal {
-                case: "a userContext nothing here can filter on",
-                status: 400,
-                code: "ValidationException",
-                message: None,
-            },
-            {
-                let mut body = query_body(&built.knowledge_base_id, model, query, None);
-                body["userContext"] = json!({ "userId": "operator-7" });
-                body
-            },
-        ),
     ];
 
     for (refusal, body) in rows {
@@ -999,5 +986,32 @@ async fn an_unservable_knowledge_base_query_is_answered_with_its_modelled_error(
     assert!(
         !text(&answer, "output.text").is_empty() && !list(&answer, "citations").is_empty(),
         "case {case:?}: expected a generated response with citations, got {answer}"
+    );
+
+    // A query carrying the identity whose authorized documents the response would be narrowed
+    // to is served the same way: the ingestion recorded no access control list for any
+    // document, and a document no ACL names is withheld from nobody, so the answer is the one
+    // the same query carrying no identity is answered with.
+    let (scoped_status, scoped) = retrieve_and_generate(&router, {
+        let mut body = query_body(&built.knowledge_base_id, model, query, None);
+        body["userContext"] = json!({ "userId": "operator-7" });
+        body
+    })
+    .await;
+    assert_eq!(
+        scoped_status, 200,
+        "case {case:?}: expected the query scoped to an identity to be served, got \
+         {scoped_status} with {scoped}"
+    );
+    assert_eq!(
+        text(&scoped, "output.text"),
+        text(&answer, "output.text"),
+        "case {case:?}: expected the identity-scoped query to answer what the unscoped one \
+         answers, got {scoped}"
+    );
+    assert_eq!(
+        list(&scoped, "citations").len(),
+        list(&answer, "citations").len(),
+        "case {case:?}: expected the same passages to be cited, got {scoped}"
     );
 }

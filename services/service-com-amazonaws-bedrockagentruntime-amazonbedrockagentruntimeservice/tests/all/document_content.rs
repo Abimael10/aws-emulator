@@ -23,8 +23,8 @@
 //!
 //! The tables span what those rules generalise over: the content type and the size of the
 //! object a document was ingested from, which half of the identity is unknown, the
-//! `outputFormat` and `userContext` legs this emulator cannot serve, and where the caller's
-//! grant comes from.
+//! `outputFormat` leg this emulator cannot serve, the identity a read is scoped to, and
+//! where the caller's grant comes from.
 //!
 //! The knowledge base, the data source and the documents are all created through the
 //! build-time plane's own API; the objects are written through S3's own store, the way the
@@ -39,6 +39,7 @@ use service_com_amazonaws_s3_amazons3::state as s3_state;
 use service_com_amazonaws_s3vectors_s3vectors::state as vectors_state;
 
 use crate::agent_memory::{allow, Emulator, Reply, ACCESS_DENIED, ACCOUNT_KEY, NOT_FOUND, REGION};
+use crate::knowledge_base_retrieval::IDENTITIES;
 use crate::sessions::label;
 
 /// The account id every ARN this emulator mints carries.
@@ -778,6 +779,115 @@ async fn a_content_read_answers_not_found_for_what_the_plane_does_not_hold() {
     }
 }
 
+/// RULE: `userContext` names the identity a content read is narrowed to the authorized
+/// documents of, and that narrowing is decided against the access control list a document
+/// was ingested with. No ingestion of this emulator records one, and a document no ACL names
+/// is withheld from nobody — so a read carrying an identity is SERVED, and reports the
+/// content the same read carrying none reports, whichever identity it names and however the
+/// document reached the knowledge base.
+#[tokio::test]
+async fn a_content_read_scoped_to_an_identity_is_served_like_the_unscoped_one() {
+    let emulator = Emulator::new();
+    let source = emulator.custom_source("content-identity").await;
+    emulator.put_object(
+        "held/identity.txt",
+        b"the pump is serviced every 90 days",
+        Some("text/plain"),
+    );
+    emulator
+        .ingest_documents(
+            "the documents the reads address",
+            &source,
+            json!([
+                s3_document("doc-from-s3", "held/identity.txt"),
+                inline_text_document("doc-inline", "coolant stays above 4 degrees"),
+            ]),
+        )
+        .await;
+
+    // Both ways a document reaches a knowledge base, so the rule is read over each: one
+    // taken from an object store and one whose bytes travelled in the ingestion.
+    for document in ["doc-from-s3", "doc-inline"] {
+        let unscoped = emulator
+            .document_content(
+                ACCOUNT_KEY,
+                &source.knowledge_base_id,
+                &source.data_source_id,
+                document,
+                None,
+            )
+            .await;
+        assert_eq!(
+            unscoped.status,
+            200,
+            "case {document:?}: expected the read carrying no identity to be served, got {} {:?}",
+            unscoped.status,
+            unscoped.json(document)
+        );
+        let expected = unscoped.json(document);
+        let unscoped_url = expected["presignedUrl"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {document:?}: no presignedUrl in {expected:?}"))
+            .to_string();
+        let (status, content) = emulator.follow(document, &unscoped_url).await;
+        assert_eq!(
+            status, 200,
+            "case {document:?}: following the unscoped read's address must reach the content, \
+             got {status}"
+        );
+        assert!(
+            !content.is_empty(),
+            "case {document:?}: expected the ingested content to be served"
+        );
+
+        for (identity, user_id) in IDENTITIES {
+            let case = format!("{identity} reading {document}");
+            let reply = emulator
+                .document_content(
+                    ACCOUNT_KEY,
+                    &source.knowledge_base_id,
+                    &source.data_source_id,
+                    document,
+                    Some(json!({ "userContext": { "userId": user_id } })),
+                )
+                .await;
+            assert_eq!(
+                reply.status,
+                200,
+                "case {case:?}: expected the read scoped to an identity to be served, got {} {:?}",
+                reply.status,
+                reply.json(&case)
+            );
+            let answer = reply.json(&case);
+            assert_eq!(
+                (
+                    answer["mimeType"].clone(),
+                    answer["documentContentLength"].clone()
+                ),
+                (
+                    expected["mimeType"].clone(),
+                    expected["documentContentLength"].clone()
+                ),
+                "case {case:?}: expected the content the unscoped read reports, got {answer:?}"
+            );
+            let url = answer["presignedUrl"]
+                .as_str()
+                .unwrap_or_else(|| panic!("case {case:?}: no presignedUrl in {answer:?}"));
+            let (status, scoped) = emulator.follow(&case, url).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: following the address must reach the content, got {status}"
+            );
+            assert_eq!(
+                scoped.as_ref(),
+                content.as_ref(),
+                "case {case:?}: expected the ingested bytes, got {:?}",
+                String::from_utf8_lossy(&scoped)
+            );
+        }
+    }
+}
+
 /// RULE: a leg this emulator cannot compute is refused with the modelled
 /// `ValidationException` (400) naming the member, rather than answered with a URL that
 /// leads nowhere or content the caller asked to have filtered.
@@ -802,21 +912,12 @@ async fn a_content_read_refuses_a_leg_it_cannot_compute() {
         names: &'static str,
     }
 
-    let rows = [
-        Row {
-            case: "the extracted rendering of a document",
-            document: "doc-in-s3",
-            body: Some(json!({ "outputFormat": "EXTRACTED" })),
-            names: "outputFormat",
-        },
-        Row {
-            case: "a read narrowed to one user's documents",
-            document: "doc-in-s3",
-            body: Some(json!({ "userContext": { "dataAccessPolicyArn":
-                "arn:aws:bedrock:us-west-2:000000000000:data-access-policy/ABCDEFGHIJ" } })),
-            names: "userContext",
-        },
-    ];
+    let rows = [Row {
+        case: "the extracted rendering of a document",
+        document: "doc-in-s3",
+        body: Some(json!({ "outputFormat": "EXTRACTED" })),
+        names: "outputFormat",
+    }];
 
     for row in rows {
         let reply = emulator

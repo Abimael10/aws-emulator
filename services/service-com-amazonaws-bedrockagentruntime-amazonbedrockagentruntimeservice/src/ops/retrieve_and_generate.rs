@@ -43,8 +43,7 @@
 //! A leg this emulator cannot compute is REFUSED with the modelled `ValidationException`,
 //! because a plausible-looking success is worse than an error: a response that ignored the
 //! member would cite passages the caller asked to have filtered, reordered or withheld, or
-//! report an answer shaped by a prompt nothing read. Those legs are `userContext` (access
-//! control filtering needs the per-document ACLs nothing in this emulator holds), a
+//! report an answer shaped by a prompt nothing read. Those legs are a
 //! `guardrailConfiguration` (no guardrail policy is evaluated here, so neither an
 //! intervention nor its absence can be reported), a `promptTemplate` (the template is what
 //! the model is ASKED, and no model is asked anything here), an `orchestrationConfiguration`
@@ -53,6 +52,12 @@
 //! `implicitFilterConfiguration` of the retrieval, and an `EXTERNAL_SOURCES` configuration,
 //! whose sources are documents this plane has ingested nothing of — so there is no chunk to
 //! rank and nothing but the caller's own bytes to cite.
+//!
+//! `userContext` IS served: it names the identity the cited passages are narrowed to the
+//! authorized documents of, and that narrowing withholds nothing here, because no document
+//! of a knowledge base is ingested with an access control list and a document no ACL names
+//! is withheld from nobody (the rule is stated once, in
+//! [`crate::state::knowledge_base_retrieval`]).
 //!
 //! ## Shape of an operation
 //!
@@ -255,15 +260,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RetrieveAndGenera
         // cannot compute is refused whatever the stores hold, and that refusal depends on
         // the request alone, so it says nothing about which knowledge bases exist.
         let query = query_text(&input.input)?;
-        if input.user_context.is_some() {
-            return Err(refuse(
-                "userContext: this service applies no per-document access control to a \
-                 retrieval, so the passages a response cites cannot be narrowed to the \
-                 documents one user may read; omit userContext to generate over every \
-                 ingested document"
-                    .to_string(),
-            ));
-        }
         let configuration = input
             .retrieve_and_generate_configuration
             .as_ref()

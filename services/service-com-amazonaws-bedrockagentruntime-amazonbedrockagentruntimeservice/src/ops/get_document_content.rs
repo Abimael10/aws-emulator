@@ -30,14 +30,17 @@
 //!
 //! * `outputFormat: EXTRACTED` — the parsed-text rendering of a document is produced by a
 //!   document parser, and none runs in this emulator, so there is no extracted content to
-//!   hand out and no object holding one;
-//! * `userContext` — access-control filtering needs the per-document ACLs nothing in this
-//!   emulator holds, so a content read cannot be narrowed to the documents one user may
-//!   read.
+//!   hand out and no object holding one.
 //!
-//! Each is the modelled `ValidationException`, because a plausible-looking success — a URL
+//! That is the modelled `ValidationException`, because a plausible-looking success — a URL
 //! that leads nowhere, or content the caller asked to have filtered — is worse than an
 //! error.
+//!
+//! `userContext` IS served: it names the identity the read is narrowed to the authorized
+//! documents of, and that narrowing withholds nothing here, because no document of a
+//! knowledge base is ingested with an access control list and a document no ACL names is
+//! withheld from nobody (the rule is stated once, in
+//! [`crate::state::knowledge_base_retrieval`]).
 //!
 //! ## Shape of an operation
 //!
@@ -199,14 +202,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The request is read in full BEFORE anything is looked up: a leg this service
         // cannot compute is refused whatever the stores hold, and that refusal depends on
         // the request alone, so it says nothing about which documents exist.
-        if input.user_context.is_some() {
-            return Err(refuse(
-                "userContext: this service applies no per-document access control to a \
-                 content read, so a read for one user cannot be narrowed to the documents \
-                 that user may read; omit userContext to read an ingested document"
-                    .to_string(),
-            ));
-        }
         match input.output_format.as_deref() {
             None | Some(content::OUTPUT_FORMAT_RAW) => {}
             Some(content::OUTPUT_FORMAT_EXTRACTED) => {
