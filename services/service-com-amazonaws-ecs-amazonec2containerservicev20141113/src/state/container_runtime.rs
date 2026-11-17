@@ -24,6 +24,18 @@
 //! ([`ContainerOutcome::Abandoned`]) — which is also why such a task is not stopped as one
 //! whose essential container exited.
 //!
+//! # The log driver is initialised whatever the container then runs
+//!
+//! Starting a container also INITIALISES its log driver, and that is independent of the
+//! program: the `awslogs` driver "sends container logs to Amazon CloudWatch Logs" and is
+//! given its arguments when the container is created, so the stream the output would go to
+//! is created as the container starts ([`super::log_driver_init`] is the gate on exactly
+//! that call, and [`ContainerOutput::open`] is the call). A container of a started task
+//! whose `logConfiguration` describes an `awslogs` delivery therefore has its stream in the
+//! group that configuration names, whether or not this emulator holds a program for its
+//! image — the stream is the driver's, while the EVENTS in it are the container's own
+//! output and are only ever what something really wrote.
+//!
 //! What the program SEES is its definition's environment with the launch's own overrides
 //! applied, and then the values the agent fetched for it — a container definition's
 //! `secrets` ([`super::container_secrets`]), read before the program starts, as the task's
@@ -128,6 +140,12 @@ pub struct ContainerRun {
     signals: Arc<ContainerSignals>,
     /// The task the container belongs to, so a run is forgotten when its task is.
     task_arn: String,
+    /// Whether a PROGRAM of the container's own is being performed, as against a run that
+    /// only initialises the container's log driver ([`ContainerLaunch::program`]). What
+    /// [`ComAmazonawsEcsAmazonec2containerservicev20141113State::performing_containers`]
+    /// answers: a container that runs no program holds nothing open, so the end of a
+    /// standalone task's work never waits on one.
+    runs_a_program: bool,
     /// Whether the program has ENDED. An entry stays after it has, so the container's
     /// program is performed once and never restarted, and only the entries that have not
     /// ended count against [`MAX_CONTAINER_RUNS`].
@@ -148,8 +166,11 @@ pub struct ContainerLaunch {
     /// The container this run is of.
     container_arn: String,
     /// The program it runs, resolved from the revision's `entryPoint`/`command` and the
-    /// launch's own container overrides.
-    program: ContainerProgram,
+    /// launch's own container overrides, and `None` for a container whose launch names no
+    /// argument vector at all — one whose image's own entry point would run, which this
+    /// emulator does not hold. Such a launch still initialises the container's log driver
+    /// (see this module's header) and then reports nothing of its own.
+    program: Option<ContainerProgram>,
     /// The environment it runs with: the revision's `environment` with the launch's
     /// override applied.
     environment: BTreeMap<String, String>,
@@ -230,7 +251,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             let launch_region = super::request_arn::RequestArn::parse(&task.task_arn)
                 .map(|arn| arn.region.to_string())
                 .unwrap_or_else(|| region.to_string());
-            let mut started: Vec<(String, Arc<ContainerSignals>)> = Vec::new();
+            let mut started: Vec<(String, Arc<ContainerSignals>, bool)> = Vec::new();
             for container in &task.containers {
                 // A container that has not STARTED yet runs nothing: one whose
                 // `dependsOn` conditions are not met is still `PENDING`, and its program
@@ -281,11 +302,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 let command = override_for
                     .and_then(|over| over.command.as_deref())
                     .or(stored.command.as_deref());
-                let Some(program) =
-                    ContainerProgram::resolve(stored.entry_point.as_deref(), command)
-                else {
-                    continue;
-                };
+                let program = ContainerProgram::resolve(stored.entry_point.as_deref(), command);
                 let mut environment = environment_of(stored.environment.as_deref());
                 // `ContainerOverride$environment`: "The environment variables to send to
                 // the container ... This parameter maps to Env in the docker container
@@ -307,8 +324,17 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     &container_id,
                     &launch_region,
                 );
+                // Nothing to perform for this container at all: no program of its own and
+                // no log driver to initialise, so no run is held for it.
+                if program.is_none() && log_target.is_none() {
+                    continue;
+                }
                 let signals = Arc::new(ContainerSignals::new());
-                started.push((container.container_arn.clone(), Arc::clone(&signals)));
+                started.push((
+                    container.container_arn.clone(),
+                    Arc::clone(&signals),
+                    program.is_some(),
+                ));
                 launches.push(ContainerLaunch {
                     container_arn: container.container_arn.clone(),
                     program,
@@ -321,12 +347,13 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     signals,
                 });
             }
-            for (container_arn, signals) in started {
+            for (container_arn, signals, runs_a_program) in started {
                 self.container_runs.insert(
                     container_arn,
                     ContainerRun {
                         signals,
                         task_arn: task_arn.clone(),
+                        runs_a_program,
                         ended: false,
                         handle: None,
                     },
@@ -346,12 +373,17 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             .count()
     }
 
-    /// The containers whose programs are still being PERFORMED — the set a task's own end
+    /// The containers whose PROGRAMS are still being performed — the set a task's own end
     /// waits on ([`TaskRecord::essential_programs_running`]).
+    ///
+    /// A run that only initialises the container's log driver performs no program of the
+    /// container's ([`ContainerRun::runs_a_program`]), so it holds nothing open: a
+    /// standalone task whose containers run nothing ends when its work is due, exactly as it
+    /// did before such a container had a run at all.
     pub(super) fn performing_containers(&self) -> HashSet<String> {
         self.container_runs
             .iter()
-            .filter(|(_, run)| !run.ended)
+            .filter(|(_, run)| !run.ended && run.runs_a_program)
             .map(|(container_arn, _)| container_arn.clone())
             .collect()
     }
@@ -484,8 +516,14 @@ pub fn settle_container_runtime<Eng: Send + Sync + 'static>(
     settle_container_health(callback, engine);
 }
 
-/// Run ONE container's program to its end, delivering what it writes and recording what it
-/// exited with.
+/// Start ONE container: initialise its log driver, then run its program to its end,
+/// delivering what it writes and recording what it exited with.
+///
+/// A container this emulator holds no program for still has its driver initialised — the
+/// stream is created as the container starts, which is what makes the group the
+/// configuration names hold one stream per started container (see this module's header) —
+/// and then reports nothing of its own ([`ContainerOutcome::Abandoned`]): the image holds
+/// the program whose output would have filled that stream, so no event is put in it.
 async fn run_container(
     state: ::engine::ServiceState<ComAmazonawsEcsAmazonec2containerservicev20141113State>,
     callback: ::smithy_server_runtime::EmbeddedEmulator,
@@ -506,6 +544,13 @@ async fn run_container(
     // The stream the driver delivers to exists before the container writes its first line,
     // which is the order the driver itself does it in.
     output.open().await;
+    let Some(program) = launch.program.as_ref() else {
+        // The driver is initialised and there is nothing of this container's own to run.
+        state
+            .lock()
+            .record_container_outcome(&launch.container_arn, ContainerOutcome::Abandoned);
+        return;
+    };
     let deadline = Instant::now() + CONTAINER_RUN_LIFETIME;
     let mut shell = ContainerShell::new(
         environment,
@@ -513,7 +558,7 @@ async fn run_container(
         Arc::clone(&launch.signals),
         deadline,
     );
-    let outcome = shell.run(&launch.program).await;
+    let outcome = shell.run(program).await;
     state
         .lock()
         .record_container_outcome(&launch.container_arn, outcome);
