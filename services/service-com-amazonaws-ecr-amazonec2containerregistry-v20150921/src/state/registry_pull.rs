@@ -226,14 +226,15 @@ pub fn parse_reference(image: &str) -> Option<RegistryReference> {
 /// The form is the one the Amazon ECR User Guide gives for a pull:
 /// `<account>.dkr.ecr.<region>.amazonaws.com/<repository>[:<tag>|@<digest>]`, so the account,
 /// the Region and the repository are read out of the reference itself
-/// ([`ecr_registry_host_parts`] for the host). A reference naming no tag and no digest asks
-/// for [`DEFAULT_IMAGE_TAG`].
+/// ([`registry_host_parts`] for the host, which reads the address this registry ANNOUNCES
+/// for one of its own repositories as well as the host AWS publishes, because both name the
+/// same registry). A reference naming no tag and no digest asks for [`DEFAULT_IMAGE_TAG`].
 #[must_use]
 pub fn parse_registry_reference(image: &str) -> Option<(String, RegistryReference)> {
     let (host, path) = image.trim().split_once('/')?;
     let lowercased = host.to_ascii_lowercase();
-    let (addressed_registry, region) = ecr_registry_host_parts(&lowercased)
-        .map(|(account, region)| (account.to_string(), region.to_string()))?;
+    let (addressed_registry, region) = registry_host_parts(&lowercased)
+        .map(|parts| (parts.registry_id.to_string(), parts.region.to_string()))?;
     let reference = reference_into(region, path)?;
     Some((addressed_registry, reference))
 }
@@ -274,17 +275,17 @@ fn reference_into(region: String, path: &str) -> Option<RegistryReference> {
 }
 
 /// The Region the registry host `host` names, when `host` is THIS registry's host: this
-/// account's id, the two fixed labels, one Region label and the partition suffix. `host` is
-/// already lowercased.
+/// account's id, the two fixed labels, one Region label and the zone the registry is served
+/// in — AWS's own partition suffix, or the zone this emulator announces its registries in.
 ///
 /// The host layout itself is read by the one walk of it this service states
-/// ([`ecr_registry_host_parts`]); what this adds is that the account has to be the account
-/// this registry serves — a repository of another account's registry is not ours to pull
-/// from. It is the one reading of "which Region did this client dial" every plane of this
-/// registry takes, the data plane included (`crate::service`'s registry endpoint).
+/// ([`registry_host_parts`]); what this adds is that the account has to be the account this
+/// registry serves — a repository of another account's registry is not ours to pull from. It
+/// is the one reading of "which Region did this client dial" every plane of this registry
+/// takes, the data plane included (`crate::service`'s registry endpoint).
 pub fn host_region(host: &str) -> Option<String> {
-    let (account, region) = ecr_registry_host_parts(host)?;
-    (account == registry_id()).then(|| region.to_string())
+    let parts = registry_host_parts(host)?;
+    (parts.registry_id == registry_id()).then(|| parts.region.to_ascii_lowercase())
 }
 
 /// Why no image in this registry answers to `reference`: the repository is not here at all,
@@ -769,6 +770,17 @@ mod tests {
             Row {
                 case: "another account's registry",
                 image: "123456789012.dkr.ecr.us-east-1.amazonaws.com/app:1".to_string(),
+                names: None,
+            },
+            Row {
+                // A registry-shaped host in ANOTHER partition's zone: AWS serves a Region's
+                // registries only under its own partition's suffix, so no registry answers
+                // there and the reference names none of this account's repositories.
+                case: "this account and Region under another partition's zone",
+                image: format!(
+                    "{}.dkr.ecr.us-east-1.amazonaws.com.cn/app:1",
+                    registry_id()
+                ),
                 names: None,
             },
             Row {

@@ -297,11 +297,12 @@ fn task_definition_arn(family: &str, revision: i64) -> String {
     format!("arn:aws:ecs:{REGION}:{ACCOUNT_ID}:task-definition/{family}:{revision}")
 }
 
-/// `<registry endpoint>/<repository>` — the URI Amazon ECR REPORTS for `repository`, which is
-/// the ADDRESS a container client pushes and pulls it at (`Repository$repositoryUri`: "You
-/// can use this URI for container image `push` and `pull` operations"). This suite's router is
-/// served on no port of its own, so that endpoint is the base `smithy_server_runtime` reports
-/// for one.
+/// `<registry host>/<repository>` — the URI Amazon ECR REPORTS for `repository`, which names
+/// the REGISTRY that holds it and is the ADDRESS a container client pushes and pulls it at
+/// (`Repository$repositoryUri`: "You can use this URI for container image `push` and `pull`
+/// operations"): this account's id, the two fixed registry labels and the Region, in the zone
+/// this emulator answers in. This suite's router is served on no port of its own, so that
+/// zone is the host of the base `smithy_server_runtime` reports for one.
 ///
 /// It is also the URI every row's registered image carries. A declaration that reaches the
 /// repository's `RepositoryUri` attribute resolves to it directly; one that spells the AWS
@@ -311,10 +312,10 @@ fn task_definition_arn(family: &str, revision: i64) -> String {
 /// registry this emulator serves, which is the only address the image can be pulled from here.
 pub(crate) fn published_repository_uri(repository: &str) -> String {
     let base = ::smithy_server_runtime::UNSERVED_URL_BASE;
-    let authority = base
+    let zone = base
         .split_once("://")
         .map_or(base, |(_scheme, authority)| authority);
-    format!("{authority}/{repository}")
+    format!("{ACCOUNT_ID}.dkr.ecr.{REGION}.{zone}/{repository}")
 }
 
 /// One deployment: the template, and what each owning service must then hold.

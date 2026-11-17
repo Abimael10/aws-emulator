@@ -36,28 +36,48 @@ pub fn endpoint_host(region: &str) -> String {
 /// only kind of address a client on the machine an emulator runs on can reach.
 pub const SERVED_URL_BASE: &str = "https://127.0.0.1:9297";
 
-/// The registry URL this service announces to a call made through this harness: its calls
-/// are addressed to [`endpoint_host`], which names a service and is therefore an endpoint
-/// no registry client can use, so what is announced is the address this emulator is served
-/// at ([`SERVED_URL_BASE`]).
-pub const ANNOUNCED_REGISTRY_URL: &str = SERVED_URL_BASE;
+/// The zone and port every registry address this harness's emulator ANNOUNCES is named in.
+///
+/// Its calls are addressed to [`endpoint_host`], which names a service and is therefore an
+/// endpoint no registry client can use, so the address the registry is announced on is built
+/// on the one this emulator is served at ([`SERVED_URL_BASE`]) — a loopback ADDRESS, and the
+/// zone a resolver answers with that interface is the loopback zone RFC 6761 reserves
+/// together with every name under it, on the port the emulator is served on.
+pub const ANNOUNCED_REGISTRY_ZONE: &str = "localhost:9297";
 
-/// The `host[:port]` half of [`ANNOUNCED_REGISTRY_URL`], which is the endpoint a
-/// `docker login` made through this harness is pointed at.
-pub fn announced_registry_endpoint() -> &'static str {
-    ::service_common::data_plane_addressing::url_authority(ANNOUNCED_REGISTRY_URL)
+/// The host this emulator announces this account's registry in `region` at: the owning
+/// account's id, the two fixed labels of a registry host, the registry's own Region and the
+/// zone this emulator answers in ([`ANNOUNCED_REGISTRY_ZONE`]) — the layout
+/// `AuthorizationData$proxyEndpoint` documents ("The Amazon ECR registry URL format is
+/// `https://aws_account_id.dkr.ecr.region.amazonaws.com`"), in the zone a client of these
+/// suites can reach.
+pub fn announced_registry_host(region: &str) -> String {
+    format!("{REGISTRY_ID}.dkr.ecr.{region}.{ANNOUNCED_REGISTRY_ZONE}")
+}
+
+/// The registry URL a `docker login` of a call signed for `region` is pointed at
+/// (`AuthorizationData$proxyEndpoint`): a scheme followed by that registry's own host
+/// ([`announced_registry_host`]).
+pub fn announced_registry_url(region: &str) -> String {
+    format!("https://{}", announced_registry_host(region))
 }
 
 /// The account id every generated emulator vends, spelled out here rather than imported
 /// so a wrong registry id in the implementation fails these tests.
 pub const REGISTRY_ID: &str = "000000000000";
 
-/// The URI Amazon ECR reports for the repository `name` (`Repository$repositoryUri`: "The URI
-/// for the repository. You can use this URI for container image `push` and `pull`
-/// operations"): the endpoint this emulator serves the registry at for a call made through
-/// this harness ([`announced_registry_endpoint`]), followed by the repository's own name.
+/// The URI Amazon ECR reports for the repository `name` of the registry in `region`
+/// (`Repository$repositoryUri`: "The URI for the repository. You can use this URI for
+/// container image `push` and `pull` operations"): the host of the registry that HOLDS it
+/// ([`announced_registry_host`]), followed by the repository's own name.
+pub fn repository_uri_in(region: &str, name: &str) -> String {
+    format!("{}/{name}", announced_registry_host(region))
+}
+
+/// [`repository_uri_in`] for a repository of the Region these suites sign for
+/// ([`REGION`]).
 pub fn repository_uri(name: &str) -> String {
-    format!("{}/{name}", announced_registry_endpoint())
+    repository_uri_in(REGION, name)
 }
 
 /// The `X-Amz-Target` prefix this service routes on (`OPERATIONS.md`, "Wire protocol").

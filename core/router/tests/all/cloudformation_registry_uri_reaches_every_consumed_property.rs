@@ -40,9 +40,21 @@ use super::query_wire::outputs_of;
 
 /// The registry host AWS itself serves a private repository at
 /// (`aws_account_id.dkr.ecr.region.amazonaws.com`, as `ContainerDefinition$image` spells it in
-/// its own examples) — the run every stand-in for a `RepositoryUri` carries, and so the run no
-/// value a deployed resource holds may still carry here.
-const AWS_REGISTRY_HOST_MARK: &str = ".dkr.ecr.";
+/// its own examples) — what every stand-in for a `RepositoryUri` carries, and so what no value
+/// a deployed resource holds may still carry here.
+///
+/// The address Amazon ECR ASSIGNS here carries the same `dkr.ecr` labels, because a repository
+/// URI names the account and the Region whose registry HOLDS the repository; what tells a
+/// stand-in from the assigned value is the ZONE those labels sit in — AWS's own for a stand-in,
+/// and one this emulator answers in for the address it assigned.
+const AWS_REGISTRY_LABELS_MARK: &str = ".dkr.ecr.";
+const AWS_REGISTRY_ZONE_MARK: &str = ".amazonaws.com";
+
+/// Whether `text` still carries a registry host in AWS's OWN zone, which is what a stand-in
+/// left behind looks like (see [`AWS_REGISTRY_LABELS_MARK`]).
+fn names_the_aws_registry_host(text: &str) -> bool {
+    text.contains(AWS_REGISTRY_LABELS_MARK) && text.contains(AWS_REGISTRY_ZONE_MARK)
+}
 
 /// The container every row declares, and the name of the environment variable and the docker
 /// label it carries the registry address in.
@@ -384,12 +396,13 @@ async fn every_property_that_consumes_the_repository_holds_the_address_ecr_assig
         strings(&answer, &mut held);
         let standing: Vec<&String> = held
             .iter()
-            .filter(|text| text.contains(AWS_REGISTRY_HOST_MARK))
+            .filter(|text| names_the_aws_registry_host(text))
             .collect();
         assert!(
             standing.is_empty(),
-            "case {:?}: expected no value of the registered revision to still name the AWS \
-             registry host {AWS_REGISTRY_HOST_MARK:?}, got {standing:?}",
+            "case {:?}: expected no value of the registered revision to still name a registry \
+             host in AWS's own zone ({AWS_REGISTRY_LABELS_MARK:?} under \
+             {AWS_REGISTRY_ZONE_MARK:?}), got {standing:?}",
             row.case
         );
     }

@@ -53,12 +53,27 @@ const POLL_ATTEMPTS: usize = 80;
 /// The authority this emulator answers on when it is served on no port of its own, which is
 /// how this suite mounts it: the authority of the framework's unserved base
 /// (`smithy_server_runtime::UNSERVED_URL_BASE`). Every address a service here announces for a
-/// client to dial is built on the endpoint the emulator is reached at, so this is the
-/// authority the published repository URI carries — and it is NOT a host AWS publishes.
+/// client to dial is built on the endpoint the emulator is reached at, so this is the zone the
+/// published repository URI's registry host sits in — and it is NOT a host AWS publishes.
 fn emulator_authority() -> &'static str {
     let base = ::smithy_server_runtime::UNSERVED_URL_BASE;
     base.split_once("://")
         .map_or(base, |(_scheme, authority)| authority)
+}
+
+/// The account id every emulated ARN and registry host carries
+/// (`engine::emulator_account_id`).
+const ACCOUNT: &str = ::engine::EMULATOR_ACCOUNT_ID;
+
+/// The host Amazon ECR announces this account's registry in `region` at, which is the
+/// authority of every repository URI of that registry: the owning account's id, the two fixed
+/// labels of a registry host and the registry's Region, in the zone this emulator answers in
+/// ([`emulator_authority`]) — the registry URL layout `AuthorizationData$proxyEndpoint`
+/// documents (`aws_account_id.dkr.ecr.region.<zone>`), in a zone a client of this suite can
+/// reach. An Amazon ECR registry is one account's in ONE Region, so the Region a stack deploys
+/// in is part of the address of the repository it created.
+fn registry_host(region: &str) -> String {
+    format!("{ACCOUNT}.dkr.ecr.{region}.{}", emulator_authority())
 }
 
 /// The emulator with the two services this suite exercises, mounted on ONE engine exactly as
@@ -406,7 +421,6 @@ const ROWS: &[Row] = &[
 #[tokio::test]
 async fn a_stack_publishes_the_repository_values_amazon_ecr_itself_reports() {
     let router = build_router();
-    let authority = emulator_authority();
     for row in ROWS {
         let described = deploy(&router, row.case, row.region, row.stack, row.template).await;
         let outputs = outputs_of(&described);
@@ -468,11 +482,12 @@ async fn a_stack_publishes_the_repository_values_amazon_ecr_itself_reports() {
             row.case
         );
 
-        // The URI that service reports is the address this emulator serves the registry at,
-        // followed by the repository's own name — the one address a container client here can
-        // push to and pull from.
+        // The URI that service reports names the registry that HOLDS the repository — this
+        // account's, in the Region the stack deployed in — followed by the repository's own
+        // name, in the zone this emulator answers in: the one address a container client here
+        // can push to and pull from.
         let held_uri = held["repositoryUri"].as_str().unwrap_or_default().to_string();
-        let expected_uri = format!("{authority}/{repository}");
+        let expected_uri = format!("{}/{repository}", registry_host(row.region));
         assert_eq!(
             held_uri, expected_uri,
             "case {:?}: expected Amazon ECR to report the repository URI {expected_uri:?}, got \

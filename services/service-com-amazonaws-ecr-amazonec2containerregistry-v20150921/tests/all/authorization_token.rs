@@ -9,11 +9,14 @@
 //! UNIT the member documents — "the Unix time in seconds and milliseconds", so a whole
 //! number of milliseconds and nothing finer, whatever precision the host clock carries —
 //! and whose
-//! `proxyEndpoint` is the registry endpoint THIS EMULATOR serves — `proxyEndpoint` is
-//! where `docker login` and every pull after it go, and this emulator is what answers the
-//! registry API (`service/registry_v2.rs`), so an address naming AWS's own
-//! `<account>.dkr.ecr.<region>.amazonaws.com` host would send the next client out of the
-//! emulator entirely. `registryIds` is `@deprecated` — "specifying a
+//! `proxyEndpoint` names THE REGISTRY THE TOKEN WAS ISSUED FOR — this account's registry in
+//! the Region the call was signed for, in the registry URL layout the member documents
+//! (`https://aws_account_id.dkr.ecr.region.amazonaws.com`) — in the zone this emulator
+//! answers in. `proxyEndpoint` is where `docker login` and every pull after it go, and this
+//! emulator is what answers the registry API (`service/registry_v2.rs`), so a host in AWS's
+//! own zone would send the next client out of the emulator entirely, while a host naming
+//! neither account nor Region would not say which registry was logged in to.
+//! `registryIds` is `@deprecated` — "specifying a
 //! registry ID doesn't change the permissions scope of the authorization token" — so it
 //! selects nothing: a request carrying any accepted value for it is answered exactly like
 //! one carrying none.
@@ -31,7 +34,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::wire::{
-    call, emulator, ok, ok_in_region, ANNOUNCED_REGISTRY_URL, REGION, REGISTRY_ID,
+    announced_registry_url, call, emulator, ok, ok_in_region, REGION, REGISTRY_ID,
 };
 
 /// The user half of the `user:password` pair the token decodes to, as the handler's
@@ -68,13 +71,12 @@ const MEMBER_PROXY: &str = "proxyEndpoint";
 /// An account id that is NOT this emulator's registry.
 const OTHER_REGISTRY_ID: &str = "123456789012";
 
-/// The registry URL an issued token must name: the endpoint this emulator serves the
-/// registry at for the calling client (see the module docs). `crate::wire`'s calls are
-/// addressed to `api.ecr.<region>.amazonaws.com`, a host that names a service and so is an
-/// endpoint no registry client can use, which is why every row — whatever Region it is
-/// signed for — is answered with the address this emulator is served at
-/// ([`ANNOUNCED_REGISTRY_URL`]).
-const EXPECTED_PROXY_ENDPOINT: &str = ANNOUNCED_REGISTRY_URL;
+/// The registry URL a token issued to a call signed for `region` must name: the host of
+/// this account's registry in THAT Region, in the zone this emulator answers in (see the
+/// module docs and [`announced_registry_url`]).
+fn expected_proxy_endpoint(region: &str) -> String {
+    announced_registry_url(region)
+}
 
 /// Ten distinct 12-digit account ids — the modelled maximum of
 /// `GetAuthorizationTokenRegistryIdList` (`@length(min: 1, max: 10)`), every entry
@@ -183,11 +185,10 @@ async fn issue(
     let proxy_endpoint = data[MEMBER_PROXY]
         .as_str()
         .unwrap_or_else(|| panic!("case {case:?}: expected a string proxyEndpoint in {body}"));
+    let expected = expected_proxy_endpoint(region);
     assert_eq!(
-        proxy_endpoint,
-        EXPECTED_PROXY_ENDPOINT,
-        "case {case:?}: expected the registry URL this emulator serves, got \
-         {proxy_endpoint:?}"
+        proxy_endpoint, expected,
+        "case {case:?}: expected the registry URL {expected:?}, got {proxy_endpoint:?}"
     );
 
     token
@@ -347,16 +348,17 @@ async fn two_independent_registries_issue_different_tokens() {
     );
 }
 
-/// The endpoint this emulator serves the registry at is what the issued token's registry
-/// URL names, whatever Region the call is signed for: one endpoint serves them all here,
-/// so this pins the answer across the published Region naming forms rather than one
-/// recorded Region.
+/// The registry the token was issued FOR is what its registry URL names: a registry is one
+/// account's in ONE Region, so the URL carries the Region the call was signed for and no two
+/// Regions' tokens are pointed at one host. The rows span the published Region naming forms
+/// rather than one recorded Region.
 #[tokio::test]
-async fn the_proxy_endpoint_names_the_registry_endpoint_this_emulator_serves() {
+async fn the_proxy_endpoint_names_the_registry_the_token_was_issued_for() {
     // Regions spanning the naming forms AWS publishes: a classic three-part name, a
     // numbered one, a four-part one, and a non-`aws` partition's.
     let regions = ["us-east-1", "ap-southeast-2", "us-gov-west-1", "cn-north-1"];
     let router = emulator();
+    let mut announced: BTreeSet<String> = BTreeSet::new();
     for region in regions {
         let body = ok_in_region(
             &router,
@@ -369,11 +371,17 @@ async fn the_proxy_endpoint_names_the_registry_endpoint_this_emulator_serves() {
         let endpoint = body["authorizationData"][0][MEMBER_PROXY]
             .as_str()
             .unwrap_or_else(|| panic!("case {region:?}: expected a string proxyEndpoint in {body}"));
+        let expected = expected_proxy_endpoint(region);
         assert_eq!(
-            endpoint,
-            EXPECTED_PROXY_ENDPOINT,
-            "case {region:?}: expected the registry URL this emulator serves, got \
-             {endpoint:?}"
+            endpoint, expected,
+            "case {region:?}: expected the registry URL {expected:?}, got {endpoint:?}"
+        );
+        // The one thing naming the registry is FOR: two Regions are two registries, so a
+        // client cannot be pointed at the same host for both.
+        assert!(
+            announced.insert(endpoint.to_string()),
+            "case {region:?}: expected a registry URL no other Region's token names, but \
+             {endpoint:?} was already announced in {announced:?}"
         );
     }
 }
