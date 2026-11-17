@@ -146,6 +146,9 @@ fn job(name: &str, status: &str, created: u64, modified: u64) -> TrainingJob {
             status: secondary_status_for(status).to_string(),
             starts_at: at(created),
         }],
+        // A seeded row's run produced nothing to publish, for the same reason it carries no
+        // recorded run at all.
+        pending_artifact: None,
         entered: 1,
         tuning_job_arn: None,
         request: CreateTrainingJobInput::default(),

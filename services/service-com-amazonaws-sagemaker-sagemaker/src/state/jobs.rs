@@ -30,6 +30,27 @@ pub const TRAINING_JOB_PHASE_SPAN: Duration = Duration::from_secs(2);
 /// does) observes a terminal status and a waiter terminates.
 pub const TRAINING_JOB_ENDS_AFTER: Duration = TRAINING_JOB_PHASE_SPAN.saturating_mul(4);
 
+/// When the clock owes the stage that FOLLOWS `stages_before` stages of work which the
+/// accepting call performed server-side and reported at `reported_at`.
+///
+/// Every span a clock owes such a resource is measured from the instant its work REPORTED —
+/// the first instant a caller can hold the accepting call's answer and read the record it
+/// created — and never from the instant that call began: the work is performed INSIDE the
+/// create, so a schedule measured from the creation instant is already spent by the time the
+/// caller can read anything whenever the work took longer than one span, and the resource's
+/// whole lifecycle collapses into a single terminal observation. Measured from here, a caller
+/// that reads as soon as its create answers observes the non-terminal status, and one that
+/// keeps reading observes each stage of the work in turn, however long that work took.
+///
+/// The span is never zero and does not shrink with the work's duration, so every stage stays
+/// observable: `stages_before` counts the stages that come first, and the answer is one span
+/// past the last of them.
+#[must_use]
+pub fn stage_due_after(reported_at: SystemTime, span: Duration, stages_before: usize) -> SystemTime {
+    reported_at
+        + span.saturating_mul(u32::try_from(stages_before.saturating_add(1)).unwrap_or(u32::MAX))
+}
+
 /// `TrainingJobStatus`'s members this emulator moves a training job through (the modelled
 /// enum also carries `Deleting`, which this slice does not reach: `DeleteTrainingJob` is
 /// still a stub). Named once here so no handler compares a bare string literal.
@@ -205,6 +226,11 @@ pub struct TrainingJob {
     /// reported ([`crate::state::TrainingRunOutcome::phases`]), laid out over the span the
     /// clock gives the work. Stored, never slept on.
     pub phases: Vec<TrainingPhase>,
+    /// The model artifact this job's run produced, held until the stage of the work that
+    /// PUBLISHES it falls due and taken by the publication that writes it
+    /// ([`crate::state::training_artifact`]). `None` for a run that produced none, once the
+    /// object has been written, and for a job whose run the caller abandoned.
+    pub pending_artifact: Option<crate::state::PendingArtifact>,
     /// How many of [`Self::phases`] the clock has already materialised — at least the
     /// `Starting` the job was accepted in, so a read never reports a stage that is not due
     /// yet and never un-reports one that is.
@@ -282,6 +308,8 @@ impl TrainingJob {
                 status: TRAINING_SECONDARY_STATUS_STARTING.to_string(),
                 starts_at: now,
             }],
+            // Filled in by the job's run too: nothing has been produced to publish yet.
+            pending_artifact: None,
             entered: 1,
             tuning_job_arn,
             tags: request.tags.clone().unwrap_or_default(),
@@ -302,7 +330,7 @@ impl TrainingJob {
     ///
     /// A job still RUNNING whose run has NOT reported yet is not settled at all, whatever the
     /// clock says: the terminal status IS the run's, so there is none to materialise until
-    /// the run has one, and [`Self::record_run`] pushes the due instant out to the moment it
+    /// the run has one, and [`Self::record_run`] lays the due instant out past the moment it
     /// reports. So no reader can turn a run that is still going into a failure, and a run
     /// slower than [`TRAINING_JOB_ENDS_AFTER`] still settles into what it actually produced.
     ///
@@ -425,37 +453,88 @@ impl TrainingJob {
 
     /// Record what the job's RUN reported, `at` the instant it reported.
     ///
-    /// The clock owes the job its terminal status [`TRAINING_JOB_ENDS_AFTER`] after the create
-    /// — but it cannot owe it before the work is over, so a run that took longer than that
-    /// span pushes the due instant out to the moment it reported. The status the clock then
-    /// materialises is always the one the run produced.
+    /// The stages the run went through ([`crate::state::TrainingRunOutcome::phases`]) and the
+    /// terminal status that follows them are laid out from the instant the run REPORTED
+    /// ([`stage_due_after`]), each owed [`TRAINING_JOB_PHASE_SPAN`] after the one before it:
+    /// the run is performed inside the create that accepted the job, so a schedule measured
+    /// from the creation instant is already spent by the time that create answers whenever the
+    /// work took longer than one span, and the job's first observation would be its terminal
+    /// one. Measured from the report, a caller that describes the job as soon as its create
+    /// answers observes `InProgress` with no stage of the work begun, and one that keeps
+    /// polling observes `Downloading`, `Training` and `Uploading` in the order the run
+    /// performed them before the terminal status — however long the work itself took.
     ///
-    /// The stages the run went through ([`crate::state::TrainingRunOutcome::phases`]) are laid
-    /// out over the span the clock gives the work, each owed [`TRAINING_JOB_PHASE_SPAN`] after
-    /// the one before it, so the job enters them in the order the run performed them and the
-    /// terminal status falls due after the last of them.
+    /// The status the clock then materialises is always the one the run produced.
     ///
     /// A job the caller has already asked to stop keeps the due instant that stop set: the
     /// terminal status it is waiting for is `Stopped`, which does not depend on what the
     /// abandoned run reported, so a late report must not push `Stopped` further away.
     pub fn record_run(&mut self, outcome: crate::state::TrainingRunOutcome, at: SystemTime) {
+        let mut outcome = outcome;
         if self.status == TRAINING_STATUS_IN_PROGRESS {
             let reached = outcome.phases();
             for (index, status) in reached.iter().enumerate() {
                 self.phases.push(TrainingPhase {
                     status: status.clone(),
-                    starts_at: self.creation_time
-                        + TRAINING_JOB_PHASE_SPAN.saturating_mul(
-                            u32::try_from(index + 1).unwrap_or(u32::MAX),
-                        ),
+                    starts_at: stage_due_after(at, TRAINING_JOB_PHASE_SPAN, index),
                 });
             }
-            let scheduled = self.creation_time
-                + TRAINING_JOB_PHASE_SPAN
-                    .saturating_mul(u32::try_from(reached.len() + 1).unwrap_or(u32::MAX));
-            self.ends_at = scheduled.max(at);
+            self.ends_at = stage_due_after(at, TRAINING_JOB_PHASE_SPAN, reached.len());
+            // What the run produced is held here until the stage that uploads it falls due;
+            // a job the caller has already asked to stop holds nothing, because that stop
+            // abandons the run.
+            if let crate::state::TrainingRunOutcome::Completed { artifact, .. } = &mut outcome {
+                self.pending_artifact = artifact.take();
+            }
         }
         self.run = Some(outcome);
+    }
+
+    /// When the clock owes this job's artifact its appearance in Amazon S3: the instant the
+    /// job enters the stage that uploads it, and `None` for a job with no such stage.
+    ///
+    /// "Uploading - Training is complete and the model artifacts are being uploaded to the S3
+    /// location" (`DescribeTrainingJob$SecondaryStatus`), so the object appears there and not
+    /// at an earlier stage.
+    #[must_use]
+    pub fn artifact_due_at(&self) -> Option<SystemTime> {
+        self.phases
+            .iter()
+            .find(|phase| phase.status == TRAINING_SECONDARY_STATUS_UPLOADING)
+            .map(|phase| phase.starts_at)
+    }
+
+    /// Take the held artifact once the stage that publishes it is due, so the caller can
+    /// write it ([`crate::state::publish_due_artifact`]).
+    ///
+    /// Taking it is what makes the publication happen exactly once, whichever of the armed
+    /// instant and a read gets here first. Nothing is taken before the stage is due, and
+    /// nothing at all for a job whose run the caller abandoned.
+    pub fn claim_due_artifact(&mut self, now: SystemTime) -> Option<crate::state::PendingArtifact> {
+        if self.artifact_due_at().is_none_or(|due| now < due) {
+            return None;
+        }
+        self.pending_artifact.take()
+    }
+
+    /// Record that the upload leg of this job's work failed, which is the job's own
+    /// `FailureReason`: the run got as far as the stage that uploads the artifact and the
+    /// object could not be written, so the job fails there with the stages it did reach.
+    ///
+    /// Applied only while the job is still running: a job that already reached a terminal
+    /// status reached it with what the clock had already materialised, and a job the caller
+    /// asked to stop is not failed by work it abandoned.
+    pub fn record_artifact_failure(&mut self, reason: String) {
+        if self.status != TRAINING_STATUS_IN_PROGRESS {
+            return;
+        }
+        let reached: Vec<String> = self
+            .phases
+            .iter()
+            .skip(1)
+            .map(|phase| phase.status.clone())
+            .collect();
+        self.run = Some(crate::state::TrainingRunOutcome::failed_in(reached, reason));
     }
 
     /// Whether the job has reached a status nothing leaves on its own, i.e. one of
@@ -482,12 +561,15 @@ impl TrainingJob {
     ///
     /// The run the job was doing is abandoned rather than reported: nothing is published
     /// beside `Stopping` or the `Stopped` that follows it, so no failure reason, artifact or
-    /// metric from a run the caller cut short is revealed as the job's own outcome.
+    /// metric from a run the caller cut short is revealed as the job's own outcome — and an
+    /// artifact the run produced but the stage that uploads it had not published yet is
+    /// dropped rather than written, because that stage never happens.
     pub fn request_stop(&mut self, now: SystemTime) {
         self.status = TRAINING_STATUS_STOPPING.to_string();
         self.secondary_status = Some(TRAINING_SECONDARY_STATUS_STOPPING.to_string());
         self.failure_reason = None;
         self.training_end_time = None;
+        self.pending_artifact = None;
         self.last_modified_time = now;
         self.ends_at = now + TRAINING_JOB_STOPS_AFTER;
     }
@@ -876,12 +958,13 @@ impl ProcessingJob {
     /// Record what the job's container PROGRAM did, `at` the instant it reported.
     ///
     /// `None` is a run that could not be carried out in this process at all, which is the
-    /// server's own failure rather than anything the program produced. The clock cannot owe the
-    /// job its terminal status before the program is over, so a run that took longer than
-    /// [`PROCESSING_JOB_ENDS_AFTER`] pushes the due instant out to the moment it reported.
+    /// server's own failure rather than anything the program produced. The terminal status
+    /// falls due [`PROCESSING_JOB_ENDS_AFTER`] past the instant the program reported
+    /// ([`stage_due_after`]), so a caller that describes the job as soon as its create answers
+    /// observes `InProgress` however long that program ran.
     pub fn record_run(&mut self, run: Option<crate::state::ContainerOutcome>, at: SystemTime) {
         if self.status == PROCESSING_STATUS_IN_PROGRESS {
-            self.ends_at = self.ends_at.max(at);
+            self.ends_at = stage_due_after(at, PROCESSING_JOB_ENDS_AFTER, 0);
         }
         self.run = run;
     }
@@ -1089,12 +1172,12 @@ impl InferenceRecommendationsJob {
 
     /// Record what the job's BENCHMARK reported, `at` the instant it reported.
     ///
-    /// The clock cannot owe the job its terminal status before the benchmark is over, so a
-    /// benchmark that took longer than [`RECOMMENDATION_JOB_SETTLES_AFTER`] pushes the due
-    /// instant out to the moment it reported.
+    /// The terminal status falls due [`RECOMMENDATION_JOB_SETTLES_AFTER`] past the instant the
+    /// benchmark reported ([`stage_due_after`]), so a caller that describes the job as soon as
+    /// its create answers observes `PENDING` however long that benchmark took.
     pub fn record_run(&mut self, outcome: crate::state::RecommendationRunOutcome, at: SystemTime) {
         if self.status == RECOMMENDATION_JOB_STATUS_PENDING {
-            self.ends_at = self.ends_at.max(at);
+            self.ends_at = stage_due_after(at, RECOMMENDATION_JOB_SETTLES_AFTER, 0);
         }
         self.run = Some(outcome);
     }
@@ -1127,6 +1210,7 @@ mod tests {
                 status: TRAINING_SECONDARY_STATUS_STARTING.to_string(),
                 starts_at: created,
             }],
+            pending_artifact: None,
             entered: 1,
             tuning_job_arn: None,
             request: crate::ops::types::CreateTrainingJobInput::default(),
@@ -1181,6 +1265,7 @@ mod tests {
                         model_artifacts: "s3://bucket/clock-probe/output/model.tar.gz".to_string(),
                         final_metrics: Vec::new(),
                         phases: Vec::new(),
+                        artifact: None,
                     }
                 } else {
                     crate::state::TrainingRunOutcome::failed("ClientError: the probe's reason")
@@ -1204,47 +1289,250 @@ mod tests {
         }
     }
 
-    /// RULE: the clock cannot owe a terminal status before the work is over — a run that
-    /// reports after the span pushes the due instant out to the moment it reported, and the
-    /// status it produced is then what a later read materialises.
+    /// RULE: a run that reports later than the span the clock gives the work still leaves
+    /// every stage of that work ahead of the report — the stages and the terminal status are
+    /// laid out from the instant the run reported — and the status the run produced is what a
+    /// read past the last of them materialises.
     #[test]
-    fn a_run_slower_than_the_span_pushes_the_due_instant_out() {
+    fn a_run_slower_than_the_span_leaves_the_stages_ahead_of_its_report() {
         let created = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
         // Past the span the clock gives a job's work, and not a whole number of seconds of
         // it, so the seconds the describe reports are the rounded-up ones.
         let reported_at = created + TRAINING_JOB_ENDS_AFTER + Duration::from_millis(1_500);
-        let span = reported_at
-            .duration_since(created)
-            .expect("the probe's run reports after the job was created");
         let mut job = stored_job(created);
         job.record_run(
             crate::state::TrainingRunOutcome::Completed {
                 model_artifacts: "s3://bucket/clock-probe/output/model.tar.gz".to_string(),
                 final_metrics: Vec::new(),
                 phases: Vec::new(),
+                artifact: None,
             },
             reported_at,
         );
         assert_eq!(
-            job.ends_at, reported_at,
-            "expected the due instant to be the one the run reported at, got {:?}",
+            job.ends_at,
+            reported_at + TRAINING_JOB_PHASE_SPAN,
+            "expected the due instant a span past the report, got {:?}",
             job.ends_at
         );
         assert!(
-            !job.settle_status(reported_at - Duration::from_millis(1)),
-            "a read before the run reported must settle nothing, got {:?}",
+            !job.settle_status(reported_at),
+            "a read at the instant the run reported must settle nothing, got {:?}",
             job.status
         );
+        let ends_at = job.ends_at;
         assert!(
-            job.settle_status(reported_at) && job.status == TRAINING_STATUS_COMPLETED,
+            job.settle_status(ends_at) && job.status == TRAINING_STATUS_COMPLETED,
             "expected the completed status the run produced, got {:?}",
             job.status
         );
+        let span = job
+            .training_end_time
+            .expect("a settled job reports when its work ended")
+            .duration_since(created)
+            .expect("the probe's work ends after the job was created");
         assert_eq!(
             job.training_time_in_seconds(),
-            i32::try_from(span.as_secs() + 1).ok(),
+            i32::try_from(span.as_secs() + u64::from(span.subsec_nanos() > 0)).ok(),
             "expected the seconds the work spanned, rounded up, got {:?}",
             job.training_time_in_seconds()
         );
+    }
+
+    /// RULE: the stages of the work and the terminal status are laid out from the instant the
+    /// job's run REPORTED, so a caller that reads as soon as the create answers observes the
+    /// job `InProgress` with no stage of the work begun, and one that keeps reading observes
+    /// every stage the run went through, in order, before the terminal status — however long
+    /// that work took.
+    ///
+    /// The rows differ along how long the run took before it reported: less than one stage's
+    /// span, more than one, more than the whole span the clock gives the work, and many times
+    /// that span.
+    #[test]
+    fn the_stages_of_the_work_are_observable_however_long_the_run_took() {
+        let created = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        // The stages a run that brings data down, fits a model and uploads the artifact goes
+        // through, which is what `TrainingRunOutcome::phases` reports for it.
+        let reached = vec![
+            TRAINING_SECONDARY_STATUS_DOWNLOADING.to_string(),
+            TRAINING_SECONDARY_STATUS_TRAINING.to_string(),
+            TRAINING_SECONDARY_STATUS_UPLOADING.to_string(),
+        ];
+        // (case, how long the run took before it reported)
+        let rows: [(&str, Duration); 4] = [
+            (
+                "a run shorter than one stage's span",
+                Duration::from_millis(1),
+            ),
+            (
+                "a run just over one stage's span",
+                TRAINING_JOB_PHASE_SPAN + Duration::from_millis(1),
+            ),
+            (
+                "a run longer than the whole span of the work",
+                TRAINING_JOB_ENDS_AFTER,
+            ),
+            (
+                "a run many times the span of the work",
+                TRAINING_JOB_ENDS_AFTER.saturating_mul(10),
+            ),
+        ];
+
+        for (case, took) in rows {
+            let reported_at = created + took;
+            let mut job = stored_job(created);
+            job.record_run(
+                crate::state::TrainingRunOutcome::Completed {
+                    model_artifacts: "s3://bucket/clock-probe/output/model.tar.gz".to_string(),
+                    final_metrics: Vec::new(),
+                    phases: reached.clone(),
+                    artifact: None,
+                },
+                reported_at,
+            );
+
+            // The first read a caller can make is the one straight after the create answers,
+            // which is the instant the run reported: no stage of the work is begun yet.
+            job.settle_status(reported_at);
+            assert_eq!(
+                (job.status.as_str(), job.secondary_status.as_deref()),
+                (
+                    TRAINING_STATUS_IN_PROGRESS,
+                    Some(TRAINING_SECONDARY_STATUS_STARTING)
+                ),
+                "case {case:?}: expected the job InProgress/Starting on the first read, \
+                 got {:?}/{:?}",
+                job.status,
+                job.secondary_status
+            );
+
+            // Then every stage the run went through, each a span after the one before it.
+            for (index, stage) in reached.iter().enumerate() {
+                let due = stage_due_after(reported_at, TRAINING_JOB_PHASE_SPAN, index);
+                job.settle_status(due);
+                assert_eq!(
+                    (job.status.as_str(), job.secondary_status.as_deref()),
+                    (TRAINING_STATUS_IN_PROGRESS, Some(stage.as_str())),
+                    "case {case:?}: expected the job InProgress/{stage} at stage {index}, \
+                     got {:?}/{:?}",
+                    job.status,
+                    job.secondary_status
+                );
+            }
+
+            // And last the terminal status the run produced, a span past the final stage.
+            let ends_at = stage_due_after(reported_at, TRAINING_JOB_PHASE_SPAN, reached.len());
+            assert_eq!(
+                job.ends_at, ends_at,
+                "case {case:?}: expected the terminal status a span past the last stage, \
+                 got {:?}",
+                job.ends_at
+            );
+            job.settle_status(ends_at);
+            assert_eq!(
+                (job.status.as_str(), job.secondary_status.as_deref()),
+                (
+                    TRAINING_STATUS_COMPLETED,
+                    Some(TRAINING_SECONDARY_STATUS_COMPLETED)
+                ),
+                "case {case:?}: expected the completed status the run produced, got {:?}/{:?}",
+                job.status,
+                job.secondary_status
+            );
+
+            // The history names the stage the job was accepted in, every stage the run went
+            // through and the status it ended in, in that order.
+            let history: Vec<String> = job
+                .secondary_status_transitions()
+                .into_iter()
+                .map(|transition| transition.status)
+                .collect();
+            let expected: Vec<String> =
+                ::std::iter::once(TRAINING_SECONDARY_STATUS_STARTING.to_string())
+                    .chain(reached.clone())
+                    .chain([TRAINING_SECONDARY_STATUS_COMPLETED.to_string()])
+                    .collect();
+            assert_eq!(
+                history, expected,
+                "case {case:?}: expected the history to name every stage the job was in, \
+                 got {history:?}"
+            );
+        }
+    }
+
+    /// RULE: the artifact a run produced is published at the stage of the work that UPLOADS
+    /// it — it is claimable from that instant and not before, exactly once however many
+    /// claims are made, and not at all for a job whose run the caller abandoned.
+    ///
+    /// The rows differ along when the claim is made relative to that stage and whether the
+    /// caller asked the job to stop first.
+    #[test]
+    fn the_artifact_is_claimable_only_from_the_stage_that_uploads_it() {
+        let created = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let reported_at = created + Duration::from_millis(1);
+        let reached = vec![
+            TRAINING_SECONDARY_STATUS_DOWNLOADING.to_string(),
+            TRAINING_SECONDARY_STATUS_TRAINING.to_string(),
+            TRAINING_SECONDARY_STATUS_UPLOADING.to_string(),
+        ];
+        // (case, when the claim is made relative to the stage, whether the caller stopped the
+        // job first, whether the archive is handed over)
+        let rows: [(&str, i64, bool, bool); 5] = [
+            ("a claim a whole span before the stage", -2_000, false, false),
+            ("a claim a moment before the stage", -1, false, false),
+            ("a claim at the instant the stage is due", 0, false, true),
+            ("a claim past the stage", 5_000, false, true),
+            ("a claim past the stage, after a stop", 5_000, true, false),
+        ];
+
+        for (case, offset_millis, stopped, handed_over) in rows {
+            let mut job = stored_job(created);
+            job.record_run(
+                crate::state::TrainingRunOutcome::Completed {
+                    model_artifacts: "s3://bucket/clock-probe/output/model.tar.gz".to_string(),
+                    final_metrics: Vec::new(),
+                    phases: reached.clone(),
+                    artifact: Some(crate::state::PendingArtifact {
+                        location: crate::state::S3Location {
+                            bucket: "bucket".to_string(),
+                            key: "clock-probe/output/model.tar.gz".to_string(),
+                        },
+                        archive: vec![1, 2, 3],
+                    }),
+                },
+                reported_at,
+            );
+            let due = job
+                .artifact_due_at()
+                .expect("a run that produced an artifact has a stage that uploads it");
+            assert_eq!(
+                due,
+                stage_due_after(reported_at, TRAINING_JOB_PHASE_SPAN, reached.len() - 1),
+                "case {case:?}: expected the artifact owed at the stage that uploads it, \
+                 got {due:?}"
+            );
+            if stopped {
+                job.request_stop(reported_at);
+            }
+            let at = if offset_millis < 0 {
+                due - Duration::from_millis(offset_millis.unsigned_abs())
+            } else {
+                due + Duration::from_millis(offset_millis.unsigned_abs())
+            };
+            let claimed = job.claim_due_artifact(at);
+            assert_eq!(
+                claimed.is_some(),
+                handed_over,
+                "case {case:?}: expected the archive to be handed over: {handed_over}, \
+                 got {:?}",
+                claimed.as_ref().map(|artifact| artifact.location.uri())
+            );
+            // Whoever gets there first writes it: a second claim at the same instant hands
+            // over nothing, so the object is never written twice.
+            assert!(
+                job.claim_due_artifact(at).is_none(),
+                "case {case:?}: expected a second claim to hand over nothing"
+            );
+        }
     }
 }

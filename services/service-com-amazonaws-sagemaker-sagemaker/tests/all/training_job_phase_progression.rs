@@ -27,10 +27,21 @@
 //! with the secondary `MaxRuntimeExceeded` beside it and no failure reason — the job ends
 //! exactly at the cap — while a cap the work fits inside leaves the job `Completed`.
 //!
+//! RULE FOUR — the clock lays those stages out from the instant the job's RUN reported, never
+//! from the instant the create that accepted it began: the run is performed inside that
+//! create, so the FIRST read a caller can make still finds the job `InProgress` with a
+//! `SecondaryStatus` out of the pre-upload set, and a poller still observes a stage of the
+//! work in progress — however much work the run had to do before it could report. The model
+//! artifact belongs to the stage that uploads it, so a poll that reports a pre-upload stage
+//! finds nothing at the output location and the completed job's artifact is an object Amazon
+//! S3 holds.
+//!
 //! The tables span what the rules generalise over: how many channels a job declares and
-//! whether it declares any at all, the shape of the records they hold, and where a runtime
+//! whether it declares any at all, the shape of the records they hold, where a runtime
 //! cap falls relative to the work — at the modelled minimum, inside the work, and at the
-//! values the member's own doc names as its default and its maximum.
+//! values the member's own doc names as its default and its maximum — and how much work the
+//! run does before it reports: the records its channels hold and how many objects they are
+//! spread over.
 
 use std::time::{Duration, Instant};
 
@@ -65,6 +76,15 @@ const WITHOUT_DOWNLOAD: [&str; 3] = ["Starting", "Training", "Uploading"];
 
 /// The statuses nothing leaves on its own, so a poll that reaches one is over.
 const TERMINAL: [&str; 3] = ["Completed", "Failed", "Stopped"];
+
+/// The `SecondaryStatus` members a job carries BEFORE its model artifact is uploaded: the
+/// stage it is accepted in, and the stages of work that precede the upload
+/// (`DescribeTrainingJob$SecondaryStatus`).
+const PRE_UPLOAD: [&str; 3] = ["Starting", "Downloading", "Training"];
+
+/// The stages of work only a RUNNING job is in, i.e. the pre-upload stages the run performs
+/// rather than the one the create accepts the job in.
+const IN_PROGRESS_STAGES: [&str; 2] = ["Downloading", "Training"];
 
 /// How long a poll below gives the clock to settle a job: far longer than the span the state
 /// gives a job's work, so a loaded host still settles well inside it.
@@ -497,6 +517,244 @@ async fn a_runtime_cap_the_work_does_not_fit_inside_ends_the_job_at_the_cap() {
             assert!(
                 ended_at > created_at,
                 "case {case:?}: expected the job to end after it was created, got {settled}"
+            );
+        }
+    }
+}
+
+/// RULE FOUR: the first read a caller can make — straight after `CreateTrainingJob` answers —
+/// finds the job `InProgress` in a pre-upload stage, a poller then observes a stage of its
+/// work in progress, and the history names every stage it was in, however much work the run
+/// the create performed server-side had to do before it could report.
+///
+/// The rows differ along how much work that is: one small object, several objects of wider
+/// records under one prefix, two channels addressed differently, and no channel at all.
+#[tokio::test]
+async fn the_stages_stay_observable_however_much_work_the_run_did() {
+    /// One case: the job's name, the objects it stages, the channels it declares (none at all
+    /// when `None`) and the stages its history must name.
+    struct Row {
+        case: &'static str,
+        job: &'static str,
+        /// (key, body) of every object this row stages in [`BUCKET`].
+        objects: Vec<(String, String)>,
+        channels: Option<Value>,
+        stages: &'static [&'static str],
+    }
+
+    let emulator = Emulator::new();
+    emulator.given_bucket(BUCKET).await;
+    let role = emulator
+        .given_role("stage-observability-role", Some(&read_and_write()))
+        .await;
+
+    // A channel whose records are spread over several objects of one prefix, each longer and
+    // wider than the single-object case: the run reads every one of them, so this is the row
+    // whose work before reporting is the largest.
+    let spread: Vec<(String, String)> = (0..12)
+        .map(|part| {
+            (
+                format!("stages/spread/part-{part:02}.csv"),
+                csv_records(400, 8),
+            )
+        })
+        .collect();
+
+    let rows = vec![
+        Row {
+            case: "one object of records",
+            job: "stages-one-object",
+            objects: vec![("stages/one/train.csv".to_string(), csv_records(6, 2))],
+            channels: Some(json!([channel(
+                "train",
+                &format!("s3://{BUCKET}/stages/one/"),
+                "S3Prefix"
+            )])),
+            stages: &WITH_DOWNLOAD,
+        },
+        Row {
+            case: "a prefix holding several objects of wider records",
+            job: "stages-spread-objects",
+            objects: spread,
+            channels: Some(json!([channel(
+                "train",
+                &format!("s3://{BUCKET}/stages/spread/"),
+                "S3Prefix"
+            )])),
+            stages: &WITH_DOWNLOAD,
+        },
+        Row {
+            case: "a training channel beside a validation channel",
+            job: "stages-two-channels",
+            objects: vec![
+                ("stages/two/train.csv".to_string(), csv_records(20, 4)),
+                (
+                    "stages/two/validation/holdout.csv".to_string(),
+                    csv_records(10, 4),
+                ),
+            ],
+            channels: Some(json!([
+                channel(
+                    "train",
+                    &format!("s3://{BUCKET}/stages/two/train.csv"),
+                    "S3Prefix"
+                ),
+                channel(
+                    "validation",
+                    &format!("s3://{BUCKET}/stages/two/validation/"),
+                    "S3Prefix"
+                ),
+            ])),
+            stages: &WITH_DOWNLOAD,
+        },
+        Row {
+            case: "no channel at all, so nothing to bring down",
+            job: "stages-no-channel",
+            objects: Vec::new(),
+            channels: None,
+            stages: &WITHOUT_DOWNLOAD,
+        },
+    ];
+
+    for row in rows {
+        let case = row.case;
+        for (key, body) in &row.objects {
+            emulator.given_object(BUCKET, key, body).await;
+        }
+        let output = format!("s3://{BUCKET}/stage-output/{}/", row.job);
+        let mut body = training_body(
+            row.job,
+            &role,
+            row.channels.clone().unwrap_or_else(|| json!([])),
+            &output,
+        );
+        if row.channels.is_none() {
+            body.as_object_mut()
+                .expect("the request body is an object")
+                .remove("InputDataConfig");
+        }
+        emulator.sagemaker_ok("CreateTrainingJob", &body).await;
+
+        // The first read a caller can make: whatever the run had to do before the create could
+        // answer, the job is still running and has not reached the upload.
+        let accepted = describe(&emulator, row.job).await;
+        let first = str_field(&accepted, "SecondaryStatus");
+        assert_eq!(
+            (
+                str_field(&accepted, "TrainingJobStatus"),
+                PRE_UPLOAD.contains(&first.as_str()),
+            ),
+            ("InProgress".to_string(), true),
+            "case {case:?}: expected the first read to find the job InProgress in one of \
+             {PRE_UPLOAD:?}, got {accepted}"
+        );
+
+        // Polled to the terminal status, correlating what the job reports with what the output
+        // location holds: the artifact belongs to the stage that uploads it, so a poll that
+        // reports a pre-upload stage must not find the object there.
+        let artifact = artifact_key(&output, row.job);
+        let deadline = Instant::now() + SETTLE_DEADLINE;
+        let mut observed: Vec<String> = vec![first];
+        let settled = loop {
+            let described = describe(&emulator, row.job).await;
+            let secondary = str_field(&described, "SecondaryStatus");
+            if observed.last() != Some(&secondary) {
+                observed.push(secondary.clone());
+            }
+            if PRE_UPLOAD.contains(&secondary.as_str())
+                && emulator.object_bytes(BUCKET, &artifact).await.is_some()
+            {
+                // The stage may have fallen due between the describe above and the listing, so
+                // the job is read again: an object beside a job a FRESH read still reports in a
+                // pre-upload stage is one that appeared too early.
+                let again = describe(&emulator, row.job).await;
+                let still = str_field(&again, "SecondaryStatus");
+                assert!(
+                    !PRE_UPLOAD.contains(&still.as_str()),
+                    "case {case:?}: the artifact {artifact} appeared while the job was still in \
+                     the pre-upload stage {still:?}, got {again}"
+                );
+            }
+            if TERMINAL.contains(&str_field(&described, "TrainingJobStatus").as_str()) {
+                break described;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "case {case:?}: the job must reach a terminal status, last read {described}, \
+                 having been in {observed:?}"
+            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+        };
+        assert_eq!(
+            (
+                str_field(&settled, "TrainingJobStatus"),
+                str_field(&settled, "SecondaryStatus"),
+            ),
+            ("Completed".to_string(), "Completed".to_string()),
+            "case {case:?}: expected the job to complete, got {settled}, having been in \
+             {observed:?}"
+        );
+        // And the artifact the completed job names is an object Amazon S3 holds: the stage
+        // that uploads it is over.
+        assert!(
+            emulator.object_bytes(BUCKET, &artifact).await.is_some(),
+            "case {case:?}: expected {artifact} to name an object Amazon S3 holds once the job \
+             completed, got {settled}"
+        );
+        // Every status observed — the first read's included — belongs to this job's own work,
+        // and at least one of them is a stage the RUN performs rather than the one the create
+        // accepted the job in.
+        assert!(
+            observed
+                .iter()
+                .any(|status| IN_PROGRESS_STAGES.contains(&status.as_str())),
+            "case {case:?}: expected a poller to observe a stage of the work in progress, \
+             having been in {observed:?}"
+        );
+        assert!(
+            observed
+                .iter()
+                .all(|status| row.stages.contains(&status.as_str()) || status == "Completed"),
+            "case {case:?}: expected every observation to be a stage of this job's work {:?}, \
+             having been in {observed:?}",
+            row.stages
+        );
+
+        // The history names the stage the job was accepted in, every stage its run went
+        // through and the status it ended in, in that order, each beginning after the one
+        // before it — and the first of them when the job was created.
+        let transitions = history(&settled, case);
+        let expected: Vec<String> = row
+            .stages
+            .iter()
+            .map(|stage| (*stage).to_string())
+            .chain(["Completed".to_string()])
+            .collect();
+        assert_eq!(
+            transitions
+                .iter()
+                .map(|(status, ..)| status.clone())
+                .collect::<Vec<_>>(),
+            expected,
+            "case {case:?}: expected the history to name every stage of the work, got {settled}"
+        );
+        let created_at = settled
+            .get("CreationTime")
+            .and_then(Value::as_f64)
+            .unwrap_or_else(|| panic!("case {case:?}: expected a CreationTime in {settled}"));
+        assert_eq!(
+            transitions.first().map(|(_, start, ..)| *start),
+            Some(created_at),
+            "case {case:?}: the job was accepted in its first stage, so that entry begins when \
+             the job was created, got {settled}"
+        );
+        for (index, pair) in transitions.windows(2).enumerate() {
+            assert!(
+                pair[1].1 > pair[0].1,
+                "case {case:?}: entry {index} ({:?}) must begin before the next one ({:?}), \
+                 got {settled}",
+                pair[0].0,
+                pair[1].0
             );
         }
     }

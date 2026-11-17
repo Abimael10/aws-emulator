@@ -281,6 +281,16 @@ pub fn s3_client(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
 ) -> ::aws_sdk_s3::Client {
+    s3_client_through(ctx.callback(), region)
+}
+
+/// The same client for code with no request of its own: a task a create armed for the instant
+/// a stage of a job's work falls due is handed a clone of the callback rather than a context,
+/// and reaches Amazon S3 through exactly the hop [`s3_client`] configures.
+pub fn s3_client_through(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    region: &str,
+) -> ::aws_sdk_s3::Client {
     let region = ::service_common::arn::region_label(region).unwrap_or(DEFAULT_REGION);
     let config = ::aws_sdk_s3::Config::builder()
         .behavior_version(::aws_sdk_s3::config::BehaviorVersion::latest())
@@ -289,8 +299,8 @@ pub fn s3_client(
         // The emulator serves one endpoint for every service, so the bucket travels in the
         // path rather than in a per-bucket host the router could not resolve.
         .force_path_style(true)
-        .credentials_provider(ctx.callback().aws_credentials_provider())
-        .http_client(ctx.callback().http_client())
+        .credentials_provider(callback.aws_credentials_provider())
+        .http_client(callback.http_client())
         .retry_config(::aws_sdk_s3::config::retry::RetryConfig::disabled())
         .timeout_config(::aws_sdk_s3::config::timeout::TimeoutConfig::disabled())
         .identity_cache(::aws_sdk_s3::config::IdentityCache::no_cache())

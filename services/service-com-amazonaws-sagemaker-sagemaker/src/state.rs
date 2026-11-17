@@ -162,8 +162,9 @@ pub use admission::{
 /// Re-exported below, so a handler names them as `crate::state::…` like every other slice.
 pub mod s3_access;
 pub use s3_access::{
-    arn_partition, first_unreadable_location, s3_client, S3Location, UnreadableLocation,
-    DEFAULT_PARTITION, GET_OBJECT_ACTION, LIST_BUCKET_ACTION, PUT_OBJECT_ACTION,
+    arn_partition, first_unreadable_location, s3_client, s3_client_through, S3Location,
+    UnreadableLocation, DEFAULT_PARTITION, GET_OBJECT_ACTION, LIST_BUCKET_ACTION,
+    PUT_OBJECT_ACTION,
 };
 
 /// The CONTAINER IMAGE slice: the one reading of a container image path a request names, and
@@ -1119,6 +1120,11 @@ pub use jobs::*;
 /// it fits, the artifact it writes and the metrics it measures: see `state/training_run.rs`.
 pub mod training_run;
 pub use training_run::*;
+
+/// The PUBLICATION of what a training run produced — the model artifact it built and the
+/// stage of the work at which it appears in Amazon S3: see `state/training_artifact.rs`.
+pub mod training_artifact;
+pub use training_artifact::*;
 
 /// The server-side RUN of an accepted Inference Recommender job — the endpoint it
 /// benchmarks, the traffic it sends and what it measured: see `state/recommendation_run.rs`.

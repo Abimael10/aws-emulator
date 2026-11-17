@@ -10,8 +10,10 @@
 //! `ModelArtifacts.S3ModelArtifacts`, its start instant, its training and billable time and
 //! the metrics it measured — are reported from the record the run wrote (see
 //! `create_training_job.rs` and [`crate::state::run_training_job`]); a run that has not
-//! reported yet has none of them. The debugger and profiler rule evaluations stay absent:
-//! no rule container is evaluated against the run.
+//! reported yet has none of them. This read also makes the appearance of the artifact the
+//! clock has already made due ([`crate::state::publish_due_artifact`]) — the stage that
+//! uploads it — so the object is there for the read that reports that stage. The debugger and
+//! profiler rule evaluations stay absent: no rule container is evaluated against the run.
 //!
 //! Beside the modelled members, the response carries the ones the recorded service answers
 //! that this service's on-disk model does not declare — the job's `DisableEFA`, each input
@@ -309,6 +311,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // Before the job is read: the appearance of the artifact its run produced, when the
+        // stage of the work that uploads it is already due. The object was owed at this
+        // instant whether or not anybody described the job, so writing it changes nothing a
+        // caller could not have observed by waiting — and it is what makes the artifact
+        // present for the read that reports that stage. A job with nothing held, or whose
+        // stage is not due yet, is left exactly as it was found.
+        crate::state::publish_due_artifact(
+            &*self.engine,
+            ctx.callback(),
+            &crate::state::request_region(ctx),
+            ::std::time::SystemTime::now(),
+            &input.training_job_name,
+        )
+        .await;
 
         let mut store = state.lock();
         let Some(job) = store.training_jobs.get_mut(&input.training_job_name) else {

@@ -217,30 +217,26 @@ impl AutoMLJobV2 {
 
     /// Record what the job's RUN reported, `at` the instant it reported.
     ///
-    /// The clock owes the job its terminal status [`AUTO_ML_JOB_TERMINAL_AFTER`] after the
-    /// create — but it cannot owe it before the work is over, so a run that took longer than
-    /// that span pushes the due instant out to the moment it reported. The status the clock
-    /// then materialises is always the one the run produced.
-    ///
-    /// The stages the run went through are laid out over the span the clock gives the work,
-    /// each owed [`AUTO_ML_JOB_PHASE_SPAN`] after the one before it, so the job enters them in
-    /// the order the run performed them and the terminal status falls due after the last of
-    /// them.
+    /// The stages the run went through and the terminal status that follows them are laid out
+    /// from the instant the run REPORTED ([`super::stage_due_after`]), each owed
+    /// [`AUTO_ML_JOB_PHASE_SPAN`] after the one before it: the run is performed inside the
+    /// create that accepted the job, so a schedule measured from the creation instant is
+    /// already spent by the time that create answers whenever the work took longer than one
+    /// span. Measured from the report, a caller that describes the job as soon as its create
+    /// answers observes `InProgress` with no stage begun, and one that keeps polling observes
+    /// each stage in the order the run performed them before the terminal status — however
+    /// long that work took. The status the clock then materialises is always the one the run
+    /// produced.
     pub fn record_run(&mut self, outcome: super::AutoMLRunOutcome, at: SystemTime) {
         if self.status == AUTO_ML_STATUS_IN_PROGRESS {
             let reached = outcome.phases().to_vec();
             for (index, status) in reached.iter().enumerate() {
                 self.phases.push(AutoMLPhase {
                     status: status.clone(),
-                    starts_at: self.creation_time
-                        + AUTO_ML_JOB_PHASE_SPAN
-                            .saturating_mul(u32::try_from(index + 1).unwrap_or(u32::MAX)),
+                    starts_at: super::stage_due_after(at, AUTO_ML_JOB_PHASE_SPAN, index),
                 });
             }
-            let scheduled = self.creation_time
-                + AUTO_ML_JOB_PHASE_SPAN
-                    .saturating_mul(u32::try_from(reached.len() + 1).unwrap_or(u32::MAX));
-            self.terminal_at = scheduled.max(at);
+            self.terminal_at = super::stage_due_after(at, AUTO_ML_JOB_PHASE_SPAN, reached.len());
         }
         self.run = Some(outcome);
     }

@@ -24,7 +24,7 @@
 //!
 //! The run is this emulator's own ([`crate::state::run_training_job`]): it reads the
 //! training data the request's channels name out of Amazon S3 under the execution role,
-//! fits a model on those records, writes the model artifact under
+//! fits a model on those records, builds the model artifact for
 //! `OutputDataConfig.S3OutputPath` and measures the error it reports. It is performed HERE,
 //! before this handler answers, and its outcome is RECORDED on the stored job rather than
 //! revealed: the terminal status is owed by the clock, which
@@ -33,11 +33,16 @@
 //! data or write its artifact leaves the job's modelled `Failed` status with the reason
 //! naming that condition — never a `Completed` status for a run that produced nothing.
 //!
-//! The stages of the work are revealed in the same way: the run records the `SecondaryStatus`
-//! phases it went through and the clock materialises them in order
-//! ([`crate::state::TrainingJob::settle_status`]), so a caller polling the job observes
-//! `Downloading`, `Training` and `Uploading` before the terminal status, and
-//! `SecondaryStatusTransitions` reports every stage the job was in. A job whose
+//! The stages of the work are revealed in the same way, laid out from the instant the run
+//! REPORTED ([`crate::state::TrainingJob::record_run`]) so none of them has gone by before
+//! this call answers: the run records the `SecondaryStatus` phases it went through and the
+//! clock materialises them in order ([`crate::state::TrainingJob::settle_status`]), so a
+//! caller polling the job observes `Downloading`, `Training` and `Uploading` before the
+//! terminal status, and `SecondaryStatusTransitions` reports every stage the job was in. The
+//! artifact the run built appears under the output location at the stage that UPLOADS it,
+//! which this call arms for the instant the clock owes it
+//! ([`crate::state::publish_when_due`]), so a client that polls `SecondaryStatus` to decide
+//! when the artifact exists never finds it before the job says so. A job whose
 //! `StoppingCondition.MaxRuntimeInSeconds` falls inside the span of its work is ended at that
 //! cap instead, with the `Stopped`/`MaxRuntimeExceeded` pair the model groups together.
 //!
@@ -657,6 +662,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::run_training_job(ctx, &region, &input.training_job_name, &input).await;
         recorder.report(outcome);
         drop(recorder);
+
+        // What the run produced appears in Amazon S3 at the stage of the work that uploads it
+        // ("Uploading - Training is complete and the model artifacts are being uploaded to the
+        // S3 location"), which the clock owes later than this call. A client that creates a
+        // job and then watches the output prefix never calls this service again, so that
+        // instant is armed here rather than left to a read that may never come; it claims the
+        // same held archive a read claims, so whichever gets there first writes it once.
+        let due_at = {
+            let store = state.lock();
+            store
+                .training_jobs
+                .get(&input.training_job_name)
+                .and_then(crate::state::TrainingJob::artifact_due_at)
+        };
+        if let Some(due_at) = due_at {
+            crate::state::publish_when_due(
+                ::std::sync::Arc::clone(&self.engine),
+                ctx.callback().clone(),
+                region.clone(),
+                input.training_job_name.clone(),
+                due_at,
+            );
+        }
 
         crate::state::record_state_change(Self::NAME, &arn, ctx);
         Ok(CreateTrainingJobOutput {

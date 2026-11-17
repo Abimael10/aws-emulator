@@ -807,7 +807,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .await;
             let reported_at = ::std::time::SystemTime::now();
-            let ends_at = {
+            let (ends_at, artifact_due_at) = {
                 let mut store = state.lock();
                 match store
                     .training_jobs
@@ -815,11 +815,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 {
                     Some(job) => {
                         job.record_run(outcome.clone(), reported_at);
-                        job.ends_at
+                        (job.ends_at, job.artifact_due_at())
                     }
-                    None => reported_at,
+                    None => (reported_at, None),
                 }
             };
+            // A launched job's artifact appears at the stage of its work that uploads it, the
+            // same way a caller's own job's does, so that instant is armed for each child
+            // rather than left to a read of it that may never come
+            // (`crate::state::publish_when_due`).
+            if let Some(due_at) = artifact_due_at {
+                crate::state::publish_when_due(
+                    ::std::sync::Arc::clone(&self.engine),
+                    ctx.callback().clone(),
+                    region.clone(),
+                    child.request.training_job_name.clone(),
+                    due_at,
+                );
+            }
             children_end = children_end.max(ends_at);
             summaries.push(crate::state::child_summary(
                 child,

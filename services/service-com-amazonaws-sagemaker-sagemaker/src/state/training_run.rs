@@ -25,12 +25,13 @@
 //! * a least-squares LINEAR model is fitted on them by batch gradient descent, bounded by
 //!   [`MAX_FIT_OPERATIONS`]: every number the run reports is measured from the caller's
 //!   data;
-//! * the fitted model is serialized and written as the gzip-compressed tar `model.tar.gz`
-//!   ("a SageMaker container stores your trained model artifacts in the /opt/ml/model
-//!   directory. After training has completed, by default, these artifacts are uploaded to
-//!   your Amazon S3 bucket as compressed files" — `ModelArtifacts`) under
-//!   `<S3OutputPath>/<TrainingJobName>/output/`, so the object the describe names is an
-//!   object Amazon S3 itself holds;
+//! * the fitted model is serialized as the gzip-compressed tar `model.tar.gz` ("a SageMaker
+//!   container stores your trained model artifacts in the /opt/ml/model directory. After
+//!   training has completed, by default, these artifacts are uploaded to your Amazon S3
+//!   bucket as compressed files" — `ModelArtifacts`), to be PUBLISHED under
+//!   `<S3OutputPath>/<TrainingJobName>/output/` at the stage of the work that uploads it
+//!   ([`super::training_artifact`]), so the object the describe names is an object Amazon S3
+//!   itself holds from that stage on;
 //! * the root-mean-square error of the fitted model is measured over each channel and
 //!   reported as the run's final metrics.
 //!
@@ -60,10 +61,13 @@
 //! that holds no record of the form above leaves a run that still fits, writes its artifact
 //! and completes, with how many rows held no record reported in that artifact.
 //!
-//! The stages of the work are reported as they happen: the run records the `SecondaryStatus`
-//! phases it got through ([`TrainingRunOutcome::phases`]) and the clock reveals them in order
-//! ([`super::TrainingJob::settle_status`]), so a caller polling the job sees the data come
-//! down, the fit run and the artifact go up before the terminal status.
+//! The stages of the work are reported in the order the run got through them: the run records
+//! the `SecondaryStatus` phases it reached ([`TrainingRunOutcome::phases`]) and the clock
+//! reveals them from the instant the run reported ([`super::TrainingJob::record_run`],
+//! [`super::TrainingJob::settle_status`]), so a caller polling the job sees the data come
+//! down, the fit run and the artifact go up before the terminal status \u2014 and the artifact
+//! appears in Amazon S3 at the stage that uploads it and not before
+//! ([`super::training_artifact`]).
 //!
 //! # The job runs AS the execution role
 //!
@@ -156,6 +160,11 @@ pub enum TrainingRunOutcome {
         /// The stages of its work the run GOT THROUGH, in the order it did (see
         /// [`TrainingRunOutcome::phases`]).
         phases: Vec<String>,
+        /// The archive the run built, waiting for the stage of the work that PUBLISHES it
+        /// (see [`super::training_artifact`]). Taken out of the outcome by the record that
+        /// holds it ([`super::TrainingJob::record_run`]), so an outcome stored on a job
+        /// carries none and nothing holds the bytes twice.
+        artifact: Option<super::PendingArtifact>,
     },
     /// The run did not finish, and this is the condition that stopped it — the job's
     /// `FailureReason`.
@@ -588,16 +597,19 @@ pub async fn run_training_job(
             model_upload_failed(&artifact.uri(), &access_denied_detail()),
         );
     }
-    if let Err(detail) = write_object(&client, &artifact, archive).await {
-        return TrainingRunOutcome::failed_in(
-            phases,
-            model_upload_failed(&artifact.uri(), &detail),
-        );
-    }
+    // The archive is PRODUCED here and PUBLISHED at the stage that uploads it, which the
+    // clock owes later than this call ([`super::training_artifact`]): the upload leg is a
+    // leg of the run, and the object it leaves must not be readable before the job reports
+    // that stage. A write Amazon S3 then refuses fails the job the same way a write refused
+    // here would.
     TrainingRunOutcome::Completed {
         model_artifacts: artifact.uri(),
         final_metrics,
         phases,
+        artifact: Some(super::PendingArtifact {
+            location: artifact,
+            archive,
+        }),
     }
 }
 
