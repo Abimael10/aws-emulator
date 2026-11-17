@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSchemas
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSchemas`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSchemas::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the schemas of one database of a data warehouse, out of that
+//! database's OWN catalogue of schemas: the one it holds from the moment it
+//! exists, the ones its statements created and the external ones they bound,
+//! narrowed by the `SchemaPattern` wild cards and paged with an opaque
+//! `NextToken`. A reporting operation — it reads the catalogue of a database the
+//! warehouse already holds and writes nothing, not even the database itself.
 //!
 //! ## Shape of an operation
 //!
@@ -127,6 +124,15 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{
+    decode_cursor, encode_cursor, non_empty, BadConnection, ConnectionRequest, TargetSelectors,
+    ABSENT_ENDPOINT_MESSAGE, CURSOR_SCHEMAS, DEFAULT_PAGE_SIZE, INVALID_TOKEN_MESSAGE,
+};
+
+/// The compute-target selectors THIS operation accepts: its input shape models
+/// `ClusterIdentifier` and `WorkgroupName` and no other selector, so its
+/// target-selection refusal names those two alone.
+const SELECTORS: TargetSelectors = TargetSelectors::Warehouse;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -200,18 +206,174 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSchemas` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSchemasErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSchemas"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListSchemasErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Redshift Data API state store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // The same connection combinations every operation of this service
+        // documents: one data warehouse, one database, one authorization
+        // method. `Database` is "the name of the database that contains the
+        // schemas to list", so it is the database whose catalogue is read;
+        // `ConnectedDatabase` names the one the credentials connect to, which
+        // this emulator does not need to tell apart because a statement reaches
+        // exactly the database it names.
+        let requested = ConnectionRequest {
+            cluster_identifier: input.cluster_identifier.as_ref(),
+            workgroup_name: input.workgroup_name.as_ref(),
+            session_id: None,
+            database: Some(&input.database),
+            db_user: input.db_user.as_ref(),
+            secret_arn: input.secret_arn.as_ref(),
+        };
+        let connection = match requested.resolve() {
+            // Every other combination — both warehouses, neither of them, no
+            // database, two authorization methods — is a malformed request.
+            // WHAT the request named is resolved before HOW MANY it named is
+            // judged: a request whose every named warehouse is absent from the
+            // Region it was signed for has no catalogue to read whichever of
+            // them it meant, so it is answered as naming no endpoint rather
+            // than as an ambiguous selection. This operation models no session
+            // selector, so no session can carry an endpoint for it.
+            Err(problem) => {
+                if problem == BadConnection::SeveralTargets
+                    && crate::state::warehouse::names_only_absent_targets(ctx, requested, false)
+                        .await
+                {
+                    return Err(validation(ABSENT_ENDPOINT_MESSAGE));
+                }
+                return Err(validation(&problem.message(SELECTORS)));
+            }
+            Ok(connection) => connection,
+        };
+
+        // A schema lives in a database of a data warehouse, so the target this
+        // request named is resolved against the service that owns it before its
+        // catalogue is read: a cluster or workgroup that does not exist in this
+        // Region has no catalogue to list. A target the owner could not be
+        // asked about is UNDECIDED, and is read rather than refused.
+        let facts = crate::state::warehouse::describe_target(ctx, &connection.target).await;
+        if facts.resolution == crate::state::warehouse::TargetResolution::Absent {
+            return Err(validation(ABSENT_ENDPOINT_MESSAGE));
+        }
+
+        let schema_pattern = non_empty(input.schema_pattern.as_ref());
+
+        // The cursor is an offset into the filtered listing, and its kind names
+        // the warehouse, the database and the pattern the page was issued for,
+        // so a token minted while paging one listing is refused for any other
+        // rather than silently resolving to the same offset in a different one.
+        let cursor_kind = format!(
+            "{CURSOR_SCHEMAS}:{}:{}:{}",
+            connection.target.key(),
+            connection.database,
+            schema_pattern.as_deref().unwrap_or_default()
+        );
+        let offset = match input.next_token.as_deref() {
+            None => 0_usize,
+            Some(token) => match decode_cursor(&cursor_kind, token)
+                .and_then(|position| usize::try_from(position).ok())
+            {
+                Some(offset) => offset,
+                None => return Err(validation(INVALID_TOKEN_MESSAGE)),
+            },
+        };
+
+        // A reporting operation must not OPEN a database, or a later caller
+        // would find one this read had created — so the catalogue is read from
+        // the database this emulator already holds. Only a database the
+        // warehouse does not hold at all is the missing resource the refusal
+        // names.
+        let handle = state
+            .lock()
+            .open_database(&connection.target, &connection.database);
+        if handle.is_none() && !facts.provisions_database(&connection.database) {
+            return Err(ListSchemasErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Database does not exist: {}", connection.database),
+                    resource_id: connection.database.clone(),
+                },
+            )
+            .into());
+        }
+
+        let schemas = match handle {
+            // A database of the warehouse no statement has opened yet holds the
+            // schema every Redshift database has from the moment it exists.
+            None => crate::state::unopened_schemas(schema_pattern.as_deref()),
+            // The catalogue of an open database is read on the blocking pool,
+            // because the lock guarding it is held for a whole execution:
+            // bounded exactly as a catalog read is, so a read queued behind a
+            // slow statement cannot pin this request.
+            Some(handle) => {
+                let budget = crate::state::CATALOG_REQUEST_BUDGET;
+                let pattern = schema_pattern.clone();
+                let joined = tokio::time::timeout(
+                    budget,
+                    tokio::task::spawn_blocking(move || {
+                        crate::state::schemas_on(&handle, pattern.as_deref())
+                    }),
+                )
+                .await;
+                match joined {
+                    Ok(Ok(schemas)) => schemas,
+                    // The database did not answer while another execution held
+                    // it, which is the same timeout a catalog read reports.
+                    Err(_elapsed) => {
+                        return Err(ListSchemasErrorModeled::QueryTimeoutException(
+                            QueryTimeoutException {
+                                message: Some(format!(
+                                    "the database's catalog did not answer within {} seconds",
+                                    budget.as_secs()
+                                )),
+                            },
+                        )
+                        .into())
+                    }
+                    Ok(Err(_panicked)) => {
+                        return Err(ListSchemasErrorModeled::InternalServerException(
+                            InternalServerException {
+                                message: "the SQL engine did not answer for this database's catalog"
+                                    .to_string(),
+                            },
+                        )
+                        .into())
+                    }
+                }
+            }
+        };
+
+        if offset > schemas.len() {
+            return Err(validation(INVALID_TOKEN_MESSAGE));
+        }
+        // `MaxResults` is modelled with a default of 0, which names no page
+        // size; the page then holds as much as the modelled maximum allows.
+        let page_size = usize::try_from(input.max_results)
+            .ok()
+            .filter(|size| *size > 0)
+            .unwrap_or(DEFAULT_PAGE_SIZE);
+        let end = offset.saturating_add(page_size).min(schemas.len());
+
+        Ok(ListSchemasOutput {
+            schemas: Some(schemas[offset..end].to_vec()),
+            // A token only when schemas remain past this page, pointing at the
+            // first of them so the next page resumes exactly where this one
+            // stopped.
+            next_token: (end < schemas.len())
+                .then(|| encode_cursor(&cursor_kind, u64::try_from(end).unwrap_or(u64::MAX))),
+        })
     }
+}
+
+/// Refuse the request as invalid, with the `ValidationException` this operation
+/// models.
+fn validation(message: &str) -> ListSchemasError {
+    ListSchemasErrorModeled::ValidationException(ValidationException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }

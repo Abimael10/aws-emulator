@@ -128,8 +128,12 @@ mod column_metadata;
 /// Where a statement's result columns come from, read from its own text and
 /// from the definitions the engine's catalog holds.
 mod column_origins;
+/// The schemas one database holds — its own catalogue, which `ListSchemas`
+/// reports.
+mod schema_catalogue;
 pub use column_metadata::*;
 pub use connections::*;
+pub use schema_catalogue::*;
 
 /// Page size `ListStatements` uses when the request leaves `MaxResults` at its
 /// modelled default of 0 — the modelled maximum, so an unparameterised call
@@ -2902,6 +2906,8 @@ pub const CURSOR_COLUMNS: &str = "columns";
 pub const CURSOR_DATABASES: &str = "databases";
 /// Cursor kind naming an offset into the tables of one database.
 pub const CURSOR_TABLES: &str = "tables";
+/// Cursor kind naming an offset into the schemas of one database.
+pub const CURSOR_SCHEMAS: &str = "schemas";
 
 /// Where the page of a statement's result that starts at `offset` ends.
 ///

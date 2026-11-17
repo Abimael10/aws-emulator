@@ -2114,21 +2114,7 @@ async fn the_number_of_open_databases_is_bounded() {
 // Operations that are still scaffolded
 // ---------------------------------------------------------------------------
 
-/// The operations this slice does not implement still answer 501, so a client
-/// can tell "not written yet" from an empty success.
-#[tokio::test]
-async fn the_operations_outside_this_slice_still_answer_not_implemented() {
-    let emulator = Emulator::new();
-    let cases: [(&str, Value); 1] = [(
-        "ListSchemas",
-        json!({"ClusterIdentifier": "my-cluster", "Database": "dev"}),
-    )];
-
-    for (operation, request) in &cases {
-        let (status, response) = emulator.call(operation, request).await;
-        assert_eq!(
-            status, 501,
-            "case {operation}: expected 501 NotImplemented, got {status} {response}"
-        );
-    }
-}
+// Every operation of this service now has a handler, so there is no operation
+// left for this section to point at: a 501 is "nobody has written it yet", and
+// nothing of this service is unwritten. The census itself lives in the handlers
+// (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`).

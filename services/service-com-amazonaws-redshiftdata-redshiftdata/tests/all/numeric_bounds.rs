@@ -65,10 +65,7 @@ struct Bounded {
 /// values below are `i32`'s extremes.
 ///
 /// `GetStatementResultV2` reads the CSV form of a result, so the statement it is
-/// driven with is one submitted in that format; `ListSchemas` is the one
-/// operation of this service that still answers `501`, and its bound is checked
-/// before its handler is reached, so it carries `served: false` rather than
-/// being left out.
+/// driven with is one submitted in that format.
 const BOUNDED: [Bounded; 13] = [
     Bounded {
         operation: "ExecuteStatement",
@@ -164,7 +161,7 @@ const BOUNDED: [Bounded; 13] = [
         path: "maxResults",
         min: 0,
         max: 1000,
-        served: false,
+        served: true,
     },
     Bounded {
         operation: "ListTables",
