@@ -26,7 +26,9 @@
 //! The action performed today is `kinesis`, "write data to an Amazon Kinesis stream", over
 //! the emulator's own in-process transport
 //! ([`::service_common::kinesis_client`] — no socket, and no part of the action is a
-//! destination), and `http`, "send data to an HTTPS endpoint", whose endpoint is a TOPIC RULE
+//! destination), `sqs`, "publish data to an Amazon SQS queue", over that same transport
+//! ([`::service_common::sqs_client`]), and `http`, "send data to an HTTPS endpoint", whose
+//! endpoint is a TOPIC RULE
 //! DESTINATION: the message is POSTed to the action's `url` only while a destination that
 //! admits that URL is `ENABLED` ([`super::topic_rule_destinations::http_action_is_allowed`]),
 //! and nothing is sent otherwise — "the destination must be confirmed prior to use"
@@ -37,20 +39,23 @@
 //! approximated.
 //!
 //! Every call an action makes goes over the emulator's own IN-PROCESS transport — the
-//! Kinesis client's and the `http` action's alike — so a stream name or a URL a caller
-//! configured reaches only what this emulator serves itself: no socket is opened and no name
-//! is resolved.
+//! Kinesis client's, the Amazon SQS client's and the `http` action's alike — so a stream name,
+//! a queue URL or an endpoint URL a caller configured reaches only what this emulator serves
+//! itself: no socket is opened and no name is resolved.
 
 use super::rule_action_role::{role_bars_action, IamState};
 use super::rule_sql::{selected_message, Selected};
 use super::topic_rule_destinations::{http_action_is_allowed, http_action_unperformable};
-use crate::ops::types::{Action, HttpAction, KinesisAction};
+use crate::ops::types::{Action, HttpAction, KinesisAction, SqsAction};
 
 /// The service principal the rules engine acts as: the one an action's role must trust.
 pub const SERVICE_PRINCIPAL: &str = "iot.amazonaws.com";
 
 /// The IAM action a `kinesis` rule action performs on the stream it names.
 pub const KINESIS_PUT_RECORD_ACTION: &str = "kinesis:PutRecord";
+
+/// The IAM action an `sqs` rule action performs on the queue it names.
+pub const SQS_SEND_MESSAGE_ACTION: &str = "sqs:SendMessage";
 
 /// Amazon Kinesis's ARN namespace and the resource type of a data stream:
 /// `arn:aws:kinesis:<region>:<account>:stream/<streamName>`, the resource an action's role is
@@ -166,6 +171,9 @@ enum Performed<'a> {
     /// `Action$kinesis`: one [`KINESIS_PUT_RECORD_ACTION`] of the selected message onto the
     /// stream the action names, under its partition key.
     Kinesis(&'a KinesisAction),
+    /// `Action$sqs`: one [`SQS_SEND_MESSAGE_ACTION`] of the selected message to the queue the
+    /// action's `queueUrl` addresses.
+    Sqs(&'a SqsAction),
     /// `Action$http`: one POST of the selected message to the endpoint URL the action names,
     /// made only while a topic rule destination admits that URL.
     Http(&'a HttpAction),
@@ -181,6 +189,7 @@ impl<'a> Performed<'a> {
             .kinesis
             .as_ref()
             .map(Performed::Kinesis)
+            .or_else(|| action.sqs.as_ref().map(Performed::Sqs))
             .or_else(|| action.http.as_ref().map(Performed::Http))
     }
 
@@ -198,6 +207,7 @@ impl<'a> Performed<'a> {
             Self::Kinesis(action) => {
                 put_record(ctx, region, iam, rule_name, action, message).await
             }
+            Self::Sqs(action) => send_message(ctx, region, iam, rule_name, action, message).await,
             Self::Http(action) => post_to_endpoint(ctx, state, rule_name, action, message).await,
         }
     }
@@ -351,6 +361,84 @@ fn partition_key(action: &KinesisAction) -> Option<String> {
         Some(key) if key.contains(SUBSTITUTION_TEMPLATE_OPENING) || key.is_empty() => None,
         Some(key) => Some(key.to_string()),
         None => Some(super::fresh_uuid()),
+    }
+}
+
+/// Send one Amazon SQS message for the selected message, under the action's role: the body is
+/// the message the statement selected, and the queue is the one the action's `queueUrl`
+/// addresses — reached through the shared in-process client, so the send never leaves this
+/// process.
+///
+/// "Specifies whether to use Base64 encoding" (`SqsAction$useBase64`): with it set the body is
+/// the base64 of the selected message, and otherwise the message's own bytes as the text of a
+/// queue message — which is what an action leaving the member out sends.
+///
+/// Nothing is sent when the role bars the call, and nothing when Amazon SQS refuses the message
+/// (a queue the account does not hold, a body its own quota refuses) — that refusal is the
+/// target service's answer about its own state, which AWS does not surface to the publisher
+/// either.
+async fn send_message(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    iam: Option<&::engine::ServiceState<IamState>>,
+    rule_name: &str,
+    action: &SqsAction,
+    message: &[u8],
+) {
+    if action.queue_url.contains(SUBSTITUTION_TEMPLATE_OPENING) {
+        ::tracing::debug!(
+            rule = %rule_name,
+            "an sqs rule action's queueUrl is not one this emulator's rules engine renders \
+             as the queue the action means, so no message was sent"
+        );
+        return;
+    }
+    // The resource the role is granted the send on: the queue the action's URL addresses.
+    let Some(queue_arn) = ::service_common::sqs_client::queue_arn_of_url(region, &action.queue_url)
+    else {
+        ::tracing::debug!(
+            rule = %rule_name,
+            "an sqs rule action's queueUrl addresses no queue, so no message was sent"
+        );
+        return;
+    };
+    // The verdict is read under the IAM guard and the guard is released before the send: no
+    // lock is held across an await.
+    let barred = iam.is_some_and(|iam| {
+        role_bars_action(
+            &iam.lock(),
+            &action.role_arn,
+            SERVICE_PRINCIPAL,
+            SQS_SEND_MESSAGE_ACTION,
+            &queue_arn,
+        )
+    });
+    if barred {
+        ::tracing::debug!(
+            rule = %rule_name,
+            "an sqs rule action's role does not grant the queue send, so no message was sent"
+        );
+        return;
+    }
+    let body = if action.use_base64.unwrap_or(false) {
+        use ::base64::Engine as _;
+
+        ::base64::engine::general_purpose::STANDARD.encode(message)
+    } else {
+        String::from_utf8_lossy(message).into_owned()
+    };
+    let sent = ::service_common::sqs_client::sqs_client(ctx, region)
+        .send_message()
+        .queue_url(&action.queue_url)
+        .message_body(body)
+        .send()
+        .await;
+    if let Err(error) = sent {
+        ::tracing::warn!(
+            rule = %rule_name,
+            error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+            "an sqs rule action's message was not sent"
+        );
     }
 }
 

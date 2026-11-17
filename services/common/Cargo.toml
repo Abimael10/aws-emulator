@@ -60,6 +60,10 @@ aws-sdk-xray = { version = "1", default-features = false }
 # needed — the emulator supplies the transport, so the SDK's own HTTPS stack and runtime
 # are left out and the client can reach nothing off this process.
 aws-sdk-kinesis = { version = "1", default-features = false }
+# `sqs_client`: the in-process Amazon SQS client a service DELIVERING a message sends through,
+# built once here for the same reason and with the same features left out, so it too can reach
+# nothing off this process.
+aws-sdk-sqs = { version = "1", default-features = false }
 # `firehose_client`: the in-process Amazon Data Firehose client a service REACHING a delivery
 # stream a client named drives — resolving whether that stream exists before a destination
 # naming it is stored among them — built once here for every such service, with the same

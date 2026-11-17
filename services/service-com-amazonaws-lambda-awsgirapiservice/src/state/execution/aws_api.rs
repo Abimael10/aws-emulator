@@ -1003,6 +1003,40 @@ pub const APIS: &[Api] = &[
         protocol: Protocol::RestJson(&IOT),
         answer_model: Some(&IOT_ANSWERS),
     },
+    // `services/service-com-amazonaws-iotdataplane-iotmoonrakerservice/smithy-model/
+    // com-amazonaws-iotdataplane-iotmoonrakerservice.json`: restJson1, sigv4Name `iotdata`,
+    // endpointPrefix `data-ats.iot`, sdkId `IoT Data Plane`. Its requests are bound per
+    // operation out of that same model ([`IOT_DATA`]).
+    //
+    // The device DATA plane is the other half of the registry above, and it is the half a
+    // function acts through: the endpoint the control plane answers `DescribeEndpoint` with is
+    // the one a handler then builds this client for, to publish a message to a topic
+    // (`Publish`) or to read and write a thing's reported and desired state
+    // (`GetThingShadow`, `UpdateThingShadow`). So a handler that cannot reach this service can
+    // learn where the data plane answers and then do nothing with it: the message is never
+    // published and the shadow never moves.
+    //
+    // This is the token a Python client is built with (`boto3.client("iot-data")`); the
+    // JavaScript SDK's own spelling of the same id is the entry below.
+    Api {
+        sdk_token: "iot-data",
+        signing_name: "iotdata",
+        endpoint_prefix: "data-ats.iot",
+        model: Some(IOT_DATA_MODEL),
+        protocol: Protocol::RestJson(&IOT_DATA),
+        answer_model: Some(&IOT_DATA_ANSWERS),
+    },
+    // The same service under the token its own SDK id gives it, which is the name the
+    // JavaScript SDK publishes that service's client package under
+    // (`@aws-sdk/client-iot-data-plane`).
+    Api {
+        sdk_token: "iot-data-plane",
+        signing_name: "iotdata",
+        endpoint_prefix: "data-ats.iot",
+        model: Some(IOT_DATA_MODEL),
+        protocol: Protocol::RestJson(&IOT_DATA),
+        answer_model: Some(&IOT_DATA_ANSWERS),
+    },
     // `services/service-com-amazonaws-transfer-transferservice/smithy-model/
     // com-amazonaws-transfer-transferservice.json`: awsJson1_1, sigv4Name `transfer`,
     // endpointPrefix `transfer`, sdkId `Transfer`, service shape `TransferService`.
@@ -1217,6 +1251,10 @@ pub(super) const IOT_MODEL: &str = include_str!(
     "../../../../service-com-amazonaws-iot-awsiotservice/smithy-model/\
      com-amazonaws-iot-awsiotservice.json"
 );
+pub(super) const IOT_DATA_MODEL: &str = include_str!(
+    "../../../../service-com-amazonaws-iotdataplane-iotmoonrakerservice/smithy-model/\
+     com-amazonaws-iotdataplane-iotmoonrakerservice.json"
+);
 pub(super) const TRANSFER_MODEL: &str = include_str!(
     "../../../../service-com-amazonaws-transfer-transferservice/smithy-model/\
      com-amazonaws-transfer-transferservice.json"
@@ -1381,6 +1419,10 @@ static IOT_ANSWERS: super::blob_members::ServiceModel = super::blob_members::Ser
     source: IOT_MODEL,
     plan: ::std::sync::OnceLock::new(),
 };
+static IOT_DATA_ANSWERS: super::blob_members::ServiceModel = super::blob_members::ServiceModel {
+    source: IOT_DATA_MODEL,
+    plan: ::std::sync::OnceLock::new(),
+};
 static TRANSFER: super::blob_members::ServiceModel = super::blob_members::ServiceModel {
     source: TRANSFER_MODEL,
     plan: ::std::sync::OnceLock::new(),
@@ -1494,6 +1536,13 @@ static APPCONFIG: super::rest_json::RestApi = super::rest_json::RestApi {
 static IOT: super::rest_json::RestApi = super::rest_json::RestApi {
     model: IOT_MODEL,
     namespace: "com.amazonaws.iot",
+    parsed: ::std::sync::OnceLock::new(),
+};
+
+/// AWS IoT's DATA plane's own model, embedded the same way and for the same reason.
+static IOT_DATA: super::rest_json::RestApi = super::rest_json::RestApi {
+    model: IOT_DATA_MODEL,
+    namespace: "com.amazonaws.iotdataplane",
     parsed: ::std::sync::OnceLock::new(),
 };
 
@@ -2464,6 +2513,7 @@ mod tests {
                 "cognitoidentityprovider",
                 true,
             ),
+            ("IoT Data Plane", "iot-data", "iotdata", true),
             // The one question asked out of OpenSearch's model is how a request to it is
             // bound, which its protocol entry carries, so no model is held on the entry.
             ("OpenSearch", "opensearch", "es", false),
@@ -2603,6 +2653,11 @@ mod tests {
             ("the same id run together", "cloudwatchlogs", "cloudwatchlogs"),
             ("a one-word id", "sqs", "sqs"),
             ("an id carrying a digit", "s3", "s3"),
+            // The device registry and its data plane are two services whose tokens share a
+            // leading word, so neither spelling of one reaches the other.
+            ("a two-word id hyphenated", "iot-data", "iot-data"),
+            ("the same id run together", "iotdata", "iot-data"),
+            ("the id it shares a word with", "iot", "iot"),
         ];
         for (case, asked, expected) in reached {
             let found = super::api_for(asked).map(|api| api.sdk_token);

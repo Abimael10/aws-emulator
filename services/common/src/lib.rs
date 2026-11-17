@@ -591,6 +591,10 @@ pub mod s3_client;
 /// The ONE construction of the in-process Amazon SNS client a service publishing a
 /// notification drives, so no two services configure that hop differently.
 pub mod sns_client;
+/// The ONE construction of the in-process Amazon SQS client a service delivering a message
+/// drives, so no two services configure that hop differently — and the ONE reading of the
+/// ARN of the queue a URL addresses.
+pub mod sqs_client;
 /// The ONE construction of the in-process AWS Organizations client a service acting on an
 /// organization drives, so no two services configure that hop differently.
 pub mod organizations_client;

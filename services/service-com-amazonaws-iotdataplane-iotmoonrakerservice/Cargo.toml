@@ -31,6 +31,15 @@ hex = { workspace = true }
 # what the rules engine runs on, so the data plane drives that service's evaluation
 # (`state::rules_engine`) rather than holding a second copy of the rules.
 service-com-amazonaws-iot-awsiotservice = { workspace = true }
+# The request-path readers and the ONE shared IAM policy evaluation the authorization gate in
+# front of every operation decides with (`service::authorization`).
+service-common = { path = "../common" }
+# That decision is taken on the account's own records: the identity-based policies and the
+# permissions boundary IAM holds for the principal a request speaks for, and the session the
+# token service minted the request's access key for — each read through the owning service's
+# own store over the shared engine, which needs that service's state TYPE.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

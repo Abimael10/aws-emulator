@@ -699,15 +699,21 @@ _host = __import__("_lambda_host")
 # rather than to every client, because the token is a database login's, not an API call's.
 _DB_AUTH_TOKEN_SERVICES = ("rds",)
 
-# The input members a call carries BYTES in, by service. Every protocol this SDK speaks
-# carries a blob as base64 text, so the bytes a handler passes in one of these are encoded
-# before the call is made; a `str` is encoded as UTF-8 first, which is what a client does
-# with a text body. The members of the ANSWER that carry bytes are named by the answer
-# itself, so nothing about them is listed here.
+# The input members a call carries BYTES in, by service, keyed by the service's token with
+# its hyphens dropped — the one spelling both of a two-word token's forms compact to, so a
+# client built with either reaches the same entry. Every protocol this SDK speaks carries a
+# blob as base64 text, so the bytes a handler passes in one of these are encoded before the
+# call is made; a `str` is encoded as UTF-8 first, which is what a client does with a text
+# body. The members of the ANSWER that carry bytes are named by the answer itself, so
+# nothing about them is listed here.
 _BLOB_PARAMETERS = {
     "s3": ("Body",),
     "appconfig": ("Content",),
     "apigatewaymanagementapi": ("Data",),
+    # The IoT data plane carries the MQTT message and the shadow state document it is given
+    # at one member name, whichever operation is called: `payload`.
+    "iotdata": ("payload",),
+    "iotdataplane": ("payload",),
 }
 
 
@@ -868,10 +874,20 @@ def _error_code(query_code, shape):
 
 
 def _error_message(document):
+    """The message a refusal carries, as the SDK reports it on `Error.Message`.
+
+    The member as the answer carried it, where that is a value a message can be: the TEXT of
+    a string, and `None` for a service that answers a refusal whose `message` is null, which
+    is what the SDK renders the sentence of such a refusal from. Anything else — a member
+    holding a document or a number, which no refusal of this wire carries — is reported the
+    way a document carrying no message at all is, because `Error.Message` is a string.
+    """
     for member in ("message", "Message", "errorMessage"):
-        text = document.get(member)
-        if isinstance(text, str):
-            return text
+        if member not in document:
+            continue
+        held = document[member]
+        if held is None or isinstance(held, str):
+            return held
     return ""
 
 
@@ -1186,7 +1202,7 @@ class Client:
 
     def _sent(self, parameters):
         """The call's parameters, with every byte-carrying member encoded as base64."""
-        members = _BLOB_PARAMETERS.get(self._service_name, ())
+        members = _BLOB_PARAMETERS.get(self._service_name.replace("-", ""), ())
         if not members:
             return parameters
         sent = dict(parameters)

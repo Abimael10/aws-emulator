@@ -54,11 +54,27 @@
 //! as `application/json`. Every other response, including the blob members
 //! `GetRetainedMessage` carries in its JSON body, keeps exactly what the model's
 //! protocol produces.
+//!
+//! ## The authorization decision in front of every operation
+//!
+//! AWS answers the IAM decision at the layer in FRONT of a service, before the request's
+//! own shape is looked at, so every request this service serves passes through
+//! [`AuthorizationGate`] first: a caller whose identity-based policies do not allow
+//! `iot:<OperationName>` on the resource the request addresses is refused
+//! `ForbiddenException` (HTTP 403) and the call performs nothing — no message is
+//! published, no rule runs and no shadow moves ([`authorization`]). `override_operation`
+//! is the only seam that can run ahead of the framework's deserialize -> validate ->
+//! handle walk, which is why the gate is picked there; every request it does not refuse
+//! is served by the modelled operation the request's own routing key names.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, BoxFuture, ErasedOperation, OperationContext, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+
+/// Whether IAM lets the principal a request speaks for perform the action it asks for, taken
+/// in front of every operation of this service ([`AuthorizationGate`]).
+pub mod authorization;
 
 use aws_smithy_runtime_api::http::{Request as WireRequest, Response as WireResponse};
 use aws_smithy_schema::{Schema, ShapeType};
@@ -116,6 +132,94 @@ fn carries_json_document(output_schema: &Schema) -> bool {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// THE AUTHORIZATION GATE every request of this service passes through, which serves the
+    /// modelled operation the request named once IAM permits the action
+    /// ([`AuthorizationGate`]).
+    gate: AuthorizationGate<Eng>,
+}
+
+/// THE GATE every request this service serves passes through, as an operation the dispatch
+/// path can run: whether IAM permits the ACTION the request named
+/// ([`authorization::authorize`]).
+///
+/// The order is AWS's: authorization is decided by the IAM layer in FRONT of the service, so it
+/// is answered before anything about the request's own resource is resolved, let alone
+/// deserialized or constraint-checked. A request it does not refuse is handed to the modelled
+/// operation the request named, read off this service's own routing table, so it is served by
+/// exactly the centralized deserialize -> validate -> handle walk every other request takes:
+/// the gate changes WHICH refusal comes first, not whether the modelled constraints are
+/// enforced.
+///
+/// It names no operation of its own, because the operation is the routing key the request
+/// carries: ONE gate stands in front of all of this service's operations, and the action it
+/// judges is that key under AWS IoT Core's own IAM prefix.
+pub struct AuthorizationGate<Eng> {
+    /// The same shared engine the entry constructed each operation from, so the decision reads
+    /// the account's own IAM and STS stores rather than a second copy of them.
+    engine: Arc<Eng>,
+}
+
+impl<Eng: Send + Sync + 'static> AuthorizationGate<Eng> {
+    /// A gate on the shared engine.
+    fn new(engine: Arc<Eng>) -> Self {
+        Self { engine }
+    }
+}
+
+impl<Eng: Send + Sync + 'static> ErasedOperation for AuthorizationGate<Eng> {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r WireRequest,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, WireResponse> {
+        Box::pin(async move {
+            // The operation the request named, read exactly as dispatch reads it: the routing
+            // key this service's protocol resolves from the request line. It is the ACTION the
+            // IAM decision is about, and the key the modelled operation is wired under.
+            let Ok(operation) = svc.definition().protocol().routing_key(req) else {
+                // `override_operation` picks this gate only for a request whose key resolves,
+                // so this is unreachable; answered as the request naming no modelled
+                // operation, which is what it would be.
+                return svc.definition().routing_error_response(req);
+            };
+            // The resource the request ADDRESSES, in the Region it was signed for, which is
+            // the Region segment of the ARN a statement about it names. The Region is read the
+            // way the registry beside this plane reads it, so a thing or a topic is named by
+            // the ARN that service mints for the same request.
+            let resource = authorization::judged_resource(
+                &::service_com_amazonaws_iot_awsiotservice::state::request_region(ctx.parts()),
+                operation,
+                ::service_common::request_path(req.uri()),
+            );
+            // IAM's decision, taken before the operation reads or writes anything. A refused
+            // request never reaches the delegate, so it publishes nothing and moves nothing.
+            // The answer states no reason — see [`authorization`] — so the sentence IAM
+            // refused with goes to this service's own log instead.
+            if let Err(denial) = authorization::authorize(&*self.engine, ctx, operation, &resource)
+            {
+                ::tracing::debug!(
+                    operation,
+                    reason = %denial.reason,
+                    "an iot data plane request was refused by the account's identity policies"
+                );
+                return authorization::refusal_response();
+            }
+            match svc.definition().routing_table().get(operation) {
+                Some(modelled) => modelled.run(svc, req, ctx).await,
+                // Unreachable in practice: the key came from this service's own protocol.
+                // Answer the framework's own no-such-operation response rather than inventing
+                // one.
+                None => svc.definition().routing_error_response(req),
+            }
+        })
+    }
+
+    /// `None`, NOT an empty list: the request is still signed as the operation the MODEL names,
+    /// so wrapping every operation in this gate changes which schemes sign none of them.
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        None
+    }
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -124,7 +228,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            gate: AuthorizationGate::new(engine),
         }
     }
 }
@@ -220,6 +325,7 @@ impl<Eng: Send + Sync + 'static> std::fmt::Debug for EmulatedService<Eng> {
         f.debug_struct("EmulatedService")
             .field("protocol", &self.entry.protocol().protocol_id())
             .field("json_document_payloads", &JSON_DOCUMENT_PAYLOAD_OUTPUTS)
+            .field("action_prefix", &authorization::ACTION_PREFIX)
             .finish()
     }
 }
@@ -246,12 +352,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // THE AUTHORIZATION GATE, and the only seam it can run in: a request is authorized
+        // before its shape is validated, because the framework's centralized walk is
+        // deserialize -> validate -> handle and a handler therefore runs only AFTER
+        // modelled-constraint enforcement, while AWS answers the IAM decision in front of all
+        // of it ([`AuthorizationGate`]). NOT a re-route: the gate serves the very operation
+        // the model's own routing key names, so a key the model does not name resolves to
+        // `None` here exactly as it does in the generated table.
+        self.entry.protocol().routing_key(req).ok()?;
+        Some(&self.gate as &dyn ErasedOperation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
