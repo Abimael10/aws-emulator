@@ -15,6 +15,13 @@
 //! type, which form of endpoint service name, how many subnets the endpoint is created in,
 //! whether the policy and the security groups were chosen or defaulted, and which member of
 //! the request is at fault.
+//!
+//! The private-DNS table at the end of this file is about one member of that rule: an
+//! interface endpoint created without `PrivateDnsEnabled` takes the SERVICE's own default —
+//! the association is on for a service that publishes a default public DNS name for the
+//! Region, which is the record set the private hosted zone exists for — so the endpoint
+//! reports it and claims every private name the endpoint-service catalogue advertises, which
+//! is read off `DescribeVpcEndpointServices` rather than written out here.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -1675,3 +1682,199 @@ async fn a_service_without_endpoint_policy_support_refuses_a_narrowing_document(
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// What an ABSENT PrivateDnsEnabled means
+// ---------------------------------------------------------------------------
+
+/// One row of the private-DNS default table: a create, and what the endpoint it makes has to
+/// report about the private hosted zone.
+struct PrivateDnsCase {
+    case: &'static str,
+    /// The endpoint service the endpoint is created to.
+    service_name: &'static str,
+    /// `VpcEndpointType` as the request spells it.
+    endpoint_type: &'static str,
+    /// `PrivateDnsEnabled` as the request spells it, or `None` to leave the member out of the
+    /// request entirely — the input this table is about.
+    requested: Option<&'static str>,
+    /// What `<privateDnsEnabled>` has to carry. A private hosted zone is an INTERFACE
+    /// endpoint's option ("(Interface endpoint) Indicates whether to associate a private
+    /// hosted zone with the specified VPC",
+    /// `smithy_query(query="doc",shape="CreateVpcEndpointRequest",member="PrivateDnsEnabled")`),
+    /// so an endpoint of any other type holds none and reports the member false.
+    reported: &'static str,
+    /// Whether `DescribeVpcEndpointServices` advertises a private DNS name for this service,
+    /// read off the catalogue rather than trusted here.
+    advertises_private_name: bool,
+}
+
+/// The rows, differing along what the rule generalises over: whether the member is absent or
+/// explicit and which value it carries, which endpoint TYPE the endpoint is, and whether the
+/// SERVICE publishes a default public DNS name a private hosted zone could answer on — with
+/// labels of three name families and dotted labels among them.
+fn private_dns_cases() -> Vec<PrivateDnsCase> {
+    vec![
+        PrivateDnsCase {
+            case: "no flag, to a service that publishes a default public name",
+            service_name: "com.amazonaws.us-east-1.kms",
+            endpoint_type: "Interface",
+            requested: None,
+            reported: "true",
+            advertises_private_name: true,
+        },
+        PrivateDnsCase {
+            case: "no flag, to a service whose label carries a dot",
+            service_name: "com.amazonaws.us-east-1.ecr.api",
+            endpoint_type: "Interface",
+            requested: None,
+            reported: "true",
+            advertises_private_name: true,
+        },
+        PrivateDnsCase {
+            case: "no flag, to a service of the api.aws family",
+            service_name: "api.aws.us-east-1.cassandra-streams",
+            endpoint_type: "Interface",
+            requested: None,
+            reported: "true",
+            advertises_private_name: true,
+        },
+        PrivateDnsCase {
+            case: "no flag, to a streaming service of a dotted label",
+            service_name: "com.amazonaws.us-east-1.appstream.streaming",
+            endpoint_type: "Interface",
+            requested: None,
+            reported: "true",
+            advertises_private_name: true,
+        },
+        PrivateDnsCase {
+            case: "the flag asking for no private DNS",
+            service_name: "com.amazonaws.us-east-1.logs",
+            endpoint_type: "Interface",
+            requested: Some("false"),
+            reported: "false",
+            advertises_private_name: true,
+        },
+        PrivateDnsCase {
+            case: "the flag asking for private DNS",
+            service_name: "com.amazonaws.us-east-1.events",
+            endpoint_type: "Interface",
+            requested: Some("true"),
+            reported: "true",
+            advertises_private_name: true,
+        },
+        PrivateDnsCase {
+            case: "no flag, to a service that publishes no default public name",
+            service_name: "com.amazonaws.us-east-1.iot.data",
+            endpoint_type: "Interface",
+            requested: None,
+            reported: "false",
+            advertises_private_name: false,
+        },
+        PrivateDnsCase {
+            case: "no flag, on a gateway endpoint",
+            service_name: "com.amazonaws.us-east-1.s3",
+            endpoint_type: "Gateway",
+            requested: None,
+            reported: "false",
+            advertises_private_name: true,
+        },
+    ]
+}
+
+/// The private DNS names `DescribeVpcEndpointServices` advertises for `service_name`
+/// (`ServiceDetail$PrivateDnsNames`), read off the one catalogue a create resolves against.
+async fn advertised_private_names(
+    case: &str,
+    router: &MultiServiceRouter,
+    service_name: &str,
+) -> Vec<String> {
+    let body = ok(
+        case,
+        router,
+        "DescribeVpcEndpointServices",
+        &indexed("ServiceName", &[service_name]),
+    )
+    .await;
+    set_members(case, &body, "privateDnsNameSet", "privateDnsName")
+}
+
+/// An interface endpoint created without a word about `PrivateDnsEnabled` associates the
+/// private hosted zone anyway, whenever the SERVICE publishes a default public DNS name for
+/// the Region — the record set that zone exists for — so it reports `privateDnsEnabled` true
+/// and carries every private name the endpoint-service catalogue advertises for that service
+/// among its DNS entries; a request that spells the member out is answered with the value it
+/// chose, a service publishing no such name has nothing to associate, and an endpoint of a
+/// type that holds no private hosted zone reports the member false.
+#[tokio::test]
+async fn an_absent_private_dns_flag_takes_the_services_own_default() {
+    let router = emulator();
+    let built = network("the private-DNS table", &router, &["us-east-1a"]).await;
+
+    for row in private_dns_cases() {
+        let case = row.case;
+        let mut params = vec![
+            param("VpcId", &built.vpc_id),
+            param("ServiceName", row.service_name),
+            param("VpcEndpointType", row.endpoint_type),
+        ];
+        if let Some(requested) = row.requested {
+            params.push(param("PrivateDnsEnabled", requested));
+        }
+        // A gateway endpoint stands up no endpoint network interface and so takes no subnet;
+        // every other type creates one per subnet it is given.
+        if row.endpoint_type != "Gateway" {
+            params.extend(indexed("SubnetId", &[built.subnets[0].as_str()]));
+        }
+        let body = ok(case, &router, "CreateVpcEndpoint", &params).await;
+        let endpoint_id = member(case, &body, "vpcEndpointId");
+        assert_eq!(
+            element(&body, "privateDnsEnabled").as_deref(),
+            Some(row.reported),
+            "case {case:?}: expected <privateDnsEnabled> to carry {expected:?}, got {body}",
+            expected = row.reported
+        );
+
+        // The create ANSWERED the stored record, so the describe reports the same — which is
+        // the read a caller polls while the endpoint comes into service.
+        let described = describe_endpoint(case, &router, &endpoint_id).await;
+        assert_eq!(
+            element(&described, "privateDnsEnabled").as_deref(),
+            Some(row.reported),
+            "case {case:?}: the stored endpoint must report {expected:?}, got {described}",
+            expected = row.reported
+        );
+
+        let dns_names = set_members(case, &described, "dnsEntrySet", "dnsName");
+        let advertised = advertised_private_names(case, &router, row.service_name).await;
+        assert_eq!(
+            !advertised.is_empty(),
+            row.advertises_private_name,
+            "case {case:?}: expected the catalogue to {} a private DNS name for \
+             {service_name:?}, got {advertised:?}",
+            if row.advertises_private_name {
+                "advertise"
+            } else {
+                "advertise none"
+            },
+            service_name = row.service_name
+        );
+        for advertised_name in &advertised {
+            // An endpoint that holds the zone claims the name it is the record set of; one
+            // that does not is reached only through its own generated names, so the
+            // advertised name must NOT be among them.
+            assert_eq!(
+                dns_names.contains(advertised_name),
+                row.reported == "true",
+                "case {case:?}: expected the advertised private name \
+                 {advertised_name:?} to be {} the endpoint's DNS entries, got {dns_names:?}",
+                if row.reported == "true" {
+                    "among"
+                } else {
+                    "absent from"
+                }
+            );
+        }
+    }
+}
+
