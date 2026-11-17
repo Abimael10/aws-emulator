@@ -582,33 +582,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // record it builds is a copy of a configuration whose own size is bounded — the
         // batchspec is only read at all up to `crate::state`'s batchspec byte ceiling, so
         // a buildspec larger than that declares nothing and fans out into no builds.
-        let levels = crate::state::declaration_levels(&declarations);
-        // A batch that declared nothing fans out into nothing at all — not even the
+        //
+        // The plan itself — which groups run and which level each waits behind — is the
+        // store's one reading of a batch's fan-out (`crate::state::batch_fan_out`), shared
+        // with `crate::ops::retry_build_batch`, which runs the groups of a failed batch
+        // again. A batch that declared nothing fans out into nothing at all, not even the
         // source download, since there is no build to download a source for.
-        let planned: Vec<(crate::state::BatchBuildDeclaration, usize)> = if declarations.is_empty()
-        {
-            Vec::new()
-        } else {
-            ::std::iter::once((crate::state::source_download_declaration(), 0))
-                .chain(
-                    declarations
-                        .iter()
-                        .cloned()
-                        .zip(levels.iter().map(|level| level.saturating_add(1))),
-                )
-                .collect()
-        };
-        let mut build_groups: Vec<BuildGroup> = Vec::with_capacity(planned.len());
+        let fan_out = crate::state::batch_fan_out(&declarations);
+        let mut build_groups: Vec<BuildGroup> = Vec::with_capacity(fan_out.planned.len());
         let mut group_builds: Vec<(String, crate::state::StoredBuild)> =
-            Vec::with_capacity(planned.len());
-        for (declaration, level) in &planned {
+            Vec::with_capacity(fan_out.planned.len());
+        for (declaration, level) in &fan_out.planned {
             let build_number = guard.allocate_build_number(&input.project_name);
             let build_id = format!(
                 "{}:{}",
                 input.project_name,
                 crate::state::build_uuid(&input.project_name, build_number, now)
             );
-            let build = group_build(
+            let build = crate::state::batch_group_build(
                 &build_batch,
                 &build_artifacts,
                 declaration,
@@ -643,9 +634,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::StoredBuild {
                     build,
                     start_millis: now,
-                    settle_due_millis: now
-                        + crate::state::BUILD_SETTLE_MILLIS
-                            * i64::try_from(level.saturating_add(1)).unwrap_or(1),
+                    settle_due_millis: crate::state::batch_group_settle_due_millis(now, *level),
                     // Every build of the batch uploads to the destination the batch
                     // resolved, which is the one its own group's resolved artifacts are
                     // then read from.
@@ -659,16 +648,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // A batch that declared nothing carries no build group at all, rather than an
         // empty one: there was no batchspec to fan out.
-        let deepest_level = planned.iter().map(|(_, level)| *level).max().unwrap_or(0);
-        // How many spans the batch itself takes: one per level of its dependency graph,
-        // plus the one in which the batch combines what its deepest level produced. A
-        // batch that declared nothing fans out into nothing and takes the single span a
-        // build takes.
-        let batch_spans = if declarations.is_empty() {
-            1
-        } else {
-            deepest_level.saturating_add(2)
-        };
         if !build_groups.is_empty() {
             build_batch.build_groups = Some(build_groups);
         }
@@ -687,7 +666,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // instant whether or not anybody calls again, and is never slept on.
                 settle_due_millis: now
                     + crate::state::BUILD_SETTLE_MILLIS
-                        * i64::try_from(batch_spans).unwrap_or(1),
+                        * i64::try_from(fan_out.spans).unwrap_or(1),
             },
         );
         if let Some(key) = token_key {
@@ -715,119 +694,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// (`Ok(Some(build_batch))`), and the same token with a changed request is "a parameter
 /// mismatch error", which AWS documents as a refusal rather than a second batch build.
 /// `Ok(None)` means this request has to start one.
+///
+/// The window and the mismatch are the store's one reading of them
+/// (`crate::state::ComAmazonawsCodebuildCodebuild20161006State::resolve_build_batch_idempotency_token`),
+/// read against THIS operation's own token store; only the sentence the mismatch is
+/// refused with is this operation's, because it names the operation the token was issued
+/// for.
 fn resolve_idempotency_token(
     state: &mut crate::state::ComAmazonawsCodebuildCodebuild20161006State,
     token_key: Option<&(String, String)>,
     fingerprint: &str,
     now: i64,
 ) -> Result<Option<BuildBatch>, StartBuildBatchError> {
-    let Some(key) = token_key else {
-        return Ok(None);
-    };
-    let in_force = state
-        .start_build_batch_tokens
-        .get(key)
-        .filter(|issued| now - issued.issued_millis < crate::state::IDEMPOTENCY_TOKEN_TTL_MILLIS)
-        .cloned();
-    let Some(issued) = in_force else {
-        return Ok(None);
-    };
-    if issued.request_fingerprint != fingerprint {
-        return Err(StartBuildBatchErrorModeled::InvalidInputException(
-            InvalidInputException {
+    state
+        .resolve_build_batch_idempotency_token(
+            crate::state::BuildBatchTokenStore::StartBuildBatch,
+            token_key,
+            fingerprint,
+            now,
+        )
+        .map_err(|_| {
+            StartBuildBatchErrorModeled::InvalidInputException(InvalidInputException {
                 message: Some(
                     "Parameter mismatch: idempotencyToken was already used for a \
                      StartBuildBatch request with different parameters"
                         .to_string(),
                 ),
-            },
-        )
-        .into());
-    }
-    Ok(state
-        .settled_build_batch(&issued.build_id, now)
-        .map(|stored| stored.build_batch.clone()))
-}
-
-/// The build this batch starts for one declared build group.
-///
-/// A build of a batch runs with the configuration the BATCH resolved — the source,
-/// environment, artifacts, role, timeouts and key the batch itself reports — because
-/// those are the settings the project and this request settled for the whole batch; the
-/// group adds only what the batchspec declares for it, which is its own buildspec when
-/// it names one (`buildspec` in the batchspec, the per-build equivalent of
-/// `StartBuild`'s `buildspecOverride`). It is a build of the same project, with its own
-/// build number from that project's sequence, and it names the batch it belongs to
-/// through `buildBatchArn`.
-///
-/// `artifacts` is the batch's destination as a run reports one
-/// (`crate::state::build_artifacts_of`), so a build of the batch answers exactly what a
-/// build of the same project answers.
-fn group_build(
-    build_batch: &BuildBatch,
-    artifacts: &crate::state::GroupArtifacts,
-    declaration: &crate::state::BatchBuildDeclaration,
-    build_id: &str,
-    region: &str,
-    build_number: i64,
-    now: i64,
-) -> Build {
-    let mut source = build_batch.source.clone().unwrap_or_default();
-    if let Some(buildspec) = declaration.buildspec.clone() {
-        source.buildspec = Some(buildspec);
-    }
-    Build {
-        id: Some(build_id.to_string()),
-        arn: Some(crate::state::build_arn(region, build_id)),
-        build_number: Some(build_number),
-        start_time: Some(crate::state::datetime(now)),
-        end_time: None,
-        current_phase: Some("QUEUED".to_string()),
-        build_status: Some("IN_PROGRESS".to_string()),
-        source_version: build_batch.source_version.clone(),
-        // The commit the source version resolved to. Nothing clones a repository here,
-        // so there is no resolved revision to report.
-        resolved_source_version: None,
-        project_name: build_batch.project_name.clone(),
-        phases: Some(crate::state::in_progress_phases(now)),
-        source: Some(source),
-        secondary_sources: build_batch.secondary_sources.clone(),
-        secondary_source_versions: build_batch.secondary_source_versions.clone(),
-        artifacts: artifacts.primary.clone(),
-        secondary_artifacts: artifacts.secondary.clone(),
-        cache: build_batch.cache.clone(),
-        environment: build_batch.environment.clone(),
-        service_role: build_batch.service_role.clone(),
-        // Where this build's output goes, under the log configuration the BATCH runs
-        // with — every build of the batch delivers under that one configuration, each to
-        // the stream its own id names (`crate::state::build_logs_location`).
-        logs: Some(crate::state::build_logs_location(
-            region,
-            build_batch.project_name.as_deref().unwrap_or_default(),
-            build_id,
-            build_batch.log_config.as_ref(),
-        )),
-        timeout_in_minutes: build_batch.build_timeout_in_minutes,
-        queued_timeout_in_minutes: build_batch.queued_timeout_in_minutes,
-        build_complete: false,
-        initiator: build_batch.initiator.clone(),
-        vpc_config: build_batch.vpc_config.clone(),
-        // Allocated when a build container joins the project's VPC; no container is
-        // provisioned here.
-        network_interface: None,
-        encryption_key: build_batch.encryption_key.clone(),
-        // Exported by a buildspec's `env/exported-variables` while it runs, and reports
-        // and artifacts are produced by a running build.
-        exported_environment_variables: None,
-        report_arns: None,
-        file_system_locations: build_batch.file_system_locations.clone(),
-        debug_session: None,
-        // What makes this a build OF the batch: the batch it belongs to, by ARN.
-        build_batch_arn: build_batch.arn.clone(),
-        // Retries are per build and are asked for by `RetryBuild`; a batch's own
-        // retries are `RetryBuildBatch`.
-        auto_retry_config: None,
-    }
+            })
+            .into()
+        })
 }
 
 /// A refusal of the request itself, as this operation's one modelled error for a

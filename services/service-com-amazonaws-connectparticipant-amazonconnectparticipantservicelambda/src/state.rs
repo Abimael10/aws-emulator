@@ -339,10 +339,17 @@ impl ChatSession {
     }
 
     /// Record that this session's participant acknowledged the item `message_id` names, at
-    /// `now`, and answer that item's own `Id` and the time the receipt was sent.
+    /// `now`, and answer that item's own `Id` and the time that acknowledgement carries.
     ///
     /// `None` when this transcript holds no such item: a receipt names a message of the
     /// chat it is sent in.
+    ///
+    /// One acknowledgement per recipient and kind: the SAME participant acknowledging the
+    /// same message the same way again is the same acknowledgement, so the instant is
+    /// recorded once and a repeat answers the instant the first call recorded — the way
+    /// every other repeat of this service answers what the first call reported
+    /// ([`Self::replayed_event`]), and what makes the timestamp a client reads stable
+    /// across calls.
     pub fn record_receipt(
         &mut self,
         message_id: &str,
@@ -372,12 +379,13 @@ impl ChatSession {
                 item.receipts.len() - 1
             }
         };
+        let id = item.id.clone();
         let receipt = item.receipts.get_mut(index)?;
-        match kind {
-            ReceiptKind::Delivered => receipt.delivered_timestamp = Some(at.clone()),
-            ReceiptKind::Read => receipt.read_timestamp = Some(at.clone()),
-        }
-        Some((item.id.clone(), at))
+        let recorded = match kind {
+            ReceiptKind::Delivered => receipt.delivered_timestamp.get_or_insert(at),
+            ReceiptKind::Read => receipt.read_timestamp.get_or_insert(at),
+        };
+        Some((id, recorded.clone()))
     }
 
     /// Append an item sent at `now`, attributed to this session's participant, recording

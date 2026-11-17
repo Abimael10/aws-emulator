@@ -54,6 +54,8 @@ mod artifacts;
 /// Which files of a build's working tree its artifacts are made of, and where in the
 /// account's object store those objects go.
 mod artifact_upload;
+/// How a batch build fans out into builds: the plan, its pacing, and one group's build.
+mod batch_fan_out;
 /// Which builds the `batch` section of a buildspec declares a batch build is made of.
 mod batchspec;
 /// The cache one project carries from one of its builds into the next.
@@ -98,6 +100,7 @@ pub mod wire_refusals;
 pub use arn_fields::*;
 pub use artifact_upload::*;
 pub use artifacts::*;
+pub use batch_fan_out::*;
 pub use batchspec::*;
 pub use build_cache::*;
 pub use build_image::*;
@@ -432,6 +435,16 @@ pub const MAX_BUILDS: usize = 10_000;
 /// oldest batch (preferring one that has already completed) past this ceiling,
 /// pruning `build_batches_by_project` and the per-project counters with it.
 pub const MAX_BUILD_BATCHES: usize = 10_000;
+
+/// Earlier attempts of one build group a batch build retains.
+///
+/// `BuildGroup$priorBuildSummaryList` carries "summaries of previous build groups", and
+/// `RetryBuildBatch` adds one entry to it per group it runs again, so the list is a
+/// growth site: THIS CEILING IS THE EMULATOR'S, NOT AWS'S — the model puts no `@length`
+/// on `BuildSummaries`, and a chain of retries is as long as a caller makes it. A group
+/// keeps its most recent attempts and drops the ones before them, whose builds
+/// [`MAX_BUILDS`] has long evicted.
+pub const MAX_PRIOR_BUILD_SUMMARIES: usize = 10;
 
 /// Idempotency entries retained at once, across every operation that takes a token.
 ///
@@ -1019,6 +1032,13 @@ pub struct ComAmazonawsCodebuildCodebuild20161006State {
     /// for a retry of a build of one project, and neither may resolve the
     /// other's build.
     pub retry_build_tokens: BTreeMap<(String, String), StartBuildToken>,
+    /// `RetryBuildBatch` idempotency tokens, keyed by (project name, token).
+    ///
+    /// Its own store for the reason every other one here is: the operations issue
+    /// their tokens independently, so one token value may be in force for a batch
+    /// build and for a retry of a batch build of one project, and neither may
+    /// resolve the other's batch.
+    pub retry_build_batch_tokens: BTreeMap<(String, String), StartBuildToken>,
 }
 
 /// A persisted build project: the modelled [`Project`] plus the instants its
@@ -1546,6 +1566,17 @@ pub enum BuildTokenStore {
     RetryBuild,
 }
 
+/// Which operation's idempotency store a lookup for a BATCH build reads —
+/// [`BuildTokenStore`]'s sibling for the operations that mint a [`BuildBatch`], so the
+/// documented five-minute / parameter-mismatch rule is written once for those too.
+#[derive(Debug, Clone, Copy)]
+pub enum BuildBatchTokenStore {
+    /// `StartBuildBatch`'s store (`start_build_batch_tokens`).
+    StartBuildBatch,
+    /// `RetryBuildBatch`'s store (`retry_build_batch_tokens`).
+    RetryBuildBatch,
+}
+
 impl ComAmazonawsCodebuildCodebuild20161006State {
     /// Hand out the sequence number the next created compute fleet derives its id
     /// from, and advance the counter — see [`Self::fleets_created`].
@@ -1785,25 +1816,15 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
         fingerprint: &str,
         now_millis: i64,
     ) -> Result<Option<Build>, IdempotencyMismatch> {
-        let Some(key) = key else {
-            return Ok(None);
-        };
         let tokens = match store {
             BuildTokenStore::StartBuild => &self.start_build_tokens,
             BuildTokenStore::RetryBuild => &self.retry_build_tokens,
         };
-        let in_force = tokens
-            .get(key)
-            .filter(|issued| now_millis - issued.issued_millis < IDEMPOTENCY_TOKEN_TTL_MILLIS)
-            .cloned();
-        let Some(issued) = in_force else {
+        let Some(resolved_id) = token_in_force(tokens, key, fingerprint, now_millis)? else {
             return Ok(None);
         };
-        if issued.request_fingerprint != fingerprint {
-            return Err(IdempotencyMismatch);
-        }
         Ok(self
-            .settled_build(&issued.build_id, now_millis)
+            .settled_build(&resolved_id, now_millis)
             .map(|stored| stored.build.clone()))
     }
 
@@ -1864,6 +1885,54 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
             IDEMPOTENCY_TOKEN_TTL_MILLIS,
             MAX_IDEMPOTENCY_TOKENS,
         );
+    }
+
+    /// Record the batch build an in-force `RetryBuildBatch` idempotency token
+    /// resolves to, under [`Self::record_start_build_token`]'s rule and in that
+    /// operation's own store.
+    pub fn record_retry_build_batch_token(
+        &mut self,
+        key: (String, String),
+        token: StartBuildToken,
+        now_millis: i64,
+    ) {
+        record_token(
+            &mut self.retry_build_batch_tokens,
+            key,
+            token,
+            now_millis,
+            IDEMPOTENCY_TOKEN_TTL_MILLIS,
+            MAX_IDEMPOTENCY_TOKENS,
+        );
+    }
+
+    /// What an idempotency token already in force for a BATCH build resolves to —
+    /// [`Self::resolve_idempotency_token`]'s rule, read through the same window
+    /// ([`token_in_force`]) and applied to the operations that answer with a
+    /// [`BuildBatch`].
+    ///
+    /// A repeat of the SAME request inside the documented five-minute window resolves to
+    /// the batch build the first one answered with, the same token carrying a changed
+    /// request is an [`IdempotencyMismatch`], and `Ok(None)` means this request has to do
+    /// the work itself. The batch is read through [`Self::settled_build_batch`], so a
+    /// replay reports it as of now rather than as of the first call.
+    pub fn resolve_build_batch_idempotency_token(
+        &mut self,
+        store: BuildBatchTokenStore,
+        key: Option<&(String, String)>,
+        fingerprint: &str,
+        now_millis: i64,
+    ) -> Result<Option<BuildBatch>, IdempotencyMismatch> {
+        let tokens = match store {
+            BuildBatchTokenStore::StartBuildBatch => &self.start_build_batch_tokens,
+            BuildBatchTokenStore::RetryBuildBatch => &self.retry_build_batch_tokens,
+        };
+        let Some(resolved_id) = token_in_force(tokens, key, fingerprint, now_millis)? else {
+            return Ok(None);
+        };
+        Ok(self
+            .settled_build_batch(&resolved_id, now_millis)
+            .map(|stored| stored.build_batch.clone()))
     }
 
     /// Whether this account holds the project or report group `arn` names — the
@@ -2686,6 +2755,41 @@ fn record_token<T: IssuedToken>(
         let Some(oldest) = oldest else { break };
         tokens.remove(&oldest);
     }
+}
+
+/// The record an idempotency token in force at `now_millis` resolves to, by the id the
+/// entry was issued for — the ONE reading of the window AWS documents for every
+/// `idempotencyToken` member of this service.
+///
+/// `Ok(None)` when there is no token to resolve against: the request carried none, no entry
+/// was issued for it, or the entry's [`IDEMPOTENCY_TOKEN_TTL_MILLIS`] lifetime has elapsed,
+/// past which it can never be matched again. [`IdempotencyMismatch`] when the entry is in
+/// force but was issued for a DIFFERENT request, which AWS documents as a parameter
+/// mismatch rather than a second resource. Which store it reads, and what the id resolves
+/// to, is the caller's: the operations that answer with a [`Build`]
+/// ([`ComAmazonawsCodebuildCodebuild20161006State::resolve_idempotency_token`]) and those
+/// that answer with a [`BuildBatch`]
+/// ([`ComAmazonawsCodebuildCodebuild20161006State::resolve_build_batch_idempotency_token`])
+/// share this window and differ only in the record they read.
+fn token_in_force(
+    tokens: &BTreeMap<(String, String), StartBuildToken>,
+    key: Option<&(String, String)>,
+    fingerprint: &str,
+    now_millis: i64,
+) -> Result<Option<String>, IdempotencyMismatch> {
+    let Some(key) = key else {
+        return Ok(None);
+    };
+    let Some(issued) = tokens
+        .get(key)
+        .filter(|issued| now_millis - issued.issued_millis < IDEMPOTENCY_TOKEN_TTL_MILLIS)
+    else {
+        return Ok(None);
+    };
+    if issued.request_fingerprint != fingerprint {
+        return Err(IdempotencyMismatch);
+    }
+    Ok(Some(issued.build_id.clone()))
 }
 
 impl StoredFleet {
@@ -3746,6 +3850,9 @@ pub enum AuditOutcome {
     BuildDeleted,
     /// A batch build that was still running was ended by a caller.
     BuildBatchStopped,
+    /// A batch build that had failed was restarted by a caller, which runs its build
+    /// groups again.
+    BuildBatchRetried,
     /// No resource of that name exists (400 `ResourceNotFoundException`).
     NotFound,
     /// A resource-based policy was stored against a resource's ARN.
@@ -3774,6 +3881,7 @@ impl AuditOutcome {
             Self::BuildBatchDeleted => "build-batch-deleted",
             Self::BuildDeleted => "build-deleted",
             Self::BuildBatchStopped => "build-batch-stopped",
+            Self::BuildBatchRetried => "build-batch-retried",
             Self::NotFound => "not-found",
             Self::ResourcePolicyStored => "resource-policy-stored",
             Self::ResourcePolicyDeleted => "resource-policy-deleted",

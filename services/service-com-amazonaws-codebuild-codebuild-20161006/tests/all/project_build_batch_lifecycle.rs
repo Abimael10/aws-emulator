@@ -5,13 +5,18 @@
 //! awsJson1_1.
 //!
 //! Every assertion here is about state: what `StartBuildBatch` persisted is what
-//! `BatchGetBuildBatches` reports, and nothing is recomputed per call.
+//! `BatchGetBuildBatches` reports, and nothing is recomputed per call. The same holds for
+//! the call that runs a stored batch build again, `RetryBuildBatch`, whose cover is the
+//! last three suites below.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_codebuild_codebuild_20161006::ops::types::BuildBatch;
+use service_com_amazonaws_codebuild_codebuild_20161006::ops::types::{
+    BuildBatch, RETRY_BUILD_BATCH_TYPE_VALUES,
+};
 use service_com_amazonaws_codebuild_codebuild_20161006::state::{
     self, ComAmazonawsCodebuildCodebuild20161006State as CodeBuildState, StartBuildToken,
     StoredBuildBatch,
@@ -22,7 +27,7 @@ use smithy_server_runtime::MultiServiceRouter;
 // This suite drives the wire through its own harness (its own region, access key and
 // `call`), and reaches into the shared harness for the ONE fragment both need: the
 // `buildBatchConfig` that makes a project batch-enabled.
-use crate::project_build_lifecycle::batch_enabled;
+use crate::project_build_lifecycle::{batch_enabled, merged};
 
 /// The region every request below is signed for — deliberately not the emulator's
 /// `us-east-1` default, so an ARN assertion proves the region came from the request.
@@ -968,5 +973,687 @@ fn the_batch_build_stores_are_bounded_at_their_growth_site() {
     assert!(
         guard.start_build_tokens.is_empty(),
         "a batch token must not be recorded in the build token store"
+    );
+}
+
+// --- RetryBuildBatch ---------------------------------------------------------------
+//
+// `RetryBuildBatch` "restarts a failed batch build. Only batch builds that have failed can
+// be retried", and it restarts that batch IN PLACE: the record keeps the identity it
+// already had and runs its build groups again, which is why `BuildGroup` carries a
+// `priorBuildSummaryList` of "summaries of previous build groups".
+
+/// A `retryType` outside the modelled `RetryBuildBatchType` value set — a modelled value
+/// in the wrong case, which is the form a typo takes.
+const UNMODELLED_RETRY_TYPE: &str = "retry_failed_builds";
+
+/// How long the retry suites wait for the clock-owed transitions of a batch build and the
+/// builds it fanned out into, looking again until the batch reports itself complete.
+/// Generous on purpose: the wait ends on the CONDITION, and the deadline is only there so
+/// a batch that never settles fails the test instead of hanging it.
+const SETTLE_DEADLINE: Duration = Duration::from_secs(120);
+
+/// How long [`settled_build_batch`] waits before looking again.
+const LOOK_AGAIN_AFTER: Duration = Duration::from_millis(25);
+
+/// Look again until the batch build `id` reports itself complete, and hand back that
+/// record as `BatchGetBuildBatches` reports it.
+async fn settled_build_batch(router: &MultiServiceRouter, id: &str) -> Value {
+    let deadline = tokio::time::Instant::now() + SETTLE_DEADLINE;
+    loop {
+        let batch = get_build_batch(router, id).await;
+        if batch["complete"] == json!(true) {
+            return batch;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "batch build {id}: expected it to complete, last read {batch}"
+        );
+        tokio::time::sleep(LOOK_AGAIN_AFTER).await;
+    }
+}
+
+/// A buildspec whose `batch` section declares one `build-list` entry per pair, each entry
+/// running its own buildspec — so `command` is what decides whether that group's build
+/// succeeds (`false` fails it, the way `buildspec_execution` drives a failing phase).
+fn batch_list_spec(entries: &[(&str, &str)]) -> String {
+    let mut spec = String::from("version: 0.2\nbatch:\n  build-list:\n");
+    for (identifier, command) in entries {
+        spec.push_str(&format!(
+            "    - identifier: {identifier}\n      \
+               buildspec: |\n        \
+                 version: 0.2\n        \
+                 phases:\n          \
+                   build:\n            \
+                     commands:\n              \
+                       - {command}\n"
+        ));
+    }
+    spec.push_str("phases:\n  build:\n    commands:\n      - echo base\n");
+    spec
+}
+
+/// A `CreateProject` request body fragment for a batch-enabled project whose inline
+/// buildspec is `buildspec`.
+fn batch_project_with(buildspec: &str) -> Value {
+    merged(
+        json!({"source": {"type": "NO_SOURCE", "buildspec": buildspec}}),
+        batch_enabled(),
+    )
+}
+
+/// The build each of a batch's groups is running, and the earlier attempts that group
+/// retains, keyed by the group's identifier.
+fn group_attempts(batch: &Value) -> BTreeMap<String, (String, Vec<String>)> {
+    let arn_of = |summary: &Value| summary["arn"].as_str().unwrap_or_default().to_string();
+    batch["buildGroups"]
+        .as_array()
+        .map(|groups| {
+            groups
+                .iter()
+                .map(|group| {
+                    (
+                        group["identifier"].as_str().unwrap_or_default().to_string(),
+                        (
+                            arn_of(&group["currentBuildSummary"]),
+                            group["priorBuildSummaryList"]
+                                .as_array()
+                                .map(|prior| prior.iter().map(arn_of).collect())
+                                .unwrap_or_default(),
+                        ),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The build ids `ListBuildsForProject` reports for `project`.
+async fn listed_build_ids(router: &MultiServiceRouter, project: &str) -> Vec<String> {
+    let (status, body) = call(
+        router,
+        "ListBuildsForProject",
+        json!({"projectName": project}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "ListBuildsForProject {project:?}: expected 200, got {status} with {body}"
+    );
+    body["ids"]
+        .as_array()
+        .map(|ids| {
+            ids.iter()
+                .map(|id| id.as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// RULE: `RetryBuildBatch` restarts a FAILED batch build IN PLACE — the record keeps its
+/// id, its ARN and its `buildBatchNumber`, reports the run this call started
+/// (`IN_PROGRESS`, not complete, no end instant) and runs its build groups again: every
+/// group when the request asks for `RETRY_ALL_BUILDS` or names no `retryType`, and only
+/// the groups whose build did not succeed when it asks for `RETRY_FAILED_BUILDS`. A group
+/// that is run again carries a NEW build of the project and moves its earlier attempt into
+/// `priorBuildSummaryList`; one that is not keeps the build it already had.
+///
+/// The rows span the class: a batchspec that declares no build at all, a `build-list` whose
+/// builds disagree on their outcome, and a `build-graph` whose groups depend on each other,
+/// each with the `retryType` the request carries (absent, and both values of
+/// `RetryBuildBatchType`).
+#[tokio::test]
+async fn retry_build_batch_restarts_a_failed_batch_build_in_place() {
+    // The `retryType` values the rows below cover are the model's whole value set.
+    // Source: `RetryBuildBatchType` —
+    // smithy_query(query="shape",shape="RetryBuildBatchType",model_path="services/service-com-amazonaws-codebuild-codebuild-20161006/smithy-model/com-amazonaws-codebuild-codebuild-20161006.json")
+    // — as the generated value list carries it.
+    assert_eq!(
+        RETRY_BUILD_BATCH_TYPE_VALUES,
+        ["RETRY_ALL_BUILDS", "RETRY_FAILED_BUILDS"],
+        "the rows below cover every modelled retryType, got {RETRY_BUILD_BATCH_TYPE_VALUES:?}"
+    );
+    let failing_list = batch_list_spec(&[("good", "echo fine"), ("bad", "false")]);
+    // A graph whose leaf waits for a base that succeeds and then fails itself.
+    let failing_graph = "version: 0.2\nbatch:\n  \
+         build-graph:\n    \
+           - identifier: base\n      \
+             buildspec: |\n        \
+               version: 0.2\n        \
+               phases:\n          \
+                 build:\n            \
+                   commands:\n              \
+                     - echo base\n    \
+           - identifier: leaf\n      \
+             depends-on:\n        \
+               - base\n      \
+             buildspec: |\n        \
+               version: 0.2\n        \
+               phases:\n          \
+                 build:\n            \
+                   commands:\n              \
+                     - false\n"
+        .to_string();
+    // (case, the project's buildspec, the request's retryType, the identifiers whose build
+    // the retry must REPLACE)
+    let rows: Vec<(&str, String, Option<&str>, Vec<&str>)> = vec![
+        (
+            "a batchspec that declared no build at all",
+            "version: 0.2\nphases:\n  build:\n    commands:\n      - echo plain\n".to_string(),
+            None,
+            vec![],
+        ),
+        (
+            "a build-list, with no retryType",
+            failing_list.clone(),
+            None,
+            vec![state::SOURCE_DOWNLOAD_IDENTIFIER, "good", "bad"],
+        ),
+        (
+            "a build-list, RETRY_ALL_BUILDS",
+            failing_list.clone(),
+            Some("RETRY_ALL_BUILDS"),
+            vec![state::SOURCE_DOWNLOAD_IDENTIFIER, "good", "bad"],
+        ),
+        (
+            "a build-list, RETRY_FAILED_BUILDS",
+            failing_list,
+            Some("RETRY_FAILED_BUILDS"),
+            vec!["bad"],
+        ),
+        (
+            "a build-graph, RETRY_FAILED_BUILDS",
+            failing_graph.clone(),
+            Some("RETRY_FAILED_BUILDS"),
+            vec!["leaf"],
+        ),
+        (
+            "a build-graph, RETRY_ALL_BUILDS",
+            failing_graph,
+            Some("RETRY_ALL_BUILDS"),
+            vec![state::SOURCE_DOWNLOAD_IDENTIFIER, "base", "leaf"],
+        ),
+    ];
+
+    for (index, (case, buildspec, retry_type, replaced)) in rows.into_iter().enumerate() {
+        // A fresh emulator per row: a row's state must not depend on the one before.
+        let router = emulator();
+        let project = format!("retry-batch-{index}");
+        create_project(&router, &project, batch_project_with(&buildspec)).await;
+        let started = start_build_batch(&router, json!({"projectName": project})).await;
+        let id = started["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: the batch build carries an id, got {started}"))
+            .to_string();
+
+        // Only a batch build that has failed can be retried, so every row waits for the
+        // outcome the clock owes this one before it asks.
+        let failed = settled_build_batch(&router, &id).await;
+        assert_ne!(
+            failed["buildBatchStatus"],
+            json!("SUCCEEDED"),
+            "case {case:?}: the batch must have failed to be retryable, got {failed}"
+        );
+        let before = group_attempts(&failed);
+        let builds_before = listed_build_ids(&router, &project).await;
+
+        let mut request = json!({"id": id.clone()});
+        if let (Value::Object(members), Some(retry_type)) = (&mut request, retry_type) {
+            members.insert("retryType".to_string(), json!(retry_type));
+        }
+        let (status, body) = call(&router, "RetryBuildBatch", request.clone()).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: {request}: expected 200, got {status} with {body}"
+        );
+        let retried = body["buildBatch"].clone();
+
+        // The identity the batch already had: a retry restarts THAT batch build.
+        assert_eq!(
+            retried["id"],
+            json!(id),
+            "case {case:?}: the retry restarts the same batch build, got {retried}"
+        );
+        assert_eq!(
+            retried["arn"], failed["arn"],
+            "case {case:?}: the restarted batch keeps its ARN, got {retried}"
+        );
+        assert_eq!(
+            retried["buildBatchNumber"], failed["buildBatchNumber"],
+            "case {case:?}: the restarted batch keeps its buildBatchNumber, got {retried}"
+        );
+        assert_eq!(
+            retried["projectName"], failed["projectName"],
+            "case {case:?}: the restarted batch is still a batch of its project, got {retried}"
+        );
+        // And the run this call started.
+        assert_eq!(
+            retried["buildBatchStatus"],
+            json!("IN_PROGRESS"),
+            "case {case:?}: a restarted batch build is IN_PROGRESS, got {retried}"
+        );
+        assert_eq!(
+            retried["complete"],
+            json!(false),
+            "case {case:?}: a restarted batch build is not complete, got {retried}"
+        );
+        assert!(
+            retried["endTime"].is_null(),
+            "case {case:?}: a restarted batch build has not ended, got {retried}"
+        );
+        assert_eq!(
+            retried["currentPhase"],
+            json!("DOWNLOAD_BATCHSPEC"),
+            "case {case:?}: a restarted batch fetches its batchspec first, got {retried}"
+        );
+
+        // A retry restarts the batch rather than minting a second one.
+        let (_, listed) = call(
+            &router,
+            "ListBuildBatchesForProject",
+            json!({"projectName": project}),
+        )
+        .await;
+        assert_eq!(
+            listed["ids"].as_array().map(Vec::as_slice),
+            Some([json!(id.clone())].as_slice()),
+            "case {case:?}: the project must still hold exactly that one batch build, \
+             got {listed}"
+        );
+
+        let after = group_attempts(&retried);
+        assert_eq!(
+            after.keys().collect::<Vec<_>>(),
+            before.keys().collect::<Vec<_>>(),
+            "case {case:?}: the retry runs the groups the batch already had, got {retried}"
+        );
+        if before.is_empty() {
+            assert!(
+                retried["buildGroups"].is_null(),
+                "case {case:?}: a batch that declared no build carries no group, got {retried}"
+            );
+        }
+        for (identifier, (arn_before, prior_before)) in &before {
+            let (arn_after, prior_after) = after
+                .get(identifier)
+                .unwrap_or_else(|| panic!("case {case:?}: group {identifier:?} is reported"));
+            if replaced.contains(&identifier.as_str()) {
+                assert_ne!(
+                    arn_after, arn_before,
+                    "case {case:?}: group {identifier:?} must run a NEW build, got {arn_after}"
+                );
+                let expected_prior: Vec<String> = prior_before
+                    .iter()
+                    .cloned()
+                    .chain([arn_before.clone()])
+                    .collect();
+                assert_eq!(
+                    prior_after, &expected_prior,
+                    "case {case:?}: group {identifier:?} retains its earlier attempt, \
+                     got {prior_after:?}"
+                );
+                // The ARN the group now names resolves to a real build of this project,
+                // which belongs to this batch.
+                let (_, builds) = call(&router, "BatchGetBuilds", json!({"ids": [arn_after]})).await;
+                let build = builds["builds"][0].clone();
+                assert_eq!(
+                    build["arn"],
+                    json!(arn_after),
+                    "case {case:?}: group {identifier:?}'s new build must be retrievable, \
+                     got {builds}"
+                );
+                assert_eq!(
+                    build["projectName"],
+                    json!(project),
+                    "case {case:?}: group {identifier:?}'s new build is a build of the \
+                     project, got {build}"
+                );
+                assert_eq!(
+                    build["buildBatchArn"], retried["arn"],
+                    "case {case:?}: group {identifier:?}'s new build names the batch it \
+                     belongs to, got {build}"
+                );
+                assert!(
+                    build["buildNumber"].is_number(),
+                    "case {case:?}: group {identifier:?}'s new build takes a build number \
+                     of its project, got {build}"
+                );
+            } else {
+                assert_eq!(
+                    arn_after, arn_before,
+                    "case {case:?}: group {identifier:?} was not retried, so it keeps the \
+                     build it had, got {arn_after}"
+                );
+                assert_eq!(
+                    prior_after, prior_before,
+                    "case {case:?}: group {identifier:?} was not retried, so its earlier \
+                     attempts are unchanged, got {prior_after:?}"
+                );
+            }
+        }
+
+        // One new build per group the retry ran, and every build of the earlier attempt is
+        // still retained — the summaries that name them must resolve.
+        let builds_after = listed_build_ids(&router, &project).await;
+        assert_eq!(
+            builds_after.len(),
+            builds_before.len() + replaced.len(),
+            "case {case:?}: expected one new build per retried group, got {builds_after:?}"
+        );
+        assert!(
+            builds_before
+                .iter()
+                .all(|held| builds_after.contains(held)),
+            "case {case:?}: the builds of the earlier attempt are retained, got {builds_after:?}"
+        );
+
+        // What a later read reports is the record the retry wrote, not a per-call answer:
+        // the groups it published are the ones the store now holds.
+        let read = get_build_batch(&router, &id).await;
+        assert_eq!(
+            read["id"],
+            json!(id),
+            "case {case:?}: the stored batch build is the one the retry restarted, got {read}"
+        );
+        assert_eq!(
+            group_attempts(&read)
+                .iter()
+                .map(|(identifier, (arn, _))| (identifier.clone(), arn.clone()))
+                .collect::<Vec<_>>(),
+            after
+                .iter()
+                .map(|(identifier, (arn, _))| (identifier.clone(), arn.clone()))
+                .collect::<Vec<_>>(),
+            "case {case:?}: the stored batch runs the builds the retry started, got {read}"
+        );
+
+        // And the restarted batch reaches an outcome of its own, like any other run.
+        let settled = settled_build_batch(&router, &id).await;
+        assert_eq!(
+            settled["complete"],
+            json!(true),
+            "case {case:?}: the restarted batch build completes, got {settled}"
+        );
+    }
+}
+
+/// RULE: "only batch builds that have failed can be retried" — a batch build that is still
+/// running and one that SUCCEEDED are both refused with the modelled
+/// `InvalidInputException`, an identifier naming no batch build of this account with the
+/// modelled `ResourceNotFoundException`, and a request naming no batch build at all with
+/// the modelled `InvalidInputException`. A refused retry changes nothing.
+#[tokio::test]
+async fn retry_build_batch_refuses_a_batch_build_it_cannot_restart() {
+    /// What the retry names, and so what it must answer.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Target {
+        /// A batch build whose builds have not finished: it has not failed yet.
+        StillRunning,
+        /// A batch build every build of which succeeded.
+        Succeeded,
+        /// A well-formed batch build id nothing started.
+        Unknown,
+        /// A batch build that was deleted after it failed.
+        Deleted,
+        /// A failed batch build whose project has since been deleted.
+        ProjectGone,
+        /// A request carrying no `id` at all.
+        Unnamed,
+        /// A request whose `retryType` is outside the modelled value set.
+        UnmodelledRetryType,
+    }
+
+    // A chain of groups, each waiting for the one before it: the batch is paced one span
+    // per level, so a batch of this shape is still running when the next call arrives with
+    // generous room to spare.
+    let chained: Vec<(String, String)> = (0..4_usize)
+        .map(|step| (format!("step{step}"), format!("step{}", step.saturating_sub(1))))
+        .collect();
+    let mut chain_spec = String::from("version: 0.2\nbatch:\n  build-graph:\n");
+    for (index, (identifier, parent)) in chained.iter().enumerate() {
+        chain_spec.push_str(&format!("    - identifier: {identifier}\n"));
+        if index > 0 {
+            chain_spec.push_str(&format!("      depends-on:\n        - {parent}\n"));
+        }
+    }
+    chain_spec.push_str("phases:\n  build:\n    commands:\n      - false\n");
+
+    let targets = [
+        Target::StillRunning,
+        Target::Succeeded,
+        Target::Unknown,
+        Target::Deleted,
+        Target::ProjectGone,
+        Target::Unnamed,
+        Target::UnmodelledRetryType,
+    ];
+    for (index, target) in targets.into_iter().enumerate() {
+        let router = emulator();
+        let project = format!("retry-refuse-{index}");
+        let buildspec = match target {
+            // Every group succeeds, so the batch succeeds.
+            Target::Succeeded => batch_list_spec(&[("good", "echo fine")]),
+            Target::StillRunning => chain_spec.clone(),
+            _ => batch_list_spec(&[("bad", "false")]),
+        };
+        create_project(&router, &project, batch_project_with(&buildspec)).await;
+        let started = start_build_batch(&router, json!({"projectName": project})).await;
+        let id = started["id"].as_str().expect("a batch id").to_string();
+        let arn = started["arn"].as_str().expect("a batch ARN").to_string();
+
+        if target != Target::StillRunning {
+            let settled = settled_build_batch(&router, &id).await;
+            let succeeded = settled["buildBatchStatus"] == json!("SUCCEEDED");
+            assert_eq!(
+                succeeded,
+                target == Target::Succeeded,
+                "case {target:?}: the row needs the other outcome, got {settled}"
+            );
+        }
+        if target == Target::Deleted {
+            let (status, body) = call(&router, "DeleteBuildBatch", json!({"id": id.clone()})).await;
+            assert_eq!(
+                status, 200,
+                "case {target:?}: DeleteBuildBatch expected 200, got {status} with {body}"
+            );
+        }
+        if target == Target::ProjectGone {
+            let (status, body) = call(&router, "DeleteProject", json!({"name": project})).await;
+            assert_eq!(
+                status, 200,
+                "case {target:?}: DeleteProject expected 200, got {status} with {body}"
+            );
+        }
+
+        let requested_id = match target {
+            Target::Unknown => format!("{project}:00000000-0000-8000-8000-000000000001"),
+            _ => id.clone(),
+        };
+        let (expected_error, expected_message) = match target {
+            Target::StillRunning => (
+                "InvalidInputException",
+                format!("Cannot retry BuildBatch {arn}, as it is still in progress"),
+            ),
+            Target::Succeeded => (
+                "InvalidInputException",
+                format!("Cannot retry BuildBatch {arn}, as it did not fail"),
+            ),
+            Target::Unknown | Target::Deleted => (
+                "ResourceNotFoundException",
+                format!("BuildBatch cannot be found: {requested_id}"),
+            ),
+            Target::ProjectGone => (
+                "ResourceNotFoundException",
+                format!("Project cannot be found: {}", expected_arn(&format!("project/{project}"))),
+            ),
+            Target::Unnamed => (
+                "InvalidInputException",
+                "Value at 'id' failed to satisfy constraint: Member must not be null".to_string(),
+            ),
+            // `retryType` is the modelled enum `RetryBuildBatchType`, so a value outside
+            // its set is refused by the shared constraint envelope before the handler
+            // runs — the retry is never performed for one.
+            Target::UnmodelledRetryType => (
+                "InvalidInputException",
+                format!(
+                    "1 validation error detected: Value '{UNMODELLED_RETRY_TYPE}' at \
+                     'retryType' failed to satisfy constraint: Member must satisfy enum \
+                     value set: [{}]",
+                    RETRY_BUILD_BATCH_TYPE_VALUES.join(", ")
+                ),
+            ),
+        };
+        let request = match target {
+            Target::Unnamed => json!({}),
+            Target::UnmodelledRetryType => {
+                json!({"id": requested_id.clone(), "retryType": UNMODELLED_RETRY_TYPE})
+            }
+            _ => json!({"id": requested_id.clone()}),
+        };
+
+        let (status, body) = call(&router, "RetryBuildBatch", request.clone()).await;
+        assert_eq!(
+            status, 400,
+            "case {target:?}: {request}: expected 400, got {status} with {body}"
+        );
+        assert_eq!(
+            error_type(&body),
+            expected_error,
+            "case {target:?}: expected {expected_error}, got {body}"
+        );
+        assert_eq!(
+            body["message"],
+            json!(expected_message),
+            "case {target:?}: expected the refusal to state why, got {body}"
+        );
+
+        // EFFECT ABSENT: a refused retry starts no build and leaves the batch build it
+        // named exactly as it was. The project-deleted row lists nothing, because the
+        // project whose builds would be listed is gone.
+        if target != Target::ProjectGone {
+            let builds = listed_build_ids(&router, &project).await;
+            let expected_builds = match target {
+                // Deleting a batch build deletes the builds it is made of.
+                Target::Deleted => 0,
+                Target::StillRunning => chained.len() + 1,
+                _ => 2,
+            };
+            assert_eq!(
+                builds.len(),
+                expected_builds,
+                "case {target:?}: a refused retry starts no build, got {builds:?}"
+            );
+        }
+        if matches!(
+            target,
+            Target::StillRunning | Target::Succeeded | Target::UnmodelledRetryType
+        ) {
+            let read = get_build_batch(&router, &id).await;
+            assert_eq!(
+                read["buildBatchNumber"], started["buildBatchNumber"],
+                "case {target:?}: the batch build the retry refused is unchanged, got {read}"
+            );
+            assert_eq!(
+                group_attempts(&read)
+                    .values()
+                    .flat_map(|(_, prior)| prior.clone())
+                    .count(),
+                0,
+                "case {target:?}: a refused retry retains no earlier attempt, got {read}"
+            );
+        }
+    }
+}
+
+/// RULE: a `RetryBuildBatch` idempotency token is in force for the window AWS documents —
+/// a repeat of the SAME request inside it resolves to the batch build the first call
+/// restarted and starts no further build, while the same token carrying a CHANGED request
+/// is the parameter mismatch AWS documents rather than a second restart.
+#[tokio::test]
+async fn a_retry_build_batch_idempotency_token_restarts_the_batch_once() {
+    let router = emulator();
+    let project = "retry-batch-token";
+    create_project(
+        &router,
+        project,
+        batch_project_with(&batch_list_spec(&[("good", "echo fine"), ("bad", "false")])),
+    )
+    .await;
+    let started = start_build_batch(&router, json!({"projectName": project})).await;
+    let id = started["id"].as_str().expect("a batch id").to_string();
+    settled_build_batch(&router, &id).await;
+
+    let request = json!({
+        "id": id.clone(),
+        "retryType": "RETRY_FAILED_BUILDS",
+        "idempotencyToken": "retry-batch-token-1",
+    });
+    let (status, first) = call(&router, "RetryBuildBatch", request.clone()).await;
+    assert_eq!(
+        status, 200,
+        "the first retry: expected 200, got {status} with {first}"
+    );
+    let groups = group_attempts(&first["buildBatch"]);
+    let builds_after_first = listed_build_ids(&router, project).await;
+
+    let (status, repeated) = call(&router, "RetryBuildBatch", request).await;
+    assert_eq!(
+        status, 200,
+        "the repeat: expected 200, got {status} with {repeated}"
+    );
+    assert_eq!(
+        repeated["buildBatch"]["id"],
+        json!(id),
+        "the repeat resolves to the batch build the first call restarted, got {repeated}"
+    );
+    assert_eq!(
+        group_attempts(&repeated["buildBatch"])
+            .iter()
+            .map(|(identifier, (arn, _))| (identifier.clone(), arn.clone()))
+            .collect::<Vec<_>>(),
+        groups
+            .iter()
+            .map(|(identifier, (arn, _))| (identifier.clone(), arn.clone()))
+            .collect::<Vec<_>>(),
+        "the repeat must not restart the batch a second time, got {repeated}"
+    );
+    assert_eq!(
+        listed_build_ids(&router, project).await,
+        builds_after_first,
+        "the repeat must start no further build"
+    );
+
+    // The same token with a changed parameter is a refusal, not a second restart.
+    let (status, mismatched) = call(
+        &router,
+        "RetryBuildBatch",
+        json!({
+            "id": id.clone(),
+            "retryType": "RETRY_ALL_BUILDS",
+            "idempotencyToken": "retry-batch-token-1",
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "the changed repeat: expected 400, got {status} with {mismatched}"
+    );
+    assert_eq!(
+        error_type(&mismatched),
+        "InvalidInputException",
+        "the changed repeat: expected InvalidInputException, got {mismatched}"
+    );
+    assert_eq!(
+        mismatched["message"],
+        json!(
+            "Parameter mismatch: idempotencyToken was already used for a RetryBuildBatch \
+             request with different parameters"
+        ),
+        "the changed repeat: expected the parameter-mismatch sentence, got {mismatched}"
+    );
+    assert_eq!(
+        listed_build_ids(&router, project).await,
+        builds_after_first,
+        "a refused repeat must start no further build"
     );
 }

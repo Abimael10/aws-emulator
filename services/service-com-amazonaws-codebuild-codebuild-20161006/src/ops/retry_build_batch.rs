@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RetryBuildBatch
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RetryBuildBatch`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RetryBuildBatch::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Restarts a failed batch build: runs the STORED batch again, in place — the record
+//! keeps its identity and its configuration, and every build group runs a new build of
+//! the project, or only the groups that did not succeed, as `retryType` asks. This is the
+//! ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +139,433 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RetryBuildBatch` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RetryBuildBatchErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RetryBuildBatch"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "RetryBuildBatch (this engine carries no CodeBuild state)",
+            ));
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        // "Restarts a failed batch build": the batch this call starts was started by
+        // whoever called THIS operation, not by whoever started the batch it retries.
+        let initiator = crate::state::request_initiator(ctx.parts());
+        let now = crate::state::now_millis();
+        // The request as sent, hashed to a fixed size, so a repeat carrying the same
+        // idempotency token can be told apart from one that changed a parameter without
+        // retaining a request-sized value per token.
+        let fingerprint = crate::state::request_fingerprint(&format!("{input:?}"));
+
+        // The model puts no `@required` on `id`, so the boundary validator lets a request
+        // without one through: "Specifies the identifier of the batch build to restart" is
+        // the whole request, and there is no batch build to restart without it, so it is
+        // refused here naming the member.
+        let Some(batch_id) = input.id.clone() else {
+            return Err(invalid_input(
+                "Value at 'id' failed to satisfy constraint: Member must not be null".to_string(),
+            ));
+        };
+
+        // The runs the clock owes are performed BEFORE the critical section, from here,
+        // where the object store those runs reach can be reached: the record this retry is
+        // derived from — and whose outcome decides whether it HAS failed — is the one the
+        // clock already owes.
+        crate::state::settle_due_builds(ctx.callback(), &*self.engine, &state, &region).await;
+        // ONE critical section: reading the batch to retry, allocating the new batch's
+        // number and its builds' numbers, publishing its groups and recording the token
+        // have to be atomic with respect to each other, and none of the work between them
+        // is caller-sized.
+        let mut guard = state.lock();
+
+        // Read through `settled_build_batch`, so the batch this retry is derived from is
+        // the one the clock already owes: a batch whose span has elapsed is reported, and
+        // retried, as finished. The batch record is the authority on whether there is
+        // anything to restart — a request naming one this account holds no record of is
+        // answered on the BATCH, whatever its id's project half says.
+        let Some(retried) = guard
+            .settled_build_batch(&batch_id, now)
+            .map(|stored| stored.build_batch.clone())
+        else {
+            return Err(build_batch_not_found(&batch_id));
+        };
+
+        // Every batch build this service mints belongs to a project: that project is what
+        // a retry runs again and what a later `ListBuildBatchesForProject` finds the batch
+        // by. Unreachable by construction for a record this service wrote; it is here so a
+        // record without one cannot be restarted into builds that belong to nothing.
+        let Some(project_name) = retried.project_name.clone() else {
+            return Err(invalid_input(format!(
+                "BuildBatch {batch_id} is not associated with a build project and cannot \
+                 be retried"
+            )));
+        };
+        // A retry runs the project's batch build again, so there has to be a project to
+        // run: a batch build outlives the project it belongs to (AWS documents that
+        // deleting a project leaves its build records), and there is nothing to build
+        // again once that project is gone.
+        if !guard.projects.contains_key(&project_name) {
+            return Err(project_not_found(&crate::state::project_arn(
+                &region,
+                &project_name,
+            )));
+        }
+
+        // The token is resolved and recorded in `RetryBuildBatch`'s OWN store, so a token
+        // a `StartBuildBatch` issued never resolves a retry and vice versa. Resolved after
+        // the batch and project checks — a request naming a batch this service holds no
+        // record of is answered on what it asked for, not on a token it carried — and
+        // BEFORE the state the retry itself puts the batch into is judged below: a repeat
+        // carrying a token in force is the same request, so it resolves to the batch the
+        // first call restarted rather than being refused for having restarted it.
+        let token_key = input
+            .idempotency_token
+            .clone()
+            .map(|token| (project_name.clone(), token));
+        if let Some(build_batch) = guard
+            .resolve_build_batch_idempotency_token(
+                crate::state::BuildBatchTokenStore::RetryBuildBatch,
+                token_key.as_ref(),
+                &fingerprint,
+                now,
+            )
+            .map_err(|_| parameter_mismatch())?
+        {
+            return Ok(RetryBuildBatchOutput {
+                build_batch: Some(build_batch),
+            });
+        }
+
+        // "Only batch builds that have failed can be retried": a batch that is still
+        // running has not failed yet, and one that reached `SUCCEEDED` never did, so
+        // neither is a batch this call may restart. The refusal names the batch by its own
+        // ARN — the one the record carries, or the one this service forms for that id in
+        // the region the call was signed for — which is how
+        // `crate::ops::delete_build_batch` names the batch build it would not act on.
+        let arn = retried
+            .arn
+            .clone()
+            .unwrap_or_else(|| crate::state::build_batch_arn(&region, &batch_id));
+        if !retried.complete {
+            return Err(invalid_input(format!(
+                "Cannot retry BuildBatch {arn}, as it is still in progress"
+            )));
+        }
+        if retried.build_batch_status.as_deref() == Some(crate::state::BUILD_STATUS_SUCCEEDED) {
+            return Err(invalid_input(format!(
+                "Cannot retry BuildBatch {arn}, as it did not fail"
+            )));
+        }
+
+        // Which builds the batch is made of is declared by the `batch` section of the
+        // buildspec the batch RAN WITH, which the retried batch's own record carries: a
+        // retry runs that batchspec again, exactly as `RetryBuild` runs the settings the
+        // retried build had resolved rather than re-reading the project. It is the same
+        // text the start was held to, so the fan-out is bounded by the ceiling that start
+        // already applied to it (`crate::state::MAX_BATCH_BUILD_GROUPS`).
+        let declarations = crate::state::batch_build_declarations(
+            retried
+                .source
+                .as_ref()
+                .and_then(|source| source.buildspec.as_deref())
+                .unwrap_or_default(),
+        );
+        let fan_out = crate::state::batch_fan_out(&declarations);
+        // `retryType` "specifies the type of retry to perform": `RETRY_FAILED_BUILDS` runs
+        // only the builds that did not succeed. It is a modelled enum, so a value outside
+        // its set never reaches this handler (the boundary validator refuses it with the
+        // shared constraint envelope); what arrives is one of the two values or nothing,
+        // and a request that names none restarts the batch's builds all together.
+        let failed_builds_only = input.retry_type.as_deref() == Some(RETRY_FAILED_BUILDS);
+
+        // Where the builds of this batch upload their output: the destinations the batch
+        // being retried ran with ([`retried_destinations`]).
+        let (configured_artifacts, configured_secondary_artifacts) =
+            retried_destinations(&guard, &retried, &project_name);
+        // The destination as each build of the batch REPORTS it, which the retried batch's
+        // own record already carries in that form.
+        let group_artifacts = crate::state::GroupArtifacts {
+            primary: retried.artifacts.clone(),
+            secondary: retried.secondary_artifacts.clone(),
+        };
+
+        // The SAME batch build, restarted: recorded behaviour of `RetryBuildBatch` is that
+        // a retry runs the batch again IN PLACE, so the record keeps the id, the ARN and
+        // the `buildBatchNumber` it already had — which is also what makes
+        // `BuildGroup$priorBuildSummaryList` the place a group's earlier attempt goes —
+        // and reports the run this call started.
+        let mut build_batch = BuildBatch {
+            start_time: Some(crate::state::datetime(now)),
+            end_time: None,
+            // A batch build's first act after being submitted is to fetch the batch build
+            // specification from the project's source.
+            current_phase: Some("DOWNLOAD_BATCHSPEC".to_string()),
+            build_batch_status: Some("IN_PROGRESS".to_string()),
+            // Nothing clones a repository here, so the retry has no resolved revision of
+            // its own yet.
+            resolved_source_version: None,
+            phases: Some(crate::state::in_progress_batch_phases(now)),
+            complete: false,
+            initiator: Some(initiator),
+            // Published below, once the builds this batch runs have been minted.
+            build_groups: None,
+            // Produced by merging the reports of the builds in the batch, of which this
+            // batch has produced none yet.
+            report_arns: None,
+            // Every other member comes from the retried batch's own record — the
+            // configuration it resolved when it was started, which is what "restarts a
+            // failed batch build" runs again — never from this request, which carries no
+            // configuration at all.
+            ..retried.clone()
+        };
+
+        // The retry FANS OUT exactly as the start did: one build per group the batchspec
+        // declares, behind the source download the batch runs for itself, each a build of
+        // this project that `BatchGetBuilds` resolves on its own and that carries this
+        // batch's ARN back. A group the retry does not run again keeps the build it
+        // already has.
+        let mut build_groups: Vec<BuildGroup> = Vec::with_capacity(fan_out.planned.len());
+        let mut group_builds: Vec<(String, crate::state::StoredBuild)> =
+            Vec::with_capacity(fan_out.planned.len());
+        for (declaration, level) in &fan_out.planned {
+            let previous = retried_group(&retried, &declaration.identifier);
+            // `RETRY_FAILED_BUILDS` retries only what failed, so a group whose build
+            // SUCCEEDED is not run again: the batch keeps reporting that build as the
+            // group's current one, and nothing is started for it.
+            if failed_builds_only {
+                if let Some(succeeded) = previous.filter(|group| group_succeeded(group)) {
+                    build_groups.push(succeeded.clone());
+                    continue;
+                }
+            }
+            let build_number = guard.allocate_build_number(&project_name);
+            let build_id = format!(
+                "{project_name}:{}",
+                crate::state::build_uuid(&project_name, build_number, now)
+            );
+            let build = crate::state::batch_group_build(
+                &build_batch,
+                &group_artifacts,
+                declaration,
+                &build_id,
+                &region,
+                build_number,
+                now,
+            );
+            build_groups.push(BuildGroup {
+                identifier: Some(declaration.identifier.clone()),
+                // Always stated, `[]` for a group that waits for nothing: a client reading
+                // the graph off the answer must find a list there.
+                depends_on: Some(declaration.depends_on.clone()),
+                ignore_failure: declaration.ignore_failure,
+                current_build_summary: Some(BuildSummary {
+                    arn: build.arn.clone(),
+                    requested_on: Some(crate::state::datetime(now)),
+                    build_status: build.build_status.clone(),
+                    // Resolved from the artifacts the build deployed, of which a build that
+                    // has not finished has deployed none.
+                    primary_artifact: None,
+                    secondary_artifacts: None,
+                }),
+                // "Summaries of previous build groups": the attempts this group has
+                // already had — the retried batch's own attempt of it, behind the ones
+                // that batch had itself retained.
+                prior_build_summary_list: Some(prior_summaries(previous)),
+            });
+            group_builds.push((
+                build_id,
+                crate::state::StoredBuild {
+                    build,
+                    start_millis: now,
+                    settle_due_millis: crate::state::batch_group_settle_due_millis(now, *level),
+                    artifacts: configured_artifacts.clone(),
+                    secondary_artifacts: configured_secondary_artifacts.clone(),
+                    run_claimed: false,
+                },
+            ));
+        }
+        // A batch whose specification declared nothing carries no build group at all,
+        // rather than an empty one: there was no batchspec to fan out.
+        if !build_groups.is_empty() {
+            build_batch.build_groups = Some(build_groups);
+        }
+        for (build_id, stored) in group_builds {
+            guard.insert_build(build_id, stored);
+        }
+
+        // The restarted record goes back under the id it already had, IN PLACE: the batch
+        // keeps its one entry in the project's batch index, so no later read reports it
+        // twice, and `start_millis` / `settle_due_millis` are those of the run this call
+        // started.
+        let Some(stored) = guard.build_batches.get_mut(&batch_id) else {
+            // Unreachable: the record was read above under this very guard, which has not
+            // been released since. It is answered rather than assumed, so no success is
+            // reported for a restart nothing persisted.
+            return Err(build_batch_not_found(&batch_id));
+        };
+        stored.build_batch = build_batch.clone();
+        stored.start_millis = now;
+        // The same chosen span the start of a batch uses, once per level of the batch's
+        // dependency graph and once more for the batch's own completion: this batch's move
+        // out of `IN_PROGRESS` falls due at this instant whether or not anybody calls
+        // again, and is never slept on.
+        stored.settle_due_millis =
+            now + crate::state::BUILD_SETTLE_MILLIS * i64::try_from(fan_out.spans).unwrap_or(1);
+        if let Some(key) = token_key {
+            guard.record_retry_build_batch_token(
+                key,
+                crate::state::StartBuildToken {
+                    build_id: batch_id.clone(),
+                    request_fingerprint: fingerprint,
+                    issued_millis: now,
+                },
+                now,
+            );
+        }
+        drop(guard);
+
+        // The lock is dropped before the audit record is written, so a log consumer can
+        // never hold this service's state. Recorded the way `crate::ops::stop_build_batch`
+        // records the other call that changes a stored batch build's course: which
+        // operation changed what.
+        crate::state::audit(
+            Self::NAME,
+            ctx.parts(),
+            crate::state::AuditOutcome::BuildBatchRetried,
+            Some(&batch_id),
+        );
+
+        Ok(RetryBuildBatchOutput {
+            build_batch: Some(build_batch),
+        })
     }
+}
+
+/// The `retryType` that narrows a retry to the builds of the batch that did not succeed.
+///
+/// Source: `RetryBuildBatchType`'s values, which the generated
+/// [`crate::ops::types::RETRY_BUILD_BATCH_TYPE_VALUES`] carries —
+/// `smithy_query(query="shape",shape="RetryBuildBatchType",model_path="services/service-com-amazonaws-codebuild-codebuild-20161006/smithy-model/com-amazonaws-codebuild-codebuild-20161006.json")`
+/// — whose other value, `RETRY_ALL_BUILDS`, is what every group running again is.
+const RETRY_FAILED_BUILDS: &str = "RETRY_FAILED_BUILDS";
+
+/// The build group of `retried` that ran for `identifier`, when the batch carried one.
+fn retried_group<'batch>(
+    retried: &'batch BuildBatch,
+    identifier: &str,
+) -> Option<&'batch BuildGroup> {
+    retried
+        .build_groups
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .find(|group| group.identifier.as_deref() == Some(identifier))
+}
+
+/// Whether the build `group` names SUCCEEDED, which is the group a retry of only the
+/// failed builds leaves alone.
+fn group_succeeded(group: &BuildGroup) -> bool {
+    group
+        .current_build_summary
+        .as_ref()
+        .and_then(|summary| summary.build_status.as_deref())
+        == Some(crate::state::BUILD_STATUS_SUCCEEDED)
+}
+
+/// The earlier attempts of one build group, as the restarted batch's group reports them:
+/// everything the group had retained, and then the attempt it was running until now —
+/// oldest first, so the list reads in the order the attempts ran.
+///
+/// Bounded by [`crate::state::MAX_PRIOR_BUILD_SUMMARIES`], keeping the most recent
+/// attempts: each retry would otherwise add one entry per group without end.
+fn prior_summaries(previous: Option<&BuildGroup>) -> Vec<BuildSummary> {
+    let Some(group) = previous else {
+        return Vec::new();
+    };
+    let mut summaries: Vec<BuildSummary> = group
+        .prior_build_summary_list
+        .clone()
+        .unwrap_or_default();
+    summaries.extend(group.current_build_summary.clone());
+    let retained = summaries.len().min(crate::state::MAX_PRIOR_BUILD_SUMMARIES);
+    summaries.split_off(summaries.len() - retained)
+}
+
+/// Where the builds of the retried batch uploaded their output, which is where the builds
+/// this retry starts upload theirs: a retry runs the batch again, so it deploys to the
+/// destination that batch was started with.
+///
+/// Read off the build records of the retried batch's own groups, which is where the
+/// destination's configured form is kept ([`crate::state::StoredBuild::artifacts`]) — the
+/// batch's own record reports a destination rather than configuring one, and the two are
+/// not the same shape. A batch none of whose builds is still retained falls back to the
+/// project's own configured destinations, which is where a build of that project uploads.
+fn retried_destinations(
+    state: &crate::state::ComAmazonawsCodebuildCodebuild20161006State,
+    retried: &BuildBatch,
+    project_name: &str,
+) -> (Option<ProjectArtifacts>, Vec<ProjectArtifacts>) {
+    let summaries = retried
+        .build_groups
+        .iter()
+        .flatten()
+        .filter_map(|group| group.current_build_summary.as_ref());
+    for summary in summaries {
+        let held = summary
+            .arn
+            .as_deref()
+            .and_then(crate::state::build_id_from_arn)
+            .and_then(|build_id| state.builds.get(build_id));
+        if let Some(stored) = held {
+            return (stored.artifacts.clone(), stored.secondary_artifacts.clone());
+        }
+    }
+    let project = state.projects.get(project_name);
+    (
+        project.and_then(|stored| stored.project.artifacts.clone()),
+        project
+            .and_then(|stored| stored.project.secondary_artifacts.clone())
+            .unwrap_or_default(),
+    )
+}
+
+/// No batch build of this account answers to that identifier, so there is nothing to
+/// restart.
+///
+/// The absent resource is named by its MODELLED shape name, `BuildBatch`, and then by the
+/// identifier the request gave, exactly as given — recorded behaviour of this operation,
+/// and the same shape of sentence `crate::ops::retry_build` answers for the single build.
+fn build_batch_not_found(id: &str) -> RetryBuildBatchError {
+    RetryBuildBatchErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("BuildBatch cannot be found: {id}")),
+    })
+    .into()
+}
+
+/// No project of that name is held, so the batch build this request names belongs to
+/// nothing that can be built again. The refusal names the project by its ARN, which is the
+/// wording CodeBuild records for the build-starting operations.
+fn project_not_found(project_arn: &str) -> RetryBuildBatchError {
+    RetryBuildBatchErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("Project cannot be found: {project_arn}")),
+    })
+    .into()
+}
+
+/// A refusal of the request itself, as this operation's one modelled error for it. Every
+/// sentence is stated by its caller.
+fn invalid_input(message: String) -> RetryBuildBatchError {
+    RetryBuildBatchErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The same idempotency token carrying a changed request, which AWS documents as a refusal
+/// rather than a second batch build: "If you repeat the RetryBuildBatch request with the
+/// same token, but change a parameter, CodeBuild returns a parameter mismatch error."
+fn parameter_mismatch() -> RetryBuildBatchError {
+    invalid_input(
+        "Parameter mismatch: idempotencyToken was already used for a RetryBuildBatch \
+         request with different parameters"
+            .to_string(),
+    )
 }
