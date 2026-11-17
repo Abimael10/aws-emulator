@@ -864,7 +864,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             region,
             cluster_name,
             daemon_name,
-            &format!("{:019}", self.next_daemon_deployment_seq),
+            &daemon_sequence_id(self.next_daemon_deployment_seq),
         )
     }
 

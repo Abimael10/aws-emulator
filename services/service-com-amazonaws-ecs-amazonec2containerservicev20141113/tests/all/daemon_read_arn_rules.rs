@@ -16,6 +16,10 @@
 //!   and one whose cluster this account holds no record of — as the invalid parameter it is
 //!   (`InvalidParameterException`, with the sentence the member's own read words), and keeps
 //!   the `failures` channel for an entry that COULD name one and names none;
+//! * the ID in the last segment of such an ARN is MINTED by the service, so how it is spelled
+//!   is no part of what makes the ARN an identifier: an entry of that shape under a cluster
+//!   this account holds is read as the resource it names whatever its id looks like, and an
+//!   id this store holds nothing under is one `MISSING` failure of its own entry;
 //! * a daemon write resolves the resources its own PARAMETERS name — the daemon task
 //!   definition first, then the capacity providers — before the cluster and the daemon its
 //!   `daemonArn` identifies, so a request naming a task definition that does not exist is
@@ -276,10 +280,13 @@ async fn a_daemon_read_refuses_an_arn_that_could_identify_no_resource_of_this_ac
     for (operation, member, resource_type, expected) in ARN_LIST_READS {
         // The rows differ along WHAT about the ARN makes it name nothing: its not being an
         // ARN, its partition/vendor fields, its resource type, how many segments its
-        // resource path carries, the character set of the names in it, the form of the id,
-        // and the cluster it carries. The last row pairs an unusable entry with a usable
-        // one, so the refusal is of the REQUEST and not of one entry's own report.
-        let rows: [(&str, Value); 12] = [
+        // resource path carries, the character set of the names in it, and the cluster it
+        // carries. How the ID is spelled is NOT one of them: the service mints it, so it is
+        // read as the identifier it is whatever it looks like
+        // ([`a_daemon_read_reads_an_id_it_holds_nothing_under_however_it_is_spelled`]). The
+        // last row pairs an unusable entry with a usable one, so the refusal is of the
+        // REQUEST and not of one entry's own report.
+        let rows: [(&str, Value); 11] = [
             ("a value that is no ARN at all", json!(["not-an-arn"])),
             (
                 "an ARN of another service",
@@ -326,10 +333,6 @@ async fn a_daemon_read_refuses_an_arn_that_could_identify_no_resource_of_this_ac
                     "{}/extra",
                     below_daemon(resource_type, CLUSTER, "agents", &sequence_id(1))
                 )]),
-            ),
-            (
-                "an id that is not the token these resources are numbered by",
-                json!([below_daemon(resource_type, CLUSTER, "agents", "latest")]),
             ),
             (
                 "a daemon name spelled outside the name rule",
@@ -574,4 +577,123 @@ async fn a_daemon_write_resolves_the_resources_its_parameters_name_before_the_da
         list(&body, "daemonSummariesList", CASE).is_empty(),
         "expected every refused write to store nothing, got {body}"
     );
+}
+
+/// The ARN of the rollout one daemon of `cluster` was created with, and the ARN of the
+/// revision that rollout is deploying — the two daemon-scoped ARNs this service MINTED, read
+/// back through the rollout's own report.
+async fn minted_daemon_arns(
+    router: &MultiServiceRouter,
+    cluster: &str,
+    provider: &str,
+    definition: &str,
+    case: &str,
+) -> (String, String) {
+    let (_, deployment) = create_daemon(
+        router,
+        cluster,
+        "agents",
+        provider,
+        definition,
+        case,
+    )
+    .await;
+    let body = ok(
+        router,
+        "DescribeDaemonDeployments",
+        json!({ "daemonDeploymentArns": [deployment.clone()] }),
+        case,
+    )
+    .await;
+    let reported = list(&body, "daemonDeployments", case);
+    let revision = string(
+        &reported
+            .first()
+            .unwrap_or_else(|| panic!("case {case:?}: expected the rollout, got {body}"))
+            ["targetDaemonRevision"],
+        "arn",
+        case,
+    );
+    (deployment, revision)
+}
+
+#[tokio::test]
+async fn a_daemon_read_reads_an_id_it_holds_nothing_under_however_it_is_spelled() {
+    let router = service();
+    const CLUSTER: &str = "daemon-arn-id-forms";
+    const CASE: &str = "setup";
+    create_cluster(&router, CLUSTER, CASE).await;
+    let provider = managed_provider(&router, CLUSTER, "mi-id-forms", CASE).await;
+    let definition = daemon_definition(&router, "daemonarnidforms", CASE).await;
+    let (deployment, revision) =
+        minted_daemon_arns(&router, CLUSTER, &provider, &definition, CASE).await;
+
+    for (operation, member, resource_type, _) in ARN_LIST_READS {
+        // The ARN this service minted for the resource, so every row below is answered by
+        // what the store holds under the id rather than by a read that reports nothing
+        // whatever it is asked.
+        let held = if resource_type == "daemon-deployment" {
+            deployment.clone()
+        } else {
+            revision.clone()
+        };
+        let reported = if resource_type == "daemon-deployment" {
+            ("daemonDeployments", "daemonDeploymentArn")
+        } else {
+            ("daemonRevisions", "daemonRevisionArn")
+        };
+
+        // The rows differ along HOW the id is spelled: a short decimal, the width this
+        // service renders its counter at, a minted id carrying a suffix, a hyphenated hex id
+        // of the form other Amazon ECS resources are named by, a word, and a long token.
+        // None of them is a fault of the request — each is an id of this account's daemon
+        // that this store holds nothing under.
+        let ids: [(&str, String); 6] = [
+            ("a short decimal", "1".to_string()),
+            (
+                "the width this service numbers these resources at",
+                sequence_id(987_654),
+            ),
+            ("a minted id with a suffix", format!("{}-gone", sequence_id(1))),
+            (
+                "a hyphenated hex id",
+                "7f3c1a2b-9d84-4e55-b0c6-2a1f5e6d7c88".to_string(),
+            ),
+            ("a word", "latest".to_string()),
+            ("a long token", "z".repeat(64)),
+        ];
+        for (row, id) in ids {
+            let unheld = below_daemon(resource_type, CLUSTER, "agents", &id);
+            let case = format!("{operation} given {row} as the id");
+            // Paired with the ARN that DOES resolve, so the answer carries both channels:
+            // the request is not lost, and the entry that names nothing is its own failure.
+            let body = ok(
+                &router,
+                operation,
+                json!({ member: [held.clone(), unheld.clone()] }),
+                &case,
+            )
+            .await;
+            assert_eq!(
+                list(&body, reported.0, &case)
+                    .iter()
+                    .map(|entry| string(entry, reported.1, &case))
+                    .collect::<Vec<String>>(),
+                vec![held.clone()],
+                "case {case:?}: expected the resource the minted ARN names to still be \
+                 reported, got {body}"
+            );
+            assert_eq!(
+                list(&body, "failures", &case)
+                    .iter()
+                    .map(|failure| (
+                        string(failure, "arn", &case),
+                        string(failure, "reason", &case)
+                    ))
+                    .collect::<Vec<(String, String)>>(),
+                vec![(unheld.clone(), "MISSING".to_string())],
+                "case {case:?}: expected the entry echoed as MISSING, got {body}"
+            );
+        }
+    }
 }

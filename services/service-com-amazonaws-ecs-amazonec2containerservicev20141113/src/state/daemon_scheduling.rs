@@ -112,12 +112,17 @@ pub fn daemon_revision_arn(
 /// spelled in: the fixed width [`ComAmazonawsEcsAmazonec2containerservicev20141113State::next_daemon_deployment_arn`]
 /// and [`ComAmazonawsEcsAmazonec2containerservicev20141113State::next_daemon_revision_arn`]
 /// render their counter at, so sorting two such ARNs orders what they name oldest first.
+///
+/// How this service SPELLS that id is its own doing, so it is no part of what an ARN a
+/// caller supplies has to look like ([`is_daemon_scoped_arn`]): the id is minted here, and
+/// a client cannot be asked to reproduce this service's numbering for its ARN to be read as
+/// the identifier it is.
 pub const DAEMON_SEQUENCE_ID_WIDTH: usize = 19;
 
-/// Whether `token` is an id token of a daemon deployment's or a daemon revision's ARN: the
-/// decimal token of [`DAEMON_SEQUENCE_ID_WIDTH`] digits those ARNs are numbered by.
-pub fn is_daemon_sequence_id(token: &str) -> bool {
-    token.len() == DAEMON_SEQUENCE_ID_WIDTH && token.bytes().all(|byte| byte.is_ascii_digit())
+/// The id token one daemon deployment or daemon revision is numbered with, spelled at the
+/// one width [`DAEMON_SEQUENCE_ID_WIDTH`] fixes.
+pub(super) fn daemon_sequence_id(sequence: u64) -> String {
+    format!("{sequence:0width$}", width = DAEMON_SEQUENCE_ID_WIDTH)
 }
 
 /// The segments of the RESOURCE PATH `arn` carries when it is an ARN of a `resource_type`
@@ -142,8 +147,14 @@ fn daemon_scoped_arn_path<'a>(arn: &'a str, resource_type: &str) -> Option<Vec<&
 
 /// Whether `arn` is SHAPED like the ARN of a `resource_type` resource BELOW a daemon —
 /// `<type>/<cluster>/<daemon>/<id>` ([`daemon_scoped_arn_path`]), with names a cluster and a
-/// daemon may carry ([`is_valid_name`]) and an id token the numbering of these resources
-/// produces ([`is_daemon_sequence_id`]).
+/// daemon may carry ([`is_valid_name`]) and an id in the last segment.
+///
+/// What is asked is which RESOURCE the value identifies, so it is asked of the ARN's shape:
+/// the resource type, the cluster and the daemon the resource sits under, and an id. How
+/// that id is SPELLED is no part of it — the service mints it
+/// ([`DAEMON_SEQUENCE_ID_WIDTH`]) — so an ARN of this shape whose id this store holds
+/// nothing under still names a resource of this account's daemon, and a read reports it as
+/// the MISSING resource it is rather than refusing the request that carried it.
 fn is_daemon_scoped_arn(arn: &str, resource_type: &str) -> bool {
     daemon_scoped_arn_path(arn, resource_type).is_some_and(|segments| {
         matches!(
@@ -151,7 +162,7 @@ fn is_daemon_scoped_arn(arn: &str, resource_type: &str) -> bool {
             [cluster_name, daemon_name, id]
                 if is_valid_name(cluster_name)
                     && is_valid_name(daemon_name)
-                    && is_daemon_sequence_id(id)
+                    && !id.is_empty()
         )
     })
 }
@@ -605,7 +616,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             region,
             cluster_name,
             daemon_name,
-            &format!("{:019}", self.next_daemon_revision_seq),
+            &daemon_sequence_id(self.next_daemon_revision_seq),
         )
     }
 
