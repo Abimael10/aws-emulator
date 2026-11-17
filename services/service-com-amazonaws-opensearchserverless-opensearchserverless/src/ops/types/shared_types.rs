@@ -45,21 +45,23 @@ pub struct CollectionGroupCapacityLimits {
     pub min_search_capacity_in_ocu: Option<f32>,
 }
 
-/// The `storageConfiguration` block every collection-group detail reports.
+/// The `storageConfiguration` block every collection-group detail AND every row of the
+/// collection-group listing reports.
 ///
-/// Reached by both `CreateCollectionGroupDetail` and `CollectionGroupDetail`, so it
-/// lives here rather than beside one operation.
+/// Reached by `CreateCollectionGroupDetail`, `CollectionGroupDetail` and
+/// `CollectionGroupSummary`, so it lives here rather than beside one operation.
 ///
 /// **LOCAL MODEL ADDITION — re-apply after a model refresh.** Neither this shape nor the
-/// `storageConfiguration` member on the two detail shapes is in the Smithy model as
+/// `storageConfiguration` member on those three shapes is in the Smithy model as
 /// shipped: the live OpenSearch Serverless API returns the block on every
-/// collection-group detail (recorded behaviour), and
+/// collection-group detail and on every listing row (recorded behaviour), and
 /// `smithy-model/com-amazonaws-opensearchserverless-opensearchserverless.json` carries
-/// both additions locally, with the same note on the shape's own `documentation` trait,
-/// because this crate's response serializer can only emit MODELLED members. A refresh
-/// from upstream that still predates the member will drop them, and the two details will
-/// silently stop reporting `storageConfiguration` — which the
-/// `collection_group_capacity` integration suite is what catches.
+/// every one of those additions locally, with the same note on the shape's own
+/// `documentation` trait, because this crate's response serializer can only emit MODELLED
+/// members. A refresh from upstream that still predates the member will drop them, and the
+/// details and the listing will silently stop reporting `storageConfiguration` — which the
+/// `collection_group_capacity` and `collection_group_listing` integration suites are what
+/// catch.
 #[smithy_macros::smithy(
     shape = "com.amazonaws.opensearchserverless#CollectionGroupStorageConfiguration"
 )]

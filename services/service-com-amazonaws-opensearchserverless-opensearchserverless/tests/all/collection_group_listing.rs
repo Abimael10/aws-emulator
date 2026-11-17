@@ -11,9 +11,9 @@
 //!
 //! 1. the listing reports the collection groups the account has stored, each as the STORED
 //!    record's own summary — the minted id, its ARN, its name, its creation instant, its
-//!    effective capacity limits, its generation, and the number of collections that name
-//!    it, counted from the collections themselves — in one stable order, and it carries no
-//!    member `CollectionGroupSummary` does not model;
+//!    effective capacity limits, its generation, its storage configuration, and the number
+//!    of collections that name it, counted from the collections themselves — in one stable
+//!    order, and it carries no member `CollectionGroupSummary` does not model;
 //! 2. the page `maxResults` and `nextToken` select is a window on that one order: a page
 //!    holds at most `maxResults` rows (20 when the request names none), a `nextToken`
 //!    comes back exactly while rows remain after the page, and resuming with it walks the
@@ -30,8 +30,9 @@
 //! count and up to `maxResults`' own published maximum.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_opensearchserverless_opensearchserverless::state::SERVERLESS_GENERATION_CLASSIC;
 
-use crate::collection_group_capacity::expected_capacity_limits;
+use crate::collection_group_capacity::{expected_capacity_limits, expected_storage_configuration};
 use crate::collection_group_lifecycle::{batch_get, create_group, detail_at};
 use crate::collection_lifecycle::{at, call, emulator, is_collection_id, text, ACCOUNT, CLIENT_ERROR};
 
@@ -43,7 +44,6 @@ const DETAIL_ONLY_MEMBERS: &[&str] = &[
     "description",
     "tags",
     "currentCapacity",
-    "storageConfiguration",
 ];
 
 /// The members `CollectionGroupSummary` and `CollectionGroupDetail` BOTH model, which a
@@ -56,6 +56,7 @@ const SHARED_MEMBERS: &[&str] = &[
     "capacityLimits",
     "generation",
     "numberOfCollections",
+    "storageConfiguration",
 ];
 
 /// One page of `ListCollectionGroups`: its summaries and the token that resumes after
@@ -286,6 +287,79 @@ async fn the_listing_reports_each_stored_group_as_its_own_summary() {
             assert!(
                 summary.get(member).is_none(),
                 "case {case}: a summary carries no {member}, got {summary}"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rule 1, continued: a row's storageConfiguration follows the group's generation.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn every_listing_row_reports_the_storage_configuration_of_its_group() {
+    let router = emulator();
+
+    // `ServerlessGeneration` is `CLASSIC | NEXTGEN` (`smithy_query(query="shape",
+    // shape="ServerlessGeneration")`); `None` is the omitted case, which stores the
+    // service default.
+    let generations: Vec<Option<&str>> = vec![None, Some("CLASSIC"), Some("NEXTGEN")];
+
+    // More groups than the smaller page bounds below hold, with the generations
+    // interleaved, so a row the listing reports on a LATER page is covered too.
+    let mut stored: Vec<(String, String)> = Vec::new();
+    for index in 0..9 {
+        let named = generations[index % generations.len()];
+        let mut request = json!({
+            "name": format!("storage-group-{index:02}"),
+            "standbyReplicas": if index % 2 == 0 { "ENABLED" } else { "DISABLED" },
+        });
+        if let Some(named) = named {
+            request["generation"] = json!(named);
+        }
+        let detail = create_group(&router, "us-east-1", request).await;
+        let generation = named.unwrap_or(SERVERLESS_GENERATION_CLASSIC).to_string();
+        assert_eq!(
+            at(&detail, "storageConfiguration"),
+            &expected_storage_configuration(&generation),
+            "case the create of storage-group-{index:02} ({generation}): storageConfiguration \
+             must follow the stored generation, got {detail}"
+        );
+        stored.push((text(&detail, "id"), generation));
+    }
+
+    // Walked a page at a time as well as whole, and with no bound at all: wherever a row
+    // falls in the paging it carries the block, and it carries what a read of the same
+    // group reports.
+    for bound in [Some(1_i64), Some(2), Some(4), Some(100), None] {
+        let mut rows: Vec<Value> = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let (page, next) = list_page(&router, bound, token.as_deref()).await;
+            rows.extend(page);
+            match next {
+                Some(next) => token = Some(next),
+                None => break,
+            }
+        }
+        for (id, generation) in &stored {
+            let case = format!("the row of {id} ({generation}) with maxResults={bound:?}");
+            let row = rows
+                .iter()
+                .find(|row| &text(row, "id") == id)
+                .cloned()
+                .unwrap_or(Value::Null);
+            assert_eq!(
+                at(&row, "storageConfiguration"),
+                &expected_storage_configuration(generation),
+                "case {case}: expected v2Enabled to follow the stored generation, got {row}"
+            );
+            let read = detail_at(&batch_get(&router, "us-east-1", json!({ "ids": [id] })).await, 0);
+            assert_eq!(
+                at(&row, "storageConfiguration"),
+                at(&read, "storageConfiguration"),
+                "case {case}: a listing row must report the group's storage mode exactly as a \
+                 read of the same group does, got {row} beside {read}"
             );
         }
     }

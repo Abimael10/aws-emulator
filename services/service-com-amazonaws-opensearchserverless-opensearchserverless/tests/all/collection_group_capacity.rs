@@ -65,8 +65,9 @@ pub(crate) fn expected_capacity_limits(requested: &Value) -> Value {
     Value::Object(expected)
 }
 
-/// The `storageConfiguration` a group of `generation` must report.
-fn expected_storage_configuration(generation: &str) -> Value {
+/// The `storageConfiguration` a group of `generation` must report, on a detail and on a
+/// row of the listing alike.
+pub(crate) fn expected_storage_configuration(generation: &str) -> Value {
     json!({ "v2Enabled": generation == SERVERLESS_GENERATION_NEXTGEN })
 }
 

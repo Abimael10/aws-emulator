@@ -1194,11 +1194,13 @@ impl CollectionGroupRecord {
     /// beside it exactly as [`Self::detail`] does, so a listing cannot report a group
     /// differently from a read of the same group.
     ///
-    /// `CollectionGroupSummary` models only `id`, `arn`, `name`, `numberOfCollections`,
-    /// `createdDate`, `capacityLimits` and `generation`
+    /// `CollectionGroupSummary` models `id`, `arn`, `name`, `numberOfCollections`,
+    /// `createdDate`, `capacityLimits`, `generation` and `storageConfiguration`
     /// (`smithy_query(query="shape", shape="CollectionGroupSummary")`), so the members
     /// only a detail carries — `standbyReplicas`, `description`, `tags`,
-    /// `currentCapacity`, `storageConfiguration` — are not in it.
+    /// `currentCapacity` — are not in it. `storageConfiguration` comes from the very
+    /// [`Self::storage_configuration`] the details render, so a row of the listing reports
+    /// a group's storage mode exactly as a read of that group does.
     pub fn summary(&self, number_of_collections: i32) -> CollectionGroupSummary {
         CollectionGroupSummary {
             id: Some(self.id.clone()),
@@ -1208,6 +1210,7 @@ impl CollectionGroupRecord {
             created_date: Some(self.created_date),
             capacity_limits: Some(self.capacity_limits.clone()),
             generation: Some(self.generation.clone()),
+            storage_configuration: Some(self.storage_configuration()),
         }
     }
 
@@ -1217,8 +1220,8 @@ impl CollectionGroupRecord {
     /// storage stack, which is what [`SERVERLESS_GENERATION_NEXTGEN`] selects: a group's
     /// `generation` is the only setting it carries that chooses a storage stack, so a
     /// `NEXTGEN` group is `v2Enabled: true` and a `CLASSIC` one `false`. Reported on every
-    /// detail, so a client can read the group's storage mode off either the create or a
-    /// later read.
+    /// detail AND on every row of the listing, so a client can read the group's storage
+    /// mode off the create, a later read or an inventory sweep alike.
     ///
     /// Only the `CLASSIC` -> `false` half is backed by a recording; the `NEXTGEN` -> `true`
     /// half is INFERRED from what the two generations are, and a later recording of a

@@ -25,6 +25,13 @@ pub struct ListCollectionGroupsOutput {
     pub next_token: Option<String>,
 }
 
+/// One row of the collection-group listing.
+///
+/// `storageConfiguration` is a **LOCAL MODEL ADDITION — re-apply after a model refresh**,
+/// exactly as it is on the two detail shapes: see
+/// [`CollectionGroupStorageConfiguration`] for why the member and its shape are carried in
+/// this repo's copy of the model rather than coming from upstream. A listing row reports
+/// the block because a read of the same group does.
 #[smithy_macros::smithy(shape = "com.amazonaws.opensearchserverless#CollectionGroupSummary")]
 #[derive(Debug, Clone, Default)]
 pub struct CollectionGroupSummary {
@@ -35,5 +42,6 @@ pub struct CollectionGroupSummary {
     pub created_date: Option<i64>,
     pub capacity_limits: Option<CollectionGroupCapacityLimits>,
     pub generation: Option<String>,
+    pub storage_configuration: Option<CollectionGroupStorageConfiguration>,
 }
 
