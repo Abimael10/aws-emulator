@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The sessions this account's workgroups run, and the notebook a notebook session was
-//! started in.
+//! The sessions this account's workgroups run, the executors each session runs on, and the
+//! notebook a notebook session was started in.
 //!
 //! A session lives in the [`SessionRegistry`] of
-//! [`ComAmazonawsAthenaAmazonathenaState::sessions`]: the request that starts one writes a
-//! [`SessionRecord`] there and `ListNotebookSessions` answers out of those same records, so
-//! every session a listing reports is one some earlier write persisted rather than
-//! anything derived from the reading request.
+//! [`ComAmazonawsAthenaAmazonathenaState::sessions`]: `StartSession` writes a
+//! [`SessionRecord`] there and `GetSession`, `GetSessionStatus`, `ListSessions`,
+//! `ListExecutors` and `ListNotebookSessions` all answer out of those same records, so every
+//! value a read reports is one the start persisted or one derived from the clock — never
+//! anything rebuilt from the reading request.
 //!
 //! A session HAS a lifecycle the clock owes, and `SessionStatus$State` documents it:
 //! "CREATING - The session is being started, including acquiring resources", "IDLE - The
@@ -17,6 +18,13 @@
 //! every read derives the state from that instant ([`SessionRecord::state_at`]) rather than
 //! a reader having to move the record on; a shutdown is owed the same kind of span, which
 //! is what makes the documented TERMINATING state observable instead of skipped.
+//!
+//! The EXECUTORS are the session's own resources rather than a second registry: a session
+//! runs on a coordinator ("A coordinator is a special executor that orchestrates processing
+//! work and manages other executors in a notebook session", `EngineConfiguration$
+//! CoordinatorDpuSize`), which is started with the session and comes up over the same span,
+//! so `ListExecutors` reports what the start provisioned and each executor's state follows
+//! its session's own.
 //!
 //! Those four are the states the stored instants can yield. The others the enum carries
 //! follow from something else: BUSY from a calculation running ON the session ("the session
@@ -41,8 +49,8 @@ use std::time::{Duration, SystemTime};
 use super::*;
 
 use crate::ops::types::{
-    EngineConfiguration, MonitoringConfiguration, NotebookSessionSummary, SessionConfiguration,
-    SessionStatus,
+    EngineConfiguration, EngineVersion, ExecutorsSummary, MonitoringConfiguration,
+    NotebookSessionSummary, SessionConfiguration, SessionStatus, SessionSummary,
 };
 
 /// The `SessionState` of a session whose resources are still being acquired: "CREATING -
@@ -68,10 +76,12 @@ pub const SESSION_STATE_TERMINATED: &str = "TERMINATED";
 
 /// The session states that count as ACTIVE.
 ///
-/// `ListNotebookSessions` names them: it "Lists, in descending order, the sessions that
-/// have been created in a notebook that are in an active state like CREATING, CREATED,
-/// IDLE or BUSY" — so a session in any other state (one shutting down, one whose resources
-/// are gone, or one that ended badly) is not part of a notebook's session listing.
+/// The two session listings name them in the same words: `ListSessions` "Lists the sessions
+/// in a workgroup that are in an active state like CREATING, CREATED, IDLE, or BUSY" and
+/// `ListNotebookSessions` "Lists, in descending order, the sessions that have been created
+/// in a notebook that are in an active state like CREATING, CREATED, IDLE or BUSY" — so a
+/// session in any other state (one shutting down, one whose resources are gone, or one that
+/// ended badly) is part of neither listing, though `GetSession` still reads it.
 pub const ACTIVE_SESSION_STATES: &[&str] = &[
     SESSION_STATE_CREATING,
     SESSION_STATE_CREATED,
@@ -84,20 +94,68 @@ pub const ACTIVE_SESSION_STATES: &[&str] = &[
 /// the value of the Athena notebook ID".
 pub const NOTEBOOK_ID_CONFIG: &str = "NotebookId";
 
+/// The `ExecutorState` of an executor whose resources are still being acquired: "`CREATING`
+/// - The executor is being started, including acquiring resources" (`ExecutorsSummary$
+/// ExecutorState`). One of `EXECUTOR_STATE_VALUES` in [`crate::ops::types`].
+pub const EXECUTOR_STATE_CREATING: &str = "CREATING";
+/// The `ExecutorState` of an executor the session has registered: "`REGISTERED` - The
+/// executor has been registered", which is the state an executor backing a running session
+/// is in. See [`EXECUTOR_STATE_CREATING`].
+pub const EXECUTOR_STATE_REGISTERED: &str = "REGISTERED";
+/// The `ExecutorState` of an executor that is shutting down with its session:
+/// "`TERMINATING` - The executor is in the process of shutting down". See
+/// [`EXECUTOR_STATE_CREATING`].
+pub const EXECUTOR_STATE_TERMINATING: &str = "TERMINATING";
+/// The `ExecutorState` of an executor that is gone: "`TERMINATED` - The executor is no
+/// longer running". See [`EXECUTOR_STATE_CREATING`].
+pub const EXECUTOR_STATE_TERMINATED: &str = "TERMINATED";
+
+/// The `ExecutorType` of the one executor a session is started with: the coordinator, "a
+/// special executor that orchestrates processing work and manages other executors in a
+/// notebook session" (`EngineConfiguration$CoordinatorDpuSize`). One of
+/// `EXECUTOR_TYPE_VALUES` in [`crate::ops::types`].
+pub const EXECUTOR_TYPE_COORDINATOR: &str = "COORDINATOR";
+
 /// How long after a session is started its resources are DUE.
 ///
 /// Athena hands back a session in a non-terminal state — `StartSession` answers with a
-/// `State` of its own — and the resources arrive later, so this is a transition the CLOCK
-/// owes: the instant is stored on the record and every read derives the state from it. The
-/// span is this emulator's, not a duration AWS publishes (a real session takes as long as
-/// its coordinator takes to come up), and it is never zero — a caller reading straight back
-/// must still observe the documented CREATING state.
+/// `State` of its own, and "the session is ready when it reaches an IDLE state" — and the
+/// resources arrive later, so this is a transition the CLOCK owes: the instant is stored on
+/// the record and every read derives the state from it. The span is this emulator's, not a
+/// duration AWS publishes (a real session takes as long as its coordinator takes to come
+/// up), and it is never zero — a caller reading straight back must still observe the
+/// documented CREATING state.
 pub const SESSION_CREATION: Duration = Duration::from_secs(3);
 
 /// How long after a session is asked to shut down the shutdown is complete: the same kind
 /// of emulator-chosen span as [`SESSION_CREATION`], so the documented TERMINATING state a
 /// session passes through is observable rather than skipped.
 pub const SESSION_TERMINATION: Duration = Duration::from_secs(3);
+
+/// The session idle timeout a start that names none is given, in minutes.
+///
+/// CHOSEN by this emulator: `StartSessionRequest$SessionIdleTimeoutInMinutes` publishes no
+/// default, only the range the model carries (1 to 480), so a session that names none is
+/// given a timeout well inside that range rather than none at all — a session has an idle
+/// timeout in Athena whether or not the request set one, and `SessionConfiguration` reports
+/// it under both the names that shape carries. What the timeout IS to this emulator is the
+/// configuration the session runs under; see [`SessionRecord::idle_timeout_minutes`].
+pub const DEFAULT_SESSION_IDLE_TIMEOUT_MINUTES: i32 = 20;
+
+/// The number of data processing units a coordinator runs on when the request names none:
+/// "The default is 1" (`EngineConfiguration$CoordinatorDpuSize`), which is also the only
+/// value the modelled range (1..1) admits.
+pub const DEFAULT_COORDINATOR_DPU_SIZE: i32 = 1;
+
+/// The number of data processing units an executor runs on when the request names none: "The
+/// default number of DPUs to use for executors. […] The default is 1"
+/// (`EngineConfiguration$DefaultExecutorDpuSize`).
+pub const DEFAULT_EXECUTOR_DPU_SIZE: i32 = 1;
+
+/// The largest number of data processing units a session may run concurrently when the
+/// request names none: the `@default` the model carries on
+/// `EngineConfiguration$MaxConcurrentDpus`.
+pub const DEFAULT_MAX_CONCURRENT_DPUS: i32 = 20;
 
 /// How many sessions this emulator retains for one account.
 ///
@@ -106,6 +164,24 @@ pub const SESSION_TERMINATION: Duration = Duration::from_secs(3);
 /// without limit. The OLDEST session is dropped once this many are held, exactly as the
 /// query-execution history is bounded.
 pub const MAX_SESSIONS: usize = 1000;
+
+/// One executor a session runs on, as this service persists it.
+///
+/// Neither its state nor its termination instant is stored: both follow from the session's
+/// own instants (see [`SessionRecord::executor_summaries`]), an executor of a session being
+/// started with it and torn down with it.
+#[derive(Debug, Clone)]
+pub struct ExecutorRecord {
+    /// The executor's id, reported as `ExecutorsSummary$ExecutorId` ("The UUID of the
+    /// executor").
+    pub id: String,
+    /// An `ExecutorType` value: [`EXECUTOR_TYPE_COORDINATOR`] for the executor a session is
+    /// started with.
+    pub executor_type: String,
+    /// How many data processing units this executor runs on, reported as
+    /// `ExecutorsSummary$ExecutorSize`.
+    pub size_dpus: i32,
+}
 
 /// One session, as this service persists it.
 ///
@@ -178,11 +254,13 @@ pub struct SessionRecord {
     /// When the session was asked to shut down, if it was, from which the
     /// [`SESSION_TERMINATION`] span runs.
     pub terminate_requested_at: Option<SystemTime>,
+    /// The executors the start provisioned: the coordinator the session runs on.
+    pub executors: Vec<ExecutorRecord>,
 }
 
 impl SessionRecord {
     /// The record a start of `id` in `work_group` at `now` registers: its resources not
-    /// acquired yet, and no shutdown asked for.
+    /// acquired yet, no shutdown asked for, and the coordinator it runs on provisioned.
     ///
     /// Everything the starting request carried beyond the workgroup and the notebook is set
     /// by the caller on the record this hands back, so one session is built in one place
@@ -211,6 +289,11 @@ impl SessionRecord {
             created_at: now,
             resources_due_at: due_at(now, SESSION_CREATION),
             terminate_requested_at: None,
+            executors: vec![ExecutorRecord {
+                id: new_executor_id(),
+                executor_type: EXECUTOR_TYPE_COORDINATOR.to_string(),
+                size_dpus: DEFAULT_COORDINATOR_DPU_SIZE,
+            }],
         }
     }
 
@@ -322,12 +405,32 @@ impl SessionRecord {
         ACTIVE_SESSION_STATES.contains(&self.state_at(now))
     }
 
-    /// Ask the session to shut down at `now`: the shutdown is complete
-    /// [`SESSION_TERMINATION`] later, so the session is [`SESSION_STATE_TERMINATING`]
-    /// until then. A session already asked keeps the instant it was first asked at — a
-    /// repeat does not restart the shutdown.
-    pub fn terminate(&mut self, now: SystemTime) {
-        self.terminate_requested_at = Some(self.terminate_requested_at.unwrap_or(now));
+    /// Whether the session and its resources are no longer running at `now`.
+    pub fn is_terminated_at(&self, now: SystemTime) -> bool {
+        self.state_at(now) == SESSION_STATE_TERMINATED
+    }
+
+    /// The record as the modelled `SessionSummary` a workgroup's session listing reports it
+    /// by, as of `now`.
+    ///
+    /// Every member is projected from this same record, and the status through the ONE place
+    /// a session's status is projected ([`Self::to_session_status`]), so the listing reports
+    /// no value a detailed read would not. The engine version travels as the `EngineVersion`
+    /// shape here where `GetSession` reports the string, so the version the session was
+    /// started on is resolved into that shape the way a workgroup's selection is
+    /// ([`resolved_engine_version`]).
+    pub fn to_summary(&self, now: SystemTime) -> SessionSummary {
+        SessionSummary {
+            session_id: Some(self.id.clone()),
+            description: self.description.clone(),
+            engine_version: Some(resolved_engine_version(Some(&EngineVersion {
+                selected_engine_version: self.engine_version.clone(),
+                // Read only, and ignored on the way in: the resolution decides it.
+                effective_engine_version: None,
+            }))),
+            notebook_version: self.notebook_version.clone(),
+            status: Some(self.to_session_status(now)),
+        }
     }
 
     /// The record as the modelled `NotebookSessionSummary` a notebook's session listing
@@ -338,22 +441,69 @@ impl SessionRecord {
             creation_time: Some(::aws_smithy_types::DateTime::from(self.created_at)),
         }
     }
+
+    /// The session's executors as the modelled `ExecutorsSummary` entries `ListExecutors`
+    /// reports, as of `now`, in the order they were provisioned.
+    ///
+    /// An executor is started with its session and torn down with it, so its state follows
+    /// the session's: it is being acquired while the session is, registered while the session
+    /// runs, and shutting down or gone with it. Its termination instant is the session's own
+    /// end, and is reported only once it has one.
+    ///
+    /// The mapping is TOTAL over the session states, including the one `ListExecutors` does
+    /// not reach today: that operation refuses a session whose resources "are no longer
+    /// running" rather than listing them, so a `TERMINATED` executor is what this projects
+    /// for any other caller of it.
+    pub fn executor_summaries(&self, now: SystemTime) -> Vec<ExecutorsSummary> {
+        let state = match self.state_at(now) {
+            SESSION_STATE_CREATING => EXECUTOR_STATE_CREATING,
+            SESSION_STATE_TERMINATING => EXECUTOR_STATE_TERMINATING,
+            SESSION_STATE_TERMINATED => EXECUTOR_STATE_TERMINATED,
+            _ => EXECUTOR_STATE_REGISTERED,
+        };
+        let terminated = self
+            .is_terminated_at(now)
+            .then(|| self.ended_at())
+            .flatten()
+            .map(epoch_millis);
+        self.executors
+            .iter()
+            .map(|executor| ExecutorsSummary {
+                executor_id: executor.id.clone(),
+                executor_type: Some(executor.executor_type.clone()),
+                start_date_time: Some(epoch_millis(self.created_at)),
+                termination_date_time: terminated,
+                executor_state: Some(state.to_string()),
+                executor_size: Some(i64::from(executor.size_dpus)),
+            })
+            .collect()
+    }
+
+    /// Ask the session to shut down at `now`: the shutdown is complete
+    /// [`SESSION_TERMINATION`] later, so the session is [`SESSION_STATE_TERMINATING`]
+    /// until then. A session already asked keeps the instant it was first asked at — a
+    /// repeat does not restart the shutdown, which is the no-op `TerminateSession`
+    /// documents for a session that is already inactive.
+    pub fn terminate(&mut self, now: SystemTime) {
+        self.terminate_requested_at = Some(self.terminate_requested_at.unwrap_or(now));
+    }
 }
 
-/// Every session this account holds.
+/// Every session this account holds, and the start tokens that already minted one.
 ///
 /// A struct of its own rather than loose fields on the store, so the bound above is applied
-/// in the ONE place a session is written and the newest-first order a listing reports is
-/// derived in the ONE place a session is looked up, and neither can be honoured on one
-/// operation's path and skipped on another's.
+/// in the ONE place a session is written ([`SessionRegistry::insert`]) and the newest-first
+/// order a listing reports is derived in the ONE place sessions are looked up, and neither
+/// can be honoured on one operation's path and skipped on another's.
 #[derive(Debug, Default)]
 pub struct SessionRegistry {
     /// The sessions, keyed by `SessionId`. A `BTreeMap` so a walk of the registry is in one
     /// stable order.
     sessions: BTreeMap<String, SessionRecord>,
     /// The ids of [`Self::sessions`] in the order they were started, oldest first — the
-    /// order a notebook's listing reports reversed, and the order sessions are dropped in
-    /// once [`MAX_SESSIONS`] are held.
+    /// order a listing reports reversed ("Newer sessions are listed first; older sessions
+    /// are listed later"), and the order sessions are dropped in once [`MAX_SESSIONS`] are
+    /// held.
     order: Vec<String>,
     /// The session each `ClientRequestToken` minted, so a repeat of the request that
     /// carried it is answered with that same session rather than starting another.
@@ -412,6 +562,16 @@ impl SessionRegistry {
         self.sessions.insert(id, record);
     }
 
+    /// The sessions of `work_group`, newest first — the order `ListSessions` reports.
+    pub fn sessions_in(&self, work_group: &str) -> Vec<&SessionRecord> {
+        self.order
+            .iter()
+            .rev()
+            .filter_map(|id| self.sessions.get(id))
+            .filter(|record| record.work_group == work_group)
+            .collect()
+    }
+
     /// The ACTIVE sessions of the notebook `notebook_id`, newest first, as the modelled
     /// `NotebookSessionSummary` entries a listing reports.
     ///
@@ -441,6 +601,35 @@ impl SessionRegistry {
             .map(|record| record.to_notebook_session_summary())
             .collect()
     }
+
+    /// Remove every session of `work_group`, as a delete of that workgroup does, and answer
+    /// with how many were removed.
+    ///
+    /// A session is addressed by its `SessionId` alone, but it BELONGS to the workgroup it was
+    /// started in — the workgroup whose engine configuration and execution role it runs under
+    /// — so one whose workgroup is gone could never be started again or listed, and keeping it
+    /// would hand a workgroup later created under the same name sessions nobody started in it.
+    pub fn remove_work_group(&mut self, work_group: &str) -> usize {
+        let removed: Vec<String> = self
+            .sessions
+            .values()
+            .filter(|record| record.work_group == work_group)
+            .map(|record| record.id.clone())
+            .collect();
+        for id in &removed {
+            self.remove(id);
+        }
+        removed.len()
+    }
+
+    /// Drop the session `id` names, with the start token that named it: a token whose session
+    /// is gone cannot answer with the same id, so it is not kept pointing at nothing.
+    fn remove(&mut self, id: &str) -> Option<SessionRecord> {
+        let removed = self.sessions.remove(id)?;
+        self.order.retain(|held| held != id);
+        self.of_token.retain(|_, minted| minted != id);
+        Some(removed)
+    }
 }
 
 /// A fresh `SessionId`: a version-4 UUID in its hyphenated, lower-case form, well inside
@@ -448,6 +637,24 @@ impl SessionRegistry {
 /// laid out here.
 pub fn new_session_id() -> String {
     ::uuid::Uuid::new_v4().as_hyphenated().to_string()
+}
+
+/// A fresh `ExecutorId`: the UUID `ExecutorsSummary$ExecutorId` documents ("The UUID of the
+/// executor").
+pub fn new_executor_id() -> String {
+    ::uuid::Uuid::new_v4().as_hyphenated().to_string()
+}
+
+/// The cursor a `ListSessions` page hands back: the workgroup it is listing the sessions of
+/// and the position to resume at.
+fn sessions_cursor(work_group: &str, position: usize) -> String {
+    format!("sessions{CURSOR_SEPARATOR}{work_group}{CURSOR_SEPARATOR}{position}")
+}
+
+/// The cursor a `ListExecutors` page hands back: the session whose executors it is reporting
+/// and the position to resume at.
+fn executors_cursor(session_id: &str, position: usize) -> String {
+    format!("executors{CURSOR_SEPARATOR}{session_id}{CURSOR_SEPARATOR}{position}")
 }
 
 /// The `SessionConfiguration` a session started in `work_group` runs under: "the workgroup
@@ -544,6 +751,37 @@ fn notebook_sessions_cursor(notebook_id: &str, position: usize) -> String {
 }
 
 impl ComAmazonawsAthenaAmazonathenaState {
+    /// The `NextToken` a `ListSessions` page of `work_group` resumed at `position` hands back.
+    pub fn sessions_page_token(&self, work_group: &str, position: usize) -> String {
+        ::hex::encode(
+            self.page_token_key
+                .mint(&sessions_cursor(work_group, position)),
+        )
+    }
+
+    /// The position `token` resumes a session listing of `work_group` at, or `None` for a
+    /// token this store did not mint for THAT workgroup.
+    pub fn sessions_page_position(&self, work_group: &str, token: &str) -> Option<usize> {
+        let cursor = self.page_cursor(token)?;
+        cursor_position(&cursor, "sessions", work_group)
+    }
+
+    /// The `NextToken` a `ListExecutors` page of session `session_id` resumed at `position`
+    /// hands back.
+    pub fn executors_page_token(&self, session_id: &str, position: usize) -> String {
+        ::hex::encode(
+            self.page_token_key
+                .mint(&executors_cursor(session_id, position)),
+        )
+    }
+
+    /// The position `token` resumes an executor listing of session `session_id` at, or `None`
+    /// for a token this store did not mint for THAT session.
+    pub fn executors_page_position(&self, session_id: &str, token: &str) -> Option<usize> {
+        let cursor = self.page_cursor(token)?;
+        cursor_position(&cursor, "executors", session_id)
+    }
+
     /// The `NextToken` a `ListNotebookSessions` page of `notebook_id` resumed at `position`
     /// hands back.
     pub fn notebook_sessions_page_token(&self, notebook_id: &str, position: usize) -> String {
@@ -565,9 +803,305 @@ impl ComAmazonawsAthenaAmazonathenaState {
     }
 }
 
+/// `at` as the count of milliseconds since the Unix epoch, which is how
+/// `ExecutorsSummary$StartDateTime` and `$TerminationDateTime` carry an instant (a `Long`).
+fn epoch_millis(at: SystemTime) -> i64 {
+    millis_between(SystemTime::UNIX_EPOCH, at)
+}
+
 /// `now` plus `span`, or `now` when that instant is not representable — so a clock far
 /// enough in the future to overflow yields a transition that is already due rather than a
 /// panic.
 fn due_at(now: SystemTime, span: Duration) -> SystemTime {
     now.checked_add(span).unwrap_or(now)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A session started in `work_group` at `started_at`, the record every case below moves
+    /// the clock over.
+    fn session(work_group: &str, started_at: SystemTime) -> SessionRecord {
+        SessionRecord::started(
+            new_session_id(),
+            work_group.to_string(),
+            None,
+            started_at,
+        )
+    }
+
+    /// RULE: a session's state follows the clock — it is `CREATING` until its resources are
+    /// due up and `IDLE` from then on — and no read has to write to move it on.
+    #[test]
+    fn the_state_a_session_reports_follows_the_clock() {
+        let started_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let record = session("spark-wg", started_at);
+        let cases = [
+            ("at the start", Duration::ZERO, SESSION_STATE_CREATING),
+            (
+                "a moment before the resources are up",
+                SESSION_CREATION - Duration::from_millis(1),
+                SESSION_STATE_CREATING,
+            ),
+            (
+                "the instant they are up",
+                SESSION_CREATION,
+                SESSION_STATE_IDLE,
+            ),
+            (
+                "long after they are up",
+                SESSION_CREATION * 1_000,
+                SESSION_STATE_IDLE,
+            ),
+        ];
+        for (case, elapsed, expected) in cases {
+            let now = started_at + elapsed;
+            let reached = record.state_at(now);
+            assert_eq!(
+                reached, expected,
+                "case {case:?}: expected {expected}, got {reached}"
+            );
+            assert_eq!(
+                record.idle_since(now).is_some(),
+                expected == SESSION_STATE_IDLE,
+                "case {case:?}: an idle instant is reported exactly while the session is \
+                 idle, got {:?}",
+                record.idle_since(now)
+            );
+        }
+    }
+
+    /// RULE: a shutdown is a span of the clock too — the session reports `TERMINATING` until
+    /// the teardown is due and `TERMINATED` from then on, its end instant is that teardown's,
+    /// and a repeated shutdown does not restart it.
+    #[test]
+    fn a_requested_shutdown_passes_through_terminating() {
+        let started_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let mut record = session("spark-wg", started_at);
+        let asked_at = started_at + SESSION_CREATION;
+        record.terminate(asked_at);
+        // A repeat keeps the instant the first call stored, so the session ends when that
+        // first teardown is due rather than later.
+        record.terminate(asked_at + SESSION_TERMINATION * 10);
+        let cases = [
+            (
+                "the instant the teardown was asked for",
+                Duration::ZERO,
+                SESSION_STATE_TERMINATING,
+                false,
+            ),
+            (
+                "a moment before it is due",
+                SESSION_TERMINATION - Duration::from_millis(1),
+                SESSION_STATE_TERMINATING,
+                false,
+            ),
+            (
+                "the instant it is due",
+                SESSION_TERMINATION,
+                SESSION_STATE_TERMINATED,
+                true,
+            ),
+        ];
+        for (case, elapsed, expected, ended) in cases {
+            let now = asked_at + elapsed;
+            let reached = record.state_at(now);
+            assert_eq!(
+                reached, expected,
+                "case {case:?}: expected {expected}, got {reached}"
+            );
+            // The end instant is the teardown's own, so it is the SAME instant before and
+            // after the clock reaches it; what changes at that instant is whether the
+            // session has ended, which is the state asserted above and the instant
+            // `SessionStatus$EndDateTime` is then reported from.
+            assert_eq!(
+                record.is_terminated_at(now),
+                ended,
+                "case {case:?}: expected the session to have ended: {ended}, got the state \
+                 {reached}"
+            );
+            assert_eq!(
+                record.ended_at(),
+                Some(asked_at + SESSION_TERMINATION),
+                "case {case:?}: expected the end instant to be the first teardown's, got {:?}",
+                record.ended_at()
+            );
+            assert!(
+                !record.is_active_at(now),
+                "case {case:?}: a session that was asked to shut down is in no active state"
+            );
+        }
+    }
+
+    /// RULE: the state of a session's executor follows its session's own at every instant —
+    /// acquiring while the session is, registered while it runs, shutting down and then gone
+    /// with it — and its termination instant is the session's own end.
+    #[test]
+    fn an_executors_state_follows_its_sessions() {
+        let started_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let live = session("spark-wg", started_at);
+        // The same session once a shutdown has been asked for: a record carries ONE
+        // shutdown instant, so the states either side of it are read off the record as it
+        // stood then.
+        let asked_at = started_at + SESSION_CREATION * 2;
+        let mut shutting_down = live.clone();
+        shutting_down.terminate(asked_at);
+        let cases = [
+            (
+                "while the session acquires its resources",
+                &live,
+                started_at,
+                EXECUTOR_STATE_CREATING,
+                false,
+            ),
+            (
+                "once the session is ready",
+                &live,
+                started_at + SESSION_CREATION,
+                EXECUTOR_STATE_REGISTERED,
+                false,
+            ),
+            (
+                "while the session shuts down",
+                &shutting_down,
+                asked_at,
+                EXECUTOR_STATE_TERMINATING,
+                false,
+            ),
+            (
+                "once the session is gone",
+                &shutting_down,
+                asked_at + SESSION_TERMINATION,
+                EXECUTOR_STATE_TERMINATED,
+                true,
+            ),
+        ];
+        for (case, record, now, expected, terminated) in cases {
+            let summaries = record.executor_summaries(now);
+            assert_eq!(
+                summaries.len(),
+                1,
+                "case {case:?}: expected the coordinator alone, got {summaries:?}"
+            );
+            let coordinator = summaries.first().expect("one executor");
+            assert_eq!(
+                coordinator.executor_state.as_deref(),
+                Some(expected),
+                "case {case:?}: expected {expected}, got {:?}",
+                coordinator.executor_state
+            );
+            assert_eq!(
+                coordinator.executor_type.as_deref(),
+                Some(EXECUTOR_TYPE_COORDINATOR),
+                "case {case:?}: the executor a start provisions is the coordinator, got {:?}",
+                coordinator.executor_type
+            );
+            assert_eq!(
+                coordinator.termination_date_time.is_some(),
+                terminated,
+                "case {case:?}: expected a termination instant to be reported: {terminated}, \
+                 got {:?}",
+                coordinator.termination_date_time
+            );
+        }
+    }
+
+    /// RULE: a workgroup's sessions are walked newest first, and only its own.
+    #[test]
+    fn a_workgroups_sessions_are_walked_newest_first() {
+        let started_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let mut registry = SessionRegistry::default();
+        let mut ids = Vec::new();
+        for index in 0..3u32 {
+            let record = session("spark-wg", started_at + Duration::from_secs(index.into()));
+            ids.push(record.id.clone());
+            registry.insert(record);
+        }
+        // Another workgroup's session is never in this workgroup's walk.
+        registry.insert(session("another-wg", started_at));
+
+        let walked: Vec<&str> = registry
+            .sessions_in("spark-wg")
+            .into_iter()
+            .map(|record| record.id.as_str())
+            .collect();
+        let newest_first: Vec<&str> = ids.iter().rev().map(String::as_str).collect();
+        assert_eq!(
+            walked, newest_first,
+            "case \"three sessions of one workgroup\": expected the newest first, got {walked:?}"
+        );
+        assert_eq!(
+            registry.len(),
+            4,
+            "case \"four sessions across two workgroups\": expected all four to be held"
+        );
+    }
+
+    /// RULE: a start token answers with the session it minted, and the record it points at
+    /// goes with the session when the workgroup is deleted.
+    #[test]
+    fn a_start_token_resolves_the_session_it_minted() {
+        let started_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let mut registry = SessionRegistry::default();
+        let mut record = session("spark-wg", started_at);
+        record.client_request_token = Some("a-token".to_string());
+        let id = record.id.clone();
+        registry.insert(record);
+        assert_eq!(
+            registry.session_of_token("a-token").map(|held| &held.id),
+            Some(&id),
+            "case \"the token the start carried\": expected the session it minted"
+        );
+        assert!(
+            registry.session_of_token("another-token").is_none(),
+            "case \"a token no start carried\": expected no session"
+        );
+        assert_eq!(
+            registry.remove_work_group("spark-wg"),
+            1,
+            "case \"deleting the workgroup\": expected its one session to go with it"
+        );
+        assert!(
+            registry.session_of_token("a-token").is_none() && registry.is_empty(),
+            "case \"after the workgroup was deleted\": expected neither the session nor its \
+             token to be held"
+        );
+    }
+
+    /// RULE: the notebook an engine configuration binds its session to is the value of its
+    /// `NotebookId` additional config, and nothing else binds one.
+    #[test]
+    fn the_notebook_a_start_binds_comes_from_its_additional_configs() {
+        let with = |entries: &[(&str, &str)]| EngineConfiguration {
+            additional_configs: Some(
+                entries
+                    .iter()
+                    .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                    .collect(),
+            ),
+            ..EngineConfiguration::default()
+        };
+        let cases = [
+            (
+                "the documented key",
+                with(&[(NOTEBOOK_ID_CONFIG, "nb-1")]),
+                Some("nb-1".to_string()),
+            ),
+            (
+                "the documented key beside others",
+                with(&[("Other", "x"), (NOTEBOOK_ID_CONFIG, "nb-2")]),
+                Some("nb-2".to_string()),
+            ),
+            ("another key alone", with(&[("NotebookName", "nb-3")]), None),
+            ("no additional configs at all", with(&[]), None),
+        ];
+        for (case, configuration, expected) in cases {
+            let bound = notebook_of_engine_configuration(Some(&configuration));
+            assert_eq!(
+                bound, expected,
+                "case {case:?}: expected {expected:?}, got {bound:?}"
+            );
+        }
+    }
 }

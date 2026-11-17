@@ -45,13 +45,17 @@
 //! reports what an import persisted rather than anything rebuilt from the reading request.
 //!
 //! SESSIONS live in the [`SessionRegistry`] of
-//! [`ComAmazonawsAthenaAmazonathenaState::sessions`], each belonging to the workgroup it
-//! runs in and, when the request that started it bound it to one ([`NOTEBOOK_ID_CONFIG`]),
-//! to one notebook: `ListNotebookSessions` reports a notebook's active sessions out of
-//! those records. A session has a lifecycle the clock owes — a start stores when its
-//! resources are due and every read derives the state from that instant
+//! [`ComAmazonawsAthenaAmazonathenaState::sessions`], each started in the Spark enabled
+//! workgroup it runs in and, when the request that started it bound it to one
+//! ([`NOTEBOOK_ID_CONFIG`]), to one notebook: `StartSession` writes a [`SessionRecord`]
+//! there and `GetSession`, `GetSessionStatus`, `ListSessions`, `ListExecutors` and
+//! `ListNotebookSessions` all answer out of those same records. A session has a lifecycle
+//! the clock owes — a start stores when its resources are due, a termination is owed a span
+//! of its own, and every read derives the state from those instants
 //! ([`SessionRecord::state_at`]) — so a session a caller reads straight back is still
-//! CREATING and becomes idle whether or not anybody polls it.
+//! CREATING, it becomes idle whether or not anybody polls it, and no read has to write to
+//! move it on. A session lives as long as its workgroup does, deleting the workgroup taking
+//! its sessions with it ([`ComAmazonawsAthenaAmazonathenaState::delete_work_group`]).
 //!
 //! PREPARED STATEMENTS live in the [`PreparedStatementRegistry`] of
 //! [`ComAmazonawsAthenaAmazonathenaState::prepared_statements`], scoped to the workgroup
@@ -99,8 +103,8 @@ mod runtime_statistics;
 mod notebooks;
 pub use notebooks::*;
 
-/// The sessions this account's workgroups run, and the notebook each notebook session
-/// was started in.
+/// The sessions this account's workgroups run, the executors each one runs on, and the
+/// notebook a notebook session was started in.
 mod sessions;
 pub use sessions::*;
 
@@ -2220,9 +2224,10 @@ pub struct ComAmazonawsAthenaAmazonathenaState {
     /// `ImportNotebook` writes it and `ExportNotebook` reads it; see
     /// [`NotebookRegistry`].
     pub notebooks: NotebookRegistry,
-    /// Every session this account holds, each belonging to one workgroup and, for a
-    /// notebook session, to one notebook. The request that starts a session writes it and
-    /// `ListNotebookSessions` reads it; see [`SessionRegistry`].
+    /// Every session this account holds, each started in one workgroup and, for a notebook
+    /// session, in one notebook. `StartSession` writes it and `GetSession`,
+    /// `ListSessions`, `ListExecutors` and `ListNotebookSessions` read it; see
+    /// [`SessionRegistry`].
     pub sessions: SessionRegistry,
     /// Every capacity reservation this account holds. `CreateCapacityReservation` writes
     /// it and `GetCapacityReservation` reads it; see [`CapacityReservationRegistry`].

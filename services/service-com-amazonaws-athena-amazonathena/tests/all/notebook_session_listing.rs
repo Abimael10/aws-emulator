@@ -21,8 +21,9 @@
 //! lifecycle is seeded with the instants that put it there, and every row's expectation
 //! holds whether or not the emulator's own creation and shutdown spans elapse mid-run.
 //! The sessions are written straight into this service's store through its own
-//! [`SessionRecord`] — the operation that STARTS a session is still a scaffold, so the store
-//! is where a session can come from — and the listing is read back over the wire.
+//! [`SessionRecord`] — seeding is what lets a row place a session at an exact point of its
+//! lifecycle, which starting one over the wire cannot — and the listing is read back over
+//! the wire.
 
 use std::cmp::Reverse;
 use std::sync::Arc;

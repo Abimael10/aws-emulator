@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TerminateSession
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TerminateSession`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TerminateSession::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: asks the session the request names to shut down and answers with the state
+//! it is then in — `TERMINATING` for a live session, over the span its teardown is due
+//! after. A session that is already inactive is left exactly as it is and reported as it
+//! stands, which is the no-op the operation documents.
 //!
 //! ## Shape of an operation
 //!
@@ -149,20 +144,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TerminateSession` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TerminateSessionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TerminateSession"))
+        // No IAM decision here, for the reason `GetSession` states: an Athena action is
+        // scoped by the WORKGROUP the request names, and a session-addressed request names
+        // none.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TerminateSessionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("Athena state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+
+        // The same refusal every session-addressed request this service will not act on
+        // answers with (`crate::state::SESSION_NOT_FOUND`): RECORDED behaviour for an id
+        // that never named a session, and the sentence states nothing about whether one
+        // does. A session this account DOES hold is terminated below, whatever state it is
+        // in.
+        let Some(record) = store.sessions.session_mut(&input.session_id) else {
+            return Err(TerminateSessionError::invalid_request(
+                crate::state::ERROR_CODE_INVALID_INPUT,
+                crate::state::SESSION_NOT_FOUND,
+            ));
+        };
+
+        // "A TerminateSession call on a session that is already inactive (for example, in a
+        // FAILED, TERMINATED or TERMINATING state) succeeds but has no effect": the shutdown
+        // keeps the instant it was FIRST asked at (`crate::state::SessionRecord::terminate`),
+        // so a repeat neither restarts the teardown nor moves the instant the session ends
+        // at, and the state reported below is the one the session is in.
+        record.terminate(now);
+
+        Ok(TerminateSessionOutput {
+            state: Some(record.state_at(now).to_string()),
+        })
     }
 }

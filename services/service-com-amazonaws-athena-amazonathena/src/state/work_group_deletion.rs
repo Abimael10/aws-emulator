@@ -70,12 +70,14 @@ impl ComAmazonawsAthenaAmazonathenaState {
     /// record the registry no longer holds — or `None` when it held none under that name.
     ///
     /// The contents go with the workgroup: its named queries, the query executions of its
-    /// history (and any `ClientRequestToken` that named one of them), its notebooks and its
-    /// prepared statements. The statements are not among the three kinds
-    /// `RecursiveDeleteOption` names, and so are not what a delete is refused over, but
-    /// they are addressed by a `StatementName` TOGETHER WITH their workgroup — so one whose
-    /// workgroup is gone could never be read, listed or deleted again, and keeping it would
-    /// hand a workgroup later created under the same name statements nobody created in it.
+    /// history (and any `ClientRequestToken` that named one of them), its notebooks, its
+    /// prepared statements and its sessions. The statements and the sessions are not among the
+    /// three kinds `RecursiveDeleteOption` names, and so are not what a delete is refused
+    /// over, but each is addressed TOGETHER WITH its workgroup — a statement by its
+    /// `StatementName` and a workgroup, a session by the workgroup whose engine configuration
+    /// and execution role it runs under — so one whose workgroup is gone could never be read,
+    /// listed or deleted again, and keeping it would hand a workgroup later created under the
+    /// same name contents nobody created in it.
     ///
     /// Whether the delete may proceed at all — the account's default workgroup cannot be
     /// deleted, and a workgroup that still holds contents needs the recursive option — is
@@ -85,6 +87,7 @@ impl ComAmazonawsAthenaAmazonathenaState {
         self.named_queries.remove_work_group(name);
         self.notebooks.remove_work_group(name);
         self.prepared_statements.remove_work_group(name);
+        self.sessions.remove_work_group(name);
         let executions: HashSet<String> = self
             .query_execution_ids(name)
             .into_iter()
