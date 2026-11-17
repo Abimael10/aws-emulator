@@ -12,5 +12,5 @@
 //! layout rule requires; it holds no tests of its own.
 
 pub(crate) use crate::lifecycle::{
-    instant, wait_for_status, Answer, Emulator, PAST_DUE, SOLUTION_STACK,
+    instant, wait_for_status, wait_for_version_status, Answer, Emulator, PAST_DUE, SOLUTION_STACK,
 };

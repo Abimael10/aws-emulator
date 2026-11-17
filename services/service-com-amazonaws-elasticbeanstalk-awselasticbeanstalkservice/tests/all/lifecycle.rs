@@ -625,6 +625,52 @@ pub(crate) async fn wait_for_status(emulator: &Emulator, case: &str, name: &str,
     }
 }
 
+/// Look again until the version `version_label` of `application` reports
+/// `expected` — the CONDITION a client that waits for a version to become
+/// deployable polls for, never a fixed wait for the clock — or until
+/// [`STATUS_DEADLINE`] has passed, and hand back the report it settled in.
+///
+/// `expected` is a modelled `ApplicationVersionStatus`; what a reader puts on the
+/// wire is the upper-cased form of it, which is what this compares. Shared by
+/// every suite that waits on a version's pre-processing, so none of them keeps
+/// its own copy of the poll — the deadline and the interval are stated once,
+/// here, beside the environment poll above.
+pub(crate) async fn wait_for_version_status(
+    emulator: &Emulator,
+    case: &str,
+    application: &str,
+    version_label: &str,
+    expected: &str,
+) -> Answer {
+    let expected = eb::state::version_status_on_the_wire(expected);
+    let started = std::time::Instant::now();
+    loop {
+        let described = emulator
+            .call(
+                "DescribeApplicationVersions",
+                &[
+                    ("ApplicationName", application),
+                    ("VersionLabels.member.1", version_label),
+                ],
+            )
+            .await;
+        let status = described
+            .value("ApplicationVersions/member/Status")
+            .unwrap_or_default()
+            .to_string();
+        if status == expected {
+            return described;
+        }
+        assert!(
+            started.elapsed() < STATUS_DEADLINE,
+            "case {case:?}: version {version_label:?} of {application:?} never reached \
+             {expected}, last status {status:?} in body {}",
+            described.body
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The lifecycle, end to end
 // ---------------------------------------------------------------------------

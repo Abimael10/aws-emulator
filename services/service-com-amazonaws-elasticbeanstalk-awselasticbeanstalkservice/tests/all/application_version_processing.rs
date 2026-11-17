@@ -23,7 +23,7 @@
 //! engine and uploads the bundle through the S3 front door, so the archive the
 //! create pre-processes is one object storage really holds.
 
-use crate::harness::{instant, Answer, Emulator, PAST_DUE};
+use crate::harness::{instant, wait_for_version_status, Answer, Emulator, PAST_DUE};
 use crate::lifecycle::TEST_REGION;
 
 use service_com_amazonaws_elasticbeanstalk_awselasticbeanstalkservice as eb;
@@ -584,4 +584,242 @@ async fn a_bundle_uploaded_to_the_storage_location_processes_to_a_deployable_ver
         "case {case:?}: the environment must run the processed version, got body {}",
         launched.body
     );
+}
+
+// ---------------------------------------------------------------------------
+// Every version a client publishes settles on its own
+// ---------------------------------------------------------------------------
+
+/// One application version a client publishes: the bundle it is created from,
+/// whether its create asks for that bundle to be pre-processed, and the terminal
+/// `ApplicationVersionStatus` the version must settle in.
+#[derive(Debug, Clone, Copy)]
+struct Published {
+    case: &'static str,
+    /// The application the version belongs to, so the same label under two
+    /// applications is two different versions.
+    application: &'static str,
+    label: &'static str,
+    bundle: Bundle,
+    process: bool,
+    terminal: &'static str,
+}
+
+/// The application most of the fleet is published under.
+const FLEET_APPLICATION: &str = "fleet-app";
+/// A second application on the same engine, carrying a label the first one
+/// carries too.
+const OTHER_APPLICATION: &str = "other-fleet-app";
+
+/// The versions one client publishes, differing along what the rule
+/// generalises over: how MANY versions are outstanding at once, which verdict
+/// each one's own bundle reaches (so the three terminal statuses are all
+/// outstanding together), whether its create asked for pre-processing at all,
+/// and which application the label belongs to. Which bundle SHAPES reach which
+/// verdict is the table at the top of this file; these rows carry one bundle per
+/// verdict.
+const PUBLISHED: &[Published] = &[
+    Published {
+        case: "a manifest and a configuration file",
+        application: FLEET_APPLICATION,
+        label: "v-manifest",
+        bundle: Bundle::Zip(&[
+            ("env.yaml", VALID_MANIFEST),
+            (".ebextensions/01-options.config", YAML_CONFIG),
+        ]),
+        process: true,
+        terminal: eb::state::VERSION_STATUS_PROCESSED,
+    },
+    Published {
+        case: "a manifest that is not a YAML document",
+        application: FLEET_APPLICATION,
+        label: "v-broken-manifest",
+        bundle: Bundle::Zip(&[("env.yaml", BROKEN_YAML), ("Procfile", b"web: true")]),
+        process: true,
+        terminal: eb::state::VERSION_STATUS_FAILED,
+    },
+    Published {
+        // "Many of the values are only applicable if you specified True for the
+        // Process parameter": a create that asks for nothing to be pre-processed
+        // leaves its version `Unprocessed` however good its bundle is, and that
+        // is terminal too. That it is still `Unprocessed` a whole transition span
+        // later — rather than merely at the create — is what
+        // `a_version_whose_create_asks_for_no_processing_stays_unprocessed`
+        // above asserts; this row is here so one application carries a version in
+        // each terminal status at once.
+        case: "a valid bundle whose create asked for no pre-processing",
+        application: FLEET_APPLICATION,
+        label: "v-no-process",
+        bundle: Bundle::Zip(&[("env.yaml", VALID_MANIFEST)]),
+        process: false,
+        terminal: eb::state::VERSION_STATUS_UNPROCESSED,
+    },
+    Published {
+        // The same label as the first row, under another application and
+        // carrying another bundle: the verdict belongs to the version, not to
+        // the label.
+        case: "the same label under another application",
+        application: OTHER_APPLICATION,
+        label: "v-manifest",
+        bundle: Bundle::Zip(&[("env.yaml", NOT_TEXT)]),
+        process: true,
+        terminal: eb::state::VERSION_STATUS_FAILED,
+    },
+];
+
+/// The object each published version's bundle is uploaded as: one object per
+/// version, so no two versions are judged on the same archive.
+fn bundle_key(row: &Published) -> String {
+    format!("bundles/{}/{}.zip", row.application, row.label)
+}
+
+/// The status `described` reports for `label`, read out of the member that
+/// carries that label rather than by position — so a report that paired the
+/// statuses with the wrong versions could not pass.
+fn reported_status(described: &Answer, label: &str) -> Option<String> {
+    described
+        .elements_at("ApplicationVersions/member")
+        .into_iter()
+        .find(|member| member.value("VersionLabel") == Some(label))
+        .and_then(|member| member.value("Status").map(str::to_string))
+}
+
+/// A client publishes SEVERAL versions and every one of them settles in the
+/// terminal status its OWN bundle validated to, so each becomes deployable (or
+/// reports why it is not) on its own.
+///
+/// The rule the rows span: pre-processing is per application version — the
+/// archive THAT create named is read and the verdict that reading reached is the
+/// status THAT version settles in one transition span later — so a fleet of
+/// outstanding versions settles version by version, and a label another
+/// application carries is a different version with its own verdict. Every status
+/// is read back through `DescribeApplicationVersions`, the reader a client waits
+/// on, and reading it again reports the same thing. What a SINGLE version's
+/// create answers, which bundle shapes reach which verdict and that a processed
+/// version launches an environment are the suites above; this one is about a
+/// fleet of them.
+#[tokio::test]
+async fn every_published_version_settles_in_the_status_its_own_bundle_validated_to() {
+    let emulator = Emulator::with_object_storage();
+    for application in [FLEET_APPLICATION, OTHER_APPLICATION] {
+        given_application(&emulator, application).await;
+    }
+
+    // One bucket for every bundle, the way a client uploads into the one
+    // storage location: the first upload creates it, the rest are PutObject
+    // alone over the S3 front door.
+    let mut bucket_created = false;
+    for row in PUBLISHED {
+        let case = row.case;
+        let key = bundle_key(row);
+        let bytes = row.bundle.bytes();
+        if bucket_created {
+            let stored = emulator
+                .s3("PUT", &format!("/{BUNDLE_BUCKET}/{key}"), &bytes)
+                .await;
+            assert_eq!(
+                stored, 200,
+                "case {case:?}: expected 200 from PutObject of the bundle, got {stored}"
+            );
+        } else {
+            emulator.put_object(BUNDLE_BUCKET, &key, &bytes).await;
+            bucket_created = true;
+        }
+
+        let mut params = vec![
+            ("ApplicationName", row.application),
+            ("VersionLabel", row.label),
+            ("SourceBundle.S3Bucket", BUNDLE_BUCKET),
+            ("SourceBundle.S3Key", key.as_str()),
+        ];
+        if row.process {
+            params.push(("Process", "true"));
+        }
+        let created = emulator.call("CreateApplicationVersion", &params).await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: expected 200 from CreateApplicationVersion, got {} and body {}",
+            created.status, created.body
+        );
+        // A create that asked for pre-processing answers the transient status,
+        // because the work it started is not done when the call returns; one
+        // that asked for none answers its terminal status straight away.
+        let at_the_create = eb::state::version_status_on_the_wire(if row.process {
+            eb::state::VERSION_STATUS_PROCESSING
+        } else {
+            eb::state::VERSION_STATUS_UNPROCESSED
+        });
+        assert_eq!(
+            created.value("ApplicationVersion/Status"),
+            Some(at_the_create.as_str()),
+            "case {case:?}: expected the create to report {at_the_create}, got body {}",
+            created.body
+        );
+    }
+
+    // Each version is waited on the way its own client waits on it: for the
+    // CONDITION that it reports its terminal status, through the one poll this
+    // test target states that wait in. The report it settled in is that
+    // version's own labelled read, and reading it again must report the same
+    // thing — a read reports the settled status without moving it on.
+    for row in PUBLISHED {
+        let case = row.case;
+        let expected = eb::state::version_status_on_the_wire(row.terminal);
+        let settled = wait_for_version_status(
+            &emulator,
+            case,
+            row.application,
+            row.label,
+            row.terminal,
+        )
+        .await;
+        assert_eq!(
+            settled.value("ApplicationVersions/member/VersionLabel"),
+            Some(row.label),
+            "case {case:?}: the settled report must be the version that was asked for, got body {}",
+            settled.body
+        );
+        let (again, answer) = described_status(&emulator, row.application, row.label).await;
+        assert_eq!(
+            again, expected,
+            "case {case:?}: a read must not change what a later read sees, got {again:?} and body \
+             {}",
+            answer.body
+        );
+    }
+
+    // And the report of the application as a whole pairs every one of its
+    // versions with its OWN status.
+    for application in [FLEET_APPLICATION, OTHER_APPLICATION] {
+        let settled = emulator
+            .call(
+                "DescribeApplicationVersions",
+                &[("ApplicationName", application)],
+            )
+            .await;
+        let published: Vec<&Published> = PUBLISHED
+            .iter()
+            .filter(|row| row.application == application)
+            .collect();
+        assert_eq!(
+            settled
+                .values_at("ApplicationVersions/member/VersionLabel")
+                .len(),
+            published.len(),
+            "case {application:?}: expected every published version to be reported, got body {}",
+            settled.body
+        );
+        for row in published {
+            let case = row.case;
+            let expected = eb::state::version_status_on_the_wire(row.terminal);
+            assert_eq!(
+                reported_status(&settled, row.label),
+                Some(expected.clone()),
+                "case {case:?}: expected version {:?} of {application:?} to settle in {expected}, \
+                 got body {}",
+                row.label,
+                settled.body
+            );
+        }
+    }
 }

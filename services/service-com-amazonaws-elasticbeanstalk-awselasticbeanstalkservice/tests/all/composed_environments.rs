@@ -36,8 +36,7 @@
 //! `application_version_processing.rs` owns.
 
 use crate::application_version_processing::zip_of;
-use crate::harness::{wait_for_status, Answer, Emulator, SOLUTION_STACK};
-use crate::lifecycle::{POLL_INTERVAL, STATUS_DEADLINE};
+use crate::harness::{wait_for_status, wait_for_version_status, Answer, Emulator, SOLUTION_STACK};
 
 use service_com_amazonaws_elasticbeanstalk_awselasticbeanstalkservice as eb;
 
@@ -239,51 +238,11 @@ async fn given_version(
     wait_for_version_status(
         emulator,
         case,
+        APPLICATION,
         version_label,
         eb::state::VERSION_STATUS_PROCESSED,
     )
     .await;
-}
-
-/// Look again until the version `version_label` reports `expected` — the
-/// CONDITION the caller waits on, never a fixed wait for the clock — or until
-/// the harness's generous [`STATUS_DEADLINE`] has passed.
-///
-/// `expected` is a modelled `ApplicationVersionStatus`; what a reader reports is
-/// the wire form of it, which is what this compares.
-async fn wait_for_version_status(
-    emulator: &Emulator,
-    case: &str,
-    version_label: &str,
-    expected: &str,
-) {
-    let expected = eb::state::version_status_on_the_wire(expected);
-    let started = std::time::Instant::now();
-    loop {
-        let described = emulator
-            .call(
-                "DescribeApplicationVersions",
-                &[
-                    ("ApplicationName", APPLICATION),
-                    ("VersionLabels.member.1", version_label),
-                ],
-            )
-            .await;
-        let status = described
-            .value("ApplicationVersions/member/Status")
-            .unwrap_or_default()
-            .to_string();
-        if status == expected {
-            return;
-        }
-        assert!(
-            started.elapsed() < STATUS_DEADLINE,
-            "case {case:?}: version {version_label:?} never reached {expected}, last status \
-             {status:?} in body {}",
-            described.body
-        );
-        tokio::time::sleep(POLL_INTERVAL).await;
-    }
 }
 
 /// Compose the group the `version_labels` describe, with `group_name` when the
@@ -976,7 +935,7 @@ async fn a_version_that_was_not_successfully_processed_composes_nothing() {
                 created.body
             );
         } else {
-            wait_for_version_status(&emulator, case, VERSION_LABEL, status).await;
+            wait_for_version_status(&emulator, case, APPLICATION, VERSION_LABEL, status).await;
         }
 
         let refused = compose(&emulator, Some(GROUP_NAME), &[VERSION_LABEL]).await;
