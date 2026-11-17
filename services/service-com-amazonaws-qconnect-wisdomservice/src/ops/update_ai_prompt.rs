@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAIPrompt
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAIPrompt`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAIPrompt::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! MUTATES the AI prompt the route names: every member this call carries is written to
+//! the prompt's working copy — the one record `CreateAIPrompt` stored and `GetAIPrompt`
+//! reports — so a read after this call reports what this call wrote. A route naming an
+//! assistant this account does not hold, or a prompt that assistant does not hold, is the
+//! modelled `ResourceNotFoundException` (HTTP 404).
 //!
 //! ## Shape of an operation
 //!
@@ -97,6 +94,24 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The modelled `ResourceNotFoundException` (HTTP 404), naming the resource the request
+/// addressed — the member the model provides for exactly that.
+fn not_found(message: &str, resource_name: &str) -> UpdateAIPromptError {
+    UpdateAIPromptErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message.to_string()),
+        resource_name: Some(resource_name.to_string()),
+    })
+    .into()
+}
+
+/// The modelled `ConflictException` (HTTP 409).
+fn conflict(message: &str) -> UpdateAIPromptError {
+    UpdateAIPromptErrorModeled::ConflictException(ConflictException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -170,18 +185,117 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAIPrompt` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAIPromptErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAIPrompt"))
+        // Modeled constraints (`description`'s length and pattern, `modelId`'s length,
+        // the template text's length, the inference parameters' ranges, the
+        // `visibilityStatus` enumeration and both label patterns) are already refused
+        // BEFORE this handler runs, so reaching here means the input satisfies every one
+        // of them. Nothing in this operation mints an ARN, so the request's region is not
+        // read.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable in this emulator: the router builds one `InMemoryEngine` and
+            // hands it to every service.
+            crate::scaffolded::Scaffolded::not_implemented("UpdateAIPrompt")
+        })?;
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // An AI prompt exists only inside an assistant, so the parent is resolved first:
+        // an update naming an assistant this account does not hold is not found, whatever
+        // else the request carries.
+        let Some(assistant) = store.assistant(&input.assistant_id) else {
+            return Err(not_found(
+                crate::state::MESSAGE_ASSISTANT_NOT_FOUND,
+                &input.assistant_id,
+            ));
+        };
+        let assistant_id = assistant.assistant_id.clone();
+
+        // The record this update writes: the prompt's working copy. A label naming a
+        // numbered VERSION names a published snapshot rather than the working copy, and no
+        // snapshot is what an update changes, so such a label names nothing to write.
+        let Some(stored) = store.ai_prompt(&assistant_id, &input.ai_prompt_id) else {
+            return Err(not_found(
+                crate::state::MESSAGE_AI_PROMPT_NOT_FOUND,
+                &input.ai_prompt_id,
+            ));
+        };
+        let ai_prompt_id = stored.ai_prompt_id.clone();
+
+        // What this update's `@idempotencyToken` identifies: every member the write below
+        // applies. The template and inference configurations are fingerprinted through
+        // their `Debug` rendering, which is stable for one request.
+        let fingerprint = crate::state::request_fingerprint(&[
+            input.visibility_status.clone(),
+            input.description.clone().unwrap_or_default(),
+            input.model_id.clone().unwrap_or_default(),
+            format!("{:?}", input.template_configuration),
+            format!("{:?}", input.inference_configuration),
+        ]);
+
+        // A replayed `@idempotencyToken` answers with the prompt's record as it now
+        // stands, writing nothing a second time, while the same token carrying a DIFFERENT
+        // request is the modelled idempotency conflict. The token is scoped to this
+        // operation and this prompt, so the same token on another call is another request.
+        // A token the store has forgotten (its bound keeps the most recent ones) replays
+        // as the fresh request it then is.
+        let token_scope = format!("{}/{assistant_id}/{ai_prompt_id}", Self::NAME);
+        match store.replayed_create(&token_scope, input.client_token.as_deref(), &fingerprint) {
+            crate::state::Replay::Conflict => {
+                return Err(conflict(crate::state::MESSAGE_IDEMPOTENCY_CONFLICT))
+            }
+            crate::state::Replay::Retry(_) => {
+                if let Some(prompt) = store.ai_prompt(&assistant_id, &ai_prompt_id) {
+                    return Ok(UpdateAIPromptOutput {
+                        ai_prompt: Some(prompt.to_ai_prompt_data()),
+                    });
+                }
+            }
+            crate::state::Replay::Fresh => {}
+        }
+
+        // Nothing is refused past this point, so the record is written once, through the
+        // same seam a read resolves: an update and a read reach one record.
+        // `visibilityStatus` is `@required`, so every update states it; the optional
+        // members are applied only where the request carried them, so what it left out
+        // keeps the value the prompt already held.
+        let Some(slot) = store.ai_prompt_mut(&assistant_id, &ai_prompt_id) else {
+            // Unreachable: the record was resolved above under the same lock.
+            return Err(not_found(
+                crate::state::MESSAGE_AI_PROMPT_NOT_FOUND,
+                &input.ai_prompt_id,
+            ));
+        };
+        slot.visibility_status = input.visibility_status.clone();
+        if let Some(description) = input.description.clone() {
+            slot.description = Some(description);
+        }
+        if let Some(model_id) = input.model_id.clone() {
+            slot.model_id = model_id;
+        }
+        if let Some(template_configuration) = input.template_configuration.clone() {
+            slot.template_configuration = template_configuration;
+        }
+        if let Some(inference_configuration) = input.inference_configuration.clone() {
+            slot.inference_configuration = Some(inference_configuration);
+        }
+        // The write is what `modifiedTime` reports: when this record last changed.
+        slot.modified_at = now;
+        // Answer out of what was just persisted, so this response and a later
+        // `GetAIPrompt` cannot disagree about what the prompt holds. The ARN this write
+        // reports is the prompt's own: a write addresses the resource, and it is a READ of
+        // one version that names the version it answered for.
+        let data = slot.to_ai_prompt_data();
+
+        store.remember_create(
+            &token_scope,
+            input.client_token.as_deref(),
+            &fingerprint,
+            &ai_prompt_id,
+        );
+
+        Ok(UpdateAIPromptOutput {
+            ai_prompt: Some(data),
+        })
     }
 }

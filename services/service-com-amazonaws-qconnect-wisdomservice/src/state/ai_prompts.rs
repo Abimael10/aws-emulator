@@ -158,6 +158,21 @@ impl Assistant {
             _ => self.ai_prompts.get(id),
         }
     }
+
+    /// The same AI prompt as [`Self::ai_prompt`], for a caller that WRITES to it: the
+    /// seam `UpdateAIPrompt` applies its change through, so an update and a read reach
+    /// one record rather than two copies.
+    ///
+    /// A label resolves here exactly as it does for a read, so a qualifier naming a
+    /// numbered VERSION of the prompt names nothing to write either: a version is a
+    /// snapshot of the prompt, not the working copy an update changes.
+    pub fn ai_prompt_mut(&mut self, label: &str) -> Option<&mut AiPrompt> {
+        let (id, qualifier) = resolve_qualified_id(label);
+        match qualifier {
+            Some(qualifier) if qualifier != VERSION_QUALIFIER_LATEST => None,
+            _ => self.ai_prompts.get_mut(id),
+        }
+    }
 }
 
 impl ComAmazonawsQconnectWisdomserviceState {
@@ -166,6 +181,45 @@ impl ComAmazonawsQconnectWisdomserviceState {
     /// assistant, so a prompt of ANOTHER assistant is not found under this one.
     pub fn ai_prompt(&self, assistant_label: &str, prompt_label: &str) -> Option<&AiPrompt> {
         self.assistant(assistant_label)?.ai_prompt(prompt_label)
+    }
+
+    /// The same AI prompt as [`Self::ai_prompt`], for a caller that WRITES to it — the
+    /// seam [`Assistant::ai_prompt_mut`] describes, reached through the assistant the
+    /// route named.
+    pub fn ai_prompt_mut(
+        &mut self,
+        assistant_label: &str,
+        prompt_label: &str,
+    ) -> Option<&mut AiPrompt> {
+        self.assistant_mut(assistant_label)?
+            .ai_prompt_mut(prompt_label)
+    }
+
+    /// Forget one AI prompt, as `DeleteAIPrompt` does, together with the `clientToken`
+    /// entry that created it: a token whose resource is gone must not resurrect it on a
+    /// replay. `None` — nothing removed — when the pair names no prompt this account
+    /// holds, which is the caller's not-found.
+    ///
+    /// The assistant's prompt count drops with it, so [`MAX_AI_PROMPTS_PER_ASSISTANT`] is
+    /// about the prompts still LIVE, exactly as the sibling families' removals leave their
+    /// own bound.
+    pub fn remove_ai_prompt(
+        &mut self,
+        assistant_label: &str,
+        prompt_label: &str,
+    ) -> Option<AiPrompt> {
+        let assistant_id = self.assistant(assistant_label)?.assistant_id.clone();
+        let prompt_id = self
+            .ai_prompt(&assistant_id, prompt_label)?
+            .ai_prompt_id
+            .clone();
+        let prompt = self
+            .assistants
+            .get_mut(&assistant_id)?
+            .ai_prompts
+            .remove(&prompt_id)?;
+        self.forget_idempotency_for(&prompt_id);
+        Some(prompt)
     }
 
     /// Store an AI prompt inside the assistant it names. `false` — nothing stored — when

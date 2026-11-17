@@ -1,14 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end tests for the Amazon Q in Connect AI-prompt slice (`CreateAIPrompt` +
-//! `GetAIPrompt`), driven over HTTP through the same router the emulator serves with.
+//! End-to-end tests for the Amazon Q in Connect AI-prompt slice (`CreateAIPrompt`,
+//! `UpdateAIPrompt`, `DeleteAIPrompt` + `GetAIPrompt`), driven over HTTP through the same
+//! router the emulator serves with.
 //!
-//! The rule under test, asserted over a TABLE of inputs rather than the one recorded
-//! request: a create of a resource nested in an assistant PERSISTS every member the
-//! request carried under an id the service mints, and answers out of the stored record, so
-//! a later read — by id, by ARN, or by either carrying the working copy's version
-//! qualifier — reports exactly the same values, while a label naming no such resource of
-//! the assistant the route named is refused as not found.
+//! The rules under test, each asserted over a TABLE of inputs rather than the one recorded
+//! request:
+//!
+//! * a create of a resource nested in an assistant PERSISTS every member the request
+//!   carried under an id the service mints, and answers out of the stored record, so a
+//!   later read — by id, by ARN, or by either carrying the working copy's version
+//!   qualifier — reports exactly the same values, while a label naming no such resource of
+//!   the assistant the route named is refused as not found;
+//! * a MUTATION of that resource is what every later read of it reports: an update writes
+//!   the working copy — the member it requires and every optional member it carries
+//!   replace the stored values, a member it carries none of keeps the value it had, and
+//!   the members the service owns are untouched — and a delete removes the record, so
+//!   every later read, delete or update of it is that operation's own not-found and the
+//!   assistant's ceiling counts only the prompts still live.
 //!
 //! The rows differ along every axis the rule generalises over:
 //!
@@ -20,7 +29,11 @@
 //!   own text, and whether the optional members are sent at all;
 //! * the inference configuration: absent, partial, and every parameter at each published
 //!   bound of its range;
-//! * the tag count (none, one, several).
+//! * the tag count (none, one, several);
+//! * for a mutation: which optional members the update carries (none, one, all), in which
+//!   direction the visibility status moves, how many updates are layered on one record,
+//!   and which of the label forms a read resolves the update or the delete is addressed
+//!   by.
 //!
 //! Every assertion goes over the wire — only the HTTP status, the `x-amzn-errortype`
 //! header and the JSON body are inspected — so a response that is not computed from
@@ -151,6 +164,36 @@ async fn get_prompt(emulator: &Emulator, assistant: &str, prompt: &str) -> Reply
 /// for the AI Prompt template").
 fn template(text: &str) -> Value {
     json!({ "textFullAIPromptEditTemplateConfiguration": { "text": text } })
+}
+
+/// `UpdateAIPrompt` (`POST /assistants/{assistantId}/aiprompts/{aiPromptId}`).
+async fn update_prompt(emulator: &Emulator, assistant: &str, prompt: &str, body: Value) -> Reply {
+    emulator
+        .send(
+            "POST",
+            &format!(
+                "/assistants/{}/aiprompts/{}",
+                label(assistant),
+                label(prompt)
+            ),
+            Some(body),
+        )
+        .await
+}
+
+/// `DeleteAIPrompt` (`DELETE /assistants/{assistantId}/aiprompts/{aiPromptId}`).
+async fn delete_prompt(emulator: &Emulator, assistant: &str, prompt: &str) -> Reply {
+    emulator
+        .send(
+            "DELETE",
+            &format!(
+                "/assistants/{}/aiprompts/{}",
+                label(assistant),
+                label(prompt)
+            ),
+            None,
+        )
+        .await
 }
 
 /// The required members of every create in this suite, so a row states only what it
@@ -952,4 +995,846 @@ async fn an_assistant_holds_at_most_the_stores_prompt_ceiling() {
         "the refusal must state the ceiling it enforced, body {}",
         refused.body
     );
+}
+
+// ---------------------------------------------------------------------------
+// The mutation rule: an update writes the record every later read answers with,
+// and a delete removes it from every later caller
+// ---------------------------------------------------------------------------
+
+/// The members of `AIPromptData` an update can write
+/// (`smithy_query(query="operation",operation="UpdateAIPrompt")` takes `visibilityStatus`
+/// required, and `description`, `modelId`, `templateConfiguration` and
+/// `inferenceConfiguration` optional).
+const WRITABLE_MEMBERS: [&str; 5] = [
+    "visibilityStatus",
+    "description",
+    "modelId",
+    "templateConfiguration",
+    "inferenceConfiguration",
+];
+
+/// The members of `AIPromptData` no update carries, so none of them may move
+/// (`smithy_query(query="shape",shape="AIPromptData")`). `modifiedTime` is in neither
+/// list: it reports when the record was last written, so an update is expected to move it.
+const PRESERVED_MEMBERS: [&str; 11] = [
+    "assistantId",
+    "assistantArn",
+    "aiPromptId",
+    "aiPromptArn",
+    "name",
+    "type",
+    "templateType",
+    "apiFormat",
+    "origin",
+    "status",
+    "tags",
+];
+
+/// One row of the update table: the create it starts from, and the updates layered on the
+/// record that create left.
+#[derive(Debug, Clone)]
+struct UpdateRow {
+    label: String,
+    create: Value,
+    updates: Vec<Value>,
+}
+
+/// An `UpdateAIPrompt` body: `visibilityStatus` is the one member the model requires, so a
+/// row states only the optional members it varies.
+fn update_with(visibility: &str, members: Vec<(&str, Value)>) -> Value {
+    let mut body = json!({ "visibilityStatus": visibility });
+    for (member, value) in members {
+        body[member] = value;
+    }
+    body
+}
+
+/// A `CreateAIPrompt` body of this suite's first type and format, so an update row states
+/// only what it needs the record to start from.
+fn created_with(name: &str, visibility: &str, members: Vec<(&str, Value)>) -> Value {
+    let mut body = required(name, PROMPT_TYPES[0], API_FORMATS[0], visibility);
+    for (member, value) in members {
+        body[member] = value;
+    }
+    body
+}
+
+/// The updates the write rule is asserted over. Each row differs from the others along one
+/// axis of the rule — which optional members the update carries, which direction the
+/// visibility status moves, a published bound of a member it writes, and how many updates
+/// are layered on one record.
+fn update_rows() -> Vec<UpdateRow> {
+    let mut rows: Vec<UpdateRow> = Vec::new();
+
+    // The required member alone, in both directions and restating the value already held:
+    // an update carrying no optional member keeps every optional value the record has.
+    for (what, from, to) in [
+        (
+            "publishing a saved prompt",
+            VISIBILITY_SAVED,
+            VISIBILITY_PUBLISHED,
+        ),
+        (
+            "saving a published prompt",
+            VISIBILITY_PUBLISHED,
+            VISIBILITY_SAVED,
+        ),
+        (
+            "restating the visibility status the prompt already holds",
+            VISIBILITY_SAVED,
+            VISIBILITY_SAVED,
+        ),
+    ] {
+        rows.push(UpdateRow {
+            label: format!("{what}, carrying only the required member"),
+            create: created_with(
+                "visibility only",
+                from,
+                vec![
+                    ("description", json!("Described at create time")),
+                    ("inferenceConfiguration", json!({ "topK": TOP_K_MAX })),
+                ],
+            ),
+            updates: vec![update_with(to, Vec::new())],
+        });
+    }
+
+    // `description` at each published bound, onto a prompt created with one and onto a
+    // prompt created without any.
+    for (what, create) in [
+        (
+            "onto a described prompt",
+            created_with(
+                "described",
+                VISIBILITY_SAVED,
+                vec![("description", json!("Described at create time"))],
+            ),
+        ),
+        (
+            "onto a prompt created without a description",
+            created_with("undescribed", VISIBILITY_SAVED, Vec::new()),
+        ),
+    ] {
+        rows.push(UpdateRow {
+            label: format!("a description at each published bound, {what}"),
+            create,
+            updates: vec![
+                update_with(
+                    VISIBILITY_PUBLISHED,
+                    vec![("description", json!("d".repeat(DESCRIPTION_MIN)))],
+                ),
+                update_with(
+                    VISIBILITY_PUBLISHED,
+                    vec![("description", json!("d".repeat(DESCRIPTION_MAX)))],
+                ),
+            ],
+        });
+    }
+
+    // `modelId`: one entry of the documented catalog, and each published length bound.
+    rows.push(UpdateRow {
+        label: "another model id, from the catalog and at each published bound".to_string(),
+        create: created_with("remodelled", VISIBILITY_SAVED, Vec::new()),
+        updates: vec![
+            update_with(VISIBILITY_SAVED, vec![("modelId", json!(MODEL_IDS[1]))]),
+            update_with(
+                VISIBILITY_SAVED,
+                vec![("modelId", json!("m".repeat(MODEL_ID_MIN)))],
+            ),
+            update_with(
+                VISIBILITY_PUBLISHED,
+                vec![("modelId", json!("m".repeat(MODEL_ID_MAX)))],
+            ),
+        ],
+    });
+
+    // The prompt template, at each published length bound of its text.
+    rows.push(UpdateRow {
+        label: "another prompt template, at each published text length".to_string(),
+        create: created_with("retemplated", VISIBILITY_PUBLISHED, Vec::new()),
+        updates: vec![
+            update_with(
+                VISIBILITY_PUBLISHED,
+                vec![(
+                    "templateConfiguration",
+                    template(&"t".repeat(TEMPLATE_TEXT_MIN)),
+                )],
+            ),
+            update_with(
+                VISIBILITY_SAVED,
+                vec![(
+                    "templateConfiguration",
+                    template(&"t".repeat(TEMPLATE_TEXT_MAX)),
+                )],
+            ),
+        ],
+    });
+
+    // The inference parameters: added by the update, every parameter at each published
+    // bound of its range, then a partial set, which replaces the whole structure.
+    rows.push(UpdateRow {
+        label: "inference parameters at each published bound, then a partial set".to_string(),
+        create: created_with("inference", VISIBILITY_SAVED, Vec::new()),
+        updates: vec![
+            update_with(
+                VISIBILITY_SAVED,
+                vec![(
+                    "inferenceConfiguration",
+                    json!({
+                        "temperature": PROBABILITY_MIN,
+                        "topP": PROBABILITY_MIN,
+                        "topK": TOP_K_MIN,
+                        "maxTokensToSample": MAX_TOKENS_MIN,
+                    }),
+                )],
+            ),
+            update_with(
+                VISIBILITY_PUBLISHED,
+                vec![(
+                    "inferenceConfiguration",
+                    json!({
+                        "temperature": PROBABILITY_MAX,
+                        "topP": PROBABILITY_MAX,
+                        "topK": TOP_K_MAX,
+                        "maxTokensToSample": MAX_TOKENS_MAX,
+                    }),
+                )],
+            ),
+            update_with(
+                VISIBILITY_PUBLISHED,
+                vec![(
+                    "inferenceConfiguration",
+                    json!({ "maxTokensToSample": MAX_TOKENS_MAX }),
+                )],
+            ),
+        ],
+    });
+
+    // Every writable member at once, and several updates layered on one record: each is
+    // applied to the record the previous left.
+    rows.push(UpdateRow {
+        label: "every writable member at once".to_string(),
+        create: created_with("everything", VISIBILITY_SAVED, Vec::new()),
+        updates: vec![update_with(
+            VISIBILITY_PUBLISHED,
+            vec![
+                ("description", json!("Every writable member at once")),
+                ("modelId", json!(MODEL_IDS[2])),
+                (
+                    "templateConfiguration",
+                    template("system: Everything at once.\n"),
+                ),
+                (
+                    "inferenceConfiguration",
+                    json!({ "temperature": PROBABILITY_MAX, "topK": TOP_K_MAX }),
+                ),
+            ],
+        )],
+    });
+    rows.push(UpdateRow {
+        label: "three updates layered on one record".to_string(),
+        create: created_with(
+            "layered",
+            VISIBILITY_SAVED,
+            vec![("description", json!("The description the create carried"))],
+        ),
+        updates: vec![
+            update_with(VISIBILITY_PUBLISHED, vec![("modelId", json!(MODEL_IDS[3]))]),
+            update_with(
+                VISIBILITY_PUBLISHED,
+                vec![("description", json!("The second update"))],
+            ),
+            update_with(
+                VISIBILITY_SAVED,
+                vec![(
+                    "templateConfiguration",
+                    template("system: The third update.\n"),
+                )],
+            ),
+        ],
+    });
+
+    rows
+}
+
+/// Every label form that addresses one prompt — the forms a read resolves: by id, by ARN,
+/// and by either carrying the working copy's version qualifier.
+fn label_forms(assistant_id: &str, prompt_id: &str) -> Vec<(String, String)> {
+    vec![
+        ("the prompt id".to_string(), prompt_id.to_string()),
+        (
+            "the prompt ARN".to_string(),
+            expected_prompt_arn(assistant_id, prompt_id),
+        ),
+        (
+            "the id carrying the working copy's qualifier".to_string(),
+            format!("{prompt_id}:{QUALIFIER_LATEST}"),
+        ),
+        (
+            "the ARN carrying the working copy's qualifier".to_string(),
+            expected_read_arn(assistant_id, prompt_id, QUALIFIER_LATEST),
+        ),
+    ]
+}
+
+/// The `AIPromptData` an update must answer with: every member it carried replaces the
+/// stored value, every other writable member is the one the previous answer reported, and
+/// the members the service owns — the ARN of the resource among them — are untouched.
+fn assert_applies_update(case: &str, what: &str, stored: &Value, update: &Value, reply: &Reply) {
+    assert_eq!(
+        reply.status, 200,
+        "case {case:?}: {what} must be served, got HTTP {} with body {}",
+        reply.status, reply.body
+    );
+    let got = reply
+        .field("/aiPrompt")
+        .unwrap_or_else(|| panic!("case {case:?}: {what} answered no aiPrompt: {}", reply.body));
+
+    for member in WRITABLE_MEMBERS {
+        let expected = update.get(member).or_else(|| stored.get(member));
+        let actual = got.get(member);
+        assert_eq!(
+            actual, expected,
+            "case {case:?}: {what} must report the {member:?} the update carried, or the \
+             stored one when it carried none, expected {expected:?}, got {actual:?}"
+        );
+    }
+    for member in PRESERVED_MEMBERS {
+        let expected = stored.get(member);
+        let actual = got.get(member);
+        assert_eq!(
+            actual, expected,
+            "case {case:?}: {what} must leave {member:?} as it was, expected {expected:?}, \
+             got {actual:?}"
+        );
+    }
+
+    // The write is what `modifiedTime` reports, so it never moves backwards.
+    let was = stored
+        .get("modifiedTime")
+        .and_then(Value::as_f64)
+        .unwrap_or_default();
+    let now = got.get("modifiedTime").and_then(Value::as_f64);
+    assert!(
+        now.is_some_and(|now| now >= was),
+        "case {case:?}: {what} must report when the record was last written, expected at \
+         least {was}, got {now:?}"
+    );
+}
+
+/// The record the update left, read back through `GetAIPrompt` however it is addressed: a
+/// read answers with that record, with the one member a read renders differently — the ARN
+/// it reports names the version it answered for.
+async fn assert_reads_the_update(
+    emulator: &Emulator,
+    case: &str,
+    assistant: &str,
+    prompt_id: &str,
+    written: &Value,
+) {
+    let mut expected = written.clone();
+    expected["aiPromptArn"] = json!(expected_read_arn(assistant, prompt_id, QUALIFIER_LATEST));
+    for (what, addressed_by) in label_forms(assistant, prompt_id) {
+        let reply = get_prompt(emulator, assistant, &addressed_by).await;
+        assert_eq!(
+            reply.status, 200,
+            "case {case:?}: a read addressed by {what} must be served, got HTTP {} with body \
+             {}",
+            reply.status, reply.body
+        );
+        let read = reply.field("/aiPrompt");
+        assert_eq!(
+            read,
+            Some(&expected),
+            "case {case:?}: a read addressed by {what} must answer with the record the update \
+             wrote, expected {expected}, got {read:?}"
+        );
+        // The model: a version number is reported only when the request's `aiPromptId`
+        // named a VERSION. An update writes the working copy and publishes nothing, so a
+        // read of it names no numbered version.
+        assert!(
+            reply.field("/versionNumber").is_none(),
+            "case {case:?}: a read of the working copy reports no versionNumber, body {}",
+            reply.body
+        );
+    }
+
+    // An update publishes no version, so a numbered qualifier still names nothing.
+    let numbered = format!("{prompt_id}:1");
+    let reply = get_prompt(emulator, assistant, &numbered).await;
+    assert_not_found(case, MESSAGE_AI_PROMPT_NOT_FOUND, &numbered, &reply);
+}
+
+#[tokio::test]
+async fn an_update_writes_the_prompt_every_later_read_answers_with() {
+    let emulator = Emulator::new();
+    let assistant = assistant_id(&emulator, "prompt update").await;
+
+    for row in update_rows() {
+        let created = create_prompt(&emulator, &assistant, row.create.clone()).await;
+        assert_eq!(
+            created.status, 200,
+            "case {:?}: the create must be served, got HTTP {} with body {}",
+            row.label, created.status, created.body
+        );
+        let prompt_id = created.string("/aiPrompt/aiPromptId");
+        let mut stored = created
+            .field("/aiPrompt")
+            .cloned()
+            .unwrap_or_else(|| panic!("case {:?}: the create answered no aiPrompt", row.label));
+
+        for (index, update) in row.updates.iter().enumerate() {
+            let what = format!("update {} of {}", index + 1, row.updates.len());
+            let reply = update_prompt(&emulator, &assistant, &prompt_id, update.clone()).await;
+            assert_applies_update(&row.label, &what, &stored, update, &reply);
+            let written = reply
+                .field("/aiPrompt")
+                .cloned()
+                .unwrap_or_else(|| panic!("case {:?}: {what} answered no aiPrompt", row.label));
+            assert_reads_the_update(&emulator, &row.label, &assistant, &prompt_id, &written).await;
+            // The next update is applied to the record this one left.
+            stored = written;
+        }
+
+        // Released again, so the rows of this table do not fill the assistant's ceiling.
+        assert_eq!(
+            delete_prompt(&emulator, &assistant, &prompt_id).await.status,
+            204,
+            "case {:?}: the cleanup delete must be served",
+            row.label
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_update_addressed_through_every_label_form_writes_the_working_copy() {
+    let emulator = Emulator::new();
+    let assistant = assistant_id(&emulator, "prompt update labels").await;
+    let created = create_prompt(
+        &emulator,
+        &assistant,
+        created_with("addressed", VISIBILITY_SAVED, Vec::new()),
+    )
+    .await;
+    assert_eq!(
+        created.status, 200,
+        "the prompt this suite writes to must be created, got HTTP {} with body {}",
+        created.status, created.body
+    );
+    let prompt_id = created.string("/aiPrompt/aiPromptId");
+    let mut stored = created
+        .field("/aiPrompt")
+        .cloned()
+        .expect("the create answered no aiPrompt");
+
+    for (index, (what, addressed_by)) in label_forms(&assistant, &prompt_id).iter().enumerate() {
+        // The `description` pattern (`^[a-zA-Z0-9\s_.,-]+`) admits none of the label
+        // forms' own punctuation, so each row writes the row number rather than the form's
+        // name.
+        let update = update_with(
+            if index % 2 == 0 {
+                VISIBILITY_PUBLISHED
+            } else {
+                VISIBILITY_SAVED
+            },
+            vec![("description", json!(format!("Written through form {index}")))],
+        );
+        let reply = update_prompt(&emulator, &assistant, addressed_by, update.clone()).await;
+        assert_applies_update(what, "the update", &stored, &update, &reply);
+        let written = reply
+            .field("/aiPrompt")
+            .cloned()
+            .unwrap_or_else(|| panic!("case {what:?}: the update answered no aiPrompt"));
+        assert_reads_the_update(&emulator, what, &assistant, &prompt_id, &written).await;
+        stored = written;
+    }
+
+    // A numbered version qualifier names a published snapshot rather than the working copy
+    // an update writes, and this prompt published none, so it names nothing to write.
+    let numbered = format!("{prompt_id}:1");
+    let reply = update_prompt(
+        &emulator,
+        &assistant,
+        &numbered,
+        update_with(VISIBILITY_SAVED, Vec::new()),
+    )
+    .await;
+    assert_not_found(
+        "an update addressed by a numbered version",
+        MESSAGE_AI_PROMPT_NOT_FOUND,
+        &numbered,
+        &reply,
+    );
+}
+
+#[tokio::test]
+async fn a_mutation_naming_no_prompt_of_this_assistant_is_refused_and_writes_nothing() {
+    let emulator = Emulator::new();
+    let assistant = assistant_id(&emulator, "prompt mutation refusals").await;
+    let other = assistant_id(&emulator, "prompt mutation refusals elsewhere").await;
+    let created = create_prompt(
+        &emulator,
+        &assistant,
+        created_with(
+            "untouched",
+            VISIBILITY_SAVED,
+            vec![("description", json!("The description the create carried"))],
+        ),
+    )
+    .await;
+    assert_eq!(
+        created.status, 200,
+        "the prompt these refusals must not touch has to be created, got HTTP {} with body {}",
+        created.status, created.body
+    );
+    let prompt_id = created.string("/aiPrompt/aiPromptId");
+    let stored = created
+        .field("/aiPrompt")
+        .cloned()
+        .expect("the create answered no aiPrompt");
+
+    // Rows: the prompt label that names nothing the addressed assistant holds — an absent
+    // uuid and a version qualifier naming a version nothing published, under the assistant
+    // that holds the prompt; and, under an assistant that holds nothing, every label form
+    // of this prompt and its ARN under another account or another region, since a prompt of
+    // ANOTHER assistant is not this one's however correctly it is named.
+    let absent: Vec<(String, String)> = vec![
+        (assistant.clone(), ABSENT_UUID.to_string()),
+        (assistant.clone(), format!("{prompt_id}:1")),
+        (
+            other.clone(),
+            wisdom_arn(
+                "aws",
+                REGION,
+                OTHER_ACCOUNT,
+                &format!("ai-prompt/{assistant}/{prompt_id}"),
+            ),
+        ),
+        (
+            other.clone(),
+            wisdom_arn(
+                "aws",
+                OTHER_REGION,
+                engine::EMULATOR_ACCOUNT_ID,
+                &format!("ai-prompt/{assistant}/{prompt_id}"),
+            ),
+        ),
+    ]
+    .into_iter()
+    .chain(
+        label_forms(&assistant, &prompt_id)
+            .into_iter()
+            .map(|(_, prompt_label)| (other.clone(), prompt_label)),
+    )
+    .collect();
+
+    for (assistant_label, prompt_label) in &absent {
+        let reply = update_prompt(
+            &emulator,
+            assistant_label,
+            prompt_label,
+            update_with(
+                VISIBILITY_PUBLISHED,
+                vec![("description", json!("Never written"))],
+            ),
+        )
+        .await;
+        assert_not_found(
+            &format!("update of {prompt_label:?} under {assistant_label:?}"),
+            MESSAGE_AI_PROMPT_NOT_FOUND,
+            prompt_label,
+            &reply,
+        );
+        let reply = delete_prompt(&emulator, assistant_label, prompt_label).await;
+        assert_not_found(
+            &format!("delete of {prompt_label:?} under {assistant_label:?}"),
+            MESSAGE_AI_PROMPT_NOT_FOUND,
+            prompt_label,
+            &reply,
+        );
+    }
+
+    // A route whose ASSISTANT names nothing this account holds is not found for the
+    // assistant, whatever the rest of the route names.
+    for assistant_label in [
+        ABSENT_UUID.to_string(),
+        wisdom_arn(
+            "aws",
+            REGION,
+            OTHER_ACCOUNT,
+            &format!("assistant/{assistant}"),
+        ),
+    ] {
+        let reply = update_prompt(
+            &emulator,
+            &assistant_label,
+            &prompt_id,
+            update_with(VISIBILITY_PUBLISHED, Vec::new()),
+        )
+        .await;
+        assert_not_found(
+            &format!("update under assistant {assistant_label:?}"),
+            "Assistant does not exist.",
+            &assistant_label,
+            &reply,
+        );
+        let reply = delete_prompt(&emulator, &assistant_label, &prompt_id).await;
+        assert_not_found(
+            &format!("delete under assistant {assistant_label:?}"),
+            "Assistant does not exist.",
+            &assistant_label,
+            &reply,
+        );
+    }
+
+    // Nothing above wrote or removed anything: the prompt still reads back as the create
+    // left it.
+    let reply = get_prompt(&emulator, &assistant, &prompt_id).await;
+    assert_reads_the_create("every refusal", "the read after them", &stored, &reply);
+}
+
+#[tokio::test]
+async fn a_deleted_prompt_is_reported_to_no_later_caller() {
+    let emulator = Emulator::new();
+    let assistant = assistant_id(&emulator, "prompt delete").await;
+
+    // Rows: the label form the delete addresses the prompt by — the same forms a read
+    // resolves — each on a prompt of its own, beside one the delete never addresses.
+    for (index, (what, _)) in label_forms(&assistant, ABSENT_UUID).iter().enumerate() {
+        let kept = create_prompt(
+            &emulator,
+            &assistant,
+            created_with(&format!("kept {index}"), VISIBILITY_SAVED, Vec::new()),
+        )
+        .await;
+        let kept_id = kept.string("/aiPrompt/aiPromptId");
+        let kept_record = kept
+            .field("/aiPrompt")
+            .cloned()
+            .unwrap_or_else(|| panic!("case {what:?}: the create answered no aiPrompt"));
+        let doomed = create_prompt(
+            &emulator,
+            &assistant,
+            created_with(&format!("deleted {index}"), VISIBILITY_PUBLISHED, Vec::new()),
+        )
+        .await;
+        assert_eq!(
+            doomed.status, 200,
+            "case {what:?}: the prompt to delete must be created, got HTTP {} with body {}",
+            doomed.status, doomed.body
+        );
+        let doomed_id = doomed.string("/aiPrompt/aiPromptId");
+        let addressed_by = label_forms(&assistant, &doomed_id)[index].1.clone();
+
+        let deleted = delete_prompt(&emulator, &assistant, &addressed_by).await;
+        assert_eq!(
+            deleted.status, 204,
+            "case {what:?}: the delete must answer the modelled 204, got HTTP {} with body {}",
+            deleted.status, deleted.body
+        );
+        assert!(
+            deleted
+                .body
+                .as_object()
+                .is_none_or(serde_json::Map::is_empty),
+            "case {what:?}: the modelled 204 carries no document members, got {}",
+            deleted.body
+        );
+
+        // Every operation that resolves the prompt stops finding it, whichever label form
+        // addresses it: a read, a second delete, and an update.
+        for (form, label_of_gone) in label_forms(&assistant, &doomed_id) {
+            let case = format!("{what:?} deleted, then addressed by {form}");
+            let reply = get_prompt(&emulator, &assistant, &label_of_gone).await;
+            assert_not_found(
+                &format!("read: {case}"),
+                MESSAGE_AI_PROMPT_NOT_FOUND,
+                &label_of_gone,
+                &reply,
+            );
+            let reply = delete_prompt(&emulator, &assistant, &label_of_gone).await;
+            assert_not_found(
+                &format!("second delete: {case}"),
+                MESSAGE_AI_PROMPT_NOT_FOUND,
+                &label_of_gone,
+                &reply,
+            );
+            let reply = update_prompt(
+                &emulator,
+                &assistant,
+                &label_of_gone,
+                update_with(VISIBILITY_SAVED, Vec::new()),
+            )
+            .await;
+            assert_not_found(
+                &format!("update: {case}"),
+                MESSAGE_AI_PROMPT_NOT_FOUND,
+                &label_of_gone,
+                &reply,
+            );
+        }
+
+        // The delete removed ONE record: the prompt it did not address still reads back as
+        // its create left it.
+        let reply = get_prompt(&emulator, &assistant, &kept_id).await;
+        assert_reads_the_create(what, "the sibling the delete left alone", &kept_record, &reply);
+    }
+}
+
+#[tokio::test]
+async fn a_delete_releases_the_assistants_prompt_ceiling() {
+    let emulator = Emulator::new();
+    let assistant = assistant_id(&emulator, "prompt ceiling release").await;
+
+    let mut first = String::new();
+    for index in 0..MAX_AI_PROMPTS_PER_ASSISTANT {
+        let reply = create_prompt(
+            &emulator,
+            &assistant,
+            created_with(&format!("prompt {index}"), VISIBILITY_SAVED, Vec::new()),
+        )
+        .await;
+        assert_eq!(
+            reply.status, 200,
+            "case {index}: a create inside the ceiling must be served, got HTTP {} with body \
+             {}",
+            reply.status, reply.body
+        );
+        if index == 0 {
+            first = reply.string("/aiPrompt/aiPromptId");
+        }
+    }
+    let refused = create_prompt(
+        &emulator,
+        &assistant,
+        created_with("one too many", VISIBILITY_SAVED, Vec::new()),
+    )
+    .await;
+    assert_eq!(
+        refused.status, 402,
+        "a create past the ceiling is the modelled quota refusal, got HTTP {} with body {}",
+        refused.status, refused.body
+    );
+
+    // The ceiling counts the prompts still LIVE, so releasing one makes room for exactly
+    // one more.
+    assert_eq!(
+        delete_prompt(&emulator, &assistant, &first).await.status,
+        204,
+        "the delete that makes room must be served"
+    );
+    let served = create_prompt(
+        &emulator,
+        &assistant,
+        created_with("after the delete", VISIBILITY_PUBLISHED, Vec::new()),
+    )
+    .await;
+    assert_eq!(
+        served.status, 200,
+        "a create into the room the delete freed must be served, got HTTP {} with body {}",
+        served.status, served.body
+    );
+    let refused = create_prompt(
+        &emulator,
+        &assistant,
+        created_with("one too many again", VISIBILITY_SAVED, Vec::new()),
+    )
+    .await;
+    assert_eq!(
+        refused.status, 402,
+        "the ceiling still holds after a delete and a create, got HTTP {} with body {}",
+        refused.status, refused.body
+    );
+}
+
+#[tokio::test]
+async fn a_replayed_client_token_on_an_update_answers_with_the_record_its_write_left() {
+    let emulator = Emulator::new();
+    let assistant = assistant_id(&emulator, "prompt update idempotency").await;
+
+    // Rows: the token's form, spanning the published length bounds of `ClientToken`
+    // (`len 1..4096`).
+    for token in ["an-update-token", &"t".repeat(4096), "1"] {
+        let created = create_prompt(
+            &emulator,
+            &assistant,
+            created_with("idempotent update", VISIBILITY_SAVED, Vec::new()),
+        )
+        .await;
+        assert_eq!(
+            created.status, 200,
+            "case {token:?}: the create must be served, got HTTP {} with body {}",
+            created.status, created.body
+        );
+        let prompt_id = created.string("/aiPrompt/aiPromptId");
+        let stored = created
+            .field("/aiPrompt")
+            .cloned()
+            .unwrap_or_else(|| panic!("case {token:?}: the create answered no aiPrompt"));
+
+        let mut update = update_with(
+            VISIBILITY_PUBLISHED,
+            vec![("description", json!("The update this token identifies"))],
+        );
+        update["clientToken"] = json!(token);
+        let written = update_prompt(&emulator, &assistant, &prompt_id, update.clone()).await;
+        assert_applies_update(token, "the update", &stored, &update, &written);
+        let record = written
+            .field("/aiPrompt")
+            .cloned()
+            .unwrap_or_else(|| panic!("case {token:?}: the update answered no aiPrompt"));
+
+        // The same token carrying the same request answers with the record that write
+        // left, writing nothing a second time.
+        let replayed = update_prompt(&emulator, &assistant, &prompt_id, update.clone()).await;
+        assert_eq!(
+            replayed.field("/aiPrompt"),
+            Some(&record),
+            "case {token:?}: a replayed token must answer with the record its write left, \
+             body {}",
+            replayed.body
+        );
+
+        // The same token carrying a DIFFERENT request is the idempotency conflict, and
+        // writes nothing.
+        for (member, value) in [
+            ("visibilityStatus", json!(VISIBILITY_SAVED)),
+            ("description", json!("Another request under one token")),
+            ("modelId", json!(MODEL_IDS[1])),
+            (
+                "templateConfiguration",
+                template("system: Something else entirely.\n"),
+            ),
+            (
+                "inferenceConfiguration",
+                json!({ "maxTokensToSample": MAX_TOKENS_MIN }),
+            ),
+        ] {
+            let mut changed = update.clone();
+            changed[member] = value;
+            let conflict = update_prompt(&emulator, &assistant, &prompt_id, changed).await;
+            assert_eq!(
+                conflict.status, 409,
+                "case {token:?}/{member}: one token identifies one request, got HTTP {} with \
+                 body {}",
+                conflict.status, conflict.body
+            );
+            assert_eq!(
+                conflict.string("/message"),
+                MESSAGE_IDEMPOTENCY_CONFLICT,
+                "case {token:?}/{member}: the refusal must carry this endpoint's sentence \
+                 for the condition, body {}",
+                conflict.body
+            );
+        }
+        assert_reads_the_update(&emulator, token, &assistant, &prompt_id, &record).await;
+
+        // Released again, so the rows of this table do not fill the assistant's ceiling.
+        assert_eq!(
+            delete_prompt(&emulator, &assistant, &prompt_id).await.status,
+            204,
+            "case {token:?}: the cleanup delete must be served"
+        );
+    }
 }
