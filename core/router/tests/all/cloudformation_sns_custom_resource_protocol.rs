@@ -26,6 +26,12 @@
 //! a dependent resource reads, the `Status` the answer carries (so the id is adopted either
 //! way), whether an `Update`'s answer repeats the resource's id or names a new one (in-place
 //! versus replacement), and how many resources one template chains with `DependsOn`.
+//!
+//! The provider this suite stands up — the topic, the subscribed queue, the read of the next
+//! request off it and the unsigned write that answers it — is `pub(crate)` because the
+//! sibling suite [`super::cloudformation_custom_resource_answered_identity`] drives the SAME
+//! sequence to assert what the stack REPORTS about an answered resource; one spelling of the
+//! sequence keeps the two from drifting about how a provider is stood up and answered.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -51,13 +57,13 @@ const LOOK: Duration = Duration::from_millis(25);
 const QUIET_WINDOW: Duration = Duration::from_secs(8);
 
 /// The statuses the rows are stated in.
-const CREATE_COMPLETE: &str = "CREATE_COMPLETE";
-const UPDATE_COMPLETE: &str = "UPDATE_COMPLETE";
-const ROLLBACK_COMPLETE: &str = "ROLLBACK_COMPLETE";
+pub(crate) const CREATE_COMPLETE: &str = "CREATE_COMPLETE";
+pub(crate) const UPDATE_COMPLETE: &str = "UPDATE_COMPLETE";
+pub(crate) const ROLLBACK_COMPLETE: &str = "ROLLBACK_COMPLETE";
 
 /// The emulator as it is ASSEMBLED, on one engine: the request CloudFormation publishes is
 /// delivered by the SNS this router serves to the queue it serves too.
-fn build_router() -> MultiServiceRouter {
+pub(crate) fn build_router() -> MultiServiceRouter {
     let engine: std::sync::Arc<engine::InMemoryEngine> =
         std::sync::Arc::new(engine::InMemoryEngine::new());
     let mut router = aws_emulator_router::build_router(engine);
@@ -103,7 +109,7 @@ async fn query(
 }
 
 /// One CloudFormation call (API version 2010-05-15).
-async fn cloudformation(
+pub(crate) async fn cloudformation(
     router: &MultiServiceRouter,
     action: &str,
     members: &[(&str, &str)],
@@ -144,8 +150,8 @@ async fn sqs(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16
 /// The provider a row's template names: the topic CloudFormation publishes its requests to,
 /// and the queue — subscribed to that topic, with the policy that lets SNS write to it — the
 /// provider reads them off.
-struct Provider {
-    topic_arn: String,
+pub(crate) struct Provider {
+    pub(crate) topic_arn: String,
     queue_url: String,
     /// The requests read off the queue and not acted on yet, oldest first: one read takes
     /// every message then waiting off the queue, and a provider acts on them one at a time.
@@ -154,7 +160,7 @@ struct Provider {
 
 /// Create that provider: topic, queue, the queue policy SNS's delivery needs, and the
 /// subscription that carries one to the other.
-async fn provider(router: &MultiServiceRouter, name: &str) -> Provider {
+pub(crate) async fn provider(router: &MultiServiceRouter, name: &str) -> Provider {
     let (status, body) = sns(router, "CreateTopic", &[("Name", name)]).await;
     assert_eq!(
         status, 200,
@@ -284,7 +290,7 @@ fn published_request(message: &Value) -> Option<Value> {
 /// The next provider request, waited for with NOTHING calling CloudFormation: the request is
 /// CloudFormation's own to publish once the previous answer landed, so a provider that only
 /// reads its queue has to receive it.
-async fn next_request(
+pub(crate) async fn next_request(
     router: &MultiServiceRouter,
     provider: &mut Provider,
     case: &str,
@@ -320,12 +326,20 @@ async fn requests_inside_the_quiet_window(
 
 /// PUT one answer to the `ResponseURL` the request carried — the plain, unsigned write a
 /// provider makes, to the address this emulator published for that one request.
-async fn answer(router: &MultiServiceRouter, request: &Value, document: &Value) -> (u16, String) {
+pub(crate) async fn answer(
+    router: &MultiServiceRouter,
+    request: &Value,
+    document: &Value,
+) -> (u16, String) {
     answer_bytes(router, request, document.to_string()).await
 }
 
 /// [`answer`] for a row that decides the document's BYTES itself (the response-size rule).
-async fn answer_bytes(router: &MultiServiceRouter, request: &Value, body: String) -> (u16, String) {
+pub(crate) async fn answer_bytes(
+    router: &MultiServiceRouter,
+    request: &Value,
+    body: String,
+) -> (u16, String) {
     let url = request["ResponseURL"]
         .as_str()
         .unwrap_or_else(|| panic!("every provider request must carry a ResponseURL: {request}"));
@@ -351,7 +365,7 @@ async fn answer_bytes(router: &MultiServiceRouter, request: &Value, body: String
 
 /// Answer one request with a `SUCCESS` carrying `physical_resource_id` and `data`, asserting
 /// the write was accepted.
-async fn answered_success(
+pub(crate) async fn answered_success(
     router: &MultiServiceRouter,
     case: &str,
     request: &Value,
@@ -391,7 +405,7 @@ fn properties_of(request: &Value) -> BTreeMap<String, String> {
 }
 
 /// The `StackStatus` one stack reports now.
-async fn stack_status(router: &MultiServiceRouter, stack: &str) -> String {
+pub(crate) async fn stack_status(router: &MultiServiceRouter, stack: &str) -> String {
     let (status, body) = cloudformation(router, "DescribeStacks", &[("StackName", stack)]).await;
     assert_eq!(
         status, 200,
@@ -403,7 +417,7 @@ async fn stack_status(router: &MultiServiceRouter, stack: &str) -> String {
 /// Poll the stack until it reports `wanted`, answering every provider request that arrives
 /// meanwhile with a `SUCCESS` under the id the request already names — a provider that
 /// carries out whatever it is sent, which is what lets a rollback conclude.
-async fn settled_with_a_responsive_provider(
+pub(crate) async fn settled_with_a_responsive_provider(
     router: &MultiServiceRouter,
     provider: &mut Provider,
     case: &str,
@@ -463,7 +477,12 @@ async fn reported_reason(
 }
 
 /// Create one stack, asserting the call was accepted.
-async fn create_stack(router: &MultiServiceRouter, case: &str, stack: &str, template: &str) {
+pub(crate) async fn create_stack(
+    router: &MultiServiceRouter,
+    case: &str,
+    stack: &str,
+    template: &str,
+) {
     let (status, body) = cloudformation(
         router,
         "CreateStack",
@@ -929,7 +948,7 @@ async fn a_chained_resource_is_asked_after_the_one_it_depends_on_answers() {
 
 /// One `SUCCESS` answer whose whole document is exactly `bytes` long: the padding is a `Data`
 /// value, which is where a provider's own payload rides.
-fn padded_answer(physical_resource_id: &str, bytes: usize) -> String {
+pub(crate) fn padded_answer(physical_resource_id: &str, bytes: usize) -> String {
     let mut document = json!({
         "Status": "SUCCESS",
         "PhysicalResourceId": physical_resource_id,

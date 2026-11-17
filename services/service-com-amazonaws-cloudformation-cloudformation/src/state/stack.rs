@@ -2604,26 +2604,54 @@ impl StoredStack {
             .find(|resource| resource.logical_id == logical_id)
             .map(|resource| resource.physical_resource_id.clone())
             .filter(|id| !id.is_empty());
-        let Some(walk) = self.resource_timeline.as_mut() else {
-            return;
-        };
-        for step in walk
-            .steps
-            .iter_mut()
-            .filter(|step| step.logical_id == logical_id)
-        {
-            for event in step
-                .events
-                .iter_mut()
-                .filter(|event| !event.recorded && !event.in_progress())
-            {
-                event.status = status.to_string();
-                event.reason = Some(reason.to_string());
-                event.recorded = reported == Reported::Already;
-                if let Some(id) = &in_force {
-                    event.physical_resource_id = Some(id.clone());
-                }
+        for event in self.planned_terminal_events(logical_id, PlannedSteps::Every) {
+            event.status = status.to_string();
+            event.reason = Some(reason.to_string());
+            event.recorded = reported == Reported::Already;
+            if let Some(id) = &in_force {
+                event.physical_resource_id = Some(id.clone());
             }
+        }
+    }
+
+    /// Every event the walk still OWES about one resource that ENDS its transition: the
+    /// events of that resource's steps which are not in the stack's log yet and whose status
+    /// is not `*_IN_PROGRESS`.
+    ///
+    /// The one walk both writers above go through, so neither can disagree about which event
+    /// reports a resource's outcome: an event already recorded is one a client has read, and
+    /// an `*_IN_PROGRESS` event reports the work STARTING rather than what became of it.
+    fn planned_terminal_events(
+        &mut self,
+        logical_id: &str,
+        steps: PlannedSteps,
+    ) -> impl Iterator<Item = &mut timeline::PlannedEvent> + '_ {
+        let logical_id = logical_id.to_string();
+        self.resource_timeline
+            .iter_mut()
+            .flat_map(|walk| walk.steps.iter_mut())
+            .filter(move |step| step.logical_id == logical_id && steps.admits(step))
+            .flat_map(|step| step.events.iter_mut())
+            .filter(|event| !event.recorded && !event.in_progress())
+    }
+}
+
+/// Which steps of a walk [`StoredStack::planned_terminal_events`] reads the events of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlannedSteps {
+    /// Every step about the resource, whatever it does to it.
+    Every,
+    /// Only the steps that bring the resource UP — its creation or its change — and not the
+    /// ones that remove a physical resource, whose events are about the id being removed.
+    Provisioning,
+}
+
+impl PlannedSteps {
+    /// Whether the events of `step` are this scope's.
+    fn admits(self, step: &timeline::Step) -> bool {
+        match self {
+            Self::Every => true,
+            Self::Provisioning => !step.deleting,
         }
     }
 }
@@ -3268,6 +3296,16 @@ impl StoredStack {
     /// answers, and what `Ref` resolves to from then on is this one. Written onto the records
     /// of the operation IN FLIGHT where there is one, since those are what [`Self::settle`]
     /// installs; an id already carrying this value changes nothing.
+    ///
+    /// The EVENT the walk still owes about the resource is repointed with it: that event is
+    /// what reports the resource's outcome to a client
+    /// (`StackEvent$PhysicalResourceId`), and the physical resource it is about is the one the
+    /// provider named — whichever `Status` the answer carried, since a provider that could not
+    /// carry the request out still names the resource it is responsible for. Only the event
+    /// that ENDS the resource's transition and has not been recorded yet, which is the one the
+    /// wait this answer released was holding; a step that DELETES the resource is about the
+    /// physical resource being removed — the OLD one, for the cleanup of a replacement — so it
+    /// keeps the id it was planned with.
     pub fn adopt_provider_identity(&mut self, logical_id: &str, physical_resource_id: &str) {
         if physical_resource_id.is_empty() {
             return;
@@ -3278,7 +3316,11 @@ impl StoredStack {
         if held.physical_resource_id == physical_resource_id {
             return;
         }
-        held.physical_resource_id = physical_resource_id.to_string();
+        let adopted = physical_resource_id.to_string();
+        held.physical_resource_id = adopted.clone();
+        for event in self.planned_terminal_events(logical_id, PlannedSteps::Provisioning) {
+            event.physical_resource_id = Some(adopted.clone());
+        }
         // An output whose value is a `Ref` to this resource resolved to the stand-in, so what
         // the stack publishes is re-evaluated against the identity it really has.
         self.reevaluate_outputs();
