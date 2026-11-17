@@ -1148,21 +1148,35 @@ fn stream_arn_at(registration: &StreamRegistration, at: SystemTime) -> String {
 
 /// A stream label: "A timestamp, in ISO 8601 format, for this stream"
 /// (`Stream$StreamLabel`), e.g. `2026-10-21T21:58:07.123`.
+///
+/// Rendered at FIXED millisecond precision — always three fractional-second digits —
+/// so every label of every stream has the same form whatever instant it names: the
+/// label identifies the stream to the millisecond, and the stream's ARN is built from
+/// it, so a label whose width followed its own digits would give one stream an
+/// identifier spelt unlike every other's. The width comes from the resolution the
+/// identity is minted at, not from the value: `…:07.000` and `…:07.380` are as much
+/// labels of their instant as `…:07.123` is.
 #[must_use]
 pub fn iso8601_label(at: SystemTime) -> String {
     let millis = epoch_millis(at);
+    // The sub-second field is written from the instant's own milliseconds rather than
+    // taken from the rendering below, which drops a fraction's trailing zeros — and a
+    // whole second's fraction entirely.
+    let subsecond_millis = millis.rem_euclid(1_000);
     let rendered = ::aws_smithy_types::DateTime::from_millis(millis)
         .fmt(::aws_smithy_types::date_time::Format::DateTime)
         .unwrap_or_default();
     // `Format::DateTime` renders RFC 3339 with a `Z` zone; the label AWS emits for
-    // a stream is the same instant without it.
-    let trimmed = rendered.strip_suffix('Z').unwrap_or(&rendered);
-    if trimmed.is_empty() {
+    // a stream is the same instant without it. The calendar (month lengths, leap
+    // years) still comes from the library: only the fraction is written here.
+    let civil = rendered.strip_suffix('Z').unwrap_or(&rendered);
+    let whole_second = civil.split_once('.').map_or(civil, |(seconds, _)| seconds);
+    if whole_second.is_empty() {
         // Unreachable for any instant `from_millis` accepts, but a label must
         // never be empty: the stream ARN is built from it.
         return millis.to_string();
     }
-    trimmed.to_string()
+    format!("{whole_second}.{subsecond_millis:03}")
 }
 
 /// A sequence number for the `n`th record: a 21-digit decimal string, so the
