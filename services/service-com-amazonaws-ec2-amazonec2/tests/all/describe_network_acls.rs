@@ -19,8 +19,8 @@
 
 use ec2::ops::types::{IcmpTypeCode, NetworkAclEntry, PortRange, Tag};
 use ec2::state::{
-    ComAmazonawsEc2Amazonec2State as Ec2State, NetworkAclSpec, SubnetSpec,
-    availability_zones_in_region,
+    ComAmazonawsEc2Amazonec2State as Ec2State, NETWORK_ACL_ASSOCIATION_ID_PREFIX, NetworkAclSpec,
+    SubnetSpec, availability_zones_in_region,
 };
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
@@ -1334,4 +1334,352 @@ async fn dry_run_reports_the_permitted_outcome_without_describing() {
         reported, seeded.ids,
         "DryRun=false: expected the ordinary report, got {reported:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// A subnet resolves to the network ACL it is associated with NOW
+// ---------------------------------------------------------------------------
+
+/// A VPC created over the wire, by id.
+async fn create_vpc(router: &MultiServiceRouter, case: &str, cidr_block: &str) -> String {
+    let (status, body) =
+        super::ec2_query::call(router, REGION, "CreateVpc", &[param("CidrBlock", cidr_block)]).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from CreateVpc, got {status} with body {body}"
+    );
+    super::wire::member(case, &body, "vpcId")
+}
+
+/// A subnet of `vpc_id` created over the wire, by id. A created subnet is associated with the
+/// ACL its VPC came with, which is the association each journey below moves.
+async fn create_subnet(
+    router: &MultiServiceRouter,
+    case: &str,
+    vpc_id: &str,
+    cidr_block: &str,
+) -> String {
+    let params = [param("VpcId", vpc_id), param("CidrBlock", cidr_block)];
+    let (status, body) = super::ec2_query::call(router, REGION, "CreateSubnet", &params).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from CreateSubnet, got {status} with body {body}"
+    );
+    super::wire::member(case, &body, "subnetId")
+}
+
+/// A network ACL created over the wire in `vpc_id`, carrying `tags`, by id.
+async fn create_acl(
+    router: &MultiServiceRouter,
+    case: &str,
+    vpc_id: &str,
+    tags: &[(&str, &str)],
+) -> String {
+    let mut params = vec![param("VpcId", vpc_id)];
+    if !tags.is_empty() {
+        params.push(param("TagSpecification.1.ResourceType", "network-acl"));
+        for (index, (key, value)) in tags.iter().enumerate() {
+            let position = index + 1;
+            params.push(param(&format!("TagSpecification.1.Tag.{position}.Key"), key));
+            params.push(param(
+                &format!("TagSpecification.1.Tag.{position}.Value"),
+                value,
+            ));
+        }
+    }
+    let (status, body) = super::ec2_query::call(router, REGION, "CreateNetworkAcl", &params).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from CreateNetworkAcl, got {status} with body {body}"
+    );
+    element(&body, "networkAclId").unwrap_or_else(|| {
+        panic!("case {case:?}: CreateNetworkAcl answered no networkAclId: {body}")
+    })
+}
+
+/// The form fields `CreateNetworkAclEntry` sends for the rule `entry` describes, so one
+/// description of a row's rule drives both the request and what the read must report for it.
+fn entry_params(network_acl_id: &str, entry: &NetworkAclEntry) -> Vec<(String, String)> {
+    let number = |value: Option<i32>| value.unwrap_or_default().to_string();
+    let mut params = vec![
+        param("NetworkAclId", network_acl_id),
+        param("RuleNumber", &number(entry.rule_number)),
+        param("Egress", &entry.egress.unwrap_or(false).to_string()),
+        param("RuleAction", entry.rule_action.as_deref().unwrap_or_default()),
+        param("Protocol", entry.protocol.as_deref().unwrap_or_default()),
+    ];
+    if let Some(cidr_block) = entry.cidr_block.as_deref() {
+        params.push(param("CidrBlock", cidr_block));
+    }
+    if let Some(ipv6_cidr_block) = entry.ipv6_cidr_block.as_deref() {
+        params.push(param("Ipv6CidrBlock", ipv6_cidr_block));
+    }
+    if let Some(range) = entry.port_range.as_ref() {
+        params.push(param("PortRange.From", &number(range.from)));
+        params.push(param("PortRange.To", &number(range.to)));
+    }
+    if let Some(icmp) = entry.icmp_type_code.as_ref() {
+        params.push(param("Icmp.Type", &number(icmp.r#type)));
+        params.push(param("Icmp.Code", &number(icmp.code)));
+    }
+    params
+}
+
+/// One rule authored on `network_acl_id` over the wire.
+async fn create_entry(
+    router: &MultiServiceRouter,
+    case: &str,
+    network_acl_id: &str,
+    entry: &NetworkAclEntry,
+) {
+    let params = entry_params(network_acl_id, entry);
+    let (status, body) =
+        super::ec2_query::call(router, REGION, "CreateNetworkAclEntry", &params).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from CreateNetworkAclEntry, got {status} with body \
+         {body}"
+    );
+}
+
+/// `ReplaceNetworkAclAssociation` over the wire, answering "the ID of the new association"
+/// (`ReplaceNetworkAclAssociationResult$NewAssociationId`).
+async fn replace_association(
+    router: &MultiServiceRouter,
+    case: &str,
+    association_id: &str,
+    network_acl_id: &str,
+) -> String {
+    let params = [
+        param("AssociationId", association_id),
+        param("NetworkAclId", network_acl_id),
+    ];
+    let (status, body) =
+        super::ec2_query::call(router, REGION, "ReplaceNetworkAclAssociation", &params).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from ReplaceNetworkAclAssociation, got {status} with \
+         body {body}"
+    );
+    element(&body, "newAssociationId").unwrap_or_else(|| {
+        panic!("case {case:?}: ReplaceNetworkAclAssociation answered no newAssociationId: {body}")
+    })
+}
+
+/// The one network ACL reported for the subnet `subnet_id`, read the way a client asks which
+/// ACL governs a subnet: `DescribeNetworkAcls` narrowed by the documented
+/// `association.subnet-id` filter. A subnet is associated with exactly one ACL, so a report
+/// naming any other number of them is the failure.
+async fn acl_of_subnet(router: &MultiServiceRouter, case: &str, subnet_id: &str) -> ReportedAcl {
+    let params = filters(&[("association.subnet-id", &[subnet_id])]);
+    let (status, body) = describe(router, &params).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200, got {status} with body {body}"
+    );
+    let mut reported = reported_acls(case, &body);
+    assert_eq!(
+        reported.len(),
+        1,
+        "case {case:?}: expected exactly one network ACL for {subnet_id}, got {reported:?}"
+    );
+    reported.remove(0)
+}
+
+/// The entries a network ACL a CALLER created comes with: the catch-all deny in each
+/// direction and nothing else, since a custom ACL "denies all inbound and outbound traffic
+/// until you add rules" (Amazon VPC User Guide, "Control subnet traffic with network access
+/// control lists").
+fn created_entries() -> Vec<NetworkAclEntry> {
+    vec![
+        with_cidr(rule(32767, false, "deny", "-1"), "0.0.0.0/0"),
+        with_cidr(rule(32767, true, "deny", "-1"), "0.0.0.0/0"),
+    ]
+}
+
+/// What a created ACL's `entrySet` reports once `authored` has been added to it: the pair it
+/// was created with and the authored rule, egress rules first and then ingress, each by
+/// ascending rule number — the order an ACL's entries come back in.
+fn expected_entries(authored: &NetworkAclEntry) -> Vec<ReportedEntry> {
+    let mut entries = created_entries();
+    entries.push(authored.clone());
+    entries.sort_by_key(|entry| {
+        (
+            !entry.egress.unwrap_or(false),
+            entry.rule_number.unwrap_or_default(),
+        )
+    });
+    entries.iter().map(reported_entry).collect()
+}
+
+/// `entry` as `DescribeNetworkAcls` reports it: each member as its wire text, and nothing at
+/// all for the members the rule leaves out.
+fn reported_entry(entry: &NetworkAclEntry) -> ReportedEntry {
+    let number = |value: Option<i32>| value.unwrap_or_default().to_string();
+    ReportedEntry {
+        rule_number: number(entry.rule_number),
+        rule_action: entry.rule_action.clone().unwrap_or_default(),
+        protocol: entry.protocol.clone().unwrap_or_default(),
+        cidr_block: entry.cidr_block.clone(),
+        ipv6_cidr_block: entry.ipv6_cidr_block.clone(),
+        egress: entry.egress.unwrap_or(false).to_string(),
+        port_range: entry
+            .port_range
+            .as_ref()
+            .map(|range| (number(range.from), number(range.to))),
+        icmp_type_code: entry
+            .icmp_type_code
+            .as_ref()
+            .map(|icmp| (number(icmp.r#type), number(icmp.code))),
+    }
+}
+
+/// One journey: a VPC with one subnet, a custom ACL created with `tags`, and the one rule the
+/// journey authors on that ACL before the subnet is moved onto it.
+struct Journey {
+    case: &'static str,
+    vpc_cidr_block: &'static str,
+    subnet_cidr_block: &'static str,
+    tags: Vec<(&'static str, &'static str)>,
+    authored: NetworkAclEntry,
+}
+
+/// The journey table. The rows differ along what the rule generalises over: the direction of
+/// the authored rule, its action, its rule number (including the highest one
+/// `CreateNetworkAclEntryRequest$RuleNumber` publishes, 32766), its protocol and so which
+/// match members it carries (an IPv4 range, an IPv6 range, a port range, an ICMP type and
+/// code), and how many tags the ACL was created with — none among them.
+fn journeys() -> Vec<Journey> {
+    vec![
+        Journey {
+            case: "a TCP deny on the SSH port, tagged by name",
+            vpc_cidr_block: "10.20.0.0/16",
+            subnet_cidr_block: "10.20.1.0/24",
+            tags: vec![("Name", "ssh-deny")],
+            authored: with_ports(with_cidr(rule(90, false, "deny", "6"), "0.0.0.0/0"), 22, 22),
+        },
+        Journey {
+            case: "an ICMP echo allow over every code, untagged",
+            vpc_cidr_block: "10.21.0.0/16",
+            subnet_cidr_block: "10.21.1.0/24",
+            tags: Vec::new(),
+            authored: with_icmp(
+                with_cidr(rule(120, false, "allow", "1"), "198.51.100.0/24"),
+                8,
+                -1,
+            ),
+        },
+        Journey {
+            case: "an egress UDP allow on the DNS port, two tags",
+            vpc_cidr_block: "10.22.0.0/16",
+            subnet_cidr_block: "10.22.1.0/24",
+            tags: vec![("Name", "dns"), ("Tier", "batch")],
+            authored: with_ports(with_cidr(rule(110, true, "allow", "17"), "10.0.0.0/8"), 53, 53),
+        },
+        Journey {
+            case: "an IPv6 deny over every protocol at the highest rule number",
+            vpc_cidr_block: "10.23.0.0/16",
+            subnet_cidr_block: "10.23.1.0/24",
+            tags: vec![("Project", "atlas")],
+            authored: with_ipv6_cidr(rule(32766, false, "deny", "-1"), "::/0"),
+        },
+    ]
+}
+
+/// A subnet-filtered read resolves the subnet to the network ACL it is associated with NOW:
+/// after a custom ACL is created with tags, given a rule and put in the place of the subnet's
+/// association, that read reports THAT ACL — its id, `default` false, the authored rule
+/// alongside the catch-all denies the ACL was created with, an `associationSet` carrying the
+/// association id the replace answered against this subnet, and the tags the create assigned
+/// — and no longer the ACL the subnet started on.
+#[tokio::test]
+async fn a_subnet_filtered_read_reports_the_network_acl_the_subnet_is_associated_with_now() {
+    let (router, _engine) = super::ec2_query::emulator();
+    let account = engine::emulator_account_id().to_string();
+
+    for journey in journeys() {
+        let case = journey.case;
+        let vpc_id = create_vpc(&router, case, journey.vpc_cidr_block).await;
+        let subnet_id = create_subnet(&router, case, &vpc_id, journey.subnet_cidr_block).await;
+
+        // Where the subnet starts: on the ACL its VPC came with, which that read reports as
+        // the default one with the entries every default ACL carries.
+        let before = acl_of_subnet(&router, case, &subnet_id).await;
+        assert_eq!(
+            before.is_default, "true",
+            "case {case:?}: expected a created subnet on the ACL its VPC came with, got \
+             {before:?}"
+        );
+        assert_eq!(
+            before.entries,
+            default_entries(),
+            "case {case:?}: expected the default ACL's own entries, got {before:?}"
+        );
+        assert_eq!(
+            before.associations.len(),
+            1,
+            "case {case:?}: expected the subnet associated once with the ACL it starts on, \
+             got {before:?}"
+        );
+        let (held_association_id, associated_subnet_id) = before.associations[0].clone();
+        assert_eq!(
+            associated_subnet_id, subnet_id,
+            "case {case:?}: expected the association to name the subnet the read was \
+             filtered by, got {before:?}"
+        );
+        let default_acl_id = before.network_acl_id.clone();
+
+        // The custom ACL, the tags it is created with and the one rule authored on it.
+        let network_acl_id = create_acl(&router, case, &vpc_id, &journey.tags).await;
+        create_entry(&router, case, &network_acl_id, &journey.authored).await;
+
+        // The subnet moves onto it, under the id the replace answers.
+        let new_association_id =
+            replace_association(&router, case, &held_association_id, &network_acl_id).await;
+        assert!(
+            is_long_id(NETWORK_ACL_ASSOCIATION_ID_PREFIX, &new_association_id),
+            "case {case:?}: expected an association id of EC2's own form, got \
+             {new_association_id:?}"
+        );
+
+        // The subnet-filtered read now reports the CUSTOM ACL, member for member.
+        let after = acl_of_subnet(&router, case, &subnet_id).await;
+        let expected = ReportedAcl {
+            network_acl_id: network_acl_id.clone(),
+            vpc_id: vpc_id.clone(),
+            owner_id: account.clone(),
+            is_default: "false".to_string(),
+            entries: expected_entries(&journey.authored),
+            associations: vec![(new_association_id.clone(), subnet_id.clone())],
+            tags: journey
+                .tags
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
+        };
+        assert_eq!(
+            after, expected,
+            "case {case:?}: expected the custom ACL {network_acl_id} as {expected:?}, got \
+             {after:?}"
+        );
+
+        // The same record read by id, so the subnet-filtered read is the store rather than a
+        // projection of its own.
+        let by_id = describe_one(case, &router, &network_acl_id).await;
+        assert_eq!(
+            by_id, expected,
+            "case {case:?}: expected reading {network_acl_id} by id to answer the same \
+             record, got {by_id:?}"
+        );
+
+        // The ACL the subnet started on reports it no longer: the subnet is associated with
+        // exactly one ACL, so the move is not a second association.
+        let started_on = describe_one(case, &router, &default_acl_id).await;
+        assert_eq!(
+            started_on.associations,
+            Vec::new(),
+            "case {case:?}: expected {default_acl_id} to report the moved subnet no longer, \
+             got {started_on:?}"
+        );
+    }
 }
