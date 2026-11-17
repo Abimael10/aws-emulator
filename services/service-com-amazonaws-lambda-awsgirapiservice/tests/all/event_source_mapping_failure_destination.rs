@@ -335,7 +335,15 @@ async fn dynamodb(router: &MultiServiceRouter, operation: &str, body: &Value) ->
 }
 
 /// One Amazon SQS call.
-async fn sqs(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+///
+/// `pub(crate)` because every suite that observes a mapping's failure destination through a
+/// queue drives Amazon SQS over this one wire
+/// (`tests/all/kinesis_event_source_retry_budget.rs`).
+pub(crate) async fn sqs(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
     rpc(
         router,
         "sqs",
@@ -382,7 +390,14 @@ fn element(document: &str, name: &str) -> Option<String> {
 }
 
 /// A queue of this account: its url and its ARN, both as the queue itself reports them.
-async fn given_queue(router: &MultiServiceRouter, case: &str, name: &str) -> (String, String) {
+///
+/// `pub(crate)` for the same reason as [`sqs`]: one fixture for the queue a discarded batch's
+/// record is read off.
+pub(crate) async fn given_queue(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+) -> (String, String) {
     let (status, created) = sqs(router, "CreateQueue", &json!({ "QueueName": name })).await;
     assert_eq!(
         status, 200,
