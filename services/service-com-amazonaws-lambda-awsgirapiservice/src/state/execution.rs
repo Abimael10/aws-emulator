@@ -2319,4 +2319,118 @@ mod tests {
             "expected the stream to name the date, the version and the invocation, got {stream:?}"
         );
     }
+
+    /// One row of the table below: the invocation's trace context, what the function's own
+    /// environment sets for the two X-Ray variables, and what the run must then be published.
+    struct DaemonRow {
+        case: &'static str,
+        /// The trace context the invocation carries, or `None` for one carrying none.
+        trace: Option<trace_context::InvocationTrace>,
+        /// The function's own value for the daemon address, where it sets one.
+        own_address: Option<&'static str>,
+        /// The function's own value for the context-missing variable, where it sets one.
+        own_missing: Option<&'static str>,
+    }
+
+    /// EVERY run is told where to send its X-Ray segment documents, and the two variables that
+    /// say so are ones the runtime sets WITHOUT reserving — so a function that sets one of them
+    /// runs with its own value, and one that does not is given the platform's.
+    ///
+    /// The rows span what that generalises over: whether the invocation carries a trace context
+    /// at all (an invocation X-Ray records, one it does not, and one with no context), and
+    /// whether the function's own environment names either variable. The published address is
+    /// read back as `IP_ADDRESS:PORT`, the form the runtime environment reports it in, rather
+    /// than against a literal.
+    #[test]
+    fn the_daemon_address_is_published_to_every_run_and_a_functions_own_value_wins() {
+        let rows = vec![
+            DaemonRow {
+                case: "an invocation with no trace context at all",
+                trace: None,
+                own_address: None,
+                own_missing: None,
+            },
+            DaemonRow {
+                case: "an invocation carrying a context X-Ray records nothing for",
+                trace: Some(trace_context::InvocationTrace {
+                    header: "Root=1-00000000-000000000000000000000001;Sampled=0".to_string(),
+                    recorded: None,
+                }),
+                own_address: None,
+                own_missing: None,
+            },
+            DaemonRow {
+                case: "an invocation X-Ray records",
+                trace: Some(trace_context::InvocationTrace {
+                    header: "Root=1-00000000-000000000000000000000002;Parent=\
+                             0000000000000003;Sampled=1"
+                        .to_string(),
+                    recorded: Some(trace_context::Recorded {
+                        trace_id: "1-00000000-000000000000000000000002".to_string(),
+                        service_span: "0000000000000004".to_string(),
+                        function_span: "0000000000000003".to_string(),
+                        caller_span: None,
+                    }),
+                }),
+                own_address: None,
+                own_missing: None,
+            },
+            DaemonRow {
+                case: "a function whose own environment names both variables",
+                trace: None,
+                own_address: Some("127.0.0.1:2100"),
+                own_missing: Some("RUNTIME_ERROR"),
+            },
+        ];
+        for row in &rows {
+            let case = row.case;
+            let mut invocation = probe_invocation();
+            invocation.trace = row.trace.clone();
+            if let Some(address) = row.own_address {
+                invocation.variables.insert(
+                    xray_daemon::DAEMON_ADDRESS_VARIABLE.to_string(),
+                    address.to_string(),
+                );
+            }
+            if let Some(missing) = row.own_missing {
+                invocation.variables.insert(
+                    xray_daemon::CONTEXT_MISSING_VARIABLE.to_string(),
+                    missing.to_string(),
+                );
+            }
+            let environment = runtime_environment(&invocation, SystemTime::UNIX_EPOCH);
+            let published = environment
+                .get(xray_daemon::DAEMON_ADDRESS_VARIABLE)
+                .map(String::as_str)
+                .unwrap_or_default();
+            // Whatever it carries, it is the `IP_ADDRESS:PORT` the runtime environment reports
+            // the daemon at, which is the form a handler parses.
+            assert!(
+                published.parse::<::std::net::SocketAddrV4>().is_ok(),
+                "case {case:?}: expected {} to be published as IP_ADDRESS:PORT, got \
+                 {published:?}",
+                xray_daemon::DAEMON_ADDRESS_VARIABLE
+            );
+            let context_missing = environment
+                .get(xray_daemon::CONTEXT_MISSING_VARIABLE)
+                .map(String::as_str)
+                .unwrap_or_default();
+            // The function's own value for either variable is the one its run carries; a
+            // function that sets neither is given the platform's.
+            let expected_address = row.own_address.unwrap_or(xray_daemon::DAEMON_ADDRESS);
+            let expected_missing = row
+                .own_missing
+                .unwrap_or(xray_daemon::CONTEXT_MISSING_LOG_ERROR);
+            assert_eq!(
+                published, expected_address,
+                "case {case:?}: expected the daemon address {expected_address:?}, got \
+                 {published:?}"
+            );
+            assert_eq!(
+                context_missing, expected_missing,
+                "case {case:?}: expected {} to be {expected_missing:?}, got {context_missing:?}",
+                xray_daemon::CONTEXT_MISSING_VARIABLE
+            );
+        }
+    }
 }
