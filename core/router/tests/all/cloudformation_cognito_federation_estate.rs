@@ -59,7 +59,10 @@ use super::query_wire::{element, elements, form_encode, opt_element, outputs_of}
 use super::cloudformation_provisions_cognito_user_pools::{is_minted_pool_id, output};
 
 /// Keep this at or above `boot_serve.rs`'s stack: the same assembly runs here.
-const BOOT_STACK_SIZE: usize = 64 * 1024 * 1024;
+///
+/// Visible to the other suites of this target, so a sibling that assembles the same router
+/// sizes its thread by the same constant rather than by a second copy of it.
+pub(crate) const BOOT_STACK_SIZE: usize = 64 * 1024 * 1024;
 
 /// How long a row goes on polling for a stack status that is already due, and how often: the
 /// transition is owed on the stack's own clock, so the wait is for the CONDITION, with a
@@ -88,9 +91,11 @@ const CREATE_COMPLETE: &str = "CREATE_COMPLETE";
 const VENDED_ROLE_SESSION_NAME: &str = "CognitoIdentityCredentials";
 
 /// The service shapes the two Amazon Cognito models bind their `X-Amz-Target` to
-/// (`smithy_query(query="service_info")`), and their signing names.
-const COGNITO_IDP: (&str, &str) = ("cognito-idp", "AWSCognitoIdentityProviderService");
-const COGNITO_IDENTITY: (&str, &str) = ("cognito-identity", "AWSCognitoIdentityService");
+/// (`smithy_query(query="service_info")`), and their signing names. Visible to the other
+/// suites of this target for the reason [`Wire`] is.
+pub(crate) const COGNITO_IDP: (&str, &str) = ("cognito-idp", "AWSCognitoIdentityProviderService");
+/// See [`COGNITO_IDP`].
+pub(crate) const COGNITO_IDENTITY: (&str, &str) = ("cognito-identity", "AWSCognitoIdentityService");
 
 /// The emulator's own address, for the unsigned legs: `GetId` and `GetCredentialsForIdentity`
 /// list no auth scheme, so a client sends them with no credential scope and the service name
@@ -98,13 +103,13 @@ const COGNITO_IDENTITY: (&str, &str) = ("cognito-identity", "AWSCognitoIdentityS
 const EMULATOR_HOST: &str = "127.0.0.1:9297";
 
 /// What one call answered.
-struct Answer {
-    status: u16,
-    body: bytes::Bytes,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) body: bytes::Bytes,
 }
 
 impl Answer {
-    fn json(&self) -> Value {
+    pub(crate) fn json(&self) -> Value {
         if self.body.is_empty() {
             Value::Null
         } else {
@@ -112,23 +117,28 @@ impl Answer {
         }
     }
 
-    fn text(&self) -> String {
+    pub(crate) fn text(&self) -> String {
         String::from_utf8_lossy(&self.body).to_string()
     }
 }
 
 /// The assembled emulator and the runtime its requests are driven on, carried together so
 /// each leg below names only what it is ABOUT.
-struct Wire<'a> {
-    router: &'a MultiServiceRouter,
-    runtime: &'a tokio::runtime::Runtime,
+///
+/// Visible to the other suites of this target: a sibling driving the same two Amazon Cognito
+/// services and CloudFormation over one assembled router calls THIS harness rather than
+/// writing a second encoder, a second signer and a second settle loop, which would drift from
+/// these.
+pub(crate) struct Wire<'a> {
+    pub(crate) router: &'a MultiServiceRouter,
+    pub(crate) runtime: &'a tokio::runtime::Runtime,
 }
 
 impl Wire<'_> {
     /// Dispatch one request, signed for a signing name in `region` with an access key id, or
     /// unsigned when `signed` is `None` — which is how an SDK sends an operation whose model
     /// lists no auth scheme.
-    fn dispatch(
+    pub(crate) fn dispatch(
         &self,
         signed: Option<(&str, &str)>,
         region: &str,
@@ -166,7 +176,7 @@ impl Wire<'_> {
     }
 
     /// One awsJson1_1 call to one of the two Amazon Cognito services, signed or unsigned.
-    fn rpc(
+    pub(crate) fn rpc(
         &self,
         service: (&str, &str),
         signed: bool,
@@ -188,7 +198,7 @@ impl Wire<'_> {
 
     /// One awsJson1_1 call that has to be served, with the case in the panic of one that was
     /// not.
-    fn rpc_ok(
+    pub(crate) fn rpc_ok(
         &self,
         service: (&str, &str),
         signed: bool,
@@ -210,7 +220,7 @@ impl Wire<'_> {
 
     /// One awsQuery call, which is how CloudFormation and STS are called, signed with
     /// `access_key_id`.
-    fn query(
+    pub(crate) fn query(
         &self,
         signing_name: &str,
         access_key_id: &str,
@@ -235,7 +245,12 @@ impl Wire<'_> {
     }
 
     /// One CloudFormation call over its awsQuery wire.
-    fn cloudformation(&self, region: &str, action: &str, members: &[(&str, &str)]) -> Answer {
+    pub(crate) fn cloudformation(
+        &self,
+        region: &str,
+        action: &str,
+        members: &[(&str, &str)],
+    ) -> Answer {
         self.query(
             "cloudformation",
             SETUP_KEY_ID,
@@ -249,7 +264,7 @@ impl Wire<'_> {
     /// Every `ResourceStatusReason` the stack's event stream carries, which is the
     /// deployment's own account of itself: what a failed assertion about the terminal status
     /// names.
-    fn event_reasons(&self, region: &str, stack: &str) -> Vec<String> {
+    pub(crate) fn event_reasons(&self, region: &str, stack: &str) -> Vec<String> {
         let answered = self.cloudformation(region, "DescribeStackEvents", &[("StackName", stack)]);
         elements(&answered.text(), "ResourceStatusReason")
     }
@@ -260,7 +275,7 @@ impl Wire<'_> {
     /// `CAPABILITY_NAMED_IAM` acknowledges the IAM role every row declares, in the form that
     /// covers both a role the template names and one CloudFormation names ("If you have IAM
     /// resources with custom names, you must specify CAPABILITY_NAMED_IAM").
-    fn deploy(
+    pub(crate) fn deploy(
         &self,
         region: &str,
         stack: &str,
@@ -323,7 +338,9 @@ impl Wire<'_> {
 /// Whether `id` has the form Amazon Cognito Identity mints for an identity pool of `region`:
 /// `IdentityPoolId`, `@length 1..55`, `@pattern ^[\w-]+:[0-9a-f-]+$`, documented as
 /// "REGION:GUID".
-fn is_minted_identity_pool_id(id: &str, region: &str) -> bool {
+///
+/// Visible to the other suites of this target for the reason [`is_minted_client_id`] is.
+pub(crate) fn is_minted_identity_pool_id(id: &str, region: &str) -> bool {
     id.chars().count() <= 55
         && id.strip_prefix(&format!("{region}:")).is_some_and(|guid| {
             !guid.is_empty() && guid.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
@@ -332,7 +349,10 @@ fn is_minted_identity_pool_id(id: &str, region: &str) -> bool {
 
 /// Whether `id` has the form Amazon Cognito mints for an app client: `ClientIdType`,
 /// `@length 1..128`, `@pattern ^[\w+]+$` — which a hyphenated generated name cannot satisfy.
-fn is_minted_client_id(id: &str) -> bool {
+///
+/// Visible to the other suites of this target, so the predicate for a minted app-client id is
+/// stated once wherever one is asserted on.
+pub(crate) fn is_minted_client_id(id: &str) -> bool {
     !id.is_empty()
         && id.chars().count() <= 128
         && id
