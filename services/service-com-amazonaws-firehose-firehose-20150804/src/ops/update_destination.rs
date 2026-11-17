@@ -242,6 +242,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(crate::scaffolded::Scaffolded::validation)?;
 
+        // And every member the model constrains to a NON-BLANK value is judged against
+        // that pattern, for the same reason: the boundary's engine has no form for the
+        // look-ahead that states it, so a blank value would otherwise be stored as an HTTP
+        // endpoint's name (`crate::service::check_non_blank`).
+        crate::service::check_non_blank(crate::service::non_blank_http_endpoint_members(
+            HTTP_ENDPOINT_DESTINATION_MEMBER,
+            input
+                .http_endpoint_destination_update
+                .as_ref()
+                .and_then(|update| update.endpoint_configuration.as_ref()),
+            input
+                .http_endpoint_destination_update
+                .as_ref()
+                .and_then(|update| update.request_configuration.as_ref()),
+        ))
+        .map_err(crate::scaffolded::Scaffolded::validation)?;
+
         // And the data processors it carries must each carry the parameters their type
         // cannot run without, exactly as on the create path.
         if let Some(message) = crate::state::incomplete_processor(update.processing_configuration())
@@ -589,6 +606,10 @@ const S3_UPDATE_MEMBER: &str = "S3Update";
 const S3_BACKUP_UPDATE_MEMBER: &str = "S3BackupUpdate";
 const S3_CONFIGURATION_MEMBER: &str = "S3Configuration";
 
+/// The member an HTTP endpoint destination's update is submitted at, spelled as the model
+/// declares it.
+const HTTP_ENDPOINT_DESTINATION_MEMBER: &str = "HttpEndpointDestinationUpdate";
+
 /// The bucket a nested `S3DestinationUpdate` names, when it names one.
 fn s3_update_bucket(update: Option<&S3DestinationUpdate>) -> Option<&str> {
     update.and_then(|s3| s3.bucket_arn.as_deref())
@@ -626,22 +647,6 @@ enum DestinationUpdateKind {
 }
 
 impl DestinationUpdateKind {
-    /// The `*DestinationUpdate` member this update came from, for a refusal message.
-    fn member(&self) -> &'static str {
-        match self {
-            Self::S3(_) => "S3DestinationUpdate",
-            Self::ExtendedS3(_) => "ExtendedS3DestinationUpdate",
-            Self::Redshift(_) => "RedshiftDestinationUpdate",
-            Self::Elasticsearch(_) => "ElasticsearchDestinationUpdate",
-            Self::AmazonOpenSearchService(_) => "AmazonopensearchserviceDestinationUpdate",
-            Self::Splunk(_) => "SplunkDestinationUpdate",
-            Self::HttpEndpoint(_) => "HttpEndpointDestinationUpdate",
-            Self::Snowflake(_) => "SnowflakeDestinationUpdate",
-            Self::AmazonOpenSearchServerless(_) => "AmazonOpenSearchServerlessDestinationUpdate",
-            Self::Iceberg(_) => "IcebergDestinationUpdate",
-        }
-    }
-
     /// The data-processing configuration this update carries, whatever variant it is.
     ///
     /// `S3DestinationUpdate` is the one update the model gives no
@@ -769,16 +774,15 @@ fn sole_update(
     }
 
     if supplied.len() > 1 {
-        let members: Vec<&str> = supplied.iter().map(DestinationUpdateKind::member).collect();
-        return Err(invalid_argument(format!(
-            "only one destination update may be specified, but {} were: {}",
-            members.len(),
-            members.join(", ")
-        )));
+        // Several destination updates break the destination-arity rule a create breaks by
+        // naming several destinations, and it is refused with the same fixed sentence: a
+        // Firehose carries one destination configuration, whichever call names them.
+        return Err(invalid_argument(crate::service::sole_destination_message()));
     }
     supplied
         .pop()
-        .ok_or_else(|| invalid_argument("a destination update must be specified".to_string()))
+        // And naming none breaks it the same way a create that names no destination does.
+        .ok_or_else(|| invalid_argument(crate::service::sole_destination_message()))
 }
 
 /// The stored configuration this destination has AFTER `update` is applied.

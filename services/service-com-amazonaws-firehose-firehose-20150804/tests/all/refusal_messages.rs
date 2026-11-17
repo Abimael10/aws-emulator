@@ -13,8 +13,8 @@
 //! 3. a refusal the handlers raise themselves is scoped to the ACCOUNT: a duplicate
 //!    name states name and account, a lookup that found nothing states the account and
 //!    not the name it was given, a delete the state blocks states name, account and
-//!    state, and two destination configurations that exclude each other are refused with
-//!    one sentence over the members supplied;
+//!    state, and a create that does not name exactly one destination configuration is
+//!    refused with the one fixed sentence stating that arity rule;
 //! 4. a put to a stream that is not accepting data states the stream the request named
 //!    and the account the put was scoped to, and not the state the stream is in.
 //!
@@ -30,6 +30,9 @@ use super::delivery_stream_lifecycle::{
 // test crate reads a refusal the same way rather than carrying its own copy. It is
 // re-exported here because a sibling suite imports it from this module.
 pub(crate) use super::delivery_stream_lifecycle::error_message;
+// The arity sentence is the `destination_arity_refusal` suite's: one wording for one rule,
+// asserted there on the rule itself and here on the several-destination fault.
+use super::destination_arity_refusal::ARITY_REFUSAL;
 
 /// The envelope one constraint violation is reported in.
 fn one_error(clause: String) -> String {
@@ -78,6 +81,15 @@ fn splunk_configuration() -> Value {
     json!({
         "HECEndpoint": "https://splunk.example.com:8088",
         "HECEndpointType": "Raw",
+        "S3Configuration": s3_configuration(),
+    })
+}
+
+/// An `HttpEndpointDestinationConfiguration` whose `EndpointConfiguration` is `endpoint`,
+/// with the `S3Configuration` the model requires beside it.
+fn http_endpoint_configuration(endpoint: Value) -> Value {
+    json!({
+        "EndpointConfiguration": endpoint,
         "S3Configuration": s3_configuration(),
     })
 }
@@ -242,10 +254,15 @@ async fn a_pattern_is_reported_without_the_models_anchoring() {
     // (case, operation, request, member, model pattern, reported pattern)
     //
     // The model patterns are `smithy_query(query="shape",
-    // shape="DeliveryStreamName,FileExtension,CustomTimeZone")`. A single anchored
-    // expression is reported bare; a top-level alternation keeps one pair of anchors
-    // around the group, because dropping them branch by branch would widen the language
-    // the clause describes.
+    // shape="DeliveryStreamName,FileExtension,CustomTimeZone,HttpEndpointUrl,
+    // AmazonOpenSearchServerlessCollectionEndpoint,HttpEndpointName,
+    // HttpEndpointAttributeName")`. A single expression anchored at both ends is reported
+    // bare; a top-level alternation keeps one pair of anchors around the group, because
+    // dropping them branch by branch would widen the language the clause describes; an
+    // expression anchored at ONE end has the run it leaves free spelled out, because the
+    // clause describes a whole value; and one carrying a look-ahead keeps the anchoring
+    // that positions it, less an end anchor a trailing run of any character already
+    // reaches.
     let rows: Vec<(&str, &str, Value, &str, &str, &str)> = vec![
         (
             "a stream name with an illegal character, on the control plane",
@@ -300,6 +317,77 @@ async fn a_pattern_is_reported_without_the_models_anchoring() {
             "extendedS3DestinationConfiguration.customTimeZone",
             "^$|[a-zA-Z/_]+$",
             "^(|[a-zA-Z/_]+)$",
+        ),
+        (
+            // Anchored at the START only: the constraint admits any continuation, so the
+            // clause spells that run out rather than describing the prefix alone.
+            "an HTTP endpoint URL that is not https",
+            "CreateDeliveryStream",
+            json!({
+                "DeliveryStreamName": "http-endpoint-stream",
+                "HttpEndpointDestinationConfiguration": http_endpoint_configuration(json!({
+                    "Url": "http://example.com/firehose",
+                    "Name": "an-endpoint",
+                })),
+            }),
+            "httpEndpointDestinationConfiguration.endpointConfiguration.url",
+            "^https://",
+            "https://.*",
+        ),
+        (
+            // Not a member the issue cited: the same start-anchored shape on another
+            // destination's endpoint, so the same rendering rule has to hold for it.
+            "an OpenSearch Serverless collection endpoint that is not https",
+            "CreateDeliveryStream",
+            json!({
+                "DeliveryStreamName": "collection-stream",
+                "AmazonOpenSearchServerlessDestinationConfiguration": {
+                    "RoleARN": ROLE_ARN,
+                    "CollectionEndpoint": "http://collection.example.com",
+                    "IndexName": "logs",
+                    "S3Configuration": s3_configuration(),
+                },
+            }),
+            "amazonOpenSearchServerlessDestinationConfiguration.collectionEndpoint",
+            "^https:",
+            "https:.*",
+        ),
+        (
+            // A look-ahead: its anchoring stays, less the end anchor the trailing run of
+            // any character already reaches.
+            "a whitespace-only HTTP endpoint name",
+            "CreateDeliveryStream",
+            json!({
+                "DeliveryStreamName": "blank-name-stream",
+                "HttpEndpointDestinationConfiguration": http_endpoint_configuration(json!({
+                    "Url": "https://example.com/firehose",
+                    "Name": "   ",
+                })),
+            }),
+            "httpEndpointDestinationConfiguration.endpointConfiguration.name",
+            "^(?!\\s*$).+$",
+            "^(?!\\s*$).+",
+        ),
+        (
+            // Another member of the same non-blank shape class, which the issue did not
+            // cite: one rule for both.
+            "a whitespace-only common attribute name",
+            "CreateDeliveryStream",
+            json!({
+                "DeliveryStreamName": "blank-attribute-stream",
+                "HttpEndpointDestinationConfiguration": {
+                    "EndpointConfiguration": { "Url": "https://example.com/firehose" },
+                    "S3Configuration": s3_configuration(),
+                    "RequestConfiguration": {
+                        "CommonAttributes": [
+                            { "AttributeName": "\t", "AttributeValue": "v" },
+                        ],
+                    },
+                },
+            }),
+            "httpEndpointDestinationConfiguration.requestConfiguration.commonAttributes.1.member.attributeName",
+            "^(?!\\s*$).+$",
+            "^(?!\\s*$).+",
         ),
     ];
 
@@ -720,17 +808,18 @@ async fn a_delete_the_state_blocks_names_the_stream_the_account_and_that_state()
 }
 
 #[tokio::test]
-async fn destinations_that_exclude_each_other_are_refused_with_one_sentence_over_them() {
+async fn destinations_that_exclude_each_other_are_refused_with_the_arity_rule() {
     let emulator = Emulator::new();
 
     // The model declares each destination as its own optional member with no union over
-    // them, in this order: S3DestinationConfiguration, ExtendedS3DestinationConfiguration,
-    // …, SplunkDestinationConfiguration (`smithy_query(query="operation",
-    // operation="CreateDeliveryStream")`). The sentence names the members that were
-    // supplied, in THAT order — never the order the request happened to list them in.
+    // them (`smithy_query(query="operation", operation="CreateDeliveryStream")`), and "A
+    // Firehose stream is configured with a single destination": naming several breaks the
+    // same arity rule as naming none, so the refusal is the one fixed sentence that states
+    // it — it names no member, however many the request supplied and in whatever order it
+    // listed them.
     //
-    // (case, request, expected alternatives)
-    let rows: Vec<(&str, Value, &str)> = vec![
+    // (case, request)
+    let rows: Vec<(&str, Value)> = vec![
         (
             "the deprecated S3 member beside its replacement",
             json!({
@@ -738,7 +827,6 @@ async fn destinations_that_exclude_each_other_are_refused_with_one_sentence_over
                 "S3DestinationConfiguration": s3_configuration(),
                 "ExtendedS3DestinationConfiguration": extended_s3_configuration(),
             }),
-            "S3DestinationConfiguration or ExtendedS3DestinationConfiguration",
         ),
         (
             "two unrelated destinations",
@@ -747,7 +835,6 @@ async fn destinations_that_exclude_each_other_are_refused_with_one_sentence_over
                 "S3DestinationConfiguration": s3_configuration(),
                 "SplunkDestinationConfiguration": splunk_configuration(),
             }),
-            "S3DestinationConfiguration or SplunkDestinationConfiguration",
         ),
         (
             "a later member beside an earlier one",
@@ -756,7 +843,6 @@ async fn destinations_that_exclude_each_other_are_refused_with_one_sentence_over
                 "SplunkDestinationConfiguration": splunk_configuration(),
                 "ExtendedS3DestinationConfiguration": extended_s3_configuration(),
             }),
-            "ExtendedS3DestinationConfiguration or SplunkDestinationConfiguration",
         ),
         (
             "three destinations at once",
@@ -766,12 +852,10 @@ async fn destinations_that_exclude_each_other_are_refused_with_one_sentence_over
                 "ExtendedS3DestinationConfiguration": extended_s3_configuration(),
                 "S3DestinationConfiguration": s3_configuration(),
             }),
-            "S3DestinationConfiguration, ExtendedS3DestinationConfiguration or \
-             SplunkDestinationConfiguration",
         ),
     ];
 
-    for (case, request, alternatives) in rows {
+    for (case, request) in rows {
         let (status, refused) = emulator.call("CreateDeliveryStream", request).await;
         assert_eq!(status, 400, "case {case:?}: got {refused:?}");
         assert_eq!(
@@ -780,10 +864,9 @@ async fn destinations_that_exclude_each_other_are_refused_with_one_sentence_over
             "case {case:?}: got {refused:?}"
         );
         let message = error_message(&refused);
-        let expected = format!("Exactly one of {alternatives} must be specified.");
         assert_eq!(
-            message, expected,
-            "case {case:?}: expected {expected:?}, got {message:?}"
+            message, ARITY_REFUSAL,
+            "case {case:?}: expected {ARITY_REFUSAL:?}, got {message:?}"
         );
     }
 

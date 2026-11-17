@@ -26,7 +26,12 @@
 //!    value outside the set is refused with a clause enumerating exactly that set;
 //! 5. a customer managed CMK the stream's own account does not own cannot carry the grant
 //!    Firehose needs, so it is refused as a KMS access denial — the modelled
-//!    `InvalidKMSResourceException` relaying that KMS exception type.
+//!    `InvalidKMSResourceException` relaying that KMS exception type;
+//! 6. a member the model constrains to a NON-BLANK value (`smithy_query(query="shape",
+//!    shape="HttpEndpointName,HttpEndpointAttributeName")` -> `^(?!\s*$).+$`) admits no
+//!    value that is whitespace to its end, on the create and on the update alike, and the
+//!    refused request creates and changes nothing; a value the expression admits round
+//!    trips through the description unchanged.
 //!
 //! The harness (`Emulator`, `error_code`, …) is the lifecycle suite's.
 
@@ -34,7 +39,8 @@ use serde_json::{json, Value};
 use service_com_amazonaws_firehose_firehose_20150804::ops::types::shared_types::COMPRESSION_FORMAT_VALUES;
 
 use super::delivery_stream_lifecycle::{
-    error_code, error_message, Emulator, BUCKET_ARN, PAST_THE_TRANSITION, REGION, ROLE_ARN,
+    error_code, error_message, s3_configuration, Emulator, BUCKET_ARN, PAST_THE_TRANSITION,
+    REGION, ROLE_ARN,
 };
 
 /// The error code the framework answers a modelled input-constraint violation with.
@@ -1001,5 +1007,286 @@ async fn a_cmk_outside_the_stream_s_own_account_is_refused_as_a_kms_access_denia
     assert_eq!(
         status, 200,
         "a CMK of this account must not be refused by the account rule, got {created:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------------
+// Rule 6: a member the model constrains to a NON-BLANK value admits no blank one
+// ---------------------------------------------------------------------------------
+
+/// The `@pattern` of the non-blank shapes as the model spells it
+/// (`smithy_query(query="shape", shape="HttpEndpointName,HttpEndpointAttributeName")`).
+const NON_BLANK_MODEL_PATTERN: &str = r"^(?!\s*$).+$";
+
+/// The same expression as a constraint clause REPORTS it: the look-ahead's anchoring stays,
+/// less the end anchor the trailing run of any character already reaches (the
+/// `refusal_messages` suite owns that rule).
+const REPORTED_NON_BLANK_PATTERN: &str = r"^(?!\s*$).+";
+
+/// `HttpEndpointName`'s modelled `@length` maximum
+/// (`smithy_query(query="shape", shape="HttpEndpointName")`: `1..256`).
+const HTTP_ENDPOINT_NAME_MAX: usize = 256;
+
+/// The refusal a non-blank violation at `path` is stated with.
+fn non_blank_clause(path: &str) -> String {
+    format!(
+        "1 validation error detected: Value at '{path}' failed to satisfy constraint: \
+         Member must satisfy regular expression pattern: {REPORTED_NON_BLANK_PATTERN}"
+    )
+}
+
+/// Values the modelled pattern does NOT admit: whitespace all the way to the end, in every
+/// form the expression's `\s` covers, and a value whose characters the `.` class does not
+/// admit.
+fn blank_values() -> Vec<(&'static str, String)> {
+    vec![
+        ("a single space", " ".to_string()),
+        ("several spaces", "   ".to_string()),
+        ("a tab", "\t".to_string()),
+        ("a line feed", "\n".to_string()),
+        ("mixed whitespace", " \t \r\n ".to_string()),
+        // `\s` is Unicode-aware, so a space outside ASCII is whitespace too.
+        ("a non-breaking space", "\u{a0}".to_string()),
+        ("an ideographic space", "\u{3000}".to_string()),
+        // The `.` class admits no line break, so a value carrying one is outside the
+        // expression however much content it has.
+        ("content either side of a line break", "first\nsecond".to_string()),
+    ]
+}
+
+/// Values the modelled pattern DOES admit, including the two bounds of the member's
+/// `@length` and values that merely CONTAIN whitespace.
+fn non_blank_values() -> Vec<(&'static str, String)> {
+    vec![
+        ("a plain name", "an-endpoint".to_string()),
+        ("one character", "e".to_string()),
+        ("whitespace around content", "  an endpoint  ".to_string()),
+        ("a single non-space character", ".".to_string()),
+        ("a Unicode name", "конечная точка".to_string()),
+        (
+            "the longest name the length bound admits",
+            "e".repeat(HTTP_ENDPOINT_NAME_MAX),
+        ),
+    ]
+}
+
+/// A `CreateDeliveryStream` carrying an HTTP endpoint destination whose endpoint `Name` is
+/// `name`.
+fn create_with_endpoint_name(stream: &str, name: &str) -> Value {
+    json!({
+        "DeliveryStreamName": stream,
+        "HttpEndpointDestinationConfiguration": {
+            "EndpointConfiguration": {
+                "Url": "https://example.com/firehose",
+                "Name": name,
+            },
+            "S3Configuration": s3_configuration(),
+        },
+    })
+}
+
+#[tokio::test]
+async fn a_blank_value_is_refused_on_every_member_the_model_constrains_to_a_non_blank_one() {
+    let emulator = Emulator::new();
+
+    for (reason, value) in blank_values() {
+        // Both members that target a non-blank shape: the endpoint's own `Name`, and the
+        // `AttributeName` of a common attribute — reported here at the SECOND element, so
+        // the position in the list is the one the request submitted it at.
+        let requests: Vec<(&str, Value, String)> = vec![
+            (
+                "the endpoint name",
+                create_with_endpoint_name("non-blank-name", &value),
+                non_blank_clause("httpEndpointDestinationConfiguration.endpointConfiguration.name"),
+            ),
+            (
+                "a common attribute name",
+                json!({
+                    "DeliveryStreamName": "non-blank-attribute",
+                    "HttpEndpointDestinationConfiguration": {
+                        "EndpointConfiguration": { "Url": "https://example.com/firehose" },
+                        "S3Configuration": s3_configuration(),
+                        "RequestConfiguration": {
+                            "CommonAttributes": [
+                                { "AttributeName": "first", "AttributeValue": "a" },
+                                { "AttributeName": value, "AttributeValue": "b" },
+                            ],
+                        },
+                    },
+                }),
+                non_blank_clause(
+                    "httpEndpointDestinationConfiguration.requestConfiguration.\
+                     commonAttributes.2.member.attributeName",
+                ),
+            ),
+        ];
+
+        for (member, request, expected) in requests {
+            let case = format!("{member} as {reason} ({value:?})");
+            let stream = request["DeliveryStreamName"].as_str().unwrap_or_default().to_string();
+            let (status, refused) = emulator.call("CreateDeliveryStream", request).await;
+            assert_eq!(status, 400, "case {case:?}: got {refused:?}");
+            assert_eq!(
+                error_code(&refused),
+                VALIDATION_EXCEPTION,
+                "case {case:?}: got {refused:?}"
+            );
+            let message = error_message(&refused);
+            assert_eq!(
+                message, expected,
+                "case {case:?}: expected {expected:?}, got {message:?}"
+            );
+            // The clause quotes the expression a value must satisfy, not the model's
+            // string.
+            assert!(
+                !message.contains(NON_BLANK_MODEL_PATTERN),
+                "case {case:?}: expected the reported pattern, not the model's \
+                 {NON_BLANK_MODEL_PATTERN:?}, got {message:?}"
+            );
+            // And the refused create left no stream behind.
+            let (status, described) = emulator
+                .call(
+                    "DescribeDeliveryStream",
+                    json!({ "DeliveryStreamName": stream }),
+                )
+                .await;
+            assert_eq!(status, 400, "case {case:?}: describe got {described:?}");
+            assert_eq!(
+                error_code(&described),
+                "ResourceNotFoundException",
+                "case {case:?}: a refused create persists no stream, got {described:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_non_blank_value_is_accepted_and_reported_back_unchanged() {
+    let emulator = Emulator::new();
+
+    for (index, (reason, value)) in non_blank_values().into_iter().enumerate() {
+        let case = format!("{reason} ({value:?})");
+        let stream = format!("non-blank-accepted-{index}");
+        let (status, created) = emulator
+            .call(
+                "CreateDeliveryStream",
+                create_with_endpoint_name(&stream, &value),
+            )
+            .await;
+        assert_eq!(status, 200, "case {case:?}: got {created:?}");
+
+        let (status, described) = emulator
+            .call(
+                "DescribeDeliveryStream",
+                json!({ "DeliveryStreamName": stream }),
+            )
+            .await;
+        assert_eq!(status, 200, "case {case:?}: describe got {described:?}");
+        let reported = &described["DeliveryStreamDescription"]["Destinations"][0]
+            ["HttpEndpointDestinationDescription"]["EndpointConfiguration"]["Name"];
+        assert_eq!(
+            reported,
+            &json!(value),
+            "case {case:?}: expected the name back unchanged, got {reported:?} in \
+             {described:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_update_is_refused_for_a_blank_value_and_changes_nothing() {
+    // The constraint is the SHAPE's, so the update path applies it to the same two members
+    // of `HttpEndpointDestinationUpdate` — and a refused update leaves the stream as it
+    // was.
+    let emulator = Emulator::new();
+    let (status, created) = emulator
+        .call(
+            "CreateDeliveryStream",
+            create_with_endpoint_name("non-blank-update", "an-endpoint"),
+        )
+        .await;
+    assert_eq!(status, 200, "create got {created:?}");
+    emulator.await_active("non-blank-update").await;
+
+    let (status, described) = emulator
+        .call(
+            "DescribeDeliveryStream",
+            json!({ "DeliveryStreamName": "non-blank-update" }),
+        )
+        .await;
+    assert_eq!(status, 200, "describe got {described:?}");
+    let before = described["DeliveryStreamDescription"].clone();
+    let version = before["VersionId"].as_str().unwrap_or_default().to_string();
+    let destination_id = before["Destinations"][0]["DestinationId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+
+    for (reason, value) in blank_values() {
+        // (case, the update's `HttpEndpointDestinationUpdate`, the refusal it owes)
+        let rows: Vec<(&str, Value, String)> = vec![
+            (
+                "the endpoint name",
+                json!({
+                    "EndpointConfiguration": {
+                        "Url": "https://example.com/firehose",
+                        "Name": value,
+                    },
+                }),
+                non_blank_clause("httpEndpointDestinationUpdate.endpointConfiguration.name"),
+            ),
+            (
+                "a common attribute name",
+                json!({
+                    "RequestConfiguration": {
+                        "CommonAttributes": [
+                            { "AttributeName": value, "AttributeValue": "b" },
+                        ],
+                    },
+                }),
+                non_blank_clause(
+                    "httpEndpointDestinationUpdate.requestConfiguration.\
+                     commonAttributes.1.member.attributeName",
+                ),
+            ),
+        ];
+
+        for (member, update, expected) in rows {
+            let case = format!("{member} as {reason} ({value:?})");
+            let (status, refused) = emulator
+                .call(
+                    "UpdateDestination",
+                    json!({
+                        "DeliveryStreamName": "non-blank-update",
+                        "CurrentDeliveryStreamVersionId": version,
+                        "DestinationId": destination_id,
+                        "HttpEndpointDestinationUpdate": update,
+                    }),
+                )
+                .await;
+            assert_eq!(status, 400, "case {case:?}: got {refused:?}");
+            assert_eq!(
+                error_code(&refused),
+                VALIDATION_EXCEPTION,
+                "case {case:?}: got {refused:?}"
+            );
+            let message = error_message(&refused);
+            assert_eq!(
+                message, expected,
+                "case {case:?}: expected {expected:?}, got {message:?}"
+            );
+        }
+    }
+
+    let (status, after) = emulator
+        .call(
+            "DescribeDeliveryStream",
+            json!({ "DeliveryStreamName": "non-blank-update" }),
+        )
+        .await;
+    assert_eq!(status, 200, "describe got {after:?}");
+    assert_eq!(
+        after["DeliveryStreamDescription"], before,
+        "a refused update changes nothing, expected {before:?}, got {after:?}"
     );
 }

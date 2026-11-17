@@ -185,35 +185,52 @@ fn element_clause(member: &str, constraints: &[String]) -> String {
 /// A `@pattern` expression as a constraint message REPORTS it, which is not quite the
 /// expression the model spells.
 ///
-/// A model anchors a pattern so the match it describes is total (`^…$`); the reported
-/// form states the expression a value must satisfy, with that anchoring normalised:
+/// A reported expression describes a WHOLE value — the clause says what a member must
+/// satisfy, not what it must contain somewhere — so the model's anchoring is normalised
+/// away and whatever the model left unanchored is spelled out instead:
 ///
-/// * the anchors are dropped, so `^[a-zA-Z0-9_.-]+$` is reported as `[a-zA-Z0-9_.-]+`;
-/// * a TOP-LEVEL alternation cannot lose them branch by branch without changing the
-///   language it accepts, so for one the anchoring is restated once around the whole
-///   group: `^$|\.[0-9a-z]+$` is reported as `^(|\.[0-9a-z]+)$`;
-/// * an expression carrying a LOOK-AROUND cannot lose them at all — the look-around is
-///   positioned by the anchor it sits behind, so an expression without them admits values
-///   the constraint refuses — and is reported exactly as the model spells it.
+/// * anchored at BOTH ends, the anchors are dropped, so `^[a-zA-Z0-9_.-]+$` is reported as
+///   `[a-zA-Z0-9_.-]+`;
+/// * anchored at ONE end, the other end admits any run of characters, and the reported
+///   expression spells that run out rather than dropping the anchor and describing a
+///   narrower language than the constraint enforces: `^https://` is reported as
+///   `https://.*`;
+/// * anchored at NEITHER end the constraint is satisfied by an occurrence anywhere in the
+///   value, which is what the expression already says, so it is reported as spelled;
+/// * a TOP-LEVEL alternation cannot lose its anchoring branch by branch without changing
+///   the language it accepts, so for one anchored at both ends the anchoring is restated
+///   once around the whole group: `^$|\.[0-9a-z]+$` is reported as `^(|\.[0-9a-z]+)$`;
+/// * an expression carrying a LOOK-AROUND keeps the anchoring the model spells — the
+///   look-around is positioned by the anchor it sits behind, so an expression without it
+///   admits values the constraint refuses — except an end anchor standing behind an
+///   unbounded run of ANY character, which that run already reaches on its own:
+///   `^(?!\s*$).+$` is reported as `^(?!\s*$).+`.
 ///
-/// The first two forms describe exactly the values the constraint admits; neither is the
+/// Every form describes exactly the values the constraint admits, and none of them is the
 /// raw model string, which is what a client re-validating with the pattern it read out of
-/// a message would otherwise get. An alternation the model did NOT anchor at both ends is
-/// reported as the model spells it: anchoring it here would describe a narrower language
-/// than the constraint enforces.
+/// a message would otherwise get.
 fn reported_pattern(pattern: &str) -> String {
+    let anchored_start = pattern.starts_with('^');
+    let anchored_end = without_end_anchor(pattern).is_some();
     if carries_look_around(pattern) {
-        return pattern.to_string();
+        return match without_end_anchor(pattern) {
+            Some(body) if ends_with_any_character_run(body) => body.to_string(),
+            _ => pattern.to_string(),
+        };
     }
     let body = unanchored(pattern);
     let branches = top_level_alternatives(body);
     match branches.as_slice() {
-        [] | [_] => body.to_string(),
+        [] | [_] => match (anchored_start, anchored_end) {
+            // One end anchored: the value continues past the expression, so the run the
+            // constraint leaves free is stated rather than left implied.
+            (true, false) => format!("{body}{ANY_CHARACTER_RUN}"),
+            (false, true) => format!("{ANY_CHARACTER_RUN}{body}"),
+            _ => body.to_string(),
+        },
         // Anchored at one end only, or not at all: there is no total match to normalise,
         // and grouping it would state a narrower language than the constraint enforces.
-        _ if !(pattern.starts_with('^') && without_end_anchor(pattern).is_some()) => {
-            pattern.to_string()
-        }
+        _ if !(anchored_start && anchored_end) => pattern.to_string(),
         branches => format!(
             "^({})$",
             branches
@@ -223,6 +240,33 @@ fn reported_pattern(pattern: &str) -> String {
                 .join("|")
         ),
     }
+}
+
+/// The expression for a run of any characters, which is what an end a model left
+/// unanchored admits.
+const ANY_CHARACTER_RUN: &str = ".*";
+
+/// Whether `expression` ends in an UNBOUNDED run of any character (`.*` or `.+`). Such a
+/// run reaches a value's last character by itself, so an end anchor behind one states
+/// nothing the expression does not state already.
+fn ends_with_any_character_run(expression: &str) -> bool {
+    let Some(atom) = ['*', '+']
+        .iter()
+        .find_map(|quantifier| expression.strip_suffix(*quantifier))
+    else {
+        return false;
+    };
+    atom.ends_with('.') && !tail_is_escaped(atom)
+}
+
+/// Whether the last character of `expression` is escaped by a backslash — an escaped dot
+/// is a literal dot and not the any-character class.
+fn tail_is_escaped(expression: &str) -> bool {
+    let Some(last) = expression.chars().next_back() else {
+        return false;
+    };
+    let head = &expression[..expression.len() - last.len_utf8()];
+    (head.len() - head.trim_end_matches('\\').len()) % 2 == 1
 }
 
 /// A `@pattern` expression without the anchors a model may spell it with.
@@ -332,8 +376,8 @@ fn violation_envelope(clauses: &[String]) -> Option<String> {
 //
 // The boundary's constraint walk compiles a `@pattern` with the linear-time `regex` crate
 // and reads a pattern it cannot compile as satisfied — so a value constrained by an
-// expression that engine refuses reaches a handler UNCHECKED. Two of this model's
-// expressions are such: one written with a LOOK-AHEAD (which a linear-time engine has no
+// expression that engine refuses reaches a handler UNCHECKED. Three of this model's
+// expressions are such: two written with a LOOK-AHEAD (which a linear-time engine has no
 // form for) and one whose BOUNDED repetition over a character class the engine declines to
 // expand. A handler judges such a value itself, by the clause the engine cannot decide and
 // the same walk for the rest of the expression, and words the refusal with the renderer
@@ -419,32 +463,109 @@ impl SerializableStruct for CheckedString<'_> {
 /// Whether [`TAG_KEY_PATTERN`] admits `key`: it does not begin with the reserved prefix the
 /// look-ahead excludes, and its characters are the ones the rest of the expression lists.
 fn admits_tag_key(key: &str) -> bool {
-    !key.starts_with(RESERVED_TAG_KEY_PREFIX)
-        && validate(
-            &CheckedString {
-                member: &M_TAG_KEY,
-                value: key,
-            },
-            &CHECKED_MEMBER_SCHEMA,
-        )
-        .is_empty()
+    !names_a_system_tag(key) && admits_tag_key_characters(key)
+}
+
+/// Whether the character clause of [`TAG_KEY_PATTERN`] admits `key` — the half of the
+/// expression that says what a key may be WRITTEN with, judged by the framework's own walk
+/// over [`TAG_KEY_CHARACTERS`].
+fn admits_tag_key_characters(key: &str) -> bool {
+    validate(
+        &CheckedString {
+            member: &M_TAG_KEY,
+            value: key,
+        },
+        &CHECKED_MEMBER_SCHEMA,
+    )
+    .is_empty()
+}
+
+/// Whether `key` names a SYSTEM tag: one beginning with the prefix
+/// [`RESERVED_TAG_KEY_PREFIX`] that Amazon Web Services keeps for the tags it sets itself.
+fn names_a_system_tag(key: &str) -> bool {
+    key.starts_with(RESERVED_TAG_KEY_PREFIX)
+}
+
+/// Why a request's tag keys were refused — the two faults are answered under different
+/// codes, so the check that finds one says WHICH it found and the operation answers it
+/// through its own error channel.
+#[derive(Debug)]
+pub(crate) enum TagKeyRefusal {
+    /// A key outside the characters the modelled pattern lists: a fault of the request's
+    /// SHAPE, worded the way the request boundary words one (HTTP 400
+    /// `ValidationException`).
+    Shape(String),
+    /// A key naming a SYSTEM tag. Not a fault of the request's shape but of what it asks
+    /// for — to write or remove a tag Amazon Web Services owns — so it is answered under
+    /// the operation's modelled argument error with [`system_tag_message`].
+    SystemTag,
+}
+
+/// What Firehose states for a request that would write or remove a system tag: the
+/// reserved prefix such a key begins with, and that those tags cannot be modified.
+///
+/// Fixed text over that prefix — the sentence names NO key, however many of the request's
+/// keys carry it.
+pub fn system_tag_message() -> String {
+    format!(
+        "Some tag keys in the request started with '{RESERVED_TAG_KEY_PREFIX}'. \
+         System tags cannot be modified."
+    )
 }
 
 /// Refuse every tag key of a request that [`TAG_KEY_PATTERN`] does not admit, each named
 /// at the dotted path it was submitted at; `Ok(())` when they all satisfy it.
 ///
-/// For the keys submitted as NAMED members — a `Tags` entry's `Key`, a start key. One
-/// refusal states every violating key, the way the boundary walk accumulates violations
-/// rather than reporting only the first. The key's `@length` bounds and the `TagValue`
-/// pattern are separate traits the boundary enforces itself, so they are not re-checked
-/// here.
+/// For a key submitted at a NAMED member that names no tag to write or remove — a listing
+/// start key — where the whole modelled expression, reserved prefix included, is a
+/// constraint on the value the request boundary would have applied. A key the request
+/// WRITES is judged by [`check_modified_tag_keys`] instead.
 pub(crate) fn check_tag_keys<'a, I>(keys: I) -> Result<(), String>
+where
+    I: IntoIterator<Item = (String, &'a str)>,
+{
+    check_tag_keys_against(keys, admits_tag_key)
+}
+
+/// Refuse the tag keys a request WRITES OR REMOVES, each named at the dotted path it was
+/// submitted at; `Ok(())` when the request may carry them all.
+///
+/// Two rules judge such a key, and they are not the same fault: the characters it is
+/// written with are a constraint on the request's shape, and the reserved prefix is the tag
+/// policy refusing to let a caller modify a tag Amazon Web Services owns. The shape is
+/// judged first — the request boundary would have judged it before any rule of the
+/// service's own — and one refusal states every key that violates it.
+pub(crate) fn check_modified_tag_keys<'a, I>(keys: I) -> Result<(), TagKeyRefusal>
+where
+    I: IntoIterator<Item = (String, &'a str)>,
+{
+    let keys: Vec<(String, &str)> = keys.into_iter().collect();
+    check_tag_keys_against(
+        keys.iter().map(|(path, key)| (path.clone(), *key)),
+        admits_tag_key_characters,
+    )
+    .map_err(TagKeyRefusal::Shape)?;
+    if keys.iter().any(|(_, key)| names_a_system_tag(key)) {
+        return Err(TagKeyRefusal::SystemTag);
+    }
+    Ok(())
+}
+
+/// Refuse every tag key `admits` does not admit, each named at the dotted path it was
+/// submitted at.
+///
+/// One refusal states every violating key, the way the boundary walk accumulates
+/// violations rather than reporting only the first, and the clause quotes the whole
+/// modelled expression whichever of its clauses the key failed — it is that one constraint
+/// the key did not satisfy. The key's `@length` bounds and the `TagValue` pattern are
+/// separate traits the boundary enforces itself, so they are not re-checked here.
+fn check_tag_keys_against<'a, I>(keys: I, admits: fn(&str) -> bool) -> Result<(), String>
 where
     I: IntoIterator<Item = (String, &'a str)>,
 {
     let clauses: Vec<String> = keys
         .into_iter()
-        .filter(|(_, key)| !admits_tag_key(key))
+        .filter(|(_, key)| !admits(key))
         .filter_map(|(path, _)| {
             constraint_clause(&Violation {
                 path,
@@ -462,21 +583,23 @@ where
     }
 }
 
-/// Refuse a LIST of tag keys holding a key [`TAG_KEY_PATTERN`] does not admit; `Ok(())`
-/// when every element satisfies it.
+/// Refuse a LIST of tag keys a request REMOVES, under the two rules
+/// [`check_modified_tag_keys`] applies to a named one and in the same order.
 ///
-/// An element has no member name of its own, so the refusal names the list ONCE however
-/// many of its elements violate the pattern, and states the whole constraint set the
-/// list's elements carry — see [`element_clause`].
-pub(crate) fn check_tag_key_list(keys: &[String]) -> Result<(), String> {
-    if keys.iter().all(|key| admits_tag_key(key)) {
-        return Ok(());
+/// An element has no member name of its own, so a shape refusal names the list ONCE
+/// however many of its elements violate the pattern, and states the whole constraint set
+/// the list's elements carry — see [`element_clause`].
+pub(crate) fn check_modified_tag_key_list(keys: &[String]) -> Result<(), TagKeyRefusal> {
+    if !keys.iter().all(|key| admits_tag_key_characters(key)) {
+        let clauses = vec![element_clause(&tag_keys_member(), &tag_key_constraints())];
+        if let Some(message) = violation_envelope(&clauses) {
+            return Err(TagKeyRefusal::Shape(message));
+        }
     }
-    let clauses = vec![element_clause(&tag_keys_member(), &tag_key_constraints())];
-    match violation_envelope(&clauses) {
-        Some(message) => Err(message),
-        None => Ok(()),
+    if keys.iter().any(|key| names_a_system_tag(key)) {
+        return Err(TagKeyRefusal::SystemTag);
     }
+    Ok(())
 }
 
 /// Every constraint the elements of a list of tag keys carry, in the order a refusal
@@ -618,6 +741,133 @@ where
         Some(message) => Err(message),
         None => Ok(()),
     }
+}
+
+/// The `@pattern` of the shapes that admit any value EXCEPT a blank one — `HttpEndpointName`
+/// and `HttpEndpointAttributeName` (`smithy_query(query="shape",
+/// shape="HttpEndpointName,HttpEndpointAttributeName")`). Held as the model spells it,
+/// because that expression is what a refusal reports.
+///
+/// Its look-ahead says the value is not whitespace to its very end, which is the clause the
+/// boundary's engine has no form for; the rest says the value is one or more characters of a
+/// single line.
+const NON_BLANK_PATTERN: &str = r"^(?!\s*$).+$";
+
+/// [`NON_BLANK_PATTERN`] without that clause: one or more characters, none of them a line
+/// break.
+const NON_BLANK_CHARACTERS: &str = "^.+$";
+
+/// [`NON_BLANK_CHARACTERS`] hung on a member schema, for the same reason
+/// [`TAG_KEY_TRAITS`] is: the decision is then the framework's own constraint walk rather
+/// than a second reading of the expression.
+static NON_BLANK_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(PatternTrait::new(NON_BLANK_CHARACTERS)));
+    traits
+});
+
+/// The member schema carrying [`NON_BLANK_TRAITS`]. Its name never reaches a message — see
+/// [`M_TAG_KEY`].
+static M_NON_BLANK: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.firehose#CheckedMember$nonBlank",
+        NAMESPACE,
+        "nonBlank",
+    ),
+    ShapeType::String,
+    "nonBlank",
+    0,
+)
+.with_traits(&NON_BLANK_TRAITS);
+
+/// Whether [`NON_BLANK_PATTERN`] admits `value`: it is not whitespace all the way to its
+/// end — the clause the look-ahead states, a test over the whole value that needs no
+/// backtracking engine — and its characters are what the rest of the expression admits.
+fn admits_non_blank(value: &str) -> bool {
+    !value.chars().all(char::is_whitespace)
+        && validate(
+            &CheckedString {
+                member: &M_NON_BLANK,
+                value,
+            },
+            &CHECKED_MEMBER_SCHEMA,
+        )
+        .is_empty()
+}
+
+/// Refuse every value of a request that [`NON_BLANK_PATTERN`] does not admit, each named at
+/// the dotted path it was submitted at; `Ok(())` when they all satisfy it.
+///
+/// One refusal states every violating member, the way the boundary walk accumulates
+/// violations rather than reporting only the first, and in the words that walk would have
+/// used — this is a modelled constraint the request boundary could not apply, not a rule of
+/// this service's own. Some of these members are `@sensitive` and the clause states the
+/// value on none of them either way (see [`constraint_clause`]).
+pub(crate) fn check_non_blank<'a, I>(values: I) -> Result<(), String>
+where
+    I: IntoIterator<Item = (String, &'a str)>,
+{
+    let clauses: Vec<String> = values
+        .into_iter()
+        .filter(|(_, value)| !admits_non_blank(value))
+        .filter_map(|(path, _)| {
+            constraint_clause(&Violation {
+                path,
+                kind: ViolationKind::Pattern(NON_BLANK_PATTERN.to_string()),
+                value: None,
+                sensitive: false,
+            })
+        })
+        .collect();
+    match violation_envelope(&clauses) {
+        Some(message) => Err(message),
+        None => Ok(()),
+    }
+}
+
+/// Every member of an HTTP endpoint destination that targets a non-blank shape, each at the
+/// dotted path it was submitted at: the endpoint's `Name` and the `AttributeName` of every
+/// common attribute the request configuration carries
+/// (`smithy_query(query="shape", shape="HttpEndpointConfiguration,\
+/// HttpEndpointRequestConfiguration,HttpEndpointCommonAttribute")`).
+///
+/// Shared by the create and the update paths: the two carry the same
+/// `HttpEndpointConfiguration` and `HttpEndpointRequestConfiguration` shapes under their
+/// own destination member, which is what `destination_member` names.
+pub(crate) fn non_blank_http_endpoint_members<'a>(
+    destination_member: &str,
+    endpoint: Option<&'a crate::ops::types::HttpEndpointConfiguration>,
+    request_configuration: Option<&'a crate::ops::types::HttpEndpointRequestConfiguration>,
+) -> Vec<(String, &'a str)> {
+    use ::aws_smithy_schema_server::constraints::path;
+
+    let mut found: Vec<(String, &str)> = Vec::new();
+    if let Some(name) = endpoint.and_then(|endpoint| endpoint.name.as_deref()) {
+        found.push((
+            path::join(&[
+                path::member(destination_member),
+                path::member("EndpointConfiguration"),
+                path::member("Name"),
+            ]),
+            name,
+        ));
+    }
+    let attributes = request_configuration
+        .and_then(|configuration| configuration.common_attributes.as_deref())
+        .unwrap_or_default();
+    for (index, attribute) in attributes.iter().enumerate() {
+        found.push((
+            path::join(&[
+                path::member(destination_member),
+                path::member("RequestConfiguration"),
+                path::member("CommonAttributes"),
+                path::element(index + 1),
+                path::member("AttributeName"),
+            ]),
+            attribute.attribute_name.as_str(),
+        ));
+    }
+    found
 }
 
 // ---------------------------------------------------------------------------------
@@ -841,27 +1091,17 @@ pub fn blocked_delete_message(name: &str, state: &str) -> String {
     )
 }
 
-/// A create that carried NO destination configuration at all.
+/// A request that does not name EXACTLY ONE destination configuration — none, or several
+/// that exclude each other.
 ///
-/// A Firehose stream is "configured with a single destination", so the refusal states that
-/// arity rule as one fixed sentence. It names no member because the request supplied none
-/// to name: the sentence is the same whichever destination the caller meant to configure.
-pub fn sole_destination_required_message() -> String {
+/// "A Firehose stream is configured with a single destination", and "You must specify only
+/// one of the following destination configuration parameters", so both faults are the one
+/// arity rule and the refusal states it as one fixed sentence. It names no member either
+/// way: the sentence is the same whichever destination the caller meant to configure and
+/// whichever ones it supplied, so a client matching the refusal matches one text for the
+/// rule rather than one per combination.
+pub fn sole_destination_message() -> String {
     "Exactly one destination configuration is supported for a Firehose".to_string()
-}
-
-/// Two or more members that exclude each other were supplied: the members, in the order
-/// the model declares them.
-///
-/// The model expresses no union over them, so the exclusion is a rule this service
-/// enforces and states as one sentence over the alternatives it saw.
-pub fn exactly_one_of_message(members: &[&str]) -> String {
-    let alternatives = match members {
-        [] => String::new(),
-        [only] => (*only).to_string(),
-        [first @ .., last] => format!("{} or {last}", first.join(", ")),
-    };
-    format!("Exactly one of {alternatives} must be specified.")
 }
 
 /// Whether a boundary refusal is ABOUT a role ARN: one of its violations is a `@pattern`

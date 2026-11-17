@@ -15,7 +15,8 @@
 //! The rule is a property of the request walk, so it holds for every operation that takes
 //! a constrained value beside a resource name: `TagDeliveryStream`, `UntagDeliveryStream`,
 //! `ListTagsForDeliveryStream` and `CreateDeliveryStream`. Each table below spans a SET of
-//! violated constraints — the look-ahead `TagKey` pattern a handler applies itself, a
+//! violated constraints — the `TagKey` character class a handler applies itself (the
+//! modelled pattern's look-ahead keeps the boundary's engine from compiling it), a
 //! `@length` bound on a string and on a list, a `@range` bound on an integer, and an
 //! absent `@required` member — crossed with a SET of store contents.
 //!
@@ -115,11 +116,11 @@ type InvalidRequest = (&'static str, &'static str, Value, String);
 fn invalid_requests() -> Vec<InvalidRequest> {
     vec![
         (
-            "a tag key carrying the reserved prefix",
+            "a tag key outside the modelled class",
             "TagDeliveryStream",
             json!({
                 "DeliveryStreamName": ADDRESSED,
-                "Tags": [{ "Key": "aws:owner", "Value": "v" }],
+                "Tags": [{ "Key": "bad*key", "Value": "v" }],
             }),
             pattern_refusal("tags.1.member.key"),
         ),
@@ -159,7 +160,7 @@ fn invalid_requests() -> Vec<InvalidRequest> {
         (
             "a tag key outside the modelled class, in a list of keys",
             "UntagDeliveryStream",
-            json!({ "DeliveryStreamName": ADDRESSED, "TagKeys": ["env", "aws:owner"] }),
+            json!({ "DeliveryStreamName": ADDRESSED, "TagKeys": ["env", "bad*key"] }),
             element_refusal("tagKeys"),
         ),
         (
@@ -190,12 +191,12 @@ fn invalid_requests() -> Vec<InvalidRequest> {
             ),
         ),
         (
-            "a tag key carrying the reserved prefix, on a create",
+            "a tag key outside the modelled class, on a create",
             "CreateDeliveryStream",
             json!({
                 "DeliveryStreamName": ADDRESSED,
                 "S3DestinationConfiguration": s3_configuration(),
-                "Tags": [{ "Key": "aws:owner", "Value": "v" }],
+                "Tags": [{ "Key": "bad*key", "Value": "v" }],
             }),
             pattern_refusal("tags.1.member.key"),
         ),

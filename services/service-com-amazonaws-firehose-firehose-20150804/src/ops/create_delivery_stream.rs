@@ -250,11 +250,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // A tag the create carries is a tag of the stream it creates, so each of its keys
-        // is judged against the modelled `TagKey` pattern before anything is written, the
-        // way the request boundary would have judged it had it been able to compile that
-        // pattern (`crate::service::check_tag_keys`).
+        // is judged before anything is written: the characters it is written with are the
+        // modelled `TagKey` pattern the request boundary would have applied had it been
+        // able to compile it, and a key naming a system tag is the tag policy's own
+        // refusal (`crate::service::check_modified_tag_keys`).
         if let Some(tags) = input.tags.as_deref() {
-            crate::service::check_tag_keys(tags.iter().enumerate().map(|(index, tag)| {
+            crate::service::check_modified_tag_keys(tags.iter().enumerate().map(|(index, tag)| {
                 (
                     path::join(&[
                         path::member("Tags"),
@@ -264,8 +265,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     tag.key.as_str(),
                 )
             }))
-            .map_err(crate::scaffolded::Scaffolded::validation)?;
+            .map_err(tag_key_refusal)?;
         }
+
+        // Every member the model constrains to a NON-BLANK value is judged against that
+        // pattern here, for the same reason the tag keys are: the boundary's engine has no
+        // form for the look-ahead that states it, so a blank value would otherwise be
+        // stored as an HTTP endpoint's name (`crate::service::check_non_blank`).
+        crate::service::check_non_blank(crate::service::non_blank_http_endpoint_members(
+            HTTP_ENDPOINT_DESTINATION_MEMBER,
+            input
+                .http_endpoint_destination_configuration
+                .as_ref()
+                .map(|config| &config.endpoint_configuration),
+            input
+                .http_endpoint_destination_configuration
+                .as_ref()
+                .and_then(|config| config.request_configuration.as_ref()),
+        ))
+        .map_err(crate::scaffolded::Scaffolded::validation)?;
 
         // Every `BucketARN` the create names is judged against the modelled pattern the
         // request boundary could not apply, at the member it was submitted at and in the
@@ -491,6 +509,25 @@ fn invalid_argument(message: String) -> CreateDeliveryStreamError {
     })
     .into()
 }
+
+/// Answer a refusal of the tag keys this create carries under the code that fault calls
+/// for: a fault of the request's SHAPE in the code the request boundary would have
+/// answered, and a system tag under this operation's modelled `InvalidArgumentException` —
+/// a tag policy refusing what the request ASKS FOR is not a malformed request.
+fn tag_key_refusal(refusal: crate::service::TagKeyRefusal) -> CreateDeliveryStreamError {
+    match refusal {
+        crate::service::TagKeyRefusal::Shape(message) => {
+            crate::scaffolded::Scaffolded::validation(message)
+        }
+        crate::service::TagKeyRefusal::SystemTag => {
+            invalid_argument(crate::service::system_tag_message())
+        }
+    }
+}
+
+/// The member an HTTP endpoint destination is submitted at on this operation, spelled as
+/// the model declares it.
+const HTTP_ENDPOINT_DESTINATION_MEMBER: &str = "HttpEndpointDestinationConfiguration";
 
 /// Every IAM role ARN the create names, each distinct ARN once.
 ///
@@ -785,90 +822,57 @@ fn sole_destination(
 ) -> Result<crate::state::DestinationConfigKind, CreateDeliveryStreamError> {
     use crate::state::DestinationConfigKind as Kind;
 
-    let mut supplied: Vec<(&'static str, Kind)> = Vec::new();
+    let mut supplied: Vec<Kind> = Vec::new();
     if let Some(config) = input.s3_destination_configuration.clone() {
-        supplied.push(("S3DestinationConfiguration", Kind::S3(Box::new(config))));
+        supplied.push(Kind::S3(Box::new(config)));
     }
     if let Some(config) = input.extended_s3_destination_configuration.clone() {
-        supplied.push((
-            "ExtendedS3DestinationConfiguration",
-            Kind::ExtendedS3(Box::new(config)),
-        ));
+        supplied.push(Kind::ExtendedS3(Box::new(config)));
     }
     if let Some(mut config) = input.redshift_destination_configuration.clone() {
         config.password = None;
-        supplied.push((
-            "RedshiftDestinationConfiguration",
-            Kind::Redshift(Box::new(config)),
-        ));
+        supplied.push(Kind::Redshift(Box::new(config)));
     }
     if let Some(config) = input.elasticsearch_destination_configuration.clone() {
-        supplied.push((
-            "ElasticsearchDestinationConfiguration",
-            Kind::Elasticsearch(Box::new(config)),
-        ));
+        supplied.push(Kind::Elasticsearch(Box::new(config)));
     }
     if let Some(config) = input
         .amazonopensearchservice_destination_configuration
         .clone()
     {
-        supplied.push((
-            "AmazonopensearchserviceDestinationConfiguration",
-            Kind::AmazonOpenSearchService(Box::new(config)),
-        ));
+        supplied.push(Kind::AmazonOpenSearchService(Box::new(config)));
     }
     if let Some(config) = input.splunk_destination_configuration.clone() {
-        supplied.push((
-            "SplunkDestinationConfiguration",
-            Kind::Splunk(Box::new(config)),
-        ));
+        supplied.push(Kind::Splunk(Box::new(config)));
     }
     if let Some(config) = input.http_endpoint_destination_configuration.clone() {
-        supplied.push((
-            "HttpEndpointDestinationConfiguration",
-            Kind::HttpEndpoint(Box::new(config)),
-        ));
+        supplied.push(Kind::HttpEndpoint(Box::new(config)));
     }
-    // Declared after `HttpEndpointDestinationConfiguration` in the model, and collected
-    // in that order: the mutual-exclusion refusal names the members it saw in the
-    // model's declaration order.
     if let Some(config) = input
         .amazon_open_search_serverless_destination_configuration
         .clone()
     {
-        supplied.push((
-            "AmazonOpenSearchServerlessDestinationConfiguration",
-            Kind::AmazonOpenSearchServerless(Box::new(config)),
-        ));
+        supplied.push(Kind::AmazonOpenSearchServerless(Box::new(config)));
     }
     if let Some(mut config) = input.snowflake_destination_configuration.clone() {
         config.private_key = None;
         config.key_passphrase = None;
-        supplied.push((
-            "SnowflakeDestinationConfiguration",
-            Kind::Snowflake(Box::new(config)),
-        ));
+        supplied.push(Kind::Snowflake(Box::new(config)));
     }
     if let Some(config) = input.iceberg_destination_configuration.clone() {
-        supplied.push((
-            "IcebergDestinationConfiguration",
-            Kind::Iceberg(Box::new(config)),
-        ));
+        supplied.push(Kind::Iceberg(Box::new(config)));
     }
 
     if supplied.len() > 1 {
-        // The model declares these as separate optional members with no union over
-        // them, so the exclusion is this service's rule and it is stated as one sentence
-        // over the alternatives that were supplied.
-        let names: Vec<&str> = supplied.iter().map(|(name, _)| *name).collect();
-        return Err(invalid_argument(crate::service::exactly_one_of_message(
-            &names,
-        )));
+        // Naming several destinations breaks the SAME arity rule as naming none, so it is
+        // refused with the same fixed sentence: a Firehose carries one destination
+        // configuration, and the refusal states that rule rather than naming the members
+        // this request happened to supply.
+        return Err(invalid_argument(crate::service::sole_destination_message()));
     }
     supplied
         .pop()
-        .map(|(_, kind)| kind)
-        .ok_or_else(|| invalid_argument(crate::service::sole_destination_required_message()))
+        .ok_or_else(|| invalid_argument(crate::service::sole_destination_message()))
 }
 
 /// Which source configuration a Firehose stream of this `DeliveryStreamType` is fed by.

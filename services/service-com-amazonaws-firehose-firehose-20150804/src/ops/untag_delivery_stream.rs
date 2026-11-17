@@ -105,6 +105,24 @@ impl From<UntagDeliveryStreamErrorModeled> for UntagDeliveryStreamError {
     }
 }
 
+/// Answer a refusal of the tag keys this request names under the code that fault calls
+/// for: a fault of the request's SHAPE in the code the request boundary would have
+/// answered, and a system tag under this operation's modelled `InvalidArgumentException` —
+/// a tag policy refusing what the request ASKS FOR is not a malformed request.
+fn tag_key_refusal(refusal: crate::service::TagKeyRefusal) -> UntagDeliveryStreamError {
+    match refusal {
+        crate::service::TagKeyRefusal::Shape(message) => {
+            crate::scaffolded::Scaffolded::validation(message)
+        }
+        crate::service::TagKeyRefusal::SystemTag => {
+            UntagDeliveryStreamErrorModeled::InvalidArgumentException(InvalidArgumentException {
+                message: Some(crate::service::system_tag_message()),
+            })
+            .into()
+        }
+    }
+}
+
 /// The `UntagDeliveryStream` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -151,11 +169,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let _ = ctx;
 
-        // Every named key is judged against the modelled `TagKey` pattern BEFORE anything
-        // is looked up or removed, the way the request boundary would have judged it had
-        // it been able to compile that pattern (`crate::service::check_tag_key_list`).
-        crate::service::check_tag_key_list(&input.tag_keys)
-            .map_err(crate::scaffolded::Scaffolded::validation)?;
+        // Every named key is judged BEFORE anything is looked up or removed: the
+        // characters it is written with are the modelled `TagKey` pattern the request
+        // boundary would have applied had it been able to compile it, and a key naming a
+        // system tag is the tag policy's own refusal
+        // (`crate::service::check_modified_tag_key_list`).
+        crate::service::check_modified_tag_key_list(&input.tag_keys).map_err(tag_key_refusal)?;
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
