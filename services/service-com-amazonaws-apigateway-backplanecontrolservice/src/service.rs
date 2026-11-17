@@ -34,9 +34,11 @@
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
 //! - `override_routing_error` — how this service words a request that reached it
-//!   but named no modeled operation. The default returns `None`, so the entry
-//!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
-//!   404, …). Return `Some(resp)` to answer in your own envelope if desired.
+//!   but named no modeled operation. EDITED HERE: it serves the one invoke
+//!   [`Service::override_operation`] deliberately names no operation for — a request a
+//!   browser sent from another site that a deployed method declaring its origin answers from
+//!   the api's own records — and otherwise returns `None`, so the entry renders the
+//!   protocol-correct default (query -> 400 InvalidAction, awsJson -> 404, …).
 //! - `override_framework_error` — how this service words a transport-level
 //!   failure the orchestrator detects up front (e.g. a malformed `aws-chunked`
 //!   body). The default returns `None`, keeping the entry's protocol-correct
@@ -76,7 +78,7 @@
 //! reserved `/_aws/execute-api/{api-id}` prefix, as its first segment, or by the STAGE
 //! segment alone; [`invoke`] resolves every one of those addressings.
 //!
-//! Two seams carry it, and nothing else changes:
+//! Three seams carry it, and nothing else changes:
 //!
 //! - [`Service::can_handle`] also claims a request addressed to a deployed stage of an api
 //!   this service HOLDS ([`invoke::claims_parts`]), which is what routes it here at all;
@@ -86,6 +88,16 @@
 //!   modelled operation by construction (`/{stage}/{path}` is not in the model), so that
 //!   operation is named only for a request the data plane claims, and every modelled
 //!   request keeps resolving through the generated table.
+//! - [`Service::override_routing_error`] serves the ONE invoke that operation is not named
+//!   for: the request a browser sent from another site that a DEPLOYED METHOD DECLARING ITS
+//!   ORIGIN answers from the api's own records — the `OPTIONS` preflight a browser sends
+//!   before a cross-origin call and the `MOCK` method behind it — and the request no deployed
+//!   method serves, which the stage refuses itself. The front door refuses such a request
+//!   after an operation is named for it and before it is run, with no seam to admit one
+//!   through, so naming none is what routes it to this seam — which runs ahead of that
+//!   refusal. It is served from the same records, by the same resolution, over a transport
+//!   that reaches nothing, so nothing beyond those records answers it; every other cross-site
+//!   request is named above and refused there as before ([`invoke::browser_invoke`]).
 //!
 //! Why that operation declares NO auth scheme, which is what the router reads as "served
 //! unsigned": the router verifies a named
@@ -661,6 +673,20 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // in-process transport an `AWS` integration's call to another service is made over.
         // It declares no auth scheme, so the router serves the invoke whatever credential
         // it carries — see that operation's own `auth_schemes`.
+        //
+        // EXCEPT the invoke the front door would refuse before that operation ran — one a
+        // browser sent from another site that a DEPLOYED METHOD DECLARING ITS ORIGIN answers
+        // from the api's own records (or that no deployed method serves at all, which the
+        // stage refuses itself). That is the cross-origin call a CORS contract is made of: the
+        // `OPTIONS` preflight a browser sends first, and the `MOCK` method behind it. Naming
+        // no operation for it is what routes it to `override_routing_error` below, which runs
+        // ahead of that refusal and serves it from those same records, over a transport that
+        // reaches nothing ([`invoke::browser_invoke`]). Every other cross-site request — one
+        // from an origin no method declares, or one whose method's integration names a backend
+        // — keeps being named here and refused there, exactly as before.
+        if invoke::claims_a_cross_origin_browser_request(&*self.engine, req) {
+            return None;
+        }
         invoke::claims_request(&*self.engine, req)
             .then_some(&self.data_plane as &dyn ErasedOperation)
     }
@@ -689,7 +715,21 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // serves nothing for: it keeps the protocol-correct default for this service's
         // envelope (query -> 400 InvalidAction text/xml, awsJson -> 404, rpcv2Cbor -> 404,
         // rest -> 501) by returning `None`.
-        let _ = req;
+        //
+        // With ONE exception: the invoke a browser sent from another site THAT A DEPLOYED
+        // METHOD DECLARING ITS ORIGIN ANSWERS FROM THE API'S OWN RECORDS, which
+        // `override_operation` deliberately leaves unnamed so that it reaches this seam — the
+        // one that still answers it, because it runs before the front door refuses such a
+        // request. A deployed stage answers the cross-origin call a browser makes of such a
+        // method, so it is served from those records here, over a transport that reaches
+        // nothing else of this emulator ([`invoke::browser_invoke`]).
+        if invoke::claims_a_cross_origin_browser_request(&*self.engine, req) {
+            return Some(invoke::serve_without_transport(
+                &self.engine,
+                self.definition().identity(),
+                req,
+            ));
+        }
         None
     }
 

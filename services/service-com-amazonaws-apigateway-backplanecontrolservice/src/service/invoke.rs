@@ -4883,6 +4883,12 @@ pub use request_validation::*;
 mod announced_address;
 pub use announced_address::*;
 
+/// The invoke a BROWSER sent from another site — the request the front door leaves unnamed,
+/// and which this plane serves from the routing seam instead — in a file of its own;
+/// re-exported whole, so the seam that serves it reaches it as `invoke::…`.
+mod browser_invoke;
+pub use browser_invoke::*;
+
 /// Where the stage holds the result an authorizer returned for ONE identity, in a file of its
 /// own with the tests of that key's own property.
 mod authorizer_cache;

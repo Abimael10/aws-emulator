@@ -16,7 +16,11 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true, features = ["io-util", "net", "time"] }
+# `rt`/`rt-multi-thread` beside them for the ONE seam that serves an invoke from a
+# synchronous entry point (`src/service/invoke/browser_invoke.rs`): the work is handed to
+# the runtime as a task and waited on with `block_in_place`, both of which the multi-thread
+# runtime's own feature carries.
+tokio = { workspace = true, features = ["io-util", "net", "rt", "rt-multi-thread", "time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde = { workspace = true }

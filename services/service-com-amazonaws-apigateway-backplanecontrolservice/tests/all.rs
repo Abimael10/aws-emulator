@@ -18,6 +18,11 @@
 // reason; the suite itself is an ordinary `tests/all/<name>.rs` file.
 #[path = "all/documentation_part_creation.rs"]
 mod documentation_part_creation;
+// Declared here, at the head, for the reason the entry above records: what a deployed stage
+// answers the cross-origin requests a browser makes to it — the preflight its `OPTIONS` method
+// serves and the real request that follows.
+#[path = "all/stage_cross_origin_invoke.rs"]
+mod stage_cross_origin_invoke;
 // Declared here, at the head, for the reason the entry above records: what a `CreateDeployment`
 // naming a stage the api has no stage for does to the invoke URL that was refused for want of
 // it.
