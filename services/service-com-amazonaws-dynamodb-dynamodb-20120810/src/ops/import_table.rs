@@ -490,7 +490,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // stream: the declaration carries a member for none of them, so the imported
             // table starts life exactly as a create that named none of them would.
             table_class: None,
-            table_class_updated_at: None,
+            table_class_changes: crate::state::TableClassChanges::default(),
             deletion_protection_enabled: false,
             point_in_time_recovery: crate::state::PointInTimeRecovery::default(),
             tags: crate::state::ResourceTags::default(),

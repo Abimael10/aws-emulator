@@ -21,17 +21,18 @@
 //! by the next request ([`super::ComAmazonawsDynamodbDynamodb20120810State::apply_due_transitions`]).
 
 use std::collections::BTreeMap;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    ReplicaDescription, ReplicationGroupUpdate, TableClassSummary, TableWarmThroughputDescription,
+    GlobalTableWitnessGroupUpdate, ReplicaDescription, ReplicationGroupUpdate, TableClassSummary,
+    TableWarmThroughputDescription,
 };
 
 use super::{
     index_arn, new_table_id, table_arn, CapacityBudget, ComAmazonawsDynamodbDynamodb20120810State,
     ContributorInsights, IndexStatus, Item, ItemKey, KeyWriteBudgets, MeteredCounters,
-    OnDemandCeilings, PointInTimeRecovery, RequestError, ResourceTags, Table, ThroughputHistory,
-    TimeToLive, STATUS_TRANSITION,
+    OnDemandCeilings, PointInTimeRecovery, RequestError, ResourceTags, Table, TableClassChanges,
+    ThroughputHistory, TimeToLive, STATUS_TRANSITION,
 };
 
 /// What one replica OVERRIDES of the table it is a replica of: the Region it lives in and
@@ -135,6 +136,14 @@ pub struct TableReplica {
     /// The change the clock still owes this replica, and when it falls due — `None` for a
     /// settled replica, which is `ACTIVE`.
     pub pending: Option<PendingReplicaChange>,
+    /// When the table HOLDING this record acted as the SOURCE Region for the add of this
+    /// replica — the instant the `UpdateTable` that created it was made against that table
+    /// — and `None` on every other table's record of it, which sourced nothing.
+    ///
+    /// What it is for is the protection window a newly sourced replica puts the source
+    /// Region under ([`sourced_a_replica_within_window`]): the source has to keep serving
+    /// the group while the new replica catches up, so it cannot be deleted yet.
+    pub sourced_at: Option<SystemTime>,
 }
 
 /// A replica change in flight: what it is, and when the clock makes it due.
@@ -176,10 +185,15 @@ pub const REPLICA_ACTIVE: &str = "ACTIVE";
 impl TableReplica {
     /// A replica as the call that asked for it leaves it: the settings it named, and the
     /// change the clock owes.
+    ///
+    /// `sourced` says whether the table this record is being put on is the one the call was
+    /// made against, which is the Region that acted as the SOURCE for the add
+    /// ([`Self::sourced_at`]).
     pub fn starting(
         settings: TableReplicaSettings,
         kind: ReplicaChange,
         now: SystemTime,
+        sourced: bool,
     ) -> Self {
         Self {
             region: settings.region.clone(),
@@ -188,6 +202,7 @@ impl TableReplica {
                 kind,
                 due_at: now + STATUS_TRANSITION,
             }),
+            sourced_at: (sourced && kind == ReplicaChange::Creating).then_some(now),
         }
     }
 
@@ -648,12 +663,211 @@ pub fn replica_name_taken(region: &str, name: &str) -> RequestError {
     ))
 }
 
+// =============================================================================
+// THE SOURCE REGION'S PROTECTION WINDOW
+//
+// A Region that has just sourced a new replica cannot be taken out of the group: the
+// replica it sourced is still catching up with it, so the group would lose the copy that
+// is ahead.
+// =============================================================================
+
+/// How long after sourcing a replica add a Region cannot be deleted: 24 hours, the window
+/// AWS states in the refusal itself ([`sourced_replica_recently`]).
+pub const REPLICA_SOURCE_PROTECTION_WINDOW: Duration = super::DAY;
+
+/// Whether the table acted as the SOURCE Region for a replica added inside the protection
+/// window ending at `now`, which is what makes it one the group cannot lose yet.
+fn sourced_a_replica_within_window(table: &Table, now: SystemTime) -> bool {
+    table.replicas.iter().any(|replica| {
+        replica.sourced_at.is_some_and(|sourced_at| {
+            now.duration_since(sourced_at)
+                .is_ok_and(|elapsed| elapsed < REPLICA_SOURCE_PROTECTION_WINDOW)
+                // An add recorded at an instant later than `now` is inside every window
+                // that ends at `now`.
+                || sourced_at > now
+        })
+    })
+}
+
+/// How the delete of a replica that has sourced an add inside the window is refused: AWS's
+/// own sentence for it, which states the role the Region played and the window.
+pub fn sourced_replica_recently() -> RequestError {
+    RequestError::Validation(
+        "Replica cannot be deleted because it has acted as a source region for new replica(s) \
+         being added to the table in the last 24 hours."
+            .to_string(),
+    )
+}
+
 /// How a `Disassociate` on a table that belongs to no replication group is refused: there
 /// is nothing to disassociate it from.
 pub fn not_a_global_table(name: &str) -> RequestError {
     RequestError::Validation(format!(
         "One or more parameter values were invalid: Table {name} is not part of a global table"
     ))
+}
+
+// =============================================================================
+// MULTI-REGION CONSISTENCY
+//
+// Which replication groups multi-Region STRONG consistency (MRSC) is offered for: the
+// `MultiRegionConsistency` member states the mode, and `GlobalTableWitnessUpdates` adds or
+// removes the WITNESS a group can stand in for its third replica.
+//
+// Each refusal below states its rule in the MODEL's own words, inside the clause this
+// service opens every refusal of an invalid parameter value with. WHAT AWS WORDS EACH OF
+// THEM WITH is not recorded anywhere this crate can read: the sentences here are therefore
+// the documented rule rather than the observed text, and the wording of this family is
+// filed as its own gap issue, the way the consistency mode and the witness this slice does
+// not store yet are.
+// =============================================================================
+
+/// The value of `MultiRegionConsistency` that asks for multi-Region STRONG consistency:
+/// "`STRONG`: Configures a new global table for multi-Region strong consistency (MRSC)"
+/// (`UpdateTable$MultiRegionConsistency`).
+pub const MULTI_REGION_CONSISTENCY_STRONG: &str = "STRONG";
+
+/// How many Regions one MRSC replication group spans: "A MRSC global table can be
+/// configured with either three replicas, or with two replicas and one witness"
+/// (`CreateGlobalTableWitnessGroupMemberAction`) — three Regions either way, of which at
+/// most one is a witness.
+pub const MRSC_GROUP_REGIONS: usize = 3;
+
+/// How an entry of `GlobalTableWitnessUpdates` that does not state exactly one action is
+/// refused: the entry "represents one of the following: a new witness to be added ... an
+/// existing witness to be removed" (`GlobalTableWitnessGroupUpdate`), so one of them and
+/// not both or neither — the same rule a `ReplicaUpdates` entry is held to
+/// ([`ONE_REPLICA_ACTION_MESSAGE`]).
+pub const ONE_WITNESS_ACTION_MESSAGE: &str =
+    "One or more parameter values were invalid: Each GlobalTableWitnessUpdate must contain \
+     exactly one of Create or Delete";
+
+/// How a `MultiRegionConsistency` sent by a request that creates no replica is refused:
+/// "this parameter is only valid when you create a global table by specifying one or more
+/// Create actions in the ReplicaUpdates action list" (that member's doc).
+pub const CONSISTENCY_WITHOUT_CREATE_MESSAGE: &str =
+    "One or more parameter values were invalid: MultiRegionConsistency is only valid when the \
+     request creates a global table with one or more Create actions in ReplicaUpdates";
+
+/// How a witness `Create` on a request that is not creating an MRSC global table is
+/// refused: "the witness must be added when creating the MRSC global table"
+/// (`GlobalTableWitnessGroupUpdate$Create`), so there is no group for it to join.
+pub const WITNESS_WITHOUT_MRSC_MESSAGE: &str =
+    "One or more parameter values were invalid: A witness Region can only be added when creating \
+     a global table with MultiRegionConsistency STRONG";
+
+/// How a configuration that is not one of the two an MRSC group takes is refused: the rule
+/// as the model itself states it, inside the clause this service opens every refusal of an
+/// invalid parameter value with (the wording its `ReplicaUpdates` refusals share).
+pub const MRSC_GROUP_SHAPE_MESSAGE: &str =
+    "One or more parameter values were invalid: A MRSC global table can be configured with \
+     either three replicas, or with two replicas and one witness";
+
+/// How a witness `Delete` naming a witness the group does not hold is refused: the action
+/// addresses "an existing witness to be removed from an existing global table"
+/// (`GlobalTableWitnessGroupUpdate$Delete`), and this group has none in that Region.
+pub fn witness_not_in_group(region: &str) -> RequestError {
+    RequestError::Validation(format!(
+        "One or more parameter values were invalid: The witness in {region} is not part of this \
+         table's global table"
+    ))
+}
+
+/// How a witness `Create` naming a Region the group holds a replica in is refused: "the
+/// witness must be in a different Region than the replicas"
+/// (`CreateGlobalTableWitnessGroupMemberAction$RegionName`).
+pub fn witness_region_is_a_replica(region: &str) -> RequestError {
+    RequestError::Validation(format!(
+        "One or more parameter values were invalid: The witness Region {region} must be a Region \
+         other than the Regions of this table's replicas"
+    ))
+}
+
+/// Why one request's multi-Region consistency configuration is not one AWS serves, or
+/// `None` when the request asks for a configuration that is.
+///
+/// Both members state a configuration of the REPLICATION GROUP, so what they ask for is
+/// decided against the group the request would leave behind: the local table, the replicas
+/// it already has and the ones this request creates, plus the witness it adds. The rules are
+/// the model's own:
+///
+/// * an entry of `GlobalTableWitnessUpdates` states exactly one action
+///   ([`ONE_WITNESS_ACTION_MESSAGE`]), and a `Delete` addresses a witness the group holds
+///   ([`witness_not_in_group`]);
+/// * `MultiRegionConsistency` "is only valid when you create a global table by specifying
+///   one or more Create actions in the ReplicaUpdates action list"
+///   ([`CONSISTENCY_WITHOUT_CREATE_MESSAGE`]), and a witness belongs to the MRSC group that
+///   create establishes ([`WITNESS_WITHOUT_MRSC_MESSAGE`]);
+/// * an MRSC group is "either three replicas, or ... two replicas and one witness"
+///   ([`MRSC_GROUP_SHAPE_MESSAGE`]), whose witness is in a Region of its own
+///   ([`witness_region_is_a_replica`]).
+///
+/// A request naming neither member asks for no such configuration and is left alone.
+pub fn unsupported_consistency_configuration(
+    consistency: Option<&str>,
+    witness_updates: Option<&Vec<GlobalTableWitnessGroupUpdate>>,
+    actions: &[ReplicaAction],
+    table: &Table,
+) -> Option<RequestError> {
+    let witnesses: &[GlobalTableWitnessGroupUpdate] =
+        witness_updates.map_or(&[], |updates| updates.as_slice());
+    for update in witnesses {
+        let named = usize::from(update.create.is_some()) + usize::from(update.delete.is_some());
+        if named != 1 {
+            return Some(RequestError::Validation(
+                ONE_WITNESS_ACTION_MESSAGE.to_string(),
+            ));
+        }
+        // This store holds no witness for any table, so every `Delete` addresses one the
+        // group does not have.
+        if let Some(delete) = update.delete.as_ref() {
+            return Some(witness_not_in_group(&delete.region_name));
+        }
+    }
+    let added: Vec<&str> = witnesses
+        .iter()
+        .filter_map(|update| update.create.as_ref())
+        .map(|create| create.region_name.as_str())
+        .collect();
+    if consistency.is_none() && added.is_empty() {
+        return None;
+    }
+    let creates = actions
+        .iter()
+        .filter(|action| matches!(action, ReplicaAction::Create(_)))
+        .count();
+    if consistency.is_some() && creates == 0 {
+        return Some(RequestError::Validation(
+            CONSISTENCY_WITHOUT_CREATE_MESSAGE.to_string(),
+        ));
+    }
+    let strong = consistency == Some(MULTI_REGION_CONSISTENCY_STRONG);
+    if !strong {
+        return added.first().map(|_| {
+            RequestError::Validation(WITNESS_WITHOUT_MRSC_MESSAGE.to_string())
+        });
+    }
+    // The local table is a replica of the group it is about to become part of, so the
+    // group's Regions are it, the replicas it already has and the ones this request creates.
+    // Both shapes the model admits are decided by that count: `GlobalTableWitnessUpdates`
+    // carries at most one entry (its `@length`), so three Regions of which the witness is
+    // one leaves two replicas.
+    let replicas = 1 + table.replicas.len() + creates;
+    if replicas + added.len() != MRSC_GROUP_REGIONS {
+        return Some(RequestError::Validation(MRSC_GROUP_SHAPE_MESSAGE.to_string()));
+    }
+    for region in added {
+        if let Err(refusal) = checked_region(region) {
+            return Some(refusal);
+        }
+        if region == table.region
+            || table.replica(region).is_some()
+            || actions.iter().any(|action| action.region() == region)
+        {
+            return Some(witness_region_is_a_replica(region));
+        }
+    }
+    None
 }
 
 impl Table {
@@ -822,7 +1036,7 @@ impl Table {
                 .table_class
                 .clone()
                 .or_else(|| self.table_class.clone()),
-            table_class_updated_at: None,
+            table_class_changes: TableClassChanges::default(),
             deletion_protection_enabled: false,
             point_in_time_recovery: PointInTimeRecovery::default(),
             tags: ResourceTags::seeded(BTreeMap::new(), now),
@@ -889,6 +1103,7 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
         region: &str,
         name: &str,
         actions: &[ReplicaAction],
+        now: SystemTime,
     ) -> Result<(), RequestError> {
         let table = self.table(region, name)?;
         for action in actions {
@@ -912,6 +1127,16 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
                     if table.replica(region).is_none() {
                         return Err(replica_not_in_group(region));
                     }
+                    // A replica that has just SOURCED an add is one the group cannot lose
+                    // yet, whichever Region the delete is asked from: the question is asked
+                    // of the addressed replica's own regional table, which is where the
+                    // record of what it sourced lives ([`sourced_replica_recently`]).
+                    if self
+                        .table(region, name)
+                        .is_ok_and(|replica| sourced_a_replica_within_window(replica, now))
+                    {
+                        return Err(sourced_replica_recently());
+                    }
                 }
                 ReplicaAction::Disassociate(_) => {
                     if table.replicas.is_empty() {
@@ -921,6 +1146,18 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
             }
         }
         Ok(())
+    }
+
+    /// Whether the table in `region` is one the replication group cannot lose yet: it acted
+    /// as the SOURCE Region for a replica added inside the protection window
+    /// ([`REPLICA_SOURCE_PROTECTION_WINDOW`]), so deleting it would take away the copy the
+    /// new replica is still catching up with.
+    ///
+    /// What the two destroying calls ask before they accept: `DeleteTable` of that regional
+    /// table, and a `ReplicaUpdates` `Delete` naming it.
+    pub fn sourced_a_replica_recently(&self, region: &str, name: &str, now: SystemTime) -> bool {
+        self.table(region, name)
+            .is_ok_and(|table| sourced_a_replica_within_window(table, now))
     }
 
     /// Which QUOTA one request's replica creates would cross, if any: the message the
@@ -979,6 +1216,41 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
         None
     }
 
+    /// Whether a replica action's `TableClassOverride` would take that replica's own table
+    /// past the table-class change quota, and the sentence it is refused with.
+    ///
+    /// A `TableClassOverride` moves the CLASS of the replica's regional table ("replica-specific
+    /// table class", `UpdateReplicationGroupMemberAction$TableClassOverride`), so it is one of
+    /// that table's changes and is held to the same quota a class change made against the table
+    /// itself is ([`super::TableClassChanges`]) — asked here, before anything is written, so a
+    /// refused update leaves every regional table as it was. An override that re-states the
+    /// class the replica is already in changes nothing and spends none of the quota.
+    pub fn replica_class_changes_over_limit(
+        &self,
+        name: &str,
+        actions: &[ReplicaAction],
+        now: SystemTime,
+    ) -> Option<String> {
+        for settings in actions.iter().filter_map(|action| match action {
+            ReplicaAction::Create(settings) | ReplicaAction::Update(settings) => Some(settings),
+            _ => None,
+        }) {
+            let Some(class) = settings.table_class.as_deref() else {
+                continue;
+            };
+            let Ok(replica) = self.table(&settings.region, name) else {
+                // A replica this request CREATES is a new table, whose class the create sets
+                // rather than changes.
+                continue;
+            };
+            if replica.table_class.as_deref() != Some(class)
+                && replica.table_class_changes.exhausted(now)
+            {
+                return Some(super::table_class_change_limit_message());
+            }
+        }
+        None
+    }
     /// Apply the replica actions of one `UpdateTable`, having checked them
     /// ([`Self::check_replica_actions`]).    ///
     /// Every regional table of the group is kept in step here: a created replica is a new
@@ -1054,6 +1326,9 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
                 region: settings.region.clone(),
                 settings,
                 pending: None,
+                // The NEW replica sourced none of the group's members: it is the one being
+                // added.
+                sourced_at: None,
             })
             .collect();
         let regions_to_record = self.group_regions(name);
@@ -1071,6 +1346,9 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
                         settings.clone(),
                         ReplicaChange::Creating,
                         now,
+                        // Only the Region the request was MADE against acted as the source
+                        // for this add; the other members of the group just record it.
+                        peer_region == region,
                     ));
                 }
             }
@@ -1097,7 +1375,9 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
         }
         if let Ok(table) = self.table_mut(&settings.region, name) {
             if let Some(class) = settings.table_class.clone() {
-                table.table_class_updated_at = Some(now);
+                if table.table_class.as_deref() != Some(class.as_str()) {
+                    table.table_class_changes.record(now);
+                }
                 table.table_class = Some(class);
             }
             if let Some(units) = settings.read_capacity_units {

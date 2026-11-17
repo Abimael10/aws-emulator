@@ -439,6 +439,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A table-class CHANGE is held to the quota on how many of them one table may be
+        // given in the trailing window ([`crate::state::TableClassChanges`]). Past it the
+        // answer is the control plane's modelled limit error — the code a client waits the
+        // window out on — and nothing is written, so the table keeps the class it has. A
+        // request that re-states the class the table is already in changes nothing and is
+        // not held to the quota at all.
+        if let Some(requested) = input.table_class.as_deref() {
+            if stored.table_class.as_deref() != Some(requested)
+                && stored.table_class_changes.exhausted(now)
+            {
+                return Err(UpdateTableErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(crate::state::table_class_change_limit_message()),
+                    },
+                )
+                .into());
+            }
+        }
+        // What `MultiRegionConsistency` and `GlobalTableWitnessUpdates` ask for, held to
+        // the configurations multi-Region strong consistency is offered for: a combination
+        // AWS does not serve is a bad REQUEST and is refused as one, ahead of the
+        // scaffold's 501 for the members this slice does not store
+        // ([`crate::state::unsupported_consistency_configuration`]).
+        if let Some(refusal) = crate::state::unsupported_consistency_configuration(
+            input.multi_region_consistency.as_deref(),
+            input.global_table_witness_updates.as_ref(),
+            &replica_actions,
+            stored,
+        ) {
+            return Err(lift(refusal));
+        }
+
         // What the update resolves to is computed against the STORED table, so a
         // request that only names an index update leaves the table's own mode and
         // throughput alone.
@@ -468,13 +500,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // created again. Checked here, before anything is written, so a refused update
         // leaves every regional table of the group exactly as it was.
         store
-            .check_replica_actions(&region, &name, &replica_actions)
+            .check_replica_actions(&region, &name, &replica_actions, now)
             .map_err(lift)?;
         // What those actions would COST: a created replica is a table of its own in
         // another Region holding a copy of the group's data, so it is counted against the
         // same quotas a create is. Past one of them the modelled limit error is the
         // answer — the code a client backs off and retries fewer replicas on.
         if let Some(message) = store.replica_creates_over_limit(&region, &name, &replica_actions) {
+            return Err(UpdateTableErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+        // A `TableClassOverride` moves the class of the replica's OWN regional table, so it
+        // is held to the same table-class change quota a class change made against this
+        // table is ([`crate::state::TableClassChanges`]) — the one quota, asked of whichever
+        // table the change lands on.
+        if let Some(message) =
+            store.replica_class_changes_over_limit(&name, &replica_actions, now)
+        {
             return Err(UpdateTableErrorModeled::LimitExceededException(
                 LimitExceededException {
                     message: Some(message),
@@ -659,9 +705,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "The date and time at which the table class was last updated"
             // (`TableClassSummary$LastUpdateDateTime`): this call is that update, so it
             // is stamped at the instant the call was made — a request that re-states the
-            // class the table is already in updates nothing and stamps nothing.
+            // class the table is already in updates nothing, stamps nothing and spends
+            // none of the quota's changes ([`crate::state::TableClassChanges`]).
             if table.table_class.as_deref() != Some(table_class.as_str()) {
-                table.table_class_updated_at = Some(now);
+                table.table_class_changes.record(now);
             }
             table.table_class = Some(table_class);
         }

@@ -811,6 +811,12 @@ pub const CANCELLATION_CODE_CONDITION_FAILED: &str = "ConditionalCheckFailed";
 /// refused.
 pub const CANCELLATION_CODE_VALIDATION_ERROR: &str = "ValidationError";
 
+/// The `CancellationReason$Code` an action whose own table could not be resolved carries:
+/// the element names a resource the service does not hold, which is a failure of that
+/// element and not of the request, so the transaction is cancelled with this reason rather
+/// than answered a top-level lookup failure ([`cancelled_element_reasons`]).
+pub const CANCELLATION_CODE_RESOURCE_NOT_FOUND: &str = "ResourceNotFound";
+
 /// The clause every refusal of a parameter value in this service opens with, which the
 /// documented `ValidationError` cancellation reason also states ("Message: One or more
 /// parameter values were invalid").
@@ -880,10 +886,26 @@ pub fn cancelled_by_element_reasons(
     elements: usize,
     detail: &str,
 ) -> (String, Vec<CancellationReason>) {
+    cancelled_element_reasons(at, elements, CANCELLATION_CODE_VALIDATION_ERROR, detail)
+}
+
+/// The same for a cancellation whose failing element carries a reason code of its own:
+/// `code` is the `CancellationReason$Code` the element at `at` reports, beside `detail`,
+/// and every other element of `elements` still reports [`CANCELLATION_CODE_NONE`] with no
+/// message.
+///
+/// The message lists the codes in the same order, which is what makes the top-level sentence
+/// name the reason the caller then finds in `CancellationReasons`.
+pub fn cancelled_element_reasons(
+    at: usize,
+    elements: usize,
+    code: &str,
+    detail: &str,
+) -> (String, Vec<CancellationReason>) {
     let codes: Vec<&str> = (0..elements)
         .map(|element| {
             if element == at {
-                CANCELLATION_CODE_VALIDATION_ERROR
+                code
             } else {
                 CANCELLATION_CODE_NONE
             }

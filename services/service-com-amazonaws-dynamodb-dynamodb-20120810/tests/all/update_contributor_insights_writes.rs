@@ -211,10 +211,10 @@ async fn each_accepted_call_replaces_the_setting() {
     settle().await;
 
     // Rows are the calls in the order they arrive, which is what the rule generalises
-    // over: a first enable naming no mode, a narrowing, a widening, a disable, the same
-    // disable again, and an enable after it. The last column is the mode in force once the
+    // over: a first enable naming no mode, a narrowing, a widening, a disable, and an
+    // enable after it. The last column is the mode in force once the
     // call has been applied: an enable's own, and for a disable the one it leaves in place.
-    let steps: [Step; 6] = [
+    let steps: [Step; 5] = [
         (
             "the first enable, no mode named",
             "ENABLE",
@@ -235,12 +235,6 @@ async fn each_accepted_call_replaces_the_setting() {
         ),
         (
             "disabled",
-            "DISABLE",
-            None,
-            Some("ACCESSED_AND_THROTTLED_KEYS"),
-        ),
-        (
-            "disabled a second time",
             "DISABLE",
             None,
             Some("ACCESSED_AND_THROTTLED_KEYS"),

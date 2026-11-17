@@ -289,3 +289,145 @@ async fn a_table_class_change_stamps_the_instant_it_was_made() {
         settle().await;
     }
 }
+
+/// How many times one table's class may be CHANGED in the trailing window: "You can update
+/// the table class of a table twice in a 30-day trailing period" ("Service, account, and
+/// table quotas in Amazon DynamoDB", the table-class entry).
+const MAX_TABLE_CLASS_CHANGES: usize = 2;
+
+/// The two values `TableClass` names, which a run of changes alternates between.
+const TABLE_CLASSES: [&str; 2] = ["STANDARD_INFREQUENT_ACCESS", "STANDARD"];
+
+/// The class that is NOT the one in force, which is what makes the next request a CHANGE.
+fn other_class(in_force: Option<&str>) -> &'static str {
+    if in_force == Some(TABLE_CLASSES[0]) {
+        TABLE_CLASSES[1]
+    } else {
+        TABLE_CLASSES[0]
+    }
+}
+
+/// One row of the quota table: the case, the table, the class it is created with, and how
+/// many class changes its run asks for past the quota.
+type QuotaRow = (&'static str, &'static str, Option<&'static str>, usize);
+
+#[tokio::test]
+async fn a_table_class_change_past_the_quota_is_refused_and_changes_nothing() {
+    // RULE: a table-class CHANGE is held to the documented quota on how many of them one
+    // table may be given in the trailing window ([`MAX_TABLE_CLASS_CHANGES`]); past it the
+    // answer is the control plane's modelled limit error — the code a client waits the
+    // window out on — and the table keeps the class it has. A request that re-states the
+    // class the table is already in changes nothing and spends none of the quota.
+    let router = emulator();
+
+    /// The sentence AWS refuses a change past the quota with, which states the quota and
+    /// nothing of the table.
+    const EXPECTED: &str =
+        "Subscriber limit exceeded: Updates to TableClass are limited to 2 times in 30 day(s).";
+
+    // The rows differ in the class the table starts in — both values `TableClass` names and
+    // a create that names none — and in how many changes past the quota the run asks for,
+    // so a refusal is answered on the first one past it and on every later one too.
+    let rows: [QuotaRow; 3] = [
+        ("created with no class", "ClassQuotaDefaulted", None, 1),
+        (
+            "created STANDARD",
+            "ClassQuotaStandard",
+            Some("STANDARD"),
+            2,
+        ),
+        (
+            "created infrequent access",
+            "ClassQuotaInfrequent",
+            Some("STANDARD_INFREQUENT_ACCESS"),
+            1,
+        ),
+    ];
+
+    for (case, name, created_class, past_quota) in rows {
+        let mut create = json!({
+            "TableName": name,
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "BillingMode": "PAY_PER_REQUEST",
+        });
+        if let Some(class) = created_class {
+            create["TableClass"] = json!(class);
+        }
+        ok(&router, "CreateTable", create).await;
+        settle().await;
+
+        // The changes the quota ADMITS are served, each alternating the class so every one
+        // of them is a real change.
+        let mut in_force = created_class.map(ToString::to_string);
+        for change in 0..MAX_TABLE_CLASS_CHANGES {
+            let asked = other_class(in_force.as_deref());
+            let served = ok(
+                &router,
+                "UpdateTable",
+                json!({"TableName": name, "TableClass": asked}),
+            )
+            .await;
+            assert_eq!(
+                served["TableDescription"]["TableClassSummary"]["TableClass"],
+                json!(asked),
+                "case {case:?}: change {change} is inside the quota and is served, got {served}"
+            );
+            in_force = Some(asked.to_string());
+            settle().await;
+        }
+
+        // Re-stating the class in force changes nothing, so it is not held to the quota at
+        // all: it is served even though the quota's changes are spent.
+        let restated = ok(
+            &router,
+            "UpdateTable",
+            json!({"TableName": name, "TableClass": in_force.clone()}),
+        )
+        .await;
+        assert_eq!(
+            restated["TableDescription"]["TableClassSummary"]["TableClass"],
+            json!(in_force),
+            "case {case:?}: re-stating the class in force is served, got {restated}"
+        );
+        settle().await;
+
+        // Every further CHANGE is refused, and the table keeps the class the last admitted
+        // one left it in. Each attempt asks for the OTHER class, so every one of them would
+        // be a real change.
+        for attempt in 0..past_quota {
+            let asked = other_class(in_force.as_deref());
+            let (status, body) = crate::emulator::call(
+                &router,
+                "UpdateTable",
+                json!({"TableName": name, "TableClass": asked}),
+            )
+            .await;
+            assert_eq!(
+                (
+                    status,
+                    crate::emulator::error_code(&body),
+                    crate::emulator::message(&body)
+                ),
+                (
+                    400,
+                    "LimitExceededException".to_string(),
+                    EXPECTED.to_string()
+                ),
+                "case {case:?}: attempt {attempt} past the quota is refused, got {status} with \
+                 {body}"
+            );
+            assert_eq!(
+                body.get("TableDescription"),
+                None,
+                "case {case:?}: a refused change answers no TableDescription, got {body}"
+            );
+            let read = ok(&router, "DescribeTable", json!({"TableName": name})).await;
+            assert_eq!(
+                read["Table"]["TableClassSummary"]["TableClass"],
+                json!(in_force),
+                "case {case:?}: the refused change left the class in force, got {read}"
+            );
+        }
+    }
+}

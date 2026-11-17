@@ -119,8 +119,9 @@ pub fn mint_table(minted: MintedTable) -> Table {
         vector_indexes,
         table_class,
         // The create SET the table's class; no call has updated it since, so there is no
-        // update instant to report under `TableClassSummary`.
-        table_class_updated_at: None,
+        // update instant to report under `TableClassSummary` and the quota's window holds
+        // no change of this table's.
+        table_class_changes: TableClassChanges::default(),
         deletion_protection_enabled,
         // A new table's continuous backups are on and its point-in-time recovery is off: no
         // create carries a `PointInTimeRecoverySpecification`.

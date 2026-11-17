@@ -408,6 +408,16 @@ impl NativeResourceProvider for TableProvider {
         let table = store
             .table_mut(region, &name)
             .map_err(|_| NativeRefusal::NotFound)?;
+        // A class the model MOVES is one of that table's changes, so it is held to the owning
+        // service's own table-class change quota: past it that service refuses the change, and
+        // this path reports the refusal as the capacity verdict it is rather than spending a
+        // change the DynamoDB control plane would not. Asked before anything is written.
+        let moves_class = table.table_class != desired.table_class;
+        if moves_class && table.table_class_changes.exhausted(at) {
+            return Err(NativeRefusal::AtCapacity(
+                ddb::table_class_change_limit_message(),
+            ));
+        }
         // The move that capacity change starts is SETTLED here, for the same reason a table
         // this path creates is already `ACTIVE`: a Cloud Control API request reports `SUCCESS`
         // only once the type's handler has stabilised the resource, and the request's own span
@@ -416,9 +426,9 @@ impl NativeResourceProvider for TableProvider {
         table.updated_at = None;
         // "The date and time at which the table class was last updated"
         // (`TableClassSummary$LastUpdateDateTime`): recorded only where the class moves.
-        if table.table_class != desired.table_class {
+        if moves_class {
             table.table_class = desired.table_class.clone();
-            table.table_class_updated_at = Some(at);
+            table.table_class_changes.record(at);
         }
         table.deletion_protection_enabled = desired.deletion_protection_enabled;
         // A resource model is the WHOLE desired state, so the tag set it carries is the one

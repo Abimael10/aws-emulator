@@ -893,3 +893,89 @@ async fn a_create_the_owning_service_would_refuse_fails_with_the_handlers_verdic
         );
     }
 }
+
+#[tokio::test]
+async fn a_table_class_patch_past_the_owning_quota_fails_with_the_handlers_verdict() {
+    // RULE: a class this path MOVES is one of that table's own changes, so it is held to the
+    // owning service's table-class change quota — twice in a 30-day trailing period — and a
+    // patch past it fails with that service's capacity verdict instead of spending a change
+    // the DynamoDB control plane itself refuses.
+    let emulator = Emulator::with_dynamodb();
+    let name = "class-quota-by-cloud-control";
+    let identifier = emulator
+        .provision(
+            TABLE,
+            &json!({
+                "TableName": name,
+                "KeySchema": [{ "AttributeName": "id", "KeyType": "HASH" }],
+                "AttributeDefinitions": [{ "AttributeName": "id", "AttributeType": "S" }],
+                "ProvisionedThroughput": {
+                    "ReadCapacityUnits": 1,
+                    "WriteCapacityUnits": 1,
+                },
+            }),
+        )
+        .await;
+
+    // The changes the quota admits, each alternating the class so every one of them moves it.
+    for class in ["STANDARD_INFREQUENT_ACCESS", "STANDARD"] {
+        emulator
+            .update_and_settle(
+                TABLE,
+                &identifier,
+                &json!([{ "op": "add", "path": "/TableClass", "value": class }]),
+            )
+            .await;
+        let model = emulator.properties(TABLE, &identifier).await;
+        assert_eq!(
+            model["TableClass"],
+            json!(class),
+            "case a change inside the quota: expected {class:?}, got {model:?}"
+        );
+    }
+
+    let before = emulator.properties(TABLE, &identifier).await;
+    let (status, accepted) = emulator
+        .update(
+            TABLE,
+            &identifier,
+            &json!([{ "op": "add", "path": "/TableClass",
+                      "value": "STANDARD_INFREQUENT_ACCESS" }]),
+            None,
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "case the change past the quota: the request itself is accepted, got {status} with body \
+         {accepted:?}"
+    );
+    let event = emulator
+        .terminal(&text(&progress(&accepted), "RequestToken"))
+        .await;
+    assert_eq!(
+        (
+            text(&event, "OperationStatus"),
+            text(&event, "ErrorCode"),
+            text(&event, "StatusMessage"),
+        ),
+        (
+            STATUS_FAILED.to_string(),
+            "ServiceLimitExceeded".to_string(),
+            "Subscriber limit exceeded: Updates to TableClass are limited to 2 times in 30 \
+             day(s)."
+                .to_string(),
+        ),
+        "case the change past the quota: expected the owning handler's capacity verdict, got \
+         {event:?}"
+    );
+    // Nothing was written, in either plane: the table keeps the class the last admitted
+    // change left it in.
+    let after = emulator.properties(TABLE, &identifier).await;
+    let described = described(&emulator, "after the refused patch", name).await;
+    assert_eq!(
+        (after, described["TableClassSummary"]["TableClass"].clone()),
+        (before, json!("STANDARD")),
+        "case the change past the quota: the refused patch left the class as it was, got \
+         {described:?}"
+    );
+}

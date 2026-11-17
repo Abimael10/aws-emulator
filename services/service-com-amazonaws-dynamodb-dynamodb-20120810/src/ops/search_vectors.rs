@@ -15,13 +15,14 @@
 //!
 //! The refusals, each grounded in the operation's own contract:
 //!
-//! * a table that is absent or not serving items, and an index the table declares but
-//!   that is not `ACTIVE` yet, are answered `ResourceNotFoundException` — "The operation
-//!   tried to access a nonexistent table or index … or its status might not be ACTIVE";
-//! * an `IndexName` the table declares no vector index for is answered the
-//!   `ValidationException` this service words for an index a request names and the table
-//!   does not have, over the name the request sent
-//!   ([`crate::state::unknown_index_named`]);
+//! * a table that is absent or not serving items is answered `ResourceNotFoundException` —
+//!   "The operation tried to access a nonexistent table or index … or its status might not
+//!   be ACTIVE";
+//! * an `IndexName` the table has no index to search for — one it declares no vector index
+//!   for, and one whose index is declared but not `ACTIVE` yet, since "the index must be in
+//!   the ACTIVE state" (`SearchVectors$IndexName`) — is answered the `ValidationException`
+//!   this service words for an index a request names and the table does not have, over the
+//!   name the request sent ([`crate::state::unknown_index_named`]);
 //! * a `SearchVector` whose length differs from the index's `Dimensions`, and a
 //!   `SearchConditionExpression` that reads an attribute outside the index's search
 //!   schema, reads a schema element any way other than by pinning it with `=`, or leaves
@@ -294,20 +295,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // use leaves nothing this search could decrypt: the KMS fault is reported rather
         // than a page of matches ([`crate::state::check_table_key_accessible`]).
         crate::state::check_table_key_accessible(&*self.engine, table).map_err(lift)?;
-        // An `IndexName` the table declares no vector index for is the REQUEST's mistake:
-        // the table was found and has no such index, which AWS states over the name the
-        // request sent.
+        // An `IndexName` the table has no index to SEARCH for is the REQUEST's mistake:
+        // the table was found, and what is wrong is the name the request sent, which AWS
+        // states over that name ([`crate::state::unknown_index_named`]).
+        //
+        // An index the table declares but that has not finished building is the same
+        // mistake: "the index must be in the ACTIVE state" (`SearchVectors$IndexName`), so
+        // an index still being created is not yet one of the sources this table can be
+        // searched by and the refusal names it exactly as a name no index of the table
+        // answers to does — a table-level `ResourceNotFoundException` would instead say the
+        // TABLE is not there.
         let index = table
             .vector_indexes
             .iter()
-            .find(|candidate| candidate.name == input.index_name)
+            .find(|candidate| {
+                candidate.name == input.index_name
+                    && candidate.status(now) == crate::state::IndexStatus::Active
+            })
             .ok_or_else(|| lift(crate::state::unknown_index_named(&input.index_name)))?;
-        // "The index must be in the ACTIVE state" (`SearchVectors$IndexName`): one that is
-        // still becoming active serves no search yet, which is the case the operation's
-        // `ResourceNotFoundException` describes as "its status might not be ACTIVE".
-        if index.status(now) != crate::state::IndexStatus::Active {
-            return Err(lift(crate::state::item_resource_not_found()));
-        }
         // "The number of dimensions must match the number of dimensions configured for the
         // vector index" (`SearchVectors$SearchVector`).
         if i64::try_from(search_vector.len()).unwrap_or(i64::MAX) != index.dimensions {

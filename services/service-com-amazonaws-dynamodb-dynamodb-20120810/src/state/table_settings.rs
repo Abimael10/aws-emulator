@@ -344,6 +344,83 @@ impl PointInTimeRecovery {
 }
 
 // =============================================================================
+// TABLE CLASS
+//
+// One setting per table, plus how often it has been changed: `CreateTable` seeds the
+// class, `UpdateTable` moves it, `TableClassSummary` reports the class and the instant
+// of the last move, and the quota below bounds how many moves one table may be given.
+// =============================================================================
+
+/// How many times one table's class may be CHANGED inside [`TABLE_CLASS_CHANGE_WINDOW`]:
+/// "You can update the table class of a table twice in a 30-day trailing period"
+/// ("Service, account, and table quotas in Amazon DynamoDB", the table-class entry).
+pub const MAX_TABLE_CLASS_CHANGES: usize = 2;
+
+/// The trailing period that quota counts over, 30 days.
+pub const TABLE_CLASS_CHANGE_WINDOW: Duration = Duration::from_secs(30 * DAY.as_secs());
+
+/// How a table-class change past that quota is refused.
+///
+/// The control plane's modelled limit error is what carries it ("Subscriber limit
+/// exceeded", the wording every quota of this service is refused with), and the sentence
+/// states the quota — how many changes, over how long — and nothing of the table or of the
+/// class the request asked for: the caller cannot fix the request, only wait out the
+/// window.
+pub fn table_class_change_limit_message() -> String {
+    format!(
+        "Subscriber limit exceeded: Updates to TableClass are limited to \
+         {MAX_TABLE_CLASS_CHANGES} times in {} day(s).",
+        TABLE_CLASS_CHANGE_WINDOW.as_secs() / DAY.as_secs()
+    )
+}
+
+/// The table-class changes one table has been given: the instant of each, oldest first.
+///
+/// Only the instants inside the window are kept ([`Self::record`]), so the record of one
+/// table stays bounded by the quota however many changes a caller asks for over the life of
+/// the store. A table whose class has only ever been the one its create named carries none,
+/// which is what makes `TableClassSummary$LastUpdateDateTime` absent for it — "the date and
+/// time at which the table class was last updated" (that member's doc): that class was
+/// never updated.
+#[derive(Debug, Clone, Default)]
+pub struct TableClassChanges {
+    changed_at: Vec<SystemTime>,
+}
+
+impl TableClassChanges {
+    /// When the class was last changed, which is what `TableClassSummary` reports.
+    pub fn last_update(&self) -> Option<SystemTime> {
+        self.changed_at.last().copied()
+    }
+
+    /// Record one accepted change, forgetting the ones the window has left behind.
+    pub fn record(&mut self, now: SystemTime) {
+        self.changed_at.retain(|at| inside_window(*at, now));
+        self.changed_at.push(now);
+    }
+
+    /// Whether this table's changes for the window ending at `now` are already spent, so
+    /// the next one is refused ([`table_class_change_limit_message`]).
+    pub fn exhausted(&self, now: SystemTime) -> bool {
+        self.changed_at
+            .iter()
+            .filter(|at| inside_window(**at, now))
+            .count()
+            >= MAX_TABLE_CLASS_CHANGES
+    }
+}
+
+/// Whether a change recorded at `at` is still inside the trailing window ending at `now`.
+fn inside_window(at: SystemTime, now: SystemTime) -> bool {
+    match now.duration_since(at) {
+        Ok(elapsed) => elapsed < TABLE_CLASS_CHANGE_WINDOW,
+        // A change recorded at an instant later than `now` is inside every window that
+        // ends at `now`: nothing has elapsed since it.
+        Err(_) => true,
+    }
+}
+
+// =============================================================================
 // CONTRIBUTOR INSIGHTS
 //
 // A table and each of its global secondary indexes carry their own setting: what
@@ -371,13 +448,13 @@ pub const CONTRIBUTOR_INSIGHTS_DISABLED: &str = "DISABLED";
 const CONTRIBUTOR_INSIGHTS_INVALID_STATE: &str =
     "Table or Index is not in a valid state to update Key Access Insights";
 
-/// How a `DISABLE` is refused when the resource it addresses has no key access insights
-/// configuration to turn off ([`ContributorInsights::disableable`]).
+/// How a `DISABLE` is refused when the resource it addresses is not in a status that action
+/// can be performed from ([`ContributorInsights::disableable`]).
 ///
 /// The refusal is stated over the statuses the action REQUIRES — the same way the Kinesis
 /// streaming commands state theirs ([`kinesis_destination_not_active_to_disable`]) — and
-/// names neither the table nor the index: there is no configuration of this resource's for
-/// the action to be performed against.
+/// names neither the table nor the index: what is wrong is the state the addressed
+/// resource's key access insights are in, not which resource was addressed.
 pub fn contributor_insights_not_disableable() -> RequestError {
     RequestError::Validation(format!(
         "{CONTRIBUTOR_INSIGHTS_INVALID_STATE}: ContributorInsights Status must be ENABLED or \
@@ -441,12 +518,6 @@ pub struct ContributorInsights {
     /// When the clock owes an accepted enable the move out of `ENABLING`, and `None` for a
     /// setting with no move owed: one whose enable has settled, and every disabled one.
     pub(super) settles_at: Option<SystemTime>,
-    /// Whether an enable has ever CONFIGURED this resource's key access insights.
-    ///
-    /// Set by the first accepted `ENABLE` and never cleared: what a disable turns off is
-    /// the configuration, not the record of there having been one, so this is what decides
-    /// whether a `DISABLE` has anything to act on ([`Self::disableable`]).
-    pub(super) configured: bool,
     /// The mode last configured, as an enable named it (or
     /// [`DEFAULT_CONTRIBUTOR_INSIGHTS_MODE`] where it named none). A `DISABLE` does NOT
     /// clear it: the mode is the configuration of the resource's key access insights, which
@@ -472,7 +543,6 @@ impl ContributorInsights {
         self.requested_at = Some(now);
         self.settles_at = enable.then(|| now + STATUS_TRANSITION);
         if enable {
-            self.configured = true;
             self.mode = Some(
                 mode.unwrap_or(DEFAULT_CONTRIBUTOR_INSIGHTS_MODE)
                     .to_string(),
@@ -490,17 +560,23 @@ impl ContributorInsights {
         }
     }
 
-    /// Whether a `DISABLE` may be performed on this setting.
+    /// Whether a `DISABLE` may be performed on this setting at `now`.
     ///
-    /// What a disable turns off is a CONFIGURATION of key access insights
-    /// ([`Self::configured`]): an enable creates one and nothing removes it, so a resource
-    /// has one from its first enable onwards — while its insights are being turned on, while
-    /// they are on, and after they have been turned off again. A resource that has one is
-    /// served, a redundant disable included, which leaves its insights off; a resource no
-    /// enable has ever configured has nothing for the action to be performed against and is
-    /// refused ([`contributor_insights_not_disableable`]).
-    pub fn disableable(&self) -> bool {
-        self.configured
+    /// The action is performed from a STATUS, and the statuses it requires are the two the
+    /// refusal names: `ENABLED` and `FAILED` ([`contributor_insights_not_disableable`]). So
+    /// the question is the status this setting reports at `now` ([`Self::status`]) and not
+    /// whether an enable once configured the resource:
+    ///
+    /// * `ENABLED` — the insights are on, and the disable turns them off;
+    /// * `ENABLING` — the enable that was accepted is still in flight, so the action it
+    ///   would undo has not finished; a client that serialises its control-plane calls by
+    ///   catching this refusal is what the transient status is for;
+    /// * `DISABLED` — there is nothing on to turn off, both for a resource an earlier
+    ///   disable turned off and for one no enable has ever configured;
+    /// * `FAILED` — never reported by this store, so no setting is ever disableable through
+    ///   that half of the requirement ([`CONTRIBUTOR_INSIGHTS_ENABLING`]).
+    pub fn disableable(&self, now: SystemTime) -> bool {
+        self.status(now) == CONTRIBUTOR_INSIGHTS_ENABLED
     }
 
     /// "Timestamp of the last time the status was changed"

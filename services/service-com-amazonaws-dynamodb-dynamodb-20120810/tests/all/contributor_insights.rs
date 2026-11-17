@@ -589,8 +589,8 @@ async fn every_status_reported_is_one_the_model_declares() {
     // `ContributorInsightsStatus` is an enum, so what a read reports must be a value from
     // the model's own table — the generated `CONTRIBUTOR_INSIGHTS_STATUS_VALUES` — and
     // not a spelling this emulator invented. Rows span the states a resource can be read
-    // in: never touched, enabling, enabled, and off — the disable that turns it off and a
-    // redundant one after it.
+    // in: never touched, enabling, enabled, off again after the disable that turns it off,
+    // and on again after that.
     use service_com_amazonaws_dynamodb_dynamodb_20120810::ops::types::CONTRIBUTOR_INSIGHTS_STATUS_VALUES;
 
     let router = emulator();
@@ -602,7 +602,7 @@ async fn every_status_reported_is_one_the_model_declares() {
         ("enabling", Some(("ENABLE", false))),
         ("enabled", Some(("ENABLE", true))),
         ("disabled", Some(("DISABLE", false))),
-        ("disabled a second time", Some(("DISABLE", true))),
+        ("enabled again after the disable", Some(("ENABLE", true))),
     ];
     for (case, action) in cases {
         if let Some((action, wait)) = action {

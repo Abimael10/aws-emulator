@@ -32,10 +32,11 @@
 //! dialect, number canonicalization, the documented item-size and index-key limits and
 //! the capacity accounting have ONE implementation in this crate, shared with
 //! `ExecuteStatement`, `BatchExecuteStatement` and the classic item API. A statement
-//! naming a table that is absent — or not yet `ACTIVE` — is
-//! `ResourceNotFoundException`, a table whose resource-based policy denies the caller
-//! the statement's own PartiQL action is `AccessDeniedException`, and a transaction
-//! addressing one item twice is a `ValidationException`.
+//! naming a table that is absent — or not yet `ACTIVE` — is a failure of THAT statement,
+//! so the transaction is cancelled and that statement's `CancellationReasons` entry
+//! carries `ResourceNotFound` ([`cancelled_absent_table`]); a table whose resource-based
+//! policy denies the caller the statement's own PartiQL action is `AccessDeniedException`,
+//! and a transaction addressing one item twice is a `ValidationException`.
 //!
 //! `ClientRequestToken` makes a write transaction idempotent: a repeat of a token
 //! inside the documented 10-minute window
@@ -511,14 +512,17 @@ fn read_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
     // is refused consumed nothing anywhere.
     let mut per_table: ::std::collections::BTreeMap<String, f64> =
         ::std::collections::BTreeMap::new();
-    for statement in parsed {
+    for (at, statement) in parsed.iter().enumerate() {
         let crate::state::PartiqlStatement::Select(select) = statement else {
             return Err(crate::scaffolded::Scaffolded::validation(
                 MIXED_TRANSACTION_MESSAGE,
             ));
         };
-        let name = crate::state::resolve_table_name_in(&select.table, region).map_err(lift)?;
-        let table = store.active_table(region, &name, now).map_err(lift)?;
+        // A table a statement names that this region does not hold is a failure OF THAT
+        // STATEMENT, the same way it is for a write ([`cancelled_absent_table`]).
+        let absent = |error| cancelled_absent_table(at, parsed.len(), error);
+        let name = crate::state::resolve_table_name_in(&select.table, region).map_err(absent)?;
+        let table = store.active_table(region, &name, now).map_err(absent)?;
         // A table the policies in force do not let this caller act on with this
         // statement's own action is not read at all. PartiQL has its own four actions,
         // and the partition the statement addresses is what a conditioned statement is
@@ -649,11 +653,16 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
         // item, so it cancels the transaction. A refusal about the VALUE the request
         // carried needs no table to decide, so it stays a request-level refusal.
         let keying = |error| cancelled_by_element(at, elements, error);
-        let name = crate::state::resolve_table_name_in(statement.table(), region).map_err(lift)?;
+        // A table a statement names that this region does not hold — or does not hold in a
+        // status that serves items — is a failure OF THAT STATEMENT, so it cancels the
+        // transaction with that statement's own reason ([`cancelled_absent_table`]).
+        let absent = |error| cancelled_absent_table(at, elements, error);
+        let name =
+            crate::state::resolve_table_name_in(statement.table(), region).map_err(absent)?;
         let returns_old_on_failure =
             entry.return_values_on_condition_check_failure.as_deref() == Some("ALL_OLD");
         {
-            let table = store.active_table(region, &name, now).map_err(lift)?;
+            let table = store.active_table(region, &name, now).map_err(absent)?;
             if let Some(denial) = crate::state::authorization::denial_addressing(
                 caller,
                 table,
@@ -1106,6 +1115,41 @@ fn cancelled_by_element(
     };
     let (message, cancellation_reasons) =
         crate::state::cancelled_by_element_reasons(at, elements, &message);
+    ExecuteTransactionErrorModeled::TransactionCanceledException(TransactionCanceledException {
+        message: Some(message),
+        cancellation_reasons: Some(cancellation_reasons),
+    })
+    .into()
+}
+
+/// Report the table ONE statement names not being there as the cancellation it is.
+///
+/// A statement of a transaction resolves its own table, so a name this region holds no
+/// table for — or holds one for in a status that serves no item — is a failure OF THAT
+/// STATEMENT rather than of the request: the transaction is cancelled, and the statement's
+/// `CancellationReasons` entry carries
+/// [`crate::state::CANCELLATION_CODE_RESOURCE_NOT_FOUND`] with the sentence the lookup
+/// itself words, while every other statement's reason is `None` — which is what tells a
+/// caller WHICH of its statements could not be resolved. A top-level
+/// `ResourceNotFoundException` would hide that index and put the failure on the whole call.
+///
+/// Anything else the lookup refuses is about the REQUEST — a value that is no table name or
+/// ARN of this endpoint at all — so it is answered directly, which is what [`lift`] does
+/// with it.
+fn cancelled_absent_table(
+    at: usize,
+    elements: usize,
+    error: crate::state::RequestError,
+) -> ExecuteTransactionError {
+    let crate::state::RequestError::NotFound(message) = error else {
+        return lift(error);
+    };
+    let (message, cancellation_reasons) = crate::state::cancelled_element_reasons(
+        at,
+        elements,
+        crate::state::CANCELLATION_CODE_RESOURCE_NOT_FOUND,
+        &message,
+    );
     ExecuteTransactionErrorModeled::TransactionCanceledException(TransactionCanceledException {
         message: Some(message),
         cancellation_reasons: Some(cancellation_reasons),

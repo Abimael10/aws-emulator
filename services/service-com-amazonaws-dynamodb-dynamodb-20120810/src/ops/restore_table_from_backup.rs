@@ -20,15 +20,19 @@
 //! restored table carries no tags, no stream and no resource policy, and its
 //! point-in-time recovery is off.
 //!
-//! `BillingModeOverride`, `ProvisionedThroughputOverride` and the two secondary-index
-//! overrides are applied to the restored table, and every vector index the backup
-//! recorded is rebuilt on it — "If not specified, all vector indexes from the backup are
-//! restored" (`$VectorIndexOverride`, the doc below); `SSESpecificationOverride`,
-//! `VectorIndexOverride` itself and `OnDemandThroughputOverride` are members no restore
-//! applies yet (`CreateTable` refuses the same three), so they answer the
-//! scaffold's 501 and are filed as their own gap issues — after the request's own
-//! contradictions, so an on-demand ceiling named for a table restored `PROVISIONED` is
-//! the `ValidationException` the two capacity models make it.
+//! `BillingModeOverride`, `ProvisionedThroughputOverride`, the two secondary-index
+//! overrides and `SSESpecificationOverride` are applied to the restored table, and every
+//! vector index the backup recorded is rebuilt on it — "If not specified, all vector
+//! indexes from the backup are restored" (`$VectorIndexOverride`, the doc below). An
+//! `SSESpecificationOverride` that enables encryption restores the table encrypted with
+//! the KMS key it names, resolved by KMS in this Region exactly as a create's own
+//! `SSESpecification` is ([`crate::state::requested_encryption`]), so the restored table's
+//! `SSEDescription` reports that key's ARN; one that does not enable encryption leaves the
+//! table on the Amazon Web Services owned key. `VectorIndexOverride` itself and
+//! `OnDemandThroughputOverride` are members no restore applies yet (`CreateTable` refuses
+//! the same two), so they answer the scaffold's 501 and are filed as their own gap issues
+//! — after the request's own contradictions, so an on-demand ceiling named for a table
+//! restored `PROVISIONED` is the `ValidationException` the two capacity models make it.
 //!
 //! ## Shape of an operation
 //!
@@ -353,6 +357,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .fold(0, i64::saturating_add);
 
         let active_at = now + crate::state::STATUS_TRANSITION;
+        // The encryption the restored table is created with, with the key ARN KMS resolved
+        // for the identifier `SSESpecificationOverride` named: a key this Region's KMS
+        // endpoint does not serve refuses the whole restore, so no table is ever left
+        // reporting a key ARN nothing minted. The restored table is a NEW table, so its
+        // encryption is in force from the instant it was created rather than after an
+        // update span ([`crate::state::requested_encryption`]).
+        let encryption = crate::state::requested_encryption(
+            &*self.engine,
+            &region,
+            input.sse_specification_override.as_ref(),
+            None,
+            now,
+        )
+        .map_err(sse_unresolved)?;
         let mut table = crate::state::Table {
             arn: crate::state::table_arn(&region, &target),
             name: target.clone(),
@@ -385,7 +403,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             table_class: None,
             // No call has updated this table's class, so there is no update instant to
             // report under `TableClassSummary`.
-            table_class_updated_at: None,
+            table_class_changes: crate::state::TableClassChanges::default(),
             deletion_protection_enabled: false,
             point_in_time_recovery: crate::state::PointInTimeRecovery::default(),
             // "You must manually set up the following on the restored table: ... Tags
@@ -435,9 +453,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // backup's data, not a replication group, so it has no replica until
             // `UpdateTable` adds one.
             replicas: Vec::new(),
-            // Encryption is one of the settings a caller sets up again on the restored
-            // table, so it starts life encrypted with the Amazon Web Services owned key.
-            encryption: None,
+            // "The new server-side encryption settings for the restored table"
+            // (`$SSESpecificationOverride`): the restored table is encrypted with the key
+            // the override names, in force from its first instant, and a restore that
+            // names no override — or one that does not enable encryption — leaves it on the
+            // Amazon Web Services owned key, exactly as a create does
+            // ([`crate::state::requested_encryption`]).
+            encryption,
             // An on-demand ceiling is named through `OnDemandThroughputOverride`, which
             // this slice does not store yet, so the restored table starts with none.
             on_demand_throughput: crate::state::OnDemandCeilings::default(),
@@ -473,6 +495,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(RestoreTableFromBackupOutput {
             table_description: Some(description),
         })
+    }
+}
+
+/// The modelled refusal for a restore whose `SSESpecificationOverride` could not be
+/// served: a key this Region's KMS endpoint does not serve, or a type the service does not
+/// offer, is the 400 the bad request it is, and a KMS store this process cannot reach at
+/// all is a server fault. Refusing either way is the only honest answer — a table reported
+/// as encrypted with a key ARN nothing minted would name a key no client could use.
+fn sse_unresolved(fault: crate::state::SseFault) -> RestoreTableFromBackupError {
+    match fault {
+        crate::state::SseFault::Invalid(error) => lift(error),
+        crate::state::SseFault::StoreUnavailable => {
+            RestoreTableFromBackupErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the KMS key store is unavailable".to_string()),
+            })
+            .into()
+        }
     }
 }
 
@@ -515,7 +554,7 @@ fn lift(error: crate::state::RequestError) -> RestoreTableFromBackupError {
 
 /// The first input member present that no stored table carries yet, if any.
 ///
-/// The same three members `CreateTable` reports as unimplemented, under the names this
+/// The members `CreateTable` reports as unimplemented too, under the names this
 /// operation declares them: a restore cannot store what a create cannot.
 fn unsupported_member(input: &RestoreTableFromBackupInput) -> Option<&'static str> {
     if input
@@ -524,13 +563,6 @@ fn unsupported_member(input: &RestoreTableFromBackupInput) -> Option<&'static st
         .is_some_and(|indexes| !indexes.is_empty())
     {
         return Some("VectorIndexOverride");
-    }
-    if input
-        .sse_specification_override
-        .as_ref()
-        .is_some_and(|specification| specification.enabled.unwrap_or(false))
-    {
-        return Some("SSESpecificationOverride");
     }
     if input.on_demand_throughput_override.is_some() {
         return Some("OnDemandThroughputOverride");

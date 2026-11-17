@@ -1996,7 +1996,8 @@ impl Table {
                 // class has only ever been the one its create named — that class was
                 // never updated.
                 last_update_date_time: self
-                    .table_class_updated_at
+                    .table_class_changes
+                    .last_update()
                     .map(super::reported_date),
             }),
             // Every table has a warm throughput, so every description carries one: the

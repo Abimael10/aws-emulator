@@ -2761,11 +2761,12 @@ pub struct Table {
     /// never stored as one.
     pub vector_indexes: Vec<VectorIndex>,
     pub table_class: Option<String>,
-    /// When the table's class was last UPDATED, which is what
-    /// `TableClassSummary.LastUpdateDateTime` reports: "the date and time at which the
-    /// table class was last updated" (that member's doc). `None` while the class is
-    /// still the one the table was created with, which no call has updated.
-    pub table_class_updated_at: Option<SystemTime>,
+    /// The table-class changes this table has been given inside the quota's trailing
+    /// window ([`TableClassChanges`]): what `TableClassSummary.LastUpdateDateTime` reports
+    /// — "the date and time at which the table class was last updated" (that member's doc)
+    /// — and what bounds how many more changes `UpdateTable` admits. Empty while the class
+    /// is still the one the table was created with, which no call has updated.
+    pub table_class_changes: TableClassChanges,
     pub deletion_protection_enabled: bool,
     /// This table's continuous-backups settings: whether point-in-time recovery is on
     /// and for how long a period, as `UpdateContinuousBackups` left them and both

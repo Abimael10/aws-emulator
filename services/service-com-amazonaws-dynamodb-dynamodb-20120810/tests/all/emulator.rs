@@ -439,6 +439,48 @@ pub async fn describe_when_active(router: &MultiServiceRouter, case: &str, name:
     panic!("case {case:?}: the table never reached ACTIVE within {ACTIVE_DEADLINE:?}, last {last}")
 }
 
+/// Poll `DescribeContributorInsights` until the resource's insights report `status`,
+/// answering the description it reported then — the waiter a client runs after an
+/// `UpdateContributorInsights`, whose `ENABLE` is asynchronous ("the status only becomes
+/// the settled one once the rules behind it exist").
+///
+/// `index` names the global secondary index the setting belongs to, or `None` for the
+/// table's own. Every poll must answer 200: the resource was addressed by a call the
+/// service accepted. The wait is bounded by [`ACTIVE_DEADLINE`], and a setting that never
+/// reaches `status` panics naming the last description rather than hanging. `case` names
+/// the row the assertions belong to.
+pub async fn insights_when(
+    router: &MultiServiceRouter,
+    case: &str,
+    table: &str,
+    index: Option<&str>,
+    status: &str,
+) -> Value {
+    let mut request = json!({"TableName": table});
+    if let Some(index) = index {
+        request["IndexName"] = json!(index);
+    }
+    let started = std::time::Instant::now();
+    let mut last = Value::Null;
+    while started.elapsed() < ACTIVE_DEADLINE {
+        let (code, body) = call(router, "DescribeContributorInsights", request.clone()).await;
+        assert_eq!(
+            code, 200,
+            "case {case:?}: DescribeContributorInsights must answer for a resource an update \
+             named, got {code} with {body}"
+        );
+        if body["ContributorInsightsStatus"] == json!(status) {
+            return body;
+        }
+        last = body;
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+    panic!(
+        "case {case:?}: the contributor insights of {table} never reached {status} within \
+         {ACTIVE_DEADLINE:?}, last {last}"
+    )
+}
+
 /// Every record a table's stream holds, read from its trim horizon through the STREAMS
 /// surface — the loop a change-data-capture consumer runs, shared by every suite that
 /// reads a change feed. `case` names the row the assertions below belong to.

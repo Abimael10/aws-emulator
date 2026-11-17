@@ -28,7 +28,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::emulator::{call, emulator, error_code, ok};
+use crate::emulator::{call, emulator, error_code, message, ok};
 use crate::table_items::create_active_table;
 
 /// The table a transaction's first statement addresses.
@@ -666,6 +666,150 @@ async fn a_client_request_token_makes_a_write_transaction_idempotent() {
             "case {}: expected the counter to read {}, got {counter}",
             row.case,
             row.counter
+        );
+    }
+}
+
+/// One row of the absent-table table: the case, the statements the transaction carries,
+/// and the `CancellationReasons` code each of them must report, in request order.
+struct AbsentTableRow {
+    case: &'static str,
+    statements: Vec<Value>,
+    codes: Vec<&'static str>,
+}
+
+/// The rows differ in what kind of transaction names the table that is not there (a read
+/// and each of the three writes), in WHICH position in the list names it, in how many
+/// statements the transaction carries, and in why the name resolves to no table (a name
+/// nothing created, and one that differs from a stored table's only in case, since a table
+/// name is matched exactly).
+fn absent_table_rows() -> Vec<AbsentTableRow> {
+    vec![
+        AbsentTableRow {
+            case: "a SELECT of a table nothing created, alone",
+            statements: vec![statement("SELECT * FROM ledgers WHERE id = 'a1'")],
+            codes: vec!["ResourceNotFound"],
+        },
+        AbsentTableRow {
+            case: "a read transaction whose second SELECT names it",
+            statements: vec![
+                statement("SELECT * FROM accounts WHERE id = 'a1'"),
+                statement("SELECT * FROM ledgers WHERE id = 'a1'"),
+            ],
+            codes: vec!["None", "ResourceNotFound"],
+        },
+        AbsentTableRow {
+            case: "a write transaction whose first INSERT names it",
+            statements: vec![
+                statement("INSERT INTO ledgers VALUE {'id': 'l1', 'note': 'unwritten'}"),
+                statement("INSERT INTO audit VALUE {'id': 'fresh', 'note': 'unwritten'}"),
+            ],
+            codes: vec!["ResourceNotFound", "None"],
+        },
+        AbsentTableRow {
+            case: "a write transaction whose second UPDATE names it",
+            statements: vec![
+                statement("UPDATE accounts SET balance = 7 WHERE id = 'a1'"),
+                statement("UPDATE ledgers SET note = 'moved' WHERE id = 'l1'"),
+            ],
+            codes: vec!["None", "ResourceNotFound"],
+        },
+        AbsentTableRow {
+            case: "a DELETE naming a name that differs from a stored table's only in case",
+            statements: vec![statement("DELETE FROM Accounts WHERE id = 'a1'")],
+            codes: vec!["ResourceNotFound"],
+        },
+        AbsentTableRow {
+            case: "a write transaction whose middle statement names it, of three",
+            statements: vec![
+                statement("INSERT INTO audit VALUE {'id': 'fresh', 'note': 'unwritten'}"),
+                statement("DELETE FROM ledgers WHERE id = 'l1'"),
+                statement("UPDATE accounts SET balance = 9 WHERE id = 'a1'"),
+            ],
+            codes: vec!["None", "ResourceNotFound", "None"],
+        },
+    ]
+}
+
+#[tokio::test]
+async fn a_statement_naming_a_table_that_is_not_there_cancels_the_transaction() {
+    // The rule: a statement of a transaction resolves its OWN table, so a name the region
+    // holds no table for is a failure of that STATEMENT — the transaction is cancelled and
+    // that statement's `CancellationReasons` entry carries `ResourceNotFound`, which is what
+    // tells a caller WHICH of its statements could not be resolved. A top-level
+    // `ResourceNotFoundException` would hide the index and change the retry class.
+    let router = emulator();
+    two_tables(&router).await;
+    ok(
+        &router,
+        "ExecuteTransaction",
+        json!({
+            "TransactStatements": [
+                statement("INSERT INTO accounts VALUE {'id': 'a1', 'balance': 100}"),
+            ],
+        }),
+    )
+    .await;
+    let seeded = stored(&router, ACCOUNTS, "a1").await;
+
+    for row in absent_table_rows() {
+        let (status, body) = transact(&router, row.statements.clone()).await;
+        let expected_message = format!(
+            "Transaction cancelled, please refer cancellation reasons for specific reasons [{}]",
+            row.codes.join(", ")
+        );
+        assert_eq!(
+            (status, error_code(&body), message(&body)),
+            (
+                400,
+                "TransactionCanceledException".to_string(),
+                expected_message.clone()
+            ),
+            "case {}: expected the cancellation {expected_message:?}, got {status} with {body}",
+            row.case
+        );
+        assert_eq!(
+            reason_codes(&body),
+            row.codes,
+            "case {}: expected one reason per statement in request order, got {body}",
+            row.case
+        );
+        // The statement that could not be resolved is the only one with a reason MESSAGE,
+        // and it is the sentence this service words a resource that is not there with.
+        let messages: Vec<Value> = body["CancellationReasons"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|reason| reason.get("Message").cloned().unwrap_or(Value::Null))
+            .collect();
+        let expected_messages: Vec<Value> = row
+            .codes
+            .iter()
+            .map(|code| {
+                if *code == "ResourceNotFound" {
+                    json!("Requested resource not found")
+                } else {
+                    Value::Null
+                }
+            })
+            .collect();
+        assert_eq!(
+            messages, expected_messages,
+            "case {}: only the unresolved statement carries a reason message, got {body}",
+            row.case
+        );
+
+        // A cancelled transaction wrote nothing: the seeded item is untouched and no
+        // statement of the row landed an item of its own.
+        assert_eq!(
+            (
+                stored(&router, ACCOUNTS, "a1").await,
+                stored(&router, AUDIT, "fresh").await,
+            ),
+            (seeded.clone(), Value::Null),
+            "case {}: the cancelled transaction left the store as it was",
+            row.case
         );
     }
 }

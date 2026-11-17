@@ -433,3 +433,220 @@ async fn an_update_table_that_asks_for_nothing_earns_one_fixed_sentence() {
         "an update that names a member is served, got {served}"
     );
 }
+
+/// The most operators and functions one expression may state: "the maximum number of
+/// operators or functions allowed in an expression is 300" ("Service, Account, and Table
+/// Quotas", the expression-parameter entry), whose own example is that `a IN (b, c, d)`
+/// states ONE operator however many values its list carries.
+const MAX_EXPRESSION_OPERATORS: usize = 300;
+
+/// A condition stating `comparisons` equality comparisons over one attribute, joined by
+/// `AND`: one operator per comparison and one per `AND`, so `2 * comparisons - 1` of them.
+fn chained_comparisons(comparisons: usize) -> String {
+    vec!["#a = :v"; comparisons].join(" AND ")
+}
+
+/// The operators such a chain states.
+fn chained_operators(comparisons: usize) -> usize {
+    2 * comparisons - 1
+}
+
+/// The placeholders an `IN` list of `values` entries references, as the list text.
+fn in_list(values: usize) -> String {
+    let listed: Vec<String> = (0..values).map(|at| format!(":v{at}")).collect();
+    format!("#a IN ({})", listed.join(", "))
+}
+
+/// The substitution tables every row below states its condition through: one attribute
+/// name, the value its comparisons compare against, and the values an `IN` row lists.
+fn substitutions(in_values: usize) -> (Value, Value) {
+    let mut values = json!({":v": {"S": "active"}});
+    for at in 0..in_values {
+        // The first value is the one the seeded item holds, so an `IN` row that is SERVED
+        // selects the item rather than being served and selecting nothing.
+        let held = if at == 0 { "active" } else { "other" };
+        values[format!(":v{at}")] = json!({"S": held});
+    }
+    (json!({"#a": "status"}), values)
+}
+
+/// The whole message an expression past the operator quota earns, in or out of the
+/// envelope.
+fn operator_refusal(member: &str, operators: usize, enveloped: bool) -> String {
+    let stated = format!(
+        "Invalid {member}: The expression contains too many operators; operator count: {operators}"
+    );
+    if enveloped {
+        return format!("{ENVELOPE}{stated}");
+    }
+    stated
+}
+
+/// One row of the operator-quota table: the case, the operation, the request, and the
+/// message it must earn — `None` for a row the quota serves.
+struct OperatorRow {
+    case: &'static str,
+    operation: &'static str,
+    request: Value,
+    expected: Option<String>,
+}
+
+/// The rows differ along how many operators the expression states (one under the quota,
+/// exactly it, and one over), the shape that states them (a chain of comparisons, a chain
+/// with a leading `NOT`, and a chain carrying an `IN` list whose values are NOT operators),
+/// the member it is sent as — which decides whether the refusal carries the envelope — and
+/// the operation carrying that member.
+fn operator_rows() -> Vec<OperatorRow> {
+    let (names, values) = substitutions(0);
+    let (in_names, in_values) = substitutions(20);
+    // 150 comparisons state 299 operators and 151 state 301; a leading `NOT` over a
+    // comparison of its own brings a 149-comparison chain to exactly the quota: 1 `NOT`,
+    // 150 comparisons and 149 `AND`s.
+    let under = chained_comparisons(150);
+    let at_quota = format!("NOT #a = :absent AND {}", chained_comparisons(149));
+    let over = chained_comparisons(151);
+    // An `IN` list of twenty values is ONE operator, so these two chains state 297 and 301:
+    // a reader that counted the listed values would refuse both.
+    let in_under = format!("{} AND {}", in_list(20), chained_comparisons(148));
+    let in_over = format!("{} AND {}", in_list(20), chained_comparisons(150));
+    vec![
+        OperatorRow {
+            case: "a scan's filter one operator under the quota",
+            operation: "Scan",
+            request: json!({"TableName": TABLE, "FilterExpression": under,
+                            "ExpressionAttributeNames": names, "ExpressionAttributeValues": values}),
+            expected: None,
+        },
+        OperatorRow {
+            case: "a scan's filter at exactly the quota",
+            operation: "Scan",
+            request: json!({"TableName": TABLE, "FilterExpression": at_quota,
+                            "ExpressionAttributeNames": names,
+                            "ExpressionAttributeValues": {":v": {"S": "active"},
+                                                          ":absent": {"S": "gone"}}}),
+            expected: None,
+        },
+        OperatorRow {
+            case: "a scan's filter one operator past the quota",
+            operation: "Scan",
+            request: json!({"TableName": TABLE, "FilterExpression": over,
+                            "ExpressionAttributeNames": names, "ExpressionAttributeValues": values}),
+            expected: Some(operator_refusal(
+                "FilterExpression",
+                chained_operators(151),
+                false,
+            )),
+        },
+        OperatorRow {
+            case: "a scan's filter carrying an IN list, inside the quota",
+            operation: "Scan",
+            request: json!({"TableName": TABLE, "FilterExpression": in_under,
+                            "ExpressionAttributeNames": in_names,
+                            "ExpressionAttributeValues": in_values}),
+            expected: None,
+        },
+        OperatorRow {
+            case: "a scan's filter carrying an IN list, past the quota",
+            operation: "Scan",
+            request: json!({"TableName": TABLE, "FilterExpression": in_over,
+                            "ExpressionAttributeNames": in_names,
+                            "ExpressionAttributeValues": in_values}),
+            expected: Some(operator_refusal("FilterExpression", 301, false)),
+        },
+        OperatorRow {
+            case: "a query's filter past the quota, beside a sound key condition",
+            operation: "Query",
+            request: json!({"TableName": TABLE,
+                            "KeyConditionExpression": "pk = :p",
+                            "FilterExpression": over,
+                            "ExpressionAttributeNames": names,
+                            "ExpressionAttributeValues": {":p": {"S": "item-1"},
+                                                          ":v": {"S": "active"}}}),
+            expected: Some(operator_refusal(
+                "FilterExpression",
+                chained_operators(151),
+                false,
+            )),
+        },
+        OperatorRow {
+            case: "a write's condition past the quota, which carries the envelope",
+            operation: "PutItem",
+            request: json!({"TableName": TABLE, "Item": {"pk": {"S": "item-9"}},
+                            "ConditionExpression": over,
+                            "ExpressionAttributeNames": names, "ExpressionAttributeValues": values}),
+            expected: Some(operator_refusal(
+                "ConditionExpression",
+                chained_operators(151),
+                true,
+            )),
+        },
+        OperatorRow {
+            case: "a delete's condition past the quota",
+            operation: "DeleteItem",
+            request: json!({"TableName": TABLE, "Key": key(),
+                            "ConditionExpression": over,
+                            "ExpressionAttributeNames": names, "ExpressionAttributeValues": values}),
+            expected: Some(operator_refusal(
+                "ConditionExpression",
+                chained_operators(151),
+                true,
+            )),
+        },
+    ]
+}
+
+#[tokio::test]
+async fn an_expression_past_the_operator_quota_is_refused_and_an_in_list_counts_as_one() {
+    // RULE: an expression member is refused when the operators and functions it states
+    // exceed the documented quota ([`MAX_EXPRESSION_OPERATORS`]), counted the way the quota
+    // counts them — the OPERANDS of an operator are not operators of their own, so an `IN`
+    // list is one however many values it carries. Every expression member is held to it,
+    // and the refusal carries the envelope exactly when the member is one a write states its
+    // intent through.
+    assert_eq!(
+        (chained_operators(150), chained_operators(151)),
+        (MAX_EXPRESSION_OPERATORS - 1, MAX_EXPRESSION_OPERATORS + 1),
+        "the chains below straddle the quota"
+    );
+    let router = seeded().await;
+
+    for row in operator_rows() {
+        let (status, body) = call(&router, row.operation, row.request.clone()).await;
+        match row.expected {
+            Some(expected) => {
+                assert_eq!(
+                    (status, error_code(&body).as_str()),
+                    (400, "ValidationException"),
+                    "case {:?} ({}): an expression past the quota is refused, got {status} with \
+                     {body}",
+                    row.case,
+                    row.operation
+                );
+                let stated = message(&body);
+                assert_eq!(
+                    stated, expected,
+                    "case {:?} ({}): expected {expected:?}, got {stated:?}",
+                    row.case, row.operation
+                );
+            }
+            None => {
+                assert_eq!(
+                    status, 200,
+                    "case {:?} ({}): an expression inside the quota is served, got {status} with \
+                     {body}",
+                    row.case,
+                    row.operation
+                );
+                // Served rows are EVALUATED rather than waved through: every conjunct holds
+                // for the seeded item, so the scan reports it.
+                assert_eq!(
+                    body["Count"],
+                    json!(1),
+                    "case {:?} ({}): the filter selected the seeded item, got {body}",
+                    row.case,
+                    row.operation
+                );
+            }
+        }
+    }
+}

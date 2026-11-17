@@ -30,7 +30,10 @@
 use serde_json::{json, Map, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::emulator::{call, call_in, emulator, emulator_with_streams, error_code, message, ok};
+use crate::emulator::{
+    call, call_in, emulator, emulator_with_kms, emulator_with_streams, error_code, message, ok,
+    ok_kms,
+};
 
 /// Wait out one transient span, so whatever the clock owes a table or a backup is due.
 async fn settle() {
@@ -869,7 +872,7 @@ async fn an_override_that_cannot_hold_on_the_restored_table_is_refused() {
             400,
             "ValidationException",
         ),
-        // The two members no stored table carries yet are reported as unimplemented
+        // The member no stored table carries yet is reported as unimplemented
         // rather than accepted and dropped — a 501 that says "nobody has written this
         // member", which no SDK branch mistakes for a modelled refusal.
         (
@@ -878,16 +881,6 @@ async fn an_override_that_cannot_hold_on_the_restored_table_is_refused() {
                 "TargetTableName": "Fresh",
                 "BackupArn": on_demand_arn,
                 "OnDemandThroughputOverride": {"MaxReadRequestUnits": 10},
-            }),
-            501,
-            "NotImplemented",
-        ),
-        (
-            "server-side encryption settings",
-            json!({
-                "TargetTableName": "Fresh",
-                "BackupArn": on_demand_arn,
-                "SSESpecificationOverride": {"Enabled": true},
             }),
             501,
             "NotImplemented",
@@ -915,4 +908,191 @@ async fn an_override_that_cannot_hold_on_the_restored_table_is_refused() {
              {described_status} with {described_body}"
         );
     }
+}
+
+/// One row of the encryption table: the case, the target name, the
+/// `SSESpecificationOverride` the restore carries, and the key ARN the restored table must
+/// report — `None` for a restore that leaves it on the Amazon Web Services owned key, which
+/// has no description at all.
+type EncryptedRestore = (&'static str, &'static str, Value, Option<String>);
+
+#[tokio::test]
+async fn an_sse_specification_override_restores_the_table_under_the_key_it_names() {
+    // RULE: "The new server-side encryption settings for the restored table"
+    // (`RestoreTableFromBackup$SSESpecificationOverride`) are APPLIED to it — an override
+    // that enables encryption restores the table encrypted with the KMS key it names,
+    // resolved by KMS in this Region in every form that service accepts an identifier in,
+    // exactly as a create's own `SSESpecification` is — and one that does not enable it
+    // leaves the restored table on the Amazon Web Services owned key. A key this Region's
+    // KMS endpoint resolves nothing for refuses the whole restore.
+    let router = emulator_with_kms();
+    let create = on_demand_simple();
+    active_table(&router, "Encrypted.Source", &create).await;
+    let item = json!({"Part": {"S": "bolt"}, "Colour": {"S": "red"}});
+    ok(
+        &router,
+        "PutItem",
+        json!({"TableName": "Encrypted.Source", "Item": item}),
+    )
+    .await;
+    let backup = available_backup(&router, "Encrypted.Source", "encrypted-backup").await;
+    let arn = backup_arn(&backup);
+
+    // A customer managed key, an alias for it, and the Amazon Web Services managed key the
+    // default DynamoDB alias stands for: the forms one row each names a key in.
+    let key = ok_kms(&router, "CreateKey", json!({})).await;
+    let key_id = key["KeyMetadata"]["KeyId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let key_arn = key["KeyMetadata"]["Arn"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    ok_kms(
+        &router,
+        "CreateAlias",
+        json!({"AliasName": "alias/restored-table", "TargetKeyId": key_id}),
+    )
+    .await;
+    let default_arn = ok_kms(
+        &router,
+        "DescribeKey",
+        json!({"KeyId": "alias/aws/dynamodb"}),
+    )
+    .await["KeyMetadata"]["Arn"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !key_arn.is_empty() && !default_arn.is_empty(),
+        "case the keys: KMS must mint the keys the rows name, got {key}"
+    );
+
+    // Rows differ in whether the override enables encryption at all and in the FORM the key
+    // it names takes, which is what the rule generalises over.
+    let rows: [EncryptedRestore; 6] = [
+        (
+            "no override at all",
+            "Restored.Owned",
+            Value::Null,
+            None,
+        ),
+        (
+            "an override that does not enable encryption",
+            "Restored.Disabled",
+            json!({"Enabled": false}),
+            None,
+        ),
+        (
+            "a customer managed key by key id",
+            "Restored.ById",
+            json!({"Enabled": true, "KMSMasterKeyId": key_id, "SSEType": "KMS"}),
+            Some(key_arn.clone()),
+        ),
+        (
+            "the same key by key ARN",
+            "Restored.ByArn",
+            json!({"Enabled": true, "KMSMasterKeyId": key_arn}),
+            Some(key_arn.clone()),
+        ),
+        (
+            "the same key by alias name",
+            "Restored.ByAlias",
+            json!({"Enabled": true, "KMSMasterKeyId": "alias/restored-table"}),
+            Some(key_arn.clone()),
+        ),
+        (
+            "an override naming no key, which is the default DynamoDB key",
+            "Restored.ByDefault",
+            json!({"Enabled": true}),
+            Some(default_arn.clone()),
+        ),
+    ];
+
+    for (case, target, override_, expected) in rows {
+        let mut request = json!({"TargetTableName": target, "BackupArn": arn});
+        if !override_.is_null() {
+            request["SSESpecificationOverride"] = override_;
+        }
+        let restored = ok(&router, "RestoreTableFromBackup", request).await;
+        let description = &restored["TableDescription"];
+        match expected.as_deref() {
+            Some(key_arn) => assert_eq!(
+                (
+                    description["SSEDescription"]["Status"].clone(),
+                    description["SSEDescription"]["SSEType"].clone(),
+                    description["SSEDescription"]["KMSMasterKeyArn"].clone(),
+                ),
+                (json!("ENABLED"), json!("KMS"), json!(key_arn)),
+                "case {case}: the restore reports the key KMS resolved, got {description}"
+            ),
+            None => assert_eq!(
+                description.get("SSEDescription"),
+                None,
+                "case {case}: a restore on the owned key reports no SSEDescription, got \
+                 {description}"
+            ),
+        }
+
+        // Read back through the implemented reader once the restore has settled: the
+        // encryption is the restored table's own stored state, and its items are readable
+        // under that key.
+        settle().await;
+        let read_back = described(&router, target).await;
+        let read = ok(
+            &router,
+            "GetItem",
+            json!({"TableName": target, "Key": key_of(&create, &item)}),
+        )
+        .await;
+        assert_eq!(
+            (
+                read_back["SSEDescription"]["KMSMasterKeyArn"].clone(),
+                read_back["TableStatus"].clone(),
+                read["Item"].clone(),
+            ),
+            (
+                expected
+                    .as_deref()
+                    .map_or(Value::Null, |key_arn| json!(key_arn)),
+                json!("ACTIVE"),
+                item.clone(),
+            ),
+            "case {case}: the restored table keeps the key it was restored under and serves \
+             the backup's items, got {read_back} and {read}"
+        );
+    }
+
+    // A key this Region's KMS endpoint resolves nothing for refuses the whole restore, so
+    // no table is ever left reporting a key ARN nothing minted.
+    let (status, body) = call(
+        &router,
+        "RestoreTableFromBackup",
+        json!({
+            "TargetTableName": "Restored.Unresolved",
+            "BackupArn": arn,
+            "SSESpecificationOverride": {
+                "Enabled": true,
+                "KMSMasterKeyId": "alias/absent-restore-key",
+            },
+        }),
+    )
+    .await;
+    assert_eq!(
+        (status, error_code(&body)),
+        (400, "ValidationException".to_string()),
+        "case a key KMS does not hold: the restore is refused, got {status} with {body}"
+    );
+    let (described_status, described_body) = call(
+        &router,
+        "DescribeTable",
+        json!({"TableName": "Restored.Unresolved"}),
+    )
+    .await;
+    assert_eq!(
+        described_status, 400,
+        "case a key KMS does not hold: the refused restore stored no table, got \
+         {described_status} with {described_body}"
+    );
 }

@@ -16,9 +16,10 @@
 //! 3. a `SearchConditionExpression` filters the scored items by the index's search schema
 //!    attributes, each PINNED by `=`, and may reference no others;
 //! 4. a request that addresses no searchable index is refused: a table that is not serving
-//!    items with `ResourceNotFoundException`, an `IndexName` the table declares no vector
-//!    index for and a `SearchVector` that is not the index's shape with
-//!    `ValidationException`;
+//!    items with `ResourceNotFoundException`, and an `IndexName` the table has no index to
+//!    search for — one it declares no vector index for, and one whose index has not
+//!    finished building — together with a `SearchVector` that is not the index's shape,
+//!    with `ValidationException`;
 //! 5. `ConsumedCapacity` reports the index data the search read, in bytes, and only when
 //!    the request asked for it.
 //!
@@ -30,7 +31,7 @@
 
 use serde_json::{json, Map, Value};
 
-use crate::emulator::{call, emulator, error_code, message, ok};
+use crate::emulator::{call, describe_when_active, emulator, error_code, message, ok};
 
 /// Wait out one transient span, so the table's `CREATING` -> `ACTIVE` transition and its
 /// indexes' are due.
@@ -679,6 +680,118 @@ async fn a_request_that_addresses_no_searchable_index_is_refused() {
             message(&response)
         );
     }
+}
+
+#[tokio::test]
+async fn a_search_of_a_vector_index_that_has_not_finished_building_is_refused() {
+    // RULE: an index is a source the table can be searched by only once it is serving —
+    // "The index must be in the ACTIVE state" (`SearchVectors$IndexName`) — so a search of
+    // one the table declares but has not finished building is refused over the NAME the
+    // request sent, exactly as a name no index of the table answers to is. A table-level
+    // `ResourceNotFoundException` would instead say the table is not there, which a caller
+    // cannot tell a still-building index from.
+    //
+    // Each attempt adds an index of its own and asserts only once a read confirms that
+    // index is still `CREATING`: the build span is generous, but a loaded machine could let
+    // it elapse between the two calls, which is not a defect.
+    const ATTEMPTS: usize = 3;
+
+    let router = emulator();
+    table_with(
+        &router,
+        "vector-search-building",
+        json!([{"AttributeName": "pk", "AttributeType": "S"}]),
+        json!([]),
+    )
+    .await;
+    // One item carrying a vector of the dimensions the indexes below declare, so the search
+    // that is SERVED once an index has finished building reports it rather than an empty
+    // default.
+    put(
+        &router,
+        "vector-search-building",
+        json!({"pk": {"S": "indexed"}, "emb": {"L": embedding(&[1.0, 0.0, 0.0])}}),
+    )
+    .await;
+
+    let mut refused = false;
+    let mut seen: Vec<String> = Vec::new();
+    for attempt in 0..ATTEMPTS {
+        let index = format!("building-{attempt}");
+        describe_when_active(&router, "the table takes a vector index", "vector-search-building")
+            .await;
+        ok(
+            &router,
+            "UpdateTable",
+            json!({
+                "TableName": "vector-search-building",
+                "VectorIndexUpdates": [{"Create": vector_index(
+                    &index,
+                    3,
+                    "COSINE",
+                    json!({"ProjectionType": "KEYS_ONLY"}),
+                    Value::Null,
+                )}],
+            }),
+        )
+        .await;
+        let described = ok(
+            &router,
+            "DescribeTable",
+            json!({"TableName": "vector-search-building"}),
+        )
+        .await;
+        let status = described["Table"]["VectorIndexes"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .find(|declared| declared["IndexName"] == json!(index))
+            .map(|declared| declared["IndexStatus"].clone())
+            .unwrap_or(Value::Null);
+        if status != json!("CREATING") {
+            seen.push(format!("{status}"));
+            continue;
+        }
+
+        let body = search_body(
+            "vector-search-building",
+            &index,
+            &[1.0, 0.0, 0.0],
+            3,
+        );
+        let (code, response) = call(&router, "SearchVectors", body.clone()).await;
+        assert_eq!(
+            (code, error_code(&response), message(&response)),
+            (
+                400,
+                "ValidationException".to_string(),
+                format!("The table does not have the specified index: {index}")
+            ),
+            "case the index is still CREATING: the search is refused over the name it sent, got \
+             {code} with {response}"
+        );
+
+        // Once the build has finished the SAME search is served, and it reports the item the
+        // index was built over — so the refusal was about the index's state and not about the
+        // request.
+        describe_when_active(&router, "the index finishes building", "vector-search-building")
+            .await;
+        let served = ok(&router, "SearchVectors", body).await;
+        assert_eq!(
+            result_keys(&served),
+            vec!["indexed".to_string()],
+            "case the index has finished building: the same search reports the indexed item, got \
+             {served}"
+        );
+        refused = true;
+        break;
+    }
+    assert!(
+        refused,
+        "case a still-building index: no attempt read CREATING in {ATTEMPTS} attempts, saw \
+         {seen:?}"
+    );
 }
 
 #[tokio::test]

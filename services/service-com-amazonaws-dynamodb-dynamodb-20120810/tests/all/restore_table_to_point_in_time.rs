@@ -37,7 +37,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::emulator::{call, emulator, error_code, message, ok};
+use crate::emulator::{call, emulator, emulator_with_kms, error_code, message, ok, ok_kms};
 
 /// Wait out one transient span, so whatever the clock owes a table is due.
 async fn settle() {
@@ -728,5 +728,135 @@ async fn a_target_table_that_is_still_being_created_is_in_use() {
         (400, "TableAlreadyExistsException"),
         "case a settled target: expected 400 TableAlreadyExistsException, got {status} with \
          {body}"
+    );
+}
+
+/// One row of the encryption table: the case, the target name, the
+/// `SSESpecificationOverride` the restore carries, and the key ARN the restored table must
+/// report — `None` for a restore that leaves it on the Amazon Web Services owned key.
+type EncryptedRestore = (&'static str, &'static str, Value, Option<String>);
+
+#[tokio::test]
+async fn an_sse_specification_override_restores_the_table_under_the_key_it_names() {
+    // RULE: "The new server-side encryption settings for the restored table"
+    // (`RestoreTableToPointInTime$SSESpecificationOverride`) are APPLIED to it, the same way
+    // `RestoreTableFromBackup` applies its own: the restored table is encrypted with the KMS
+    // key the override names, resolved by KMS in this Region, and a restore that names no
+    // override leaves it on the Amazon Web Services owned key.
+    let router = emulator_with_kms();
+    let create = json!({
+        "KeySchema": [{"AttributeName": "Part", "KeyType": "HASH"}],
+        "AttributeDefinitions": [{"AttributeName": "Part", "AttributeType": "S"}],
+        "BillingMode": "PAY_PER_REQUEST",
+    });
+    let item = json!({"Part": {"S": "bolt"}, "Colour": {"S": "red"}});
+    active_table(
+        &router,
+        "PitrEncryptedSource",
+        &create,
+        std::slice::from_ref(&item),
+    )
+    .await;
+    enable_recovery(&router, "PitrEncryptedSource").await;
+    settle().await;
+
+    let key = ok_kms(&router, "CreateKey", json!({})).await;
+    let key_id = key["KeyMetadata"]["KeyId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let key_arn = key["KeyMetadata"]["Arn"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !key_arn.is_empty(),
+        "case the key: KMS must mint the key the rows name, got {key}"
+    );
+
+    // Rows differ in whether the restore names an override at all and in the form the key it
+    // names takes.
+    let rows: [EncryptedRestore; 3] = [
+        ("no override at all", "PitrOwned", Value::Null, None),
+        (
+            "a customer managed key by key id",
+            "PitrById",
+            json!({"Enabled": true, "KMSMasterKeyId": key_id}),
+            Some(key_arn.clone()),
+        ),
+        (
+            "the same key by key ARN",
+            "PitrByArn",
+            json!({"Enabled": true, "KMSMasterKeyId": key_arn}),
+            Some(key_arn.clone()),
+        ),
+    ];
+
+    for (case, target, override_, expected) in rows {
+        let mut request = json!({
+            "SourceTableName": "PitrEncryptedSource",
+            "TargetTableName": target,
+            "UseLatestRestorableTime": true,
+        });
+        if !override_.is_null() {
+            request["SSESpecificationOverride"] = override_;
+        }
+        let restored = ok(&router, "RestoreTableToPointInTime", request).await;
+        assert_eq!(
+            restored["TableDescription"]["SSEDescription"]
+                .get("KMSMasterKeyArn")
+                .cloned(),
+            expected.as_deref().map(|key_arn| json!(key_arn)),
+            "case {case}: the restore reports the key KMS resolved, got {restored}"
+        );
+
+        // Read back once the restore has settled: the encryption is the restored table's
+        // own stored state, and its items are readable under that key.
+        settle().await;
+        let read_back = described(&router, target).await;
+        let read = ok(
+            &router,
+            "GetItem",
+            json!({"TableName": target, "Key": key_of(&create, &item)}),
+        )
+        .await;
+        assert_eq!(
+            (
+                read_back["SSEDescription"]
+                    .get("KMSMasterKeyArn")
+                    .cloned(),
+                read["Item"].clone(),
+            ),
+            (
+                expected.as_deref().map(|key_arn| json!(key_arn)),
+                item.clone()
+            ),
+            "case {case}: the restored table keeps the key it was restored under and serves \
+             the source's items, got {read_back} and {read}"
+        );
+    }
+
+    // A key this Region's KMS endpoint resolves nothing for refuses the whole restore.
+    let (status, body) = call(
+        &router,
+        "RestoreTableToPointInTime",
+        json!({
+            "SourceTableName": "PitrEncryptedSource",
+            "TargetTableName": "PitrUnresolved",
+            "UseLatestRestorableTime": true,
+            "SSESpecificationOverride": {
+                "Enabled": true,
+                "KMSMasterKeyId": "alias/absent-pitr-key",
+            },
+        }),
+    )
+    .await;
+    let (described_status, described_body) =
+        call(&router, "DescribeTable", json!({"TableName": "PitrUnresolved"})).await;
+    assert_eq!(
+        (status, error_code(&body), described_status),
+        (400, "ValidationException".to_string(), 400),
+        "case a key KMS does not hold: the restore is refused and stores nothing, got {status} \
+         with {body} then {described_body}"
     );
 }

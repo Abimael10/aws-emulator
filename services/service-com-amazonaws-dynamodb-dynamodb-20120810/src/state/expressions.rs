@@ -24,6 +24,17 @@ pub const MAX_EXPRESSION_BYTES: usize = 4096;
 pub const MAX_EXPRESSION_TOKENS: usize = 1024;
 pub const MAX_EXPRESSION_DEPTH: usize = 16;
 
+/// The most OPERATORS AND FUNCTIONS one expression may state: "the maximum number of
+/// operators or functions allowed in an expression is 300" ("Service, Account, and Table
+/// Quotas", the expression-parameter entry), which that entry states with the example that
+/// the expression `a IN (b, c, d)` contains ONE operator — the `IN` — however many values
+/// its list carries.
+///
+/// A quota of the EXPRESSION LANGUAGE rather than of one member, so it is held wherever an
+/// expression is read ([`tokenize_expression_spanned`]): a filter, a condition, a key
+/// condition and an update are each refused past it.
+pub const MAX_EXPRESSION_OPERATORS: usize = 300;
+
 /// The most actions one update may state, whichever member states them.
 ///
 /// An `UpdateExpression` is already bounded by the token ceiling above — the shortest
@@ -777,11 +788,70 @@ pub fn tokenize_expression_spanned(
         // AWS says the member is empty rather than pointing at a token.
         return Err(expression_is_empty(member));
     }
+    // How much the expression ASKS FOR, as the documented quota counts it: the operators and
+    // functions it states ([`MAX_EXPRESSION_OPERATORS`]). Held here, where every expression
+    // member is read, and before any of them is parsed — the count is a fact of the text.
+    let operators = stated_operators(&tokens);
+    if operators > MAX_EXPRESSION_OPERATORS {
+        return Err(too_many_expression_operators(member, operators));
+    }
     Ok(TokenizedExpression {
         tokens,
         characters,
         spans,
     })
+}
+
+/// How a member past [`MAX_EXPRESSION_OPERATORS`] is refused: the member it was sent as and
+/// the count it stated, inside the envelope that member's refusals carry
+/// ([`envelopes_expression_refusals`]).
+fn too_many_expression_operators(member: &str, operators: usize) -> RequestError {
+    expression_refusal(
+        envelopes_expression_refusals(member),
+        format!(
+            "Invalid {member}: The expression contains too many operators; operator count: \
+             {operators}"
+        ),
+    )
+}
+
+/// How many operators and functions the tokens of one expression state, the way the quota
+/// counts them ([`MAX_EXPRESSION_OPERATORS`]).
+///
+/// One per comparison (`=`, `<>`, `<`, `<=`, `>`, `>=`), per arithmetic operator an update
+/// computes with (`+`, `-`), per logical operator (`AND`, `OR`, `NOT`), per membership or
+/// range operator (`IN`, `BETWEEN`) and per function CALL — a word the text applies to an
+/// operand list, which is what the `(` after it makes it.
+///
+/// The OPERANDS of an operator are not operators: the values an `IN` list carries are
+/// operands separated by commas, so `a IN (b, c, d)` states the one operator the quota's own
+/// example counts in it, however long the list is. For the same reason the `AND` that
+/// separates a `BETWEEN` range's two bounds belongs to that `BETWEEN` rather than being a
+/// logical operator of its own.
+fn stated_operators(tokens: &[ExprToken]) -> usize {
+    let mut operators = 0;
+    // The `BETWEEN`s whose range `AND` has not been read yet, which is what makes each of
+    // them claim exactly one `AND`.
+    let mut ranges = 0usize;
+    for (at, token) in tokens.iter().enumerate() {
+        match token {
+            ExprToken::Compare(_) | ExprToken::Plus | ExprToken::Minus => operators += 1,
+            ExprToken::Word(_) if matches!(tokens.get(at + 1), Some(ExprToken::Open)) => {
+                operators += 1;
+            }
+            ExprToken::Word(word) => match word.to_ascii_uppercase().as_str() {
+                BETWEEN_OPERATOR => {
+                    operators += 1;
+                    ranges += 1;
+                }
+                "AND" if ranges > 0 => ranges -= 1,
+                "AND" | "OR" | "NOT" | "IN" => operators += 1,
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    operators
 }
 
 /// The substitution tables an expression resolves its names and values through:

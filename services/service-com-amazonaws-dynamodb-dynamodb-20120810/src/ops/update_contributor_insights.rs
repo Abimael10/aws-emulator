@@ -15,9 +15,11 @@
 //! of the resource's key access insights, which both this call and the reads keep reporting
 //! once they are off.
 //!
-//! Insights can only be turned off for a resource that has a key access insights
-//! configuration: a `DISABLE` against one no enable has ever configured is refused with the
-//! 400 `ValidationException` stating the statuses that action requires, and writes nothing.
+//! Insights can only be turned off for a resource whose insights are ON: the status a
+//! `DISABLE` is performed from has to be `ENABLED` (or `FAILED`, which this store never
+//! reports), so a `DISABLE` issued while an accepted `ENABLE` is still `ENABLING` — and one
+//! against a resource that is already `DISABLED` — is refused with the 400
+//! `ValidationException` stating the statuses that action requires, and writes nothing.
 //!
 //! A table name that resolves to no stored table, and an `IndexName` the stored table
 //! does not carry, are both the modelled `ResourceNotFoundException` — "the operation
@@ -216,12 +218,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // one and of the table where it named none.
         let has_sort_key = table.resource_declares_sort_key(index_name);
         let insights = table.contributor_insights_mut(index_name).map_err(lift)?;
-        // A `DISABLE` turns off a CONFIGURATION of key access insights: a resource that has
-        // one is served whether its insights are still being turned on, on, or already off,
-        // and a resource no enable has ever configured has nothing for the action to be
-        // performed against, so it is refused rather than accepted as a no-op
+        // A `DISABLE` turns insights OFF, and the statuses it can be performed from are the
+        // ones the refusal names: the resource's insights have to be on. One addressed while
+        // the enable that was accepted for it is still in flight, and one that is already
+        // off, are both refused rather than applied
         // ([`crate::state::contributor_insights_not_disableable`]).
-        if !enable && !insights.disableable() {
+        if !enable && !insights.disableable(now) {
             return Err(lift(crate::state::contributor_insights_not_disableable()));
         }
         insights.apply(enable, input.contributor_insights_mode.as_deref(), now);

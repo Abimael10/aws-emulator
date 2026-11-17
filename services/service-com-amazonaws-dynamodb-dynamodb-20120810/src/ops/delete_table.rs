@@ -19,6 +19,12 @@
 //! changes on that error depends on, so the observed answer is the one implemented
 //! here.
 //!
+//! A table that has acted as the SOURCE Region of a replica added inside the protection
+//! window ([`crate::state::REPLICA_SOURCE_PROTECTION_WINDOW`]) is refused with the 400
+//! `ValidationException` AWS words for that case: the replica it sourced is still catching
+//! up with it, so the replication group cannot lose this copy yet. A refused delete writes
+//! nothing and answers no `TableDescription`, so the table and its items stay.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -183,6 +189,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         store.apply_due_transitions(now);
+        // Whether a Region that has just SOURCED a replica add is what this call addresses,
+        // read before the table is borrowed to be changed
+        // ([`crate::state::ComAmazonawsDynamodbDynamodb20120810State::sourced_a_replica_recently`]);
+        // it is reported below, after the statuses a delete is refused in.
+        let sourced_a_replica_recently = store.sourced_a_replica_recently(&region, &name, now);
         let table = store
             .table_mut(&region, &name)
             .map_err(lift)?;
@@ -244,6 +255,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
             crate::state::TableStatus::Active => {}
+        }
+        // A Region that has just sourced a replica add cannot be deleted: the replica it
+        // sourced is still catching up with it, so this table holds the copy the
+        // replication group would lose ([`crate::state::sourced_replica_recently`]). The
+        // refused call writes nothing, so it destroys no table and answers no
+        // `TableDescription`.
+        if sourced_a_replica_recently {
+            return Err(lift(crate::state::sourced_replica_recently()));
         }
         if table.deletion_protection_enabled {
             // "The table cannot be deleted" while the flag is set

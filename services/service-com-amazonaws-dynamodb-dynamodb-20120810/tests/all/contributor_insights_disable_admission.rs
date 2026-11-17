@@ -6,11 +6,12 @@
 //!
 //! The rules pinned here:
 //!
-//! 1. a `DISABLE` turns off a key access insights CONFIGURATION, so it is served for every
-//!    resource that has one — whatever status that resource is in: still being turned on,
-//!    on, or already turned off by an earlier disable — and refused for a resource no
-//!    enable has ever configured, with HTTP 400 `ValidationException` carrying DynamoDB's
-//!    invalid-state sentence for that action; the refused call writes nothing;
+//! 1. a `DISABLE` is performed from the status that action requires — the resource's
+//!    insights have to be ON — so it is served for a resource whose enable has settled and
+//!    refused for every other: one whose accepted enable is still `ENABLING`, one an earlier
+//!    disable has already turned off, and one no enable has ever named, each with HTTP 400
+//!    `ValidationException` carrying DynamoDB's invalid-state sentence for that action; the
+//!    refused call writes nothing;
 //! 2. an accepted `DISABLE` answers the SETTLED status, `DISABLED`, together with the
 //!    `ContributorInsightsMode` the resource was configured with — the configuration
 //!    outlives the disable, so every later read answers that same mode until an enable
@@ -30,14 +31,17 @@ use crate::contributor_insights::{
     create_table, create_table_in, describe_insights, describe_insights_in, set_insights,
     set_insights_in, settle,
 };
-use crate::emulator::{call, call_in, emulator, error_code, message, ok, ok_in, REGION};
+use crate::emulator::{
+    call, call_in, emulator, error_code, insights_when, message, ok, ok_in, REGION,
+};
 
 /// A second region to sign for, which is not [`REGION`]: a table name is unique within ONE
 /// region, so the same name in both is two resources with settings of their own.
 const OTHER_REGION: &str = "us-west-2";
 
-/// How DynamoDB refuses a `DISABLE` against a resource that has no key access insights
-/// configuration: the whole sentence is fixed text, naming neither the table nor the index.
+/// How DynamoDB refuses a `DISABLE` against a resource whose insights are not on: the whole
+/// sentence is fixed text, naming neither the table nor the index — it states the statuses
+/// the action requires.
 const NOT_DISABLEABLE: &str = "Table or Index is not in a valid state to update Key Access \
                                Insights: ContributorInsights Status must be ENABLED or FAILED \
                                to perform DISABLE operation.";
@@ -99,7 +103,7 @@ type RefusedCase = (
 );
 
 #[tokio::test]
-async fn a_disable_of_a_resource_that_was_never_configured_is_refused_and_writes_nothing() {
+async fn a_disable_from_a_status_that_does_not_admit_it_is_refused_and_writes_nothing() {
     let router = emulator();
     create_table_in(&router, REGION, "InsightsUnconfigured", &["Un.Index"]).await;
     create_table_in(
@@ -118,9 +122,10 @@ async fn a_disable_of_a_resource_that_was_never_configured_is_refused_and_writes
     .await;
     settle().await;
 
-    // The signed region's own table and index are turned ON, so the refusals below are
-    // about the resource each call addresses and not about the surface: the same names in
-    // the other region, and the neighbours in this one, were never configured.
+    // The signed region's own table and index are turned ON and their enables waited out,
+    // so each refusal below is about the STATUS of the resource the call addresses and not
+    // about the surface: the same names in the other region, and the neighbours in this
+    // one, were never enabled.
     set_insights(&router, "InsightsConfigured", None, "ENABLE", None).await;
     set_insights(
         &router,
@@ -130,14 +135,39 @@ async fn a_disable_of_a_resource_that_was_never_configured_is_refused_and_writes
         Some("THROTTLED_KEYS"),
     )
     .await;
-    settle().await;
-    let configured_before = listed_in(&router, REGION).await;
+    for index in [None, Some("On.Index")] {
+        insights_when(
+            &router,
+            "the enable settles",
+            "InsightsConfigured",
+            index,
+            "ENABLED",
+        )
+        .await;
+    }
 
-    // Rows differ in why the resource addressed has no configuration — a table no update
-    // has ever named, an index of a table whose OWN insights are on, a table of the other
-    // region whose same-named table here is on, that table's index — and in whether the
+    // A resource whose insights ARE on is served, which is what the rows below then
+    // address: the same resources, now off.
+    for (case, index) in [
+        ("the configured table", None),
+        ("its configured index", Some("On.Index")),
+    ] {
+        let (status, body) = disable_in(&router, REGION, "InsightsConfigured", index, None).await;
+        assert_eq!(
+            (status, reported(&body, "ContributorInsightsStatus")),
+            (200, json!("DISABLED")),
+            "case {case}: a disable of a resource whose insights are on is served, got {status} \
+             with {body}"
+        );
+    }
+    let listed_before = listed_in(&router, REGION).await;
+
+    // Rows differ in why the status of the resource addressed does not admit a disable — a
+    // table no update has ever named, an index of a table whose OWN insights were on, a
+    // table of the other region whose same-named table here was on, that table's index, and
+    // the two resources an earlier disable has already turned off — and in whether the
     // request names a mode, and which.
-    let cases: [RefusedCase; 5] = [
+    let cases: [RefusedCase; 7] = [
         (
             "a table no update has ever named",
             REGION,
@@ -173,9 +203,24 @@ async fn a_disable_of_a_resource_that_was_never_configured_is_refused_and_writes
             Some("On.Index"),
             None,
         ),
+        (
+            "the table an earlier disable has turned off",
+            REGION,
+            "InsightsConfigured",
+            None,
+            None,
+        ),
+        (
+            "its index, turned off by that same pass",
+            REGION,
+            "InsightsConfigured",
+            Some("On.Index"),
+            Some("THROTTLED_KEYS"),
+        ),
     ];
 
     for (case, region, table, index, mode) in cases {
+        let before = describe_insights_in(&router, region, table, index).await;
         let (status, body) = disable_in(&router, region, table, index, mode).await;
         assert_eq!(
             (status, error_code(&body), message(&body)),
@@ -184,12 +229,12 @@ async fn a_disable_of_a_resource_that_was_never_configured_is_refused_and_writes
                 "ValidationException".to_string(),
                 NOT_DISABLEABLE.to_string()
             ),
-            "case {case}: a disable with no configuration to turn off is refused, got {status} \
+            "case {case}: a disable from a status that does not admit it is refused, got {status} \
              with {body}"
         );
 
-        // The refused call wrote nothing: the resource it addressed still reads as one no
-        // update has named, and the configured resources are untouched.
+        // The refused call wrote nothing: the resource it addressed reads exactly as it did
+        // before it, rules and all, and the listing is untouched.
         let described = describe_insights_in(&router, region, table, index).await;
         assert_eq!(
             (
@@ -198,110 +243,159 @@ async fn a_disable_of_a_resource_that_was_never_configured_is_refused_and_writes
                 reported(&described, "LastUpdateDateTime"),
                 reported(&described, "ContributorInsightsRuleList"),
             ),
-            (json!("DISABLED"), Value::Null, Value::Null, Value::Null),
-            "case {case}: the refused call left the resource unconfigured, got {described}"
+            (
+                reported(&before, "ContributorInsightsStatus"),
+                reported(&before, "ContributorInsightsMode"),
+                reported(&before, "LastUpdateDateTime"),
+                reported(&before, "ContributorInsightsRuleList"),
+            ),
+            "case {case}: the refused call left the resource as it was, got {described} after \
+             {before}"
+        );
+        assert_eq!(
+            reported(&described, "ContributorInsightsStatus"),
+            json!("DISABLED"),
+            "case {case}: every refused row addresses a resource whose insights are off, got \
+             {described}"
         );
         let still_listed = listed_in(&router, REGION).await;
         assert_eq!(
-            still_listed, configured_before,
-            "case {case}: the refused call left the configured resources listed, got \
-             {still_listed:?}"
+            still_listed, listed_before,
+            "case {case}: the refused call left the listing as it was, got {still_listed:?}"
         );
     }
+}
 
-    // The resources that DO have a configuration are served, so the refusals above are
-    // about the configuration each call addressed and not about the action.
-    for (case, index) in [
-        ("the configured table", None),
-        ("its configured index", Some("On.Index")),
-    ] {
-        let (status, body) = disable_in(&router, REGION, "InsightsConfigured", index, None).await;
-        assert_eq!(
-            (status, reported(&body, "ContributorInsightsStatus")),
-            (200, json!("DISABLED")),
-            "case {case}: a disable of a configured resource is served, got {status} with {body}"
+#[tokio::test]
+async fn a_disable_issued_while_the_enable_is_still_in_flight_is_refused() {
+    // The rule: the status a `DISABLE` is performed from has to be one that admits it, and
+    // an accepted `ENABLE` leaves the transient `ENABLING` until the clock settles it — so a
+    // client that serialises its control-plane calls catches this refusal instead of racing.
+    //
+    // Each attempt re-states the enable, which starts the span again, and only asserts once
+    // a read confirms the status still reads `ENABLING`: the span is generous, but a loaded
+    // machine could let it elapse between the enable and the disable, which is not a defect.
+    const ATTEMPTS: usize = 5;
+
+    let router = emulator();
+    create_table(&router, "InsightsInFlight", &["Flight.Index"]).await;
+    settle().await;
+
+    for (resource, index) in [("the table", None), ("its index", Some("Flight.Index"))] {
+        let mut refused = false;
+        let mut seen: Vec<String> = Vec::new();
+        for _ in 0..ATTEMPTS {
+            set_insights(&router, "InsightsInFlight", index, "ENABLE", None).await;
+            let in_flight = describe_insights(&router, "InsightsInFlight", index).await;
+            let status = reported(&in_flight, "ContributorInsightsStatus");
+            if status != json!("ENABLING") {
+                seen.push(format!("{status}"));
+                continue;
+            }
+            let (code, body) = disable_in(&router, REGION, "InsightsInFlight", index, None).await;
+            assert_eq!(
+                (code, error_code(&body), message(&body)),
+                (
+                    400,
+                    "ValidationException".to_string(),
+                    NOT_DISABLEABLE.to_string()
+                ),
+                "case {resource}: a disable issued while the enable is still ENABLING is \
+                 refused, got {code} with {body}"
+            );
+            // The refused call wrote nothing: the enable is still the action in force, so
+            // the resource settles ENABLED and the disable then earns its 200.
+            let settled = insights_when(
+                &router,
+                resource,
+                "InsightsInFlight",
+                index,
+                "ENABLED",
+            )
+            .await;
+            assert_eq!(
+                reported(&settled, "ContributorInsightsStatus"),
+                json!("ENABLED"),
+                "case {resource}: the refused disable left the enable in force, got {settled}"
+            );
+            let (code, served) =
+                disable_in(&router, REGION, "InsightsInFlight", index, None).await;
+            assert_eq!(
+                (code, reported(&served, "ContributorInsightsStatus")),
+                (200, json!("DISABLED")),
+                "case {resource}: the same disable is served once the enable has settled, got \
+                 {code} with {served}"
+            );
+            refused = true;
+            break;
+        }
+        assert!(
+            refused,
+            "case {resource}: the status never read ENABLING in {ATTEMPTS} attempts, saw \
+             {seen:?}"
         );
     }
 }
 
 /// One row of the admission table: the case, the index named beside the table (`None` for
-/// the table itself), the mode the enable asks for, the mode in force after it, whether the
-/// enable's span is waited out, and whether a first disable turns the insights off before
-/// the one under test.
+/// the table itself), the mode the enable asks for, and the mode in force after it.
 type AdmittedCase = (
     &'static str,
     Option<&'static str>,
     Option<&'static str>,
     &'static str,
-    bool,
-    bool,
 );
 
 #[tokio::test]
 async fn an_accepted_disable_answers_the_settled_status_with_the_mode_in_force() {
     let router = emulator();
 
-    // Rows differ in the status the resource is addressed in — the enable still in flight,
-    // the enable settled, and a resource an earlier disable has already turned off — in the
-    // resource addressed (a table and one of its indexes), and in the mode it was configured
-    // with: the two values `ContributorInsightsMode` declares
+    // Rows differ in the resource addressed (a table and one of its indexes) and in the
+    // mode it was configured with: the two values `ContributorInsightsMode` declares
     // (`smithy_query(query="shape", shape="ContributorInsightsMode")` gives
     // ACCESSED_AND_THROTTLED_KEYS | THROTTLED_KEYS) and naming none at all, where the wider
-    // one is configured.
+    // one is configured. The status is the one a disable is performed from in every row:
+    // the enable settled, which is what the action requires.
     let cases: [AdmittedCase; 6] = [
         (
-            "the table, the enable in flight, no mode named",
+            "the table, no mode named",
             None,
             None,
             "ACCESSED_AND_THROTTLED_KEYS",
-            false,
-            false,
         ),
         (
-            "the table, the enable settled, the wider mode",
+            "the table, the wider mode",
             None,
             Some("ACCESSED_AND_THROTTLED_KEYS"),
             "ACCESSED_AND_THROTTLED_KEYS",
-            true,
-            false,
         ),
         (
-            "the table, already off, throttled keys only",
+            "the table, throttled keys only",
             None,
             Some("THROTTLED_KEYS"),
             "THROTTLED_KEYS",
-            true,
-            true,
         ),
         (
-            "the index, the enable in flight, throttled keys only",
+            "the index, throttled keys only",
             Some("Admitted.Index"),
             Some("THROTTLED_KEYS"),
             "THROTTLED_KEYS",
-            false,
-            false,
         ),
         (
-            "the index, the enable settled, no mode named",
+            "the index, no mode named",
             Some("Admitted.Index"),
             None,
             "ACCESSED_AND_THROTTLED_KEYS",
-            true,
-            false,
         ),
         (
-            "the index, already off, the wider mode",
+            "the index, the wider mode",
             Some("Admitted.Index"),
             Some("ACCESSED_AND_THROTTLED_KEYS"),
             "ACCESSED_AND_THROTTLED_KEYS",
-            true,
-            true,
         ),
     ];
 
-    for (position, (case, index, asked, expected_mode, wait, twice)) in
-        cases.into_iter().enumerate()
-    {
+    for (position, (case, index, asked, expected_mode)) in cases.into_iter().enumerate() {
         // Each row gets a table of its own, so the status it is addressed in is the one its
         // own calls left it in.
         let table = format!("InsightsAdmitted{position}");
@@ -309,27 +403,14 @@ async fn an_accepted_disable_answers_the_settled_status_with_the_mode_in_force()
         settle().await;
 
         set_insights(&router, &table, index, "ENABLE", asked).await;
-        if wait {
-            settle().await;
-        }
-        // Whichever half of the enable the resource is read in, the mode is the one the
-        // enable configured.
-        let before = describe_insights(&router, &table, index).await;
-        let status_before = reported(&before, "ContributorInsightsStatus");
-        assert!(
-            (status_before == json!("ENABLING") || status_before == json!("ENABLED"))
-                && reported(&before, "ContributorInsightsMode") == json!(expected_mode),
-            "case {case}: the enable is in one of its two statuses with the mode it asked for, \
-             got {before}"
+        // The disable is performed from the settled status, so the enable is waited out: the
+        // mode reported is the one the enable configured.
+        let before = insights_when(&router, case, &table, index, "ENABLED").await;
+        assert_eq!(
+            reported(&before, "ContributorInsightsMode"),
+            json!(expected_mode),
+            "case {case}: the settled enable reports the mode it asked for, got {before}"
         );
-        if twice {
-            let (status, body) = disable_in(&router, REGION, &table, index, None).await;
-            assert_eq!(
-                (status, reported(&body, "ContributorInsightsStatus")),
-                (200, json!("DISABLED")),
-                "case {case}: the first disable turns the insights off, got {status} with {body}"
-            );
-        }
 
         let (status, answered) = disable_in(&router, REGION, &table, index, None).await;
         assert_eq!(
@@ -411,6 +492,19 @@ async fn an_accepted_disable_answers_the_settled_status_with_the_mode_in_force()
     }
 }
 
+/// One row of the action sequence in
+/// [`the_action_a_request_names_is_the_one_applied`]: the case, the action asked for, the
+/// mode it names, whether the enable in flight is waited out first, the status the call
+/// answers (or `refused`) and the mode in force after it.
+type ActionStep = (
+    &'static str,
+    &'static str,
+    Option<&'static str>,
+    bool,
+    &'static str,
+    &'static str,
+);
+
 #[tokio::test]
 async fn the_action_a_request_names_is_the_one_applied() {
     // The two values `ContributorInsightsAction` declares
@@ -443,13 +537,15 @@ async fn the_action_a_request_names_is_the_one_applied() {
         "case an action outside the set: nothing was written, got {untouched}"
     );
 
-    // Rows are the actions in the order they arrive, each with the status the call answers
-    // and the mode in force after it.
-    let steps: [(&str, &str, Option<&str>, &str, &str); 4] = [
+    // Rows are the actions in the order they arrive, each with whether the enable in flight
+    // is waited out first, the status the call answers (or `refused`) and the mode in force
+    // after it.
+    let steps: [ActionStep; 5] = [
         (
             "the disable before any enable",
             "DISABLE",
             None,
+            false,
             "refused",
             "<none>",
         ),
@@ -457,13 +553,23 @@ async fn the_action_a_request_names_is_the_one_applied() {
             "the enable",
             "ENABLE",
             Some("THROTTLED_KEYS"),
+            false,
             "ENABLING",
             "THROTTLED_KEYS",
         ),
         (
-            "the disable after it",
+            "the disable while that enable is still in flight",
             "DISABLE",
             None,
+            false,
+            "refused",
+            "<none>",
+        ),
+        (
+            "the disable once the enable has settled",
+            "DISABLE",
+            None,
+            true,
             "DISABLED",
             "THROTTLED_KEYS",
         ),
@@ -471,12 +577,16 @@ async fn the_action_a_request_names_is_the_one_applied() {
             "the disable once more",
             "DISABLE",
             None,
-            "DISABLED",
-            "THROTTLED_KEYS",
+            false,
+            "refused",
+            "<none>",
         ),
     ];
 
-    for (case, action, mode, expected_status, expected_mode) in steps {
+    for (case, action, mode, settled_first, expected_status, expected_mode) in steps {
+        if settled_first {
+            insights_when(&router, case, "InsightsActions", None, "ENABLED").await;
+        }
         let mut request = json!({
             "TableName": "InsightsActions",
             "ContributorInsightsAction": action,

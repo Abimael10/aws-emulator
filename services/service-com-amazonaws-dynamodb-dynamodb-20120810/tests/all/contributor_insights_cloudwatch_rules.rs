@@ -26,8 +26,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::emulator::{
-    call_cloudwatch, describe_when_active, emulator_with_cloudwatch, error_code, message, ok,
-    ok_cloudwatch,
+    call_cloudwatch, describe_when_active, emulator_with_cloudwatch, error_code, insights_when,
+    message, ok, ok_cloudwatch,
 };
 
 /// The prefix DynamoDB mints its rule names under, and the kinds it spells them with, read from
@@ -388,11 +388,13 @@ async fn enabling_contributor_insights_mints_the_mode_s_rules_for_the_table_s_ke
     }
 
     // A DISABLE deletes exactly that table's rules: every other table's keep collecting, and a
-    // report asked for a deleted rule is refused for the NAME it carried.
+    // report asked for a deleted rule is refused for the NAME it carried. The disable is
+    // performed from the status the enable settles in, so that enable is waited out first.
     let (case, table, minted) = enabled
         .first()
         .cloned()
         .expect("the table has at least one row");
+    insights_when(&router, case, &table, None, "ENABLED").await;
     set_insights(&router, &table, "DISABLE", None).await;
     let names = described_rule_names(&router, case).await;
     assert!(
@@ -642,7 +644,10 @@ async fn enabling_contributor_insights_on_an_index_mints_the_index_s_own_key_sch
          {table_itself}"
     );
 
-    // Disabling one index deletes its rules only: the other index keeps collecting.
+    // Disabling one index deletes its rules only: the other index keeps collecting. The
+    // disable is performed from the status the enable settles in, so the enable is waited
+    // out first ([`crate::emulator::insights_when`]).
+    insights_when(&router, case, TABLE, Some(HASH_ONLY_INDEX), "ENABLED").await;
     ok(
         &router,
         "UpdateContributorInsights",

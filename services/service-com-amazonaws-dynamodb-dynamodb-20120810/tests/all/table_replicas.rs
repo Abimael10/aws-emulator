@@ -905,3 +905,413 @@ async fn the_legacy_global_table_operations_answer_their_modelled_client_errors(
         "case after the legacy refusals: nothing was created, got {absent}"
     );
 }
+
+/// One row of the source-window table: the case, the call that tries to take the Region
+/// that sourced the add out of the group, and the Region it is signed for.
+type SourceWindowCase = (&'static str, &'static str, Value, &'static str);
+
+#[tokio::test]
+async fn a_region_that_has_just_sourced_a_replica_add_cannot_be_deleted() {
+    // RULE: the Region a replica was added FROM is the copy the new replica is still
+    // catching up with, so it cannot be taken out of the replication group for the 24 hours
+    // after the add — neither by deleting its own table nor by a `ReplicaUpdates` `Delete`
+    // naming it. The refusal is the 400 `ValidationException` AWS words for it, and it
+    // writes nothing: the table, its items and the whole group stay.
+    let router = emulator();
+    create_table(&router, "Replicated.Sourced").await;
+    settle().await;
+    ok_in(
+        &router,
+        REGION,
+        "PutItem",
+        json!({
+            "TableName": "Replicated.Sourced",
+            "Item": {"Id": {"S": "kept"}, "Status": {"S": "OPEN"}},
+        }),
+    )
+    .await;
+    ok_in(
+        &router,
+        REGION,
+        "UpdateTable",
+        json!({
+            "TableName": "Replicated.Sourced",
+            "ReplicaUpdates": [{"Create": {"RegionName": "us-west-2"}}],
+        }),
+    )
+    .await;
+    settle().await;
+
+    /// The sentence AWS refuses the removal of a recent source Region with, which states
+    /// the role that Region played and the window it is protected for.
+    const SOURCED_RECENTLY: &str = "Replica cannot be deleted because it has acted as a source \
+                                    region for new replica(s) being added to the table in the \
+                                    last 24 hours.";
+
+    // Rows differ in the call that would take the source Region out of the group, and in
+    // the Region the call is signed for: a `DeleteTable` of that regional table, the same
+    // delete addressed by the table's ARN, and a `ReplicaUpdates` `Delete` naming it from
+    // the replica's own Region.
+    let cases: [SourceWindowCase; 3] = [
+        (
+            "DeleteTable in the Region that sourced the add",
+            "DeleteTable",
+            json!({"TableName": "Replicated.Sourced"}),
+            REGION,
+        ),
+        (
+            "the same delete, addressed by the table's ARN",
+            "DeleteTable",
+            json!({
+                "TableName": format!(
+                    "arn:aws:dynamodb:{REGION}:000000000000:table/Replicated.Sourced"
+                ),
+            }),
+            REGION,
+        ),
+        (
+            "a ReplicaUpdates Delete naming the source Region",
+            "UpdateTable",
+            json!({
+                "TableName": "Replicated.Sourced",
+                "ReplicaUpdates": [{"Delete": {"RegionName": REGION}}],
+            }),
+            "us-west-2",
+        ),
+    ];
+
+    for (case, operation, request, signed_for) in cases {
+        let (status, body) = call_in(&router, signed_for, operation, request.clone()).await;
+        assert_eq!(
+            (status, error_code(&body), message(&body)),
+            (
+                400,
+                "ValidationException".to_string(),
+                SOURCED_RECENTLY.to_string()
+            ),
+            "case {case}: the removal is refused, got {status} with {body} for {request}"
+        );
+        assert_eq!(
+            body.get("TableDescription"),
+            None,
+            "case {case}: a refused delete answers no TableDescription, got {body}"
+        );
+
+        // Nothing was destroyed: the source table still serves its items, both regional
+        // tables are there and the group still spans both Regions.
+        let read = ok_in(
+            &router,
+            REGION,
+            "GetItem",
+            json!({"TableName": "Replicated.Sourced", "Key": {"Id": {"S": "kept"}}}),
+        )
+        .await;
+        let described = ok_in(
+            &router,
+            REGION,
+            "DescribeTable",
+            json!({"TableName": "Replicated.Sourced"}),
+        )
+        .await;
+        assert_eq!(
+            (
+                read["Item"]["Status"].clone(),
+                described["Table"]["TableStatus"].clone(),
+                replica_in(&described["Table"], "us-west-2")["ReplicaStatus"].clone(),
+                listed_group(&router, "Replicated.Sourced").await,
+            ),
+            (
+                json!({"S": "OPEN"}),
+                json!("ACTIVE"),
+                json!("ACTIVE"),
+                group_of(REGION, "us-west-2"),
+            ),
+            "case {case}: the refused removal left the group as it was, got {described}"
+        );
+    }
+
+    // The replica that was ADDED sourced nothing, so deleting ITS table is served: the
+    // window protects the Region that acted as the source and not every member of the
+    // group.
+    let deleted = ok_in(
+        &router,
+        "us-west-2",
+        "DeleteTable",
+        json!({"TableName": "Replicated.Sourced"}),
+    )
+    .await;
+    assert_eq!(
+        deleted["TableDescription"]["TableStatus"],
+        json!("DELETING"),
+        "case the added replica's own Region: its table is deleted, got {deleted}"
+    );
+}
+
+/// One row of the consistency table: the case, the `UpdateTable` body, and the message the
+/// refusal must carry.
+type ConsistencyCase = (&'static str, Value, &'static str);
+
+#[tokio::test]
+async fn a_multi_region_consistency_configuration_aws_does_not_serve_is_refused() {
+    // RULE: `MultiRegionConsistency` and `GlobalTableWitnessUpdates` state a configuration
+    // of the replication GROUP, so what they ask for is held to the group the request would
+    // leave behind: the member "is only valid when you create a global table by specifying
+    // one or more Create actions in the ReplicaUpdates action list" (its own doc), a witness
+    // belongs to the MRSC group that create establishes, and "a MRSC global table can be
+    // configured with either three replicas, or with two replicas and one witness"
+    // (`CreateGlobalTableWitnessGroupMemberAction`). A combination outside that is a bad
+    // REQUEST and is refused as the 400 `ValidationException` it is — never as an
+    // unimplemented surface, which is not a modelled outcome of this operation.
+    let router = emulator();
+    create_table(&router, "Replicated.Consistency").await;
+    settle().await;
+
+    /// How a group of the wrong shape is refused, as the model states the rule.
+    const WRONG_SHAPE: &str = "A MRSC global table can be configured with either three replicas, \
+                               or with two replicas and one witness";
+
+    // Rows differ in WHICH part of the configuration AWS does not serve: the number of
+    // Regions the group would span (two, and four), the member sent by a request that
+    // creates no replica at all, a witness added outside an MRSC create, a witness entry
+    // stating no action, a witness Region the request also creates a replica in, and a
+    // witness the group does not hold being removed.
+    let witness = |region: &str| json!([{"Create": {"RegionName": region}}]);
+    let cases: [ConsistencyCase; 7] = [
+        (
+            "STRONG with one replica create, which spans two Regions",
+            json!({
+                "TableName": "Replicated.Consistency",
+                "MultiRegionConsistency": "STRONG",
+                "ReplicaUpdates": [{"Create": {"RegionName": "us-west-2"}}],
+            }),
+            WRONG_SHAPE,
+        ),
+        (
+            "STRONG with three replica creates and a witness, which spans five",
+            json!({
+                "TableName": "Replicated.Consistency",
+                "MultiRegionConsistency": "STRONG",
+                "ReplicaUpdates": [
+                    {"Create": {"RegionName": "us-west-2"}},
+                    {"Create": {"RegionName": "eu-west-1"}},
+                    {"Create": {"RegionName": "ap-south-1"}},
+                ],
+                "GlobalTableWitnessUpdates": witness("eu-central-1"),
+            }),
+            WRONG_SHAPE,
+        ),
+        (
+            "STRONG with two replica creates and a witness in one of their Regions",
+            json!({
+                "TableName": "Replicated.Consistency",
+                "MultiRegionConsistency": "STRONG",
+                "ReplicaUpdates": [{"Create": {"RegionName": "us-west-2"}}],
+                "GlobalTableWitnessUpdates": witness("us-west-2"),
+            }),
+            "The witness Region us-west-2 must be a Region other than the Regions of this \
+             table's replicas",
+        ),
+        (
+            "STRONG on a request that creates no replica",
+            json!({
+                "TableName": "Replicated.Consistency",
+                "MultiRegionConsistency": "STRONG",
+                "ReplicaUpdates": [{"Update": {"RegionName": "us-west-2"}}],
+            }),
+            "MultiRegionConsistency is only valid when the request creates a global table with \
+             one or more Create actions in ReplicaUpdates",
+        ),
+        (
+            "EVENTUAL on a request that creates no replica",
+            json!({
+                "TableName": "Replicated.Consistency",
+                "MultiRegionConsistency": "EVENTUAL",
+                "DeletionProtectionEnabled": false,
+            }),
+            "MultiRegionConsistency is only valid when the request creates a global table with \
+             one or more Create actions in ReplicaUpdates",
+        ),
+        (
+            "a witness added by a request that is not creating an MRSC global table",
+            json!({
+                "TableName": "Replicated.Consistency",
+                "ReplicaUpdates": [{"Create": {"RegionName": "us-west-2"}}],
+                "GlobalTableWitnessUpdates": witness("eu-west-1"),
+            }),
+            "A witness Region can only be added when creating a global table with \
+             MultiRegionConsistency STRONG",
+        ),
+        (
+            "a witness entry stating neither Create nor Delete",
+            json!({
+                "TableName": "Replicated.Consistency",
+                "MultiRegionConsistency": "STRONG",
+                "ReplicaUpdates": [{"Create": {"RegionName": "us-west-2"}}],
+                "GlobalTableWitnessUpdates": [{}],
+            }),
+            "Each GlobalTableWitnessUpdate must contain exactly one of Create or Delete",
+        ),
+    ];
+
+    for (case, request, expected) in cases {
+        let (status, body) = call_in(&router, REGION, "UpdateTable", request.clone()).await;
+        assert_eq!(
+            (status, error_code(&body)),
+            (400, "ValidationException".to_string()),
+            "case {case}: the configuration is refused as a bad request, got {status} with {body}"
+        );
+        let reported = message(&body);
+        assert!(
+            reported.ends_with(expected),
+            "case {case}: expected a message carrying {expected:?}, got {reported:?}"
+        );
+        // A refused configuration wrote nothing: the table is still a regional table of its
+        // own, in no replication group at all.
+        let described = ok_in(
+            &router,
+            REGION,
+            "DescribeTable",
+            json!({"TableName": "Replicated.Consistency"}),
+        )
+        .await;
+        assert_eq!(
+            (
+                described["Table"]["Replicas"].clone(),
+                listed_group(&router, "Replicated.Consistency").await,
+            ),
+            (Value::Null, Vec::<String>::new()),
+            "case {case}: the refused call created no replication group, got {described}"
+        );
+    }
+
+    // A witness the group does not hold cannot be removed either, which is the other half
+    // of the witness rule.
+    let (status, body) = call_in(
+        &router,
+        REGION,
+        "UpdateTable",
+        json!({
+            "TableName": "Replicated.Consistency",
+            "GlobalTableWitnessUpdates": [{"Delete": {"RegionName": "eu-west-1"}}],
+        }),
+    )
+    .await;
+    assert_eq!(
+        (status, error_code(&body), message(&body)),
+        (
+            400,
+            "ValidationException".to_string(),
+            "One or more parameter values were invalid: The witness in eu-west-1 is not part of \
+             this table's global table"
+                .to_string()
+        ),
+        "case a witness delete on a group that holds none: it is refused, got {status} with {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_replica_table_class_override_past_the_quota_is_refused() {
+    // RULE: a `TableClassOverride` moves the class of the REPLICA's own regional table, so it
+    // is one of that table's changes and is held to the same table-class change quota a class
+    // change made against the table itself is — twice in a 30-day trailing period — with the
+    // control plane's modelled limit error past it and the class the replica has left in
+    // place.
+    let router = emulator();
+    let name = "Replicated.ClassQuota";
+    create_table(&router, name).await;
+    settle().await;
+    ok_in(
+        &router,
+        REGION,
+        "UpdateTable",
+        json!({
+            "TableName": name,
+            "ReplicaUpdates": [{"Create": {"RegionName": "us-west-2"}}],
+        }),
+    )
+    .await;
+    settle().await;
+
+    /// The sentence a change past the quota is refused with, whichever table it lands on.
+    const EXPECTED: &str =
+        "Subscriber limit exceeded: Updates to TableClass are limited to 2 times in 30 day(s).";
+
+    // The overrides the quota admits, each alternating the class so every one of them moves
+    // it.
+    for class in ["STANDARD_INFREQUENT_ACCESS", "STANDARD"] {
+        ok_in(
+            &router,
+            REGION,
+            "UpdateTable",
+            json!({
+                "TableName": name,
+                "ReplicaUpdates": [{"Update": {
+                    "RegionName": "us-west-2",
+                    "TableClassOverride": class,
+                }}],
+            }),
+        )
+        .await;
+        settle().await;
+        let replica_table = ok_in(&router, "us-west-2", "DescribeTable", json!({"TableName": name}))
+            .await;
+        assert_eq!(
+            replica_table["Table"]["TableClassSummary"]["TableClass"],
+            json!(class),
+            "case an override inside the quota: the replica's table holds {class}, got \
+             {replica_table}"
+        );
+    }
+
+    // The next CHANGE is refused, and the replica keeps the class the last admitted one left
+    // it in — while an override that re-states that class changes nothing and is served.
+    let (status, body) = call_in(
+        &router,
+        REGION,
+        "UpdateTable",
+        json!({
+            "TableName": name,
+            "ReplicaUpdates": [{"Update": {
+                "RegionName": "us-west-2",
+                "TableClassOverride": "STANDARD_INFREQUENT_ACCESS",
+            }}],
+        }),
+    )
+    .await;
+    assert_eq!(
+        (status, error_code(&body), message(&body)),
+        (
+            400,
+            "LimitExceededException".to_string(),
+            EXPECTED.to_string()
+        ),
+        "case an override past the quota: it is refused, got {status} with {body}"
+    );
+    let replica_table =
+        ok_in(&router, "us-west-2", "DescribeTable", json!({"TableName": name})).await;
+    assert_eq!(
+        replica_table["Table"]["TableClassSummary"]["TableClass"],
+        json!("STANDARD"),
+        "case an override past the quota: the refused update left the class as it was, got \
+         {replica_table}"
+    );
+    let restated = ok_in(
+        &router,
+        REGION,
+        "UpdateTable",
+        json!({
+            "TableName": name,
+            "ReplicaUpdates": [{"Update": {
+                "RegionName": "us-west-2",
+                "TableClassOverride": "STANDARD",
+            }}],
+        }),
+    )
+    .await;
+    assert_eq!(
+        replica_in(&restated["TableDescription"], "us-west-2")["ReplicaTableClassSummary"]
+            ["TableClass"],
+        json!("STANDARD"),
+        "case an override that re-states the class in force: it is served, got {restated}"
+    );
+}
