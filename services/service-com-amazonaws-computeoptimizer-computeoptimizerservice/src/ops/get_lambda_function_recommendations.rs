@@ -210,16 +210,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid_parameter(reason));
         }
         let include_unavailable = crate::state::lambda_filters_ask_for_unavailable(&filters);
+        // A page token names a boundary of the walk that minted it and of no other: it
+        // carries the fingerprint of THIS operation and of the members that select this
+        // result set, so a token another reader issued — every one of them hands out a
+        // boundary ARN — and one this reader issued for a different selection are both
+        // refused rather than applied as an ordering boundary of a sequence they name no
+        // position in.
+        let selection_fingerprint = crate::state::fingerprint(&(
+            Self::NAME,
+            &account_id,
+            &requested_functions,
+            &filters,
+        ));
         let resume_at = match input.next_token.as_deref() {
             None => None,
-            Some(token) => match crate::state::decode_resource_page_token(token) {
-                Some(function_arn) => Some(function_arn),
-                None => {
-                    return Err(invalid_parameter(
-                        "The value supplied for parameter nextToken is not valid.".to_string(),
-                    ))
+            Some(token) => {
+                match crate::state::decode_resource_page_token(&selection_fingerprint, token) {
+                    Some(function_arn) => Some(function_arn),
+                    None => {
+                        return Err(invalid_parameter(
+                            crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string(),
+                        ))
+                    }
                 }
-            },
+            }
         };
         // `maxResults` is modelled 0..1000 (the boundary refuses anything outside that).
         // Whatever it asks for, the page is capped at `MAX_PAGE_SIZE` so no number a request
@@ -292,12 +306,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|function| {
                 function.to_recommendation(&region, &look_back_period, last_refresh_timestamp)
             })
-            .filter(|recommendation| {
-                recommendation
-                    .function_arn
-                    .as_deref()
-                    .is_some_and(|arn| resume_at.as_deref().is_none_or(|start| arn >= start))
-            })
             // "Functions with a finding of unavailable are not returned unless you specify
             // the filter parameter with a value of Unavailable in your
             // GetLambdaFunctionRecommendations request."
@@ -311,14 +319,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
+        // Where this page starts: the position the function a `nextToken` named holds in the
+        // sequence this request selected. A token whose function that sequence no longer
+        // holds — the analysis moved on — names no boundary of THIS result set, so it is
+        // refused rather than answered with an empty final page a caller would read as "no
+        // more recommendations" ([`crate::state::resume_index`]).
+        let start = match crate::state::resume_index(
+            resume_at.as_deref(),
+            matching
+                .iter()
+                .map(|recommendation| recommendation.function_arn.as_deref().unwrap_or_default()),
+        ) {
+            Some(index) => index,
+            None => {
+                return Err(invalid_parameter(
+                    crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string(),
+                ))
+            }
+        };
+
         // One page, plus the function the next page starts at when recommendations remain.
-        let next_token = matching.get(page_size).and_then(|recommendation| {
-            recommendation
-                .function_arn
-                .as_deref()
-                .map(crate::state::encode_resource_page_token)
-        });
-        let lambda_function_recommendations = matching.into_iter().take(page_size).collect();
+        let next_token = matching
+            .get(start.saturating_add(page_size))
+            .and_then(|recommendation| {
+                recommendation.function_arn.as_deref().map(|arn| {
+                    crate::state::encode_resource_page_token(&selection_fingerprint, arn)
+                })
+            });
+        let lambda_function_recommendations =
+            matching.into_iter().skip(start).take(page_size).collect();
 
         Ok(GetLambdaFunctionRecommendationsOutput {
             next_token,

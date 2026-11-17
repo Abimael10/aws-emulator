@@ -1120,18 +1120,34 @@ fn account_scope_precedence(key: &PreferenceKey, account_id: &str) -> Option<u8>
 }
 
 /// The opaque `nextToken` `GetRecommendationPreferences` hands out: the key the next page
-/// starts at, hex-encoded so a client cannot read or construct one.
-pub fn encode_page_token(key: &PreferenceKey) -> String {
-    let encoded =
-        ::serde_json::json!([key.resource_type, key.scope_name, key.scope_value]).to_string();
+/// starts at, together with the fingerprint of the walk that minted it ([`fingerprint`],
+/// which binds the operation and the members that select the records), hex-encoded so a
+/// client cannot read or construct one.
+pub fn encode_page_token(selection_fingerprint: &str, key: &PreferenceKey) -> String {
+    let encoded = ::serde_json::json!({
+        "selection": selection_fingerprint,
+        "startAt": [key.resource_type, key.scope_name, key.scope_value],
+    })
+    .to_string();
     ::hex::encode(encoded)
 }
 
-/// The key a `nextToken` this service issued stands for, or `None` for a token it did not.
-pub fn decode_page_token(token: &str) -> Option<PreferenceKey> {
+/// The preference key a `nextToken` names FOR THIS WALK, or `None` for a token this walk
+/// cannot resume: a token this service never issued, and one minted for a different
+/// selection of the same reader, both read as absent, because only an equal fingerprint
+/// names a boundary of this result set.
+pub fn decode_page_token(selection_fingerprint: &str, token: &str) -> Option<PreferenceKey> {
     let bytes = ::hex::decode(token).ok()?;
-    let (resource_type, scope_name, scope_value) =
-        ::serde_json::from_slice::<(String, Option<String>, Option<String>)>(&bytes).ok()?;
+    let decoded = ::serde_json::from_slice::<::serde_json::Value>(&bytes).ok()?;
+    if decoded.get("selection")?.as_str()? != selection_fingerprint {
+        return None;
+    }
+    let (resource_type, scope_name, scope_value) = ::serde_json::from_value::<(
+        String,
+        Option<String>,
+        Option<String>,
+    )>(decoded.get("startAt")?.clone())
+    .ok()?;
     Some(PreferenceKey {
         resource_type,
         scope_name,
@@ -1287,22 +1303,57 @@ impl VolumeSample {
     }
 }
 
+/// What a reader answers when a `nextToken` is not one the walk it was handed to can resume.
+/// Worded once for the whole crate, so no two readers refuse the same token differently.
+pub const INVALID_NEXT_TOKEN_MESSAGE: &str =
+    "The value supplied for parameter nextToken is not valid.";
+
 /// The opaque `nextToken` a recommendation reader hands out: the ARN of the resource the
-/// next page starts at, hex-encoded so a client can neither read nor construct one.
-pub fn encode_resource_page_token(resource_arn: &str) -> String {
-    ::hex::encode(::serde_json::json!({ "startAt": resource_arn }).to_string())
+/// next page starts at, together with the fingerprint of the walk that minted it
+/// ([`fingerprint`], which every reader binds its OWN operation name and selection into),
+/// hex-encoded so a client can neither read nor construct one.
+pub fn encode_resource_page_token(selection_fingerprint: &str, resource_arn: &str) -> String {
+    ::hex::encode(
+        ::serde_json::json!({ "selection": selection_fingerprint, "startAt": resource_arn })
+            .to_string(),
+    )
 }
 
-/// The resource ARN a `nextToken` this service issued stands for, or `None` for a token
-/// it did not — including a token issued for a different page sequence, whose encoded
-/// shape is not this one.
-pub fn decode_resource_page_token(token: &str) -> Option<String> {
+/// The resource ARN a `nextToken` names FOR THIS WALK, or `None` for a token this walk
+/// cannot resume: a token this service never issued, one ANOTHER reader issued, and one this
+/// reader issued for a different selection all read as absent, because the token carries the
+/// fingerprint of the operation and selection it was minted for and only an equal fingerprint
+/// names a boundary of this result set.
+pub fn decode_resource_page_token(selection_fingerprint: &str, token: &str) -> Option<String> {
     let bytes = ::hex::decode(token).ok()?;
     let decoded = ::serde_json::from_slice::<::serde_json::Value>(&bytes).ok()?;
+    if decoded.get("selection")?.as_str()? != selection_fingerprint {
+        return None;
+    }
     decoded
         .get("startAt")?
         .as_str()
         .map(::std::string::ToString::to_string)
+}
+
+/// Where a page of a boundary-named walk resumes in the sequence this request selected: the
+/// position the boundary a `nextToken` named holds in `boundaries` (the identities of the
+/// selected sequence, in the order the reader reports them), the start for a request carrying
+/// no token, and `None` when the selected sequence no longer holds that boundary — which
+/// cannot name a boundary of THIS result set, so the reader refuses the request rather than
+/// answer an empty final page a caller would read as "no more recommendations".
+///
+/// The identity is whatever a reader's boundary is: a resource ARN for the recommendation
+/// readers, a stored record's key for the preference reader.
+pub fn resume_index<'a, T, I>(resume_at: Option<&T>, boundaries: I) -> Option<usize>
+where
+    T: PartialEq + ?Sized + 'a,
+    I: IntoIterator<Item = &'a T>,
+{
+    match resume_at {
+        None => Some(0),
+        Some(wanted) => boundaries.into_iter().position(|held| held == wanted),
+    }
 }
 
 // ===========================================================================

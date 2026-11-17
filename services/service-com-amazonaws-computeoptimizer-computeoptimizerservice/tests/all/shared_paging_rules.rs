@@ -15,6 +15,10 @@
 //! * WHICH items that page carries and what follows it — the items after the point the
 //!   previous page stopped at, with a `nextToken` handed out exactly when the sequence
 //!   continues past the page, resuming where it stopped.
+//! * WHICH WALK a page token belongs to — a `nextToken` names a boundary of the walk that
+//!   minted it and of no other, so a reader resumes its own token and refuses one another
+//!   reader minted, or one minted for a different selection of its own, rather than answering
+//!   it with a page of a different result set.
 //!
 //! Both are asserted over a TABLE of every reader of this service whose page the request
 //! sizes, each with its own default and ceiling (the eleven rows below), crossed with the
@@ -34,14 +38,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
     service_state, AnalysedResource, MemberAccountEnrollment, ANALYSIS_DELAY, DEFAULT_PAGE_SIZE,
-    ENROLLMENT_STATUSES_MAX_PAGE_SIZE, IDLE_MAX_PAGE_SIZE, MAX_PAGE_SIZE, SCOPE_ACCOUNT_ID,
-    SCOPE_ORGANIZATION, SCOPE_RESOURCE_ARN, SOURCE_TYPE_RDS_DB_INSTANCE,
+    ENROLLMENT_STATUSES_MAX_PAGE_SIZE, IDLE_MAX_PAGE_SIZE, MAX_PAGE_SIZE, RESOURCE_TYPE_EBS_VOLUME,
+    SCOPE_ACCOUNT_ID, SCOPE_ORGANIZATION, SCOPE_RESOURCE_ARN, SOURCE_TYPE_RDS_DB_INSTANCE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
-    call, call_ecs, create_bucket, emulator_with_analysed_services_and_engine, instance_arn,
-    opt_in, put_preference, seed_cloudwatch_series, ACCOUNT,
+    call, call_ecs, create_bucket, emulator_with_analysed_services_and_engine, error_code,
+    instance_arn, opt_in, put_preference, seed_cloudwatch_series, ACCOUNT,
 };
 
 /// The destination bucket the export jobs below are created against. Compute Optimizer does
@@ -327,6 +331,221 @@ async fn a_paged_walk_reports_the_unpaged_sequence_exactly_once() {
             );
         }
     }
+}
+
+/// A `nextToken` resumes the WALK that minted it and no other.
+///
+/// Every reader of this service hands out an opaque token, and several of them encode the same
+/// kind of boundary, so what makes a token this reader's is the operation and the selection
+/// bound into it. Asserted over the whole table crossed with itself: each reader resumes its
+/// OWN token, and refuses every other reader's with the one refusal this service models for a
+/// value it cannot honour — never with a page of a different result set, and never with an
+/// empty final page a client would read as "the walk is finished".
+#[tokio::test]
+async fn a_next_token_resumes_only_the_walk_that_minted_it() {
+    let (router, _engine) = paged_emulator().await;
+
+    // One token per reader, minted by a one-item page of its own walk: the fixture gives
+    // every row more than one item to report, so each hands one out.
+    let mut minted: Vec<(&'static str, String)> = Vec::new();
+    for reader in readers() {
+        let body = read(&router, &reader, "minting a token", Some(1), None).await;
+        let token = body["nextToken"].as_str().unwrap_or_else(|| {
+            panic!(
+                "case {:?}: a one-item page of a longer sequence must hand out a nextToken, got \
+                 {body}",
+                reader.operation
+            )
+        });
+        minted.push((reader.operation, token.to_string()));
+    }
+
+    for reader in readers() {
+        let whole = page_of(&read(&router, &reader, "the unpaged read", None, None).await, &reader);
+        assert!(
+            whole.len() >= 2,
+            "case {:?}: this fixture must hold at least two items for a token to resume at one, \
+             got {whole:?}",
+            reader.operation
+        );
+        let own = minted
+            .iter()
+            .find(|(operation, _)| *operation == reader.operation)
+            .map(|(_, token)| token.clone())
+            .expect("every reader of the table minted a token");
+
+        // Its OWN token resumes its own walk, at the item after the page that minted it.
+        let label = format!("{} resuming its own token", reader.operation);
+        let page = page_of(
+            &read(&router, &reader, &label, Some(1), Some(&own)).await,
+            &reader,
+        );
+        assert_eq!(
+            page,
+            whole[1..2].to_vec(),
+            "case {label:?}: expected the page {:?}, got {page:?}",
+            &whole[1..2]
+        );
+
+        // Every OTHER reader's token names a boundary of a walk this reader is not.
+        for (minted_by, token) in &minted {
+            if *minted_by == reader.operation {
+                continue;
+            }
+            let label = format!("{} resuming a token {minted_by} minted", reader.operation);
+            let mut request = reader.request.clone();
+            request["nextToken"] = json!(token);
+            let (status, body) = call(&router, reader.operation, request.clone()).await;
+            assert_eq!(
+                status, 400,
+                "case {label:?}: expected {request} to be refused with 400, got {status}: {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "InvalidParameterValueException",
+                "case {label:?}: expected InvalidParameterValueException, got {body}"
+            );
+        }
+    }
+}
+
+/// The member each recommendation reader narrows its selection with, from that operation's
+/// input in this service's Smithy model (`GetAutoScalingGroupRecommendations$autoScalingGroupArns`,
+/// `GetEBSVolumeRecommendations$volumeArns`, `GetEC2InstanceRecommendations$instanceArns`,
+/// `GetECSServiceRecommendations$serviceArns`, `GetLambdaFunctionRecommendations$functionArns`).
+/// A reader absent from this list narrows its selection by no resource ARN at all.
+const RESOURCE_SELECTION_MEMBERS: &[(&str, &str)] = &[
+    (
+        "GetAutoScalingGroupRecommendations",
+        "autoScalingGroupArns",
+    ),
+    ("GetEBSVolumeRecommendations", "volumeArns"),
+    ("GetEC2InstanceRecommendations", "instanceArns"),
+    ("GetECSServiceRecommendations", "serviceArns"),
+    ("GetLambdaFunctionRecommendations", "functionArns"),
+];
+
+/// A `nextToken` resumes the SELECTION it was minted for and no other: a token of a reader's
+/// own walk, handed back with a different set of resources selected, is refused rather than
+/// resolved against a sequence it names no position in. The rows differ in how the selection
+/// changed — the same resources named explicitly, and a narrower set — because what makes the
+/// token foreign is the selection it was minted for, not how much of it survives.
+#[tokio::test]
+async fn a_next_token_does_not_resume_a_different_selection() {
+    let (router, _engine) = paged_emulator().await;
+
+    for reader in readers() {
+        let Some((_, member)) = RESOURCE_SELECTION_MEMBERS
+            .iter()
+            .find(|(operation, _)| *operation == reader.operation)
+        else {
+            continue;
+        };
+        let whole = page_of(&read(&router, &reader, "the unpaged read", None, None).await, &reader);
+        assert!(
+            whole.len() >= 2,
+            "case {:?}: this fixture must hold at least two items for a token to resume at one, \
+             got {whole:?}",
+            reader.operation
+        );
+        let body = read(&router, &reader, "minting a token", Some(1), None).await;
+        let token = body["nextToken"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {:?}: a one-item page of a longer sequence must hand out a nextToken, \
+                     got {body}",
+                    reader.operation
+                )
+            })
+            .to_string();
+
+        for (case, selected) in [
+            ("the same resources named explicitly", whole.clone()),
+            ("one resource of the sequence", whole[..1].to_vec()),
+        ] {
+            let label = format!("{} resuming its token with {case}", reader.operation);
+            let mut request = reader.request.clone();
+            request["nextToken"] = json!(token);
+            request[*member] = json!(selected);
+            let (status, body) = call(&router, reader.operation, request.clone()).await;
+            assert_eq!(
+                status, 400,
+                "case {label:?}: expected {request} to be refused with 400, got {status}: {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "InvalidParameterValueException",
+                "case {label:?}: expected InvalidParameterValueException, got {body}"
+            );
+        }
+    }
+}
+
+/// The preference reader pages a SELECTED set of stored records too, and its selection is
+/// `resourceType` plus the optional `scope` rather than a list of resource ARNs — so the same
+/// rule holds there: a token minted for one selection of records is refused by another, never
+/// applied to it. The control row is the selection the token WAS minted for, which resumes.
+#[tokio::test]
+async fn a_preference_token_resumes_only_the_records_it_was_minted_for() {
+    let (router, _engine) = paged_emulator().await;
+    let operation = "GetRecommendationPreferences";
+    let selection = json!({"resourceType": "Ec2Instance"});
+
+    let mut request = selection.clone();
+    request["maxResults"] = json!(1);
+    let (status, body) = call(&router, operation, request).await;
+    assert_eq!(
+        status, 200,
+        "minting a token: expected 200, got {status}: {body}"
+    );
+    let token = body["nextToken"]
+        .as_str()
+        .unwrap_or_else(|| panic!("minting a token: expected a nextToken, got {body}"))
+        .to_string();
+
+    for (case, mut request) in [
+        (
+            "another resource type",
+            json!({"resourceType": RESOURCE_TYPE_EBS_VOLUME}),
+        ),
+        (
+            "a scope narrowing the records",
+            json!({
+                "resourceType": "Ec2Instance",
+                "scope": {"name": SCOPE_ACCOUNT_ID, "value": ACCOUNT},
+            }),
+        ),
+    ] {
+        request["nextToken"] = json!(token);
+        let (status, body) = call(&router, operation, request.clone()).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected {request} to be refused with 400, got {status}: {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidParameterValueException",
+            "case {case:?}: expected InvalidParameterValueException, got {body}"
+        );
+    }
+
+    // The selection the token WAS minted for resumes the walk it stopped.
+    let mut request = selection.clone();
+    request["maxResults"] = json!(1);
+    request["nextToken"] = json!(token);
+    let (status, body) = call(&router, operation, request).await;
+    assert_eq!(
+        status, 200,
+        "the selection the token was minted for: expected 200, got {status}: {body}"
+    );
+    assert_eq!(
+        body["recommendationPreferencesDetails"]
+            .as_array()
+            .map(Vec::len),
+        Some(1),
+        "the selection the token was minted for: expected the next record, got {body}"
+    );
 }
 
 /// One page of `reader`'s response, as the identities of the items it carries.

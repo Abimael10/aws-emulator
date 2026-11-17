@@ -282,17 +282,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             requested.push(reference);
         }
+        // A page token names a boundary of the walk that minted it and of no other: it
+        // carries the fingerprint of THIS operation and of the members that select this
+        // result set, so a token another reader issued — every one of them hands out a
+        // boundary ARN — and one this reader issued for a different selection are both
+        // refused rather than applied as an ordering boundary of a sequence they name no
+        // position in.
+        let selection_fingerprint = crate::state::fingerprint(&(
+            Self::NAME,
+            &account_id,
+            &input.service_arns,
+            &input.filters,
+        ));
         // A `nextToken` this service did not issue cannot name a page boundary.
         let resume_at = match input.next_token.as_deref() {
             None => None,
-            Some(token) => match crate::state::decode_resource_page_token(token) {
-                Some(arn) => Some(arn),
-                None => {
-                    return Err(invalid(
-                        "The value supplied for parameter nextToken is not valid.",
-                    ))
+            Some(token) => {
+                match crate::state::decode_resource_page_token(&selection_fingerprint, token) {
+                    Some(arn) => Some(arn),
+                    None => return Err(invalid(crate::state::INVALID_NEXT_TOKEN_MESSAGE)),
                 }
-            },
+            }
         };
         // `maxResults` is modelled 0..1000 (the boundary refuses anything outside that).
         // Whatever it asks for, the page is capped at `MAX_PAGE_SIZE` so no number a
@@ -367,17 +377,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = cloudwatch::state::now_secs();
+        // Where this page starts: the position the service a `nextToken` named holds in the
+        // sequence this request selected. A token whose service that sequence no longer holds
+        // — it was deleted, or the analysis moved on — names no boundary of THIS result set,
+        // so it is refused rather than answered with an empty final page a caller would read
+        // as "no more recommendations" ([`crate::state::resume_index`]).
+        let start = match crate::state::resume_index(
+            resume_at.as_deref(),
+            candidates
+                .iter()
+                .map(|candidate| candidate.reference.arn.as_str()),
+        ) {
+            Some(index) => index,
+            None => return Err(invalid(crate::state::INVALID_NEXT_TOKEN_MESSAGE)),
+        };
         let mut recommendations: Vec<ECSServiceRecommendation> = Vec::new();
         let mut errors: Vec<GetRecommendationError> = Vec::new();
         let mut next_token = None;
         let observations = observations.lock();
-        for candidate in &candidates {
-            if resume_at
-                .as_deref()
-                .is_some_and(|start| candidate.reference.arn.as_str() < start)
-            {
-                continue;
-            }
+        for candidate in candidates.get(start..).unwrap_or_default() {
             // `maxResults` bounds the RESPONSE: a service reported as an error of the
             // request takes a place on the page as a reported recommendation does, so no
             // number of requested ARNs can grow one response past the page size. A
@@ -387,6 +405,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if recommendations.len() + errors.len() >= page_size {
                 // The page is full and this service is the next page's first.
                 next_token = Some(crate::state::encode_resource_page_token(
+                    &selection_fingerprint,
                     &candidate.reference.arn,
                 ));
                 break;

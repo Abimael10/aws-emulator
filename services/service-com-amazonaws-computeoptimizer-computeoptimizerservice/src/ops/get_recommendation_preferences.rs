@@ -200,24 +200,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // A page token names a boundary of the walk that minted it and of no other: it
+        // carries the fingerprint of THIS operation and of the members that select the
+        // records reported, so a token minted for a different `resourceType` or `scope` is
+        // refused rather than applied as an ordering boundary of a sequence it names no
+        // position in ([`crate::state::fingerprint`], the rule every paginated reader of
+        // this service binds into its cursor).
+        let selection_fingerprint =
+            crate::state::fingerprint(&(Self::NAME, &input.resource_type, &input.scope));
         // A `nextToken` this service did not issue cannot name a page boundary.
         let resume_at = match input.next_token.as_deref() {
             None => None,
-            Some(token) => match crate::state::decode_page_token(token) {
+            Some(token) => match crate::state::decode_page_token(&selection_fingerprint, token) {
                 Some(key) => Some(key),
-                None => {
-                    return Err(
-                        GetRecommendationPreferencesErrorModeled::InvalidParameterValueException(
-                            InvalidParameterValueException {
-                                message: Some(
-                                    "The value supplied for parameter nextToken is not valid."
-                                        .to_string(),
-                                ),
-                            },
-                        )
-                        .into(),
-                    )
-                }
+                None => return Err(invalid_next_token()),
             },
         };
 
@@ -252,29 +248,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
-        let mut details: Vec<RecommendationPreferencesDetail> = Vec::new();
-        let mut next_token = None;
-        for (key, record) in &guard.preferences {
-            if key.resource_type != input.resource_type {
-                continue;
-            }
-            if only_scope.as_ref().is_some_and(|wanted| key != wanted) {
-                continue;
-            }
-            if resume_at.as_ref().is_some_and(|start| key < start) {
-                continue;
-            }
-            if details.len() >= page_size {
-                // The page is full and this record is the next page's first.
-                next_token = Some(crate::state::encode_page_token(key));
-                break;
-            }
-            details.push(record.to_detail());
-        }
+        // The records this request selects, in the order the store holds them, so a page
+        // boundary is a position in a sequence that is stable across calls.
+        let selected: Vec<(&crate::state::PreferenceKey, _)> = guard
+            .preferences
+            .iter()
+            .filter(|(key, _)| key.resource_type == input.resource_type)
+            .filter(|(key, _)| only_scope.as_ref().is_none_or(|wanted| *key == wanted))
+            .collect();
+        // Where this page starts: the position the record a `nextToken` named holds in that
+        // sequence. A token whose record the sequence no longer holds — it was deleted — names
+        // no boundary of THIS result set, so it is refused rather than answered with an empty
+        // final page a caller would read as "no more preferences"
+        // ([`crate::state::resume_index`]).
+        let start = match crate::state::resume_index(
+            resume_at.as_ref(),
+            selected.iter().map(|(key, _)| *key),
+        ) {
+            Some(index) => index,
+            None => return Err(invalid_next_token()),
+        };
+        let page = selected.get(start..).unwrap_or_default();
+        // The page is full and the record after it is the next page's first.
+        let next_token = page
+            .get(page_size)
+            .map(|(key, _)| crate::state::encode_page_token(&selection_fingerprint, key));
+        let details: Vec<RecommendationPreferencesDetail> = page
+            .iter()
+            .take(page_size)
+            .map(|(_, record)| record.to_detail())
+            .collect();
 
         Ok(GetRecommendationPreferencesOutput {
             next_token,
             recommendation_preferences_details: Some(details),
         })
     }
+}
+
+/// A 400 `InvalidParameterValueException` for a `nextToken` that is not one the walk it was
+/// handed to can resume, worded as the whole crate words it
+/// ([`crate::state::INVALID_NEXT_TOKEN_MESSAGE`]) so no two readers refuse the same token
+/// differently.
+fn invalid_next_token() -> GetRecommendationPreferencesError {
+    GetRecommendationPreferencesErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string()),
+        },
+    )
+    .into()
 }

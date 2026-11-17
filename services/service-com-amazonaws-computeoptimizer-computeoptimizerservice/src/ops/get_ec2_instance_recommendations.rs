@@ -224,17 +224,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_ref()
             .and_then(|preferences| preferences.cpu_vendor_architectures.clone())
             .unwrap_or_default();
+        // A page token names a boundary of the walk that minted it and of no other: it
+        // carries the fingerprint of THIS operation and of the members that select this
+        // result set, so a token another reader issued — every one of them hands out a
+        // boundary ARN — and one this reader issued for a different selection are both
+        // refused rather than resolved against a sequence they name no position in.
+        let selection_fingerprint = crate::state::fingerprint(&(
+            Self::NAME,
+            &account_id,
+            &requested_arns,
+            &input.filters,
+            &requested_architectures,
+        ));
         // A `nextToken` this service did not issue cannot name a page boundary.
         let resume_at = match input.next_token.as_deref() {
             None => None,
-            Some(token) => match crate::state::decode_resource_page_token(token) {
-                Some(instance_arn) => Some(instance_arn),
-                None => {
-                    return Err(invalid_parameter(
-                        "The value supplied for parameter nextToken is not valid.".to_string(),
-                    ))
+            Some(token) => {
+                match crate::state::decode_resource_page_token(&selection_fingerprint, token) {
+                    Some(instance_arn) => Some(instance_arn),
+                    None => {
+                        return Err(invalid_parameter(
+                            crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string(),
+                        ))
+                    }
                 }
-            },
+            }
         };
         // `maxResults` is modelled 0..1000 (the boundary refuses anything outside that).
         // Whatever it asks for, the page is capped at `MAX_PAGE_SIZE` so no number a request
@@ -317,21 +331,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a boundary of THIS result set — the request changed its selection, or the analysis
         // moved on — so it is refused rather than answered with an empty final page a caller
         // would read as "no more recommendations".
-        let start = match &resume_at {
-            None => 0,
-            Some(arn) => match resolved.iter().position(|(_, held, _)| held == arn) {
-                Some(index) => index,
-                None => {
-                    return Err(invalid_parameter(
-                        "The value supplied for parameter nextToken is not valid.".to_string(),
-                    ))
-                }
-            },
+        let start = match crate::state::resume_index(
+            resume_at.as_deref(),
+            resolved.iter().map(|(_, held, _)| held.as_str()),
+        ) {
+            Some(index) => index,
+            None => {
+                return Err(invalid_parameter(
+                    crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string(),
+                ))
+            }
         };
         let page = resolved.get(start..).unwrap_or_default();
-        let next_token = page
-            .get(page_size)
-            .map(|(_, arn, _)| crate::state::encode_resource_page_token(arn));
+        let next_token = page.get(page_size).map(|(_, arn, _)| {
+            crate::state::encode_resource_page_token(&selection_fingerprint, arn)
+        });
 
         let instance_recommendations: Vec<InstanceRecommendation> = page
             .iter()
