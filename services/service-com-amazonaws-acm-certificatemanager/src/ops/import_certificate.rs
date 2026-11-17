@@ -551,6 +551,8 @@ impl ImportedCertificate {
 /// operation's documented guidelines exclude:
 ///
 /// * "The certificate, private key, and certificate chain must be PEM-encoded";
+/// * the `Certificate` member frames exactly ONE PEM certificate, a body framing more
+///   or none naming no single certificate to import ([`one_certificate`]);
 /// * "The private key must be unencrypted";
 /// * "You must enter the private key that matches the certificate you are importing";
 /// * "The current time must be between the Not Before and Not After certificate
@@ -572,8 +574,7 @@ fn imported_certificate(
     input: &ImportCertificateInput,
     now: ::std::time::SystemTime,
 ) -> Result<ImportedCertificate, ImportCertificateError> {
-    let certificate =
-        X509Certificate::from_pem(&input.certificate).map_err(|_| certificate_not_pem())?;
+    let certificate = one_certificate(&input.certificate)?;
 
     let chain_pem = input
         .certificate_chain
@@ -714,11 +715,48 @@ fn chain_not_pem() -> ImportCertificateError {
     validation_exception("The certificate chain is not PEM-encoded or is not valid.")
 }
 
-/// The refusal for a `Certificate` body that is not one PEM-encoded X.509 certificate —
-/// bytes that are not text, text framing no PEM message, a body whose base64 content
-/// cannot be decoded, or one whose content does not decode as a certificate. The
-/// counterpart of [`chain_not_pem`] for the member that carries the certificate being
-/// imported, under the same sentence form.
+/// The one certificate the `Certificate` member carries.
+///
+/// That member is read as the sequence of PEM certificate messages its body frames, and
+/// it holds exactly ONE of them: the certificate being imported. The certificates above
+/// it in its path belong to `CertificateChain` ("the certificate chain that has been
+/// returned", `GetCertificateResponse$CertificateChain`), and a body framing no
+/// certificate message at all names no certificate to import either. So the COUNT is
+/// read first, over whatever bytes arrived — a body that is not text frames no PEM
+/// message — and a count other than one is refused under the sentence naming the
+/// member's one-certificate constraint ([`not_one_certificate`]); only a body framing
+/// exactly one certificate message is then decoded, and refused under the sentence
+/// naming the encoding ([`certificate_not_pem`]) when its content is not a certificate.
+fn one_certificate(body: &[u8]) -> Result<X509Certificate, ImportCertificateError> {
+    // The pre-encapsulation boundary a PEM certificate message opens with, which RFC
+    // 7468 section 2 puts on a line of its own — so only a line that IS the boundary
+    // opens a message, and a body that is not text frames none at all.
+    let boundary = format!("{PEM_BEGIN}{CERTIFICATE_PEM_LABEL}-----");
+    let certificates = String::from_utf8_lossy(body)
+        .lines()
+        .filter(|line| *line == boundary)
+        .count();
+    if certificates != 1 {
+        return Err(not_one_certificate());
+    }
+    X509Certificate::from_pem(body).map_err(|_| certificate_not_pem())
+}
+
+/// The refusal for a `Certificate` body that does not frame exactly one PEM certificate
+/// — a path pasted into the member that holds the leaf, or a body framing no certificate
+/// at all. Fixed text naming the member's constraint, with nothing of the request
+/// interpolated.
+fn not_one_certificate() -> ImportCertificateError {
+    validation_exception(
+        "The certificate field contains more than one certificate. You can specify only \
+         one certificate in this field.",
+    )
+}
+
+/// The refusal for a `Certificate` body that frames exactly one PEM certificate message
+/// whose content is not an X.509 certificate — base64 that cannot be decoded, or content
+/// that decodes to something else. The counterpart of [`chain_not_pem`] for the member
+/// that carries the certificate being imported, under the same sentence form.
 fn certificate_not_pem() -> ImportCertificateError {
     validation_exception("The certificate is not PEM-encoded or is not valid.")
 }

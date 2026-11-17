@@ -16,7 +16,12 @@
 //!   modelled constraint failure for supplied input under its own fixed sentence;
 //! * a `PrivateKey` that is well formed but belongs to another key pair is the same
 //!   class of refusal, under its own fixed sentence, and leaves the certificate stored
-//!   at the ARN the request named exactly as it was.
+//!   at the ARN the request named exactly as it was;
+//! * the `Certificate` member is read as the PEM certificate messages its body frames
+//!   and holds exactly ONE of them, so a body framing any other number is refused with
+//!   that same class under the fixed sentence naming the member's one-certificate
+//!   constraint, while a body framing exactly one whose content is not a certificate is
+//!   refused under the sentence naming the encoding.
 //!
 //! Every certificate here is built by `rcgen` — something other than the code under
 //! test — and every assertion goes through the same router the emulator serves
@@ -43,6 +48,17 @@ const CHAIN_EXPIRED: &str = "A certificate in the chain is expired. You can Impo
 const CHAIN_NOT_PEM: &str = "The certificate chain is not PEM-encoded or is not valid.";
 const CHAIN_WRONG_PEM: &str = "Passed PEM is not a certificate chain.";
 const KEY_MISMATCH: &str = "Key provided does not match the certificate.";
+/// The sentence ACM answers for a `Certificate` body that does not frame exactly one
+/// certificate, as recorded against the real service — the recording that fixes it is a
+/// body framing NO PEM message at all, which draws this sentence and not the one below:
+/// fixed text in full, naming nothing of the request.
+const NOT_ONE_CERTIFICATE: &str = "The certificate field contains more than one \
+                                   certificate. You can specify only one certificate in \
+                                   this field.";
+/// The sentence ACM answers for a `Certificate` body that frames exactly one PEM
+/// certificate message whose content it cannot read as an X.509 certificate, as recorded
+/// against the real service.
+const CERTIFICATE_NOT_PEM: &str = "The certificate is not PEM-encoded or is not valid.";
 
 /// What one generated certificate is built from: its subject common name, whether it
 /// asserts `BasicConstraints` ca=true, its validity window as `(not_before, not_after)`
@@ -458,5 +474,165 @@ async fn a_key_that_is_not_the_certificates_is_refused() {
         vec![arn.clone()],
         "case {:?}: only the control import may be stored, got {listed:?}",
         "every key refusal above"
+    );
+}
+
+/// RULE: the `Certificate` member is read as the PEM certificate messages its body
+/// frames and holds exactly ONE of them — the certificate being imported — so a body
+/// framing any other number, more or none, is the modelled constraint failure for
+/// supplied input under the fixed sentence naming that constraint, whichever
+/// certificates the body carries, in whatever order, however many, whether or not each
+/// decodes, and whatever text separates the PEM blocks. A body framing exactly one
+/// certificate message is then DECODED, and one whose content is not a certificate is
+/// refused under the sentence naming the encoding instead — so the first sentence is
+/// reported for the count and the second for the content. The certificates above the
+/// leaf belong to `CertificateChain`, where the same material is accepted and served
+/// back.
+#[tokio::test]
+async fn the_certificate_member_carries_one_certificate() {
+    let router = router();
+
+    let signer = Authority::new("one-only-ca.example.com");
+    let leaf = signer.sign(&Spec {
+        common_name: "one-only.example.com",
+        ..Spec::default()
+    });
+    let stranger = Authority::new("one-only-stranger.example.com");
+    let other_leaf = self_signed(&Spec {
+        common_name: "second-leaf.example.com",
+        ..Spec::default()
+    });
+    // A well-formed CERTIFICATE block whose content is not a certificate at all, so a
+    // body carrying two of them is more than one certificate AND undecodable.
+    let undecodable = "-----BEGIN CERTIFICATE-----\nZm9v\n-----END CERTIFICATE-----\n";
+
+    // Rows differ along how many certificates the field carries (none, two, three),
+    // which ones they are, their order, whether each decodes, what separates the PEM
+    // blocks, and — for the bodies framing none — whether the body is text at all. The
+    // first row is the shape the recorded ACM traffic fixes: a body framing no PEM
+    // message at all (the 21 bytes `not-a-pem-certificate`) draws this sentence and not
+    // the encoding one below.
+    let refusals: &[(&str, Value)] = &[
+        (
+            "text framing no PEM message at all",
+            blob("not-a-pem-certificate"),
+        ),
+        (
+            "a boundary that does not open its own line",
+            blob(&format!("leading text {}", leaf.certificate)),
+        ),
+        (
+            "a single character",
+            blob("x"),
+        ),
+        (
+            "a well-formed PEM of another type",
+            blob(&leaf.private_key),
+        ),
+        (
+            "a CERTIFICATE REQUEST block",
+            blob("-----BEGIN CERTIFICATE REQUEST-----\nZm9v\n-----END CERTIFICATE REQUEST-----\n"),
+        ),
+        (
+            "bytes that are not text",
+            json!(aws_smithy_types::base64::encode([0xff_u8, 0xfe, 0x00, 0x80])),
+        ),
+        (
+            "the leaf with its own signing authority below it",
+            blob(&format!("{}{}", leaf.certificate, signer.pem)),
+        ),
+        (
+            "the signing authority above the leaf",
+            blob(&format!("{}{}", signer.pem, leaf.certificate)),
+        ),
+        (
+            "the same certificate twice",
+            blob(&format!("{}{}", leaf.certificate, leaf.certificate)),
+        ),
+        (
+            "the leaf with an unrelated authority",
+            blob(&format!("{}{}", leaf.certificate, stranger.pem)),
+        ),
+        (
+            "the leaf with another end-entity certificate",
+            blob(&format!("{}{}", leaf.certificate, other_leaf.certificate)),
+        ),
+        (
+            "three certificates",
+            blob(&format!(
+                "{}{}{}",
+                leaf.certificate, signer.pem, stranger.pem
+            )),
+        ),
+        (
+            "two certificates separated by a blank line",
+            blob(&format!("{}\n{}", leaf.certificate, signer.pem)),
+        ),
+        (
+            "two certificates with CRLF line endings",
+            blob(&format!("{}{}", leaf.certificate, signer.pem).replace('\n', "\r\n")),
+        ),
+        (
+            "the leaf below a CERTIFICATE block framing no certificate",
+            blob(&format!("{undecodable}{}", leaf.certificate)),
+        ),
+        (
+            "two CERTIFICATE blocks framing no certificate",
+            blob(&format!("{undecodable}{undecodable}")),
+        ),
+    ];
+
+    for (case, body) in refusals {
+        let mut request = import_body(&leaf);
+        request["Certificate"] = body.clone();
+        refused(&router, case, &request, NOT_ONE_CERTIFICATE).await;
+    }
+
+    // Exactly one certificate message is a body this member holds, so what it frames is
+    // then decoded and the refusal names the encoding instead.
+    let one_message: &[(&str, String)] = &[
+        (
+            "one CERTIFICATE block framing no certificate",
+            undecodable.to_string(),
+        ),
+        (
+            "one CERTIFICATE block whose base64 is damaged",
+            leaf.certificate.replacen('M', "!", 1),
+        ),
+        (
+            "the certificate with a PEM private key below it",
+            format!("{}{}", leaf.certificate, leaf.private_key),
+        ),
+    ];
+
+    for (case, body) in one_message {
+        let mut request = import_body(&leaf);
+        request["Certificate"] = blob(body);
+        refused(&router, case, &request, CERTIFICATE_NOT_PEM).await;
+    }
+
+    let listed = stored_arns(&router).await;
+    assert!(
+        listed.is_empty(),
+        "case {:?}: a refused import must store nothing, got {listed:?}",
+        "every Certificate-member refusal above"
+    );
+
+    // The same material in the two members it belongs in: the leaf alone as the
+    // certificate, its authority as the chain — accepted, and served back as sent.
+    let case = "the leaf alone, with its authority as the chain";
+    let mut request = import_body(&leaf);
+    request["CertificateChain"] = blob(&signer.pem);
+    let arn = import(&router, case, &request).await;
+    let served = get_certificate(&router, case, &arn).await;
+    assert_eq!(
+        served["Certificate"].as_str(),
+        Some(leaf.certificate.as_str()),
+        "case {case:?}: expected the one imported certificate back, got {served}"
+    );
+    assert_eq!(
+        served["CertificateChain"].as_str(),
+        Some(signer.pem.as_str()),
+        "case {case:?}: expected the chain back as sent, got {served}"
     );
 }

@@ -52,6 +52,15 @@ use crate::certificate_validation_state_machine::{make_validation_due_now, PRIVA
 /// asserting.
 const CERTIFICATE_NOT_PEM: &str = "The certificate is not PEM-encoded or is not valid.";
 
+/// The sentence ACM answers for a `Certificate` body that frames some number of PEM
+/// certificates other than one — none at all as much as several — as recorded against
+/// the real service, whose recorded case is a body framing no PEM message whatsoever.
+/// The member holds the one certificate being imported, so the count is read before any
+/// content is, and only a body framing exactly one is held to the sentence above.
+const NOT_ONE_CERTIFICATE: &str = "The certificate field contains more than one \
+                                   certificate. You can specify only one certificate in \
+                                   this field.";
+
 /// The sentence ACM answers for a certificate whose validity window has run out
 /// ("the current time must be between the Not Before and Not After certificate fields",
 /// `ImportCertificate` doc), as recorded against the real service.
@@ -227,7 +236,7 @@ async fn import_material_defects_are_one_class_under_their_own_sentence() {
         (
             "a Certificate framing no PEM message at all",
             material("this is not a certificate", &valid.private_key),
-            CERTIFICATE_NOT_PEM,
+            NOT_ONE_CERTIFICATE,
         ),
         (
             "a CERTIFICATE block with a non-base64 character in its body",
@@ -245,12 +254,12 @@ async fn import_material_defects_are_one_class_under_their_own_sentence() {
         (
             "a well-formed PEM of another type as the Certificate",
             material(&valid.private_key, &valid.private_key),
-            CERTIFICATE_NOT_PEM,
+            NOT_ONE_CERTIFICATE,
         ),
         (
             "a Certificate body that is not text",
             json!({ "Certificate": not_text, "PrivateKey": blob(&valid.private_key) }),
-            CERTIFICATE_NOT_PEM,
+            NOT_ONE_CERTIFICATE,
         ),
         (
             "a certificate whose validity window closed decades ago",
