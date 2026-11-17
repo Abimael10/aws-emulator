@@ -227,6 +227,16 @@ impl CloudConnectorRecord {
         }
     }
 
+    /// The application this connector authenticates as in that tenant —
+    /// `AzureConfiguration$ApplicationId`, "The ID of the Azure application registration
+    /// used for authentication", which the configuration always carries because that member
+    /// is `@required` too.
+    pub fn application_id(&self) -> &str {
+        match &self.configuration {
+            CloudConnectorConfiguration::AzureConfiguration(azure) => azure.application_id.as_str(),
+        }
+    }
+
     /// The subscriptions this connector targets, in the order its configuration lists them.
     ///
     /// Empty for a TENANT-LEVEL connector: `AzureConfiguration$Targets` is optional ("The

@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ValidateCloudConnector
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ValidateCloudConnector`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! "Validates the configuration and connectivity of a cloud connector": the findings a
+//! validation of the connector a `CloudConnectorId` names reports, read out of what the
+//! connector persisted ([`crate::state::cloud_connectors`]) and what IAM answers about the
+//! role it holds ([`crate::state::cloud_connector_validation`]). This is the ONLY file to
+//! touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ValidateCloudConnector::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The id is resolved FIRST: a `CloudConnectorId` the Region holds no connector under names
+//! one that was never created, one created through another Region's endpoint, or one already
+//! deleted, and there is no configuration to validate for it — which is what the modelled
+//! `ResourceNotFoundException` reports, in the one sentence every operation of this service
+//! that resolves a connector id states
+//! ([`crate::state::cloud_connectors::CLOUD_CONNECTOR_NOT_FOUND`]). An empty finding list is
+//! NOT the answer for a connector that does not exist.
+//!
+//! The operation is `@readonly`: it reports what the connector and IAM already say and
+//! writes nothing. It is paginated over the findings, which are in a total order, so the
+//! `NextToken` a page hands back is the position the next page resumes at.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +153,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ValidateCloudConnector` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ValidateCloudConnectorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ValidateCloudConnector"))
+        use crate::state::cloud_connector_validation::{
+            federation_failure, findings, validation_findings_page_size,
+        };
+        use crate::state::cloud_connectors::CLOUD_CONNECTOR_NOT_FOUND;
+
+        // `CloudConnectorId`'s presence, its 36-character length and its hex-UUID pattern,
+        // and `MaxResults`'s range, are MODELLED constraints the centralized walk has
+        // already refused anything outside of.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ValidateCloudConnectorErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some("the cloud connector store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let page_size = validation_findings_page_size(input.max_results)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        // The connector is resolved before anything is validated: there is nothing to
+        // validate about an id this Region holds no connector under.
+        let region = crate::state::request_region(ctx.parts());
+        let Some(record) = state
+            .lock()
+            .cloud_connector(&region, &input.cloud_connector_id)
+            .cloned()
+        else {
+            return Err(
+                ValidateCloudConnectorErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(CLOUD_CONNECTOR_NOT_FOUND.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // What the connector can actually do: the role it holds has to be one this service
+        // may assume and one permitted to obtain the token the cross-cloud federation is
+        // exchanged for. The store's lock is released before the hop to IAM, which is a
+        // call of its own.
+        let failure = federation_failure(ctx, &region, &record.role_arn).await;
+        let reported = findings(&record, failure);
+
+        // The token this read hands out is the position the next page starts at within one
+        // connector's findings: a finding carries no key of its own, and the list changes
+        // only when the connector or what IAM says about its role changes. A token outside
+        // it names no page of this read to resume, and this operation models no
+        // `InvalidNextToken` to report that with.
+        let start = match crate::state::non_empty(input.next_token.as_deref()) {
+            None => 0,
+            Some(token) => match token.parse::<usize>() {
+                Ok(at) if at <= reported.len() => at,
+                _ => {
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        crate::state::INVALID_NEXT_TOKEN,
+                    ))
+                }
+            },
+        };
+        // `start` is a position in `reported`, so the page is a suffix of it; `get` keeps
+        // that in-bounds without indexing on a value the request steers.
+        let page = reported.get(start..).unwrap_or_default();
+        let validation_findings: Vec<ValidationFinding> =
+            page.iter().take(page_size).cloned().collect();
+        // A finding is still waiting past this page: hand the caller the position it
+        // resumes at, so the next request continues where this one stopped.
+        let next_token = (page.len() > validation_findings.len())
+            .then(|| (start + validation_findings.len()).to_string());
+
+        Ok(ValidateCloudConnectorOutput {
+            validation_findings: Some(validation_findings),
+            next_token,
+        })
     }
 }

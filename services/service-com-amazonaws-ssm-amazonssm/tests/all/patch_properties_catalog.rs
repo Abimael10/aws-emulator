@@ -126,33 +126,13 @@ const MAX_RESULTS_MAX: i64 = 50;
 /// crate, so the wording itself is what the assertion checks.
 const INVALID_NEXT_TOKEN_MESSAGE: &str = "The NextToken value is not valid";
 
-/// What a property an operating system does not publish is refused with: the sentence
-/// this service words a member carrying a value outside its legal set with, naming the
-/// member and the values legal for the operating system the request carried — which for
-/// this member are the properties that operating system publishes, in the order the
-/// operation's doc lists them. Spelled out here rather than read from the crate, so the
-/// wording itself is what the assertions check.
+/// What a property an operating system does not publish is refused with: the sentence this
+/// service words that mismatch with — the member, the value it carried, and the operating
+/// system that does not support it, which is the pair the caller has to change one of.
+/// Spelled out here rather than read from the crate, so the wording itself is what the
+/// assertions check.
 fn unsupported_property_message(operating_system: &str, property: &str) -> String {
-    let published = PUBLISHED_PROPERTIES
-        .iter()
-        .find(|(name, _)| *name == operating_system)
-        .map(|(_, published)| *published)
-        .unwrap_or_else(|| panic!("every modelled operating system is in the table"));
-    let in_doc_order: Vec<&str> = [
-        PRODUCT,
-        PRODUCT_FAMILY,
-        "CLASSIFICATION",
-        "MSRC_SEVERITY",
-        "PRIORITY",
-        "SEVERITY",
-    ]
-    .into_iter()
-    .filter(|property| published.contains(property))
-    .collect();
-    format!(
-        "Property {property} is invalid, valid values are {}",
-        in_doc_order.join(", ")
-    )
+    format!("Property {property} is not supported for operating system {operating_system}")
 }
 
 /// How many pages a walk may take before the test gives up: every property below reports

@@ -82,11 +82,35 @@ pub const OPS_ITEM_DELETE_SETTLES_AFTER: ::std::time::Duration =
     ::std::time::Duration::from_secs(10);
 
 /// What a client reads for a write held against an OpsItem whose delete has been asked for
-/// and has not settled yet, which is the one state `OpsItemConflictException` reports
-/// ("The specified OpsItem is in the process of being deleted"). Stated once here so every
-/// write that refuses for that reason serves one wording.
-pub const OPS_ITEM_DELETING_MESSAGE: &str =
-    "The specified OpsItem is in the process of being deleted.";
+/// and has not settled yet, which is the one state `OpsItemConflictException` reports: the
+/// deletion of that OpsItem is already under way, so there is nothing left to change about
+/// it. Stated once here so every write that refuses for that reason serves one wording.
+pub const OPS_ITEM_DELETING_BODY: &str =
+    "Deletion of the provided OpsItem is already in progress";
+
+/// The error code that refusal is reported under, which is the modelled exception's own
+/// shape name (`com.amazonaws.ssm#OpsItemConflictException`), and so what the envelope
+/// below names as its code.
+pub const OPS_ITEM_DELETING_CODE: &str = "OpsItemConflictException";
+
+/// The HTTP status that refusal carries, which is the status the model declares for the
+/// class (`OpsItemConflictException`, awsQueryError httpResponseCode 409 — a conflict), and
+/// so what the envelope below names as its status.
+pub const OPS_ITEM_DELETING_STATUS: u16 = 409;
+
+/// How this service reports a write held against an OpsItem whose delete has not settled:
+/// [`OPS_ITEM_DELETING_BODY`] followed by the envelope this service appends to a refusal it
+/// words itself ([`super::with_sdk_error_envelope`]), whose only variable part is the
+/// serving response's own request id.
+///
+/// A function rather than a constant because that request id is minted per call.
+pub fn ops_item_deleting_message() -> String {
+    super::with_sdk_error_envelope(
+        OPS_ITEM_DELETING_BODY,
+        OPS_ITEM_DELETING_STATUS,
+        OPS_ITEM_DELETING_CODE,
+    )
+}
 
 /// The `Version` token a write of an OpsItem leaves on the record.
 ///

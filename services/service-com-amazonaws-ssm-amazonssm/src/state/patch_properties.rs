@@ -20,7 +20,8 @@
 //! `PRODUCT | PRODUCT_FAMILY | CLASSIFICATION | MSRC_SEVERITY` for Windows — so a group
 //! below carries values for exactly the properties its operating system publishes, and a
 //! property it publishes none of is no property of its patches at all: a read of one is
-//! refused ([`unsupported_property_rejection`]) rather than answered with nothing.
+//! refused as unsupported FOR THAT OPERATING SYSTEM ([`unsupported_property_rejection`])
+//! rather than answered with nothing.
 //!
 //! Windows is the one operating system whose published patches are split into two PATCH
 //! SETS: "Indicates whether to list patches for the Windows operating system or for
@@ -434,44 +435,21 @@ pub fn publishes_property(operating_system: &str, property: &str) -> bool {
         })
 }
 
-/// The order the operation's doc lists an operating system's valid properties in
-/// ("WINDOWS Valid properties: PRODUCT | PRODUCT_FAMILY | CLASSIFICATION |
-/// MSRC_SEVERITY", "AMAZON_LINUX_2 Valid properties: PRODUCT | CLASSIFICATION |
-/// SEVERITY", "DEBIAN Valid properties: PRODUCT | PRIORITY"), which is the order a
-/// refusal names them in.
-const PROPERTY_ORDER: &[&str] = &[
-    PROPERTY_PRODUCT,
-    PROPERTY_PRODUCT_FAMILY,
-    PROPERTY_CLASSIFICATION,
-    PROPERTY_MSRC_SEVERITY,
-    PROPERTY_PRIORITY,
-    PROPERTY_SEVERITY,
-];
-
-/// The properties `operating_system` publishes, in the order the operation's doc lists
-/// them ([`PROPERTY_ORDER`]).
-pub fn published_properties(operating_system: &str) -> Vec<&'static str> {
-    PROPERTY_ORDER
-        .iter()
-        .copied()
-        .filter(|property| publishes_property(operating_system, property))
-        .collect()
-}
-
 /// Why `operating_system` cannot be asked about `property`, or `None` when it publishes
 /// it.
 ///
 /// A property an operating system does not publish is no property of its patches, so the
 /// read it asks for cannot be served at all — not served as nothing, which would read as
-/// "this operating system has no products". The sentence is the one this service words a
-/// member carrying a value outside its legal set with — the member, that it is invalid,
-/// and the values that are legal here, which for this member are the properties the named
-/// operating system publishes ([`published_properties`]).
+/// "this operating system has no products". The value is a member of the modelled
+/// `PatchProperty` enum and is valid for the operating systems that DO publish it, so the
+/// refusal says what is actually wrong with the request: it names the property and the
+/// operating system that does not support it, which is the pair the caller has to change
+/// one of.
 pub fn unsupported_property_rejection(operating_system: &str, property: &str) -> Option<String> {
     (!publishes_property(operating_system, property)).then(|| {
         format!(
-            "{PROPERTY_MEMBER} {property} is invalid, valid values are {}",
-            published_properties(operating_system).join(", ")
+            "{PROPERTY_MEMBER} {property} is not supported for operating system \
+             {operating_system}"
         )
     })
 }

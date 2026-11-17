@@ -236,12 +236,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(not_found());
         }
         // An OpsItem whose delete has been asked for and has not settled yet is still
-        // reported, but there is nothing left to edit about it: "the specified OpsItem is in
-        // the process of being deleted", which is what `OpsItemConflictException` reports.
+        // reported, but there is nothing left to edit about it: the deletion of it is
+        // already in progress, which is what `OpsItemConflictException` reports.
         if held.is_deleting() {
             return Err(UpdateOpsItemErrorModeled::OpsItemConflictException(
                 OpsItemConflictException {
-                    message: Some(ops_items::OPS_ITEM_DELETING_MESSAGE.to_string()),
+                    message: Some(ops_items::ops_item_deleting_message()),
                 },
             )
             .into());

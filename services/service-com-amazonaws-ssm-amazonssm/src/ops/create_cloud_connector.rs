@@ -20,8 +20,10 @@
 //! `RoleArn` names] to communicate with the third-party cloud environment", so that role
 //! has to exist and admit this service the assume, which is the reading
 //! [`crate::state::activation_role`] holds for every member of this service that hands it a
-//! role. A create naming a role IAM answered about that way is refused 400
-//! `ValidationException` and writes nothing.
+//! role, and it has to be permitted to obtain the web identity token the cross-cloud
+//! federation is exchanged for ([`crate::state::cloud_connector_validation`]). A create
+//! naming a role IAM answered about either way is refused 400 `ValidationException` and
+//! writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -183,15 +185,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
         // A connector "uses [this role] to communicate with the third-party cloud
-        // environment", so the role has to exist and admit this service the assume before a
-        // connector is minted against it — the same reading of a caller-supplied role every
+        // environment", so before a connector is minted against it the role has to exist,
+        // admit this service the assume — the same reading of a caller-supplied role every
         // other member of this service that hands it one takes
-        // ([`crate::state::activation_role`]). The refusal is grounded in what IAM answered
-        // about the role, and nothing is written when it is refused.
-        if let Some(why) =
-            crate::state::activation_role::arn_refusal(ctx, &region, &input.role_arn).await
+        // ([`crate::state::activation_role`]) — and be permitted to obtain the web identity
+        // token the cross-cloud federation is exchanged for, which is the call the
+        // federation step makes under it
+        // ([`crate::state::cloud_connector_validation`]). The refusal is grounded in what
+        // IAM answered about the role, carries the failing step's own sentence, and nothing
+        // is written when it is refused.
+        if let Some(failure) = crate::state::cloud_connector_validation::federation_failure(
+            ctx,
+            &region,
+            &input.role_arn,
+        )
+        .await
         {
-            return Err(crate::scaffolded::Scaffolded::validation(why));
+            return Err(crate::scaffolded::Scaffolded::validation(
+                failure.message(&input.role_arn),
+            ));
         }
 
         let now = ::std::time::SystemTime::now();

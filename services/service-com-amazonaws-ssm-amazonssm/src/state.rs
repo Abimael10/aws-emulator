@@ -193,6 +193,10 @@ pub mod activation_role;
 /// one reach the single store below.
 pub mod cloud_connectors;
 
+/// Whether a cloud connector can reach the cloud environment it targets: the cross-cloud
+/// federation its role has to obtain, and the findings a validation of one reports.
+pub mod cloud_connector_validation;
+
 /// Rendering a persisted document's content in the `DocumentFormat` a read asks for.
 pub mod document_format;
 

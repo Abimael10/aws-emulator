@@ -1332,10 +1332,15 @@ async fn disassociating_from_an_ops_item_being_deleted_is_refused() {
         "OpsItemConflictException",
         "case {case}: expected the conflict refusal, got {response}"
     );
-    assert_eq!(
-        response["Message"].as_str(),
-        Some("The specified OpsItem is in the process of being deleted."),
-        "case {case}: expected the sentence the service words for this class, got {response}"
+    // The sentence the service words for this class, then the envelope it appends to a
+    // refusal it words itself; only the serving response's own request id varies.
+    let message = response["Message"].as_str().unwrap_or_default();
+    let expected = "Deletion of the provided OpsItem is already in progress (Service: \
+                    AmazonSSM; Status Code: 409; Error Code: OpsItemConflictException; \
+                    Request ID: ";
+    assert!(
+        message.starts_with(expected) && message.ends_with("; Proxy: null)"),
+        "case {case}: expected {expected:?}<request id>\"; Proxy: null)\", got {message:?}"
     );
     assert_eq!(
         reported_ids(&router, case, &ops_item_id).await,

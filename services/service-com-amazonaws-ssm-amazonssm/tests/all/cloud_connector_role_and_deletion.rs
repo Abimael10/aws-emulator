@@ -12,7 +12,10 @@
 //!    this service, and one naming another account are each refused HTTP 400
 //!    `ValidationException` and NO connector is minted — the same reading of a
 //!    caller-supplied role `CreateActivation` takes, and grounded in what IAM ANSWERED, so an
-//!    emulator with no IAM mounted to ask refuses nothing;
+//!    emulator with no IAM mounted to ask refuses nothing. (The other half of what the create
+//!    resolves about that role — whether it may obtain the token the cross-cloud federation
+//!    needs — is the sibling suite's ([`crate::cloud_connector_validation`]), so every role
+//!    held here is permitted that call and the trust policy is what the rows vary.)
 //! 2. `DeleteCloudConnector` removes the connector its `CloudConnectorId` names at the Region
 //!    the request was signed for, and an id this Region holds no connector under — one
 //!    nothing created, one created through another Region, or one already deleted — is
@@ -33,6 +36,9 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::cloud_connector_validation::{
+    create_federating_role, federation_permitted, listed, put_role_policy, trusted_by_ssm,
+};
 use crate::hybrid_activation_role::{create_role, router_with_iam};
 use crate::parameter_store::{
     call, call_in_region, error_code, error_message, router, ACCOUNT, REGION,
@@ -44,11 +50,7 @@ const OTHER_REGION: &str = "us-east-1";
 /// An account other than the one this emulator serves.
 const OTHER_ACCOUNT: &str = "123456789012";
 
-/// The service principal a connector's role has to admit, in the spelling a trust policy
-/// names a service by.
-const SSM_PRINCIPAL: &str = "ssm.amazonaws.com";
-
-/// The action such a trust policy grants that principal.
+/// The action a trust policy grants the service principal it admits.
 const ASSUME_ROLE: &str = "sts:AssumeRole";
 
 /// The sentence a connector id that names no connector is refused with, written out here
@@ -84,41 +86,10 @@ fn create_body(role_arn: &str) -> Value {
     })
 }
 
-/// The trust policy of a role this service can act as, in its plainest form.
-fn trusted_by_ssm() -> Value {
-    json!({
-        "Version": "2012-10-17",
-        "Statement": [{
-            "Effect": "Allow",
-            "Principal": { "Service": SSM_PRINCIPAL },
-            "Action": ASSUME_ROLE,
-        }],
-    })
-}
-
-/// The connector ids `ListCloudConnectors` reports at `region`.
-async fn listed(router: &MultiServiceRouter, region: &str) -> Vec<String> {
-    let (status, body) = call_in_region(router, region, "ListCloudConnectors", &json!({})).await;
-    assert_eq!(
-        status, 200,
-        "ListCloudConnectors must be served, got {status} with {body}"
-    );
-    body["CloudConnectors"]
-        .as_array()
-        .unwrap_or_else(|| panic!("a listing reports CloudConnectors, got {body}"))
-        .iter()
-        .map(|summary| {
-            summary["CloudConnectorId"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string()
-        })
-        .collect()
-}
-
-/// Create a connector at `region` naming a role IAM holds and trusts, answering its id.
+/// Create a connector at `region` naming a role IAM holds, trusts and permits to federate,
+/// answering its id.
 async fn create_connector(router: &MultiServiceRouter, case: &str, region: &str, role: &str) -> String {
-    create_role(router, case, "/", role, &trusted_by_ssm()).await;
+    create_federating_role(router, case, role).await;
     let (status, created) = call_in_region(
         router,
         region,
@@ -210,6 +181,10 @@ async fn a_connector_is_minted_only_for_a_role_this_service_may_assume() {
         let router = router_with_iam();
         if let Some((role, trust)) = row.held.as_ref() {
             create_role(&router, case, "/", role, trust).await;
+            // Every held role is permitted to obtain the web identity token the create's
+            // federation step needs, so what each row varies is the TRUST half of the
+            // question and nothing else.
+            put_role_policy(&router, case, role, &federation_permitted()).await;
         }
 
         let (status, body) = call(&router, "CreateCloudConnector", &create_body(&row.role_arn)).await;
