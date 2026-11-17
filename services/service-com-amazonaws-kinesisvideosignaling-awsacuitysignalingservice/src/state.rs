@@ -236,6 +236,59 @@ pub fn forget_channel_of<Eng: Send + Sync + 'static>(engine: &Eng, arn: &str) ->
     store.forget_channel(arn)
 }
 
+/// What came of handing one message to a channel's MASTER peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MasterDelivery {
+    /// The frame is queued for the master's own socket task, which writes it to that
+    /// connection.
+    Delivered,
+    /// The channel is registered and no master is attached to it and reading right now
+    /// (or the attached one is already holding [`session::PEER_FRAME_DEPTH`] frames it has
+    /// not read), so the message reached no peer.
+    NoMaster,
+    /// No channel of that ARN is in this registry, or this emulator carries no store for
+    /// the signaling service at all: there is no data plane to deliver into.
+    UnknownChannel,
+}
+
+/// Hand ONE signaling message of type `message_type` to the master peer attached to the
+/// channel `arn` names, rendered exactly as this data plane renders every frame it
+/// delivers.
+///
+/// The seam a plane that produces a message FOR a channel's master calls from outside this
+/// crate — the WebRTC storage plane's `JoinStorageSession`, whose own model states that "an
+/// offer is sent once per each call" — so a message pushed by another service travels the
+/// same session, the same frame form and the same bounded per-peer queue as one a peer
+/// sent, and the socket task owns the write ([`session`]).
+///
+/// The sender carries no client id of its own: the message is the CHANNEL's, not another
+/// peer's, so no `senderClientId` is stated for it.
+///
+/// Nothing is awaited and the store lock is held for the hand-off alone.
+pub fn deliver_to_master_of<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    arn: &str,
+    message_type: &str,
+    message_payload: &str,
+) -> MasterDelivery {
+    let Some(state) = service_state(engine) else {
+        return MasterDelivery::UnknownChannel;
+    };
+    let store = state.lock();
+    let Ok(channel) = store.resolve_channel(arn) else {
+        return MasterDelivery::UnknownChannel;
+    };
+    let frame = crate::service::wss::delivered_frame(message_type, None, message_payload, None);
+    match channel
+        .session
+        .master()
+        .is_some_and(|master| master.deliver(frame))
+    {
+        true => MasterDelivery::Delivered,
+        false => MasterDelivery::NoMaster,
+    }
+}
+
 /// One signaling channel, as this data plane sees it.
 #[derive(Debug)]
 pub struct SignalingChannel {

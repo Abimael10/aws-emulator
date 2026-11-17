@@ -21,6 +21,14 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# The RFC 4566 session description an offer carries, built and marshalled by a maintained
+# implementation of that format rather than by hand (`src/state/sdp_offer.rs`).
+sdp = "0.17"
+# The signaling data plane the storage session's offer travels on: a channel's live peers
+# and the frames routed between them are that service's state, so this crate hands its
+# offer to the master attached there through that store's own seam
+# (`state::deliver_to_master_of`) rather than keeping a second copy of the connection.
+service-com-amazonaws-kinesisvideosignaling-awsacuitysignalingservice = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -28,6 +36,18 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The signaling service, mounted beside this one in the test harness: the storage session's
+# offer is pushed onto the master attached to that service's WebSocket data plane, so the
+# push is driven end to end against the service that owns it. It is also a normal
+# dependency of this crate (the handler delivers through its store); this entry only states
+# that the harness mounts it.
+service-com-amazonaws-kinesisvideosignaling-awsacuitysignalingservice = { workspace = true }
+# The client half of the WebSocket case: a test dials the announced signaling socket over
+# TCP (`tokio/net`) in this process, as the video producing device does, and waits a bounded
+# time for the offer (`tokio/time`).
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+futures-util = { version = "0.3", default-features = false }
 
 [lints]
 workspace = true

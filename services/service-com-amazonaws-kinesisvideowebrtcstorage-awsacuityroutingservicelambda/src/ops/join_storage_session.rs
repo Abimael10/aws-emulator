@@ -4,8 +4,10 @@
 //!
 //! Joins the caller to a signaling channel's WebRTC storage session as the **video
 //! producing device** (the master), creating the session when the channel has none.
-//! The call is not idempotent: every call counts as a join, and the most recent
-//! producer takes precedence over the incumbent one. State lives in
+//! The call is not idempotent: every call counts as a join, the most recent producer
+//! takes precedence over the incumbent one, and each call pushes ONE freshly generated
+//! `SDP_OFFER` down the channel's signaling plane to the producing device attached
+//! there ("an offer is sent once per each call"). State lives in
 //! [`crate::state`]; this operation is also where a channel ARN becomes a channel
 //! this emulator knows (see `known_channels` there).
 //!
@@ -88,6 +90,9 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use ::service_com_amazonaws_kinesisvideosignaling_awsacuitysignalingservice::state::session::SDP_OFFER;
+use ::service_com_amazonaws_kinesisvideosignaling_awsacuitysignalingservice::state::MasterDelivery;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -248,6 +253,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         drop(store);
 
+        // "Concurrent calls are allowed. An offer is sent once per each call": the
+        // storage session now offers THIS join its own session description, and the
+        // offer is pushed down the channel's signaling plane to the video producing
+        // device attached to it as that channel's master. The offer belongs to the
+        // join, so it is generated per call ([`crate::state::sdp_offer`]) and never
+        // re-sent.
+        //
+        // The signaling plane is another service's state, so this hand-off goes
+        // through that store's own seam rather than a second copy of the connection
+        // here — and it runs with THIS store's lock released, so only one store is
+        // ever held at a time.
+        let message_payload = crate::state::offer_payload(generation);
+        let delivery = ::service_com_amazonaws_kinesisvideosignaling_awsacuitysignalingservice::state::deliver_to_master_of(
+            &*self.engine,
+            &input.channel_arn,
+            SDP_OFFER,
+            &message_payload,
+        );
+        // The offer joins the session's (bounded) log either way: it is what this call
+        // sent, whether or not a producing device was attached to receive it. `false` means
+        // the session is gone again (the store was cleared between the join and here), so
+        // there is nothing for the record to belong to.
+        let recorded = state.lock().record_offer(
+            &input.channel_arn,
+            crate::state::SessionOffer {
+                generation,
+                message_payload,
+                offered_at: now,
+                delivered: delivery == MasterDelivery::Delivered,
+            },
+        );
+        if !recorded {
+            tracing::debug!(
+                operation = "JoinStorageSession",
+                channel_arn = %input.channel_arn,
+                generation,
+                "the channel held no session to record the offer on"
+            );
+        }
+
         // Audit record for a state-changing call: who was presented, what was
         // joined, and the outcome. The access key id is the one the request
         // presented, never a secret.
@@ -256,6 +301,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             channel_arn = %input.channel_arn,
             access_key_id = %::engine::extract_akid(&ctx.parts().headers),
             generation,
+            offer = ?delivery,
             outcome = "joined",
             "the video producing device joined the channel's storage session"
         );

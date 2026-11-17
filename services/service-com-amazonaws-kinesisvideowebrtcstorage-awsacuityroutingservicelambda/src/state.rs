@@ -11,6 +11,11 @@
 use std::collections::{HashMap, HashSet};
 use std::time::SystemTime;
 
+/// The SDP offer one join of a storage session is sent.
+pub mod sdp_offer;
+
+pub use sdp_offer::{offer_payload, offer_sdp, OFFER_DESCRIPTION_TYPE};
+
 /// The resource type a Kinesis Video *signaling channel* ARN carries.
 ///
 /// The modelled `@pattern` on `ChannelArn`
@@ -47,6 +52,14 @@ pub const MAX_CHANNEL_NAME_LENGTH: usize = 256;
 /// entry per distinct ARN for as long as the process runs. A join that would
 /// exceed it is refused with the modelled `ClientLimitExceededException`.
 pub const MAX_SIGNALING_CHANNELS: usize = 10_000;
+
+/// How many offers one session's log keeps.
+///
+/// Not an AWS quota — a chosen bound. Every `JoinStorageSession` call pushes an offer of
+/// its own ("an offer is sent once per each call"), so without a cap a caller looping that
+/// one route would grow this process without limit. At the cap the OLDEST offer is dropped:
+/// the log is what the session has recently offered, not an archive.
+pub const MAX_OFFERS_PER_SESSION: usize = 128;
 
 /// How many viewers one channel's session admits at once.
 ///
@@ -169,6 +182,26 @@ pub struct ProducerSession {
     pub generation: u64,
 }
 
+/// One SDP offer a session pushed to the channel's video producing device.
+///
+/// Modelled docs: "Concurrent calls are allowed. An offer is sent once per each call" — so
+/// one of these records exactly one `JoinStorageSession` call, and the payload it carries is
+/// the one that was handed to the channel's signaling plane.
+#[derive(Debug, Clone)]
+pub struct SessionOffer {
+    /// The producer join this offer belongs to: the session's [`StorageSession::join_count`]
+    /// at that call.
+    pub generation: u64,
+    /// The offer as it was pushed: base64 of the JSEP description envelope
+    /// ([`sdp_offer::offer_payload`]).
+    pub message_payload: String,
+    /// When the session offered it.
+    pub offered_at: SystemTime,
+    /// Whether the channel's signaling plane had a master peer to hand it to. An offer
+    /// nobody was attached to receive is still the offer this call sent.
+    pub delivered: bool,
+}
+
 /// A playback viewer registered on a session under its `clientId`.
 #[derive(Debug, Clone)]
 pub struct ViewerSession {
@@ -200,6 +233,9 @@ pub struct StorageSession {
     /// Producer joins seen by this session. Modelled docs: "This API is not
     /// idempotent … An offer is sent once per each call."
     pub join_count: u64,
+    /// The offers this session has pushed to the channel's video producing device, oldest
+    /// first and bounded at [`MAX_OFFERS_PER_SESSION`].
+    pub offers: Vec<SessionOffer>,
 }
 
 impl StorageSession {
@@ -211,7 +247,25 @@ impl StorageSession {
             viewers: HashMap::new(),
             created_at,
             join_count: 0,
+            offers: Vec::new(),
         }
+    }
+
+    /// Record the offer this session pushed for one join, dropping the oldest records past
+    /// [`MAX_OFFERS_PER_SESSION`] so a looping caller cannot grow the log without end.
+    pub fn record_offer(&mut self, offer: SessionOffer) {
+        let over = (self.offers.len() + 1).saturating_sub(MAX_OFFERS_PER_SESSION);
+        self.offers.drain(..over.min(self.offers.len()));
+        self.offers.push(offer);
+    }
+
+    /// The offer this session pushed for the join `generation`, if its record is still in
+    /// the log.
+    #[must_use]
+    pub fn offer_for(&self, generation: u64) -> Option<&SessionOffer> {
+        self.offers
+            .iter()
+            .find(|offer| offer.generation == generation)
     }
 
     /// Record a video-producing-device join: count the call and make this the
@@ -304,6 +358,19 @@ impl ComAmazonawsKinesisvideowebrtcstorageAwsacuityroutingservicelambdaState {
         self.reserve_channel(channel_arn)?;
         self.known_channels.insert(channel_arn.to_string());
         Ok(self.session_or_create(channel_arn, now).join_as_producer(now))
+    }
+
+    /// Record on the channel's session the offer this emulator pushed for one producer
+    /// join; `false` when the channel has no session (it was deleted in between), in which
+    /// case there is nothing the record belongs to.
+    pub fn record_offer(&mut self, channel_arn: &str, offer: SessionOffer) -> bool {
+        match self.sessions.get_mut(channel_arn) {
+            Some(session) => {
+                session.record_offer(offer);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Record a viewer join under `client_id` on the channel's session, creating
