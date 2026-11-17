@@ -68,6 +68,28 @@ const COMPLAINT: (&str, &str, &str) = ("COMPLAINT", "Complaint", "Email Complain
 /// configuration declares a dimension of this name ([`super::cloudwatch`]).
 const CONFIGURATION_SET_TAG: &str = "ses:configuration-set";
 
+/// The header a message declares its own message tags in, beside the tags the send's own
+/// parameter supplies: `DimensionValueSource`'s `MESSAGE_TAG` is "the message tags that you
+/// specify using an `X-SES-MESSAGE-TAGS` header or a parameter to the `SendEmail` or
+/// `SendRawEmail` API", so both are tags of the send
+/// (`smithy_query(query="doc",shape="CloudWatchDimensionConfiguration",member="DimensionValueSource")`).
+const MESSAGE_TAGS_HEADER: &str = "X-SES-MESSAGE-TAGS";
+
+/// How many `name=value` pairs are read from the [`MESSAGE_TAGS_HEADER`] headers of ONE
+/// message, in all — one budget over however many such headers it carries.
+///
+/// An EMULATOR ceiling, not an AWS quota: that header's value is caller-supplied text of no
+/// modelled length, and a MIME document may write the header more than once, so what
+/// reading them allocates is capped here rather than growing with the message. A message
+/// that writes more pairs than this applies the tags among the first
+/// [`MAX_HEADER_MESSAGE_TAGS`] and nothing of the rest.
+const MAX_HEADER_MESSAGE_TAGS: usize = 64;
+
+/// How long a message tag's name or value may be: it "can contain no more than 256
+/// characters" (`smithy_query(query="doc",shape="MessageTag",member="Name")`, and the same
+/// for `Value`). A tag name and value are ASCII, so a character is a byte.
+const MAX_MESSAGE_TAG_CHARS: usize = 256;
+
 /// The header names whose values make up the `commonHeaders` of a published document,
 /// matched without regard to case the way a mail header name compares.
 const COMMON_HEADER_NAMES: [&str; 3] = ["Subject", "Message-ID", "Date"];
@@ -199,10 +221,15 @@ impl PublishedSend {
         self.destinations
             .iter()
             .any(|destination| destination.cloud_watch_destination.is_some())
-            .then(|| CountedEvents {
-                store,
-                message_tags: self.message_tags(),
-                headers: self.headers(),
+            .then(|| {
+                // The headers are read ONCE and the tags are read FROM them, because a
+                // message's tags are partly written in its own header block.
+                let headers = self.headers();
+                CountedEvents {
+                    store,
+                    message_tags: self.message_tags_of(&headers),
+                    headers,
+                }
             })
     }
 
@@ -352,7 +379,9 @@ impl PublishedSend {
                 .map(|(name, value)| json!({"name": name, "value": value}))
                 .collect::<Vec<Value>>(),
             "commonHeaders": self.common_headers(&headers),
-            "tags": self.tags(),
+            // The tags are read FROM the headers already read here, so the document parses
+            // the message's header block once however many tags it declares.
+            "tags": self.tags(&headers),
         });
         if let Some(source) = &message.from {
             mail["source"] = json!(crate::state::addr_spec(source));
@@ -446,29 +475,55 @@ impl PublishedSend {
     }
 
     /// The MESSAGE TAGS of this send, in the order they apply: the configuration set the
-    /// message named, which SES applies as a message tag to every send through a set, and
-    /// then the tags the send supplied (`SendEmailRequest$EmailTags`, "to apply to an email
-    /// that you send … so that you can publish email sending events").
+    /// message named, which SES applies as a message tag to every send through a set, then
+    /// the tags the send supplied (`SendEmailRequest$EmailTags`, "to apply to an email
+    /// that you send … so that you can publish email sending events"), and then the ones
+    /// the message itself declares in its [`MESSAGE_TAGS_HEADER`] header.
     ///
-    /// One reading for every consumer of a send's tags, so the tags a published document
-    /// reports and the ones a declared dimension is resolved from
+    /// `headers` are the headers of the message ([`Self::headers`]) — one of the places a
+    /// send's tags are written — so a caller that has read them resolves the tags from
+    /// that one reading. One reading for every consumer of a send's tags, so the tags a
+    /// published document reports and the ones a declared dimension is resolved from
     /// ([`super::cloudwatch`]) cannot disagree.
-    fn message_tags(&self) -> Vec<(String, String)> {
+    ///
+    /// A dimension takes the FIRST value its name carries here
+    /// ([`super::cloudwatch::dimension_set`]), so a tag the send supplied by parameter
+    /// decides a dimension that a tag of the same name in the header would otherwise —
+    /// an order this service states, since both are message tags and Amazon SES documents
+    /// no precedence between them.
+    ///
+    /// At most [`MAX_HEADER_MESSAGE_TAGS`] tags are read from the message's headers in
+    /// ALL, however many such headers the message carries, so what a message declares
+    /// cannot grow this reading without bound.
+    fn message_tags_of(&self, headers: &[(String, String)]) -> Vec<(String, String)> {
         let mut tags: Vec<(String, String)> = Vec::new();
         if let Some(set) = &self.message.configuration_set_name {
             tags.push((CONFIGURATION_SET_TAG.to_string(), set.clone()));
         }
         tags.extend(self.message.email_tags.iter().cloned());
+        let mut budget = MAX_HEADER_MESSAGE_TAGS;
+        for (name, value) in headers {
+            if budget == 0 {
+                break;
+            }
+            if name.eq_ignore_ascii_case(MESSAGE_TAGS_HEADER) {
+                let (declared, read) = header_message_tags(value, budget);
+                budget -= read;
+                tags.extend(declared);
+            }
+        }
         tags
     }
 
     /// The `tags` of the published document: the message tags of this send
-    /// ([`Self::message_tags`]).
+    /// ([`Self::message_tags_of`], resolved from the `headers` the document already read).
     ///
-    /// Each value is a LIST, because one tag name may be applied more than once.
-    fn tags(&self) -> Value {
+    /// Each value is a LIST, because one tag name may be applied more than once — which is
+    /// what a send that supplies a tag by parameter and declares one of the same name in
+    /// its header does, and the document reports both.
+    fn tags(&self, headers: &[(String, String)]) -> Value {
         let mut tags: Map<String, Value> = Map::new();
-        for (name, value) in self.message_tags() {
+        for (name, value) in self.message_tags_of(headers) {
             match tags.get_mut(&name) {
                 Some(Value::Array(values)) => values.push(json!(value)),
                 _ => {
@@ -533,6 +588,51 @@ impl CountedEvents<'_> {
             super::cloudwatch::dimension_set(declared, &self.message_tags, &self.headers);
         super::cloudwatch::count_event(self.store, metric_name, dimensions, SystemTime::now());
     }
+}
+
+/// The tags the message's own `X-SES-MESSAGE-TAGS` header declares: `value` is a list of
+/// `name=value` pairs separated by commas, which is how that header writes message tags,
+/// and at most `limit` of them are read.
+///
+/// This reads only the VALUE of one header, whose own form this list is; the message's
+/// header block is read by the MIME crate this project parses a message with
+/// ([`mime_headers`]).
+///
+/// A pair that is no message tag applies none, so a header a sender wrote something else in
+/// applies nothing: one with no `=` at all, and one whose name or value is not a message
+/// tag's ([`is_message_tag_part`]). Whitespace around a pair is not part of the tag it
+/// writes, the way a header's value is written with spaces around its parts; what is left
+/// has to be a tag. No more than `limit` pairs are read, and how many were is answered
+/// beside the tags so a caller reading several headers spends ONE budget over them
+/// ([`MAX_HEADER_MESSAGE_TAGS`]) — so what this allocates is bounded by that budget and the
+/// tag length Amazon SES states, never by the length of the header the caller sent.
+fn header_message_tags(value: &str, limit: usize) -> (Vec<(String, String)>, usize) {
+    let mut tags: Vec<(String, String)> = Vec::new();
+    let mut read = 0;
+    for pair in value.split(',').take(limit) {
+        read += 1;
+        let Some((name, written)) = pair.split_once('=') else {
+            continue;
+        };
+        let (name, written) = (name.trim(), written.trim());
+        if is_message_tag_part(name) && is_message_tag_part(written) {
+            tags.push((name.to_string(), written.to_string()));
+        }
+    }
+    (tags, read)
+}
+
+/// Whether `part` is a message tag's name or value as Amazon SES states one: it "can only
+/// contain ASCII letters (a–z, A–Z), numbers (0–9), underscores (_), or dashes (-)" and
+/// "can contain no more than [`MAX_MESSAGE_TAG_CHARS`] characters"
+/// (`smithy_query(query="doc",shape="MessageTag",member="Name")`, and the same for
+/// `Value`), and a tag has both.
+fn is_message_tag_part(part: &str) -> bool {
+    !part.is_empty()
+        && part.len() <= MAX_MESSAGE_TAG_CHARS
+        && part
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
 
 /// The member name a published document reports the header `name` under.
