@@ -61,9 +61,18 @@ const OK: &str = "OK";
 /// The missing-data arm every alarm here carries, as `TreatMissingData` spells it.
 const NOT_BREACHING: &str = "notBreaching";
 
-/// The alarm's period and how many of them it grades: the shortest standard-resolution period
-/// CloudWatch takes, with the one-period look-back a client writes for "any refusal now".
-const PERIOD: i64 = 60;
+/// The alarm's period and how many of them it grades: the shortest cadence an alarm may be
+/// evaluated on — "Valid values are 10, 20, 30, and any multiple of 60"
+/// (`smithy_query(query="doc",shape="PutMetricAlarmInput",member="Period")`) — with the
+/// one-period look-back a client writes for "any refusal now".
+///
+/// The shortest one on purpose. An alarm grades only the periods that have CLOSED, so how long
+/// a published refusal waits for the evaluation that grades it is at most one period: naming the
+/// shortest cadence is what keeps that wait off the clock of every build, and nothing asserted
+/// here depends on how wide the period is — the refusals of a row are stored at the granularity
+/// of the series DynamoDB publishes them on and so fall in ONE window of whichever cadence the
+/// alarm names.
+const PERIOD: i64 = 10;
 const EVALUATION_PERIODS: i64 = 1;
 
 /// The partition key every row addresses, the version the seeded item carries, and the version
