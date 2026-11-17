@@ -372,6 +372,107 @@ async fn each_release_label_surface_publishes_its_own_code_and_sentence() {
     );
 }
 
+/// The sentence the release-DESCRIBE read states for a request that supplies NO release
+/// label at all, which is a class of its own beside an unoffered one.
+const RELEASE_LABEL_EMPTY: &str = "The release label can't be empty.";
+
+/// The sentence that read states for a label naming none of the catalog's releases — the
+/// class the empty-label refusal must not borrow.
+const RELEASE_LABEL_NOT_VALID: &str = "The release label isn't valid.";
+
+/// THE RULE: the release-DESCRIBE read tells a request that supplies no release label at
+/// all — the member absent, or carried with nothing in it — from one that supplies a label
+/// naming no release: the first is refused as an EMPTY label and the second as an invalid
+/// one, both as the modelled client error (HTTP 400) under the discriminator that read
+/// publishes for an input parameter it will not accept, with only the sentence telling the
+/// two classes apart. Both sentences are wholly fixed: nothing of the request appears in
+/// either.
+///
+/// Rows span the forms of "no label at all" — the member omitted, explicitly null, and the
+/// empty string — and pair each with the request's other members set and unset, so the
+/// refusal is a verdict on the label rather than on the shape of the request; the
+/// unoffered-label and offered-label rows beside them are what show the three classes are
+/// told apart rather than answered alike.
+#[tokio::test]
+async fn a_request_naming_no_release_label_is_refused_as_an_empty_one() {
+    let emr = Emr::new();
+
+    // Every form of "the request supplied no label", each with and without the paging
+    // members the operation also takes. A member carried as JSON `null` is NOT one of
+    // them: nothing readable as a label arrived, so the protocol refuses that body before
+    // the operation's own input exists (`tests/all/unreadable_request_values.rs`).
+    let absent: Vec<(&str, Value)> = vec![
+        ("ReleaseLabel omitted", json!({})),
+        ("ReleaseLabel empty", json!({ "ReleaseLabel": "" })),
+        (
+            "ReleaseLabel omitted beside MaxResults",
+            json!({ "MaxResults": 50 }),
+        ),
+        (
+            "ReleaseLabel empty beside MaxResults",
+            json!({ "ReleaseLabel": "", "MaxResults": 1 }),
+        ),
+    ];
+    for (case, body) in absent {
+        let (status, payload) = emr.call("DescribeReleaseLabel", body).await;
+        assert_refused(case, status, &payload, SERVICE_ERROR);
+        assert_eq!(
+            error_code(&payload).as_deref(),
+            Some(INVALID_INPUT_PARAMETER),
+            "case {case:?}: expected ErrorCode {INVALID_INPUT_PARAMETER}, got {:?} in \
+             {payload}",
+            error_code(&payload)
+        );
+        let said = message(case, &payload);
+        assert_eq!(
+            said, RELEASE_LABEL_EMPTY,
+            "case {case:?}: expected {RELEASE_LABEL_EMPTY:?}, got {payload}"
+        );
+        assert!(
+            at(&payload, &["ReleaseLabel"]).is_null()
+                && at(&payload, &["Applications"]).is_null(),
+            "case {case:?}: a refusal describes no release, got {payload}"
+        );
+    }
+
+    // A label that IS supplied but names no release is the other class, under the same
+    // code and its own sentence — so the empty-label sentence is not the read's answer to
+    // every bad label.
+    for label in UNOFFERED_RELEASE_LABELS {
+        let case = format!("DescribeReleaseLabel with {label:?}");
+        let (status, payload) = emr
+            .call("DescribeReleaseLabel", json!({ "ReleaseLabel": label }))
+            .await;
+        assert_refused(&case, status, &payload, SERVICE_ERROR);
+        assert_eq!(
+            error_code(&payload).as_deref(),
+            Some(INVALID_INPUT_PARAMETER),
+            "case {case:?}: expected ErrorCode {INVALID_INPUT_PARAMETER}, got {:?} in \
+             {payload}",
+            error_code(&payload)
+        );
+        assert_eq!(
+            message(&case, &payload),
+            RELEASE_LABEL_NOT_VALID,
+            "case {case:?}: expected {RELEASE_LABEL_NOT_VALID:?}, got {payload}"
+        );
+    }
+
+    // The control: a label the catalog offers is described, so both refusals above are
+    // judgements about the label and not a blanket answer.
+    let described = emr
+        .ok(
+            "DescribeReleaseLabel",
+            json!({ "ReleaseLabel": CATALOGUED_RELEASE }),
+        )
+        .await;
+    assert_eq!(
+        described["ReleaseLabel"].as_str(),
+        Some(CATALOGUED_RELEASE),
+        "case {CATALOGUED_RELEASE:?}: an offered release must be described, got {described}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // StepConcurrencyLevel: one band, one sentence, every operation that takes it
 // ---------------------------------------------------------------------------

@@ -157,18 +157,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // neither the per-caller store on `self.engine` nor any request metadata.
         let _ = (ctx, &self.engine);
 
-        // "The target release label to be described" (`ReleaseLabel` doc): there is no
-        // release to describe without one, so a request carrying none names no release.
+        // "The target release label to be described" (`ReleaseLabel` doc): a request
+        // carrying no label — the member absent, or carried with nothing in it — names
+        // no release to describe, which is its own refusal class and not the one an
+        // unoffered label gets (`crate::state::release_label_empty`).
         let Some(requested) = input
             .release_label
             .as_deref()
             .filter(|label| !label.is_empty())
         else {
             return Err(DescribeReleaseLabelErrorModeled::InvalidRequestException(
-                InvalidRequestException {
-                    error_code: None,
-                    message: Some("ReleaseLabel is required.".to_string()),
-                },
+                crate::state::release_label_empty(),
             )
             .into());
         };

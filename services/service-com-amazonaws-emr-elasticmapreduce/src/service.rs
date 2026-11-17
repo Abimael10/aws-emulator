@@ -73,6 +73,12 @@
 //! plane is fronted by, inside the service detail every refusal it raises carries
 //! ([`editors_plane`]).
 //!
+//! The framework's envelope carries ONE part that is this service's rather than the
+//! framework's: the ORDER an enum's admissible value set is listed in, which is the walk
+//! of the front door's own table of those values rather than the model's declaration order
+//! ([`enum_value_sets`]). Every clause, every other requirement, the member paths and the
+//! counted envelope stay the framework's.
+//!
 //! `Refused`, the framework's answer type, carries a code and a sentence. EMR's own
 //! error carries its sentence in `Message` BESIDE the `ErrorCode` that tells one refusal
 //! class from another, so a refusal reworded into that shape is answered by
@@ -96,6 +102,7 @@ use std::sync::Arc;
 use crate::ops::types::InvalidRequestException;
 
 pub mod editors_plane;
+pub mod enum_value_sets;
 pub mod request_layer;
 
 /// The wire error code of `com.amazonaws.emr#InvalidRequestException`, this
@@ -808,7 +815,7 @@ fn rejected_enum_values_refusal(violations: &[Violation]) -> Option<InvalidReque
     let member = first.path.split('.').next()?;
     let message = match rejected_values_message(&on_input_member) {
         Some(sentence) => sentence,
-        None => aws_smithy_schema_server::envelope(violations)?,
+        None => enum_value_sets::validation_envelope(violations)?,
     };
     Some(InvalidRequestException {
         error_code: Some(format!("{INVALID_VALUES_CODE}{}", opening(member))),
@@ -962,7 +969,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         //   in EMR's own prose for that member, under the generic code, because EMR
         //   validates that alarm itself;
         // - otherwise the message stays the framework's, which names the offending
-        //   value, the member path the model spells and the constraint it failed.
+        //   value, the member path the model spells and the constraint it failed — with
+        //   the one part of a constraint clause that is this service's rather than the
+        //   framework's: the ORDER an enum's admissible value set is listed in
+        //   (`enum_value_sets`).
         //
         // The status (400) is the framework's throughout, and an authentication
         // refusal keeps the framework's wording — it is not an input-constraint
@@ -974,7 +984,8 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             // No operation is being served, so no operation's facts apply.
             return Some(Refused {
                 code: VALIDATION_EXCEPTION.to_string(),
-                message: cloud_watch_alarm_message(violations)?,
+                message: cloud_watch_alarm_message(violations)
+                    .or_else(|| enum_value_sets::validation_envelope(violations))?,
             });
         };
         // The sentence for an input member the request did not carry is that member's
@@ -1019,7 +1030,11 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             code: VALIDATION_EXCEPTION.to_string(),
             message: match absent {
                 Some(absent) => absent.message.unwrap_or_default(),
-                None => cloud_watch_alarm_message(violations)?,
+                // Nothing of EMR's own to say about this refusal: the framework's own
+                // envelope and clauses answer it, with each enum value set listed in the
+                // order this service lists that set ([`enum_value_sets`]).
+                None => cloud_watch_alarm_message(violations)
+                    .or_else(|| enum_value_sets::validation_envelope(violations))?,
             },
         })
     }

@@ -304,6 +304,14 @@ const PLACEMENT_GROUP_STRATEGY_SENTENCE: &str =
     "Placement group for master node supports only the following placement strategy: \
      [SPREAD, NONE]";
 
+/// The sentence a launch that configures ONE instance role with several placement group
+/// entries is refused with. Its one variable part is the role configured more than once,
+/// and only the primary role is placed at all ([`PLACEMENT_GROUP_ROLE_SENTENCE`] answers
+/// every other), so that is the role this sentence can name.
+const PLACEMENT_GROUP_SINGLE_STRATEGY_SENTENCE: &str =
+    "Placement group supports single placement strategy for an instance role. Found \
+     multiple strategy for the following instance role: MASTER";
+
 /// The sentence a primary placement group on a cluster that is not multi-primary is
 /// refused with.
 const PLACEMENT_GROUP_MULTI_MASTER_SENTENCE: &str =
@@ -379,6 +387,59 @@ fn placement_cases() -> Vec<PlacementCase> {
             configs: json!([{ "InstanceRole": "MASTER" }]),
             primaries: 1,
             refusal: Some(PLACEMENT_GROUP_MULTI_MASTER_SENTENCE),
+        },
+        // One instance role is placed under ONE strategy, so a second entry for a role the
+        // request already configured asks for a second placement of it — whichever
+        // strategies the two entries carry, and whether or not they agree.
+        PlacementCase {
+            label: "the primary role configured with two different strategies",
+            configs: json!([
+                { "InstanceRole": "MASTER", "PlacementStrategy": "SPREAD" },
+                { "InstanceRole": "MASTER", "PlacementStrategy": "NONE" },
+            ]),
+            primaries: 3,
+            refusal: Some(PLACEMENT_GROUP_SINGLE_STRATEGY_SENTENCE),
+        },
+        PlacementCase {
+            label: "the primary role configured twice with the same strategy",
+            configs: json!([
+                { "InstanceRole": "MASTER", "PlacementStrategy": "SPREAD" },
+                { "InstanceRole": "MASTER", "PlacementStrategy": "SPREAD" },
+            ]),
+            primaries: 3,
+            refusal: Some(PLACEMENT_GROUP_SINGLE_STRATEGY_SENTENCE),
+        },
+        PlacementCase {
+            label: "the primary role configured twice, once with no strategy at all",
+            configs: json!([
+                { "InstanceRole": "MASTER" },
+                { "InstanceRole": "MASTER", "PlacementStrategy": "SPREAD" },
+            ]),
+            primaries: 3,
+            refusal: Some(PLACEMENT_GROUP_SINGLE_STRATEGY_SENTENCE),
+        },
+        // A role configured twice is reported before the STRATEGIES those entries carry:
+        // the request has asked for two placements of one role, which is what a caller
+        // fixes, and no single strategy of theirs is the one to report on.
+        PlacementCase {
+            label: "the primary role configured twice, one entry with an unplaced strategy",
+            configs: json!([
+                { "InstanceRole": "MASTER", "PlacementStrategy": "SPREAD" },
+                { "InstanceRole": "MASTER", "PlacementStrategy": "CLUSTER" },
+            ]),
+            primaries: 3,
+            refusal: Some(PLACEMENT_GROUP_SINGLE_STRATEGY_SENTENCE),
+        },
+        // And AFTER which role may be placed at all: a role Amazon EMR places none of is
+        // reported as that, however many entries configure it.
+        PlacementCase {
+            label: "a role that is not placed at all, configured twice",
+            configs: json!([
+                { "InstanceRole": "CORE", "PlacementStrategy": "SPREAD" },
+                { "InstanceRole": "CORE", "PlacementStrategy": "NONE" },
+            ]),
+            primaries: 3,
+            refusal: Some(PLACEMENT_GROUP_ROLE_SENTENCE),
         },
         PlacementCase {
             label: "the SPREAD strategy on a multi-primary cluster",

@@ -150,6 +150,37 @@ pub const PLACEMENT_GROUP_INSTANCE_ROLES: &[&str] = &[instance_group_type::MASTE
 pub const PLACEMENT_GROUP_INSTANCE_ROLE_MESSAGE: &str =
     "Placement group supports only the following instance role: [MASTER]";
 
+/// How Amazon EMR refuses a launch that configures ONE instance role with more than one
+/// placement group entry.
+///
+/// Recorded behavior for the text: Amazon EMR states the rule — one placement strategy per
+/// instance role — and then names the role the request configured more than once, which is
+/// the one variable part of the sentence.
+pub fn multiple_placement_strategies_message(instance_role: &str) -> String {
+    format!(
+        "Placement group supports single placement strategy for an instance role. Found \
+         multiple strategy for the following instance role: {instance_role}"
+    )
+}
+
+/// The instance role a launch's `PlacementGroupConfigs` configure more than once, in the
+/// order the request spelled the entries, or `None` when every entry names a role of its
+/// own.
+///
+/// "The configuration specifies the placement strategy that can be applied to instance
+/// roles during cluster creation" (`PlacementGroupConfig` doc) — one role is placed under
+/// one strategy ([`super::cluster_instances`] places it that way too), so a second entry
+/// for a role the request already configured names a second strategy for it, whichever
+/// strategies the two entries carry.
+fn role_configured_twice(configs: &[PlacementGroupConfig]) -> Option<&str> {
+    configs.iter().enumerate().find_map(|(at, config)| {
+        configs[..at]
+            .iter()
+            .any(|earlier| earlier.instance_role == config.instance_role)
+            .then_some(config.instance_role.as_str())
+    })
+}
+
 /// How Amazon EMR refuses a primary placement group configured with a strategy it does not
 /// place primaries with. Recorded behavior, and entirely fixed text.
 pub const MASTER_PLACEMENT_GROUP_STRATEGY_MESSAGE: &str =
@@ -174,10 +205,11 @@ pub const MULTI_PRIMARY_NODES: i64 = 3;
 /// The refusal a launch's `PlacementGroupConfigs` earn, or `None` when every entry
 /// configures a placement group this cluster can hold.
 ///
-/// Three readings, in the order a caller can act on them. WHICH ROLE may be placed at all
-/// ([`PLACEMENT_GROUP_INSTANCE_ROLES`]) and WHICH STRATEGY places it
-/// ([`MASTER_PLACEMENT_GROUP_STRATEGIES`]) are facts about the entry itself, so they are
-/// read before the cluster is looked at; an entry that names no strategy names none to
+/// Four readings, in the order a caller can act on them. WHICH ROLE may be placed at all
+/// ([`PLACEMENT_GROUP_INSTANCE_ROLES`]), whether that role is configured ONCE
+/// ([`role_configured_twice`]) and WHICH STRATEGY places it
+/// ([`MASTER_PLACEMENT_GROUP_STRATEGIES`]) are facts about the entries themselves, so they
+/// are read before the cluster is looked at; an entry that names no strategy names none to
 /// reject, and still asks for a placement group. WHETHER THE CLUSTER HAS primaries to place
 /// is the cross-field reading: a placement group of the primary nodes exists to spread the
 /// primaries of a multi-primary cluster ([`MULTI_PRIMARY_NODES`]) over distinct hardware, so
@@ -185,17 +217,24 @@ pub const MULTI_PRIMARY_NODES: i64 = 3;
 /// the `NONE` strategy asks for no placement group at all ([`created_placement_groups`]),
 /// so there is no group of it to place and the cluster's shape does not concern it.
 ///
+/// A role configured more than once is read before the strategies those entries carry: the
+/// request has asked for two placements of one role, which is what a caller fixes, and no
+/// single strategy of theirs is the one to report on.
+///
 /// `primary_nodes` is the primary count of the cluster the launch describes, counted off
 /// the groups and fleets it provisions ([`primary_node_count`]).
 pub fn placement_group_refusal(
     configs: &[PlacementGroupConfig],
     primary_nodes: i64,
-) -> Option<&'static str> {
+) -> Option<String> {
     if configs
         .iter()
         .any(|config| !PLACEMENT_GROUP_INSTANCE_ROLES.contains(&config.instance_role.as_str()))
     {
-        return Some(PLACEMENT_GROUP_INSTANCE_ROLE_MESSAGE);
+        return Some(PLACEMENT_GROUP_INSTANCE_ROLE_MESSAGE.to_string());
+    }
+    if let Some(role) = role_configured_twice(configs) {
+        return Some(multiple_placement_strategies_message(role));
     }
     if configs.iter().any(|config| {
         config
@@ -203,13 +242,13 @@ pub fn placement_group_refusal(
             .as_deref()
             .is_some_and(|strategy| !MASTER_PLACEMENT_GROUP_STRATEGIES.contains(&strategy))
     }) {
-        return Some(MASTER_PLACEMENT_GROUP_STRATEGY_MESSAGE);
+        return Some(MASTER_PLACEMENT_GROUP_STRATEGY_MESSAGE.to_string());
     }
     let places_primaries = configs.iter().any(|config| {
         config.placement_strategy.as_deref() != Some(PLACEMENT_GROUP_STRATEGY_NONE)
     });
     if places_primaries && primary_nodes != MULTI_PRIMARY_NODES {
-        return Some(MASTER_PLACEMENT_GROUP_MULTI_MASTER_MESSAGE);
+        return Some(MASTER_PLACEMENT_GROUP_MULTI_MASTER_MESSAGE.to_string());
     }
     None
 }

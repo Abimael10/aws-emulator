@@ -36,7 +36,7 @@
 use serde_json::{json, Value};
 
 use crate::input_refusals::error_message;
-use crate::job_flow_lifecycle::{at, kept_alive_request, Emr};
+use crate::job_flow_lifecycle::{assert_refused, at, kept_alive_request, Emr};
 
 /// The client-input error EMR's own model declares, which its own enum check answers on
 /// an operation that declares it (`smithy_query(query="operation",
@@ -707,4 +707,309 @@ async fn every_declared_comparison_operator_is_admitted_and_persisted() {
              {stored}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The ORDER a constraint clause lists an enum's admissible value set in
+// ---------------------------------------------------------------------------
+
+/// One enum, as the MODEL declares its values and as this service LISTS them in a
+/// constraint clause.
+///
+/// `declared` is read off the model (`smithy_query(query="shape", shape="<Enum>")`, cited
+/// per row); `listed` is the order a refusal states that set in, which is the walk of the
+/// front door's own table of those values and so neither the declaration order nor a sort
+/// of it. The recorded instance behind the rule is one row — `PlacementGroupStrategy`,
+/// declared `[SPREAD, PARTITION, CLUSTER, NONE]` and stated
+/// `[PARTITION, SPREAD, NONE, CLUSTER]`.
+struct ValueSet {
+    declared: &'static [&'static str],
+    listed: &'static [&'static str],
+}
+
+/// `com.amazonaws.emr#PlacementGroupStrategy` (`smithy_query(query="shape",
+/// shape="PlacementGroupStrategy")`): the recorded row.
+const PLACEMENT_GROUP_STRATEGY: ValueSet = ValueSet {
+    declared: &["SPREAD", "PARTITION", "CLUSTER", "NONE"],
+    listed: &["PARTITION", "SPREAD", "NONE", "CLUSTER"],
+};
+
+/// `com.amazonaws.emr#MarketType` (`smithy_query(query="shape", shape="MarketType")`).
+const MARKET_TYPE: ValueSet = ValueSet {
+    declared: &["ON_DEMAND", "SPOT"],
+    listed: &["SPOT", "ON_DEMAND"],
+};
+
+/// `com.amazonaws.emr#ActionOnFailure` (`smithy_query(query="shape",
+/// shape="ActionOnFailure")`).
+const ACTION_ON_FAILURE: ValueSet = ValueSet {
+    declared: &[
+        "TERMINATE_JOB_FLOW",
+        "TERMINATE_CLUSTER",
+        "CANCEL_AND_WAIT",
+        "CONTINUE",
+    ],
+    listed: &[
+        "CANCEL_AND_WAIT",
+        "CONTINUE",
+        "TERMINATE_JOB_FLOW",
+        "TERMINATE_CLUSTER",
+    ],
+};
+
+/// `com.amazonaws.emr#ProfilerType` (`smithy_query(query="shape", shape="ProfilerType")`).
+const PROFILER_TYPE: ValueSet = ValueSet {
+    declared: &["SHS", "TEZUI", "YTS"],
+    listed: &["YTS", "TEZUI", "SHS"],
+};
+
+/// `com.amazonaws.emr#InstanceFleetType` (`smithy_query(query="shape",
+/// shape="InstanceFleetType")`).
+const INSTANCE_FLEET_TYPE: ValueSet = ValueSet {
+    declared: &["MASTER", "CORE", "TASK"],
+    listed: &["MASTER", "TASK", "CORE"],
+};
+
+/// `com.amazonaws.emr#ScaleDownBehavior` (`smithy_query(query="shape",
+/// shape="ScaleDownBehavior")`): the control on the rule — a set whose stated order and
+/// declaration order AGREE, so the order is shown to be computed from the values rather
+/// than a blanket reversal or sort of whatever the model declared.
+const SCALE_DOWN_BEHAVIOR: ValueSet = ValueSet {
+    declared: &["TERMINATE_AT_INSTANCE_HOUR", "TERMINATE_AT_TASK_COMPLETION"],
+    listed: &["TERMINATE_AT_INSTANCE_HOUR", "TERMINATE_AT_TASK_COMPLETION"],
+};
+
+/// The whole message a refusal of ONE value outside an enum states: the framework's
+/// counted envelope and clause, over the value set as `set` says this service lists it.
+fn one_enum_error(submitted: &str, path: &str, set: &ValueSet) -> String {
+    format!(
+        "1 validation error detected: Value '{submitted}' at '{path}' failed to satisfy \
+         constraint: Member must satisfy enum value set: [{}]",
+        set.listed.join(", ")
+    )
+}
+
+/// A `RunJobFlow` body carrying the members that operation requires, plus `extra`.
+fn launch(name: &str, extra: Value) -> Value {
+    let mut body = json!({
+        "Name": name,
+        "ReleaseLabel": "emr-6.15.0",
+        "Instances": { "InstanceCount": 1, "MasterInstanceType": "m5.xlarge" },
+    });
+    if let Some(members) = extra.as_object() {
+        for (key, value) in members {
+            body[key] = value.clone();
+        }
+    }
+    body
+}
+
+/// THE RULE: a refusal of a value outside a modelled enum lists that enum's admissible
+/// values in the order this service's front door walks its own table of them — ascending
+/// bucket of each value's string hash — and NOT in the order the model declares them, so
+/// one enum is listed the same way whichever member carried the value, whichever operation
+/// was served, and however deep the value sat. Everything else about the clause stays the
+/// framework's: the counted envelope, the echoed value, the member path and the
+/// requirement's wording.
+///
+/// Rows span what the rule generalises over: six enums (two, three and four values), the
+/// two error identities EMR answers a boundary refusal under, a value on the operation's
+/// own input shape and values two, three and four steps down, two positions of the same
+/// list, and — as the control — a set whose stated order the declaration order agrees
+/// with.
+#[tokio::test]
+async fn an_enum_value_set_is_listed_in_the_order_this_service_states_it() {
+    let emr = Emr::new();
+    // `AddInstanceFleet` resolves its cluster BEFORE the request's other members, so the
+    // row below names a cluster this emulator holds; the rest resolve nothing.
+    let cluster = emr
+        .run_job_flow(json!({
+            "Name": "stated enum value sets",
+            "ReleaseLabel": "emr-6.15.0",
+            "JobFlowRole": crate::job_flow_lifecycle::INSTANCE_PROFILE,
+            "ServiceRole": crate::job_flow_lifecycle::SERVICE_ROLE,
+            "Instances": {
+                "KeepJobFlowAliveWhenNoSteps": true,
+                "InstanceGroups": [
+                    { "Name": "primary", "InstanceRole": "MASTER",
+                      "InstanceType": "m5.xlarge", "InstanceCount": 1 },
+                ],
+            },
+        }))
+        .await;
+
+    let rows: Vec<(&str, &str, Value, &str, &str, &str, &ValueSet)> = vec![
+        // The recorded case: the strategy of the FIRST placement group configuration.
+        (
+            "RunJobFlow with a lower-cased PlacementStrategy",
+            "RunJobFlow",
+            launch(
+                "placement strategy out of its set",
+                json!({ "PlacementGroupConfigs": [
+                    { "InstanceRole": "MASTER", "PlacementStrategy": "spread" },
+                ] }),
+            ),
+            GENERIC,
+            "spread",
+            "placementGroupConfigs.1.member.placementStrategy",
+            &PLACEMENT_GROUP_STRATEGY,
+        ),
+        // The same enum reached through the SECOND element, so neither the set nor the
+        // clause is keyed to one position.
+        (
+            "RunJobFlow with the second PlacementStrategy mis-cased",
+            "RunJobFlow",
+            launch(
+                "second placement strategy out of its set",
+                json!({ "PlacementGroupConfigs": [
+                    { "InstanceRole": "MASTER", "PlacementStrategy": "SPREAD" },
+                    { "InstanceRole": "CORE", "PlacementStrategy": "Cluster" },
+                ] }),
+            ),
+            GENERIC,
+            "Cluster",
+            "placementGroupConfigs.2.member.placementStrategy",
+            &PLACEMENT_GROUP_STRATEGY,
+        ),
+        // A member of the operation's OWN input shape, on an operation that cannot answer
+        // EMR's client error: the control on the rule's order half.
+        (
+            "RunJobFlow with an undeclared ScaleDownBehavior",
+            "RunJobFlow",
+            launch(
+                "scale down behavior out of its set",
+                json!({ "ScaleDownBehavior": "TERMINATE_WHENEVER" }),
+            ),
+            GENERIC,
+            "TERMINATE_WHENEVER",
+            "scaleDownBehavior",
+            &SCALE_DOWN_BEHAVIOR,
+        ),
+        // Four steps down, through a list inside a nested structure.
+        (
+            "RunJobFlow with an undeclared Market on a launched group",
+            "RunJobFlow",
+            json!({
+                "Name": "market out of its set",
+                "ReleaseLabel": "emr-6.15.0",
+                "Instances": {
+                    "KeepJobFlowAliveWhenNoSteps": true,
+                    "InstanceGroups": [{
+                        "Name": "primary",
+                        "InstanceRole": "MASTER",
+                        "InstanceType": "m5.xlarge",
+                        "InstanceCount": 1,
+                        "Market": "CHEAP",
+                    }],
+                },
+            }),
+            GENERIC,
+            "CHEAP",
+            "instances.instanceGroups.1.member.market",
+            &MARKET_TYPE,
+        ),
+        // Two steps down, through a list.
+        (
+            "AddJobFlowSteps with an undeclared ActionOnFailure",
+            "AddJobFlowSteps",
+            json!({
+                "JobFlowId": "j-ABCDEFGHIJKLM",
+                "Steps": [{
+                    "Name": "a step",
+                    "ActionOnFailure": "GIVE_UP",
+                    "HadoopJarStep": { "Jar": "command-runner.jar" },
+                }],
+            }),
+            GENERIC,
+            "GIVE_UP",
+            "steps.1.member.actionOnFailure",
+            &ACTION_ON_FAILURE,
+        ),
+        // Two steps down, through a structure, on a cluster-scoped operation.
+        (
+            "AddInstanceFleet with an undeclared InstanceFleetType",
+            "AddInstanceFleet",
+            json!({
+                "ClusterId": &cluster,
+                "InstanceFleet": {
+                    "InstanceFleetType": "WORKER",
+                    "TargetOnDemandCapacity": 1,
+                    "InstanceTypeConfigs": [{ "InstanceType": "m5.xlarge" }],
+                },
+            }),
+            GENERIC,
+            "WORKER",
+            "instanceFleet.instanceFleetType",
+            &INSTANCE_FLEET_TYPE,
+        ),
+        // A member of the operation's own input shape, answered under EMR's OWN client
+        // error: one order, whichever identity carries the clause.
+        (
+            "CreatePersistentAppUI with an undeclared ProfilerType",
+            "CreatePersistentAppUI",
+            json!({
+                "TargetResourceArn":
+                    "arn:aws:elasticmapreduce:us-east-1:000000000000:cluster/j-ABCDEFGHIJKLM",
+                "ProfilerType": "SPARKUI",
+            }),
+            SELF_CHECKED,
+            "SPARKUI",
+            "profilerType",
+            &PROFILER_TYPE,
+        ),
+    ];
+
+    for (case, operation, body, code, submitted, path, set) in rows {
+        let (status, payload) = emr.call(operation, body).await;
+        assert_refused(case, status, &payload, code);
+        let expected = one_enum_error(submitted, path, set);
+        let said = error_message(&payload);
+        assert_eq!(
+            said, expected,
+            "case {case:?}: expected {expected:?}, got {said:?}"
+        );
+        // The values the model declares are exactly the values stated, so the order is
+        // all that moved: nothing is added to the set and nothing is dropped from it.
+        let mut declared: Vec<&str> = set.declared.to_vec();
+        let mut listed: Vec<&str> = set.listed.to_vec();
+        declared.sort_unstable();
+        listed.sort_unstable();
+        assert_eq!(
+            listed, declared,
+            "case {case:?}: the stated set must hold exactly the declared values, got \
+             {listed:?} against {declared:?}"
+        );
+    }
+}
+
+/// THE RULE's teeth: the recorded enum is NOT listed in the order its model declares it,
+/// and the declaration order never reaches the wire.
+#[tokio::test]
+async fn the_recorded_enum_value_set_is_not_listed_in_the_models_order() {
+    let emr = Emr::new();
+    let (status, payload) = emr
+        .call(
+            "RunJobFlow",
+            launch(
+                "placement strategy out of its set",
+                json!({ "PlacementGroupConfigs": [
+                    { "InstanceRole": "MASTER", "PlacementStrategy": "spread" },
+                ] }),
+            ),
+        )
+        .await;
+    assert_refused("the recorded placement strategy", status, &payload, GENERIC);
+    let said = error_message(&payload);
+    let declared = format!("[{}]", PLACEMENT_GROUP_STRATEGY.declared.join(", "));
+    assert!(
+        !said.contains(&declared),
+        "case {:?}: the declaration order must not reach the wire, got {said:?}",
+        "the recorded placement strategy"
+    );
+    let listed = format!("[{}]", PLACEMENT_GROUP_STRATEGY.listed.join(", "));
+    assert!(
+        said.ends_with(&listed),
+        "case {:?}: the clause must end with {listed:?}, got {said:?}",
+        "the recorded placement strategy"
+    );
 }

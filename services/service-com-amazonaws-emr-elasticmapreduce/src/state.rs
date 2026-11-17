@@ -735,6 +735,31 @@ pub fn release_label_not_valid() -> InvalidRequestException {
     }
 }
 
+/// How the operation that DESCRIBES a release refuses a request that supplies NO release
+/// label at all — the member absent, or carried with nothing in it: Amazon EMR's own
+/// CONSTANT sentence for that class.
+///
+/// Recorded behavior for the text. It is a class of its own, and not the unoffered-label
+/// class above: a request that names no label has named nothing to look up, so the
+/// sentence states that the label is EMPTY rather than that it is not valid, and nothing
+/// of the request appears in it.
+pub const RELEASE_LABEL_EMPTY_MESSAGE: &str = "The release label can't be empty.";
+
+/// The refusal the release DESCRIBE answers a request carrying no release label with:
+/// that constant sentence under the discriminator it publishes for an input parameter it
+/// will not accept ([`error_code::INVALID_INPUT_PARAMETER`]) — the same discriminator as
+/// the unoffered-label refusal beside it ([`release_label_not_valid`]), because both are
+/// verdicts on the same input parameter, with only the sentence telling them apart.
+///
+/// The code is paired with the wording HERE, in the one place that wording is built, so
+/// no branch of this read's input validation can answer the class without its code.
+pub fn release_label_empty() -> InvalidRequestException {
+    InvalidRequestException {
+        error_code: Some(error_code::INVALID_INPUT_PARAMETER.to_string()),
+        message: Some(RELEASE_LABEL_EMPTY_MESSAGE.to_string()),
+    }
+}
+
 /// How a listing bounded by a CREATION-DATE window refuses a window whose beginning is
 /// after its end.
 ///
