@@ -899,16 +899,17 @@ fn upper_camel(segment: &str) -> String {
 /// `range min 1`) and so do the members above. Stated here as well, so the rule the windows
 /// are built on does not depend on the boundary validator having run.
 ///
-/// The REQUIREMENT a period broke is what CloudWatch states, and which of the two it is depends
-/// on where the period sits. "For metrics with regular resolution, a period can be as short as
-/// one minute (60 seconds) and must be a multiple of 60. For high-resolution metrics […] the
-/// period can be 1, 5, 10, 20, 30, 60, or any multiple of 60" (`MetricStat$Period`) — the
-/// sub-minute granularities are the ADDITIONAL periods a high-resolution metric admits, so a
-/// value that is none of them broke the rule every metric is read under, which is the multiple
-/// a period has to be of. A period at or below zero is not that: a granularity is a span of
-/// seconds, so a value naming no span at all is stated against the bound it broke
-/// ([`non_positive_period_message`]) rather than against a step it could never have been a
-/// multiple of.
+/// The REQUIREMENT a period broke is what CloudWatch states, and which of the three it is
+/// depends on where the period sits. "For metrics with regular resolution, a period can be as
+/// short as one minute (60 seconds) and must be a multiple of 60. For high-resolution metrics
+/// […] the period can be 1, 5, 10, 20, 30, 60, or any multiple of 60" (`MetricStat$Period`) —
+/// so a period BELOW a minute is admitted only as one of the enumerated sub-minute
+/// granularities, and such a value is stated against that SET ([`SUB_MINUTE_PERIODS`], the only
+/// granularities shorter than a minute there are), while a period of a minute or more is
+/// admitted as any whole number of minutes and is stated against that multiple. A period at or
+/// below zero is neither: a granularity is a span of seconds, so a value naming no span at all
+/// is stated against the bound it broke ([`non_positive_period_message`]) rather than against a
+/// set or a step it could never have belonged to.
 pub fn period_error(period: i32) -> Option<String> {
     let documented = period >= SHORTEST_PERIOD_SECS
         && (SUB_MINUTE_PERIODS.contains(&period) || period % REGULAR_PERIOD_SECS == 0);
@@ -917,6 +918,15 @@ pub fn period_error(period: i32) -> Option<String> {
     }
     if period < SHORTEST_PERIOD_SECS {
         return Some(non_positive_period_message());
+    }
+    if period < REGULAR_PERIOD_SECS {
+        return Some(value_in_set_message(
+            PERIOD_PARAMETER,
+            &SUB_MINUTE_PERIODS
+                .iter()
+                .map(i32::to_string)
+                .collect::<Vec<String>>(),
+        ));
     }
     Some(format!(
         "The parameter {PERIOD_PARAMETER} must be a multiple of {REGULAR_PERIOD_SECS}."

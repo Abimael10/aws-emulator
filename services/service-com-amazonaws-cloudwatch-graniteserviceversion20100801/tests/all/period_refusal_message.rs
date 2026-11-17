@@ -4,15 +4,16 @@
 //! can be read at, and the granularities it accepts.
 //!
 //! The rule under test: **a `Period` outside the granularities a metric is stored at is refused
-//! `InvalidParameterValue` against the requirement it broke — the multiple of a minute a period
-//! has to be — with nothing of the submitted value in the sentence**, while every documented
-//! granularity (the sub-minute divisions of a minute, and any multiple of 60) is accepted.
-//! `GetMetricStatisticsInput$Period` and `MetricStat$Period` document the same set ("For
-//! metrics with regular resolution, a period can be as short as one minute (60 seconds) and
-//! must be a multiple of 60. For high-resolution metrics […] the period can be 1, 5, 10, 20,
-//! 30, 60, or any multiple of 60"), so both readers answer alike: the sub-minute values are the
-//! ADDITIONAL periods a high-resolution metric admits, so a period that is none of them broke
-//! the multiple every metric is read under.
+//! `InvalidParameterValue` against the requirement its own span broke — a period SHORTER than a
+//! minute against the set of sub-minute granularities there are, and a period of a minute or
+//! more against the multiple of a minute it has to be — with nothing of the submitted value in
+//! the sentence**, while every documented granularity (the sub-minute divisions of a minute, and
+//! any multiple of 60) is accepted. `GetMetricStatisticsInput$Period` and `MetricStat$Period`
+//! document the same set ("For metrics with regular resolution, a period can be as short as one
+//! minute (60 seconds) and must be a multiple of 60. For high-resolution metrics […] the period
+//! can be 1, 5, 10, 20, 30, 60, or any multiple of 60"), so both readers answer alike: below a
+//! minute the only granularities there are are the enumerated ones, and from a minute up every
+//! granularity is a whole number of minutes.
 //!
 //! The rows differ along the period itself — each published sub-minute granularity, values on
 //! either side of them, a value just under and just over a minute, and one between two
@@ -23,9 +24,15 @@ use serde_json::{json, Value};
 
 use crate::harness::{build_router, call, error_code, error_message, now_secs, ok};
 
-/// The sentence CloudWatch refuses a period outside those granularities with: the member and
-/// the whole number of minutes it was not, and nothing of the submitted value.
+/// The sentence CloudWatch refuses a period of a minute or more that is no whole number of
+/// minutes with: the member and the multiple it was not, and nothing of the submitted value.
 const MULTIPLE_REFUSAL: &str = "The parameter Period must be a multiple of 60.";
+
+/// The sentence it refuses a period SHORTER than a minute that is none of the sub-minute
+/// granularities with: the member and the whole set of them, and nothing of the submitted
+/// value. The set is the one `GetMetricStatisticsInput$Period` / `MetricStat$Period` enumerate
+/// ("the period can be 1, 5, 10, 20, 30, 60, or any multiple of 60") below a minute.
+const SET_REFUSAL: &str = "The parameter Period must be a value in the set [1, 5, 10, 20, 30].";
 
 /// The wire error code of that refusal, as an SDK of this service sees it.
 const REFUSAL_CODE: &str = "InvalidParameterValueException";
@@ -72,19 +79,20 @@ fn data_request(period: i64) -> Value {
 #[tokio::test]
 async fn a_period_outside_the_readable_granularities_is_refused_with_the_requirement_it_broke() {
     let router = build_router();
-    // (the period, the requirement its refusal states): every period no sub-minute granularity
-    // admits and that is no whole number of minutes is told the multiple it was not, whether it
-    // is shorter than a minute or longer.
+    // (the period, the requirement its refusal states): a period shorter than a minute that is
+    // none of the sub-minute granularities is told the SET of them, and a period of a minute or
+    // more that is no whole number of minutes is told the multiple it was not. The rows walk
+    // both sides of every published granularity and both sides of the minute boundary.
     // Source for the granularities: `GetMetricStatisticsInput$Period` / `MetricStat$Period`.
     let periods: [(i64, &str); 9] = [
-        (2, MULTIPLE_REFUSAL),
-        (4, MULTIPLE_REFUSAL),
-        (7, MULTIPLE_REFUSAL),
-        (11, MULTIPLE_REFUSAL),
-        (21, MULTIPLE_REFUSAL),
-        (31, MULTIPLE_REFUSAL),
-        (45, MULTIPLE_REFUSAL),
-        (59, MULTIPLE_REFUSAL),
+        (2, SET_REFUSAL),
+        (4, SET_REFUSAL),
+        (7, SET_REFUSAL),
+        (11, SET_REFUSAL),
+        (21, SET_REFUSAL),
+        (31, SET_REFUSAL),
+        (45, SET_REFUSAL),
+        (59, SET_REFUSAL),
         (61, MULTIPLE_REFUSAL),
     ];
 
@@ -151,6 +159,82 @@ async fn every_documented_granularity_is_read_rather_than_refused() {
                 status, 200,
                 "case period {period} on {reader}: a documented granularity is read, got \
                  {status} with {body}"
+            );
+        }
+    }
+}
+
+/// The granularities shorter than a minute a metric may be read at, from
+/// `GetMetricStatisticsInput$Period` / `MetricStat$Period` ("the period can be 1, 5, 10, 20,
+/// 30, 60, or any multiple of 60").
+const SUB_MINUTE_GRANULARITIES: [i64; 5] = [1, 5, 10, 20, 30];
+
+/// A minute in seconds: the boundary that decides WHICH requirement a refused period is stated
+/// against, and the step every granularity from it up has to be a whole number of.
+const ONE_MINUTE: i64 = 60;
+
+#[tokio::test]
+async fn which_requirement_a_refused_period_is_stated_against_follows_the_minute_boundary() {
+    let router = build_router();
+
+    // Every period from one second to just over two minutes, so no row is hand-picked: each is
+    // either a granularity the member documents (read, not refused) or a refusal stated against
+    // the requirement its own span broke.
+    for period in 1..=(2 * ONE_MINUTE + 3) {
+        let documented =
+            SUB_MINUTE_GRANULARITIES.contains(&period) || period % ONE_MINUTE == 0;
+        let (status, body) = call(&router, "GetMetricStatistics", &statistics_request(period)).await;
+        if documented {
+            assert_eq!(
+                status, 200,
+                "case period {period}: a documented granularity is read, got {status} with {body}"
+            );
+            continue;
+        }
+        let expected = if period < ONE_MINUTE {
+            SET_REFUSAL
+        } else {
+            MULTIPLE_REFUSAL
+        };
+        let message = error_message(&body);
+        assert_eq!(
+            (status, message.as_str()),
+            (400, expected),
+            "case period {period}: expected HTTP 400 with {expected:?}, got {status} with {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn each_sentence_is_fixed_across_the_periods_of_its_own_class() {
+    let router = build_router();
+
+    // Two different periods of each class: the sentence a class is refused with carries nothing
+    // of the submitted value, so the rows of one class cannot be told apart by their answer.
+    for (class, periods) in [
+        ("shorter than a minute", [7_i64, 41]),
+        ("a minute or more", [97_i64, 86_401]),
+    ] {
+        let mut answered: Vec<String> = Vec::new();
+        for period in periods {
+            let (status, body) =
+                call(&router, "GetMetricStatistics", &statistics_request(period)).await;
+            assert_eq!(
+                status, 400,
+                "case {class:?} / period {period}: expected HTTP 400, got {status} with {body}"
+            );
+            answered.push(error_message(&body));
+        }
+        assert_eq!(
+            answered[0], answered[1],
+            "case {class:?}: both periods of one class are refused with the same fixed \
+             sentence, got {answered:?}"
+        );
+        for (period, message) in periods.iter().zip(answered.iter()) {
+            assert!(
+                !message.contains(&period.to_string()),
+                "case {class:?} / period {period}: the sentence must carry nothing of the \
+                 submitted value, got {message:?}"
             );
         }
     }

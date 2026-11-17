@@ -5,10 +5,11 @@
 //!
 //! The rule under test: **a `RuleDefinition` that is not a readable Contributor Insights rule
 //! definition is refused `InvalidParameterValue` with the service's reason-code sentence for
-//! what was wrong with the body — the KEY the body is short of, when the syntax requires one it
-//! does not carry, and otherwise the one fixed sentence for a body that could not be parsed —
-//! carrying neither the rule name nor anything of the submitted body** — while a body the
-//! syntax does allow is accepted and read back. The model constrains
+//! what was wrong with the body — the KEY the body is short of, when the schema it names
+//! requires one it does not carry, and otherwise the one fixed sentence for a body that could
+//! not be parsed, which is what a body naming no readable schema gets, there being no syntax to
+//! read the rest of it under — carrying neither the rule name nor anything of the submitted
+//! body** — while a body the syntax does allow is accepted and read back. The model constrains
 //! `PutInsightRuleInput$RuleDefinition` only as a 1..8192 ASCII string
 //! (`smithy_query(query="operation",operation="PutInsightRule")`), so the body's syntax is
 //! the service's own check, and this is how the service reports the failure of that check.
@@ -88,20 +89,20 @@ async fn every_unreadable_rule_body_is_refused_with_the_one_reason_code_sentence
 
     // Rows: (case, the rule name the request carries, the body it submits, the refusal).
     let cases: Vec<(&str, String, String, String)> = vec![
-        // The minimal JSON object: syntactically valid JSON, no rule definition at all — so the
-        // first key the syntax requires is the one it is told about. The name carries no
-        // character of the sentence, so a name echoed into the message would show.
+        // The minimal JSON object: syntactically valid JSON, naming no rule schema, so there is
+        // no rule syntax to read it under at all and it is the unparseable class. The name
+        // carries no character of the sentence, so a name echoed into the message would show.
         (
             "the minimal JSON object",
             "Q1".to_string(),
             "{}".to_string(),
-            missing_key("Schema"),
+            UNPARSEABLE_RULE_BODY.to_string(),
         ),
         (
             "an object with members the syntax does not define",
             "unrelated-members".to_string(),
             json!({"Rule": "contributors", "Version": 1}).to_string(),
-            missing_key("Schema"),
+            UNPARSEABLE_RULE_BODY.to_string(),
         ),
         (
             "text that is not JSON",
@@ -137,7 +138,7 @@ async fn every_unreadable_rule_body_is_refused_with_the_one_reason_code_sentence
             "no schema",
             "no-schema".to_string(),
             definition(json!({"Schema": null})),
-            missing_key("Schema"),
+            UNPARSEABLE_RULE_BODY.to_string(),
         ),
         (
             "a schema at another version",
@@ -274,6 +275,93 @@ async fn every_unreadable_rule_body_is_refused_with_the_one_reason_code_sentence
             reported_names(&described),
             Vec::<String>::new(),
             "case {case:?}: a refused PutInsightRule must persist nothing, got {described}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_schema_selects_the_syntax_a_body_is_read_under_before_any_key_is_named() {
+    let router = build_router();
+
+    // Rows: (the case, the body, the refusal). The first group names no schema this service
+    // reads a rule in — it is absent, removed, or carries a value that is not the one
+    // `InsightRule$Schema` documents ("For rules that you create, this is always {"Name":
+    // "CloudWatchLogRule", "Version": 1}") — so there is no syntax to read the rest of the body
+    // under and each is the unparseable class, however many other keys the body carries. The
+    // second group names that schema and is short of one key of it, so each is told WHICH key.
+    let cases: Vec<(&str, String, String)> = vec![
+        (
+            "no schema key at all, and nothing else either",
+            "{}".to_string(),
+            UNPARSEABLE_RULE_BODY.to_string(),
+        ),
+        (
+            "no schema key, every other key present",
+            definition(json!({"Schema": null})),
+            UNPARSEABLE_RULE_BODY.to_string(),
+        ),
+        (
+            "a schema that is a string",
+            definition(json!({"Schema": "CloudWatchLogRule"})),
+            UNPARSEABLE_RULE_BODY.to_string(),
+        ),
+        (
+            "a schema that is a list",
+            definition(json!({"Schema": [{"Name": "CloudWatchLogRule", "Version": 1}]})),
+            UNPARSEABLE_RULE_BODY.to_string(),
+        ),
+        (
+            "a schema object naming no name",
+            definition(json!({"Schema": {"Version": 1}})),
+            UNPARSEABLE_RULE_BODY.to_string(),
+        ),
+        (
+            "a schema object naming no version",
+            definition(json!({"Schema": {"Name": "CloudWatchLogRule"}})),
+            UNPARSEABLE_RULE_BODY.to_string(),
+        ),
+        (
+            "a schema this service reads no rule in",
+            definition(json!({"Schema": {"Name": "ServiceLogRule", "Version": 1}})),
+            UNPARSEABLE_RULE_BODY.to_string(),
+        ),
+        (
+            "no schema and no contribution either",
+            definition(json!({"Schema": null, "Contribution": null})),
+            UNPARSEABLE_RULE_BODY.to_string(),
+        ),
+        // The same body WITH the schema it names the syntax by: now the absent contribution is
+        // a key of a chosen syntax, so it is the key the refusal names.
+        (
+            "the schema named, the contribution absent",
+            definition(json!({"Contribution": null})),
+            missing_key("Contribution"),
+        ),
+        (
+            "the schema named, the log groups absent",
+            definition(json!({"LogGroupNames": null})),
+            missing_key("LogGroupNames"),
+        ),
+        (
+            "the schema named, the log format absent",
+            definition(json!({"LogFormat": null})),
+            missing_key("LogFormat"),
+        ),
+    ];
+
+    for (case, body, expected) in cases {
+        let (status, response) = call(
+            &router,
+            "PutInsightRule",
+            &json!({"RuleName": "schema-selection", "RuleDefinition": body}),
+        )
+        .await;
+        let message = error_message(&response);
+        assert_eq!(
+            (status, error_code(&response), message.clone()),
+            (400, REFUSAL_CODE.to_string(), expected.clone()),
+            "case {case:?}: expected HTTP 400 {REFUSAL_CODE} with {expected:?}, got {status} \
+             with {response}"
         );
     }
 }

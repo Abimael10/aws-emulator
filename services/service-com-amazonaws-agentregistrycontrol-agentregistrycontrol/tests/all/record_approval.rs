@@ -18,8 +18,10 @@
 //!   declares — `DateTimestamp` carries `@timestampFormat("date-time")`, so it is an
 //!   RFC 3339 / ISO 8601 date-time STRING in UTC and never an epoch number;
 //! * a record whose stored status is not `DRAFT` is a precondition on the resource's
-//!   state, so the submission is the modelled `ValidationException` (HTTP 400) worded in
-//!   one sentence whose only variable part is that stored status.
+//!   state, so the submission is the modelled `ValidationException` (HTTP 400): a status
+//!   the record can still leave is worded in this operation's own one sentence, whose only
+//!   variable part is that stored status, while the lifecycle's TERMINAL status is answered
+//!   with the one sentence every change to a retired record is refused with.
 //!
 //! Every test asserts over a TABLE of inputs, so it holds for a class of requests rather
 //! than for one recorded shape.
@@ -971,7 +973,7 @@ async fn record_in_status(
 }
 
 #[tokio::test]
-async fn a_record_in_any_status_other_than_draft_is_refused_with_this_operations_own_sentence() {
+async fn a_record_in_any_status_other_than_draft_is_refused_with_the_sentence_of_its_class() {
     let router = router();
 
     // Rows span the statuses other than DRAFT a stored record can be addressed in: the two
@@ -982,6 +984,11 @@ async fn a_record_in_any_status_other_than_draft_is_refused_with_this_operations
     // `RegistryRecordStatus`' own catalogue (`smithy_query(query="shape",
     // shape="RegistryRecordStatus")`: DRAFT, PENDING_APPROVAL, APPROVED, REJECTED,
     // DEPRECATED, CREATING, UPDATING, CREATE_FAILED, UPDATE_FAILED).
+    //
+    // A status a record can still LEAVE is refused in this operation's own words, naming that
+    // status; the lifecycle's TERMINAL status is not about submission at all — the record is
+    // retired, so every change to it is refused with the one sentence that states that, the
+    // same sentence an edit and a status change answer with.
     let rows: [(&str, &str); 4] = [
         ("a record waiting for a curator", "PENDING_APPROVAL"),
         ("a record its registry approved on submission", "APPROVED"),
@@ -992,6 +999,11 @@ async fn a_record_in_any_status_other_than_draft_is_refused_with_this_operations
     for (index, (case, status)) in rows.into_iter().enumerate() {
         let (registry_id, record_id) = record_in_status(&router, case, index, status).await;
         let before = get_record(&router, &registry_id, &record_id).await;
+        let expected = if status == "DEPRECATED" {
+            format!("Cannot update registry record in {status} status (terminal state)")
+        } else {
+            format!("Cannot submit the record for approval in current status: {status}")
+        };
 
         let refused = submit_record(&router, &registry_id, &record_id).await;
         assert_eq!(
@@ -1000,13 +1012,9 @@ async fn a_record_in_any_status_other_than_draft_is_refused_with_this_operations
                 refused.error_code.as_deref(),
                 refused.message()
             ),
-            (
-                400,
-                Some("ValidationException"),
-                format!("Cannot submit the record for approval in current status: {status}")
-            ),
-            "case {case:?}: a record in {status} is refused with the modelled 400 and this \
-             operation's own sentence, whose only variable part is that status, got {} {:?}",
+            (400, Some("ValidationException"), expected.clone()),
+            "case {case:?}: a record in {status} is refused with the modelled 400 and the \
+             sentence of its class {expected:?}, got {} {:?}",
             refused.status,
             refused.body
         );

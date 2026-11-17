@@ -682,6 +682,150 @@ async fn a_deprecated_record_is_retired_so_nothing_moves_it_again() {
     }
 }
 
+/// A change asked of a record through one of the operations that CHANGE it: the operation's
+/// name as the test reports it, and the request it sends for `registry`/`record`.
+async fn change_asked_of(
+    router: &MultiServiceRouter,
+    operation: &str,
+    registry: &str,
+    record: &str,
+) -> Reply {
+    let records_path = format!(
+        "/registries/{}/records/{}",
+        encode_label(registry),
+        encode_label(record)
+    );
+    match operation {
+        "UpdateRegistryRecordStatus" => {
+            update_status(
+                router,
+                registry,
+                record,
+                json!({ "status": "APPROVED", "statusReason": "asked for by the suite" }),
+            )
+            .await
+        }
+        "UpdateRegistryRecord" => {
+            call(
+                router,
+                "PATCH",
+                &records_path,
+                Some(json!({ "description": { "optionalValue": "edited by the suite" } })),
+            )
+            .await
+        }
+        "SubmitRegistryRecordForApproval" => {
+            call(
+                router,
+                "POST",
+                &format!("{records_path}/submit-for-approval"),
+                None,
+            )
+            .await
+        }
+        other => panic!("the suite asks for no operation {other}"),
+    }
+}
+
+#[tokio::test]
+async fn every_change_asked_of_a_retired_record_is_refused_with_the_one_terminal_sentence() {
+    let (router, _engine) = router();
+    let case = "a retired record";
+    let (registry_id, registry_arn, record_id, record_arn) =
+        record_in_status(&router, case, "DEPRECATED").await;
+
+    // The sentence this service refuses a change to a retired record with: the record is past
+    // the lifecycle, so the only variable part is the status it is stored in.
+    let expected = "Cannot update registry record in DEPRECATED status (terminal state)";
+
+    // Rows: every operation that CHANGES a stored record — a status change, an edit of its
+    // fields and a submission into the approval workflow — each asked in both identifier forms
+    // the two labels accept. WHICH change was asked for cannot change the answer: a retired
+    // record admits none of them.
+    for operation in [
+        "UpdateRegistryRecordStatus",
+        "UpdateRegistryRecord",
+        "SubmitRegistryRecordForApproval",
+    ] {
+        for by_arn in [false, true] {
+            let row = format!("{case}: {operation}{}", if by_arn { " by ARN" } else { "" });
+            let (registry, record) = if by_arn {
+                (registry_arn.as_str(), record_arn.as_str())
+            } else {
+                (registry_id.as_str(), record_id.as_str())
+            };
+            let refused = change_asked_of(&router, operation, registry, record).await;
+            assert_eq!(
+                (
+                    refused.status,
+                    refused.error_code.as_deref(),
+                    refused.message()
+                ),
+                (400, Some("ValidationException"), expected.to_string()),
+                "case {row:?}: expected the modelled 400 ValidationException stating the \
+                 record is terminal, got {} {:?}",
+                refused.status,
+                refused.body
+            );
+
+            let after = get_record(&router, &registry_id, &record_id).await;
+            assert_eq!(
+                (after.str_field("status"), after.str_field("statusReason")),
+                ("DEPRECATED", STAGED_REASON),
+                "case {row:?}: the refused change writes nothing, got {:?}",
+                after.body
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_status_a_record_can_still_leave_is_refused_in_its_own_operations_words() {
+    let (router, _engine) = router();
+
+    // The counter-rows to the test above: a record in a status it can still LEAVE is refused
+    // by each operation's own rule — the submission names the status a submission cannot be
+    // made from, the status change names the transitions that status does allow — so the
+    // terminal sentence is reserved for a record that is past the lifecycle.
+    for (case, status, operation, expected) in [
+        (
+            "a record waiting for a curator",
+            "PENDING_APPROVAL",
+            "SubmitRegistryRecordForApproval",
+            "Cannot submit the record for approval in current status: PENDING_APPROVAL"
+                .to_string(),
+        ),
+        (
+            "a record its registry approved on submission",
+            "APPROVED",
+            "SubmitRegistryRecordForApproval",
+            "Cannot submit the record for approval in current status: APPROVED".to_string(),
+        ),
+        (
+            "a record a curator turned down",
+            "REJECTED",
+            "UpdateRegistryRecordStatus",
+            expected_transition_refusal("REJECTED", "APPROVED"),
+        ),
+    ] {
+        let (registry_id, _registry_arn, record_id, _record_arn) =
+            record_in_status(&router, case, status).await;
+        let refused = change_asked_of(&router, operation, &registry_id, &record_id).await;
+        assert_eq!(
+            (
+                refused.status,
+                refused.error_code.as_deref(),
+                refused.message()
+            ),
+            (400, Some("ValidationException"), expected.clone()),
+            "case {case:?} / {operation}: expected the modelled 400 ValidationException with \
+             {expected:?}, got {} {:?}",
+            refused.status,
+            refused.body
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_record_whose_asynchronous_change_is_in_flight_is_not_in_the_workflow() {
     let (router, engine) = router();

@@ -345,6 +345,10 @@ const UNPARSEABLE_RULE_BODY: &str = "INVALID_RULE_BODY: The RuleBody could not b
 /// The key is the one variable part — it is what the client has to add — and it is the key's
 /// own name in the rule syntax, whether it sits at the top of the body or inside the
 /// contribution, because that is the name the body spells it with.
+///
+/// This sentence reports a key the body's OWN schema requires, so it is reachable only once
+/// the body has named a schema this service reads a rule in: without one there is no syntax to
+/// be short of a key of, and the body is the unparseable class ([`UNPARSEABLE_RULE_BODY`]).
 fn missing_rule_body_key(key: &str) -> String {
     format!("INVALID_RULE_BODY: MissingKey encountered at {key} in the RuleBody.")
 }
@@ -368,15 +372,16 @@ fn validate_definition(definition: &str) -> Result<(), PutInsightRuleError> {
 
 /// Why the rule body is not a Contributor Insights rule definition, or `None` when it is one.
 ///
-/// Two classes of fault, which a client repairs differently: a key the syntax REQUIRES that
-/// the body does not carry at all is named ([`missing_rule_body_key`]), so the client knows
-/// what to add; anything else — a body that is no JSON object, or a key carrying a value the
+/// Two classes of fault, which a client repairs differently: once the body has named a schema
+/// this service reads a rule in, a key THAT syntax requires and the body does not carry at all
+/// is named ([`missing_rule_body_key`]), so the client knows what to add; anything else — a
+/// body that is no JSON object, a body naming no readable schema, or a key carrying a value the
 /// syntax does not admit — is the one unparseable-body class ([`UNPARSEABLE_RULE_BODY`]).
 ///
-/// The keys the body is asked for in the order a client has to supply them in: the schema that
-/// says what kind of rule it is, the contribution that says what a contributor IS, and then the
-/// log groups and the format the rule reads them from — so a body short of several of them is
-/// told about the first one.
+/// The body is read in the order a client has to supply it in: first the schema that says what
+/// kind of rule it is and under which syntax the rest is read, then the contribution that says
+/// what a contributor IS, and then the log groups and the format the rule reads them from — so
+/// a body short of several keys of its schema is told about the first one.
 fn rule_body_fault(definition: &str) -> Option<String> {
     let Ok(parsed) = ::serde_json::from_str::<::serde_json::Value>(definition) else {
         return Some(UNPARSEABLE_RULE_BODY.to_string());
@@ -388,9 +393,12 @@ fn rule_body_fault(definition: &str) -> Option<String> {
 
     // "For rules that you create, this is always {"Name": "CloudWatchLogRule", "Version": 1}"
     // (`InsightRule$Schema`) — so both members are required to be exactly that, which is what
-    // lets the stored rule report that schema back.
+    // lets the stored rule report that schema back. The schema is what SELECTS the rule syntax
+    // the rest of the body is read under, so a body that names none — or names one this
+    // service reads no rule in — is not a rule definition at all and is the unparseable-body
+    // class, not a body short of one key of a syntax that was never chosen.
     let Some(schema) = rule.get("Schema") else {
-        return Some(missing_rule_body_key("Schema"));
+        return unparseable();
     };
     let names_the_schema = schema
         .as_object()

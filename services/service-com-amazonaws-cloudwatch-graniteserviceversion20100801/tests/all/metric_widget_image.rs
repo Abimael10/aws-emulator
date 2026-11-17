@@ -561,7 +561,7 @@ async fn a_definition_this_service_cannot_render_is_refused() {
     .to_string();
 
     // (the case, the request body, the message the refusal must carry)
-    let rows: [(&str, Value, &str); 13] = [
+    let rows: [(&str, Value, &str); 14] = [
         (
             "a payload that is not JSON",
             json!({"MetricWidget": "not a document"}),
@@ -604,8 +604,13 @@ async fn a_definition_this_service_cannot_render_is_refused() {
              singleValue, gauge, bar, pie].",
         ),
         (
-            "a granularity no metric is readable at",
+            "a sub-minute granularity no metric is readable at",
             json!({"MetricWidget": widget_over(METRIC, &json!({"period": 7})).to_string()}),
+            "The parameter Period must be a value in the set [1, 5, 10, 20, 30].",
+        ),
+        (
+            "a granularity of more than a minute that is no whole number of minutes",
+            json!({"MetricWidget": widget_over(METRIC, &json!({"period": 61})).to_string()}),
             "The parameter Period must be a multiple of 60.",
         ),
         (

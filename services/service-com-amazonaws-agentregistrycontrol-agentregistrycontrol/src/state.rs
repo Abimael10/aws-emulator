@@ -138,6 +138,10 @@ pub const RESOURCE_CONFLICT: &str = "ResourceConflict";
 /// The fixed text this service refuses a submission with when the record it addresses is
 /// not in a status a submission can be made from; the status the record IS in follows it,
 /// read from the stored record. The ONE place this sentence is written.
+///
+/// It states a status the record can still leave. A record in the lifecycle's TERMINAL status
+/// is retired instead, so every change to it — a submission included — is refused with the
+/// sentence that states that ([`terminal_record_status_message`]).
 pub const NOT_SUBMITTABLE_IN_STATUS: &str =
     "Cannot submit the record for approval in current status: ";
 
@@ -303,13 +307,14 @@ pub fn invalid_status_transition_message(current: &str, target: &str) -> String 
     )
 }
 
-/// How this service refuses any later change to a record in a terminal status: the
-/// record is retired, so an edit and a status change both state this. The one
+/// How this service refuses any later change to a record in a terminal status: the record is
+/// retired, so an edit, a status change and a submission for approval all state this. The one
 /// variable part is the status the record is stored in.
 ///
-/// A SUBMISSION does not: that operation states every status a record cannot be submitted
-/// from, the terminal one included, in its own one sentence
-/// ([`NOT_SUBMITTABLE_IN_STATUS`]).
+/// A retired record is past the whole lifecycle, so WHICH change was asked for does not
+/// change the answer; the sentences an operation words for the statuses a record can still
+/// leave ([`NOT_SUBMITTABLE_IN_STATUS`], [`invalid_status_transition_message`]) are about
+/// those statuses alone.
 pub fn terminal_record_status_message(status: &str) -> String {
     format!("Cannot update registry record in {status} status (terminal state)")
 }

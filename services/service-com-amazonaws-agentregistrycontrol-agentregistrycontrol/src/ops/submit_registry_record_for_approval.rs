@@ -216,13 +216,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Deprecation retires a record: the status it is stored in is the lifecycle's
+        // terminal one, so NO later change applies to it — an edit, a status change and a
+        // submission all state that, in the one sentence this service refuses a change to a
+        // retired record with.
+        if crate::state::is_terminal_record_status(&record.status) {
+            return Err(SubmitRegistryRecordForApprovalErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::terminal_record_status_message(&record.status),
+                    // The request's fields are all well formed; what does not hold is the
+                    // state of the resource they address.
+                    reason: crate::state::RESOURCE_CONFLICT.to_string(),
+                    field_list: None,
+                },
+            )
+            .into());
+        }
+
         // Only a DRAFT record enters the approval workflow: one that is still being
-        // created has nothing to review yet, one that has already been through the
+        // created has nothing to review yet, and one that has already been through the
         // workflow is moved on with `UpdateRegistryRecordStatus` or taken back to DRAFT
-        // by an edit instead, and a retired one is in the lifecycle's terminal status, so
-        // no later change applies to it at all. This operation states all of them in ONE
-        // sentence whose only variable part is the status the record is stored in, which
-        // is what tells the caller which of those it is.
+        // by an edit instead. This operation states all of them in ONE sentence whose only
+        // variable part is the status the record is stored in, which is what tells the
+        // caller which of those it is.
         if record.status != crate::state::RECORD_DRAFT {
             return Err(SubmitRegistryRecordForApprovalErrorModeled::ValidationException(
                 ValidationException {
