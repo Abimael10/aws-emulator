@@ -813,12 +813,9 @@ fn delete_item(
         .cloned();
     // See [`crate::ops::execute_statement`]: the key the clause pins ADDRESSES the item,
     // so only what the clause states besides it is the condition this delete is held to —
-    // read against the item as it stands, no item included.
-    let satisfied = condition
-        .as_ref()
-        .map(|condition| condition.evaluate(before.as_ref()))
-        .transpose()?
-        .unwrap_or(true);
+    // held to the addressed item, and a key that holds none is nothing to remove.
+    let satisfied =
+        crate::state::delete_condition_satisfied(condition.as_ref(), before.as_ref())?;
     if !satisfied {
         // See [`update_item`]: the refused slot writes nothing and is metered all the same
         // ([`crate::state::charge_refused_conditional_write`]).

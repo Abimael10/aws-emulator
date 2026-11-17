@@ -2621,13 +2621,8 @@ pub fn parsed_condition(predicate: &Predicate) -> Result<ParsedCondition, Reques
 /// A single-item delete is addressed BY ITS PRIMARY KEY: the equalities on the key
 /// attributes say which item the statement is about, not what must hold of that item, so
 /// they are not part of the condition the delete is held to. What is left is that
-/// condition, and it is evaluated against the item as it stands — including against NO
-/// item, which is the one state a key that holds nothing can be in. That is what makes a
-/// delete addressed by key idempotent ("Unless you specify conditions, the DeleteItem is
-/// an idempotent operation; running it multiple times on the same item or attribute does
-/// not result in an error response" — the `DeleteItem` doc): a key holding no item is
-/// nothing to remove rather than a condition that failed, and the statement reports no
-/// image because it removed none.
+/// condition, and it is held to THE ADDRESSED ITEM — so it decides the statement only
+/// when the key holds one ([`delete_condition_satisfied`]).
 ///
 /// Only the equalities the TOP-LEVEL conjunction states are addressing, exactly as
 /// [`pinned_equalities`] reads them — a term inside an `OR` requires nothing, so it stays
@@ -2675,6 +2670,33 @@ fn without_addressing(predicate: &Predicate, addressing: &[&str]) -> Option<Pred
         }
         other => Some(other.clone()),
     }
+}
+
+/// Whether a single-item `DELETE` addressed by primary key proceeds: the condition its
+/// `WHERE` clause states BESIDES that key ([`parsed_delete_condition`]), held to the item
+/// the key holds.
+///
+/// A key that holds NO item decides the statement by itself, whatever the clause states
+/// besides it: the statement addresses exactly one item by its complete primary key and
+/// the further terms are a condition ON THAT ITEM, so with no item to hold them to there
+/// is nothing to remove and nothing that failed, and the delete completes having removed
+/// nothing. That is what makes a delete addressed by key idempotent ("Unless you specify
+/// conditions, the DeleteItem is an idempotent operation; running it multiple times on the
+/// same item or attribute does not result in an error response" — the `DeleteItem` doc),
+/// and it is why a guarded retry of an already-removed item is served rather than refused.
+/// Only an item that IS stored and does not satisfy the condition is the conditional
+/// refusal.
+pub fn delete_condition_satisfied(
+    condition: Option<&ParsedCondition>,
+    before: Option<&Item>,
+) -> Result<bool, RequestError> {
+    let Some(before) = before else {
+        return Ok(true);
+    };
+    Ok(condition
+        .map(|condition| condition.evaluate(Some(before)))
+        .transpose()?
+        .unwrap_or(true))
 }
 
 /// The statement's `SET`/`REMOVE` clauses as the parsed `UpdateExpression` the item

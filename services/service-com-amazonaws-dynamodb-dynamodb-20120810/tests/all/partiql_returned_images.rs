@@ -3,20 +3,22 @@
 //! What a PartiQL write addressed BY ITS KEY answers, and how a value refused on the
 //! member that carries a table's name or ARN is worded.
 //!
-//! THE RULE a single-item delete follows: the equalities a `DELETE`'s `WHERE` clause
-//! states on the table's key attributes ADDRESS the item — they say which item the
-//! statement is about, not what must hold of it — so only what the clause states BESIDES
-//! them is the condition the delete is held to, read against the item as it stands,
-//! including against no item at all. A delete addressed by key is therefore idempotent
+//! THE RULE a single-item delete follows: a `DELETE` addresses exactly ONE item by its
+//! complete primary key — the equalities its `WHERE` clause states on the table's key
+//! attributes say which item the statement is about, not what must hold of it — and what
+//! the clause states BESIDES them is a condition on THAT item. A key that holds no item
+//! therefore decides the statement by itself, whatever else the clause states: there is
+//! nothing to remove and nothing a condition can have failed, so the statement is served
+//! having removed nothing and reports no image. A delete addressed by key is idempotent
 //! ("Unless you specify conditions, the DeleteItem is an idempotent operation; running it
 //! multiple times on the same item or attribute does not result in an error response" —
-//! the `DeleteItem` doc): a key that holds no item is nothing to remove, answered with no
-//! returned image rather than with `ConditionalCheckFailedException`, while a predicate
-//! the stored item fails is still that refusal. The rows span what the rule generalises
+//! the `DeleteItem` doc), and `ConditionalCheckFailedException` is only what an item that
+//! IS stored and fails the condition earns. The rows span what the rule generalises
 //! over: which surface runs the statement (`ExecuteStatement`, `BatchExecuteStatement`,
 //! `ExecuteTransaction`), whether the addressed key holds an item, whether the clause
-//! states a condition besides the key and whether that condition holds, which
-//! `RETURNING` form the statement asks for, and how many key attributes the table has.
+//! states a condition besides the key, which FORM that condition takes and whether the
+//! stored item holds it, which `RETURNING` form the statement asks for, and how many key
+//! attributes the table has.
 //!
 //! THE RULE a refused table reference follows: `TableName` targets `TableArn`, so an ARN
 //! is accepted wherever a name is, and a value neither form admits is refused as a
@@ -208,12 +210,33 @@ fn delete_table() -> Vec<DeleteRow> {
             refused: Some("ConditionalCheckFailedException"),
         },
         DeleteRow {
+            // The key decides the statement: a condition no item can satisfy still has
+            // no item to be held to, so the delete is served having removed nothing.
             case: "a condition no item can satisfy, over a key that holds nothing",
             statement: format!(
                 "DELETE FROM \"{PAIRED}\" WHERE pk = 'ghost' AND sk = 's1' AND qty = 99"
             ),
             images: Vec::new(),
-            refused: Some("ConditionalCheckFailedException"),
+            refused: None,
+        },
+        DeleteRow {
+            case: "a condition the STORED item of another key satisfies, over a key that \
+                   holds nothing, RETURNING ALL OLD",
+            statement: format!(
+                "DELETE FROM \"{PAIRED}\" WHERE pk = 'ghost' AND sk = 'elsewhere' AND \
+                 note = 'n1' RETURNING ALL OLD *"
+            ),
+            images: Vec::new(),
+            refused: None,
+        },
+        DeleteRow {
+            case: "two conditions beside a key that holds nothing",
+            statement: format!(
+                "DELETE FROM \"{SOLO}\" WHERE pk = 'ghost' AND qty = 4 AND qty < 9 \
+                 RETURNING ALL OLD *"
+            ),
+            images: Vec::new(),
+            refused: None,
         },
         DeleteRow {
             case: "a condition an absent item satisfies, over a key that holds nothing",
@@ -286,6 +309,265 @@ async fn a_statement_delete_addressed_by_key_is_idempotent() {
             }
         }
     }
+}
+
+/// The seeded item of the two-key table, as a read reports it: what a delete that
+/// removed it reports, and what a delete that removed nothing leaves behind.
+fn stored() -> Value {
+    json!({
+        "pk": {"S": "p1"},
+        "sk": {"S": "s1"},
+        "qty": {"N": "4"},
+        "note": {"S": "n1"},
+    })
+}
+
+/// One condition FORM a delete can state beside the key it addresses, and whether the
+/// stored item satisfies it. The forms are the ones the `WHERE` grammar states: a
+/// comparison, a function call, a membership list, a presence test, a disjunction and a
+/// conjunction of several terms.
+struct GuardRow {
+    case: &'static str,
+    /// The condition, stated beside the key equalities that address the item.
+    condition: &'static str,
+    /// Whether the seeded `(p1, s1)` item satisfies it.
+    holds: bool,
+}
+
+/// The rows span the condition forms and, for each, both answers the ADDRESSED item can
+/// give: one the stored item satisfies and one it fails.
+fn guard_table() -> Vec<GuardRow> {
+    vec![
+        GuardRow {
+            case: "an equality on a string attribute the item satisfies",
+            condition: "note = 'n1'",
+            holds: true,
+        },
+        GuardRow {
+            case: "an equality on a string attribute the item fails",
+            condition: "note = 'elsewhere'",
+            holds: false,
+        },
+        GuardRow {
+            case: "a numeric comparison the item satisfies",
+            condition: "qty > 1",
+            holds: true,
+        },
+        GuardRow {
+            case: "a numeric comparison the item fails",
+            condition: "qty > 9",
+            holds: false,
+        },
+        GuardRow {
+            case: "a function call the item satisfies",
+            condition: "begins_with(note, 'n')",
+            holds: true,
+        },
+        GuardRow {
+            case: "a function call the item fails",
+            condition: "begins_with(note, 'z')",
+            holds: false,
+        },
+        GuardRow {
+            case: "a membership list the item satisfies",
+            condition: "qty IN [4, 5]",
+            holds: true,
+        },
+        GuardRow {
+            case: "a membership list the item fails",
+            condition: "qty IN [5, 6]",
+            holds: false,
+        },
+        GuardRow {
+            case: "a presence test the item satisfies",
+            condition: "note IS NOT MISSING",
+            holds: true,
+        },
+        GuardRow {
+            case: "a presence test the item fails",
+            condition: "unseen IS NOT MISSING",
+            holds: false,
+        },
+        GuardRow {
+            case: "a disjunction one branch of which the item satisfies",
+            condition: "(qty = 99 OR note = 'n1')",
+            holds: true,
+        },
+        GuardRow {
+            case: "a disjunction no branch of which the item satisfies",
+            condition: "(qty = 99 OR note = 'elsewhere')",
+            holds: false,
+        },
+        GuardRow {
+            case: "several terms the item satisfies",
+            condition: "qty = 4 AND note = 'n1'",
+            holds: true,
+        },
+        GuardRow {
+            case: "several terms one of which the item fails",
+            condition: "qty = 4 AND note = 'elsewhere'",
+            holds: false,
+        },
+    ]
+}
+
+#[tokio::test]
+async fn a_guarded_delete_of_a_key_that_holds_no_item_is_served_having_removed_nothing() {
+    let router = tables().await;
+    for row in guard_table() {
+        // Every row starts from the same stored state, so what it asserts is its own
+        // clause and nothing a previous row left behind.
+        seed(&router).await;
+        let (status, body) = call(
+            &router,
+            "ExecuteStatement",
+            json!({
+                "Statement": format!(
+                    "DELETE FROM \"{PAIRED}\" WHERE pk = 'ghost' AND sk = 's1' AND {} \
+                     RETURNING ALL OLD *",
+                    row.condition,
+                ),
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {}, over a key that holds no item: expected the statement served, got \
+             {status} with {body}",
+            row.case
+        );
+        assert_eq!(
+            body["Items"],
+            json!([]),
+            "case {}, over a key that holds no item: expected no image, got {body}",
+            row.case
+        );
+        let read = ok(
+            &router,
+            "GetItem",
+            json!({"TableName": PAIRED, "Key": {"pk": {"S": "p1"}, "sk": {"S": "s1"}}}),
+        )
+        .await;
+        assert_eq!(
+            read["Item"],
+            stored(),
+            "case {}, over a key that holds no item: the stored item is untouched, got \
+             {read}",
+            row.case
+        );
+
+        // The asymmetry the rule states: the SAME condition over the key that DOES hold
+        // an item is held to that item.
+        let (status, body) = call(
+            &router,
+            "ExecuteStatement",
+            json!({
+                "Statement": format!(
+                    "DELETE FROM \"{PAIRED}\" WHERE pk = 'p1' AND sk = 's1' AND {} \
+                     RETURNING ALL OLD *",
+                    row.condition,
+                ),
+            }),
+        )
+        .await;
+        let read = ok(
+            &router,
+            "GetItem",
+            json!({"TableName": PAIRED, "Key": {"pk": {"S": "p1"}, "sk": {"S": "s1"}}}),
+        )
+        .await;
+        if row.holds {
+            assert_eq!(
+                status, 200,
+                "case {}, over the key that holds the item: expected the statement served, \
+                 got {status} with {body}",
+                row.case
+            );
+            assert_eq!(
+                body["Items"],
+                json!([stored()]),
+                "case {}, over the key that holds the item: expected its image, got {body}",
+                row.case
+            );
+            assert!(
+                read.get("Item").is_none(),
+                "case {}, over the key that holds the item: it is removed, got {read}",
+                row.case
+            );
+        } else {
+            assert_eq!(
+                (status, error_code(&body).as_str(), message(&body).as_str()),
+                (
+                    400,
+                    "ConditionalCheckFailedException",
+                    "The conditional request failed"
+                ),
+                "case {}, over the key that holds the item: expected the conditional \
+                 refusal, got {status} with {body}",
+                row.case
+            );
+            assert_eq!(
+                read["Item"],
+                stored(),
+                "case {}, over the key that holds the item: the refused statement wrote \
+                 nothing, got {read}",
+                row.case
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_guarded_delete_of_an_absent_key_is_served_on_every_statement_surface() {
+    let router = tables().await;
+    seed(&router).await;
+    let guarded = format!(
+        "DELETE FROM \"{PAIRED}\" WHERE pk = 'ghost' AND sk = 's1' AND note = 'n1' \
+         RETURNING ALL OLD *"
+    );
+    let batched = ok(
+        &router,
+        "BatchExecuteStatement",
+        json!({"Statements": [{"Statement": guarded.clone()}]}),
+    )
+    .await;
+    let slot = batched["Responses"][0].clone();
+    assert_eq!(
+        slot["Error"]["Code"].as_str(),
+        None,
+        "case a batched guarded delete of an absent key: expected the slot served, got \
+         {slot}"
+    );
+    assert_eq!(
+        slot.get("Item").cloned().unwrap_or(Value::Null),
+        Value::Null,
+        "case a batched guarded delete of an absent key: expected no image, got {slot}"
+    );
+
+    let (status, body) = call(
+        &router,
+        "ExecuteTransaction",
+        json!({"TransactStatements": [{"Statement": guarded}]}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case a transactional guarded delete of an absent key: expected the transaction \
+         applied, got {status} with {body}"
+    );
+
+    let read = ok(
+        &router,
+        "GetItem",
+        json!({"TableName": PAIRED, "Key": {"pk": {"S": "p1"}, "sk": {"S": "s1"}}}),
+    )
+    .await;
+    assert_eq!(
+        read["Item"],
+        stored(),
+        "case a guarded delete of an absent key on every surface: the stored item is \
+         untouched, got {read}"
+    );
 }
 
 #[tokio::test]

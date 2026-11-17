@@ -23,12 +23,13 @@
 //!   stored is the modelled `DuplicateItemException`.
 //! * `UPDATE` and `DELETE` are SINGLETON writes: the `WHERE` clause must pin every
 //!   key attribute by equality, and what it states BESIDES those equalities is the
-//!   condition the write is held to — a predicate the stored item does not satisfy is
+//!   condition the write is held to — a predicate the ADDRESSED ITEM does not satisfy is
 //!   `ConditionalCheckFailedException`, carrying that item when
 //!   `ReturnValuesOnConditionCheckFailure=ALL_OLD`. An `UPDATE` changes an item that is
 //!   there, so a key holding none fails that way too; a `DELETE` addressed by key is
-//!   idempotent, so a key holding none is served with no image removed
-//!   ([`crate::state::parsed_delete_condition`]).
+//!   idempotent, so a key holding none is served with no image removed, whatever the
+//!   clause states besides that key
+//!   ([`crate::state::delete_condition_satisfied`]).
 //!   `RETURNING (ALL|MODIFIED) (OLD|NEW) *` reports the item through `Items`.
 //! * `SELECT` reads the table, or one of its indexes when the statement qualifies the
 //!   source with `table.index`, holds every candidate to the whole `WHERE` clause,
@@ -880,14 +881,12 @@ fn delete_item(
         .get(&key)
         .cloned();
     // What the clause states BESIDES the key it addresses is the condition this delete is
-    // held to, read against the item as it stands — no item included, which is the one
-    // state a key that holds nothing can be in ([`crate::state::parsed_delete_condition`]).
-    let satisfied = condition
-        .as_ref()
-        .map(|condition| condition.evaluate(before.as_ref()))
-        .transpose()
-        .map_err(lift)?
-        .unwrap_or(true);
+    // held to, held to THE ADDRESSED ITEM: a key that holds none is nothing to remove and
+    // nothing the condition can have failed, so it is served having removed nothing
+    // ([`crate::state::delete_condition_satisfied`]).
+    let satisfied =
+        crate::state::delete_condition_satisfied(condition.as_ref(), before.as_ref())
+            .map_err(lift)?;
     if !satisfied {
         // See [`update_item`]: the refused statement writes nothing and is metered all the
         // same ([`crate::state::charge_refused_conditional_write`]).

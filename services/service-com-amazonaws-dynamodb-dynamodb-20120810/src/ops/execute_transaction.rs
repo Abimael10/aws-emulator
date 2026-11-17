@@ -831,14 +831,13 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
                     .cloned();
                 // See [`crate::ops::execute_statement`]: the key the clause pins
                 // ADDRESSES the item, so only what the clause states besides it is the
-                // condition this delete is held to — read against the item as it stands,
-                // no item included.
-                let satisfied = condition
-                    .as_ref()
-                    .map(|condition| condition.evaluate(before.as_ref()))
-                    .transpose()
-                    .map_err(lift)?
-                    .unwrap_or(true);
+                // condition this delete is held to — held to the addressed item, and a
+                // key that holds none is nothing to remove.
+                let satisfied = crate::state::delete_condition_satisfied(
+                    condition.as_ref(),
+                    before.as_ref(),
+                )
+                .map_err(lift)?;
                 // A delete removes every attribute of the item, so the `MODIFIED OLD`
                 // projection of what it changed IS the item as it stood — both OLD forms
                 // report that item.
