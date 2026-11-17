@@ -365,10 +365,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ],
         )
         .map_err(lift)?;
-        // Every token the request DEFINES must be one an expression uses: an unused
-        // entry of either substitution table makes the whole request invalid.
+        // What each substitution table the request SENT says about ITSELF — its keys are
+        // tokens, it carries an expression they could go into, it defines something — is
+        // read before the values below: a table that is no substitution table at all is
+        // the defect whatever those values hold
+        // ([`crate::state::Substitutions::check_tables_well_formed`]).
         substitutions
-            .check_all_referenced(&[
+            .check_tables_well_formed(&[
                 ("UpdateExpression", input.update_expression.as_deref()),
                 ("ConditionExpression", input.condition_expression.as_deref()),
             ])
@@ -383,6 +386,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this request can ask for, and both come from the request. A value past the
         // documented item ceiling is worded as the UPDATE path words that quota
         // ([`crate::state::stated_for_an_update`]).
+        //
+        // Every value the request CARRIES is bounded BEFORE its expressions are held to
+        // the substitution tables beside them: a value outside those limits is outside
+        // them whichever expression would have substituted it, and whether any expression
+        // references the entry it sits under does not make it admissible — so the caller
+        // is told about the value rather than about an entry it would still have to fix
+        // the value of.
         for (placeholder, value) in input.expression_attribute_values.iter().flatten() {
             crate::state::check_attribute_value(placeholder, value)
                 .map_err(crate::state::stated_for_an_update)
@@ -401,6 +411,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The legacy `Expected` map carries values the same way, so it is bounded here
         // beside the others rather than only where the condition is read.
         crate::state::check_expected_condition_values(input.expected.as_ref()).map_err(lift)?;
+        // Every token the request DEFINES must be one an expression uses: an unused
+        // entry of either substitution table makes the whole request invalid.
+        substitutions
+            .check_tokens_referenced(&[
+                ("UpdateExpression", input.update_expression.as_deref()),
+                ("ConditionExpression", input.condition_expression.as_deref()),
+            ])
+            .map_err(lift)?;
 
         // "This is a legacy parameter. Use UpdateExpression instead"
         // (`UpdateItem$AttributeUpdates`): a request states its update one way or the
@@ -555,7 +573,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map_err(lift)?;
         }
         crate::state::canonicalize_item(&mut item).map_err(lift)?;
-        let size = crate::state::item_size(&item);
+        // What the update ASKED FOR is sized, not only what it leaves behind: the stored
+        // item plus the frame each clause of the request costs
+        // ([`crate::state::ParsedUpdate::request_shape_charge`]), so the largest operand
+        // one write may carry moves with the clauses stated beside it.
+        let size = crate::state::item_size(&item) + update.request_shape_charge();
         if size > crate::state::MAX_ITEM_SIZE_BYTES {
             return Err(crate::scaffolded::Scaffolded::validation(
                 crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE,

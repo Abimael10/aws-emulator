@@ -309,10 +309,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 keys.expression_attribute_names.as_ref(),
             )
             .map_err(lift)?;
-            // Every token one table's entry DEFINES must be one its projection uses, and
-            // the refusal is that ENTRY's, so it is stated on its own.
+            // Then this entry's substitution table against this entry's projection. A
+            // `RequestItems` entry carries the whole projection ask — the expression
+            // member, the legacy list and the names table that resolves the expression's
+            // aliases are all members of the ENTRY — so the entry is the scope those
+            // members are held to each other in, and it is held to the WHOLE rule a
+            // single-table read's members are: a names table sent with no projection to be
+            // substituted into has nothing to go into, which is a different defect from
+            // entries a projection that IS present does not reference, and AWS words the
+            // two differently ([`crate::state::Substitutions::check_all_referenced`]). The
+            // refusal is that ENTRY's, so it is stated on its own, and it is earned
+            // whichever generation the batch's OTHER entries stated their projection in:
+            // the request-wide hold on mixing generations is settled above, over members
+            // this one does not carry.
             crate::state::Substitutions::new(keys.expression_attribute_names.as_ref(), None)
-                .check_all_referenced_in_element(&[(
+                .check_all_referenced(&[(
                     PROJECTION_EXPRESSION,
                     keys.projection_expression.as_deref(),
                 )])

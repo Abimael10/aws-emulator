@@ -14,6 +14,8 @@
 use super::*;
 mod operands;
 pub use operands::*;
+mod request_shape;
+use request_shape::*;
 
 /// The most any one expression member may carry: "Maximum length of any expression
 /// string is 4 KB" ("Service, Account, and Table Quotas"), plus the ceilings on the
@@ -915,26 +917,51 @@ impl<'a> Substitutions<'a> {
         &self,
         expressions: &[(&str, Option<&str>)],
     ) -> Result<(), RequestError> {
+        self.check_tables_well_formed(expressions)?;
+        self.check_tokens_referenced(expressions)
+    }
+
+    /// The first half of that rule: what each substitution table the request SENT says
+    /// about itself, read without looking at any expression's text — its keys are tokens
+    /// an expression could write, the request carries an expression they could be
+    /// substituted into, and the table defines something.
+    ///
+    /// Split from the second half because the two sit on either side of the bounds the
+    /// request's VALUES are held to: a table that is not a substitution table at all is
+    /// the defect whatever the request's values hold, while a value outside its documented
+    /// limits is outside them whether or not an expression references the entry it sits
+    /// under. The two writers that bound their values themselves call the halves in that
+    /// order; every other caller asks for both at once
+    /// ([`Substitutions::check_all_referenced`]).
+    pub fn check_tables_well_formed(
+        &self,
+        expressions: &[(&str, Option<&str>)],
+    ) -> Result<(), RequestError> {
         let enveloped = declares_enveloped_expression(expressions);
         self.check_table_keys(enveloped)?;
         self.check_an_expression_was_sent(expressions)?;
-        self.check_tables_not_empty(enveloped)?;
-        self.check_tokens_referenced(expressions)
+        self.check_tables_not_empty(enveloped)
     }
 
     /// The same rules over the expressions of ONE ELEMENT of a multi-item request.
     ///
     /// What each table SAYS is held to the same rules wherever the member sits: its keys
     /// are substitution tokens, it is not empty, and every token it defines is one the
-    /// expressions beside it reference. What differs is the one rule that is the
-    /// REQUEST's — that a table was sent with an expression to be substituted into at all
-    /// ([`Substitutions::check_an_expression_was_sent`]): it is the request validator
-    /// that holds a CALL's expression members to the tables beside them, and the tables of
-    /// one `TransactItems` action or one `RequestItems` entry are members of that element.
-    /// So an element's tables are held to the element's OWN expressions, and an element
-    /// that states no expression has none to hold them to: its tables are admitted rather
-    /// than refused for the expression the element did not state or for the entries that
-    /// expression would not have referenced.
+    /// expressions beside it reference. What differs is the one rule that is about the ASK
+    /// the members state together — that a table was sent with an expression to be
+    /// substituted into at all ([`Substitutions::check_an_expression_was_sent`]): the
+    /// tables of one `TransactItems` action sit beside the expression members of that
+    /// action, which state only PART of what the element does (its condition), so an
+    /// element that states no expression is admitted rather than refused for the
+    /// expression it did not state or for the entries that expression would not have
+    /// referenced.
+    ///
+    /// A `BatchGetItem` entry is NOT such an element: the members of one `RequestItems`
+    /// entry are the whole of that table's read — its projection, the legacy list that
+    /// states the same ask and the names table that resolves the projection's aliases —
+    /// so the entry is held to the WHOLE rule, through
+    /// [`Substitutions::check_all_referenced`], exactly as a single-table read's members
+    /// are.
     pub(super) fn check_referenced_within_element(
         &self,
         expressions: &[(&str, Option<&str>)],
@@ -951,7 +978,10 @@ impl<'a> Substitutions<'a> {
     /// Every token either side names must be one the other has: an `#alias` or
     /// `:placeholder` an expression dereferences defined by the table it reads, and an
     /// entry a table defines referenced by one of the expressions.
-    fn check_tokens_referenced(
+    ///
+    /// The second half of [`Substitutions::check_all_referenced`], which the two writers
+    /// that bound their values themselves ask for after those values are bounded.
+    pub fn check_tokens_referenced(
         &self,
         expressions: &[(&str, Option<&str>)],
     ) -> Result<(), RequestError> {
@@ -1153,29 +1183,63 @@ const NAME_TOKEN_PREFIX: char = '#';
 const VALUES_MEMBER: &str = "ExpressionAttributeValues";
 const VALUE_TOKEN_PREFIX: char = ':';
 
-/// Refuse one substitution table whose keys are not all spelled as the tokens an
-/// expression substitutes them into, naming the first such key in one stable order so the
-/// same request earns the same message.
+/// The longest a KEY of either substitution table may be, 255 bytes: the documented limit
+/// on a substitution token, counted over the whole key as the request spelled it — the
+/// member's prefix character included, which is why a 255-character name under a `#` is one
+/// byte too long.
+///
+/// It bounds the KEY and not the attribute name or value behind it: the key is the token an
+/// expression writes, so what the limit is about is how long that token may be.
+pub const MAX_SUBSTITUTION_KEY_BYTES: usize = 255;
+
+/// Refuse one substitution table whose keys are not all tokens an expression can write:
+/// each key is inside the length a token may have ([`MAX_SUBSTITUTION_KEY_BYTES`]), and
+/// each is spelled as the token the member substitutes it into.
+///
+/// Both defects are the member's "invalid key", and either is reported ahead of any
+/// expression being read ([`Substitutions::check_table_keys`]): a key that no expression
+/// could write defines nothing, so what the caller is told about is the KEY rather than the
+/// expression that failed to resolve a token it does not define. The keys are walked in one
+/// stable order and the FIRST offending one is named, with the rule it broke: its LENGTH
+/// first, because a key past the limit is past it whatever characters it spells — a caller
+/// that over-ran the limit is told so rather than told about a character inside the text it
+/// has to shorten anyway.
 fn check_substitution_keys<V>(
     member: &str,
     table: Option<&HashMap<String, V>>,
     prefix: char,
     enveloped: bool,
 ) -> Result<(), RequestError> {
-    let mut invalid: Vec<&str> = table
+    let mut keys: Vec<&str> = table
         .into_iter()
         .flatten()
         .map(|(key, _)| key.as_str())
-        .filter(|key| !is_substitution_token(key, prefix))
+        .filter(|key| is_oversized_key(key) || !is_substitution_token(key, prefix))
         .collect();
-    invalid.sort_unstable();
-    match invalid.first() {
-        Some(key) => Err(expression_refusal(
-            enveloped,
-            format!("{member} contains invalid key: Syntax error; key: \"{key}\""),
-        )),
-        None => Ok(()),
-    }
+    keys.sort_unstable();
+    let Some(key) = keys.first() else {
+        return Ok(());
+    };
+    let defect = if is_oversized_key(key) {
+        // The one figure the sentence carries is the size of the offending key, measured
+        // off the request: a caller that over-ran the limit is told by how much.
+        format!(
+            "The expression attribute map contains a key that is too long; size of key: {}",
+            key.len()
+        )
+    } else {
+        format!("Syntax error; key: \"{key}\"")
+    };
+    Err(expression_refusal(
+        enveloped,
+        format!("{member} contains invalid key: {defect}"),
+    ))
+}
+
+/// Whether one key of a substitution table is longer than a substitution token may be
+/// ([`MAX_SUBSTITUTION_KEY_BYTES`]), counted in BYTES as the request sent them.
+fn is_oversized_key(key: &str) -> bool {
+    key.len() > MAX_SUBSTITUTION_KEY_BYTES
 }
 
 /// Whether one key of a substitution table is spelled as the token an expression writes
@@ -2584,6 +2648,35 @@ impl ParsedUpdate {
     /// state clauses adds an item only where one of them gave it a value.
     pub fn states_no_action(&self) -> bool {
         self.actions.is_empty()
+    }
+
+    /// What the SHAPE of this update costs the item-size accounting, on top of the bytes
+    /// the item it leaves behind stores.
+    ///
+    /// An update is sized against the documented 400 KB item ceiling over the stored item
+    /// PLUS a frame for each clause the request states: the ceiling bounds what one write
+    /// may ask for, and a clause asks for work whatever the item ends up holding. So the
+    /// largest operand a write can carry shrinks by a fixed amount for every clause it
+    /// states, and each clause KIND has its own frame ([`SET_CLAUSE_CHARGE`] and the
+    /// constants beside it). Nothing of the request's text, of the attribute names it
+    /// writes or of the values it binds is read here: one clause of a kind costs what that
+    /// kind costs, so two requests stating the same clauses are sized alike.
+    ///
+    /// A `REMOVE` is the one action whose frame depends on the request, because what it
+    /// asks for is the path itself: nothing is written, so the ask IS the path it names,
+    /// charged whether or not the item holds anything there.
+    pub fn request_shape_charge(&self) -> i64 {
+        let mut charge: i64 = 0;
+        for action in &self.actions {
+            charge = charge.saturating_add(match action {
+                UpdateAction::Set(_, value) => set_clause_charge(value),
+                UpdateAction::Remove(path) => REMOVE_CLAUSE_CHARGE
+                    .saturating_add(i64::try_from(path.render().len()).unwrap_or(i64::MAX)),
+                UpdateAction::Add(..) => ADD_CLAUSE_CHARGE,
+                UpdateAction::Delete(..) => DELETE_CLAUSE_CHARGE,
+            });
+        }
+        charge
     }
 
     /// Parse one `UpdateExpression`: the `SET`, `REMOVE`, `ADD` and `DELETE` sections,

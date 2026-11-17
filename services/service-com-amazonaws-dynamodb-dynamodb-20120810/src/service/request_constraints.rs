@@ -1,31 +1,39 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The input constraints THIS SERVICE checks itself, read off the request body.
+//! The violations of ONE request that the framework's validating walk does not report, read
+//! off the request body.
 //!
-//! The framework's validating walk finds every bound the model declares — a `@length`, a
-//! `@range`, an enumerated member's value set, an absent `@required` member — and hands
-//! them to [`super::EmulatedService::override_refusal`] as violations, which that seam
-//! words as one clause per violated member inside the
-//! `<N> validation error(s) detected: ` envelope. A constraint the model does NOT declare
-//! is invisible to that walk, so a request violating one of those AND one the walk found
-//! would be refused reporting only the second: one clause where AWS states two, and a
-//! count a client reads violations off that is short by one.
+//! That walk finds every bound the model declares — a `@length`, a `@range`, an enumerated
+//! member's value set, an absent `@required` member — and hands them to
+//! [`super::EmulatedService::override_refusal`] as violations, which that seam words as one
+//! clause per violated member inside the `<N> validation error(s) detected: ` envelope. A
+//! request can break a constraint that walk never reports in two ways, and a refusal that
+//! reported only what the walk found would state one clause where AWS states several, with
+//! a count a client reads violations off that is short:
 //!
-//! This module is the other half of that aggregate: the violations this service finds by
-//! READING the request, each as the clause the envelope counts. The request body is where
-//! they are found because that is all they are about — no stored state decides any of
-//! them — and this is the one layer that has the body in hand before the operation runs
-//! ([`super::OperationScopedClauseForm`]).
+//! 1. the constraint is one the model does NOT declare, so no walk could find it — the
+//!    first half below, which reads the request and words the clause AWS states for it;
+//! 2. the constraint IS declared, but the walk never ran: the framework deserializes the
+//!    body before it walks the built input, and a member the input requires and the body
+//!    omits stops the first step — the second half below, which reads those bounds off the
+//!    generated input SCHEMA and states the clauses that walk would have.
 //!
-//! A clause raised here keeps the wording AWS states for it rather than the form the
+//! Both halves read the request BODY, because that is all either is about — no stored state
+//! decides any of them — and this is the one layer that has the body in hand before the
+//! operation runs ([`super::OperationScopedClauseForm`]).
+//!
+//! A clause of the FIRST half keeps the wording AWS states for it rather than the form the
 //! served operation states the WALK's clauses in (`super`'s "Which form a constraint
 //! clause takes"): the walk is not what found it, so there is no declared bound to render
 //! from — exactly as an enumerated member's value set and an absent member keep the
-//! reader's own rendering whichever operation was served.
+//! reader's own rendering whichever operation was served. A violation of the SECOND half is
+//! the walk's own, so it is handed to that renderer and takes the served operation's form
+//! like any other.
 
 use serde_json::Value;
 
 use aws_smithy_runtime_api::http::Request as RtRequest;
+use aws_smithy_schema_server::constraints::{EnumTrait, LengthTrait, Violation, ViolationKind};
 
 /// The operation whose elements must each state one of a set of members the model leaves
 /// all four optional, and the member list they arrive in.
@@ -87,3 +95,182 @@ fn transact_items_clauses(document: &Value) -> Vec<String> {
     }
     Vec::new()
 }
+
+// =============================================================================
+// THE BOUNDS THE VALIDATING WALK NEVER GOT TO
+//
+// The framework reads a request in two steps: it DESERIALIZES the body into the
+// operation's input, and then walks that input for every bound the model declares. A
+// member the input REQUIRES and the body does not carry is found by the first step, which
+// cannot complete — so the walk never runs, and every other bound the same body breaks is
+// found by nobody. One request, several independent violations, one of them reported.
+//
+// AWS reports them together: a request breaking four of its input's constraints is refused
+// with four clauses in one counted envelope, so a client fixing a malformed request sees
+// every defect of it rather than one per round trip. That ORDER — deserialize, then walk —
+// is the vendored framework's (`vendor/smithy-server-runtime`'s operation sequence, which
+// this tree does not author), so the bounds that walk did not get to are read HERE off the
+// body instead.
+//
+// They are read off the SAME generated input schema the walk reads them off
+// (`crate::ops::types`'s `*_INPUT_SCHEMA`, where codegen hangs each member's `@length`,
+// `@pattern` and value set), never off a second transcription of the model: a bound the
+// model changes moves in both places at once, and the clause a defect earns here is the
+// clause that walk would have stated — the member path, the rejected value and the
+// requirement — so it is WORDED by the one renderer that words the walk's clauses
+// (`super::violation_clause`) and counted in the one envelope beside them
+// (`super::validation_envelope`).
+//
+// What is read is the TOP-LEVEL STRING members of the served input: those are the members
+// a body carrying an absent required member can still break a declared bound of. The
+// violations are produced for every such request and used only by a refusal that reports
+// an absent required member, which is the one refusal whose walk never ran.
+// =============================================================================
+
+/// The input schema of the operation whose body is read for those bounds, or `None` for an
+/// operation this reads nothing of.
+///
+/// The operations named are the ones whose input declares a required member BESIDES the
+/// table name: a request that omits the table name is refused by this service's own
+/// parameter check, which states its one sentence and nothing else
+/// (`super::SERVICE_REQUIRED_MEMBERS`), so the walk has nothing to be masked by there. An
+/// operation later found to mask a violation this way needs its own arm — the schema is all
+/// an arm carries, so no bound, no value set and no member name is written out here.
+/// `tests/all/request_shape_validation_classes.rs` reads the aggregate back over the
+/// operations that carry one.
+fn body_read_input(operation: &str) -> Option<&'static ::aws_smithy_schema::Schema> {
+    Some(match operation {
+        "DeleteItem" => crate::ops::types::DELETE_ITEM_INPUT_SCHEMA,
+        "GetItem" => crate::ops::types::GET_ITEM_INPUT_SCHEMA,
+        "PutItem" => crate::ops::types::PUT_ITEM_INPUT_SCHEMA,
+        "UpdateItem" => crate::ops::types::UPDATE_ITEM_INPUT_SCHEMA,
+        _ => return None,
+    })
+}
+
+/// The violations of `operation`'s declared bounds this service can still read off `req`'s
+/// body, kept for the one refusal that needs them.
+///
+/// `None` for every operation whose body this reads nothing of. The body is COPIED and not
+/// read here: the refusal these answer for is the one whose deserialization aborted, so
+/// reading the body eagerly would make every well-formed request of these operations pay a
+/// second full parse of an item it already parsed once.
+pub fn readable_body(operation: &str, req: &RtRequest) -> Option<ReadableBody> {
+    let input = body_read_input(operation)?;
+    Some(ReadableBody {
+        input,
+        body: req.body().bytes()?.to_vec(),
+    })
+}
+
+/// One request's body beside the schema its bounds are declared in.
+#[derive(Debug)]
+pub struct ReadableBody {
+    /// The generated schema of the operation's input, where codegen hung each member's
+    /// declared bounds.
+    input: &'static ::aws_smithy_schema::Schema,
+    /// The body as it arrived.
+    body: Vec<u8>,
+}
+
+impl ReadableBody {
+    /// The violations of the input's declared bounds this body breaks.
+    ///
+    /// Empty for every request that breaks none of them. The order several of them are
+    /// stated in is the refusal's ([`super::in_stated_member_order`]), like the walk's own.
+    pub fn violations(&self) -> Vec<Violation> {
+        let Ok(document) = ::serde_json::from_slice::<Value>(&self.body) else {
+            return Vec::new();
+        };
+        self.input
+            .members()
+            .iter()
+            .flat_map(|member| broken_bounds(member, &document))
+            .collect()
+    }
+}
+
+/// Every bound `member` declares that the value the body carries for it breaks.
+///
+/// The member is read by the name the model spells it under, which is the name this
+/// protocol puts on the wire (`awsJson` reads a struct member by its member name), and only
+/// a STRING value is read: every bound below is a string member's, and a member carrying
+/// another datatype does not decode into the input at all, which is a different refusal.
+fn broken_bounds(member: &::aws_smithy_schema::Schema, document: &Value) -> Vec<Violation> {
+    let Some(traits) = member.traits() else {
+        return Vec::new();
+    };
+    let Some(value) = member
+        .member_name()
+        .and_then(|name| document.get(name))
+        .and_then(Value::as_str)
+    else {
+        return Vec::new();
+    };
+    // In the order the walk runs a leaf's traits, so a member breaking two of its bounds
+    // earns the same clauses in the same order whichever reader found them. A `@pattern` is
+    // not among them: no top-level member of the inputs above declares one, and compiling a
+    // declared expression is the validating walk's own business — it holds the one compiled
+    // pattern cache in the tree.
+    let kinds = broken_length(traits, value)
+        .into_iter()
+        .chain(broken_value_set(traits, value));
+    kinds
+        .map(|kind| Violation {
+            // The path the validating walk reports a top-level member under.
+            path: ::aws_smithy_schema_server::constraints::path::member(
+                member.member_name().unwrap_or_default(),
+            ),
+            kind,
+            // Held to the same ceiling the walk holds its echoed values to, so a caller
+            // cannot amplify a request into an arbitrarily long response.
+            value: Some(
+                ::service_common::validation::quoted_echo_up_to(value, MAX_ECHOED_VALUE)
+                    .into_owned(),
+            ),
+            sensitive: false,
+        })
+        .collect()
+}
+
+/// The `@length` bound `value` breaks, counted in CHARACTERS — the length the walk counts
+/// for a string.
+fn broken_length(traits: &::aws_smithy_schema::TraitMap, value: &str) -> Option<ViolationKind> {
+    let declared = declared_trait::<LengthTrait>(traits, &LengthTrait::TRAIT_ID)?;
+    let length = i64::try_from(value.chars().count()).unwrap_or(i64::MAX);
+    match (declared.min, declared.max) {
+        (Some(min), _) if length < min => Some(ViolationKind::MinLength(min)),
+        (_, Some(max)) if length > max => Some(ViolationKind::MaxLength(max)),
+        _ => None,
+    }
+}
+
+/// The value set `value` falls outside, in the order the model declares it: the set a
+/// clause STATES is then the renderer's business (`super::stated_enum_order`), exactly as
+/// for the walk's own clause.
+fn broken_value_set(traits: &::aws_smithy_schema::TraitMap, value: &str) -> Option<ViolationKind> {
+    let declared = declared_trait::<EnumTrait>(traits, &EnumTrait::TRAIT_ID)?;
+    let admitted = declared.values.iter().any(|admissible| {
+        if declared.ignore_case {
+            admissible.eq_ignore_ascii_case(value)
+        } else {
+            *admissible == value
+        }
+    });
+    (!admitted).then(|| {
+        ViolationKind::EnumValue(declared.values.iter().map(|v| (*v).to_string()).collect())
+    })
+}
+
+/// One constraint trait of a member schema, as codegen hung it there.
+fn declared_trait<'t, T: 'static>(
+    traits: &'t ::aws_smithy_schema::TraitMap,
+    id: &::aws_smithy_schema::ShapeId,
+) -> Option<&'t T> {
+    traits.get(id)?.as_any().downcast_ref::<T>()
+}
+
+/// The largest rejected value one clause quotes, which is the ceiling the framework's own
+/// walk elides an echoed value at: a caller controls the length of what it sent, and a
+/// clause interpolates it as it stands.
+const MAX_ECHOED_VALUE: usize = 256;

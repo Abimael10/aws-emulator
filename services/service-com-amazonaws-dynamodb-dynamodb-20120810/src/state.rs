@@ -119,15 +119,19 @@ pub const MAX_TRANSACTION_SIZE_BYTES: i64 = 4 * 1024 * 1024;
 
 /// How a transaction past [`MAX_TRANSACTION_SIZE_BYTES`] is refused.
 ///
-/// The sentence is this service's own, in the same fixed form the item ceiling states
-/// ([`ITEM_SIZE_EXCEEDED_MESSAGE`]) and with neither the ceiling nor the offending total
-/// appended: the quota is the whole CALL's, so it names neither an action nor a table. What
-/// the CONTRACT settles is the class — a top-level `ValidationException` refusing the
-/// request rather than a cancellation, because no action of it was applicable to begin with
-/// — and this wording has not been read back from a recording of the sentence AWS sends for
-/// it.
-pub const TRANSACTION_SIZE_EXCEEDED_MESSAGE: &str =
-    "Transaction size has exceeded the maximum allowed size";
+/// The quota is the whole CALL's, so the sentence names neither an action nor a table: it
+/// states the ceiling the request crossed and then the payload the request actually
+/// carried, which is the one number a caller sizing or splitting a transaction from the
+/// refusal has to read — a transaction refused for being 10 bytes over and one refused for
+/// being megabytes over are told apart only by it. The ceiling is spelled as the quota is
+/// published (`4MB`) rather than as the byte count behind it, and the payload is the
+/// aggregate this call measured ([`MAX_TRANSACTION_SIZE_BYTES`]).
+///
+/// The class the refusal takes is a top-level `ValidationException` rather than a
+/// cancellation, because no action of the transaction was applicable to begin with.
+pub fn transaction_size_exceeded_message(payload: i64) -> String {
+    format!("Transaction payload size cannot exceed 4MB. Payload Size: {payload}")
+}
 
 /// How a `Key` member that is not the table's primary key is refused: AWS's
 /// FIXED sentence for that mismatch, with nothing about WHICH element differs

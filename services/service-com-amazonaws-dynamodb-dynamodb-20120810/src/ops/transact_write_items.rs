@@ -349,7 +349,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .sum();
         if aggregate > crate::state::MAX_TRANSACTION_SIZE_BYTES {
             return Err(crate::scaffolded::Scaffolded::validation(
-                crate::state::TRANSACTION_SIZE_EXCEEDED_MESSAGE,
+                crate::state::transaction_size_exceeded_message(aggregate),
             ));
         }
 
@@ -534,7 +534,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             .map_err(lift)?;
                     }
                     crate::state::canonicalize_item(&mut item).map_err(lift)?;
-                    if crate::state::item_size(&item) > crate::state::MAX_ITEM_SIZE_BYTES {
+                    // Sized over what this element ASKED FOR, exactly as the single-item
+                    // `UpdateItem` of the same expression is: the stored item plus the
+                    // frame each clause of the update costs
+                    // ([`crate::state::ParsedUpdate::request_shape_charge`]).
+                    if crate::state::item_size(&item) + applied.request_shape_charge()
+                        > crate::state::MAX_ITEM_SIZE_BYTES
+                    {
                         return Err(crate::scaffolded::Scaffolded::validation(
                             crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE,
                         ));

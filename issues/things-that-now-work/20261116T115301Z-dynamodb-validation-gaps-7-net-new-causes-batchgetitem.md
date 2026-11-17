@@ -90,3 +90,20 @@ Cause 5: UpdateItem 'SET doc = :v' with :v nested 40 levels deep plus an extra u
 Cause 6: TransactWriteItems with 11 Puts of ~390 KB each (>4 MB aggregate) — compare the message and assert no CancellationReasons and no items written.
 Cause 7: bisect the largest accepted operand length for 'SET v = :v' and for 'SET v1 = :v1, v2 = :v2' / 'SET v = :v, m.x = :mval' / 'SET v = :v REMOVE w' on a 400 KB-limited table and compare the per-clause deltas.
 Replay: dynamodb.batch-get-item-expression-and-legacy-parameter-rules, dynamodb.ddb-query-size-function-rejected-in-key-condition, dynamodb.expression-attribute-map-key-syntax-and-length-rejected, dynamodb.multiple-simultaneous-constraint-violations-rejected, dynamodb.nesting-depth-error-precedence-across-malformed-requests, dynamodb.transact-write-aggregate-size-over-4mb-rejected, dynamodb.update-item-request-shape-byte-charges-by-clause-kind, dynamodb.update-item-set-remove-fixed-action-cost-ceiling
+
+## Resolution
+
+All seven causes are fixed; every per-clause charge of cause 7 now moves the boundary by the
+amount AWS moves it (document path 26, arithmetic 71, function 76, ADD 21, DELETE and REMOVE
+2), and the charges live in
+`services/service-com-amazonaws-dynamodb-dynamodb-20120810/src/state/expressions/request_shape.rs`.
+
+ONE thing cause 7 leaves behind, for whoever picks it up next: the charges are DIFFERENCES,
+and where the 400 KB boundary sits in ABSOLUTE terms for a plain single-assignment update is
+the item ceiling's own accounting, which is not this issue's subject. The recorded unit
+`dynamodb.update-item-request-shape-byte-charges-by-clause-kind` gets past every per-clause
+delta and then stops on a probe that expects a refusal (`_code_and_message`) the emulator
+serves, so the emulator still accepts an operand at least one byte past where AWS stops one.
+That gap is in what one stored item is sized as against the 400 KB ceiling (and is invariant
+under the clause frames — the deltas are identical whether or not the baseline assignment is
+itself charged), not in the per-clause frames this issue named.

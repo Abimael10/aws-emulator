@@ -408,25 +408,37 @@ async fn a_substitution_table_with_no_expression_names_the_member_that_needs_one
         );
     }
 
-    // The BOUNDARY: an ELEMENT's tables are held to the element's OWN expressions, so an
-    // element that states none is served rather than told to add one.
-    for (case, operation, request) in [
+    // A `RequestItems` entry of a BATCHED read carries the whole projection ask, so the
+    // entry is held to the same rule a single-table read's members are.
+    let (status, answered) = call(
+        &router,
+        "BatchGetItem",
+        json!({"RequestItems": {table: {
+            "Keys": [{"pk": {"S": "p1"}, "sk": {"N": "1"}}],
+            "ExpressionAttributeNames": {"#l": "label"}}}}),
+    )
+    .await;
+    assert_eq!(
+        (status, message(&answered).as_str()),
         (
-            "a batch read",
-            "BatchGetItem",
-            json!({"RequestItems": {table: {
-                "Keys": [{"pk": {"S": "p1"}, "sk": {"N": "1"}}],
-                "ExpressionAttributeNames": {"#l": "label"}}}}),
+            400,
+            "ExpressionAttributeNames can only be specified when using expressions"
         ),
-        (
-            "a transactional read",
-            "TransactGetItems",
-            json!({"TransactItems": [{"Get": {
-                "TableName": table,
-                "Key": {"pk": {"S": "p1"}, "sk": {"N": "1"}},
-                "ExpressionAttributeNames": {"#l": "label"}}}]}),
-        ),
-    ] {
+        "case a batch read: the entry is told to add an expression, got {status} with \
+         {answered}"
+    );
+
+    // The BOUNDARY: a TRANSACTIONAL element's tables sit beside that element's own
+    // expression members, so an element that states none is served rather than told to add
+    // one.
+    for (case, operation, request) in [(
+        "a transactional read",
+        "TransactGetItems",
+        json!({"TransactItems": [{"Get": {
+            "TableName": table,
+            "Key": {"pk": {"S": "p1"}, "sk": {"N": "1"}},
+            "ExpressionAttributeNames": {"#l": "label"}}}]}),
+    )] {
         let (status, answered) = call(&router, operation, request).await;
         assert_eq!(
             status, 200,

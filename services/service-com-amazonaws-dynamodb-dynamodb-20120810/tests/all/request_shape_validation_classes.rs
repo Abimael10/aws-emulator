@@ -43,7 +43,45 @@
 //! and is refused naming the repeated identifier(s). The rows span the ways two items
 //! collapse onto one identifier, and the controls span the lists that do not.
 //!
-//! RULE 5 — the class boundary IN FRONT of all four: a body value whose JSON class the
+//! RULE 5 — a KEY of either substitution table is held to the length a substitution token
+//! may be (255 bytes, the whole key as the request spelled it), and the refusal names the
+//! member, says the key is too long and states the key's own size; it is reported ahead of
+//! the expression that would have dereferenced a token, and ahead of the key's SPELLING,
+//! because a key past the limit is past it whatever characters it holds. The rows span the
+//! member, the operation, both sides of the published bound, and a key that breaks the
+//! length and the spelling at once.
+//!
+//! RULE 6 — a `KeyConditionExpression` operand that is itself an OPERATION — a name applied
+//! to arguments, which is how every value-returning function of the expression language is
+//! written — is refused as a nested operation the member does not take, ahead of the generic
+//! syntax error the call's `(` would otherwise earn. The rows span the function, the
+//! position in the condition and the spelling; the controls span the member's own
+//! `begins_with`, the CONDITION functions that keep their own sentence, and the same
+//! function in a `FilterExpression`, which is a member that does take it.
+//!
+//! RULE 7 — every independent violation of one request's declared constraints is reported
+//! in ONE counted envelope, so a member whose absence stops the request being read does not
+//! mask the bounds its other members broke. The rows span how many constraints one request
+//! breaks, which classes they are (an absent member, a length, an enumerated set) and the
+//! operation that carries them; the control is the refusal of a single member a check of
+//! the service's own words in its own sentence.
+//!
+//! RULE 8 — a value the request CARRIES is held to the documented nesting depth before the
+//! request's expressions are held to the substitution tables beside them, and after what
+//! each table says about itself. The rows span what the deep value is stated beside, and
+//! every one of them writes nothing.
+//!
+//! RULE 9 — a transaction past the documented 4 MB aggregate is refused naming the ceiling
+//! and the payload the request carried, writes nothing, and a subset of the same items
+//! inside the ceiling commits.
+//!
+//! RULE 10 — an `UpdateItem` is sized against the documented 400 KB item ceiling over the
+//! item it leaves behind PLUS a frame for each clause it states, so the largest operand one
+//! write can carry moves with the clauses beside it. The rows span the clause kinds — a
+//! further assignment, an arithmetic operand, a function operand, `ADD`, `DELETE` and
+//! `REMOVE` (whose frame is the path it names) — each read off the boundary itself.
+//!
+//! RULE 11 — the class boundary IN FRONT of all of them: a body value whose JSON class the
 //! modelled type of its member cannot be read from never becomes a value, so it fails
 //! DESERIALIZATION rather than a rule — answered as the protocol's own
 //! `com.amazon.coral.service#SerializationException` with the reason under the capitalized
@@ -735,6 +773,18 @@ async fn a_substitution_table_with_no_expression_is_told_to_add_one() {
                    "ExpressionAttributeValues": {":v": {"S": "active"}}}),
             only_with_expressions_bare("ExpressionAttributeValues"),
         ),
+        // A `RequestItems` entry of a batched read carries the whole projection ask — the
+        // expression member, the legacy list and the names table that resolves the
+        // expression's aliases are all members of the ENTRY — so the entry is held to the
+        // same rule a single-table read's members are.
+        (
+            "names, on one entry of a batched read",
+            "BatchGetItem",
+            json!({"RequestItems": {SUBSTITUTED: {
+                "Keys": [key.clone()],
+                "ExpressionAttributeNames": {"#s": "status"}}}}),
+            only_with_expressions_bare("ExpressionAttributeNames"),
+        ),
     ];
 
     for (case, operation, request, expected) in rows {
@@ -752,18 +802,11 @@ async fn a_substitution_table_with_no_expression_is_told_to_add_one() {
         );
     }
 
-    // The BOUNDARY: this rule is the REQUEST's. The substitution tables of ONE ELEMENT of
-    // a multi-item call are members of that element, held to the element's OWN
-    // expressions — so an element that states no expression has none to hold them to and
-    // the call is SERVED.
+    // The BOUNDARY: this rule is held over the members ONE ASK is stated through. The
+    // substitution tables of an element of a TRANSACTIONAL call sit beside the expression
+    // members of that element, so they are held to the element's OWN expressions — and an
+    // element that states no expression has none to hold them to, so the call is SERVED.
     for (case, operation, request) in [
-        (
-            "names, on one entry of a batched read",
-            "BatchGetItem",
-            json!({"RequestItems": {SUBSTITUTED: {
-                "Keys": [key.clone()],
-                "ExpressionAttributeNames": {"#s": "status"}}}}),
-        ),
         (
             "names, on one element of a transactional read",
             "TransactGetItems",
@@ -980,8 +1023,878 @@ async fn a_select_clause_that_repeats_an_identifier_is_refused() {
 }
 
 // ===========================================================================
-// RULE 5. A value that could not be READ is a different class from one that
-//         was read and then broke a rule
+// RULE 5. A substitution table's KEY is held to the length a token may be
+// ===========================================================================
+
+/// The longest a key of either substitution table may be: the documented 255-byte limit on
+/// a substitution token, counted over the whole key as the request spelled it — the
+/// member's prefix character included.
+const MAX_KEY_BYTES: usize = 255;
+
+/// The table the key rows address.
+const KEYED: &str = "SubstitutionKeys";
+
+/// A key of `member`'s table: its prefix character and `body`.
+fn token(prefix: char, body: &str) -> String {
+    format!("{prefix}{body}")
+}
+
+/// The whole message a key past the limit earns, over the member that carried it and the
+/// size of the key itself.
+fn too_long_key(member: &str, size: usize, enveloped: bool) -> String {
+    let envelope = if enveloped {
+        "1 validation error detected: "
+    } else {
+        ""
+    };
+    format!(
+        "{envelope}{member} contains invalid key: The expression attribute map contains a key \
+         that is too long; size of key: {size}"
+    )
+}
+
+#[tokio::test]
+async fn a_substitution_key_past_the_token_limit_is_refused_naming_its_size() {
+    let router = emulator();
+    create_active_table(&router, KEYED, &[("pk", "HASH", "S")]).await;
+    ok(
+        &router,
+        "PutItem",
+        json!({"TableName": KEYED, "Item": {"pk": {"S": "k1"}, "foo": {"S": "stored"}}}),
+    )
+    .await;
+
+    // One over the bound, far over it, and a key whose SPELLING is wrong too — spanning
+    // both members, a read and a write (which states the refusal inside the envelope), and
+    // the operations that carry each table.
+    let one_over = token('#', &"a".repeat(MAX_KEY_BYTES));
+    let far_over = token('#', &"a".repeat(299));
+    let dashed = token('#', &format!("{}-{}", "a".repeat(140), "a".repeat(116)));
+    let value_key = token(':', &"v".repeat(MAX_KEY_BYTES));
+    let rows: Vec<(&str, &str, Value, String)> = vec![
+        (
+            "a name key one byte over the limit, on a keyed read",
+            "GetItem",
+            json!({"TableName": KEYED, "Key": {"pk": {"S": "k1"}},
+                   "ProjectionExpression": "#a",
+                   "ExpressionAttributeNames": {one_over.clone(): "foo"}}),
+            too_long_key("ExpressionAttributeNames", MAX_KEY_BYTES + 1, false),
+        ),
+        (
+            "a name key far over the limit",
+            "GetItem",
+            json!({"TableName": KEYED, "Key": {"pk": {"S": "k1"}},
+                   "ProjectionExpression": "#a",
+                   "ExpressionAttributeNames": {far_over.clone(): "foo"}}),
+            too_long_key("ExpressionAttributeNames", 300, false),
+        ),
+        (
+            // Length BEFORE spelling: the key holds a character no token may, and what it
+            // is told about is the length it has to fix anyway.
+            "a name key that is too long and holds a character no token may",
+            "GetItem",
+            json!({"TableName": KEYED, "Key": {"pk": {"S": "k1"}},
+                   "ProjectionExpression": "#a",
+                   "ExpressionAttributeNames": {dashed.clone(): "foo"}}),
+            too_long_key("ExpressionAttributeNames", 258, false),
+        ),
+        (
+            "a value key one byte over the limit, on a table walk",
+            "Scan",
+            json!({"TableName": KEYED, "FilterExpression": "foo = :v",
+                   "ExpressionAttributeValues": {value_key.clone(): {"S": "stored"}}}),
+            too_long_key("ExpressionAttributeValues", MAX_KEY_BYTES + 1, false),
+        ),
+        (
+            "a name key one byte over the limit, on a write",
+            "UpdateItem",
+            json!({"TableName": KEYED, "Key": {"pk": {"S": "k1"}},
+                   "UpdateExpression": "SET #a = :v",
+                   "ExpressionAttributeNames": {one_over.clone(): "foo"},
+                   "ExpressionAttributeValues": {":v": {"S": "written"}}}),
+            too_long_key("ExpressionAttributeNames", MAX_KEY_BYTES + 1, true),
+        ),
+        (
+            // The other side of the precedence: a key INSIDE the limit whose spelling is
+            // wrong is the syntax error it is.
+            "a short key no expression could write",
+            "GetItem",
+            json!({"TableName": KEYED, "Key": {"pk": {"S": "k1"}},
+                   "ProjectionExpression": "#a",
+                   "ExpressionAttributeNames": {"#a-b": "foo"}}),
+            "ExpressionAttributeNames contains invalid key: Syntax error; key: \"#a-b\""
+                .to_string(),
+        ),
+    ];
+
+    for (case, operation, request, expected) in rows {
+        let (status, body) = call(&router, operation, request).await;
+        assert_eq!(
+            (status, error_code(&body).as_str(), message(&body)),
+            (400, "ValidationException", expected.clone()),
+            "case {case:?} ({operation}): expected 400 {expected:?}, got {status} with {body}"
+        );
+    }
+
+    // The BOUND itself: a key exactly at the limit is a key, and the expression that uses
+    // it is served.
+    let at_the_bound = token('#', &"a".repeat(MAX_KEY_BYTES - 1));
+    let served = ok(
+        &router,
+        "GetItem",
+        json!({"TableName": KEYED, "Key": {"pk": {"S": "k1"}},
+               "ProjectionExpression": at_the_bound.clone(),
+               "ExpressionAttributeNames": {at_the_bound.clone(): "foo"}}),
+    )
+    .await;
+    assert_eq!(
+        served["Item"],
+        json!({"foo": {"S": "stored"}}),
+        "case \"a name key exactly at the limit\": expected the projected attribute, got \
+         {served}"
+    );
+}
+
+// ===========================================================================
+// RULE 6. A key condition takes no nested operation
+// ===========================================================================
+
+/// The table the key-condition rows query: a composite key, so a condition can state one
+/// clause per key attribute.
+const KEYED_CONDITION: &str = "NestedKeyConditions";
+
+/// AWS's fixed sentence for a key condition whose operand is an operation.
+const NESTED_OPERATIONS: &str =
+    "Invalid KeyConditionExpression: KeyConditionExpressions cannot contain nested operations";
+
+/// AWS's fixed sentence for a key condition naming an operator the member does not take.
+const INVALID_OPERATOR: &str =
+    "Invalid KeyConditionExpression: Invalid operator used in KeyConditionExpression";
+
+#[tokio::test]
+async fn a_function_call_in_a_key_condition_is_the_nested_operation_refusal() {
+    let router = emulator();
+    create_active_table(
+        &router,
+        KEYED_CONDITION,
+        &[("pk", "HASH", "S"), ("sk", "RANGE", "S")],
+    )
+    .await;
+    ok(
+        &router,
+        "PutItem",
+        json!({"TableName": KEYED_CONDITION,
+               "Item": {"pk": {"S": "p1"}, "sk": {"S": "s1"}, "note": {"S": "abcde"}}}),
+    )
+    .await;
+
+    // The function, where in the condition it sits, how it is spelled, and which operand
+    // it is applied to.
+    let values = json!({":n": {"N": "5"}, ":p": {"S": "p1"}, ":s": {"S": "s1"}});
+    for (case, expression) in [
+        ("the size function on the partition key", "size(pk) = :n"),
+        ("the same call with a space before its arguments", "size (pk) = :n"),
+        (
+            "the call on the right-hand side of the comparison",
+            "pk = :p AND :n = size(sk)",
+        ),
+        (
+            "a call beside a comparison the member does take",
+            "pk = :p AND size(sk) = :n",
+        ),
+        ("a call on an aliased name", "size(#p) = :n"),
+        ("a call naming no function of the language", "bogus(pk) = :p"),
+    ] {
+        let (status, body) = call(
+            &router,
+            "Query",
+            json!({"TableName": KEYED_CONDITION, "KeyConditionExpression": expression,
+                   "ExpressionAttributeNames": {"#p": "pk"},
+                   "ExpressionAttributeValues": values.clone()}),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&body).as_str(), message(&body).as_str()),
+            (400, "ValidationException", NESTED_OPERATIONS),
+            "case {case:?}: expected the nested-operations refusal, got {status} with {body}"
+        );
+    }
+
+    // The CONTROLS. The member's own function is a token of its grammar, and the CONDITION
+    // functions are an operator it does not take rather than an operand it cannot read.
+    for (case, expression, expected) in [
+        (
+            "a condition function the member does not take",
+            "pk = :p AND contains(sk, :s)",
+            INVALID_OPERATOR,
+        ),
+        (
+            "another condition function",
+            "pk = :p AND attribute_exists(sk)",
+            INVALID_OPERATOR,
+        ),
+    ] {
+        let (status, body) = call(
+            &router,
+            "Query",
+            json!({"TableName": KEYED_CONDITION, "KeyConditionExpression": expression,
+                   "ExpressionAttributeValues": {":p": {"S": "p1"}, ":s": {"S": "s1"}}}),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&body).as_str(), message(&body).as_str()),
+            (400, "ValidationException", expected),
+            "case {case:?}: expected {expected:?}, got {status} with {body}"
+        );
+    }
+
+    // And the member's own `begins_with`, plus the SAME call in a `FilterExpression` — a
+    // member that does take an operation — still selects the item.
+    for (case, body) in [
+        (
+            "the member's own prefix function",
+            json!({"TableName": KEYED_CONDITION,
+                   "KeyConditionExpression": "pk = :p AND begins_with(sk, :s)",
+                   "ExpressionAttributeValues": {":p": {"S": "p1"}, ":s": {"S": "s"}}}),
+        ),
+        (
+            "the same function in a filter beside a plain key condition",
+            json!({"TableName": KEYED_CONDITION, "KeyConditionExpression": "pk = :p",
+                   "FilterExpression": "size(note) = :n",
+                   "ExpressionAttributeValues": {":p": {"S": "p1"}, ":n": {"N": "5"}}}),
+        ),
+    ] {
+        let selected = ok(&router, "Query", body).await;
+        assert_eq!(
+            selected["Count"],
+            json!(1),
+            "case {case:?}: expected the stored item, got {selected}"
+        );
+    }
+}
+
+// ===========================================================================
+// RULE 7. Every violated constraint of one request is counted in one envelope
+// ===========================================================================
+
+/// The table the aggregate rows address.
+const AGGREGATED: &str = "AggregatedViolations";
+
+/// One clause of the envelope: the value as the request sent it (`None` for a member it
+/// carried none for), the member path the validating walk reports, and the requirement.
+fn constraint_clause(value: Option<&str>, path: &str, requirement: &str) -> String {
+    let shown = value.map_or_else(|| "null".to_string(), |value| format!("'{value}'"));
+    format!("Value {shown} at '{path}' failed to satisfy constraint: {requirement}")
+}
+
+/// The whole envelope over `clauses`, counted as the service counts them.
+fn envelope(clauses: &[String]) -> String {
+    let plural = if clauses.len() == 1 { "error" } else { "errors" };
+    format!(
+        "{} validation {plural} detected: {}",
+        clauses.len(),
+        clauses.join("; ")
+    )
+}
+
+#[tokio::test]
+async fn every_violated_constraint_of_one_request_is_reported_in_one_envelope() {
+    let router = emulator();
+    create_active_table(&router, AGGREGATED, &[("pk", "HASH", "S")]).await;
+
+    let absent_key = constraint_clause(None, "key", "Member must not be null");
+    let empty_name = constraint_clause(
+        Some(""),
+        "tableName",
+        "Member must have length greater than or equal to 1",
+    );
+    let capacity = constraint_clause(
+        Some("BOGUS"),
+        "returnConsumedCapacity",
+        "Member must satisfy enum value set: [INDEXES, TOTAL, NONE]",
+    );
+    let return_values = constraint_clause(
+        Some("BOGUS2"),
+        "returnValues",
+        "Member must satisfy enum value set: [ALL_NEW, UPDATED_OLD, ALL_OLD, NONE, \
+         UPDATED_NEW]",
+    );
+
+    // How many constraints one request breaks, which classes they are, and the operation
+    // that carries them: an absent member is found while the request is READ, which is
+    // what used to mask every bound beside it.
+    let rows: Vec<(&str, &str, Value, String)> = vec![
+        (
+            "one absent member alone",
+            "UpdateItem",
+            json!({"TableName": AGGREGATED}),
+            envelope(std::slice::from_ref(&absent_key)),
+        ),
+        (
+            "an absent member beside one enumerated member outside its set",
+            "UpdateItem",
+            json!({"TableName": AGGREGATED, "ReturnConsumedCapacity": "BOGUS"}),
+            envelope(&[capacity.clone(), absent_key.clone()]),
+        ),
+        (
+            "an absent member beside a member below its length bound",
+            "UpdateItem",
+            json!({"TableName": "", "ReturnConsumedCapacity": "BOGUS"}),
+            envelope(&[capacity.clone(), empty_name.clone(), absent_key.clone()]),
+        ),
+        (
+            "four violations at once",
+            "UpdateItem",
+            json!({"TableName": "", "ReturnConsumedCapacity": "BOGUS",
+                   "ReturnValues": "BOGUS2"}),
+            envelope(&[
+                capacity.clone(),
+                empty_name.clone(),
+                return_values.clone(),
+                absent_key.clone(),
+            ]),
+        ),
+        (
+            "the same pair on another operation",
+            "GetItem",
+            json!({"TableName": AGGREGATED, "ReturnConsumedCapacity": "BOGUS"}),
+            envelope(&[capacity.clone(), absent_key.clone()]),
+        ),
+    ];
+
+    for (case, operation, request, expected) in rows {
+        let (status, body) = call(&router, operation, request).await;
+        assert_eq!(
+            (status, error_code(&body).as_str(), message(&body)),
+            (400, "ValidationException", expected.clone()),
+            "case {case:?} ({operation}): expected {expected:?}, got {status} with {body}"
+        );
+    }
+
+    // Two elements of ONE list, each breaking the same bound: the clauses name the element
+    // the violation sits in, and the two lists are stated in the order the service states
+    // them.
+    let index = |name: &str| {
+        json!({"IndexName": name,
+               "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"},
+                             {"AttributeName": "sk", "KeyType": "RANGE"}],
+               "Projection": {"ProjectionType": "KEYS_ONLY"}})
+    };
+    let (status, body) = call(
+        &router,
+        "CreateTable",
+        json!({
+            "TableName": "TwoShortIndexNames",
+            "BillingMode": "PAY_PER_REQUEST",
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"},
+                          {"AttributeName": "sk", "KeyType": "RANGE"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"},
+                                     {"AttributeName": "sk", "AttributeType": "S"}],
+            "LocalSecondaryIndexes": [index("lo")],
+            "GlobalSecondaryIndexes": [index("gi")],
+        }),
+    )
+    .await;
+    let short = "Member must have length greater than or equal to 3";
+    assert_eq!(
+        (status, message(&body)),
+        (
+            400,
+            envelope(&[
+                constraint_clause(
+                    Some("gi"),
+                    "globalSecondaryIndexes.1.member.indexName",
+                    short
+                ),
+                constraint_clause(
+                    Some("lo"),
+                    "localSecondaryIndexes.1.member.indexName",
+                    short
+                ),
+            ])
+        ),
+        "case \"two short index names\": expected both clauses counted together, got {status} \
+         with {body}"
+    );
+
+    // The CONTROL: a request whose only defect is a member the service checks ITSELF is
+    // refused in that check's own words, because such a check is reached only by a request
+    // whose shape the validator already admitted.
+    let (status, body) = call(
+        &router,
+        "UpdateItem",
+        json!({"TableName": AGGREGATED, "Key": {"pk": {"S": "k1"}},
+               "ReturnValues": "BOGUS2"}),
+    )
+    .await;
+    assert_eq!(
+        (status, message(&body)),
+        (
+            400,
+            "1 validation error detected: Failed to satisfy constraint: Member must satisfy \
+             enum value set: [ALL_OLD, UPDATED_OLD, ALL_NEW, UPDATE_NEW, NONE]"
+                .to_string()
+        ),
+        "case \"one self-checked member alone\": expected that check's own sentence, got \
+         {status} with {body}"
+    );
+}
+
+// ===========================================================================
+// RULE 8. A carried value is bounded before the expressions are
+// ===========================================================================
+
+/// The table the precedence rows write to.
+const PRECEDENCE: &str = "NestingPrecedence";
+
+/// The documented maximum depth a value may nest to: "DynamoDB supports nested attributes
+/// up to 32 levels deep" ("Service, Account, and Table Quotas").
+const MAX_DEPTH: usize = 32;
+
+/// A value nested `levels` deep, which is `levels - 1` maps around a string.
+fn nested(levels: usize) -> Value {
+    let mut value = json!({"S": "leaf"});
+    for _ in 1..levels {
+        value = json!({"M": {"inner": value}});
+    }
+    value
+}
+
+#[tokio::test]
+async fn a_value_past_the_nesting_limit_is_reported_before_the_expression_tables() {
+    let router = emulator();
+    create_active_table(&router, PRECEDENCE, &[("pk", "HASH", "S")]).await;
+
+    let depth = "1 validation error detected: Nesting Levels have exceeded supported limits: \
+                 Attributes in the item have nested levels beyond supported limit";
+    let deep = nested(MAX_DEPTH + 8);
+
+    // What the deep value is stated beside: an entry no expression uses (which the depth
+    // outranks), and the two defects of the substitution TABLE itself (which outrank the
+    // depth, because a table that is no substitution table at all is the defect whatever
+    // the values hold).
+    let rows: Vec<(&str, Value, String)> = vec![
+        (
+            "a deep value alone",
+            json!({"TableName": PRECEDENCE, "Key": {"pk": {"S": "k1"}},
+                   "UpdateExpression": "SET doc = :v",
+                   "ExpressionAttributeValues": {":v": deep.clone()}}),
+            depth.to_string(),
+        ),
+        (
+            "a deep value beside an entry no expression uses",
+            json!({"TableName": PRECEDENCE, "Key": {"pk": {"S": "k1"}},
+                   "UpdateExpression": "SET doc = :v",
+                   "ExpressionAttributeValues": {":v": deep.clone(),
+                                                 ":unused": {"S": "spare"}}}),
+            depth.to_string(),
+        ),
+        (
+            "a deep value beside a names entry that names no attribute",
+            json!({"TableName": PRECEDENCE, "Key": {"pk": {"S": "k1"}},
+                   "UpdateExpression": "SET doc = :v",
+                   "ExpressionAttributeNames": {"#e": ""},
+                   "ExpressionAttributeValues": {":v": deep.clone()}}),
+            "1 validation error detected: ExpressionAttributeNames contains invalid value: \
+             Empty attribute name for key #e"
+                .to_string(),
+        ),
+        (
+            "a deep value beside a key no expression could write",
+            json!({"TableName": PRECEDENCE, "Key": {"pk": {"S": "k1"}},
+                   "UpdateExpression": "SET doc = :v",
+                   "ExpressionAttributeNames": {"bad": "doc"},
+                   "ExpressionAttributeValues": {":v": deep.clone()}}),
+            "1 validation error detected: ExpressionAttributeNames contains invalid key: \
+             Syntax error; key: \"bad\""
+                .to_string(),
+        ),
+    ];
+
+    for (case, request, expected) in rows {
+        let (status, body) = call(&router, "UpdateItem", request).await;
+        assert_eq!(
+            (status, error_code(&body).as_str(), message(&body)),
+            (400, "ValidationException", expected.clone()),
+            "case {case:?}: expected {expected:?}, got {status} with {body}"
+        );
+        // Either way nothing is written.
+        let read = ok(
+            &router,
+            "GetItem",
+            json!({"TableName": PRECEDENCE, "Key": {"pk": {"S": "k1"}}}),
+        )
+        .await;
+        assert_eq!(
+            read.get("Item"),
+            None,
+            "case {case:?}: a refused update writes nothing, got {read}"
+        );
+    }
+
+    // The other side: a SHALLOW document is what lets the unused entry surface.
+    let (status, body) = call(
+        &router,
+        "UpdateItem",
+        json!({"TableName": PRECEDENCE, "Key": {"pk": {"S": "k1"}},
+               "UpdateExpression": "SET doc = :v",
+               "ExpressionAttributeValues": {":v": nested(2), ":unused": {"S": "spare"}}}),
+    )
+    .await;
+    assert_eq!(
+        (status, message(&body)),
+        (
+            400,
+            "1 validation error detected: Value provided in ExpressionAttributeValues unused \
+             in expressions: keys: {:unused}"
+                .to_string()
+        ),
+        "case \"a shallow value beside an unused entry\": expected the unused-entry sentence, \
+         got {status} with {body}"
+    );
+}
+
+// ===========================================================================
+// RULE 9. A transaction past the aggregate ceiling names the payload it carried
+// ===========================================================================
+
+/// The table the transaction rows write to.
+const TRANSACTED: &str = "TransactionPayload";
+
+/// What one of those `Put` items stores: the key attribute's name and value, plus the
+/// payload attribute's name and value — the documented item size, "the sum of the attribute
+/// name and value lengths".
+fn put_item_size(key: &str, payload: usize) -> usize {
+    "pk".len() + key.len() + "p".len() + payload
+}
+
+#[tokio::test]
+async fn a_transaction_past_four_megabytes_names_the_payload_it_carried() {
+    let router = emulator();
+    create_active_table(&router, TRANSACTED, &[("pk", "HASH", "S")]).await;
+
+    // Eleven items, each inside the 400 KB item ceiling and together past the 4 MB
+    // aggregate.
+    let payload = 390 * 1024;
+    let text = "x".repeat(payload);
+    let keys: Vec<String> = (0..11).map(|at| format!("k{at:02}")).collect();
+    let puts: Vec<Value> = keys
+        .iter()
+        .map(|key| {
+            json!({"Put": {"TableName": TRANSACTED,
+                           "Item": {"pk": {"S": key}, "p": {"S": text}}}})
+        })
+        .collect();
+    let carried: usize = keys
+        .iter()
+        .map(|key| put_item_size(key, payload))
+        .sum();
+
+    let (status, body) = call(
+        &router,
+        "TransactWriteItems",
+        json!({"TransactItems": puts}),
+    )
+    .await;
+    assert_eq!(
+        (status, error_code(&body).as_str(), message(&body)),
+        (
+            400,
+            "ValidationException",
+            format!("Transaction payload size cannot exceed 4MB. Payload Size: {carried}")
+        ),
+        "case \"eleven items past the aggregate\": expected the payload size named, got \
+         {status} with {body}"
+    );
+    assert_eq!(
+        body.get("CancellationReasons"),
+        None,
+        "case \"eleven items past the aggregate\": no action of it was applicable, so there is \
+         nothing to cancel, got {body}"
+    );
+    for key in &keys {
+        let read = ok(
+            &router,
+            "GetItem",
+            json!({"TableName": TRANSACTED, "Key": {"pk": {"S": key}}}),
+        )
+        .await;
+        assert_eq!(
+            read.get("Item"),
+            None,
+            "case \"eleven items past the aggregate\": {key} must not have been written, got \
+             {read}"
+        );
+    }
+
+    // The other side of the ceiling: a subset of the SAME items commits.
+    ok(
+        &router,
+        "TransactWriteItems",
+        json!({"TransactItems": [
+            {"Put": {"TableName": TRANSACTED,
+                     "Item": {"pk": {"S": keys[0]}, "p": {"S": text}}}},
+            {"Put": {"TableName": TRANSACTED,
+                     "Item": {"pk": {"S": keys[1]}, "p": {"S": text}}}},
+        ]}),
+    )
+    .await;
+    for key in &keys[..2] {
+        let read = ok(
+            &router,
+            "GetItem",
+            json!({"TableName": TRANSACTED, "Key": {"pk": {"S": key}}}),
+        )
+        .await;
+        assert_eq!(
+            read["Item"]["p"]["S"].as_str().map(str::len),
+            Some(payload),
+            "case \"a subset inside the aggregate\": {key} must hold the whole payload, got a \
+             different length"
+        );
+    }
+}
+
+// ===========================================================================
+// RULE 10. An update's size accounting charges each clause's own frame
+// ===========================================================================
+
+/// The table the boundary rows write to: the rows address a one-character partition key,
+/// so the item's own overhead is as small as it can be.
+const SIZED: &str = "ClauseFrames";
+
+/// One row of the boundary table: the update's clauses, the values they bind, the stored
+/// state the row needs, and how far the largest accepted operand sits BELOW the plain
+/// `SET v = :v` baseline — the frames the clauses carry plus the bytes they leave in the
+/// item.
+struct Frame {
+    case: &'static str,
+    expression: &'static str,
+    values: fn() -> Value,
+    seed: Option<fn() -> Value>,
+    below: usize,
+}
+
+/// The alphabet the probes draw their partition keys from, each key ONE character long so
+/// every probe's item carries the same key bytes.
+///
+/// A probe gets a key of its own: an item this size is 400 of the write units one partition
+/// may take in a second, and a boundary is read off a couple of dozen probes — so writing
+/// them all to one key would measure the throughput ceiling instead of the size one.
+const PROBE_KEYS: &str = "abcdefghijklmnopqrstuvwxyz0123456789";
+
+/// The probes of one boundary measurement.
+struct Prober<'r> {
+    router: &'r smithy_server_runtime::MultiServiceRouter,
+    taken: usize,
+}
+
+impl Prober<'_> {
+    /// A key no earlier probe wrote to.
+    fn key(&mut self) -> String {
+        let at = self.taken;
+        self.taken += 1;
+        PROBE_KEYS
+            .chars()
+            .nth(at)
+            .expect("a boundary is read off fewer probes than this alphabet has keys")
+            .to_string()
+    }
+
+    /// One probe: `expression` applied to a fresh key with an operand of `length` bytes,
+    /// over the stored state `seed` leaves there. The key it used comes back, so a caller
+    /// can read the item the probe left.
+    async fn probe(
+        &mut self,
+        seed: Option<fn() -> Value>,
+        expression: &str,
+        values: &Value,
+        length: usize,
+    ) -> (String, u16, Value) {
+        let key = self.key();
+        if let Some(seed) = seed {
+            let mut seeding = seed();
+            seeding["Key"] = json!({"pk": {"S": key.clone()}});
+            ok(self.router, "UpdateItem", seeding).await;
+        }
+        let mut bound = values.clone();
+        bound[":v"] = json!({"S": "x".repeat(length)});
+        let (status, body) = call(
+            self.router,
+            "UpdateItem",
+            json!({"TableName": SIZED, "Key": {"pk": {"S": key.clone()}},
+                   "UpdateExpression": expression,
+                   "ExpressionAttributeValues": bound}),
+        )
+        .await;
+        (key, status, body)
+    }
+
+    /// The largest operand `expression` accepts, bisected inside a bracket every clause
+    /// shape below falls in.
+    async fn largest_accepted(&mut self, expression: &str, values: &Value) -> usize {
+        let (mut low, mut high) = (409_400usize, 409_650usize);
+        while low < high {
+            let at = low + (high - low).div_ceil(2);
+            let (_, status, _) = self.probe(None, expression, values, at).await;
+            if status == 200 {
+                low = at;
+            } else {
+                high = at - 1;
+            }
+        }
+        low
+    }
+}
+
+#[tokio::test]
+async fn the_largest_accepted_operand_moves_with_the_clauses_stated_beside_it() {
+    let router = emulator();
+    create_active_table(&router, SIZED, &[("pk", "HASH", "S")]).await;
+    let mut prober = Prober {
+        router: &router,
+        taken: 0,
+    };
+
+    // The baseline every frame is counted from: one assignment, nothing beside it.
+    let plain = json!({});
+    let baseline = prober.largest_accepted("SET v = :v", &plain).await;
+    assert!(
+        (409_400..409_650).contains(&baseline),
+        "case \"the baseline\": expected a boundary inside the bracketed range, got {baseline}"
+    );
+
+    // The boundary is a BOUND: the operand at it is stored, one byte more is refused with
+    // the sentence the update path states for that quota, and the attribute is left at the
+    // length last accepted.
+    let (key, status, body) = prober.probe(None, "SET v = :v", &plain, baseline).await;
+    assert_eq!(
+        status, 200,
+        "case \"the baseline\": the measured boundary must be accepted, got {body}"
+    );
+    let (status, body) = call(
+        &router,
+        "UpdateItem",
+        json!({"TableName": SIZED, "Key": {"pk": {"S": key}},
+               "UpdateExpression": "SET v = :v",
+               "ExpressionAttributeValues": {":v": {"S": "x".repeat(baseline + 1)}}}),
+    )
+    .await;
+    assert_eq!(
+        (status, message(&body).as_str()),
+        (
+            400,
+            "Item size to update has exceeded the maximum allowed size"
+        ),
+        "case \"one byte past the baseline\": expected the update-path ceiling sentence, got \
+         {status} with {body}"
+    );
+    let read = ok(
+        &router,
+        "GetItem",
+        json!({"TableName": SIZED, "Key": {"pk": {"S": key}}}),
+    )
+    .await;
+    assert_eq!(
+        read["Item"]["v"]["S"].as_str().map(str::len),
+        Some(baseline),
+        "case \"one byte past the baseline\": the attribute keeps its last accepted length, \
+         got {read}"
+    );
+
+    // One row per clause KIND. `below` is the frame that clause carries plus the bytes it
+    // leaves in the item: a one-character attribute name (1 byte) and its value — a
+    // one-character string (1 byte) or a one-digit number (1 byte, "1 byte per two
+    // significant digits plus 1 byte" with the digits rounding down).
+    let rows = [
+        Frame {
+            case: "a second assignment",
+            expression: "SET v = :v, b = :s",
+            values: || json!({":s": {"S": "x"}}),
+            seed: None,
+            below: 19 + 2,
+        },
+        Frame {
+            case: "an ADD beside the assignment",
+            expression: "SET v = :v ADD b :one",
+            values: || json!({":one": {"N": "1"}}),
+            seed: None,
+            below: 19 + 2,
+        },
+        Frame {
+            case: "an assignment whose operand is arithmetic",
+            expression: "SET v = :v, b = :one + :zero",
+            values: || json!({":one": {"N": "1"}, ":zero": {"N": "0"}}),
+            seed: None,
+            below: 69 + 2,
+        },
+        Frame {
+            case: "an assignment whose operand is a function call",
+            expression: "SET v = :v, b = if_not_exists(b, :one)",
+            values: || json!({":one": {"N": "1"}}),
+            seed: None,
+            below: 74 + 2,
+        },
+        Frame {
+            case: "a REMOVE of a one-character path",
+            expression: "SET v = :v REMOVE b",
+            values: || json!({}),
+            seed: None,
+            below: 1 + 1,
+        },
+        Frame {
+            case: "a REMOVE of a three-character path",
+            expression: "SET v = :v REMOVE bcd",
+            values: || json!({}),
+            seed: None,
+            below: 1 + 3,
+        },
+        Frame {
+            // A `DELETE` carries no frame of its own: what moves the boundary beside it is
+            // the set the item is left holding — one name byte and the one member it keeps.
+            case: "a DELETE beside the assignment",
+            expression: "SET v = :v DELETE s :gone",
+            values: || json!({":gone": {"SS": ["b"]}}),
+            seed: Some(|| {
+                json!({"TableName": SIZED, "UpdateExpression": "SET s = :seed",
+                       "ExpressionAttributeValues": {":seed": {"SS": ["a", "b"]}}})
+            }),
+            below: 2,
+        },
+    ];
+
+    for row in rows {
+        let values = (row.values)();
+        let at = baseline - row.below;
+        let (_, status, body) = prober.probe(row.seed, row.expression, &values, at).await;
+        assert_eq!(
+            status,
+            200,
+            "case {:?}: an operand {} bytes under the baseline {baseline} must be accepted, \
+             got {status} with {body}",
+            row.case,
+            row.below
+        );
+        let (_, status, body) = prober
+            .probe(row.seed, row.expression, &values, at + 1)
+            .await;
+        assert_eq!(
+            (status, message(&body).as_str()),
+            (
+                400,
+                "Item size to update has exceeded the maximum allowed size"
+            ),
+            "case {:?}: one byte more must be refused, so the boundary sits exactly {} bytes \
+             under the baseline {baseline}, got {status} with {body}",
+            row.case,
+            row.below
+        );
+    }
+}
+
+// ===========================================================================
+// RULE 11. A value that could not be READ is a different class from one that
+//          was read and then broke a rule
 // ===========================================================================
 
 /// The error class a body this service could not read into the modelled input is refused

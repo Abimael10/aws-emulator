@@ -1690,6 +1690,14 @@ fn tokenize(expression: &str) -> Result<Vec<Token>, crate::state::RequestError> 
         match character {
             c if c.is_whitespace() => at += 1,
             '(' => {
+                // A `(` straight after a NAME applies that name to arguments, which is a
+                // function call: the operand it builds is an OPERATION, and a key
+                // condition takes none ([`nested_operation_key_condition`]). The member's
+                // own `begins_with` is a token of this grammar rather than a name, so it
+                // never reaches here.
+                if matches!(tokens.last(), Some(Token::Name(_))) {
+                    return Err(nested_operation_key_condition());
+                }
                 tokens.push(Token::Open);
                 at += 1;
             }
@@ -1917,6 +1925,33 @@ fn one_condition_per_key() -> crate::state::RequestError {
 /// recognises the condition whichever unsupported shape it sent.
 fn unsupported_key_condition() -> crate::state::RequestError {
     crate::state::RequestError::Validation("Query key condition not supported".to_string())
+}
+
+/// The refusal for a key condition that applies a FUNCTION to an operand the member's own
+/// grammar has no function for.
+///
+/// A key condition compares a key ATTRIBUTE against a value: its whole vocabulary is `AND`,
+/// the comparisons `= < <= > >=`, `BETWEEN` and `begins_with`
+/// (`Query$KeyConditionExpression`, which spells each of its forms over an attribute name
+/// and a value). So an operand that is itself an OPERATION — a name applied to arguments,
+/// which is how every value-returning function of the expression language is written — is a
+/// nested operation the member does not take, whichever function it names and wherever in
+/// the condition it sits. AWS's sentence is FIXED: it names the member's rule and nothing of
+/// the function, the operand or the position, so a client matching it recognises the defect
+/// whichever nested operation the condition wrote.
+///
+/// It is reported ahead of the generic syntax error the parser would raise where the call's
+/// `(` sits, because the text IS readable — a function applied to an operand — and what is
+/// wrong with it is the rule above and not the character. The condition FUNCTIONS of the
+/// filter and condition languages are a different defect and keep their own sentence
+/// ([`invalid_key_condition_operator`], over [`NON_KEY_CONDITION_OPERATORS`]): those words
+/// name an operator the member does not accept rather than an operand it cannot read.
+fn nested_operation_key_condition() -> crate::state::RequestError {
+    crate::state::RequestError::Validation(
+        "Invalid KeyConditionExpression: KeyConditionExpressions cannot contain nested \
+         operations"
+            .to_string(),
+    )
 }
 
 /// The refusal for a comparison a key condition does not take.

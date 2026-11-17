@@ -375,10 +375,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &[("ConditionExpression", input.condition_expression.is_some())],
         )
         .map_err(lift)?;
-        // Every token the request DEFINES must be one an expression uses: an unused
-        // entry of either substitution table makes the whole request invalid.
+        // What the substitution tables the request SENT say about THEMSELVES — their keys
+        // are tokens, the request carries an expression they could go into, each defines
+        // something — is read before the values below: a table that is no substitution
+        // table at all is the defect whatever those values hold
+        // ([`crate::state::Substitutions::check_tables_well_formed`]).
         substitutions
-            .check_all_referenced(&[(
+            .check_tables_well_formed(&[(
                 "ConditionExpression",
                 input.condition_expression.as_deref(),
             )])
@@ -416,6 +419,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::check_attribute_value(placeholder, value).map_err(lift)?;
         }
         crate::state::check_expected_condition_values(input.expected.as_ref()).map_err(lift)?;
+        // Every token the request DEFINES must be one an expression uses: an unused
+        // entry of either substitution table makes the whole request invalid. It is asked
+        // AFTER the values above are bounded: a value outside those limits is outside them
+        // whichever expression would have substituted it, and whether any expression
+        // references the entry it sits under does not make it admissible — so the caller
+        // is told about the value rather than about an entry it would still have to fix
+        // the value of.
+        substitutions
+            .check_tokens_referenced(&[(
+                "ConditionExpression",
+                input.condition_expression.as_deref(),
+            )])
+            .map_err(lift)?;
 
         // Numbers are canonicalized BEFORE the item is sized, keyed or stored, so
         // every figure reported below — the capacity billed, the item-collection key

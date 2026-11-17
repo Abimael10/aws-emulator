@@ -471,6 +471,11 @@ const PUBLISHED_ENUM_ORDERS: &[&[&str]] = &[
     // `NEW_IMAGE NEW_AND_OLD_IMAGES`
     // (`smithy_query(query="shape", shape="com.amazonaws.dynamodb#ExportViewType")`).
     &["NEW_AND_OLD_IMAGES", "NEW_IMAGE"],
+    // `ReturnValue`, whose set the service is observed to state in THIS order; the model's
+    // own declaration order is a different one
+    // (`smithy_query(query="shape", shape="com.amazonaws.dynamodb#ReturnValue")`), and what
+    // the literal below holds is the order the refusal STATES, not that declaration.
+    &["ALL_NEW", "UPDATED_OLD", "ALL_OLD", "NONE", "UPDATED_NEW"],
 ];
 
 /// The admissible set `allowed` is STATED in: the order this service publishes for that
@@ -639,6 +644,12 @@ tokio::task_local! {
     /// [`validation_envelope`] so they are counted in the one envelope beside the
     /// violations the validating walk reports.
     static SERVED_SERVICE_CHECKED_CLAUSES: Vec<String>;
+
+    /// The body of the request this task is serving, beside the schema its declared bounds
+    /// live in ([`request_constraints::readable_body`]), set around the same run and read
+    /// back by [`validation_envelope`]: they are the bounds the validating walk never got
+    /// to, and they are worded and counted exactly as that walk's own violations are.
+    static SERVED_READABLE_BODY: Option<request_constraints::ReadableBody>;
 }
 
 /// The form the operation this task is serving states its clauses in.
@@ -682,6 +693,20 @@ fn served_checks_its_own_members() -> bool {
 fn served_service_checked_clauses() -> Vec<String> {
     SERVED_SERVICE_CHECKED_CLAUSES
         .try_with(Clone::clone)
+        .unwrap_or_default()
+}
+
+/// The violations of the served input's declared bounds this service can still read off the
+/// request it is serving. None at all is a refusal raised outside an operation's run, where
+/// there is no request to have read. The body is read HERE rather than when it arrived:
+/// only a refusal whose deserialization aborted needs it.
+fn served_body_violations() -> Vec<Violation> {
+    SERVED_READABLE_BODY
+        .try_with(|held| {
+            held.as_ref()
+                .map(request_constraints::ReadableBody::violations)
+                .unwrap_or_default()
+        })
         .unwrap_or_default()
 }
 
@@ -766,7 +791,10 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for OperationScopedClauseForm<E
                                 checks_its_own_members(operation),
                                 SERVED_SERVICE_CHECKED_CLAUSES.scope(
                                     request_constraints::service_checked_clauses(operation, req),
-                                    op.run(svc, req, ctx),
+                                    SERVED_READABLE_BODY.scope(
+                                        request_constraints::readable_body(operation, req),
+                                        op.run(svc, req, ctx),
+                                    ),
                                 ),
                             ),
                         ),
@@ -891,11 +919,16 @@ fn region_refusal<Eng: Send + Sync + 'static>(
 /// builds, so a clause raised here states what it has: the member and the bound it broke.
 /// `tests/all/collection_cap_constraint_reports.rs` pins that over the capped
 /// collections of the batched and transactional operations.
-fn violation_clause(violation: &Violation, form: ClauseForm) -> Option<String> {
+fn violation_clause(violation: &Violation, form: ClauseForm, alone: bool) -> Option<String> {
     match &violation.kind {
         // A member the service checks itself: the requirement with nothing echoed, over
-        // the set that check states.
-        ViolationKind::EnumValue(_) if service_checked_enum_set(&violation.path).is_some() => {
+        // the set that check states. Only where the refusal is about that member alone —
+        // a request several of whose members break a declared bound is refused by the
+        // validator before any check of the service's own reads it, so every clause of
+        // such a refusal is the validator's.
+        ViolationKind::EnumValue(_)
+            if alone && service_checked_enum_set(&violation.path).is_some() =>
+        {
             Some(format!(
                 "Failed to satisfy constraint: {}",
                 crate::state::enum_value_requirement(service_checked_enum_set(&violation.path)?)
@@ -1013,11 +1046,42 @@ fn validation_envelope(violations: &[Violation]) -> Option<String> {
         return crate::state::validation_message([violation_clause(
             masking,
             served_clause_form(),
+            true,
         )?]);
     }
-    let clauses: Vec<String> = in_stated_member_order(violations)
+    // The bounds the validating WALK never got to, read off the body: a member the input
+    // REQUIRES and the request does not carry stops the deserializer, so the walk that
+    // would have found every other violated bound of the same request never ran, and
+    // nothing but that one absence would be reported. Those violations are this request's
+    // too, so they are clauses of the same envelope ([`request_constraints`]) — and they
+    // are merged only where that is what happened, over the members the walk did not
+    // itself report, so a refusal the walk DID raise states the walk's own findings and
+    // nothing beside them.
+    let read_off_the_body: Vec<Violation> = if violations
+        .iter()
+        .any(|violation| matches!(violation.kind, ViolationKind::MissingRequiredMember))
+    {
+        served_body_violations()
+            .into_iter()
+            .filter(|found| {
+                !violations
+                    .iter()
+                    .any(|reported| reported.path == found.path)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let reported: Vec<&Violation> = read_off_the_body.iter().chain(violations.iter()).collect();
+    // A member the service checks ITSELF is stated in that check's own words only when the
+    // refusal is about that member ALONE: such a check is reached by a request whose shape
+    // the validator already admitted, so a request breaking several of its input's
+    // declared bounds never reaches one — every clause of it is the validator's, in the
+    // validator's own form ([`SERVICE_CHECKED_ENUMS`]).
+    let alone = reported.len() == 1 && served_service_checked_clauses().is_empty();
+    let clauses: Vec<String> = in_stated_member_order(&reported)
         .into_iter()
-        .map(|violation| violation_clause(violation, served_clause_form()))
+        .map(|violation| violation_clause(violation, served_clause_form(), alone))
         .collect::<Option<Vec<_>>>()?;
     // The violations this service found by READING the request are violations of the same
     // input, so they are clauses of the same envelope and are counted with the walk's
@@ -1064,6 +1128,13 @@ const STATED_MEMBER_ORDERS: &[&[&str]] = &[
     // `Limit` (`smithy_query(query="shape",
     // shape="com.amazonaws.dynamodb#ListTablesInput")`).
     &["limit", "exclusiveStartTableName"],
+    // The two secondary-index lists of a table declaration, which the model declares as
+    // `LocalSecondaryIndexes` then `GlobalSecondaryIndexes`
+    // (`smithy_query(query="operation", operation="CreateTable")`): the service states the
+    // GLOBAL list's clauses first. Named by the LIST members, so a clause about one of
+    // their elements is ordered by the list it belongs to whichever position and member
+    // inside the element it is about.
+    &["globalSecondaryIndexes", "localSecondaryIndexes"],
     // The capacity pair a table declaration or an update carries, which the model declares
     // as `ReadCapacityUnits` then `WriteCapacityUnits` (`smithy_query(query="shape",
     // shape="com.amazonaws.dynamodb#ProvisionedThroughput")`): the service states the
@@ -1071,6 +1142,17 @@ const STATED_MEMBER_ORDERS: &[&[&str]] = &[
     &[
         "provisionedThroughput.writeCapacityUnits",
         "provisionedThroughput.readCapacityUnits",
+    ],
+    // The members of a KEYED ITEM request, which the model declares as `TableName`, `Key`,
+    // then (far later) `ReturnValues` and `ReturnConsumedCapacity`
+    // (`smithy_query(query="operation", operation="UpdateItem")`): the service states the
+    // capacity member's clause first, then the table name's, then the returned-values
+    // member's, and an absent member's last.
+    &[
+        "returnConsumedCapacity",
+        "tableName",
+        "returnValues",
+        "key",
     ],
 ];
 
@@ -1081,22 +1163,33 @@ const STATED_MEMBER_ORDERS: &[&[&str]] = &[
 /// An entry applies only when it names EVERY violated member, so a refusal that mixes a
 /// member the entry knows with one it does not keeps the walk's order rather than
 /// guessing where the unknown member belongs.
-fn in_stated_member_order(violations: &[Violation]) -> Vec<&Violation> {
-    let mut stated: Vec<&Violation> = violations.iter().collect();
-    let Some(order) = STATED_MEMBER_ORDERS.iter().find(|order| {
-        violations
-            .iter()
-            .all(|violation| order.contains(&violation.path.as_str()))
-    }) else {
+fn in_stated_member_order<'v>(violations: &[&'v Violation]) -> Vec<&'v Violation> {
+    let mut stated: Vec<&Violation> = violations.to_vec();
+    let Some(order) = STATED_MEMBER_ORDERS
+        .iter()
+        .find(|order| violations.iter().all(|violation| at_in(order, violation).is_some()))
+    else {
         return stated;
     };
-    stated.sort_by_key(|violation| {
-        order
-            .iter()
-            .position(|member| *member == violation.path.as_str())
-            .unwrap_or(order.len())
-    });
+    stated.sort_by_key(|violation| at_in(order, violation).unwrap_or(order.len()));
     stated
+}
+
+/// Where `violation`'s member sits in `order`, or `None` for a member it does not name.
+///
+/// A clause's member is its whole PATH where the order names paths, and otherwise the
+/// top-level member the path starts at: an order over the input's own members decides
+/// where a clause about one of their elements goes too, because the element is reported
+/// under that member (`globalSecondaryIndexes.1.member.indexName`).
+fn at_in(order: &[&str], violation: &Violation) -> Option<usize> {
+    let path = violation.path.as_str();
+    order
+        .iter()
+        .position(|member| *member == path)
+        .or_else(|| {
+            let top = path.split('.').next()?;
+            order.iter().position(|member| *member == top)
+        })
 }
 
 /// The required members this service's OWN request code demands, named by the path the
