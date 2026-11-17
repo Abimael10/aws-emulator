@@ -171,12 +171,30 @@ pub fn launch<Eng: Send + Sync + 'static>(
             resolved_specification(&store, specification)
         });
 
-    let mut tags: BTreeMap<String, String> = request
-        .tags
-        .iter()
-        .filter(|tag| super::propagates_at_launch(tag))
-        .map(|tag| (tag.key.clone(), tag.value.clone().unwrap_or_default()))
-        .collect();
+    // What the instance's tags are, in the order one source overrides another:
+    //
+    // * the instance tags the launch-template version this launch read declares, which every
+    //   launch from that version applies, read through the service that OWNS launch templates
+    //   ([`ec2::launch_template_instance_tags`]);
+    // * the group's own tags marked `PropagateAtLaunch` — "Determines whether the tag is added
+    //   to new instances as they are launched in the group" (`Tag$PropagateAtLaunch`) — which
+    //   win over the template's for a key both spell, the group being the nearer source;
+    // * the reserved tags no source spells: the group the instance belongs to
+    //   ([`GROUP_NAME_TAG`]) and, for a launch from a template, the template and the resolved
+    //   version the launch read ([`ec2::LAUNCH_TEMPLATE_ID_TAG`]).
+    let mut tags: BTreeMap<String, String> = launched_template
+        .as_ref()
+        .and_then(|specification| template_data(&store, specification))
+        .as_ref()
+        .map(ec2::launch_template_instance_tags)
+        .unwrap_or_default();
+    tags.extend(
+        request
+            .tags
+            .iter()
+            .filter(|tag| super::propagates_at_launch(tag))
+            .map(|tag| (tag.key.clone(), tag.value.clone().unwrap_or_default())),
+    );
     tags.insert(GROUP_NAME_TAG.to_string(), request.group_name.to_string());
     // An instance launched FROM A LAUNCH TEMPLATE carries the two system tags Amazon EC2 adds
     // for one, naming the template and the version this launch read

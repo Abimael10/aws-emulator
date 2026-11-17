@@ -2240,6 +2240,13 @@ pub use launched_root_volumes::{
     block_device_mapping_bytes, root_block_device_bytes, template_block_device_mapping,
 };
 
+/// The instance tags a launch-template VERSION declares (its `instance` tag
+/// specifications) — the reading every launch from that version shares, this service's own
+/// and the one Amazon EC2 Auto Scaling makes for a group. Everything it declares is
+/// re-exported below.
+pub mod launch_template_instance_tags;
+pub use launch_template_instance_tags::*;
+
 /// The PRIMARY network interface a LAUNCH creates for the instance it stores, in the subnet
 /// the launch places it in — one method on the state, in a module of its own, beside the
 /// root volume the same launch creates.
