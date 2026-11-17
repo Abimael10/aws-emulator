@@ -1897,3 +1897,132 @@ async fn a_patched_body_is_held_to_the_whole_closed_schema_and_names_every_viola
         );
     }
 }
+
+/// The refusal a body whose TEXT does not parse carries: the fixed text of the
+/// dashboard-body rule, the line the parse stopped on and the position in that line,
+/// counted from the start of the line with its first character at position 0.
+fn not_valid_json(line: usize, column: usize) -> String {
+    format!("dashboard body is not valid JSON at line {line} column {column}")
+}
+
+#[tokio::test]
+async fn a_patched_body_that_is_not_json_is_refused_at_the_position_the_parse_failed() {
+    let omni = Omni::new();
+    let space_id = omni.space("parse", "update-parse").await;
+    let dashboard = omni
+        .create_dashboard("parse", &space_id, "dashboard", PANELS_BODY, Some("kept"))
+        .await;
+    let before = untouched_dashboard(&dashboard);
+
+    // A patched body that is not JSON at all has no document to hold to the schema, so
+    // the refusal reports the parse instead of a schema clause. The rows differ along
+    // WHERE the text stops being JSON: at its very first character, with nothing in it at
+    // all, at the end of a truncated document, at a member the document never names, past
+    // the document's end, on a LATER line, and part-way into a later line — so the
+    // position reported is a property of the submitted text rather than a fixed pair.
+    for (case, body, expected) in [
+        (
+            "text that is not JSON at all",
+            "panels".to_string(),
+            not_valid_json(1, 0),
+        ),
+        ("a body with no text at all", String::new(), not_valid_json(1, 0)),
+        (
+            "a document truncated inside its first panel",
+            r#"{"panels":[{"type":"logs"}"#.to_string(),
+            not_valid_json(1, 25),
+        ),
+        (
+            "a member missing after a comma",
+            r#"{"panels":[],}"#.to_string(),
+            not_valid_json(1, 13),
+        ),
+        (
+            "text past the end of the document",
+            format!("{PANELS_BODY} and more"),
+            not_valid_json(1, 14),
+        ),
+        (
+            "a document that fails on its third line",
+            "{\n  \"panels\": [],\n}".to_string(),
+            not_valid_json(3, 0),
+        ),
+        (
+            "a document that fails part-way into its second line",
+            "{\n  \"panels\": [,]\n}".to_string(),
+            not_valid_json(2, 13),
+        ),
+    ] {
+        let actual = refusal_message!(
+            case,
+            omni.update_dashboard(&UpdateOmniDashboardInput {
+                space_id: space_id.clone(),
+                dashboard_id: dashboard.dashboard_id.clone(),
+                body: Some(body.clone()),
+                // A name and a description ride along, so the refusal is shown to roll
+                // the WHOLE patch back rather than only the member it refused.
+                name: Some("renamed".to_string()),
+                description: Some("second".to_string()),
+            })
+            .await,
+            UpdateOmniDashboardErrorModeled::ValidationException,
+            "ValidationException",
+            400
+        );
+        assert_eq!(
+            actual, expected,
+            "case {case:?}: expected the message {expected:?}, got {actual:?}"
+        );
+        // Nothing of the refused patch reached the store the reader answers from: the
+        // dashboard still carries the body, the name and the description it had, and its
+        // `updatedAt` has not moved.
+        let stored = omni
+            .stored_dashboard(case, &space_id, &dashboard.dashboard_id)
+            .await;
+        assert_eq!(
+            (
+                stored.body.as_str(),
+                stored.name.as_str(),
+                stored.description.as_deref(),
+                millis(stored.updated_at),
+            ),
+            (
+                PANELS_BODY,
+                "dashboard",
+                Some("kept"),
+                millis(dashboard.updated_at),
+            ),
+            "case {case:?}: the refused patch changed the dashboard: {stored:?}"
+        );
+        assert_eq!(
+            untouched_dashboard(&stored),
+            before,
+            "case {case:?}: the refused patch changed a member the input cannot name"
+        );
+    }
+
+    // The refusals left the dashboard patchable: a body that IS a dashboard definition is
+    // persisted and read back through the reader that answers from the same store.
+    let patched = omni
+        .update_dashboard(&UpdateOmniDashboardInput {
+            space_id: space_id.clone(),
+            dashboard_id: dashboard.dashboard_id.clone(),
+            body: Some(ONE_PANEL_BODY.to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap_or_else(|error| panic!("the conforming patch was refused: {error:?}"));
+    let stored = omni
+        .stored_dashboard("parse", &space_id, &dashboard.dashboard_id)
+        .await;
+    assert_eq!(
+        (
+            patched.body.as_str(),
+            stored.body.as_str(),
+            stored.name.as_str(),
+            stored.description.as_deref(),
+        ),
+        (ONE_PANEL_BODY, ONE_PANEL_BODY, "dashboard", Some("kept")),
+        "expected the conforming body to persist, got {patched:?} and {stored:?}"
+    );
+}
