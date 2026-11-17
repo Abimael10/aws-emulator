@@ -19,6 +19,10 @@
 //! transform differs — each expression-based transform of the XML signature vocabulary. The
 //! recorded cases (a tampered `SignatureValue`, asserted twice for determinism, and the
 //! XPath 1.0 variant) are rows of the table.
+//!
+//! Every row is written from ONE reading of the clock, the anchor its offsets count from, so
+//! what a row says — and therefore the bytes its reference digests — is a function of the row
+//! alone and not of which second of the host clock each of its timestamps was formatted in.
 
 use super::saml_federation::{
     audience_condition, create_saml_provider, create_saml_role, emulator_with_iam, exchange,
@@ -28,7 +32,7 @@ use super::saml_federation::{
 use super::saml_relayed_refusal::{
     relayed_request_id, INVALID_RESPONSE_EXCEPTION, MANIFEST_NOT_FOUND_EXCEPTION,
 };
-use super::sts_sessions::{element, emulator_account, member};
+use super::sts_sessions::{element, emulator_account, member, now_secs};
 
 /// The transforms that select what a reference covers by an expression of their own, as W3C
 /// "XML Signature Syntax and Processing" §6.6 registers them (XSLT, XPath and base64) and
@@ -162,9 +166,15 @@ async fn a_signature_that_does_not_cover_the_response_is_refused_with_the_bare_s
     let role_arn =
         create_saml_role(&router, "signature-role", &provider_arn, audience_condition()).await;
 
-    let valid = || Response::valid(&provider, &role_arn, &provider_arn);
+    // One reading of the clock, which every row below counts its offsets from: the baseline
+    // and the rows that must digest the very same bytes as it are then written from one
+    // anchor, however long the host takes between them.
+    let anchor = now_secs();
+    let valid = || Response {
+        anchor,
+        ..Response::valid(&provider, &role_arn, &provider_arn)
+    };
     let signed = |row: Response| saml_assertion(&provider, &row);
-
     // The baseline the service ACCEPTS, so each row below differs from a federated exchange in
     // exactly what it alters.
     let baseline = signed(valid());
@@ -198,7 +208,13 @@ async fn a_signature_that_does_not_cover_the_response_is_refused_with_the_bare_s
             "a response carrying another registered provider's signature",
             with_signature_value(&baseline, |_| {
                 signature_element(
-                    &saml_assertion(&other, &Response::valid(&other, &role_arn, &provider_arn)),
+                    &saml_assertion(
+                        &other,
+                        &Response {
+                            anchor,
+                            ..Response::valid(&other, &role_arn, &provider_arn)
+                        },
+                    ),
                     "SignatureValue",
                 )
             }),
@@ -333,5 +349,115 @@ async fn only_the_classes_a_relayed_reading_refused_carry_the_envelope() {
     for (case, principal, presented, expected) in rows {
         let (status, body) = exchange(&router, &role_arn, &principal, &presented).await;
         assert_refusal(case, status, &body, &expected);
+    }
+}
+
+/// An instant written as a SAML `xs:dateTime`, which is the `DateTime` format of the model's
+/// own timestamps.
+fn at(secs: i64) -> String {
+    aws_smithy_types::DateTime::from_secs(secs)
+        .fmt(aws_smithy_types::date_time::Format::DateTime)
+        .expect("an ISO-8601 instant")
+}
+
+/// The attribute value of the FIRST `NAME="…"` of the presented response.
+fn attribute(presented: &str, name: &str) -> String {
+    let document = decoded(presented);
+    let open = format!("{name}=\"");
+    let start = document
+        .find(&open)
+        .unwrap_or_else(|| panic!("the presented response carries no {open} in {document}"))
+        + open.len();
+    let end = document[start..]
+        .find('"')
+        .unwrap_or_else(|| panic!("the {open} of the presented response is not closed"))
+        + start;
+    document[start..end].to_string()
+}
+
+/// What a row states is fixed by the row's own anchor, not by the clock at the moment each of
+/// its timestamps happens to be written: a row anchored at an instant states exactly the
+/// instants that anchor fixes, two rows sharing one anchor digest the very same bytes whatever
+/// the host does between writing them, and the pair is served and refused as the rule says —
+/// so the table above compares a variant's reference digest against the accepted baseline's
+/// without the host's speed entering into it.
+#[tokio::test]
+async fn an_anchored_row_states_the_instants_its_anchor_fixes() {
+    let (router, _engine) = emulator_with_iam();
+    let provider = IdentityProvider::mint("https://idp.example.test/saml");
+    let provider_arn = create_saml_provider(&router, "anchored-idp", &provider).await;
+    let role_arn =
+        create_saml_role(&router, "anchored-role", &provider_arn, audience_condition()).await;
+    let clock = now_secs();
+    // The window each row below states, counted from its own anchor.
+    const ISSUED: i64 = -45;
+    const CLOSES: i64 = 300;
+
+    // The rows differ along where the anchor sits relative to the clock: well behind it, just
+    // behind it, on it, and ahead of it — each one a response the rule serves.
+    for shift in [-120_i64, -1, 0, 30] {
+        let case = format!("a row anchored {shift}s from the clock");
+        let anchor = clock + shift;
+        let row = |transforms: Vec<&'static str>| Response {
+            anchor,
+            issued_at_offset: ISSUED,
+            not_before_offset: ISSUED,
+            not_on_or_after_offset: Some(CLOSES),
+            transforms,
+            ..Response::valid(&provider, &role_arn, &provider_arn)
+        };
+
+        let accepted = saml_assertion(&provider, &row(vec![ENVELOPED_SIGNATURE, EXCLUSIVE_C14N]));
+        for (member_name, expected) in [
+            ("IssueInstant", at(anchor + ISSUED)),
+            ("NotBefore", at(anchor + ISSUED)),
+            ("NotOnOrAfter", at(anchor + CLOSES)),
+        ] {
+            let stated = attribute(&accepted, member_name);
+            assert_eq!(
+                stated, expected,
+                "case {case:?}: expected {member_name} {expected:?} as the anchor fixes it, \
+                 got {stated:?}"
+            );
+        }
+
+        // The same row written again, and the row that differs from it in nothing but the
+        // transform its reference declares: both cover the very same bytes.
+        let again = saml_assertion(&provider, &row(vec![ENVELOPED_SIGNATURE, EXCLUSIVE_C14N]));
+        let variant = saml_assertion(
+            &provider,
+            &row(vec![ENVELOPED_SIGNATURE, EXCLUSIVE_C14N, XPATH_TRANSFORM]),
+        );
+        let digest = signature_element(&accepted, "DigestValue");
+        for (written, what) in [(&again, "written again"), (&variant, "the transform variant")] {
+            let covered = signature_element(written, "DigestValue");
+            assert_eq!(
+                covered, digest,
+                "case {case:?}: {what} must digest the same bytes as the row it varies from, \
+                 expected {digest:?}, got {covered:?}"
+            );
+        }
+
+        let (status, body) = exchange(&router, &role_arn, &provider_arn, &accepted).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the anchored response to be served, got {status} {body}"
+        );
+        assert!(
+            element(&body, "AccessKeyId").is_some(),
+            "case {case:?}: expected a vended credential, got {body}"
+        );
+        let (status, body) = exchange(&router, &role_arn, &provider_arn, &variant).await;
+        assert_refusal(
+            &case,
+            status,
+            &body,
+            &Expected {
+                status: 400,
+                code: "InvalidIdentityToken",
+                sentence: SIGNATURE_INVALID_MESSAGE,
+                relayed: None,
+            },
+        );
     }
 }

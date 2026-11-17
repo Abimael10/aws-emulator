@@ -27,7 +27,6 @@
 //! positive control — are rows of the table.
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -36,7 +35,8 @@ use service_com_amazonaws_iam_awsidentitymanagementv20100508 as iam;
 use service_com_amazonaws_sts_awssecuritytokenservicev20110615 as sts;
 
 use super::sts_sessions::{
-    element, emulator_account, member, query, LONG_TERM_KEY, STS_API_VERSION, STS_SIGNING_NAME,
+    element, emulator_account, member, now_secs, query, LONG_TERM_KEY, STS_API_VERSION,
+    STS_SIGNING_NAME,
 };
 use super::saml_relayed_refusal::{
     relayed_request_id, INVALID_RESPONSE_EXCEPTION, MANIFEST_NOT_FOUND_EXCEPTION,
@@ -219,17 +219,23 @@ impl IdentityProvider {
 /// The parts of an authentication response a row varies. Everything not named here is the
 /// same in every row, so each row differs from the positive control in exactly what it sets.
 pub(crate) struct Response {
-    /// Seconds from now the response was issued at.
+    /// The Unix second every offset below is counted from, read off the clock ONCE when the
+    /// row is written. A document's timestamps are therefore a function of the row alone and
+    /// not of which second of the host clock each of them happened to be formatted in: two
+    /// rows written from one anchor state the very same instants, whatever the host does
+    /// between them.
+    pub(crate) anchor: i64,
+    /// Seconds from the anchor the response was issued at.
     pub(crate) issued_at_offset: i64,
-    /// Seconds from now the validity window opens and closes.
+    /// Seconds from the anchor the validity window opens and closes.
     pub(crate) not_before_offset: i64,
     /// `None` states no `NotOnOrAfter` at all.
     pub(crate) not_on_or_after_offset: Option<i64>,
     /// The instant the ASSERTION's own conditions close at, when the row states a different
     /// one from the window its subject confirmation states.
     pub(crate) conditions_not_on_or_after_offset: Option<i64>,
-    /// Seconds from now the authentication statement bounds the SESSION at, when it bounds
-    /// it at all.
+    /// Seconds from the anchor the authentication statement bounds the SESSION at, when it
+    /// bounds it at all.
     pub(crate) session_not_on_or_after_offset: Option<i64>,
     pub(crate) status: &'static str,
     pub(crate) issuer: String,
@@ -252,6 +258,7 @@ impl Response {
     /// successful, from the provider, naming the session and the role pair asked for.
     pub(crate) fn valid(provider: &IdentityProvider, role_arn: &str, provider_arn: &str) -> Self {
         Self {
+            anchor: now_secs(),
             issued_at_offset: -30,
             not_before_offset: -30,
             not_on_or_after_offset: Some(600),
@@ -269,16 +276,11 @@ impl Response {
     }
 }
 
-/// An `xs:dateTime` `offset` seconds from now, as a SAML timestamp is written.
-fn instant(offset: i64) -> String {
-    let now = i64::try_from(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("the clock is after the Unix epoch")
-            .as_secs(),
-    )
-    .expect("the current time fits in an i64");
-    aws_smithy_types::DateTime::from_secs(now + offset)
+/// An `xs:dateTime` `offset` seconds from `anchor`, as a SAML timestamp is written. Pure in
+/// its arguments: it reads no clock of its own, so a row's instants do not move while it is
+/// being written.
+fn instant(anchor: i64, offset: i64) -> String {
+    aws_smithy_types::DateTime::from_secs(anchor + offset)
         .fmt(aws_smithy_types::date_time::Format::DateTime)
         .expect("an ISO-8601 instant")
 }
@@ -310,10 +312,13 @@ pub(crate) fn saml_assertion(provider: &IdentityProvider, row: &Response) -> Str
     let window = match row.not_on_or_after_offset {
         Some(offset) => format!(
             " NotBefore=\"{}\" NotOnOrAfter=\"{}\"",
-            instant(row.not_before_offset),
-            instant(offset)
+            instant(row.anchor, row.not_before_offset),
+            instant(row.anchor, offset)
         ),
-        None => format!(" NotBefore=\"{}\"", instant(row.not_before_offset)),
+        None => format!(
+            " NotBefore=\"{}\"",
+            instant(row.anchor, row.not_before_offset)
+        ),
     };
     let conditions_window = match row
         .conditions_not_on_or_after_offset
@@ -321,13 +326,16 @@ pub(crate) fn saml_assertion(provider: &IdentityProvider, row: &Response) -> Str
     {
         Some(offset) => format!(
             " NotBefore=\"{}\" NotOnOrAfter=\"{}\"",
-            instant(row.not_before_offset),
-            instant(offset)
+            instant(row.anchor, row.not_before_offset),
+            instant(row.anchor, offset)
         ),
-        None => format!(" NotBefore=\"{}\"", instant(row.not_before_offset)),
+        None => format!(
+            " NotBefore=\"{}\"",
+            instant(row.anchor, row.not_before_offset)
+        ),
     };
     let session_bound = match row.session_not_on_or_after_offset {
-        Some(offset) => format!(" SessionNotOnOrAfter=\"{}\"", instant(offset)),
+        Some(offset) => format!(" SessionNotOnOrAfter=\"{}\"", instant(row.anchor, offset)),
         None => String::new(),
     };
     // The assertion, split where its signature belongs: a SAML signature follows the
@@ -337,7 +345,7 @@ pub(crate) fn saml_assertion(provider: &IdentityProvider, row: &Response) -> Str
         "<saml:Assertion xmlns:saml=\"{ASSERTION_NAMESPACE}\" ID=\"{assertion_id}\" \
          IssueInstant=\"{issued}\" Version=\"2.0\">\
          <saml:Issuer>{issuer}</saml:Issuer>",
-        issued = instant(row.issued_at_offset),
+        issued = instant(row.anchor, row.issued_at_offset),
         issuer = row.issuer,
     );
     let tail = format!(
@@ -357,7 +365,7 @@ pub(crate) fn saml_assertion(provider: &IdentityProvider, row: &Response) -> Str
          <saml:AttributeStatement>{attributes}</saml:AttributeStatement>\
          </saml:Assertion>",
         name_id = row.name_id,
-        issued = instant(row.issued_at_offset),
+        issued = instant(row.anchor, row.issued_at_offset),
     );
 
     let assertion = if row.signed {
@@ -405,7 +413,7 @@ pub(crate) fn saml_assertion(provider: &IdentityProvider, row: &Response) -> Str
          <saml:Issuer>{issuer}</saml:Issuer>\
          <samlp:Status><samlp:StatusCode Value=\"{status}\"></samlp:StatusCode></samlp:Status>\
          {assertion}</samlp:Response>",
-        issued = instant(row.issued_at_offset),
+        issued = instant(row.anchor, row.issued_at_offset),
         issuer = row.issuer,
         status = row.status,
     );
