@@ -53,11 +53,23 @@
 //! ([`super::destination_encryption`]). It is asked BEFORE the test notification is published,
 //! so a destination this refuses is sent nothing at all.
 //!
+//! The grant that install-time question reads is asked AGAIN of every publication
+//! ([`delivery_admitted`]), because the two happen at different times: a publication is a
+//! call Amazon S3 makes on the destination (`sqs:SendMessage`, `sns:Publish`,
+//! `lambda:InvokeFunction`) as its own service principal acting for the publishing bucket,
+//! so it happens only while the destination's own policy allows that call for that bucket. A
+//! statement withdrawn, pointed at another action, or narrowed to another bucket after the
+//! configuration was recorded therefore stops the deliveries from then on, while leaving the
+//! recorded configuration exactly as `GetBucketNotificationConfiguration` reports it —
+//! which is what lets a client tell a destination that is not permitted apart from a chain
+//! that delivers nothing at all.
+//!
 //! Delivery is BEST EFFORT and never changes what the operation answers: S3 publishes a
 //! notification asynchronously, after the write that produced it was accepted, so a write
 //! into a bucket whose destination service is not mounted on this engine still succeeds.
 //! A delivery that could not be made is logged, because a deployment where a configured
-//! destination cannot be reached is worth seeing.
+//! destination cannot be reached is worth seeing — and a destination whose owning service
+//! could not be ASKED about the grant at all is published to, since nothing judged it.
 //!
 //! Nothing here opens a socket or leaves the host: every destination is reached through
 //! the in-process callback ([`smithy_server_runtime::OperationContext::callback`]), the
@@ -441,6 +453,10 @@ enum Delivery {
     Queue {
         region: String,
         url: String,
+        /// The ARN the configuration named the queue by, which is the resource its own
+        /// access policy's statements name — so the grant that decides this delivery is
+        /// judged against it when Amazon SQS reports no ARN of its own.
+        arn: String,
         body: String,
     },
     /// A `Publish` to the topic the configuration named.
@@ -463,19 +479,26 @@ enum Delivery {
 /// Empty — and so free — for a bucket with no event notifications configured, which is
 /// the state every bucket is created in.
 #[derive(Debug, Clone, Default)]
-pub struct Pending(Vec<Delivery>);
+pub struct Pending {
+    /// The bucket whose configuration owes these deliveries. It travels with them because
+    /// it is the PUBLISHING resource each destination's own grant is decided for
+    /// ([`destination_granted`]), which is asked again when the delivery is made.
+    bucket: String,
+    /// What to deliver, in the order the events and the configuration produced them.
+    deliveries: Vec<Delivery>,
+}
 
 impl Pending {
     /// Whether there is nothing to deliver.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.deliveries.is_empty()
     }
 
     /// How many deliveries are owed.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.deliveries.len()
     }
 }
 
@@ -561,6 +584,7 @@ pub fn pending(
                     Some(url) => Delivery::Queue {
                         region: region.to_string(),
                         url,
+                        arn: target.arn.clone(),
                         body,
                     },
                     None => continue,
@@ -586,7 +610,10 @@ pub fn pending(
              delivers; the rest are dropped"
         );
     }
-    Pending(deliveries)
+    Pending {
+        bucket: bucket.to_string(),
+        deliveries,
+    }
 }
 
 /// The Region a destination ARN names, or `None` when the value is not an ARN with one.
@@ -804,8 +831,10 @@ impl Drop for DeliveryPermit {
 /// depends on it.
 ///
 /// What bounds the task: it carries at most [`MAX_DELIVERIES_PER_REQUEST`] deliveries,
-/// at most [`MAX_IN_FLIGHT_DELIVERY_TASKS`] of them run at once, each delivery is one
-/// await with no retry loop behind it, and the whole fan-out is abandoned after
+/// at most [`MAX_IN_FLIGHT_DELIVERY_TASKS`] of them run at once, each delivery is a fixed
+/// handful of awaits with no retry loop behind it — the grant is asked of each DISTINCT
+/// destination once ([`delivery_admitted`]), so the reads are bounded by the destination
+/// count and not by the event count — and the whole fan-out is abandoned after
 /// [`DELIVERY_DEADLINE`] — so one request's deliveries cannot outlive that deadline, hold
 /// their permit past it, or keep the runtime from shutting down.
 pub fn publish(ctx: &smithy_server_runtime::OperationContext<'_>, pending: Pending) {
@@ -855,12 +884,32 @@ pub fn publish(ctx: &smithy_server_runtime::OperationContext<'_>, pending: Pendi
 /// Every one is BEST EFFORT: a failure is logged and nothing is retried, because the
 /// operation that produced the event has already been accepted and S3 answers it whether
 /// or not a consumer is reachable.
+///
+/// And every one is AUTHORIZED FIRST, against the destination's OWN resource policy: the
+/// publication is a call Amazon S3 makes as its own service principal acting for the
+/// publishing bucket, so a destination whose policy no longer grants that call is published
+/// nothing — the same question [`unvalidated_destinations`] asks when the configuration is
+/// installed, asked again here because a grant can be withdrawn after it was recorded (the
+/// recorded configuration is untouched by that, and so is what a read of the bucket
+/// reports). A destination whose owning service could not be ASKED at all is published to:
+/// nothing judged the grant, which is the same best-effort outcome as a destination that
+/// cannot be reached.
 pub async fn deliver(callback: &::smithy_server_runtime::EmbeddedEmulator, pending: Pending) {
     if pending.is_empty() {
         return;
     }
     let mut clients = Clients::default();
-    for delivery in pending.0 {
+    // What each DESTINATION answered about the grant, so a fan-out carrying many events to
+    // one destination asks its service once: the deliveries of one request are made at one
+    // instant, so the answer cannot differ between them, and this bounds the reads by the
+    // number of distinct destinations rather than by the number of events.
+    let mut admitted: Vec<(&'static str, String, bool)> = Vec::new();
+    for delivery in pending.deliveries {
+        if !delivery_admitted(&mut clients, callback, &pending.bucket, &delivery, &mut admitted)
+            .await
+        {
+            continue;
+        }
         match delivery {
             Delivery::EventBridge {
                 region,
@@ -893,7 +942,12 @@ pub async fn deliver(callback: &::smithy_server_runtime::EmbeddedEmulator, pendi
                     }
                 }
             }
-            Delivery::Queue { region, url, body } => {
+            Delivery::Queue {
+                region,
+                url,
+                arn: _,
+                body,
+            } => {
                 let answer = clients
                     .sqs(callback, &region)
                     .send_message()
@@ -902,7 +956,7 @@ pub async fn deliver(callback: &::smithy_server_runtime::EmbeddedEmulator, pendi
                     .send()
                     .await;
                 if let Err(error) = answer {
-                    report(DELIVERY_NOT_MADE, "an Amazon SQS queue", &url, &error);
+                    report(DELIVERY_NOT_MADE, QUEUE_DESTINATION, &url, &error);
                 }
             }
             Delivery::Topic { region, arn, body } => {
@@ -914,7 +968,7 @@ pub async fn deliver(callback: &::smithy_server_runtime::EmbeddedEmulator, pendi
                     .send()
                     .await;
                 if let Err(error) = answer {
-                    report(DELIVERY_NOT_MADE, "an Amazon SNS topic", &arn, &error);
+                    report(DELIVERY_NOT_MADE, TOPIC_DESTINATION, &arn, &error);
                 }
             }
             Delivery::Function {
@@ -935,12 +989,146 @@ pub async fn deliver(callback: &::smithy_server_runtime::EmbeddedEmulator, pendi
                     .send()
                     .await;
                 if let Err(error) = answer {
-                    report(DELIVERY_NOT_MADE, "a Lambda function", &arn, &error);
+                    report(DELIVERY_NOT_MADE, FUNCTION_DESTINATION, &arn, &error);
                 }
             }
         }
     }
 }
+
+/// Whether the destination `delivery` is addressed to still admits a notification of
+/// `bucket` — asked of the service that OWNS that destination, and remembered in `admitted`
+/// so one fan-out asks each destination once.
+///
+/// The publication is a call: Amazon S3 performs `sqs:SendMessage`, `sns:Publish` or
+/// `lambda:InvokeFunction` as its own service principal, acting for the publishing bucket,
+/// and every one of those is decided by the destination's own resource policy
+/// ([`destination_granted`]) — the identical question [`unvalidated_destinations`] asks
+/// before the configuration is recorded. It is asked AGAIN here because the two happen at
+/// different times: a policy statement withdrawn (or narrowed to another bucket) after the
+/// configuration was accepted takes the grant away without touching the configuration, and
+/// from then on the destination receives nothing while a read of the bucket still reports
+/// the configuration exactly as it was recorded.
+///
+/// `true` wherever nothing JUDGED the grant — the owning service was not reached at all
+/// ([`refused_by_its_service`]) — because the delivery is best effort and an emulator that
+/// does not mount the destination's service cannot answer for its policy. `false` where
+/// that service answered: either the grant is absent from the document, or the destination
+/// itself is no longer there to publish to.
+///
+/// An EventBridge delivery is admitted: an event bus takes the events of the Amazon Web
+/// Services services themselves without a resource policy naming them, so there is no
+/// destination document to ask.
+async fn delivery_admitted(
+    clients: &mut Clients,
+    callback: &::smithy_server_runtime::EmbeddedEmulator,
+    bucket: &str,
+    delivery: &Delivery,
+    admitted: &mut Vec<(&'static str, String, bool)>,
+) -> bool {
+    // WHAT this delivery is addressed to: the pair the verdict is remembered under, and the
+    // one a withheld publication is logged by.
+    let (kind, named) = match delivery {
+        // An event bus takes the events of the Amazon Web Services services themselves with
+        // no resource policy naming them, so there is no destination document to ask.
+        Delivery::EventBridge { .. } => return true,
+        Delivery::Queue { url, .. } => (QUEUE_DESTINATION, url.as_str()),
+        Delivery::Topic { arn, .. } => (TOPIC_DESTINATION, arn.as_str()),
+        Delivery::Function { arn, .. } => (FUNCTION_DESTINATION, arn.as_str()),
+    };
+    // Searched rather than hashed: one fan-out addresses at most
+    // [`super::MAX_NOTIFICATION_CONFIGURATIONS_PER_BUCKET`] destinations, so the walk is
+    // shorter than a key would be to build, and the address is copied only when a verdict
+    // is first recorded.
+    if let Some((.., remembered)) = admitted
+        .iter()
+        .find(|(held, address, _)| *held == kind && address == named)
+    {
+        return *remembered;
+    }
+    let answer = destination_admits(clients, callback, bucket, delivery).await;
+    if !answer {
+        ::tracing::warn!(
+            destination = kind,
+            named,
+            "{DELIVERY_NOT_ADMITTED}"
+        );
+    }
+    admitted.push((kind, named.to_string(), answer));
+    answer
+}
+
+/// How each destination kind is named in a log line and in [`delivery_admitted`]'s memo.
+///
+/// ONE spelling each, shared by every sentence this module logs about a destination, so the
+/// install, the publication and a failed delivery name the same thing identically.
+const QUEUE_DESTINATION: &str = "an Amazon SQS queue";
+/// See [`QUEUE_DESTINATION`].
+const TOPIC_DESTINATION: &str = "an Amazon SNS topic";
+/// See [`QUEUE_DESTINATION`].
+const FUNCTION_DESTINATION: &str = "a Lambda function";
+
+/// Ask the service that OWNS this delivery's destination whether its resource policy admits
+/// the publication — the one question, per destination kind, that [`delivery_admitted`]
+/// remembers the answer to.
+///
+/// Each arm is BOXED for the reason the install-time resolution gives: the question is
+/// another service's whole handler, reached through the in-process callback, and this runs on
+/// the delivery task of a request that may itself be several handlers down.
+async fn destination_admits(
+    clients: &mut Clients,
+    callback: &::smithy_server_runtime::EmbeddedEmulator,
+    bucket: &str,
+    delivery: &Delivery,
+) -> bool {
+    match delivery {
+        // Admitted by [`delivery_admitted`] before this is reached, for the reason stated
+        // there; answered the same way here so the two cannot disagree.
+        Delivery::EventBridge { .. } => true,
+        Delivery::Queue {
+            region, url, arn, ..
+        } => match Box::pin(asked_queue_attributes(clients, callback, region, url)).await {
+            Asked::Answered(QueueAttributes {
+                document,
+                queue_arn,
+                ..
+            }) => {
+                // The grant is judged against the ARN Amazon SQS itself resolved the queue
+                // to, falling back to the one the configuration named.
+                let resource = if queue_arn.is_empty() { arn } else { &queue_arn };
+                destination_granted(&document, SEND_MESSAGE_ACTION, resource, bucket)
+            }
+            Asked::Refused(_) => false,
+            Asked::Unjudged => true,
+        },
+        Delivery::Topic { region, arn, .. } => {
+            match Box::pin(asked_topic_attributes(clients, callback, region, arn)).await {
+                Asked::Answered(TopicAttributes { document, .. }) => {
+                    destination_granted(&document, PUBLISH_ACTION, arn, bucket)
+                }
+                Asked::Refused(_) => false,
+                Asked::Unjudged => true,
+            }
+        }
+        Delivery::Function { region, arn, .. } => {
+            match Box::pin(asked_function_policy(clients, callback, region, arn)).await {
+                Asked::Answered(FunctionPolicy {
+                    document,
+                    function_arn,
+                }) => destination_granted(&document, INVOKE_FUNCTION_ACTION, &function_arn, bucket),
+                Asked::Refused(_) => false,
+                Asked::Unjudged => true,
+            }
+        }
+    }
+}
+
+/// The sentence logged for a notification the destination's own resource policy does not
+/// admit: the publication is the call that policy decides, so it is not made at all — and
+/// the configuration naming the destination is left exactly as it was recorded.
+const DELIVERY_NOT_ADMITTED: &str = "this notification destination's own resource policy does \
+                                     not let Amazon S3 publish this bucket's notifications to \
+                                     it, so no object event is published to it";
 
 /// The sentence [`report`] logs for a notification that did not reach its destination:
 /// delivery is best effort, so the operation that produced the event was already answered.
@@ -1144,6 +1332,181 @@ const SEND_MESSAGE_ACTION: &str = "sqs:SendMessage";
 /// See [`SEND_MESSAGE_ACTION`].
 const PUBLISH_ACTION: &str = "sns:Publish";
 
+/// What the service that OWNS a destination answered when it was asked for the document
+/// that decides whether Amazon S3 may publish this bucket's notifications to it.
+///
+/// The one reading shared by the two times that question is asked — before the
+/// configuration is recorded ([`unvalidated_destinations`]) and again when a delivery is
+/// made ([`delivery_admitted`]) — so the install and the publication cannot read one
+/// destination's own service differently.
+enum Asked<T> {
+    /// The document, with whatever else the same read reports about the destination.
+    Answered(T),
+    /// The destination's own service REFUSED the read, which is the rejection that answer
+    /// amounts to: there is no such destination to publish to, or it holds no policy at all.
+    Refused(DestinationRejection),
+    /// Nothing judged it: this emulator could not reach the owning service at all
+    /// ([`refused_by_its_service`]), which is logged and treated as no verdict.
+    Unjudged,
+}
+
+/// What `GetQueueAttributes` reports about a QUEUE destination.
+struct QueueAttributes {
+    /// Its access policy: "the queue's policy. A valid Amazon Web Services policy"
+    /// (`GetQueueAttributes`), the document the grant lives in.
+    document: String,
+    /// `QueueArn`, the ARN that policy's statements name — so the grant is judged against
+    /// the ARN Amazon SQS itself resolved the queue to. Empty when it reports none.
+    queue_arn: String,
+    /// `KmsMasterKeyId` — "the ID of an Amazon Web Services managed customer master key
+    /// (CMK) for Amazon SQS or a custom CMK" (same operation): the key every message
+    /// written to the queue is encrypted under, which is the second authority over the
+    /// publication.
+    master_key_id: String,
+}
+
+/// Ask Amazon SQS what it holds about the queue `url` addresses.
+async fn asked_queue_attributes(
+    clients: &mut Clients,
+    callback: &::smithy_server_runtime::EmbeddedEmulator,
+    region: &str,
+    url: &str,
+) -> Asked<QueueAttributes> {
+    let answer = clients
+        .sqs(callback, region)
+        .get_queue_attributes()
+        .queue_url(url)
+        .attribute_names(::aws_sdk_sqs::types::QueueAttributeName::Policy)
+        .attribute_names(::aws_sdk_sqs::types::QueueAttributeName::QueueArn)
+        .attribute_names(::aws_sdk_sqs::types::QueueAttributeName::KmsMasterKeyId)
+        .send()
+        .await;
+    let attributes = match answer {
+        Ok(answered) => answered,
+        Err(error) => {
+            if refused_by_its_service(&error) {
+                return Asked::Refused(DestinationRejection::Absent);
+            }
+            unverifiable(QUEUE_DESTINATION, url, &error);
+            return Asked::Unjudged;
+        }
+    };
+    let attribute = |name: &::aws_sdk_sqs::types::QueueAttributeName| {
+        attributes
+            .attributes()
+            .and_then(|held| held.get(name))
+            .cloned()
+            .unwrap_or_default()
+    };
+    Asked::Answered(QueueAttributes {
+        document: attribute(&::aws_sdk_sqs::types::QueueAttributeName::Policy),
+        queue_arn: attribute(&::aws_sdk_sqs::types::QueueAttributeName::QueueArn),
+        master_key_id: attribute(&::aws_sdk_sqs::types::QueueAttributeName::KmsMasterKeyId),
+    })
+}
+
+/// What `GetTopicAttributes` reports about a TOPIC destination.
+struct TopicAttributes {
+    /// Its access policy: "the JSON serialization of the topic's access control policy"
+    /// (`GetTopicAttributes`), the document the grant lives in.
+    document: String,
+    /// The customer master key its messages are encrypted under, the sibling of a queue's
+    /// own ([`QueueAttributes::master_key_id`]).
+    master_key_id: String,
+}
+
+/// Ask Amazon SNS what it holds about the topic `arn` names.
+async fn asked_topic_attributes(
+    clients: &mut Clients,
+    callback: &::smithy_server_runtime::EmbeddedEmulator,
+    region: &str,
+    arn: &str,
+) -> Asked<TopicAttributes> {
+    let answer = clients
+        .sns(callback, region)
+        .get_topic_attributes()
+        .topic_arn(arn)
+        .send()
+        .await;
+    let attributes = match answer {
+        Ok(answered) => answered.attributes().cloned().unwrap_or_default(),
+        Err(error) => {
+            if refused_by_its_service(&error) {
+                return Asked::Refused(DestinationRejection::Absent);
+            }
+            unverifiable(TOPIC_DESTINATION, arn, &error);
+            return Asked::Unjudged;
+        }
+    };
+    Asked::Answered(TopicAttributes {
+        document: attributes
+            .get(TOPIC_POLICY_ATTRIBUTE)
+            .cloned()
+            .unwrap_or_default(),
+        master_key_id: attributes
+            .get(TOPIC_MASTER_KEY_ATTRIBUTE)
+            .cloned()
+            .unwrap_or_default(),
+    })
+}
+
+/// What Lambda reports about a FUNCTION destination's own resource-based policy.
+struct FunctionPolicy {
+    /// The policy document, which is where the invoke grant lives.
+    document: String,
+    /// The ARN LAMBDA resolved the destination to, so a destination written in any of the
+    /// forms `FunctionName` admits is judged against the ARN its statements name.
+    function_arn: String,
+}
+
+/// Ask Lambda for the resource-based policy of the function `arn` names.
+///
+/// A function carrying no policy at all answers `GetPolicy` with its own refusal, which
+/// grants nothing — so that answer IS the unpermitted verdict rather than an absent
+/// destination.
+async fn asked_function_policy(
+    clients: &mut Clients,
+    callback: &::smithy_server_runtime::EmbeddedEmulator,
+    region: &str,
+    arn: &str,
+) -> Asked<FunctionPolicy> {
+    let answer = clients
+        .lambda(callback, region)
+        .get_function_configuration()
+        .function_name(arn)
+        .send()
+        .await;
+    let function_arn = match answer {
+        Ok(configuration) => configuration.function_arn.unwrap_or_else(|| arn.to_string()),
+        Err(error) => {
+            if refused_by_its_service(&error) {
+                return Asked::Refused(DestinationRejection::Absent);
+            }
+            unverifiable(FUNCTION_DESTINATION, arn, &error);
+            return Asked::Unjudged;
+        }
+    };
+    let answer = clients
+        .lambda(callback, region)
+        .get_policy()
+        .function_name(&function_arn)
+        .send()
+        .await;
+    match answer {
+        Ok(policy) => Asked::Answered(FunctionPolicy {
+            document: policy.policy.unwrap_or_default(),
+            function_arn,
+        }),
+        Err(error) => {
+            if refused_by_its_service(&error) {
+                return Asked::Refused(DestinationRejection::Unpermitted);
+            }
+            unverifiable(FUNCTION_DESTINATION, arn, &error);
+            Asked::Unjudged
+        }
+    }
+}
+
 /// Why the queue `arn` names is not a destination this configuration may be recorded with,
 /// or `None` when it is one.
 ///
@@ -1167,41 +1530,15 @@ async fn queue_rejection<Eng: ::std::marker::Send + ::std::marker::Sync + 'stati
     let Some(url) = queue_url(arn) else {
         return Some(DestinationRejection::Absent);
     };
-    // The queue's `Policy` attribute is "the queue's policy. A valid Amazon Web Services
-    // policy" (`GetQueueAttributes`), and `QueueArn` is the ARN that policy's statements
-    // name — so the grant is judged against the ARN SQS itself resolved the queue to.
-    // `KmsMasterKeyId` is "the ID of an Amazon Web Services managed customer master key (CMK)
-    // for Amazon SQS or a custom CMK" (same operation): the key every message written to the
-    // queue is encrypted under, which is the second authority over the publication.
-    let answer = clients
-        .sqs(callback, region)
-        .get_queue_attributes()
-        .queue_url(&url)
-        .attribute_names(::aws_sdk_sqs::types::QueueAttributeName::Policy)
-        .attribute_names(::aws_sdk_sqs::types::QueueAttributeName::QueueArn)
-        .attribute_names(::aws_sdk_sqs::types::QueueAttributeName::KmsMasterKeyId)
-        .send()
-        .await;
-    let attributes = match answer {
-        Ok(answered) => answered,
-        Err(error) => {
-            if refused_by_its_service(&error) {
-                return Some(DestinationRejection::Absent);
-            }
-            unverifiable("an Amazon SQS queue", &url, &error);
-            return None;
-        }
+    let QueueAttributes {
+        document,
+        queue_arn: resolved,
+        master_key_id,
+    } = match asked_queue_attributes(clients, callback, region, &url).await {
+        Asked::Answered(attributes) => attributes,
+        Asked::Refused(rejection) => return Some(rejection),
+        Asked::Unjudged => return None,
     };
-    let attribute = |name: &::aws_sdk_sqs::types::QueueAttributeName| {
-        attributes
-            .attributes()
-            .and_then(|held| held.get(name))
-            .cloned()
-            .unwrap_or_default()
-    };
-    let resolved = attribute(&::aws_sdk_sqs::types::QueueAttributeName::QueueArn);
-    let document = attribute(&::aws_sdk_sqs::types::QueueAttributeName::Policy);
-    let master_key_id = attribute(&::aws_sdk_sqs::types::QueueAttributeName::KmsMasterKeyId);
     let queue_arn = if resolved.is_empty() { arn } else { &resolved };
     if !destination_granted(&document, SEND_MESSAGE_ACTION, queue_arn, bucket) {
         return Some(DestinationRejection::Unpermitted);
@@ -1213,7 +1550,7 @@ async fn queue_rejection<Eng: ::std::marker::Send + ::std::marker::Sync + 'stati
         super::NotificationDestination::Queue,
         bucket,
     ) {
-        withheld("an Amazon SQS queue", queue_arn, &reason);
+        withheld(QUEUE_DESTINATION, queue_arn, &reason);
         return Some(DestinationRejection::Unencryptable);
     }
     let answer = clients
@@ -1229,7 +1566,7 @@ async fn queue_rejection<Eng: ::std::marker::Send + ::std::marker::Sync + 'stati
             if refused_by_its_service(&error) {
                 return Some(DestinationRejection::Absent);
             }
-            unverifiable("an Amazon SQS queue", &url, &error);
+            unverifiable(QUEUE_DESTINATION, &url, &error);
             None
         }
     }
@@ -1253,33 +1590,17 @@ async fn topic_rejection<Eng: ::std::marker::Send + ::std::marker::Sync + 'stati
     bucket: &str,
     notification: &str,
 ) -> Option<DestinationRejection> {
-    let answer = clients
-        .sns(callback, region)
-        .get_topic_attributes()
-        .topic_arn(arn)
-        .send()
-        .await;
-    let attributes = match answer {
-        Ok(answered) => answered.attributes().cloned().unwrap_or_default(),
-        Err(error) => {
-            if refused_by_its_service(&error) {
-                return Some(DestinationRejection::Absent);
-            }
-            unverifiable("an Amazon SNS topic", arn, &error);
-            return None;
-        }
+    let TopicAttributes {
+        document,
+        master_key_id,
+    } = match asked_topic_attributes(clients, callback, region, arn).await {
+        Asked::Answered(attributes) => attributes,
+        Asked::Refused(rejection) => return Some(rejection),
+        Asked::Unjudged => return None,
     };
-    let document = attributes
-        .get(TOPIC_POLICY_ATTRIBUTE)
-        .cloned()
-        .unwrap_or_default();
     if !destination_granted(&document, PUBLISH_ACTION, arn, bucket) {
         return Some(DestinationRejection::Unpermitted);
     }
-    let master_key_id = attributes
-        .get(TOPIC_MASTER_KEY_ATTRIBUTE)
-        .cloned()
-        .unwrap_or_default();
     if let Some(reason) = unsealable(
         engine,
         region,
@@ -1287,7 +1608,7 @@ async fn topic_rejection<Eng: ::std::marker::Send + ::std::marker::Sync + 'stati
         super::NotificationDestination::Topic,
         bucket,
     ) {
-        withheld("an Amazon SNS topic", arn, &reason);
+        withheld(TOPIC_DESTINATION, arn, &reason);
         return Some(DestinationRejection::Unencryptable);
     }
     let answer = clients
@@ -1303,7 +1624,7 @@ async fn topic_rejection<Eng: ::std::marker::Send + ::std::marker::Sync + 'stati
             if refused_by_its_service(&error) {
                 return Some(DestinationRejection::Absent);
             }
-            unverifiable("an Amazon SNS topic", arn, &error);
+            unverifiable(TOPIC_DESTINATION, arn, &error);
             None
         }
     }
@@ -1341,46 +1662,15 @@ async fn function_rejection(
     arn: &str,
     bucket: &str,
 ) -> Option<DestinationRejection> {
-    let answer = clients
-        .lambda(callback, region)
-        .get_function_configuration()
-        .function_name(arn)
-        .send()
-        .await;
-    // The ARN the grant is evaluated on is the one LAMBDA resolved the destination to, so a
-    // destination written in any of the forms `FunctionName` admits is judged against the
-    // ARN its statements name.
-    let resolved = match answer {
-        Ok(configuration) => configuration
-            .function_arn
-            .unwrap_or_else(|| arn.to_string()),
-        Err(error) => {
-            if refused_by_its_service(&error) {
-                return Some(DestinationRejection::Absent);
-            }
-            unverifiable("a Lambda function", arn, &error);
-            return None;
-        }
+    let FunctionPolicy {
+        document,
+        function_arn,
+    } = match asked_function_policy(clients, callback, region, arn).await {
+        Asked::Answered(policy) => policy,
+        Asked::Refused(rejection) => return Some(rejection),
+        Asked::Unjudged => return None,
     };
-    let answer = clients
-        .lambda(callback, region)
-        .get_policy()
-        .function_name(&resolved)
-        .send()
-        .await;
-    let document = match answer {
-        Ok(policy) => policy.policy.unwrap_or_default(),
-        Err(error) => {
-            if refused_by_its_service(&error) {
-                // A function with no resource-based policy is reported as having none, which
-                // grants nothing.
-                return Some(DestinationRejection::Unpermitted);
-            }
-            unverifiable("a Lambda function", arn, &error);
-            return None;
-        }
-    };
-    if destination_granted(&document, INVOKE_FUNCTION_ACTION, &resolved, bucket) {
+    if destination_granted(&document, INVOKE_FUNCTION_ACTION, &function_arn, bucket) {
         return None;
     }
     Some(DestinationRejection::Unpermitted)
