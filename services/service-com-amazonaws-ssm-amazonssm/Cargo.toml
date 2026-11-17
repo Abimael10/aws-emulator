@@ -94,5 +94,10 @@ percent-encoding = "2"
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
+[dev-dependencies]
+# One module per `tests/all/<name>.rs`, so a new suite is a new file: this crate's tests
+# are the single `all` target rooted at `tests/all/main.rs`.
+automod = { workspace = true }
+
 [lints]
 workspace = true

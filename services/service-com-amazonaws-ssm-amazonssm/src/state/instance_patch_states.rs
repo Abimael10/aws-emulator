@@ -28,6 +28,13 @@
 //! ascending node-id order (the store's own order), narrowed by every filter the request
 //! carries ([`INSTANCE_PATCH_STATE_FILTER_KEYS`]) and served one page at a time
 //! ([`instance_patch_state_page_size`]).
+//!
+//! `DescribeInstancePatchStates` "retrieves the high-level patch state of one or more
+//! managed nodes" — the reports of the nodes the request NAMES
+//! ([`ComAmazonawsSsmAmazonssmState::instance_patch_states_of`]), in the same ascending
+//! node-id order and paged the same way, up to the page size that read serves
+//! ([`named_instance_patch_state_page_size`]). Both project the one store, so whichever
+//! read reaches a node's report reports the same report.
 
 use std::time::SystemTime;
 
@@ -180,6 +187,22 @@ pub fn instance_patch_state_page_size(max_results: Option<i32>) -> Result<usize,
         MAX_INSTANCE_PATCH_STATE_PAGE_SIZE,
     )?;
     Ok(requested.min(MAX_INSTANCE_PATCH_STATES_PER_PAGE))
+}
+
+/// The page size the read that NAMES the nodes it reports on serves — the same modelled
+/// `MaxResults` band, without the result-list cap [`instance_patch_state_page_size`] applies.
+///
+/// `DescribeInstancePatchStates` answers an `InstancePatchStateList`, which carries no length
+/// of its own, while the patch-group read answers an `InstancePatchStatesList` of 1..5: the
+/// result shape is what bounds a page beyond `MaxResults`, so a read whose result shape bounds
+/// nothing is bounded by `MaxResults` alone. A request naming none is served up to the modelled
+/// maximum, as a caller asking for no bound is everywhere in this service.
+pub fn named_instance_patch_state_page_size(max_results: Option<i32>) -> Result<usize, String> {
+    super::page_size(
+        max_results,
+        MIN_INSTANCE_PATCH_STATE_PAGE_SIZE,
+        MAX_INSTANCE_PATCH_STATE_PAGE_SIZE,
+    )
 }
 
 /// The patching operation that gathered a report: "SCAN assesses the patch compliance
@@ -426,6 +449,29 @@ impl ComAmazonawsSsmAmazonssmState {
         self.instance_patch_states
             .insert((region.to_string(), report.instance_id.clone()), report);
         true
+    }
+
+    /// The patch compliance reports `region` holds for the nodes `instance_ids` NAMES, in
+    /// ascending node-id order, each node reported at most once however many times it was
+    /// named.
+    ///
+    /// The store holds at most one report per node, so a node named twice has one report to
+    /// report; the ascending order is the store's own, which is what lets a page resume from
+    /// the node id it stopped at rather than from an offset. A named node no patching
+    /// operation has reported for contributes nothing: the read is about what was gathered
+    /// for a node, and nothing was.
+    pub fn instance_patch_states_of<'a>(
+        &'a self,
+        region: &str,
+        instance_ids: &[String],
+    ) -> Vec<&'a InstancePatchStateRecord> {
+        let mut named: Vec<&str> = instance_ids.iter().map(String::as_str).collect();
+        named.sort_unstable();
+        named.dedup();
+        named
+            .into_iter()
+            .filter_map(|id| self.instance_patch_state(region, id))
+            .collect()
     }
 
     /// The patch compliance reports `region` holds for the nodes of `patch_group`, in

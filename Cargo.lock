@@ -20575,6 +20575,7 @@ dependencies = [
 name = "service-com-amazonaws-ssm-amazonssm"
 version = "0.1.0"
 dependencies = [
+ "automod",
  "aws-emulator-build-support",
  "aws-emulator-emulator-telemetry",
  "aws-emulator-engine",

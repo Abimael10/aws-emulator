@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeInstancePatchStates
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeInstancePatchStates`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! The high-level patch compliance state of the managed nodes a request NAMES — the other
+//! read of this service's patch-state slice. This is the ONLY file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeInstancePatchStates::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What it reports is what the store holds ([`crate::state::instance_patch_states`]): the
+//! report of each named node a patching operation has gathered compliance for, in ascending
+//! node-id order, served one page at a time. A read — nothing is written, so a later caller
+//! sees the same reports.
+//!
+//! Patch compliance is gathered ON a node, by the patching operation Patch Manager runs
+//! there, and no operation of this service's model reports one, so a node that has never
+//! been patched holds no state and this read reports none for it rather than compliance
+//! nobody collected. A named node this endpoint holds no report for is not refused either:
+//! this operation models no node-level refusal, and the read is about what was gathered for
+//! the ids it was handed.
+//!
+//! Two things are refused rather than served:
+//!
+//! * a `NextToken` that is not a token this read hands out — the node id a page resumes at
+//!   — which is no page to continue (`InvalidNextToken`);
+//! * a `MaxResults` outside the modelled range, and an `InstanceIds` entry that is not
+//!   shaped like a managed-node id, both of which the centralized boundary walk already
+//!   refuses before this handler runs.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +158,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeInstancePatchStates` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeInstancePatchStatesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeInstancePatchStates"))
+        use crate::state::instance_patch_states::named_instance_patch_state_page_size;
+        use crate::state::{managed_node_id_is_well_formed, request_region, INVALID_NEXT_TOKEN};
+
+        // The `InstanceIds` list's length, each id's own spelling and the `MaxResults` range
+        // are MODELLED constraints the centralized walk has already refused anything outside
+        // of. What is decided here is which of the named nodes' reports this page carries.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeInstancePatchStatesErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some(
+                        "this service is mounted on an engine that holds no state".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let page_size = named_instance_patch_state_page_size(input.max_results)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        // The token this read hands out is the node id the next page starts at, so a token
+        // that is not shaped like a node id was never one of ours.
+        let resume_from = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) if managed_node_id_is_well_formed(token) => Some(token),
+            Some(_) => {
+                return Err(DescribeInstancePatchStatesErrorModeled::InvalidNextToken(
+                    InvalidNextToken {
+                        message: Some(INVALID_NEXT_TOKEN.to_string()),
+                    },
+                )
+                .into())
+            }
+        };
+
+        // Systems Manager is regional: a report is reached through the endpoint of the
+        // Region the node it was gathered on is registered with, which is the Region this
+        // request was signed for. The store yields the named nodes' reports for that Region
+        // in ascending node-id order, which is what makes the resume cursor total.
+        let region = request_region(ctx.parts());
+        let store = state.lock();
+        let mut instance_patch_states = Vec::new();
+        let mut next_token = None;
+        for report in store.instance_patch_states_of(&region, &input.instance_ids) {
+            if resume_from.is_some_and(|from| report.instance_id.as_str() < from) {
+                continue;
+            }
+            if instance_patch_states.len() == page_size {
+                // The page is full and a report is still waiting: hand the caller the node
+                // id it resumes at, so the next request continues where this one stopped.
+                next_token = Some(report.instance_id.clone());
+                break;
+            }
+            instance_patch_states.push(report.to_instance_patch_state());
+        }
+
+        // "If there are no additional items to return, the string is empty" — reported as
+        // no token at all, which is how this protocol spells an absent member.
+        Ok(DescribeInstancePatchStatesOutput {
+            instance_patch_states: Some(instance_patch_states),
+            next_token,
+        })
     }
 }
