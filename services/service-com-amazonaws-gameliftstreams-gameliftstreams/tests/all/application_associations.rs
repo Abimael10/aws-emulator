@@ -31,12 +31,18 @@
 //!   legal values are the applications the target group is already associated with, and
 //!   any other value is the modelled `ValidationException` (400) rather than a
 //!   not-found lookup.
+//! * `DeleteApplication`: "You cannot delete an application that is linked to one or
+//!   more stream groups. You must first unlink the stream group by using
+//!   DisassociateApplications", and "if any active stream groups exist for this
+//!   application, this request returns a ValidationException" — so the refusal names the
+//!   association that blocks the delete, by the ARN of each resource it holds.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::stream_workflow::{
-    active_stream_group, call, emulator, ready_application, text, ACCOUNT, PAST_TRANSITION, REGION,
+    active_stream_group, as_label, call, emulator, ready_application, text, ACCOUNT,
+    PAST_TRANSITION, REGION,
 };
 
 /// The wire error code of an error body (`__type`), or the empty string.
@@ -668,5 +674,133 @@ async fn a_default_application_the_group_is_not_associated_with_is_a_validation_
         (status, error_code(&got)),
         (400, "ValidationException".to_string()),
         "case \"the application after it was unlinked\": expected 400, got {status} {got}"
+    );
+}
+
+/// RULE: an application a stream group is still associated with cannot be deleted —
+/// "you cannot delete an application that is linked to one or more stream groups. You
+/// must first unlink the stream group by using DisassociateApplications" — and the
+/// refusal names the association that blocks it: this application and a stream group it
+/// is linked to, each by its full ARN.
+///
+/// The rows differ along what the rule generalises over: how many groups hold the
+/// application, which identifier form the delete addresses it by, and whether the
+/// application is the group's default. The last link removed makes the same delete
+/// succeed, which is what the refusal was asking for.
+#[tokio::test]
+async fn deleting_an_application_a_stream_group_holds_names_the_association() {
+    let router = emulator();
+    let (application_id, application_arn) = ready_application(&router, "held-application").await;
+    let (first_group, first_group_arn) =
+        group_without_a_default_application(&router, "holding-group-one", &[REGION]).await;
+    let (second_group, second_group_arn) =
+        group_without_a_default_application(&router, "holding-group-two", &[REGION]).await;
+
+    // The first association also makes the application that group's default ("if a
+    // stream group does not already have a linked application, Amazon GameLift Streams
+    // will automatically assign the first application provided in
+    // ApplicationIdentifiers as the default"), so both rows below are the default of the
+    // group they name.
+    associate(&router, &first_group, std::slice::from_ref(&application_id)).await;
+    associate(&router, &second_group, std::slice::from_ref(&application_id)).await;
+
+    // (case, the identifier the delete addresses, the group ARN the refusal must name)
+    let rows: Vec<(&str, &String, &String)> = vec![
+        (
+            "two groups hold it, addressed by bare id",
+            &application_id,
+            &first_group_arn,
+        ),
+        (
+            "two groups hold it, addressed by ARN",
+            &application_arn,
+            &first_group_arn,
+        ),
+    ];
+    for (case, identifier, group_arn) in &rows {
+        let (status, got) = call(
+            &router,
+            "DELETE",
+            &format!("/applications/{}", as_label(identifier)),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected 400, got {status} {got}"
+        );
+        assert_eq!(
+            error_code(&got),
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {got}"
+        );
+        let expected = format!(
+            "Application '{application_arn}' has an active association with stream group \
+             '{group_arn}"
+        );
+        assert_eq!(
+            without_internal_id(&error_message(&got), case),
+            expected,
+            "case {case:?}: expected {expected:?}, got {got}"
+        );
+        // The refused delete leaves the application exactly as it was.
+        let application = get_application(&router, &application_id).await;
+        assert_eq!(
+            application["Status"], "READY",
+            "case {case:?}: a refused delete must not move the status, got {application}"
+        );
+    }
+
+    // One link removed still leaves the other, and the refusal now names THAT group.
+    let (status, got) = call(
+        &router,
+        "POST",
+        &format!("/streamgroups/{first_group}/disassociations"),
+        Some(json!({"ApplicationIdentifiers": [application_id.clone()]})),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case \"unlink the first group\": expected 200, got {status} {got}"
+    );
+    let (status, got) = call(
+        &router,
+        "DELETE",
+        &format!("/applications/{application_id}"),
+        None,
+    )
+    .await;
+    let expected = format!(
+        "Application '{application_arn}' has an active association with stream group \
+         '{second_group_arn}"
+    );
+    assert_eq!(
+        (status, without_internal_id(&error_message(&got), "one link left")),
+        (400, expected.clone()),
+        "case \"one link left\": expected {expected:?}, got {status} {got}"
+    );
+
+    // With the last link gone the delete the refusal was asking for goes through.
+    let (status, got) = call(
+        &router,
+        "POST",
+        &format!("/streamgroups/{second_group}/disassociations"),
+        Some(json!({"ApplicationIdentifiers": [application_id.clone()]})),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case \"unlink the second group\": expected 200, got {status} {got}"
+    );
+    let (status, got) = call(
+        &router,
+        "DELETE",
+        &format!("/applications/{application_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 204,
+        "case \"no link left\": expected 204, got {status} {got}"
     );
 }

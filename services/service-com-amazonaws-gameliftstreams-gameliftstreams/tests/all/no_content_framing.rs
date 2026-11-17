@@ -24,7 +24,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::application_read_projection::{
-    application_in_ready_status, emulator_with_object_store, poll_until, stream_group_fully_active,
+    application_in_ready_status, emulator_with_staged_content, poll_until, staged_source_uri,
+    stream_group_fully_active,
 };
 use super::stream_workflow::{as_label, call, call_with_headers, text, REGION};
 
@@ -52,7 +53,7 @@ async fn ready_application(router: &MultiServiceRouter, description: &str) -> (S
             "Description": description,
             "RuntimeEnvironment": {"Type": "PROTON", "Version": "20250516"},
             "ExecutablePath": "game.exe",
-            "ApplicationSourceUri": "s3://framing-content/build/",
+            "ApplicationSourceUri": staged_source_uri(),
         })),
     )
     .await;
@@ -270,7 +271,7 @@ async fn bodiless_writes(router: &MultiServiceRouter) -> Vec<Write> {
 /// Every bodiless write answers 204 with no body and states the length it has.
 #[tokio::test]
 async fn a_success_that_carries_no_content_states_the_length_it_has() {
-    let router = emulator_with_object_store();
+    let router = emulator_with_staged_content().await;
     for write in bodiless_writes(&router).await {
         let case = &write.case;
         let (status, headers, body) =
@@ -297,7 +298,7 @@ async fn a_success_that_carries_no_content_states_the_length_it_has() {
 /// and nothing here frames it as empty.
 #[tokio::test]
 async fn a_success_that_carries_content_keeps_its_body() {
-    let router = emulator_with_object_store();
+    let router = emulator_with_staged_content().await;
     let (application_id, application_arn) = ready_application(&router, "framing-content").await;
     let (group_id, _) = active_group(
         &router,

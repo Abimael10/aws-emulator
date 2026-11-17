@@ -74,6 +74,21 @@ const CONTENT: &[(&str, usize)] = &[
     ("other/decoy.bin", 1000),
 ];
 
+/// The content location every suite that needs a staged, readable source URI creates
+/// its applications from: a prefix [`stage_content`] put objects under.
+pub(crate) fn staged_source_uri() -> String {
+    format!("s3://{BUCKET}/many/")
+}
+
+/// This service and this emulator's own Amazon S3 on one shared engine, with
+/// [`CONTENT`] already staged — so [`staged_source_uri`] is a location the store holds
+/// content at, which is what `CreateApplication` requires of it.
+pub(crate) async fn emulator_with_staged_content() -> MultiServiceRouter {
+    let router = emulator_with_object_store();
+    stage_content(&router).await;
+    router
+}
+
 /// This service and this emulator's own Amazon S3 on one shared engine.
 pub(crate) fn emulator_with_object_store() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -90,7 +105,7 @@ pub(crate) fn emulator_with_object_store() -> MultiServiceRouter {
 }
 
 /// An Amazon S3 client over the in-process seam, built the one way the tree builds it.
-fn s3(router: &MultiServiceRouter) -> ::aws_sdk_s3::Client {
+pub(crate) fn s3(router: &MultiServiceRouter) -> ::aws_sdk_s3::Client {
     let callback = EmbeddedEmulator::from_router(router.clone());
     ::service_common::s3_client::s3_client(&callback, REGION)
 }
@@ -371,8 +386,10 @@ async fn storage_bytes_reports_the_byte_size_of_the_stored_content() {
 
     // The rows differ along what the rule generalises over: how many objects the content
     // holds, how deep under the prefix they lie, whether one of them is empty, whether
-    // the URI names a prefix, a single object or a whole bucket, and whether the store
-    // holds anything there at all.
+    // the URI names a prefix, a whole bucket or one object directly, and whether it
+    // carries its trailing separator. A location the store holds nothing at is no
+    // application at all (`content_preconditions`), so every row here is one the store
+    // holds content at.
     let rows: Vec<(&str, String, i64)> = vec![
         (
             "one object under the prefix",
@@ -390,24 +407,19 @@ async fn storage_bytes_reports_the_byte_size_of_the_stored_content() {
             staged_bytes_under("zero/"),
         ),
         (
-            "a prefix the bucket holds nothing under",
-            format!("s3://{BUCKET}/absent/"),
-            0,
-        ),
-        (
             "every object of the bucket",
             format!("s3://{BUCKET}/"),
             staged_bytes_under(""),
         ),
         (
+            "a prefix submitted without its trailing separator",
+            format!("s3://{BUCKET}/many"),
+            staged_bytes_under("many/"),
+        ),
+        (
             "one object named directly",
             format!("s3://{BUCKET}/single/game.exe"),
             staged_bytes_under("single/game.exe"),
-        ),
-        (
-            "a bucket the object store does not hold",
-            "s3://gameliftstreams-no-such-content/build/".to_string(),
-            0,
         ),
     ];
 

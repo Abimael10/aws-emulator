@@ -285,18 +285,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // How much content this create copies, read from the object store BEFORE the
-        // store is locked: the read is an awaited in-process call, and this service's
-        // state is held under a non-async lock. It is what the application reports as
-        // its `StorageBytes` from here on — the size of the content at the instant it
-        // was ingested, never recomputed on a later read.
+        // The value names a LOCATION — "the location can have a multi-level prefix
+        // structure", and the create "copies everything under the specified location"
+        // — so it is STORED in the one spelling of a prefix, and that stored value is
+        // what every read of the application answers with. The content itself is read
+        // with the value as the request WROTE it (below): an S3 listing prefix is a byte
+        // prefix of the key, so the written value is what names the content, and a
+        // separator added to it would exclude the object a URI names directly.
+        let application_source_uri =
+            crate::state::content::normalized_source_uri(&input.application_source_uri);
+
+        // WHAT the content location holds, read from the object store BEFORE the store
+        // is locked: the read is an awaited in-process call, and this service's state
+        // is held under a non-async lock.
+        //
+        // "Before you create an application, upload your application content files to
+        // an Amazon Simple Storage Service (Amazon S3) bucket", and "creating an
+        // application is the only time Amazon GameLift Streams accesses your Amazon S3
+        // bucket" — so this one read is also the one precondition: a location the
+        // store holds nothing at, and one it will not let this service list and read,
+        // are both refused here, before any record is allocated. What it holds is also
+        // what the application reports as its `StorageBytes` from here on: the size of
+        // the content at the instant it was ingested, never recomputed on a later read.
         let region = crate::state::region_of(ctx.parts());
-        let storage_bytes = crate::state::content::stored_bytes(
+        let storage_bytes = match crate::state::content::source_content(
             ctx,
             &region,
             &input.application_source_uri,
         )
-        .await;
+        .await
+        {
+            crate::state::content::SourceContent::Stored(bytes) => bytes,
+            crate::state::content::SourceContent::Empty => {
+                return Err(CreateApplicationErrorModeled::ValidationException(
+                    crate::state::no_objects_at_source_uri(),
+                )
+                .into());
+            }
+            crate::state::content::SourceContent::Denied => {
+                return Err(CreateApplicationErrorModeled::AccessDeniedException(
+                    crate::state::source_uri_access_denied(),
+                )
+                .into());
+            }
+            // Nothing answered the read, so nothing about the location is established:
+            // a precondition this read could not judge is not one the caller's request
+            // failed, and a size it did not establish is not reported as one it did.
+            crate::state::content::SourceContent::Unanswered => 0,
+        };
 
         let mut state = state.lock();
         state.materialize(now);
@@ -333,7 +369,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.runtime_environment.version,
         );
         fingerprint.text("ExecutablePath", &input.executable_path);
-        fingerprint.text("ApplicationSourceUri", &input.application_source_uri);
+        // The NORMALIZED location, which is what the record stores: two requests whose
+        // source URIs name the same prefix are the same request.
+        fingerprint.text("ApplicationSourceUri", &application_source_uri);
         fingerprint.list("ApplicationLogPaths", &log_paths);
         fingerprint.optional("ApplicationLogOutputUri", log_output_uri.as_deref());
         fingerprint.map("Tags", &input.tags.clone().unwrap_or_default());
@@ -386,7 +424,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     description: input.description,
                     runtime_environment: input.runtime_environment,
                     executable_path: input.executable_path,
-                    application_source_uri: input.application_source_uri,
+                    application_source_uri: application_source_uri.clone(),
                     application_log_paths: log_paths,
                     application_log_output_uri: log_output_uri,
                     status: crate::state::APPLICATION_INITIALIZED.to_string(),

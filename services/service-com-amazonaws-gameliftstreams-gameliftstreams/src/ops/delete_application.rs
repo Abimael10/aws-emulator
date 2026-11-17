@@ -238,17 +238,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "If any active stream groups exist for this application, this request
-        // returns a ValidationException."
-        if !application.associated_stream_groups.is_empty() {
+        // returns a ValidationException." The refusal names the association that
+        // blocks the delete — this application and a stream group it is linked to,
+        // each by the ARN the stored record carries.
+        if let Some(stream_group_arn) = application.associated_stream_groups.first() {
             return Err(DeleteApplicationErrorModeled::ValidationException(
-                ValidationException {
-                    message: crate::state::with_internal_id(format!(
-                        "application {} is still associated with {} stream group(s): {}",
-                        application.id,
-                        application.associated_stream_groups.len(),
-                        application.associated_stream_groups.join(", ")
-                    )),
-                },
+                crate::state::application_association_active(
+                    &application.arn,
+                    stream_group_arn,
+                ),
             )
             .into());
         }

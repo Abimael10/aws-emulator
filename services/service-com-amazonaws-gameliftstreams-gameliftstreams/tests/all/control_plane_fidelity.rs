@@ -247,12 +247,24 @@ async fn an_application_source_uri_must_name_an_s3_location() {
             status, 201,
             "case {case:?} ({source}): expected 201, got {status} {created}"
         );
-        // Round trip: the stored record is what a later read reports.
+        // Round trip: the stored record is what a later read reports — the location as
+        // a PREFIX, which is the one spelling this service stores it in (the
+        // normalization rule itself is `content_preconditions`' own table).
         let id = text(&created, "/Id", case);
+        let stored = match source.ends_with('/') {
+            true => source.clone(),
+            false => format!("{source}/"),
+        };
+        assert_eq!(
+            created["ApplicationSourceUri"].as_str(),
+            Some(stored.as_str()),
+            "case {case:?}: expected CreateApplication to echo the stored source, got \
+             {created}"
+        );
         let (status, got) = call(&router, "GET", &format!("/applications/{id}"), None).await;
         assert_eq!(
             (status, got["ApplicationSourceUri"].as_str()),
-            (200, Some(source.as_str())),
+            (200, Some(stored.as_str())),
             "case {case:?}: expected GetApplication to report the stored source, got {status} \
              {got}"
         );

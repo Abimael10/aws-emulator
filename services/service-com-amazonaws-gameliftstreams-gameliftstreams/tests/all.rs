@@ -17,6 +17,8 @@ mod admin_shell_not_found;
 mod application_associations;
 #[path = "all/application_read_projection.rs"]
 mod application_read_projection;
+#[path = "all/content_preconditions.rs"]
+mod content_preconditions;
 #[path = "all/control_plane_fidelity.rs"]
 mod control_plane_fidelity;
 #[path = "all/no_content_framing.rs"]

@@ -38,8 +38,8 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    DefaultApplication, DisplayConfiguration, LocationConfiguration, LocationState,
-    PerformanceStatsConfiguration, ReplicationStatus, ResourceNotFoundException,
+    AccessDeniedException, DefaultApplication, DisplayConfiguration, LocationConfiguration,
+    LocationState, PerformanceStatsConfiguration, ReplicationStatus, ResourceNotFoundException,
     RuntimeEnvironment, ValidationException,
 };
 
@@ -635,6 +635,62 @@ pub fn not_an_s3_uri(member: &str) -> String {
     with_internal_id(format!(
         "'{member}' must be a valid S3 URI starting with 's3://'"
     ))
+}
+
+/// The refusal a content location holding no object carries.
+///
+/// "Before you create an application, upload your application content files to an
+/// Amazon Simple Storage Service (Amazon S3) bucket" (`CreateApplication`), and the
+/// create "copies everything under the specified location"
+/// (`ApplicationSourceUri`): a location holding nothing is content the service cannot
+/// copy, so the request is refused with the modelled client-input error. The sentence
+/// is fixed — the location is the one the request named — and carries the per-request
+/// suffix every handler-side message of this service ends in.
+pub fn no_objects_at_source_uri() -> ValidationException {
+    ValidationException {
+        message: with_internal_id("No S3 objects were found at the specified source URI"),
+    }
+}
+
+/// The refusal a content location this service may not read carries.
+///
+/// Reading the location needs both of the actions the copy performs — listing the
+/// bucket and getting each object it holds — so a location whose object store refuses
+/// either is a permission the caller has to correct rather than content that is
+/// missing, and it is answered with the modelled `AccessDeniedException` ("You don't
+/// have the required permissions to access this Amazon GameLift Streams resource.
+/// Correct the permissions before you try again."). The sentence names both actions
+/// and is otherwise fixed.
+pub fn source_uri_access_denied() -> AccessDeniedException {
+    AccessDeniedException {
+        message: with_internal_id(
+            "Access was denied for s3:ListBucket and s3:GetObject actions on the specified \
+             source URI",
+        ),
+    }
+}
+
+/// The refusal a `DeleteApplication` of an application a stream group is still
+/// associated with carries.
+///
+/// "You cannot delete an application that is linked to one or more stream groups. You
+/// must first unlink the stream group by using DisassociateApplications" and "if any
+/// active stream groups exist for this application, this request returns a
+/// ValidationException" (`DeleteApplication`), so the refusal names the association
+/// that blocks the delete: the application's own ARN and the ARN of a stream group it
+/// is linked to, both read off the stored records, in the service's own wording — whose
+/// opening quote around the stream group ARN is not closed. It carries the per-request
+/// suffix every handler-side message of this service ends in.
+pub fn application_association_active(
+    application_arn: &str,
+    stream_group_arn: &str,
+) -> ValidationException {
+    ValidationException {
+        message: with_internal_id(format!(
+            "Application '{application_arn}' has an active association with stream group \
+             '{stream_group_arn}"
+        )),
+    }
 }
 
 /// Whether `uri` names an Amazon S3 location: the `s3://` scheme followed by a
