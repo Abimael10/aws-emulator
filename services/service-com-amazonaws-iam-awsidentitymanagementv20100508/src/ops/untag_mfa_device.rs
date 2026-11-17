@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagMFADevice
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagMFADevice`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagMFADevice::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Removes the specified tags from the IAM virtual multi-factor authentication (MFA)
+//! device": each tag the device holds whose key the request names is dropped, and every
+//! other one keeps its value.
+//!
+//! The device is addressed by its serial number, which "for virtual MFA devices … is the
+//! same as the ARN" (`$SerialNumber`) and is therefore the key the account holds the device
+//! under, exactly as `TagMFADevice` and `ListMFADeviceTags` address it; a serial the
+//! account holds no device under "referenced a resource entity that does not exist".
+//!
+//! The REMOVAL is the shared definition in `crate::state` ([`crate::state::remove_tags`])
+//! every `Untag*` operation of this service follows, so a named key the device does not
+//! hold drops nothing rather than failing the call — these operations model no error for
+//! one.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +175,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagMFADevice` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagMFADeviceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagMFADevice"))
+        // `ctx` carries request metadata only; what this operation reads out of it is the
+        // signing key id of the caller the request is authorized as. The device itself is
+        // named by the serial number in the request — IAM is global, so no region is read.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UntagMFADeviceErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // A mutation: the lock is held across the lookup and the write, so the tag set
+        // this call removes from is the one it stores.
+        let mut store = state.lock();
+
+        // IAM authorizes its own API: the caller's identity-based policies are evaluated
+        // before any tag is removed, and before the store is consulted for the device, so a
+        // caller that may not change a device's tags learns that it may not rather than
+        // whether the account holds that device. The keys this call REMOVES are handed to
+        // the gate, because `aws:TagKeys` is part of the request a statement may be
+        // conditioned on. Nothing is removed when it refuses.
+        crate::state::authorization::authorize_written(
+            &store,
+            ctx,
+            crate::state::authorization::UNTAG_MFA_DEVICE,
+            &input.serial_number,
+            &format!("mfa device {}", input.serial_number),
+            crate::state::authorization::WrittenTags::Keys(&input.tag_keys),
+        )?;
+
+        // The write is addressed exactly as a read of the same serial is, so it reaches the
+        // one record `ListMFADeviceTags` reports; a serial the account holds no device under
+        // "referenced a resource entity that does not exist", in the one wording this crate
+        // gives that class (`crate::state::mfa_device_not_found_message`).
+        let Some(device) = store.virtual_mfa_devices.get_mut(&input.serial_number) else {
+            return Err(UntagMFADeviceErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(crate::state::mfa_device_not_found_message(
+                        &input.serial_number,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "The tags with matching keys are removed" (`$TagKeys`): the removal, and the
+        // exact key comparison it makes, are the one shared rule in `crate::state`, so a
+        // named key the device does not hold drops nothing rather than failing the call.
+        let remaining = crate::state::remove_tags(
+            device.tags.as_ref(),
+            input.tag_keys.iter().map(String::as_str),
+        );
+
+        // An empty tag set is the same as no tags, which is how `CreateVirtualMFADevice`
+        // stores one; every reader of the device's tags reports the member either way.
+        device.tags = (!remaining.is_empty()).then_some(remaining);
+        Ok(UntagMFADeviceOutput)
     }
 }

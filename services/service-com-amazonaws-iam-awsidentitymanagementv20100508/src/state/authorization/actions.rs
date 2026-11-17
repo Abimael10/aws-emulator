@@ -473,6 +473,15 @@ pub const DELETE_VIRTUAL_MFA_DEVICE: &str = "iam:DeleteVirtualMFADevice";
 /// `iam:ListVirtualMFADevices`.
 pub const LIST_VIRTUAL_MFA_DEVICES: &str = "iam:ListVirtualMFADevices";
 
+/// `iam:TagMFADevice`.
+pub const TAG_MFA_DEVICE: &str = "iam:TagMFADevice";
+
+/// `iam:UntagMFADevice`.
+pub const UNTAG_MFA_DEVICE: &str = "iam:UntagMFADevice";
+
+/// `iam:ListMFADeviceTags`.
+pub const LIST_MFA_DEVICE_TAGS: &str = "iam:ListMFADeviceTags";
+
 /// `iam:UploadSigningCertificate`.
 pub const UPLOAD_SIGNING_CERTIFICATE: &str = "iam:UploadSigningCertificate";
 

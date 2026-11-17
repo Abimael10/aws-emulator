@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagMFADevice
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagMFADevice`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagMFADevice::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Attaches tags to one virtual MFA device the account holds: "adds one or more tags to an
+//! IAM virtual multi-factor authentication (MFA) device. If a tag with the same key name
+//! already exists, then that tag is overwritten with the new value."
+//!
+//! The device is addressed by its serial number, which "for virtual MFA devices … is the
+//! same as the ARN" (`$SerialNumber`) and is therefore the key the account holds the device
+//! under ([`crate::state::virtual_mfa_device_arn`]) — so the write reaches the one record
+//! `ListMFADeviceTags` reports and `CreateVirtualMFADevice` created, and a serial the
+//! account holds no device under "referenced a resource entity that does not exist".
+//!
+//! The MERGE itself, the reserved-key rule and the per-resource tag bound are the shared
+//! definitions in `crate::state` ([`crate::state::merge_tags`],
+//! [`crate::state::has_reserved_tag_key`], [`crate::state::MAX_TAGS_PER_ENTITY`]) that
+//! every `Tag*` operation of this service follows, because "if any one of the tags is
+//! invalid or if you exceed the allowed maximum number of tags, then the entire request
+//! fails" — and nothing is written when either refuses.
 //!
 //! ## Shape of an operation
 //!
@@ -186,18 +194,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagMFADevice` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagMFADeviceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagMFADevice"))
+        // `ctx` carries request metadata only; what this operation reads out of it is the
+        // signing key id of the caller the request is authorized as. The device itself is
+        // named by the serial number in the request — IAM is global, so no region is read.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagMFADeviceErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // AWS reserves the `aws:` tag-key prefix, so a request naming one supplied an
+        // "invalid … value … for an input parameter". Checked through the one definition
+        // of that rule in `crate::state`, the same one `CreateVirtualMFADevice` uses, and
+        // checked before anything is written: "if any one of the tags is invalid … then
+        // the entire request fails".
+        if crate::state::has_reserved_tag_key(input.tags.iter().map(|tag| tag.key.as_str())) {
+            return Err(TagMFADeviceErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::RESERVED_TAG_KEY_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // A mutation: the lock is held across the lookup and the write, so the tag set
+        // this call merges into is the one it stores.
+        let mut store = state.lock();
+
+        // IAM authorizes its own API: the caller's identity-based policies are evaluated
+        // before any tag is stored, and before the store is consulted for the device, so a
+        // caller that may not change a device's tags learns that it may not rather than
+        // whether the account holds that device. The decision is made against the serial
+        // number, which for a virtual MFA device IS the device's ARN, and the tags this
+        // call WRITES are handed to the gate, because they are part of the request a
+        // statement may be conditioned on (`aws:RequestTag/<key>`, `aws:TagKeys`). Nothing
+        // is written when it refuses.
+        crate::state::authorization::authorize_written(
+            &store,
+            ctx,
+            crate::state::authorization::TAG_MFA_DEVICE,
+            &input.serial_number,
+            &format!("mfa device {}", input.serial_number),
+            crate::state::authorization::WrittenTags::Pairs(&input.tags),
+        )?;
+
+        // The write is addressed exactly as every other call on a device is, so it reaches
+        // the record `CreateVirtualMFADevice` stored and `ListMFADeviceTags` reports; a
+        // serial the account holds no device under "referenced a resource entity that does
+        // not exist", in the one wording this crate gives that class
+        // (`crate::state::mfa_device_not_found_message`).
+        let Some(device) = store.virtual_mfa_devices.get_mut(&input.serial_number) else {
+            return Err(TagMFADeviceErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(crate::state::mfa_device_not_found_message(
+                        &input.serial_number,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "If a tag with the same key name already exists, then that tag is overwritten
+        // with the new value" — the merge, and the per-resource tag bound it is taken
+        // against, are the one shared rule in `crate::state`. Nothing is stored when the
+        // bound is passed: "if you exceed the allowed maximum number of tags, then the
+        // entire request fails".
+        let Some(merged) = crate::state::merge_tags(device.tags.as_ref(), input.tags) else {
+            return Err(TagMFADeviceErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Cannot assign more than {} tags to IAM virtual MFA device {}",
+                        crate::state::MAX_TAGS_PER_ENTITY,
+                        input.serial_number
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // An empty tag set is the same as no tags, which is how `CreateVirtualMFADevice`
+        // stores one; the device's tag READS sort the set by key
+        // (`crate::state::tag_page`), so the record keeps the pairs rather than an order.
+        device.tags = (!merged.is_empty()).then_some(merged);
+        Ok(TagMFADeviceOutput)
     }
 }

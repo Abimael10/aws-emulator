@@ -1893,7 +1893,8 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// [`policy_by_arn`](Self::policy_by_arn), both of which answer only for a record
     /// whose OWN ARN is the one asked for; the identity providers by the ARN their maps
     /// are keyed on; the instance profiles and server certificates — keyed by name — by
-    /// the ARN each record carries. A group is held but carries no tags, because IAM's
+    /// the ARN each record carries; the virtual MFA devices by their serial number, which
+    /// for such a device is its ARN. A group is held but carries no tags, because IAM's
     /// tagging operations cover no group resource.
     ///
     /// A READ: it only consults the store.
@@ -1944,6 +1945,14 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
             .find(|record| record.metadata.arn == arn)
         {
             return Some(held_tags(certificate.tags.as_ref()));
+        }
+        // A virtual MFA device is held under its serial number, which for such a device IS
+        // its ARN ("for virtual MFA devices, the serial number is the same as the ARN",
+        // `TagMFADevice$SerialNumber`), so the ARN asked about is the key the record sits
+        // under — and its tags are a resource this store persists tags for, written by
+        // `CreateVirtualMFADevice` and `TagMFADevice` and reported by `ListMFADeviceTags`.
+        if let Some(device) = self.virtual_mfa_devices.get(arn) {
+            return Some(held_tags(device.tags.as_ref()));
         }
         None
     }

@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListMFADeviceTags
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListMFADeviceTags`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListMFADeviceTags::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the tags one virtual MFA device holds: "lists the tags that are attached to the
+//! specified IAM virtual multi-factor authentication (MFA) device. The returned list of
+//! tags is sorted by tag key."
+//!
+//! The device is addressed by its serial number, which "for virtual MFA devices … is the
+//! same as the ARN" (`$SerialNumber`) and is therefore the key the account holds the device
+//! under, exactly as `TagMFADevice` and `UntagMFADevice` address it; a serial the account
+//! holds no device under "referenced a resource entity that does not exist".
+//!
+//! The page — the key order, the `MaxItems` bound and the `Marker` that resumes strictly
+//! after the last key the previous page reported — is the shared definition in
+//! `crate::state` ([`crate::state::tag_page`]) every tag listing of this service reports
+//! through.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +175,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListMFADeviceTags` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListMFADeviceTagsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListMFADeviceTags"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListMFADeviceTagsErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The page resumes strictly after the POSITION the marker names in THIS device's
+        // tag order, so a token this service did not issue while paging this device's tags
+        // is refused as an "invalid … value … supplied for an input parameter" rather than
+        // read as "start from the beginning".
+        let scope = crate::state::entity_tags_marker_scope(&input.serial_number);
+        let resume_after = match &input.marker {
+            Some(marker) => match crate::state::decode_marker(&scope, marker) {
+                Some(key) => Some(key),
+                None => {
+                    return Err(ListMFADeviceTagsErrorModeled::InvalidInputException(
+                        InvalidInputException {
+                            message: Some(crate::state::INVALID_MARKER.to_string()),
+                        },
+                    )
+                    .into())
+                }
+            },
+            None => None,
+        };
+        // `maxItemsType` is range 1..1000 and the boundary validator has already refused
+        // anything outside it, so the only choice left here is the default for an absent
+        // `MaxItems`: "if you do not include this parameter, the number of items defaults
+        // to 100". `.max(1)` is what makes the cast lossless.
+        let page_size = input
+            .max_items
+            .unwrap_or(crate::state::DEFAULT_MAX_ITEMS)
+            .max(1) as usize;
+
+        // A read: it reports the tags the device persists and writes nothing, so a later
+        // caller sees exactly what this one did.
+        let store = state.lock();
+
+        // IAM authorizes its own API: the caller's identity-based policies are evaluated
+        // before any tag is reported, and before the store is consulted for the device, so
+        // a caller that may not read a device's tags learns that it may not rather than
+        // whether the account holds that device. The decision is made against the serial
+        // number, which for a virtual MFA device IS the device's ARN, while the refusal
+        // NAMES the device as the request named it.
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::LIST_MFA_DEVICE_TAGS,
+            &input.serial_number,
+            &format!("mfa device {}", input.serial_number),
+        )?;
+
+        let Some(device) = store.virtual_mfa_device(&input.serial_number) else {
+            return Err(ListMFADeviceTagsErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(crate::state::mfa_device_not_found_message(
+                        &input.serial_number,
+                    )),
+                },
+            )
+            .into());
+        };
+        // "The returned list of tags is sorted by tag key", and "if no tags are attached to
+        // the specified resource, the response contains an empty list" (`$Tags`) — both the
+        // shared page's doing.
+        let page = crate::state::tag_page(
+            device.tags.as_ref(),
+            &scope,
+            resume_after.as_deref(),
+            page_size,
+        );
+        Ok(ListMFADeviceTagsOutput {
+            tags: page.tags,
+            is_truncated: page.is_truncated,
+            marker: page.marker,
+        })
     }
 }

@@ -242,11 +242,8 @@ async fn every_served_call_is_recorded_and_an_unimplemented_one_is_not() {
             // Still a stub in this emulator: it answers 501, so nothing was served and
             // nothing is recorded.
             "an unimplemented operation",
-            "ListMFADeviceTags",
-            vec![(
-                "SerialNumber",
-                "arn:aws:iam::123456789012:mfa/audit-device".to_string(),
-            )],
+            "DisableOrganizationsRootSessions",
+            vec![],
             501,
             None,
             None,
