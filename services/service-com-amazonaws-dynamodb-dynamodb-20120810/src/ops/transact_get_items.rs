@@ -274,7 +274,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A table the policies in force do not let this caller read answers the
             // denial, not its items: a transactional get performs `dynamodb:GetItem`,
             // decided against the partition this get addresses and the attributes it asks
-            // for.
+            // for, INSIDE this operation
+            // ([`crate::state::authorization::EnclosingOperation`]).
             if let Some(denial) = crate::state::authorization::denial_keys(
                 &caller,
                 table,
@@ -286,7 +287,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         [&requested.get.key],
                     ),
                     projected.as_deref(),
-                ),
+                )
+                .within(crate::state::authorization::EnclosingOperation::TransactGetItems),
             ) {
                 return Err(crate::scaffolded::Scaffolded::access_denied(denial));
             }

@@ -443,12 +443,18 @@ fn run_slot<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
         let table = store
             .active_table(region, &name, now)
             .map_err(|error| SlotFailure::from(error).at(&name))?;
-        if let Some(denial) = crate::state::authorization::denial_addressing(
+        // A statement of a batch performs its own PartiQL action INSIDE this operation,
+        // which is what a statement admitting that action only as part of a given operation
+        // tests ([`crate::state::authorization::EnclosingOperation`]).
+        if let Some(denial) = crate::state::authorization::denial_keys(
             caller,
             table,
             statement.action(),
             now,
-            &crate::state::authorization::AddressedKeys::of_statement(table, &statement),
+            &crate::state::authorization::RequestKeys::addressing(
+                crate::state::authorization::AddressedKeys::of_statement(table, &statement),
+            )
+            .within(crate::state::authorization::EnclosingOperation::BatchExecuteStatement),
         ) {
             return Err(SlotFailure::new(ACCESS_DENIED_CODE, denial).at(&name));
         }

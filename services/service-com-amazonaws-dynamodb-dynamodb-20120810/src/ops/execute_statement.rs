@@ -45,7 +45,10 @@
 //! Everything the dialect does not spell, and everything this emulator cannot serve
 //! faithfully, is refused with a `ValidationException` rather than guessed at. The
 //! statement's own IAM action (`dynamodb:PartiQLSelect`, `…Insert`, `…Update`,
-//! `…Delete`) is what a table's resource-based policy is read for.
+//! `…Delete`) is what a table's resource-based policy is read for. One statement run here
+//! is an operation of its own and is enclosed in nothing, so a grant admitting its action
+//! only as part of a transaction or a batch does not reach it
+//! ([`crate::state::authorization::EnclosingOperation`]).
 //!
 //! ## Shape of an operation
 //!

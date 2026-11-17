@@ -102,6 +102,11 @@
 //!   and the one a key-addressed read implies: the attributes it listed
 //!   (`SPECIFIC_ATTRIBUTES`) or every attribute of the item (`ALL_ATTRIBUTES`). A call that
 //!   selects nothing — every write — carries no value for the key.
+//! * the operation this call's action is performed INSIDE — [`EnclosingOperation`]: the
+//!   multi-item operation one of whose entries asked for the action, which is what a
+//!   statement that admits an action only as part of a transaction tests. A call that
+//!   performs an action of its OWN carries no value for the key, which it answers for, so a
+//!   grant conditioned on an enclosing operation does not reach it.
 //! * the session tags the calling principal carries, which is where a policy written with
 //!   `${aws:PrincipalTag/<key>}` takes the text it stands for. They are known for a
 //!   session this emulator's STS registry minted and for nobody else, so only such a
@@ -142,6 +147,48 @@ const ATTRIBUTES_CONDITION_KEY: &str = "dynamodb:Attributes";
 /// The condition key whose value is WHICH attributes a read asks for, as the `Select` member
 /// of a read names them ([`Selection`]).
 const SELECT_CONDITION_KEY: &str = "dynamodb:Select";
+
+/// The condition key whose value is the operation an action is performed INSIDE, named by
+/// [`EnclosingOperation`] — what a statement admitting an action only as one entry of a
+/// transaction, or only outside one, tests.
+const ENCLOSING_OPERATION_CONDITION_KEY: &str = "dynamodb:EnclosingOperation";
+
+/// An operation that performs the actions ITS OWN ENTRIES ask for, as the condition key
+/// reporting it holds that operation's name.
+///
+/// Such an operation has no IAM action of its own: each entry of it is authorized as the
+/// action that entry performs — a statement of a PartiQL transaction or batch as that
+/// statement's own PartiQL action, an item of a transactional read or write as the
+/// single-item action it is the transactional form of — so the only thing that tells those
+/// calls apart from the single-entry operation performing the same action is this key. A
+/// call that performs an action of its own (every single-item operation, `BatchGetItem` and
+/// `BatchWriteItem`, each of which is authorized as ITSELF) encloses nothing and carries no
+/// value for the key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnclosingOperation {
+    /// A PartiQL statement run as one statement of a transaction.
+    ExecuteTransaction,
+    /// A PartiQL statement run as one statement of a batch.
+    BatchExecuteStatement,
+    /// An item read as one item of a transactional read.
+    TransactGetItems,
+    /// An item written, or checked, as one item of a transactional write.
+    TransactWriteItems,
+}
+
+impl EnclosingOperation {
+    /// The operation's name, which is the text the condition key holds for a call it
+    /// encloses.
+    #[must_use]
+    fn name(self) -> &'static str {
+        match self {
+            Self::ExecuteTransaction => "ExecuteTransaction",
+            Self::BatchExecuteStatement => "BatchExecuteStatement",
+            Self::TransactGetItems => "TransactGetItems",
+            Self::TransactWriteItems => "TransactWriteItems",
+        }
+    }
+}
 
 /// The principal a request speaks for, and everything the decision is made from.
 ///
@@ -464,6 +511,10 @@ pub struct RequestKeys {
     /// and a read addressed by key implies one, so a call with neither really carries no
     /// value for it.
     select: Option<&'static str>,
+    /// The operation this call's action is performed inside, or `None` for a call that
+    /// performs an action of its own. Every data-plane call answers for this key: it either
+    /// is one entry of such an operation or it is not ([`EnclosingOperation`]).
+    enclosing: Option<EnclosingOperation>,
 }
 
 impl RequestKeys {
@@ -476,21 +527,33 @@ impl RequestKeys {
             addressed,
             attributes: None,
             select: None,
+            enclosing: None,
         }
     }
 
+    /// The same keys, answered for a call performed as ONE ENTRY of `enclosing` rather than
+    /// as an operation of its own: the condition key reporting the enclosing operation then
+    /// holds that operation's name ([`EnclosingOperation`]).
+    #[must_use]
+    pub fn within(mut self, enclosing: EnclosingOperation) -> Self {
+        self.enclosing = Some(enclosing);
+        self
+    }
+
     /// A CONTROL-PLANE call on the table: it addresses no partition, names no attribute of
-    /// an item and asks for no selection, so it carries NO value for any of the data-plane
-    /// keys and answers that it carries none — IAM's empty set. A statement conditioned on
-    /// one of those keys therefore does not apply to such a call, whichever effect it
-    /// states, which is what AWS decides for a request whose context carries no value for
-    /// the key a clause names.
+    /// an item and asks for no selection, and it performs an action of its own rather than
+    /// one an enclosing operation asked for, so it carries NO value for any of the
+    /// data-plane keys and answers that it carries none — IAM's empty set. A statement
+    /// conditioned on one of those keys therefore does not apply to such a call, whichever
+    /// effect it states, which is what AWS decides for a request whose context carries no
+    /// value for the key a clause names.
     #[must_use]
     pub fn control_plane() -> Self {
         Self {
             addressed: AddressedKeys::whole_table(),
             attributes: Some(Vec::new()),
             select: None,
+            enclosing: None,
         }
     }
 
@@ -507,6 +570,7 @@ impl RequestKeys {
                 Some(_) => SPECIFIC_ATTRIBUTES_SELECT,
                 None => ALL_ATTRIBUTES_SELECT,
             }),
+            enclosing: None,
         }
     }
 
@@ -525,6 +589,7 @@ impl RequestKeys {
             addressed,
             attributes: named_attributes(paths),
             select: Some(select),
+            enclosing: None,
         }
     }
 
@@ -550,6 +615,7 @@ impl RequestKeys {
                     .flat_map(|map| map.keys().map(String::as_str)),
             ),
             select: None,
+            enclosing: None,
         }
     }
 }
@@ -624,6 +690,12 @@ fn condition_context(caller: &Caller, keys: &RequestKeys) -> Vec<(String, String
     if let Some(select) = keys.select {
         context.push((SELECT_CONDITION_KEY.to_string(), select.to_string()));
     }
+    if let Some(enclosing) = keys.enclosing {
+        context.push((
+            ENCLOSING_OPERATION_CONDITION_KEY.to_string(),
+            enclosing.name().to_string(),
+        ));
+    }
     context.extend(principal_context(caller));
     context
 }
@@ -666,7 +738,9 @@ fn principal_published_keys(caller: &Caller) -> Vec<&str> {
 /// than that this emulator cannot answer for them.
 ///
 /// A data-plane call answers for the selection it asks for however few values it carries
-/// for it, for every partition it addresses unless they cannot be read at all
+/// for it, and for the operation its action is performed inside whether or not it is
+/// performed inside one ([`EnclosingOperation`]), for every partition it addresses unless
+/// they cannot be read at all
 /// ([`AddressedKeys::unknown`]), and for the attributes it names only where the whole set it
 /// names is enumerated ([`RequestKeys`]) — a call that names attributes this cannot
 /// enumerate publishes nothing for that key, so a clause over it stays undecided instead of
@@ -676,7 +750,7 @@ fn principal_published_keys(caller: &Caller) -> Vec<&str> {
 /// credential answers for each key its own exchange published, so those are published one
 /// by one ([`sts_store::federated_claim_keys`]).
 fn published_condition_keys<'a>(caller: &'a Caller, keys: &RequestKeys) -> Vec<&'a str> {
-    let mut published = vec![SELECT_CONDITION_KEY];
+    let mut published = vec![SELECT_CONDITION_KEY, ENCLOSING_OPERATION_CONDITION_KEY];
     if keys.attributes.is_some() {
         published.push(ATTRIBUTES_CONDITION_KEY);
     }

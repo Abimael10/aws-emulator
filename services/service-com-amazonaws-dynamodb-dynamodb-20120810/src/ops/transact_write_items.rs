@@ -1101,7 +1101,9 @@ fn check_element_shape(
 /// read or keyed — against the partition the action addresses and, for a `Put`, the
 /// attributes the item it stores names. An `Update` names the attributes its expression
 /// writes as well, which is not enumerated here, so it answers for that key with nothing
-/// ([`crate::state::authorization::RequestKeys`]).
+/// ([`crate::state::authorization::RequestKeys`]). The action is performed INSIDE this
+/// operation, which is what a statement admitting it only as part of a transaction tests
+/// ([`crate::state::authorization::EnclosingOperation`]).
 fn deny(
     caller: &crate::state::authorization::Caller,
     table: &crate::state::Table,
@@ -1115,7 +1117,8 @@ fn deny(
             crate::state::authorization::RequestKeys::storing(addressed, &put.item)
         }
         _ => crate::state::authorization::RequestKeys::addressing(addressed),
-    };
+    }
+    .within(crate::state::authorization::EnclosingOperation::TransactWriteItems);
     match crate::state::authorization::denial_keys(
         caller,
         table,

@@ -36,7 +36,10 @@
 //! so the transaction is cancelled and that statement's `CancellationReasons` entry
 //! carries `ResourceNotFound` ([`cancelled_absent_table`]); a table whose resource-based
 //! policy denies the caller the statement's own PartiQL action is `AccessDeniedException`,
-//! and a transaction addressing one item twice is a `ValidationException`.
+//! and a transaction addressing one item twice is a `ValidationException`. A statement run
+//! here performs its action INSIDE this operation, which is what a policy admitting an
+//! action only as part of a transaction tests
+//! ([`crate::state::authorization::EnclosingOperation`]).
 //!
 //! `ClientRequestToken` makes a write transaction idempotent: a repeat of a token
 //! inside the documented 10-minute window
@@ -526,13 +529,17 @@ fn read_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
         // A table the policies in force do not let this caller act on with this
         // statement's own action is not read at all. PartiQL has its own four actions,
         // and the partition the statement addresses is what a conditioned statement is
-        // decided against.
-        if let Some(denial) = crate::state::authorization::denial_addressing(
+        // decided against. A statement of a transaction performs that action INSIDE this
+        // operation, which is what a statement admitting it only as part of one tests.
+        if let Some(denial) = crate::state::authorization::denial_keys(
             caller,
             table,
             statement.action(),
             now,
-            &crate::state::authorization::AddressedKeys::of_statement(table, statement),
+            &crate::state::authorization::RequestKeys::addressing(
+                crate::state::authorization::AddressedKeys::of_statement(table, statement),
+            )
+            .within(crate::state::authorization::EnclosingOperation::ExecuteTransaction),
         ) {
             return Err(crate::scaffolded::Scaffolded::access_denied(denial));
         }
@@ -663,12 +670,18 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
             entry.return_values_on_condition_check_failure.as_deref() == Some("ALL_OLD");
         {
             let table = store.active_table(region, &name, now).map_err(absent)?;
-            if let Some(denial) = crate::state::authorization::denial_addressing(
+            // A statement of a transaction performs its own PartiQL action INSIDE this
+            // operation, which is what a statement admitting that action only as part of
+            // one tests.
+            if let Some(denial) = crate::state::authorization::denial_keys(
                 caller,
                 table,
                 statement.action(),
                 now,
-                &crate::state::authorization::AddressedKeys::of_statement(table, statement),
+                &crate::state::authorization::RequestKeys::addressing(
+                    crate::state::authorization::AddressedKeys::of_statement(table, statement),
+                )
+                .within(crate::state::authorization::EnclosingOperation::ExecuteTransaction),
             ) {
                 return Err(crate::scaffolded::Scaffolded::access_denied(denial));
             }
