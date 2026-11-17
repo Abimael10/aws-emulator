@@ -496,6 +496,9 @@ pub const USER_ALREADY_EXISTS: &str = "User already exists";
 /// The fixed `Message` for an `ImportSshPublicKey` whose body the user already holds.
 pub const SSH_PUBLIC_KEY_ALREADY_EXISTS: &str = "Public key already exists";
 
+/// The fixed `Message` for an `ImportHostKey` whose material the server already holds.
+pub const HOST_KEY_ALREADY_EXISTS: &str = "Host key already exists";
+
 /// The fixed `Message` for an `UpdateServer` that would change `IpAddressType` on a
 /// server that is not [`SERVER_STATE_OFFLINE`].
 ///
@@ -942,6 +945,21 @@ pub fn ssh_public_key_already_exists(user_name: &str) -> ResourceExistsException
         message: SSH_PUBLIC_KEY_ALREADY_EXISTS.to_string(),
         resource: user_name.to_string(),
         resource_type: RESOURCE_TYPE_USER.to_string(),
+    }
+}
+
+/// The already-exists payload for host key material the resolved server already holds,
+/// addressed by the `HostKeyId` of the key that holds it.
+///
+/// Same construction as [`user_already_exists`]: the `Message` is the service's fixed
+/// text for the condition and interpolates nothing — not the server the request named,
+/// not the colliding key's id, not a fingerprint of the submitted material — while the
+/// identifier a caller needs travels in `Resource`.
+pub fn host_key_already_exists(host_key_id: &str) -> ResourceExistsException {
+    ResourceExistsException {
+        message: HOST_KEY_ALREADY_EXISTS.to_string(),
+        resource: host_key_id.to_string(),
+        resource_type: RESOURCE_TYPE_HOST_KEY.to_string(),
     }
 }
 

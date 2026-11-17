@@ -215,21 +215,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // material IS the same host key — its fingerprint identifies it, whatever the
         // description or the tags sent with it — so the import is refused with the
         // modelled `ResourceExistsException` rather than storing a second copy of one
-        // key under a second id.
+        // key under a second id. The refusal reports the CONDITION: its `Message` is the
+        // service's fixed text for it (`crate::state::HOST_KEY_ALREADY_EXISTS`) and
+        // carries neither the server the request named nor the colliding key's id nor a
+        // fingerprint of the submitted material, which travel — where any of them
+        // belongs — in `Resource`.
         if let Some(held) = guard
             .host_keys_of(&input.server_id)
             .find(|held| held.fingerprint == imported.fingerprint)
         {
             let host_key_id = held.host_key_id.clone();
             return Err(ImportHostKeyErrorModeled::ResourceExistsException(
-                ResourceExistsException {
-                    message: format!(
-                        "Server {} already holds host key {} with fingerprint {}",
-                        input.server_id, host_key_id, imported.fingerprint
-                    ),
-                    resource: host_key_id,
-                    resource_type: st::RESOURCE_TYPE_HOST_KEY.to_string(),
-                },
+                st::host_key_already_exists(&host_key_id),
             )
             .into());
         }

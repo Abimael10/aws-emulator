@@ -28,7 +28,8 @@
 use serde_json::{json, Value};
 
 use crate::harness::{
-    member_of, Answer, Emulator, PAST_START_SPAN, PAST_STOP_SPAN, ROLE, SSH_KEY,
+    generated_host_key, generated_rsa_host_key_pems, member_of, Answer, Emulator, PAST_START_SPAN,
+    PAST_STOP_SPAN, ROLE, SSH_KEY,
 };
 
 /// A name at `UserName`'s modelled upper length bound (`len 3..100`, pattern
@@ -247,6 +248,112 @@ async fn a_duplicate_ssh_public_key_is_refused_with_the_fixed_duplicate_key_text
     }
 
     assert_same_message("the duplicate-key condition", &messages);
+}
+
+/// RULE: an `ImportHostKey` for material the server already holds is refused with the
+/// service's fixed duplicate-host-key text, which carries neither the server the request
+/// named, the id of the key already held, nor a fingerprint of the submitted material —
+/// the identifier a caller needs travels in `Resource`.
+///
+/// The rows differ along the container the material arrives in and the key class inside
+/// it, whether the repeat re-sends the same bytes or the same key in another container,
+/// and what else the repeat carries (a description, tags, the other storage type, or
+/// nothing at all).
+#[tokio::test]
+async fn a_duplicate_host_key_is_refused_with_the_fixed_duplicate_host_key_text() {
+    let emulator = Emulator::new();
+    let (rsa_pkcs1, rsa_pkcs8) = generated_rsa_host_key_pems();
+    let (openssh, _) = generated_host_key();
+    let (other_openssh, _) = generated_host_key();
+
+    // (case, the material imported first, the material the repeat sends, the members the
+    // repeat adds on top of `ServerId` and `HostKeyBody`)
+    let cases: Vec<(&str, &str, &str, Value)> = vec![
+        (
+            "a PKCS#1 RSA PEM key re-sent identically",
+            rsa_pkcs1.as_str(),
+            rsa_pkcs1.as_str(),
+            json!({"Description": "k1"}),
+        ),
+        (
+            "the same RSA key re-sent in the PKCS#8 container",
+            rsa_pkcs1.as_str(),
+            rsa_pkcs8.as_str(),
+            json!({"Description": "k1-dup"}),
+        ),
+        (
+            "an OpenSSH ed25519 key re-sent with tags and the other storage type",
+            openssh.as_str(),
+            openssh.as_str(),
+            json!({"StorageType": "SECRETS_MANAGER", "Tags": [{"Key": "env", "Value": "prod"}]}),
+        ),
+        (
+            "a second ed25519 key re-sent with nothing else at all",
+            other_openssh.as_str(),
+            other_openssh.as_str(),
+            json!({}),
+        ),
+    ];
+
+    let mut messages: Vec<(String, String)> = Vec::new();
+    for (case, first, repeat, added) in cases {
+        // A server of its own per row: a host key's identity is per server, so each row
+        // starts from a server holding nothing but the key the service made for it.
+        let server_id = emulator.create_server(json!({})).await;
+        let imported = emulator
+            .call(
+                "ImportHostKey",
+                json!({"ServerId": &server_id, "HostKeyBody": first}),
+            )
+            .await;
+        assert_eq!(
+            imported.status, 200,
+            "case {case:?}: expected the first import to succeed, got {} with body {}",
+            imported.status, imported.body
+        );
+        let held = imported
+            .get("HostKeyId")
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: ImportHostKey answered no id: {}", imported.body))
+            .to_string();
+
+        let mut request = json!({"ServerId": &server_id, "HostKeyBody": repeat});
+        for (member, value) in added.as_object().expect("the added members are an object") {
+            request[member] = value.clone();
+        }
+        let answer = emulator.call("ImportHostKey", request).await;
+
+        // 409 is `ResourceExistsException`'s modelled `@httpError`. Neither the request's
+        // own values, nor the held key's id, nor any fingerprint of the material may reach
+        // the text.
+        let message = assert_fixed_message(
+            case,
+            &answer,
+            409,
+            "ResourceExistsException",
+            "Host key already exists",
+            &[server_id.as_str(), held.as_str(), "SHA256:", repeat],
+        );
+        assert_eq!(
+            member_text(&answer.body, "Resource"),
+            held,
+            "case {case:?}: expected the held key's id in Resource, got {}",
+            answer.body
+        );
+        assert!(
+            !member_text(&answer.body, "ResourceType").is_empty(),
+            "case {case:?}: ResourceType is modelled required, got {}",
+            answer.body
+        );
+        assert!(
+            member_of(&answer.body, "HostKeyId").is_null(),
+            "case {case:?}: expected a refused import to mint no id, got {}",
+            answer.body
+        );
+        messages.push((case.to_string(), message));
+    }
+
+    assert_same_message("the duplicate-host-key condition", &messages);
 }
 
 /// RULE: the not-found text is per RESOURCE KIND, so an unresolvable public key id, an

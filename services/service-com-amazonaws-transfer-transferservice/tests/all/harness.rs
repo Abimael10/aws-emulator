@@ -853,6 +853,33 @@ pub(crate) fn reported_fingerprint(key: &ssh_key::PublicKey) -> String {
     )
 }
 
+/// ONE real RSA 2048 private key in the two PEM containers the service's own documented
+/// host-key generation commands write — the PKCS#1 one `ssh-keygen -t rsa -m PEM` writes
+/// and the PKCS#8 one `-m PKCS8` writes — generated here, so a suite that needs RSA host
+/// key material pastes no key in. Both strings carry the SAME key, which is what lets a
+/// suite send one key in two containers.
+pub(crate) fn generated_rsa_host_key_pems() -> (String, String) {
+    use aws_lc_rs::encoding::AsDer as _;
+
+    let keypair = aws_lc_rs::rsa::KeyPair::generate(aws_lc_rs::rsa::KeySize::Rsa2048)
+        .expect("an RSA 2048 key pair");
+    let pkcs8 = keypair
+        .as_der()
+        .expect("the generated key encodes as PKCS#8 DER");
+    let info = pkcs8::PrivateKeyInfo::try_from(pkcs8.as_ref()).expect("the PKCS#8 key");
+    // A PKCS#8 RSA key's `privateKey` octets ARE the PKCS#1 structure, so the same key in
+    // the PKCS#1 container is that inner DER under the PKCS#1 label.
+    (
+        pem_armour("RSA PRIVATE KEY", info.private_key),
+        pem_armour("PRIVATE KEY", pkcs8.as_ref()),
+    )
+}
+
+/// PEM armour around `der`, written by the crate that implements the container.
+fn pem_armour(label: &str, der: &[u8]) -> String {
+    pkcs1::pem::encode_string(label, pkcs1::pem::LineEnding::LF, der).expect("the PEM")
+}
+
 /// An OpenSSH ED25519 PUBLIC key, in the `key-type key-body comment` form
 /// `ssh-keygen` writes, generated here by the OpenSSH key-format crate — so a suite
 /// that needs a real trusted host key does not paste one in.
