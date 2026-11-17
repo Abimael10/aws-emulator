@@ -134,7 +134,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "TagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    /// A tagging WRITE succeeds with NO CONTENT: this service's tagging mutations — the two
+    /// writes of its shared `/tags/{resourceArn}` surface, whose modelled outputs declare no
+    /// members — answer 204 and no body, which is what the wire this emulator reproduces
+    /// carries. The model publishes the protocol's DEFAULT success code (200) for every one
+    /// of this service's operations alike
+    /// (`smithy_query(query="operation", operation="TagResource")`: `code` 200), so it says
+    /// nothing about which of them answer with content; the status a caller branching on
+    /// "is there a body to parse" needs is the one stated here. `super::super::service::wire`
+    /// is what keeps that promise on the body itself.
+    const SUCCESS_STATUS: u16 = 204u16;
 
     async fn handle(
         &self,

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! How this service's `restJson1` ERROR document reports a modelled exception's `Message`
-//! member.
+//! member, and how it renders a success that carries NO CONTENT.
 //!
 //! RULE: an error document this service answers CARRIES its error shape's `Message` member —
 //! the sentence the refusal words, or JSON `null` for a refusal that words none — so a caller
@@ -30,6 +30,21 @@
 //! A refusal rendered before any handler ran (a value outside a modelled bound, an
 //! authentication failure) does not come through this seam, which is correct: that message is
 //! built from the request and is never absent (see [`super::modelled_refusal`]).
+//!
+//! SECOND RULE, on the SUCCESS half: a response this service answers as no content carries no
+//! body. An operation whose success says "there is nothing here to read" promises the caller
+//! there is nothing to parse, and a client that branches on the status — skipping the body
+//! entirely for a no-content answer — must not be handed one. The framework's generic
+//! serializer writes a body from the output SHAPE alone, so an output structure that declares
+//! no members still renders as the empty JSON object `{}`, which for a no-content status is a
+//! body that may never be read. [`MessageReportedRestJson::serialize_output`] drops it.
+//!
+//! That is keyed on the STATUS the operation projects, never on which operation it is, so
+//! every no-content success of this service is rendered alike and an operation that comes to
+//! answer one needs no entry anywhere. Which operations DO answer no content is each
+//! operation's own `Operation::SUCCESS_STATUS` (`crate::ops::tag_resource`,
+//! `crate::ops::untag_resource`); every other success, body and header included, is the
+//! framework's own.
 
 use aws_smithy_runtime_api::http::{Request, Response};
 use aws_smithy_schema::serde::{SerializableStruct, ShapeDeserializer};
@@ -44,6 +59,9 @@ use serde_json::Value;
 /// documents use for the same member, accepted so a shape that ever declares it is reported
 /// under the same rule.
 const MESSAGE_MEMBER_NAMES: &[&str] = &["Message", "message"];
+
+/// The success status that states a response carries no content, and so carries no body.
+const NO_CONTENT: u16 = 204;
 
 /// The name of `error_schema`'s message member, or `None` for a shape that declares none.
 ///
@@ -135,8 +153,17 @@ impl ServerProtocol for MessageReportedRestJson {
         operation_name: &str,
         success_status: u16,
     ) -> Result<Self::Response, ProtocolError> {
-        self.inner
-            .serialize_output(output, output_schema, operation_name, success_status)
+        let mut response =
+            self.inner
+                .serialize_output(output, output_schema, operation_name, success_status)?;
+        // A no-content success carries no body (see the module docs): whatever the generic
+        // serializer wrote from the output shape — the empty JSON object of an output that
+        // declares no members — is dropped, so the response is the empty one its status
+        // promises. Every other status keeps the body the framework wrote, byte for byte.
+        if response.status().as_u16() == NO_CONTENT {
+            *response.body_mut() = SdkBody::empty();
+        }
+        Ok(response)
     }
 
     fn serialize_error(
@@ -180,6 +207,77 @@ impl ServerProtocol for MessageReportedRestJson {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One row of the success table below: the case, the output and the schema it is
+    /// serialized through, the status the operation projects, and the body bytes expected.
+    type SuccessRow<'a> = (&'a str, &'a dyn SerializableStruct, &'a Schema, u16, &'a [u8]);
+
+    /// RULE on the success half, over the statuses an operation of this service can project:
+    /// a response answered as no content carries NO body, whichever output shape it was
+    /// serialized from, and a response answered with any other status keeps the body the
+    /// framework wrote for that shape — the empty JSON object of an output declaring no
+    /// members included.
+    #[test]
+    fn a_no_content_success_carries_no_body_and_every_other_status_keeps_its_body() {
+        use crate::ops::types::{
+            TagResourceOutput, UntagResourceOutput, TAG_RESOURCE_OUTPUT_SCHEMA,
+            UNTAG_RESOURCE_OUTPUT_SCHEMA,
+        };
+
+        let protocol = MessageReportedRestJson::new();
+        let tag = TagResourceOutput {};
+        let untag = UntagResourceOutput {};
+        // (case, the output, its schema, the status projected, the body bytes expected)
+        let table: [SuccessRow<'_>; 4] = [
+            (
+                "the tag write, answered as no content",
+                &tag,
+                TAG_RESOURCE_OUTPUT_SCHEMA,
+                NO_CONTENT,
+                b"",
+            ),
+            (
+                "the untag write, answered as no content",
+                &untag,
+                UNTAG_RESOURCE_OUTPUT_SCHEMA,
+                NO_CONTENT,
+                b"",
+            ),
+            (
+                "an output declaring no members, answered with content",
+                &tag,
+                TAG_RESOURCE_OUTPUT_SCHEMA,
+                200,
+                b"{}",
+            ),
+            (
+                "another no-content status",
+                &untag,
+                UNTAG_RESOURCE_OUTPUT_SCHEMA,
+                205,
+                b"{}",
+            ),
+        ];
+
+        for (case, output, schema, status, expected) in table {
+            let response = protocol
+                .serialize_output(output, schema, "TagResource", status)
+                .unwrap_or_else(|error| panic!("case {case:?}: expected a response ({error})"));
+            assert_eq!(
+                response.status().as_u16(),
+                status,
+                "case {case:?}: expected the projected status to survive, got {}",
+                response.status().as_u16()
+            );
+            assert_eq!(
+                response.body().bytes(),
+                Some(expected),
+                "case {case:?}: expected the body {:?}, got {:?}",
+                String::from_utf8_lossy(expected),
+                response.body().bytes().map(String::from_utf8_lossy)
+            );
+        }
+    }
 
     /// RULE over the bodies the renderer can hand this seam: a worded message survives
     /// verbatim — the empty string included, which is a worded message and not "none" — and

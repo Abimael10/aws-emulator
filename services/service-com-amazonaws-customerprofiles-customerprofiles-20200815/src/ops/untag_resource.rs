@@ -126,7 +126,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "UntagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UNTAG_RESOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UNTAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    /// A tagging WRITE succeeds with NO CONTENT — the removal half of the surface answers
+    /// exactly as the addition half does; see `crate::ops::tag_resource` for why the model's
+    /// published default success code does not decide this.
+    const SUCCESS_STATUS: u16 = 204u16;
 
     async fn handle(
         &self,

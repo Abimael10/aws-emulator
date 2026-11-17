@@ -2,7 +2,12 @@
 
 //! End-to-end tests for `TagResource`, `ListTagsForResource` and `UntagResource`.
 //!
-//! The rule under test: the tagging trio names its subject by the ARN of a Customer
+//! Two rules under test. The SUCCESS STATUS of the two tagging MUTATIONS: a write through
+//! this surface carries no content, so `TagResource` and `UntagResource` answer HTTP 204 with
+//! no body at all — never the protocol-default 200 with an empty JSON object — while the
+//! report beside them answers 200 with its map.
+//!
+//! The second rule: the tagging trio names its subject by the ARN of a Customer
 //! Profiles resource — `arn:<partition>:profile:<region>:<account>:` followed by the
 //! resource's own URI path — so every resource this emulator holds tags for is reachable
 //! through it. A tag attaches to the record that resource's own operations wrote, the
@@ -91,6 +96,20 @@ async fn untag(emulator: &Emulator, resource_arn: &str, tag_keys: &[&str]) -> (u
             None,
         )
         .await
+}
+
+/// The status a tagging WRITE answers: no content, so there is nothing to parse.
+const NO_CONTENT: u16 = 204;
+
+/// Assert one tagging write answered its no-content success: the status that says a response
+/// carries nothing, and a body that carries nothing — the harness reads an empty body as
+/// `Value::Null`, so an empty JSON object would be seen here as the object it is.
+fn assert_no_content(case: &str, operation: &str, status: u16, body: &Value) {
+    assert_eq!(
+        (status, body),
+        (NO_CONTENT, &Value::Null),
+        "case {case:?} {operation}: expected {NO_CONTENT} and no body, got {status} {body:?}"
+    );
 }
 
 /// A tag map as a comparison reads it, whichever order the response rendered it in.
@@ -205,10 +224,7 @@ async fn every_resource_kind_an_arn_names_tags_lists_and_untags() {
             json!({ "owner": "crm", "cost-center": "42" }),
         )
         .await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: expected TagResource 200, got {status} {body:?}"
-        );
+        assert_no_content(case, "TagResource", status, &body);
         let mut expected_now = at_create.clone();
         expected_now.insert("owner".to_string(), "crm".to_string());
         expected_now.insert("cost-center".to_string(), "42".to_string());
@@ -221,10 +237,7 @@ async fn every_resource_kind_an_arn_names_tags_lists_and_untags() {
         // Replaced: "If you specify a tag key that is already associated with the resource,
         // the new tag value that you specify replaces the previous value for that tag."
         let (status, body) = tag(&emulator, &resource_arn, json!({ "owner": "support" })).await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: expected TagResource 200 on a key already carried, got {status} {body:?}"
-        );
+        assert_no_content(case, "TagResource on a key already carried", status, &body);
         expected_now.insert("owner".to_string(), "support".to_string());
         assert_eq!(
             reported(&emulator, case, &resource_arn).await,
@@ -235,10 +248,7 @@ async fn every_resource_kind_an_arn_names_tags_lists_and_untags() {
         // Removed: the keys the request names, and no others. A key the resource does not
         // carry removes nothing and is not an error.
         let (status, body) = untag(&emulator, &resource_arn, &["owner", "never-set"]).await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: expected UntagResource 200, got {status} {body:?}"
-        );
+        assert_no_content(case, "UntagResource", status, &body);
         expected_now.remove("owner");
         assert_eq!(
             reported(&emulator, case, &resource_arn).await,
@@ -285,7 +295,7 @@ async fn domain_tags_are_one_set_across_get_domain_and_the_tagging_surface() {
     );
 
     let (status, body) = tag(&emulator, &resource_arn, json!({ "stage": "beta" })).await;
-    assert_eq!(status, 200, "TagResource: got {status} {body:?}");
+    assert_no_content("a domain created with tags", "TagResource", status, &body);
     let mut after = at_create.clone();
     after.insert("stage".to_string(), "beta".to_string());
     assert_eq!(
@@ -449,10 +459,7 @@ async fn an_untag_that_removes_nothing_leaves_the_record_as_it_was() {
         ("several keys it never carried", vec!["a", "b", "c"]),
     ] {
         let (status, body) = untag(&emulator, &resource_arn, &keys).await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: expected UntagResource 200, got {status} {body:?}"
-        );
+        assert_no_content(case, "UntagResource", status, &body);
         let (status, after) = emulator
             .send("GET", "/domains/nooptag/object-types/Contact_Record", None)
             .await;
@@ -469,9 +476,9 @@ async fn an_untag_that_removes_nothing_leaves_the_record_as_it_was() {
 
     // The same request once the resource DOES carry tags removes only what it names.
     let (status, body) = tag(&emulator, &resource_arn, json!({ "env": "dev" })).await;
-    assert_eq!(status, 200, "TagResource: got {status} {body:?}");
+    assert_no_content("an object type now carrying a tag", "TagResource", status, &body);
     let (status, body) = untag(&emulator, &resource_arn, &["never-set"]).await;
-    assert_eq!(status, 200, "UntagResource: got {status} {body:?}");
+    assert_no_content("an object type now carrying a tag", "UntagResource", status, &body);
     assert_eq!(
         reported(&emulator, "a key it never carried", &resource_arn).await,
         expected(&[("env", "dev")]),
@@ -493,10 +500,7 @@ async fn a_resource_carries_at_most_the_modelled_number_of_tags() {
         .collect::<serde_json::Map<String, Value>>()
         .into();
     let (status, body) = tag(&emulator, &resource_arn, full).await;
-    assert_eq!(
-        status, 200,
-        "case at the maximum: expected TagResource 200, got {status} {body:?}"
-    );
+    assert_no_content("at the maximum", "TagResource", status, &body);
     assert_eq!(
         reported(&emulator, "at the maximum", &resource_arn).await.len(),
         MAX_TAGS_PER_RESOURCE,
@@ -505,10 +509,7 @@ async fn a_resource_carries_at_most_the_modelled_number_of_tags() {
 
     // A key it already carries is not growth, so it is still served at the maximum.
     let (status, body) = tag(&emulator, &resource_arn, json!({ "k0": "replaced" })).await;
-    assert_eq!(
-        status, 200,
-        "case a replacement at the maximum: expected TagResource 200, got {status} {body:?}"
-    );
+    assert_no_content("a replacement at the maximum", "TagResource", status, &body);
 
     // One more key is one too many: refused, and nothing written.
     let (status, body) = tag(&emulator, &resource_arn, json!({ "one-too-many": "x" })).await;
@@ -527,5 +528,107 @@ async fn a_resource_carries_at_most_the_modelled_number_of_tags() {
         held.get("k0").map(String::as_str),
         Some("replaced"),
         "case one past the maximum: expected the replacement to have stood, got {held:?}"
+    );
+}
+
+/// A tagging MUTATION answers its success as no content — HTTP 204 with no body — over a
+/// table spanning what the rule generalises over: which of the two writes it is, how many
+/// entries the request carries (one, several, every one the resource holds, the modelled
+/// maximum), and whether the write changes the stored set at all (a new key, a replacement of
+/// a key already carried, a removal of a key never carried). None of that is the status: a
+/// write of this surface has nothing to report, so every row answers alike.
+///
+/// The REPORT beside them is the contrast: it carries a map, so it answers 200 with a body —
+/// the no-content projection belongs to the writes, not to the surface.
+#[tokio::test]
+async fn every_tagging_mutation_answers_no_content_with_no_body() {
+    let emulator = Emulator::new();
+    emulator.create_domain("statusdom", 366).await;
+    put_contact_type(&emulator, "statusdom", "Contact_Record", true).await;
+    let domain_arn = arn("domains/statusdom");
+    let object_type_arn = arn("domains/statusdom/object-types/Contact_Record");
+
+    // Every entry of the maximum this store holds per resource, in one request: the largest
+    // write the surface serves is still a write with nothing to report.
+    let full: Value = (0..MAX_TAGS_PER_RESOURCE)
+        .map(|index| (format!("k{index}"), Value::from(format!("v{index}"))))
+        .collect::<serde_json::Map<String, Value>>()
+        .into();
+    let every_key: Vec<String> = (0..MAX_TAGS_PER_RESOURCE)
+        .map(|index| format!("k{index}"))
+        .collect();
+
+    // (case, the ARN, the write to make)
+    for (case, resource_arn, write) in [
+        ("one new key", &domain_arn, json!({ "stage": "probe" })),
+        (
+            "several new keys",
+            &domain_arn,
+            json!({ "owner": "crm", "cost-center": "42" }),
+        ),
+        (
+            "a key already carried, whose value is replaced",
+            &domain_arn,
+            json!({ "stage": "live" }),
+        ),
+        (
+            "the same value written again, which changes nothing",
+            &domain_arn,
+            json!({ "stage": "live" }),
+        ),
+        (
+            "a resource whose own create stored no tags at all",
+            &object_type_arn,
+            json!({ "stage": "probe" }),
+        ),
+    ] {
+        let (status, body) = tag(&emulator, resource_arn, write).await;
+        assert_no_content(case, "TagResource", status, &body);
+    }
+
+    for (case, resource_arn, keys) in [
+        ("one key the resource carries", &domain_arn, vec!["stage"]),
+        (
+            "several keys the resource carries",
+            &domain_arn,
+            vec!["owner", "cost-center"],
+        ),
+        (
+            "a key the resource never carried, which removes nothing",
+            &domain_arn,
+            vec!["never-set"],
+        ),
+        (
+            "a resource carrying no tag map at all",
+            &arn("domains/statusdom/object-types/Contact_Record"),
+            vec!["stage"],
+        ),
+    ] {
+        let (status, body) = untag(&emulator, resource_arn, &keys).await;
+        assert_no_content(case, "UntagResource", status, &body);
+    }
+
+    // The widest pair: the maximum written in one request, then every one of those keys
+    // removed in one request.
+    let (status, body) = tag(&emulator, &domain_arn, full).await;
+    assert_no_content("the modelled maximum in one request", "TagResource", status, &body);
+    let keys: Vec<&str> = every_key.iter().map(String::as_str).collect();
+    let (status, body) = untag(&emulator, &domain_arn, &keys).await;
+    assert_no_content("every key the resource carries", "UntagResource", status, &body);
+    assert_eq!(
+        reported(&emulator, "after removing every key", &domain_arn).await,
+        BTreeMap::new(),
+        "expected the removals to have been applied behind the no-content answers"
+    );
+
+    // The report is not a write: it carries a map, so it answers with content.
+    let (status, body) = list_tags(&emulator, &domain_arn).await;
+    assert_eq!(
+        status, 200,
+        "case \"the report beside the writes\": expected 200, got {status} {body:?}"
+    );
+    assert!(
+        body.get("tags").is_some(),
+        "case \"the report beside the writes\": expected a body carrying the map, got {body:?}"
     );
 }
