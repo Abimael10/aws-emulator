@@ -32,13 +32,30 @@
 //!    id stops resolving and its ARN leaves the listing — a later create for the same
 //!    rule mints a FRESH handle, which is why the digits of an id are a per-run value
 //!    and only its form and its stability are requirements.
+//! 5. However often the create for one `(Region, RuleId)` is issued, the account holds
+//!    ONE association under ONE identity, and the BYTES every payload naming it arrives
+//!    as carry that identity once: a replayed `ClientToken` answers with the association
+//!    the first call made (`ClientToken` is `@idempotencyToken` —
+//!    `smithy_query(operation="CreateCustomDetectionRuleAssociation")`), a create for a
+//!    rule the account has already associated is the modelled 409 and mints nothing, and
+//!    the id a read echoes is byte-for-byte the id its own path label carried. Asserted
+//!    on the serialized body rather than on the parsed one, because parsing collapses a
+//!    member's JSON type, its case and the whitespace around it (the assertion itself is
+//!    whitespace-tolerant, so it pins the member and its value rather than a serializer's
+//!    spacing). The `ClientToken`
+//!    dimension overlaps the parsed-level replay rows of the
+//!    `custom_detection_rule_association_delete` suite on purpose: what is new here is
+//!    the serialized comparison and the repeat-create paths that carry no idempotency
+//!    key, so the two are not independent evidence of the same thing.
 //!
 //! Every `AssociationId` here is read off the emulator's own response: none is written
 //! into the test, because the value is minted per run.
 
 use serde_json::{json, Value};
 
-use crate::detector_lifecycle::{call_in, error_code, new_router, published_rule_ids, Router};
+use crate::detector_lifecycle::{
+    call_bytes_in, call_in, error_code, new_router, published_rule_ids, Router,
+};
 
 /// `CreateCustomDetectionRuleAssociation` and `ListCustomDetectionRuleAssociations`
 /// are both bound at `/custom-detection-rule/association` (POST and GET)
@@ -461,6 +478,279 @@ async fn an_associations_id_survives_a_mode_update_and_dies_with_the_association
                     "case {case:?}: the new association must read back under its own id, got {read_back:?}"
                 );
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rule 5: one identity per (Region, RuleId), carried once by the BYTES of every
+// payload that names it, however often the create is issued.
+// ---------------------------------------------------------------------------
+
+/// The `ClientToken` shapes a create is issued under: none at all, the EMPTY one, the
+/// shortest non-empty token and the longest — `ClientToken` is `len 0..64`
+/// (`smithy_query(operation="CreateCustomDetectionRuleAssociation")`), so the empty
+/// string is as well formed as the other three and names no idempotency key, which is
+/// why a create carrying it is a create and not a replay.
+fn client_tokens() -> Vec<Option<String>> {
+    vec![
+        None,
+        Some(String::new()),
+        Some("t".to_string()),
+        Some("k".repeat(64)),
+    ]
+}
+
+/// Whether `token` names an idempotency key a later create can replay: a create that
+/// carries no `ClientToken`, or an empty one, names none, so re-issuing it is a second
+/// create of the same pair rather than a replay of the first.
+fn replayable(token: Option<&str>) -> bool {
+    token.is_some_and(|token| !token.is_empty())
+}
+
+/// A `ClientToken` no create of a case ever carried, so a repeat create under it takes
+/// the CONFLICT path rather than the replay path.
+const UNUSED_CLIENT_TOKEN: &str = "a-token-no-create-here-carried";
+
+/// Assert that `raw` — a response body as the service SERIALIZED it — names the
+/// association `arn` under the identity `id` exactly once.
+///
+/// Read off the bytes rather than off the parsed payload: parsing collapses a member's
+/// JSON type, its case and the whitespace around it, and a second `associationId` member
+/// in one payload would be collapsed away with them, yet either would leave a client
+/// holding a handle the service does not accept. Matched against the body with its
+/// whitespace removed, so the claim is about the member and its value and not about the
+/// spacing a serializer chooses: neither an `AssociationId` (`^[a-zA-Z0-9_-]{1,64}$`) nor
+/// an ARN can carry whitespace of its own, so removing it cannot make a value match that
+/// did not.
+fn assert_one_serialized_identity(raw: &str, id: &str, arn: &str, case: &str) {
+    let compact: String = raw.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    assert_eq!(
+        compact.matches("\"associationId\"").count(),
+        1,
+        "case {case:?}: expected one associationId member in the body, got {raw:?}"
+    );
+    let member = format!("\"associationId\":\"{id}\"");
+    assert!(
+        compact.contains(&member),
+        "case {case:?}: expected the body to carry {member}, got {raw:?}"
+    );
+    let member_arn = format!("\"arn\":\"{arn}\"");
+    assert!(
+        compact.contains(&member_arn),
+        "case {case:?}: expected the body to carry {member_arn}, got {raw:?}"
+    );
+}
+
+/// Issue one create and return the status, the response body's raw bytes and that body
+/// parsed out of those same bytes.
+async fn create_bytes(
+    router: &Router,
+    region: &str,
+    request: Value,
+    case: &str,
+) -> (u16, String, Value) {
+    let (status, raw) = call_bytes_in(router, region, "POST", ASSOCIATIONS_PATH, Some(request)).await;
+    let parsed = if raw.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_str(&raw).unwrap_or_else(|error| {
+            panic!("case {case:?}: expected a JSON body, got {raw:?} ({error})")
+        })
+    };
+    (status, raw, parsed)
+}
+
+/// The create request body for `(rule_id, mode)`, carrying `token` when the case names
+/// one.
+fn create_request(rule_id: &str, mode: &str, token: Option<&str>) -> Value {
+    let mut request = json!({"ruleId": rule_id, "mode": mode});
+    if let Some(token) = token {
+        request["clientToken"] = json!(token);
+    }
+    request
+}
+
+/// One row of the table below: the Region the create is sent through, the rule it binds,
+/// the mode it asks for, the mode a replay then names instead, the `ClientToken` the
+/// create carries, and another published rule the same Region leaves free.
+struct Row {
+    region: &'static str,
+    rule_id: String,
+    mode: &'static str,
+    other_mode: &'static str,
+    token: Option<String>,
+    free_rule: String,
+}
+
+/// Every row the rule is asserted over: each Region, several published rules, both
+/// modes, and each `ClientToken` shape ([`client_tokens`]) — so the table spans every
+/// way a repeat create can arrive (carrying no token, an empty one, the token the first
+/// call used, or one it did not).
+fn rows(catalogue: &[String]) -> Vec<Row> {
+    let mut rows = Vec::new();
+    for region in REGIONS {
+        for (rule_index, rule_id) in catalogue.iter().take(3).enumerate() {
+            for (mode_index, mode) in MODES.iter().enumerate() {
+                for token in client_tokens() {
+                    rows.push(Row {
+                        region,
+                        rule_id: rule_id.clone(),
+                        mode,
+                        other_mode: MODES[(mode_index + 1) % MODES.len()],
+                        token,
+                        free_rule: catalogue[(rule_index + 1) % catalogue.len()].clone(),
+                    });
+                }
+            }
+        }
+    }
+    rows
+}
+
+#[tokio::test]
+async fn however_often_the_create_is_issued_one_association_keeps_one_serialized_identity() {
+    let catalogue = published_rule_ids(&new_router()).await;
+
+    for row in rows(&catalogue) {
+        let Row {
+            region,
+            rule_id,
+            mode,
+            other_mode,
+            token,
+            free_rule,
+        } = row;
+        let shape = match token.as_deref() {
+            Some("") => "an empty clientToken".to_string(),
+            Some(token) => format!("a {}-character clientToken", token.len()),
+            None => "no clientToken".to_string(),
+        };
+        let case = format!("{rule_id}/{mode} in {region} created under {shape}");
+        let router = new_router();
+
+        let (status, raw, body) = create_bytes(
+            &router,
+            region,
+            create_request(&rule_id, mode, token.as_deref()),
+            &case,
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: create-association expected 200, got {status} {raw:?}"
+        );
+        let created = body["ruleAssociation"].clone();
+        let id = identity(&created, &case);
+        let arn = created["arn"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: expected an arn, got {created:?}"))
+            .to_string();
+        assert_one_serialized_identity(&raw, &id, &arn, &case);
+
+        // The read reached THROUGH that id echoes it back in the same bytes the path
+        // label carried, so the value a client sent and the value it got back are
+        // interchangeable.
+        let read_path = format!("{RULES_PATH}/{rule_id}/association/{id}");
+        let (status, raw_read) = call_bytes_in(&router, region, "GET", &read_path, None).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: get-association expected 200, got {status} {raw_read:?}"
+        );
+        assert_one_serialized_identity(&raw_read, &id, &arn, &case);
+
+        // A create replaying the token the first call carried answers with the
+        // association that call made — the same record, so the same bytes.
+        if replayable(token.as_deref()) {
+            let replay_case = format!("{case}, replayed under its own token");
+            // The replay is a pure lookup on the token, so it answers with the first
+            // call's association whatever else the replaying request names: one that
+            // names the OTHER mode is still that association.
+            let (status, raw_replay, replayed) = create_bytes(
+                &router,
+                region,
+                create_request(&rule_id, other_mode, token.as_deref()),
+                &replay_case,
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {replay_case:?}: a replayed clientToken expects 200, got {status} {raw_replay:?}"
+            );
+            assert_one_serialized_identity(&raw_replay, &id, &arn, &replay_case);
+            assert_eq!(
+                raw_replay, raw,
+                "case {replay_case:?}: a replay must answer with the association the first call made, got {replayed:?}"
+            );
+        }
+
+        // A create for a rule this account has already associated is the modelled
+        // conflict, and it mints nothing: the one identity the rule carries is still the
+        // one the first create reported. Asserted under a token the first call never
+        // used, and — where the row's own token names no idempotency key — for the
+        // IDENTICAL request re-issued, the retry a client makes when it kept no token.
+        let mut repeats = vec![(
+            format!("{case}, created again under an unused token"),
+            create_request(&rule_id, mode, Some(UNUSED_CLIENT_TOKEN)),
+        )];
+        if !replayable(token.as_deref()) {
+            repeats.push((
+                format!("{case}, re-issued exactly as it was"),
+                create_request(&rule_id, mode, token.as_deref()),
+            ));
+        }
+        for (repeat_case, request) in repeats {
+            let (status, _, refused) = create_bytes(&router, region, request, &repeat_case).await;
+            assert_eq!(
+                status, 409,
+                "case {repeat_case:?}: expected the modelled 409, got {status} {refused:?}"
+            );
+            assert_eq!(
+                error_code(&refused),
+                "ConflictException",
+                "case {repeat_case:?}: expected the ConflictException class, got {refused:?}"
+            );
+        }
+
+        let (status, raw_again) = call_bytes_in(&router, region, "GET", &read_path, None).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the first identity must still resolve after a refused repeat create, got {status} {raw_again:?}"
+        );
+        assert_eq!(
+            raw_again, raw_read,
+            "case {case:?}: a refused create must leave the association alone, got {raw_again:?}"
+        );
+
+        // One association of the rule, listed once, under that same identity: the ARN a
+        // caller selects an entry by names the id it then acts on.
+        let entries = listed_associations(
+            &router,
+            region,
+            &format!("?maxResults={MAX_RESULTS}&ruleId={rule_id}"),
+        )
+        .await;
+        assert_eq!(
+            entries.len(),
+            1,
+            "case {case:?}: expected the rule to carry one association, got {entries:?}"
+        );
+        let entry = entry_with_arn(&entries, &arn, &case);
+        assert_eq!(
+            identity(&entry, &case),
+            id,
+            "case {case:?}: the listing must advertise the identity the create reported, got {entry:?}"
+        );
+
+        // Another published rule is still free here, and the association it takes is its
+        // own: one identity per (Region, RuleId), never one per call.
+        if free_rule != rule_id {
+            let other = associate(&router, region, &free_rule, mode).await;
+            let other_id = identity(&other, &case);
+            assert_ne!(
+                other_id, id,
+                "case {case:?}: another rule's association must carry its own identity, got {other:?}"
+            );
         }
     }
 }
