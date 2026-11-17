@@ -82,6 +82,10 @@ impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Stream for 
 struct Client {
     session: Session,
     correlation: i32,
+    /// Whether this connection's SASL tokens travel UNWRAPPED, which is what the
+    /// version it handshaked at selects: bare, length-prefixed byte strings at version 0
+    /// and `SaslAuthenticate` requests from version 1 on.
+    unwrapped_sasl: bool,
 }
 
 impl Client {
@@ -93,6 +97,7 @@ impl Client {
         Self {
             session: Box::new(dial(case, authority).await),
             correlation: 0,
+            unwrapped_sasl: false,
         }
     }
 
@@ -121,6 +126,7 @@ impl Client {
         Self {
             session: Box::new(stream),
             correlation: 0,
+            unwrapped_sasl: false,
         }
     }
 
@@ -210,12 +216,28 @@ impl Client {
 
     /// Complete the SASL exchange `mechanism` defines, answering the error code of its
     /// last leg: `0` for an authenticated connection.
+    ///
+    /// The tokens travel inside `SaslAuthenticate`, which is the framing a handshake at
+    /// version 1 selects; [`Client::authenticate_at`] drives the other one.
     async fn authenticate(&mut self, case: &str, mechanism: &str, password: &str) -> i16 {
+        self.authenticate_at(case, mechanism, password, 1).await
+    }
+
+    /// The same exchange, with the tokens in the framing a `SaslHandshake` at
+    /// `handshake_version` selects: bare, length-prefixed byte strings at version 0 and
+    /// `SaslAuthenticate` requests from version 1 on.
+    async fn authenticate_at(
+        &mut self,
+        case: &str,
+        mechanism: &str,
+        password: &str,
+        handshake_version: i16,
+    ) -> i16 {
         let handshake: SaslHandshakeResponse = self
             .call(
                 case,
                 ApiKey::SaslHandshake,
-                1,
+                handshake_version,
                 &SaslHandshakeRequest::default()
                     .with_mechanism(StrBytes::from_string(mechanism.to_string())),
             )
@@ -223,6 +245,7 @@ impl Client {
         if handshake.error_code != 0 {
             return handshake.error_code;
         }
+        self.unwrapped_sasl = handshake_version == 0;
         match mechanism {
             OAUTHBEARER => {
                 // RFC 7628 §3.1: the GS2 header, then `auth=Bearer <token>`. The token
@@ -240,17 +263,16 @@ impl Client {
                     .replace('/', "_")
                     .trim_end_matches('=')
                     .to_string();
-                let answered: SaslAuthenticateResponse = self
-                    .call(
+                match self
+                    .sasl_token(
                         case,
-                        ApiKey::SaslAuthenticate,
-                        2,
-                        &SaslAuthenticateRequest::default().with_auth_bytes(Bytes::from(
-                            format!("n,,\x01auth=Bearer {token}\x01\x01").into_bytes(),
-                        )),
+                        format!("n,,\x01auth=Bearer {token}\x01\x01").into_bytes(),
                     )
-                    .await;
-                answered.error_code
+                    .await
+                {
+                    Ok(_) => 0,
+                    Err(code) => code,
+                }
             }
             AWS_MSK_IAM => {
                 let payload = json!({
@@ -265,39 +287,85 @@ impl Client {
                     "x-amz-signedheaders": "host",
                     "x-amz-signature": password,
                 });
-                let answered: SaslAuthenticateResponse = self
-                    .call(
-                        case,
-                        ApiKey::SaslAuthenticate,
-                        2,
-                        &SaslAuthenticateRequest::default()
-                            .with_auth_bytes(Bytes::from(payload.to_string().into_bytes())),
-                    )
-                    .await;
-                answered.error_code
+                match self
+                    .sasl_token(case, payload.to_string().into_bytes())
+                    .await
+                {
+                    Ok(_) => 0,
+                    Err(code) => code,
+                }
             }
             _ => self.scram(case, password).await,
         }
     }
 
-    /// The SCRAM-SHA-512 exchange of RFC 5802, client side.
+    /// One leg of the exchange: `token` sent in this connection's framing, answered with
+    /// the server's token.
+    ///
+    /// `Err` carries the error code the leg was refused with. The unwrapped framing has
+    /// nowhere to carry one — a broker refusing such an exchange closes the connection,
+    /// which is what version 0 of the handshake defines — so a closed connection is
+    /// reported as the authentication failure it is.
+    async fn sasl_token(&mut self, case: &str, token: Vec<u8>) -> Result<Bytes, i16> {
+        if !self.unwrapped_sasl {
+            let answered: SaslAuthenticateResponse = self
+                .call(
+                    case,
+                    ApiKey::SaslAuthenticate,
+                    2,
+                    &SaslAuthenticateRequest::default().with_auth_bytes(Bytes::from(token)),
+                )
+                .await;
+            return match answered.error_code {
+                0 => Ok(answered.auth_bytes),
+                code => Err(code),
+            };
+        }
+        let length = u32::try_from(token.len()).expect("a SASL token fits in a u32");
+        self.session
+            .write_all(&length.to_be_bytes())
+            .await
+            .unwrap_or_else(|error| panic!("case {case:?}: the token must be written: {error}"));
+        self.session
+            .write_all(&token)
+            .await
+            .unwrap_or_else(|error| panic!("case {case:?}: the token must be written: {error}"));
+        self.server_token()
+            .await
+            .ok_or_else(|| ::kafka_protocol::ResponseError::SaslAuthenticationFailed.code())
+    }
+
+    /// The server's next UNWRAPPED token: its length, then that many bytes. An EMPTY
+    /// token is a token — it is how a mechanism whose last leg carries no data says the
+    /// exchange succeeded — so a zero length is read as one rather than as a closed
+    /// connection.
+    async fn server_token(&mut self) -> Option<Bytes> {
+        let mut length = [0u8; 4];
+        if self.session.read_exact(&mut length).await.is_err() {
+            return None;
+        }
+        let length = u32::from_be_bytes(length) as usize;
+        if length > 8 * 1024 * 1024 {
+            return None;
+        }
+        let mut token = vec![0u8; length];
+        self.session.read_exact(&mut token).await.ok()?;
+        Some(Bytes::from(token))
+    }
+
+    /// The SCRAM-SHA-512 exchange of RFC 5802, client side, with each leg sent in this
+    /// connection's token framing.
     async fn scram(&mut self, case: &str, password: &str) -> i16 {
         let client_nonce = "fyko+d2lbbFgONRv9qkxdawL";
         let client_first_bare = format!("n={SCRAM_USER},r={client_nonce}");
-        let first: SaslAuthenticateResponse = self
-            .call(
-                case,
-                ApiKey::SaslAuthenticate,
-                2,
-                &SaslAuthenticateRequest::default().with_auth_bytes(Bytes::from(
-                    format!("n,,{client_first_bare}").into_bytes(),
-                )),
-            )
-            .await;
-        if first.error_code != 0 {
-            return first.error_code;
-        }
-        let server_first = String::from_utf8(first.auth_bytes.to_vec())
+        let first = match self
+            .sasl_token(case, format!("n,,{client_first_bare}").into_bytes())
+            .await
+        {
+            Ok(answered) => answered,
+            Err(code) => return code,
+        };
+        let server_first = String::from_utf8(first.to_vec())
             .unwrap_or_else(|_| panic!("case {case:?}: the server-first message must be text"));
         let mut combined_nonce = String::new();
         let mut salt = Vec::new();
@@ -346,29 +414,26 @@ impl Client {
             "{without_proof},p={}",
             ::aws_smithy_types::base64::encode(&proof)
         );
-        let last: SaslAuthenticateResponse = self
-            .call(
-                case,
-                ApiKey::SaslAuthenticate,
-                2,
-                &SaslAuthenticateRequest::default()
-                    .with_auth_bytes(Bytes::from(client_final.into_bytes())),
-            )
+        let last = self
+            .sasl_token(case, client_final.into_bytes())
             .await;
-        if last.error_code == 0 {
-            let server_final = String::from_utf8(last.auth_bytes.to_vec()).unwrap_or_default();
-            let server_key = hmac_sha512(&salted, b"Server Key");
-            let expected = ::aws_smithy_types::base64::encode(hmac_sha512(
-                &server_key,
-                auth_message.as_bytes(),
-            ));
-            assert_eq!(
-                server_final,
-                format!("v={expected}"),
-                "case {case:?}: the server must prove it holds the same credential"
-            );
+        match last {
+            Ok(answered) => {
+                let server_final = String::from_utf8(answered.to_vec()).unwrap_or_default();
+                let server_key = hmac_sha512(&salted, b"Server Key");
+                let expected = ::aws_smithy_types::base64::encode(hmac_sha512(
+                    &server_key,
+                    auth_message.as_bytes(),
+                ));
+                assert_eq!(
+                    server_final,
+                    format!("v={expected}"),
+                    "case {case:?}: the server must prove it holds the same credential"
+                );
+                0
+            }
+            Err(code) => code,
         }
-        last.error_code
     }
 }
 
@@ -2946,4 +3011,678 @@ async fn given_secret_associated(
         associated.body
     );
     arn
+}
+
+/// One request/response exchange whose outcome is REPORTED rather than asserted, so a
+/// sweep over many API versions can name every pair that went wrong instead of stopping
+/// at the first.
+impl Client {
+    /// Send `request` at `version` and decode the response that version declares.
+    ///
+    /// `Err` carries what went wrong: a frame this client could not encode, a
+    /// connection the broker closed instead of answering, or a response that does not
+    /// decode as the version declares it.
+    async fn exchange<Request: Encodable, Response: Decodable>(
+        &mut self,
+        key: ApiKey,
+        version: i16,
+        request: &Request,
+    ) -> Result<Response, String> {
+        self.correlation += 1;
+        let mut frame = BytesMut::new();
+        RequestHeader::default()
+            .with_request_api_key(key as i16)
+            .with_request_api_version(version)
+            .with_correlation_id(self.correlation)
+            .with_client_id(Some(StrBytes::from_static_str(CLIENT_ID)))
+            .encode(&mut frame, key.request_header_version(version))
+            .map_err(|error| format!("this suite could not encode the request header: {error}"))?;
+        request
+            .encode(&mut frame, version)
+            .map_err(|error| format!("this suite could not encode the request: {error}"))?;
+        let length = u32::try_from(frame.len()).expect("a request frame fits in a u32");
+        self.session
+            .write_all(&length.to_be_bytes())
+            .await
+            .map_err(|error| format!("the frame could not be written: {error}"))?;
+        self.session
+            .write_all(&frame)
+            .await
+            .map_err(|error| format!("the frame could not be written: {error}"))?;
+        let mut answered = self
+            .answer()
+            .await
+            .ok_or_else(|| "the broker closed the connection instead of answering".to_string())?;
+        ResponseHeader::decode(&mut answered, key.response_header_version(version))
+            .map_err(|error| format!("the response header does not decode: {error}"))?;
+        Response::decode(&mut answered, version)
+            .map_err(|error| format!("the response does not decode: {error}"))
+    }
+
+    /// The next response frame, or `None` when the broker closed the connection or
+    /// framed something this client cannot read.
+    async fn answer(&mut self) -> Option<Bytes> {
+        let mut length = [0u8; 4];
+        if self.session.read_exact(&mut length).await.is_err() {
+            return None;
+        }
+        let length = u32::from_be_bytes(length) as usize;
+        if length == 0 || length > 8 * 1024 * 1024 {
+            return None;
+        }
+        let mut frame = vec![0u8; length];
+        self.session.read_exact(&mut frame).await.ok()?;
+        Some(Bytes::from(frame))
+    }
+}
+
+/// Call `key` at `version` over `client`, with the smallest request that version
+/// declares, reporting what went wrong instead of asserting.
+///
+/// One arm per API this endpoint advertises; an API no arm names is itself reported, so
+/// the sweep below cannot silently skip a newly served one.
+async fn call_at(
+    client: &mut Client,
+    key: ApiKey,
+    version: i16,
+    topic: &str,
+) -> Result<(), String> {
+    use ::kafka_protocol::messages as wire;
+
+    let topic_name = TopicName(StrBytes::from_string(topic.to_string()));
+    let group = wire::GroupId(StrBytes::from_static_str("version-sweep"));
+    match key {
+        ApiKey::ApiVersions => {
+            let mut request = ApiVersionsRequest::default();
+            // The client's own name travels only on the versions that carry it.
+            if version >= 3 {
+                request = request
+                    .with_client_software_name(StrBytes::from_static_str(CLIENT_ID))
+                    .with_client_software_version(StrBytes::from_static_str("1"));
+            }
+            client
+                .exchange::<_, ApiVersionsResponse>(key, version, &request)
+                .await
+                .map(drop)
+        }
+        ApiKey::SaslHandshake => {
+            let request = SaslHandshakeRequest::default()
+                .with_mechanism(StrBytes::from_static_str(SCRAM_SHA_512));
+            client
+                .exchange::<_, SaslHandshakeResponse>(key, version, &request)
+                .await
+                .map(drop)
+        }
+        ApiKey::SaslAuthenticate => {
+            let request = SaslAuthenticateRequest::default()
+                .with_auth_bytes(Bytes::from_static(b"n,,n=nobody,r=nonce"));
+            client
+                .exchange::<_, SaslAuthenticateResponse>(key, version, &request)
+                .await
+                .map(drop)
+        }
+        ApiKey::Metadata => {
+            let request = MetadataRequest::default().with_topics(Some(vec![
+                wire::metadata_request::MetadataRequestTopic::default()
+                    .with_name(Some(topic_name.clone())),
+            ]));
+            client
+                .exchange::<_, MetadataResponse>(key, version, &request)
+                .await
+                .map(drop)
+        }
+        ApiKey::Produce => {
+            let record = Record {
+                transactional: false,
+                control: false,
+                partition_leader_epoch: 0,
+                producer_id: -1,
+                producer_epoch: -1,
+                timestamp_type: TimestampType::Creation,
+                offset: 0,
+                sequence: 0,
+                timestamp: epoch_millis(),
+                key: None,
+                value: Some(Bytes::from_static(b"swept")),
+                headers: Default::default(),
+                delete_horizon: false,
+            };
+            let mut encoded = BytesMut::new();
+            RecordBatchEncoder::encode(
+                &mut encoded,
+                [record].iter(),
+                &RecordEncodeOptions {
+                    version: 2,
+                    compression: Compression::None,
+                },
+            )
+            .map_err(|error| format!("this suite could not encode the batch: {error}"))?;
+            let request = ProduceRequest::default()
+                .with_acks(1)
+                .with_timeout_ms(1_000)
+                .with_topic_data(vec![TopicProduceData::default()
+                    .with_name(topic_name.clone())
+                    .with_partition_data(vec![PartitionProduceData::default()
+                        .with_index(0)
+                        .with_records(Some(encoded.freeze()))])]);
+            client
+                .exchange::<_, ProduceResponse>(key, version, &request)
+                .await
+                .map(drop)
+        }
+        ApiKey::Fetch => {
+            let request = FetchRequest::default()
+                .with_max_wait_ms(0)
+                .with_min_bytes(1)
+                .with_topics(vec![FetchTopic::default()
+                    .with_topic(topic_name.clone())
+                    .with_partitions(vec![FetchPartition::default()
+                        .with_partition(0)
+                        .with_fetch_offset(0)
+                        .with_partition_max_bytes(1_048_576)])]);
+            client
+                .exchange::<_, FetchResponse>(key, version, &request)
+                .await
+                .map(drop)
+        }
+        ApiKey::ListOffsets => {
+            let request = ListOffsetsRequest::default().with_topics(vec![
+                ListOffsetsTopic::default()
+                    .with_name(topic_name.clone())
+                    .with_partitions(vec![ListOffsetsPartition::default()
+                        .with_partition_index(0)
+                        .with_timestamp(OFFSET_EARLIEST)]),
+            ]);
+            client
+                .exchange::<_, ListOffsetsResponse>(key, version, &request)
+                .await
+                .map(drop)
+        }
+        ApiKey::DescribeConfigs => {
+            let request = DescribeConfigsRequest::default().with_resources(vec![
+                DescribeConfigsResource::default()
+                    .with_resource_type(RESOURCE_TYPE_TOPIC)
+                    .with_resource_name(StrBytes::from_string(topic.to_string())),
+            ]);
+            client
+                .exchange::<_, DescribeConfigsResponse>(key, version, &request)
+                .await
+                .map(drop)
+        }
+        ApiKey::FindCoordinator => {
+            // The group a request names travels in the single `key` up to version 3 and
+            // in the `coordinator_keys` list from version 4 on.
+            let mut request = wire::FindCoordinatorRequest::default();
+            request = match version >= 4 {
+                true => request.with_coordinator_keys(vec![group.0.clone()]),
+                false => request.with_key(group.0.clone()),
+            };
+            client
+                .exchange::<_, wire::FindCoordinatorResponse>(key, version, &request)
+                .await
+                .map(drop)
+        }
+        ApiKey::InitProducerId => {
+            let request = wire::InitProducerIdRequest::default().with_transaction_timeout_ms(-1);
+            client
+                .exchange::<_, wire::InitProducerIdResponse>(key, version, &request)
+                .await
+                .map(drop)
+        }
+        ApiKey::JoinGroup => {
+            let request = wire::JoinGroupRequest::default()
+                .with_group_id(group.clone())
+                .with_session_timeout_ms(10_000)
+                .with_protocol_type(StrBytes::from_static_str("consumer"))
+                .with_protocols(vec![
+                    wire::join_group_request::JoinGroupRequestProtocol::default()
+                        .with_name(StrBytes::from_static_str("range"))
+                        .with_metadata(Bytes::from_static(b"subscription")),
+                ]);
+            client
+                .exchange::<_, wire::JoinGroupResponse>(key, version, &request)
+                .await
+                .map(drop)
+        }
+        ApiKey::SyncGroup => {
+            let request = wire::SyncGroupRequest::default()
+                .with_group_id(group.clone())
+                .with_generation_id(1);
+            client
+                .exchange::<_, wire::SyncGroupResponse>(key, version, &request)
+                .await
+                .map(drop)
+        }
+        ApiKey::Heartbeat => {
+            let request = wire::HeartbeatRequest::default()
+                .with_group_id(group.clone())
+                .with_generation_id(1);
+            client
+                .exchange::<_, wire::HeartbeatResponse>(key, version, &request)
+                .await
+                .map(drop)
+        }
+        ApiKey::LeaveGroup => {
+            // The leaving member is named by `member_id` up to version 2 and by the
+            // `members` list from version 3 on.
+            let mut request = wire::LeaveGroupRequest::default().with_group_id(group.clone());
+            request = match version >= 3 {
+                true => request.with_members(vec![
+                    wire::leave_group_request::MemberIdentity::default()
+                        .with_member_id(StrBytes::from_static_str("version-sweep-1")),
+                ]),
+                false => request.with_member_id(StrBytes::from_static_str("version-sweep-1")),
+            };
+            client
+                .exchange::<_, wire::LeaveGroupResponse>(key, version, &request)
+                .await
+                .map(drop)
+        }
+        ApiKey::OffsetCommit => {
+            let request = wire::OffsetCommitRequest::default()
+                .with_group_id(group.clone())
+                .with_topics(vec![wire::offset_commit_request::OffsetCommitRequestTopic::default()
+                    .with_name(topic_name.clone())
+                    .with_partitions(vec![
+                        wire::offset_commit_request::OffsetCommitRequestPartition::default()
+                            .with_partition_index(0)
+                            .with_committed_offset(0),
+                    ])]);
+            client
+                .exchange::<_, wire::OffsetCommitResponse>(key, version, &request)
+                .await
+                .map(drop)
+        }
+        ApiKey::OffsetFetch => {
+            let request = wire::OffsetFetchRequest::default()
+                .with_group_id(group.clone())
+                .with_topics(Some(vec![
+                    wire::offset_fetch_request::OffsetFetchRequestTopic::default()
+                        .with_name(topic_name.clone())
+                        .with_partition_indexes(vec![0]),
+                ]));
+            client
+                .exchange::<_, wire::OffsetFetchResponse>(key, version, &request)
+                .await
+                .map(drop)
+        }
+        ApiKey::CreateAcls => {
+            let request = wire::CreateAclsRequest::default().with_creations(vec![
+                wire::create_acls_request::AclCreation::default()
+                    .with_resource_type(RESOURCE_TYPE_TOPIC)
+                    .with_resource_name(StrBytes::from_string(topic.to_string()))
+                    .with_resource_pattern_type(ACL_PATTERN_TYPE_LITERAL)
+                    .with_principal(StrBytes::from_static_str("User:swept"))
+                    .with_host(StrBytes::from_static_str("*"))
+                    .with_operation(ACL_OPERATION_READ)
+                    .with_permission_type(ACL_PERMISSION_ALLOW),
+            ]);
+            client
+                .exchange::<_, wire::CreateAclsResponse>(key, version, &request)
+                .await
+                .map(drop)
+        }
+        ApiKey::DescribeAcls => {
+            // The pattern-type filter exists from version 1 on; version 0 matches on the
+            // literal name alone.
+            let mut request = wire::DescribeAclsRequest::default()
+                .with_resource_type_filter(RESOURCE_TYPE_TOPIC)
+                .with_operation(ACL_OPERATION_ANY)
+                .with_permission_type(ACL_PERMISSION_ANY);
+            if version >= 1 {
+                request = request.with_pattern_type_filter(ACL_PATTERN_TYPE_ANY);
+            }
+            client
+                .exchange::<_, wire::DescribeAclsResponse>(key, version, &request)
+                .await
+                .map(drop)
+        }
+        ApiKey::DeleteAcls => {
+            let mut filter = wire::delete_acls_request::DeleteAclsFilter::default()
+                .with_resource_type_filter(RESOURCE_TYPE_TOPIC)
+                .with_operation(ACL_OPERATION_ANY)
+                .with_permission_type(ACL_PERMISSION_ANY);
+            if version >= 1 {
+                filter = filter.with_pattern_type_filter(ACL_PATTERN_TYPE_ANY);
+            }
+            let request = wire::DeleteAclsRequest::default().with_filters(vec![filter]);
+            client
+                .exchange::<_, wire::DeleteAclsResponse>(key, version, &request)
+                .await
+                .map(drop)
+        }
+        ApiKey::CreateTopics => {
+            // A name of its own per row, so no row depends on another's outcome.
+            let request = wire::CreateTopicsRequest::default()
+                .with_timeout_ms(1_000)
+                .with_topics(vec![
+                    wire::create_topics_request::CreatableTopic::default()
+                        .with_name(TopicName(StrBytes::from_string(format!(
+                            "swept-create-v{version}"
+                        ))))
+                        .with_num_partitions(1)
+                        .with_replication_factor(1),
+                ]);
+            client
+                .exchange::<_, wire::CreateTopicsResponse>(key, version, &request)
+                .await
+                .map(drop)
+        }
+        ApiKey::DeleteTopics => {
+            let request = wire::DeleteTopicsRequest::default()
+                .with_timeout_ms(1_000)
+                .with_topic_names(vec![TopicName(StrBytes::from_string(format!(
+                    "swept-delete-v{version}"
+                )))]);
+            client
+                .exchange::<_, wire::DeleteTopicsResponse>(key, version, &request)
+                .await
+                .map(drop)
+        }
+        other => Err(format!(
+            "this suite does not know how to call {other:?}, which the broker advertises"
+        )),
+    }
+}
+
+/// RULE: a produce whose records payload the broker cannot READ is refused with the
+/// protocol's `CORRUPT_MESSAGE` and appends nothing — a producer is told its records were
+/// not written, rather than handed the offset of an append that never happened.
+///
+/// The rows span the ways a payload can be unreadable (bytes that are no batch at all, a
+/// batch truncated mid-header, a batch declaring a format version this endpoint does not
+/// write), and a batch the endpoint CAN read is the positive control that the refusal is
+/// about the payload and not about the request.
+#[tokio::test]
+async fn a_produce_the_broker_cannot_read_is_refused_and_appends_nothing() {
+    let case = "an unreadable produce";
+    let emulator = Emulator::new();
+    let cluster = emulator
+        .create_ok(&ClusterRequest::named("plane-corrupt"))
+        .await;
+    sleep_past_activation();
+    given_topic(&emulator, &cluster, "orders", 1, None).await;
+    let addresses = published(&emulator, &cluster, case).await;
+    let authority = addresses
+        .get("bootstrapBrokerString")
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: the cluster must publish a plaintext bootstrap string")
+        });
+
+    let mut readable = BytesMut::new();
+    RecordBatchEncoder::encode(
+        &mut readable,
+        [Record {
+            transactional: false,
+            control: false,
+            partition_leader_epoch: 0,
+            producer_id: -1,
+            producer_epoch: -1,
+            timestamp_type: TimestampType::Creation,
+            offset: 0,
+            sequence: 0,
+            timestamp: epoch_millis(),
+            key: None,
+            value: Some(Bytes::from_static(b"readable")),
+            headers: Default::default(),
+            delete_horizon: false,
+        }]
+        .iter(),
+        &RecordEncodeOptions {
+            version: 2,
+            compression: Compression::None,
+        },
+    )
+    .unwrap_or_else(|error| panic!("case {case:?}: the batch must encode: {error}"));
+    let readable = readable.freeze();
+    // A record batch declares its format version in the byte after its base offset, its
+    // length and its partition leader epoch (Apache Kafka's record batch header), so a
+    // value no format uses is a batch no broker can read.
+    let mut unknown_format = readable.to_vec();
+    unknown_format[16] = 9;
+
+    let rows: &[(&str, Bytes)] = &[
+        (
+            "bytes that are no record batch at all",
+            Bytes::from_static(b"this is not a record batch"),
+        ),
+        ("a batch truncated mid-header", readable.slice(0..12)),
+        (
+            "a batch of an unknown format version",
+            Bytes::from(unknown_format),
+        ),
+    ];
+    for (row, payload) in rows {
+        let probe = format!("{case} / {row}");
+        let mut client = Client::plaintext(&probe, &authority).await;
+        client.api_versions(&probe).await;
+        let before = client.offset(&probe, "orders", 0, OFFSET_LATEST).await;
+        let answered = produce_payload(&mut client, "orders", payload.clone()).await;
+        assert_eq!(
+            answered.0,
+            ::kafka_protocol::ResponseError::CorruptMessage.code(),
+            "case {probe:?}: expected the produce to be refused CORRUPT_MESSAGE, got error {} \
+             and base offset {}",
+            answered.0,
+            answered.1
+        );
+        let after = client.offset(&probe, "orders", 0, OFFSET_LATEST).await;
+        assert_eq!(
+            after, before,
+            "case {probe:?}: a refused produce must append nothing, but the log end moved from \
+             {before} to {after}"
+        );
+    }
+
+    // The positive control: the same request carrying a batch this endpoint reads is
+    // appended, at the offset the log was at.
+    let probe = format!("{case} / a batch the broker reads");
+    let mut client = Client::plaintext(&probe, &authority).await;
+    client.api_versions(&probe).await;
+    let before = client.offset(&probe, "orders", 0, OFFSET_LATEST).await;
+    let answered = produce_payload(&mut client, "orders", readable.clone()).await;
+    assert_eq!(
+        (answered.0, answered.1),
+        (0, before),
+        "case {probe:?}: expected the produce to be appended at offset {before}, got error {} \
+         and base offset {}",
+        answered.0,
+        answered.1
+    );
+    let read = client.fetch(&probe, "orders", 0, before).await;
+    assert_eq!(
+        read.first().map(|(_, _, value)| value.clone()),
+        Some("readable".to_string()),
+        "case {probe:?}: the appended record must be readable back, got {read:?}"
+    );
+}
+
+/// `Produce` one partition with `payload` as its records field EXACTLY as given, so a
+/// suite can submit bytes a record-batch encoder would never produce. Answers the
+/// `(error code, base offset)` the broker reported for the partition.
+async fn produce_payload(client: &mut Client, topic: &str, payload: Bytes) -> (i16, i64) {
+    let answered: ProduceResponse = client
+        .exchange(
+            ApiKey::Produce,
+            9,
+            &ProduceRequest::default()
+                .with_acks(1)
+                .with_timeout_ms(1_000)
+                .with_topic_data(vec![TopicProduceData::default()
+                    .with_name(TopicName(StrBytes::from_string(topic.to_string())))
+                    .with_partition_data(vec![PartitionProduceData::default()
+                        .with_index(0)
+                        .with_records(Some(payload))])]),
+        )
+        .await
+        .unwrap_or_else(|why| panic!("the broker must answer a Produce request: {why}"));
+    let partition = answered
+        .responses
+        .first()
+        .and_then(|topic| topic.partition_responses.first())
+        .cloned()
+        .expect("Produce must report the partition it was given");
+    (partition.error_code, partition.base_offset)
+}
+
+/// RULE: a broker reads a connection's SASL tokens in the framing that connection's
+/// `SaslHandshake` VERSION selects — bare, length-prefixed byte strings at version 0,
+/// and `SaslAuthenticate` requests and responses from version 1 on — and either way the
+/// completed exchange authenticates the connection, which is then served.
+///
+/// A client chooses that version, and the versions a broker advertises are what it
+/// chooses from: a broker that advertises version 0 and then reads the token after it as
+/// a Kafka request frame drops a connection it told the client to open that way, leaving
+/// the client reconnecting with no error it can report.
+///
+/// The rows span what the rule generalises over: the handshake VERSION, and which
+/// MECHANISM the exchange runs (the cluster's SASL/SCRAM credential, and IAM access
+/// control as both the Java exchange and the `OAUTHBEARER` one a non-Java client
+/// speaks). Each row proves the connection is usable afterwards by producing a record
+/// and reading it back, and each mechanism is also offered a credential the cluster does
+/// not hold, which must be refused rather than served.
+#[tokio::test]
+async fn a_sasl_exchange_is_served_in_the_framing_its_handshake_selects() {
+    let case = "a sasl exchange's token framing";
+    let emulator = Emulator::with_secrets_manager();
+    let cluster = emulator
+        .create_ok(&ClusterRequest {
+            client_broker: Some("TLS"),
+            sasl_scram: Some(true),
+            sasl_iam: Some(true),
+            ..ClusterRequest::named("plane-framing")
+        })
+        .await;
+    sleep_past_activation();
+    given_secret_associated(&emulator, &cluster, "plane-framing-secret", case).await;
+    given_topic(&emulator, &cluster, "framed", 1, None).await;
+    let addresses = published(&emulator, &cluster, case).await;
+    let scram_endpoint = addresses
+        .get("bootstrapBrokerStringSaslScram")
+        .cloned()
+        .unwrap_or_else(|| panic!("case {case:?}: the cluster must publish its SASL/SCRAM string"));
+    let iam_endpoint = addresses
+        .get("bootstrapBrokerStringSaslIam")
+        .cloned()
+        .unwrap_or_else(|| panic!("case {case:?}: the cluster must publish its SASL/IAM string"));
+
+    // (mechanism, the endpoint that offers it, the credential it authenticates with),
+    // each driven at both handshake versions.
+    let rows: &[(&str, &str, &str)] = &[
+        (SCRAM_SHA_512, &scram_endpoint, SCRAM_PASSWORD),
+        (AWS_MSK_IAM, &iam_endpoint, "a-signature"),
+        (OAUTHBEARER, &iam_endpoint, "a-signature"),
+    ];
+    for (mechanism, authority, credential) in rows {
+        for handshake_version in [0, 1] {
+            let probe = format!("{case} / {mechanism} / handshake v{handshake_version}");
+            let mut client = Client::tls(&probe, authority).await;
+            client.api_versions(&probe).await;
+            let code = client
+                .authenticate_at(&probe, mechanism, credential, handshake_version)
+                .await;
+            assert_eq!(
+                code, 0,
+                "case {probe:?}: the exchange must authenticate the connection, got error {code}"
+            );
+            // The connection is served now: a record produced over it is read back over
+            // it, which is what the exchange was for.
+            let value = format!("framed-{mechanism}-v{handshake_version}");
+            let offset = client
+                .produce(&probe, "framed", 0, &[(epoch_millis(), None, &value)])
+                .await;
+            let read = client.fetch(&probe, "framed", 0, offset).await;
+            assert_eq!(
+                read.first().map(|(_, _, value)| value.clone()),
+                Some(value.clone()),
+                "case {probe:?}: the record produced over the authenticated connection must be \
+                 read back, got {read:?}"
+            );
+
+            // And a credential the cluster does not hold is refused in either framing.
+            // The unwrapped framing carries no error code, so a broker refusing one
+            // closes the connection, which this client reports as the authentication
+            // failure it is.
+            let mut refused = Client::tls(&probe, authority).await;
+            refused.api_versions(&probe).await;
+            let code = refused
+                .authenticate_at(&probe, mechanism, "", handshake_version)
+                .await;
+            assert_eq!(
+                code,
+                ::kafka_protocol::ResponseError::SaslAuthenticationFailed.code(),
+                "case {probe:?}: a credential the cluster does not hold must be refused, got \
+                 error {code}"
+            );
+        }
+    }
+}
+
+/// RULE: every (API, version) pair a broker ADVERTISES in `ApiVersions` is answered with
+/// the response that version declares.
+///
+/// A Kafka client negotiates what it sends from that advertisement, and Apache Kafka
+/// answers a frame it cannot serve by closing the connection — so a pair the endpoint
+/// announces and then does not answer leaves the client reconnecting against a socket
+/// that drops it, with no error it can report. The recorded case is a client picking the
+/// newest version of each API; the table here is the WHOLE advertised class, read from
+/// the broker itself: every version from each advertised `min_version` to its
+/// `max_version`.
+#[tokio::test]
+async fn every_advertised_api_version_is_answered() {
+    let case = "every advertised api version";
+    let emulator = Emulator::new();
+    let cluster = emulator
+        .create_ok(&ClusterRequest::named("plane-versions"))
+        .await;
+    sleep_past_activation();
+    given_topic(&emulator, &cluster, "orders", 1, None).await;
+    let addresses = published(&emulator, &cluster, case).await;
+    let authority = addresses
+        .get("bootstrapBrokerString")
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: the cluster must publish a plaintext bootstrap string")
+        });
+
+    // A record in the log, so the read APIs below answer over a partition that holds
+    // something rather than over an empty one.
+    let mut writer = Client::plaintext(case, &authority).await;
+    writer.api_versions(case).await;
+    writer
+        .produce(case, "orders", 0, &[(epoch_millis(), None, "swept")])
+        .await;
+
+    let advertised = Client::plaintext(case, &authority)
+        .await
+        .api_versions(case)
+        .await;
+    assert!(
+        !advertised.api_keys.is_empty(),
+        "case {case:?}: the broker must advertise the APIs it serves"
+    );
+
+    let mut unanswered: Vec<String> = Vec::new();
+    for api in &advertised.api_keys {
+        let key = ApiKey::try_from(api.api_key).unwrap_or_else(|_| {
+            panic!(
+                "case {case:?}: the broker advertised API key {}, which is not a Kafka API",
+                api.api_key
+            )
+        });
+        for version in api.min_version..=api.max_version {
+            // One connection per row: a broker that drops the connection for one pair
+            // must not decide the next row's outcome.
+            let mut client = Client::plaintext(case, &authority).await;
+            if let Err(why) = call_at(&mut client, key, version, "orders").await {
+                unanswered.push(format!("{key:?} v{version}: {why}"));
+            }
+        }
+    }
+    assert!(
+        unanswered.is_empty(),
+        "case {case:?}: every advertised (API, version) pair must be answered with the \
+         response that version declares; these were not: {unanswered:#?}"
+    );
 }

@@ -26,6 +26,9 @@
 //! Nothing here is waved through: a refusal is the protocol's own
 //! `SASL_AUTHENTICATION_FAILED`, and an exchange that has not finished leaves the
 //! connection unauthenticated, which is what the handler gates every other API on.
+//! Which FRAMING carried a token is the client's choice and the handler's business
+//! ([`super::wire`]): the exchanges here read and write token BYTES, whether those
+//! bytes arrived bare or inside a `SaslAuthenticate` request.
 
 use std::collections::BTreeMap;
 

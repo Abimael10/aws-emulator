@@ -19,13 +19,26 @@
 //! `UNSUPPORTED_VERSION` rather than with an invented success, and the versions it
 //! does serve are the ones it advertises in `ApiVersions`.
 //!
+//! A client picks what it sends from that advertisement, so the advertisement is what
+//! the endpoint can really carry: every pair in [`SERVED_APIS`] is a version whose
+//! request this endpoint can read and whose response it can write, and each answer is
+//! built for the version the request came in at, not for the newest one — a response
+//! carrying a member a version does not have is a frame that cannot be written, and a
+//! frame a broker cannot write or read is a connection Apache Kafka closes, which leaves
+//! a client reconnecting with no error it can report.
+//!
 //! Authentication is the ACCESS PATH's: a connection on the plaintext or TLS path
 //! authenticates no client, and one on a SASL path must complete that mechanism's
-//! exchange ([`super::sasl`]) before any other API is served.
+//! exchange ([`super::sasl`]) before any other API is served. The TOKENS of that
+//! exchange travel in the framing the client's `SaslHandshake` version selects — bare,
+//! length-prefixed byte strings at version 0, and `SaslAuthenticate` requests and
+//! responses from version 1 on ([`Session::unwrapped_sasl`]) — so a client that
+//! handshakes at either version is authenticated by the same exchange.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::LazyLock;
 use std::time::SystemTime;
 
 use ::bytes::{Bytes, BytesMut};
@@ -47,7 +60,7 @@ use ::kafka_protocol::messages::{
     ResponseHeader, SaslAuthenticateRequest, SaslAuthenticateResponse, SaslHandshakeRequest,
     SaslHandshakeResponse, SyncGroupRequest, TopicName,
 };
-use ::kafka_protocol::protocol::{Decodable, Encodable, StrBytes};
+use ::kafka_protocol::protocol::{Decodable, Encodable, Message, StrBytes};
 use ::kafka_protocol::records::{
     Compression, Record, RecordBatchDecoder, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
 };
@@ -102,32 +115,121 @@ const RECORD_BATCH_VERSION: i8 = 2;
 /// The APIs this endpoint serves, and the versions of each: what `ApiVersions`
 /// advertises and what every other frame is admitted against, so a client negotiates
 /// exactly what is implemented here.
-const SERVED_APIS: &[(ApiKey, i16, i16)] = &[
-    (ApiKey::Produce, 0, 9),
-    (ApiKey::Fetch, 0, 13),
-    (ApiKey::ListOffsets, 0, 7),
-    (ApiKey::Metadata, 0, 12),
-    (ApiKey::FindCoordinator, 0, 4),
-    (ApiKey::SaslHandshake, 0, 1),
-    (ApiKey::ApiVersions, 0, 3),
-    (ApiKey::DescribeConfigs, 0, 4),
-    (ApiKey::SaslAuthenticate, 0, 2),
-    (ApiKey::DescribeAcls, 0, 3),
-    (ApiKey::CreateAcls, 0, 3),
-    (ApiKey::DeleteAcls, 0, 3),
-    (ApiKey::InitProducerId, 0, 4),
-    (ApiKey::JoinGroup, 0, 7),
-    (ApiKey::SyncGroup, 0, 5),
-    (ApiKey::Heartbeat, 0, 4),
-    (ApiKey::LeaveGroup, 0, 4),
-    (ApiKey::OffsetCommit, 0, 7),
-    (ApiKey::OffsetFetch, 0, 7),
-    // Topic administration stops at the last version that names a topic by NAME
-    // alone: this endpoint reports no topic ids, so the versions that create and
-    // delete topics by id are not ones it can serve.
-    (ApiKey::CreateTopics, 0, 5),
-    (ApiKey::DeleteTopics, 0, 5),
-];
+///
+/// Each entry is the range Amazon MSK's brokers offer for that API, NARROWED to the
+/// versions the protocol implementation behind this endpoint can actually carry
+/// ([`carried`]). A client picks the version it sends from the advertisement, and Apache
+/// Kafka answers a frame it cannot parse by closing the connection — so a version
+/// advertised but not readable (or a response not writable in it) would leave a client
+/// reconnecting against a socket that drops it, with no error it could report.
+static SERVED_APIS: LazyLock<Vec<(ApiKey, i16, i16)>> = LazyLock::new(served_apis);
+
+/// See [`SERVED_APIS`]: the table, built once.
+fn served_apis() -> Vec<(ApiKey, i16, i16)> {
+    let mut apis: Vec<(ApiKey, i16, i16)> = Vec::new();
+    let mut serve = |key: ApiKey, versions: Option<(i16, i16)>| {
+        if let Some((min, max)) = versions {
+            apis.push((key, min, max));
+        }
+    };
+    serve(
+        ApiKey::Produce,
+        carried::<ProduceRequest, ProduceResponse>(0, 9),
+    );
+    // `Fetch` and the topic administration below stop at the last version that names a
+    // topic by NAME alone: this endpoint reports no topic ids, so the versions that read
+    // and write topics by id are not ones it can serve.
+    serve(ApiKey::Fetch, carried::<FetchRequest, FetchResponse>(0, 12));
+    serve(
+        ApiKey::ListOffsets,
+        carried::<ListOffsetsRequest, ListOffsetsResponse>(0, 7),
+    );
+    serve(
+        ApiKey::Metadata,
+        carried::<MetadataRequest, MetadataResponse>(0, 12),
+    );
+    serve(
+        ApiKey::FindCoordinator,
+        carried::<FindCoordinatorRequest, FindCoordinatorResponse>(0, 4),
+    );
+    serve(
+        ApiKey::SaslHandshake,
+        carried::<SaslHandshakeRequest, SaslHandshakeResponse>(0, 1),
+    );
+    serve(
+        ApiKey::ApiVersions,
+        carried::<ApiVersionsRequest, ApiVersionsResponse>(0, 3),
+    );
+    serve(
+        ApiKey::DescribeConfigs,
+        carried::<DescribeConfigsRequest, DescribeConfigsResponse>(0, 4),
+    );
+    serve(
+        ApiKey::SaslAuthenticate,
+        carried::<SaslAuthenticateRequest, SaslAuthenticateResponse>(0, 2),
+    );
+    serve(
+        ApiKey::DescribeAcls,
+        carried::<DescribeAclsRequest, ::kafka_protocol::messages::DescribeAclsResponse>(0, 3),
+    );
+    serve(
+        ApiKey::CreateAcls,
+        carried::<CreateAclsRequest, ::kafka_protocol::messages::CreateAclsResponse>(0, 3),
+    );
+    serve(
+        ApiKey::DeleteAcls,
+        carried::<DeleteAclsRequest, ::kafka_protocol::messages::DeleteAclsResponse>(0, 3),
+    );
+    serve(
+        ApiKey::InitProducerId,
+        carried::<InitProducerIdRequest, InitProducerIdResponse>(0, 4),
+    );
+    serve(
+        ApiKey::JoinGroup,
+        carried::<JoinGroupRequest, ::kafka_protocol::messages::JoinGroupResponse>(0, 7),
+    );
+    serve(
+        ApiKey::SyncGroup,
+        carried::<SyncGroupRequest, ::kafka_protocol::messages::SyncGroupResponse>(0, 5),
+    );
+    serve(
+        ApiKey::Heartbeat,
+        carried::<HeartbeatRequest, ::kafka_protocol::messages::HeartbeatResponse>(0, 4),
+    );
+    serve(
+        ApiKey::LeaveGroup,
+        carried::<LeaveGroupRequest, ::kafka_protocol::messages::LeaveGroupResponse>(0, 4),
+    );
+    serve(
+        ApiKey::OffsetCommit,
+        carried::<OffsetCommitRequest, ::kafka_protocol::messages::OffsetCommitResponse>(0, 7),
+    );
+    serve(
+        ApiKey::OffsetFetch,
+        carried::<OffsetFetchRequest, ::kafka_protocol::messages::OffsetFetchResponse>(0, 7),
+    );
+    serve(
+        ApiKey::CreateTopics,
+        carried::<CreateTopicsRequest, ::kafka_protocol::messages::CreateTopicsResponse>(0, 5),
+    );
+    serve(
+        ApiKey::DeleteTopics,
+        carried::<DeleteTopicsRequest, ::kafka_protocol::messages::DeleteTopicsResponse>(0, 5),
+    );
+    apis
+}
+
+/// The versions of one API this endpoint serves: `min..=max` as Amazon MSK's brokers
+/// offer them, narrowed to the versions BOTH its request and its response can be carried
+/// in ([`Message::VERSIONS`]).
+///
+/// `None` when nothing is left of the range, which is an API this endpoint then does not
+/// advertise at all rather than one it announces and cannot read.
+fn carried<Request: Message, Response: Message>(min: i16, max: i16) -> Option<(i16, i16)> {
+    let min = min.max(Request::VERSIONS.min).max(Response::VERSIONS.min);
+    let max = max.min(Request::VERSIONS.max).min(Response::VERSIONS.max);
+    (min <= max).then_some((min, max))
+}
 
 /// One access path of one cluster's Apache Kafka endpoint.
 pub struct ClusterBroker {
@@ -206,17 +308,34 @@ struct Broker {
     emulator: EmbeddedEmulator,
 }
 
-/// What one connection has established: which SASL mechanism it chose, and whether the
-/// exchange has finished.
+/// What one connection has established: which SASL mechanism it chose, how its tokens
+/// travel, and whether the exchange has finished.
 #[derive(Default)]
 struct Session {
     /// The mechanism the client selected with `SaslHandshake`.
     mechanism: Option<Mechanism>,
+    /// Whether this connection's SASL tokens travel UNWRAPPED.
+    ///
+    /// `SaslHandshake` has two framings and the version the client selected its
+    /// mechanism with chooses between them: version 0 exchanges each SASL token as a
+    /// bare, length-prefixed byte string, while from version 1 on the tokens travel
+    /// inside `SaslAuthenticate` requests and responses. A client that handshakes at
+    /// version 0 therefore sends no API key at all for its tokens.
+    unwrapped_sasl: bool,
     /// The SASL/SCRAM exchange in flight, between the client's first message and its
     /// proof.
     scram: Option<sasl::ScramExchange>,
     /// Who the connection is authenticated as, once the exchange has succeeded.
     identity: Option<Authenticated>,
+}
+
+impl Session {
+    /// Whether the NEXT frame on this connection is a bare SASL token rather than a
+    /// Kafka request: the client selected its mechanism with the version of the
+    /// handshake that exchanges tokens unwrapped, and the exchange has not finished.
+    fn expects_sasl_token(&self) -> bool {
+        self.unwrapped_sasl && self.mechanism.is_some() && self.identity.is_none()
+    }
 }
 
 impl Broker {
@@ -231,15 +350,26 @@ impl Broker {
             }
             let length = u32::from_be_bytes(length) as usize;
             // A frame this endpoint will not buffer: the connection ends rather than
-            // the process holding a caller-sized allocation for it.
-            if !(8..=MAX_FRAME_BYTES).contains(&length) {
+            // the process holding a caller-sized allocation for it. A bare SASL token
+            // carries no request header, so it is shorter than the smallest request
+            // frame — one byte is a whole token in some mechanisms.
+            let smallest = match session.expects_sasl_token() {
+                true => 1,
+                false => 8,
+            };
+            if !(smallest..=MAX_FRAME_BYTES).contains(&length) {
                 return;
             }
             let mut frame = vec![0u8; length];
             if conn.read_exact(&mut frame).await.is_err() {
                 return;
             }
-            let Some(response) = self.answer(&mut session, Bytes::from(frame)).await else {
+            let frame = Bytes::from(frame);
+            let answered = match session.expects_sasl_token() {
+                true => self.sasl_token(&mut session, &frame).await,
+                false => self.answer(&mut session, frame).await,
+            };
+            let Some(response) = answered else {
                 return;
             };
             let framed = u32::try_from(response.len()).unwrap_or(u32::MAX);
@@ -249,6 +379,23 @@ impl Broker {
             {
                 return;
             }
+        }
+    }
+
+    /// One leg of an UNWRAPPED SASL exchange: the token the client sent, answered with
+    /// the challenge or the final message as bare bytes, with no response header.
+    ///
+    /// That framing carries no error code, so a refused exchange is answered by closing
+    /// the connection — which is what the version of the handshake that selects it
+    /// defines, and what a client of it waits for.
+    async fn sasl_token(&self, session: &mut Session, token: &Bytes) -> Option<Vec<u8>> {
+        match self.sasl_leg(session, token.as_ref()).await {
+            Ok(sasl::Leg::Continue(challenge)) => Some(challenge.to_vec()),
+            Ok(sasl::Leg::Done { response, identity }) => {
+                session.identity = Some(identity);
+                Some(response.to_vec())
+            }
+            Err(_) => None,
         }
     }
 
@@ -286,7 +433,7 @@ impl Broker {
             }
             ApiKey::SaslHandshake => {
                 let request = SaslHandshakeRequest::decode(&mut body, api_version).ok()?;
-                let response = self.sasl_handshake(session, &request);
+                let response = self.sasl_handshake(session, &request, api_version);
                 self.encode(key, api_version, &header, &response)
             }
             ApiKey::SaslAuthenticate => {
@@ -321,7 +468,7 @@ impl Broker {
             }
             ApiKey::FindCoordinator => {
                 let request = FindCoordinatorRequest::decode(&mut body, api_version).ok()?;
-                let response = self.find_coordinator(&request);
+                let response = self.find_coordinator(&request, api_version);
                 self.encode(key, api_version, &header, &response)
             }
             ApiKey::InitProducerId => {
@@ -538,10 +685,15 @@ impl Broker {
 
     /// `SaslHandshake`: the mechanisms this path offers, and whether the one the
     /// client named is among them.
+    ///
+    /// The VERSION a client handshakes at also chooses how its tokens then travel
+    /// ([`Session::unwrapped_sasl`]), so it is remembered here: the exchange that
+    /// follows is read in the framing the client selected.
     fn sasl_handshake(
         &self,
         session: &mut Session,
         request: &SaslHandshakeRequest,
+        api_version: i16,
     ) -> SaslHandshakeResponse {
         let offered = self.mechanisms();
         let chosen = offered
@@ -549,6 +701,7 @@ impl Broker {
             .copied()
             .find(|mechanism| mechanism.name() == request.mechanism.as_str());
         session.mechanism = chosen;
+        session.unwrapped_sasl = api_version == 0;
         session.scram = None;
         SaslHandshakeResponse::default()
             .with_error_code(match chosen {
@@ -563,12 +716,14 @@ impl Broker {
             )
     }
 
-    /// `SaslAuthenticate`: one leg of the exchange the chosen mechanism defines.
-    async fn sasl_authenticate(
+    /// One leg of the exchange the chosen mechanism defines, whichever framing carried
+    /// the token — so a client that handshaked at version 0 and one that wraps its
+    /// tokens in `SaslAuthenticate` are authenticated by the same exchange.
+    async fn sasl_leg(
         &self,
         session: &mut Session,
-        request: &SaslAuthenticateRequest,
-    ) -> SaslAuthenticateResponse {
+        auth_bytes: &[u8],
+    ) -> Result<sasl::Leg, sasl::Refusal> {
         let chosen = session
             .mechanism
             .filter(|mechanism| self.mechanisms().contains(mechanism));
@@ -580,20 +735,31 @@ impl Broker {
                     secret_arns: self.scram_secret_arns(),
                 };
                 let mut exchange = session.scram.take().unwrap_or_default();
-                let leg = exchange.leg(&source, request.auth_bytes.as_ref()).await;
+                let leg = exchange.leg(&source, auth_bytes).await;
                 session.scram = Some(exchange);
                 leg
             }
-            Some(Mechanism::AwsMskIam) => sasl::iam_leg(&self.region, request.auth_bytes.as_ref()),
-            Some(Mechanism::OAuthBearer) => {
-                sasl::oauth_bearer_leg(&self.region, request.auth_bytes.as_ref())
-            }
+            Some(Mechanism::AwsMskIam) => sasl::iam_leg(&self.region, auth_bytes),
+            Some(Mechanism::OAuthBearer) => sasl::oauth_bearer_leg(&self.region, auth_bytes),
             // A client that authenticates before choosing a mechanism this path
             // offers is in no state to be authenticated, which is what
             // `ILLEGAL_SASL_STATE` says.
             None => Err(sasl::Refusal::IllegalState),
         };
-        match outcome {
+        if outcome.is_err() {
+            session.scram = None;
+        }
+        outcome
+    }
+
+    /// `SaslAuthenticate`: one leg of that exchange, as the versions of the handshake
+    /// from 1 on carry it — inside this request, and answered inside its response.
+    async fn sasl_authenticate(
+        &self,
+        session: &mut Session,
+        request: &SaslAuthenticateRequest,
+    ) -> SaslAuthenticateResponse {
+        match self.sasl_leg(session, request.auth_bytes.as_ref()).await {
             Ok(sasl::Leg::Continue(challenge)) => {
                 SaslAuthenticateResponse::default().with_auth_bytes(challenge)
             }
@@ -601,12 +767,9 @@ impl Broker {
                 session.identity = Some(identity);
                 SaslAuthenticateResponse::default().with_auth_bytes(response)
             }
-            Err(refusal) => {
-                session.scram = None;
-                SaslAuthenticateResponse::default()
-                    .with_error_code(refusal.code())
-                    .with_error_message(Some(StrBytes::from_static_str(refusal.message())))
-            }
+            Err(refusal) => SaslAuthenticateResponse::default()
+                .with_error_code(refusal.code())
+                .with_error_message(Some(StrBytes::from_static_str(refusal.message()))),
         }
     }
 
@@ -784,6 +947,11 @@ impl Broker {
     /// `Produce`: append each submitted record batch to its partition's log, unless an
     /// ACL binding withholds the topic from the connection's principal.
     ///
+    /// A records payload this endpoint cannot READ is answered `CORRUPT_MESSAGE` — the
+    /// code Apache Kafka answers a batch it cannot parse — rather than with the offset of
+    /// an append that did not happen: a producer is told its records were not written,
+    /// instead of a success no log holds.
+    ///
     /// Bounded as a whole like [`Self::fetch`]: at most [`MAX_REQUEST_ENTRIES`]
     /// (topic, partition) entries are served, with the store's lock taken and released
     /// per entry.
@@ -815,7 +983,15 @@ impl Broker {
                     );
                     continue;
                 }
-                let submitted = decode_records(partition.records.clone());
+                let Some(submitted) = decode_records(partition.records.clone()) else {
+                    partitions.push(
+                        PartitionProduceResponse::default()
+                            .with_index(partition.index)
+                            .with_error_code(ResponseError::CorruptMessage.code())
+                            .with_base_offset(-1),
+                    );
+                    continue;
+                };
                 let appended = self.state.lock().data_plane_produce(
                     &self.cluster_arn,
                     &name,
@@ -1054,26 +1230,35 @@ impl Broker {
     /// `FindCoordinator`: the broker that coordinates the group or transaction a client
     /// named — this endpoint, which is the broker that holds the group.
     ///
-    /// Answered in both shapes this API has: the single coordinator a request up to
-    /// version 3 asks about, and the per-key list a later one asks for.
-    fn find_coordinator(&self, request: &FindCoordinatorRequest) -> FindCoordinatorResponse {
+    /// Answered in the shape the NEGOTIATED version has: the single coordinator a request
+    /// up to version 3 asks about, carried in the response's own members, and from
+    /// version 4 on the per-key list, which is the only place those versions carry it.
+    fn find_coordinator(
+        &self,
+        request: &FindCoordinatorRequest,
+        api_version: i16,
+    ) -> FindCoordinatorResponse {
         let (host, port) = split_authority(&self.authority());
-        let coordinators = request
-            .coordinator_keys
-            .iter()
-            .map(|key| {
-                ::kafka_protocol::messages::find_coordinator_response::Coordinator::default()
-                    .with_key(key.clone())
-                    .with_node_id(BrokerId(BROKER_NODE_ID))
-                    .with_host(StrBytes::from_string(host.clone()))
-                    .with_port(port)
-            })
-            .collect();
+        if api_version >= 4 {
+            return FindCoordinatorResponse::default().with_coordinators(
+                request
+                    .coordinator_keys
+                    .iter()
+                    .take(MAX_REQUEST_ENTRIES)
+                    .map(|key| {
+                        ::kafka_protocol::messages::find_coordinator_response::Coordinator::default()
+                            .with_key(key.clone())
+                            .with_node_id(BrokerId(BROKER_NODE_ID))
+                            .with_host(StrBytes::from_string(host.clone()))
+                            .with_port(port)
+                    })
+                    .collect(),
+            );
+        }
         FindCoordinatorResponse::default()
             .with_node_id(BrokerId(BROKER_NODE_ID))
             .with_host(StrBytes::from_string(host))
             .with_port(port)
-            .with_coordinators(coordinators)
     }
 }
 
@@ -1169,26 +1354,31 @@ fn rendered_configuration(
         .collect()
 }
 
-/// The records a produce submitted, as `(timestamp, key, value)` triples. A batch this
-/// endpoint cannot read carries no records, so nothing is appended for it.
-fn decode_records(records: Option<Bytes>) -> Vec<super::SubmittedRecord> {
+/// The records a produce submitted, as `(timestamp, key, value)` triples. A request that
+/// carries NO records payload submits none, which is nothing to append; `None` is a
+/// payload that is present and that this endpoint cannot read, which is a produce it
+/// refuses rather than reports as appended.
+fn decode_records(records: Option<Bytes>) -> Option<Vec<super::SubmittedRecord>> {
     let Some(mut encoded) = records else {
-        return Vec::new();
+        return Some(Vec::new());
     };
-    let Ok(decoded) = RecordBatchDecoder::decode(&mut encoded) else {
-        return Vec::new();
-    };
-    decoded
-        .records
-        .iter()
-        .map(|record| {
-            (
-                record.timestamp,
-                record.key.as_ref().map(|key| key.to_vec()),
-                record.value.as_ref().map(|value| value.to_vec()),
-            )
-        })
-        .collect()
+    if encoded.is_empty() {
+        return Some(Vec::new());
+    }
+    let decoded = RecordBatchDecoder::decode(&mut encoded).ok()?;
+    Some(
+        decoded
+            .records
+            .iter()
+            .map(|record| {
+                (
+                    record.timestamp,
+                    record.key.as_ref().map(|key| key.to_vec()),
+                    record.value.as_ref().map(|value| value.to_vec()),
+                )
+            })
+            .collect(),
+    )
 }
 
 /// The records a fetch answers with, in the record-batch form the protocol carries
