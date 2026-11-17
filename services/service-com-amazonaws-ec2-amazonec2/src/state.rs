@@ -2069,6 +2069,13 @@ pub use egress_only_internet_gateways::*;
 pub mod traffic_mirror_filters;
 pub use traffic_mirror_filters::*;
 
+/// The Traffic Mirror filter RULE store's own primitives — the id prefix, the direction
+/// words, the bounds, the byte charge and the error channel the Traffic Mirror filter rule
+/// operations share, with the one write a rule enters the store by. Re-exported, so a
+/// handler reaches them as `crate::state::<item>` like every other primitive of this module.
+pub mod traffic_mirror_filter_rules;
+pub use traffic_mirror_filter_rules::*;
+
 /// What `CreatePublicIpv4Pool` adds to the public IPv4 pool store below: the network border
 /// group a created pool is advertised from, and the refusal for a create the store has no
 /// room for. The pool record, its insert and its projection live in the "Public IPv4 address

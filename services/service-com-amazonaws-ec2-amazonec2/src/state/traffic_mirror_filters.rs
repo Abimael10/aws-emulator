@@ -167,6 +167,10 @@ impl ComAmazonawsEc2Amazonec2State {
             &filter,
             client_token.as_deref(),
         ));
+        // A rule lives on the filter it belongs to, so the filter's removal takes its rules
+        // with it: their bytes and their client tokens go back on the same terms as the
+        // filter's own ([`Self::release_traffic_mirror_filter_rules`]).
+        self.release_traffic_mirror_filter_rules(&filter);
         Some(filter)
     }
 

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTrafficMirrorFilterRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTrafficMirrorFilterRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTrafficMirrorFilterRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -92,6 +83,16 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The lowest `RuleNumber` a Traffic Mirror filter rule may carry.
+///
+/// "The number of the Traffic Mirror rule… The rules are processed in ascending order by rule
+/// number" (`CreateTrafficMirrorFilterRuleRequest$RuleNumber`): the rules of a filter are
+/// NUMBERED, and a numbered rule set starts at one, so nothing below it names a rule. The
+/// model puts no `@range` on the member, so this is the only place that floor can be
+/// enforced. Zero is read as the `@required` member being absent instead — a `clientOptional`
+/// integer the request left out reaches a handler as zero.
+const MIN_RULE_NUMBER: i32 = 1;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -159,18 +160,345 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTrafficMirrorFilterRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTrafficMirrorFilterRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state;
+
+        // `ctx` carries request metadata only; this operation reads none of it — the modelled
+        // `TrafficMirrorFilterRule` names neither a Region nor an ARN, and a rule is named by
+        // an id that is unique across this store. The store is reached through the engine held
+        // on `self`.
+        let _ = ctx;
+
+        // Every member of the REQUEST is read first, in a fixed order, before the store is
+        // asked anything: a request with two faults is refused for the first of them whatever
+        // the store happens to hold.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTrafficMirrorFilterRule"))
+        // "The ID of the filter that this rule is associated with"
+        // (`$TrafficMirrorFilterId`) is `@required` but modelled `clientOptional`, so a
+        // request that left it out reaches this handler as an empty string rather than being
+        // refused at the boundary. A parameter the request did not carry is EC2's
+        // `MissingParameter`.
+        let traffic_mirror_filter_id = input.traffic_mirror_filter_id.as_str();
+        if traffic_mirror_filter_id.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter trafficMirrorFilterId",
+            ));
+        }
+
+        // "The type of traffic" (`$TrafficDirection`) and "The action to take on the filtered
+        // traffic" (`$RuleAction`): both are `@required` and both target a modelled enum, so
+        // the boundary validator refuses a spelling outside the enum and this reads what a
+        // request that carried neither value leaves behind — an empty string — as the missing
+        // parameter it is, with the enum check as the backstop that keeps a word the store
+        // would then report out of a stored rule.
+        let traffic_direction = requested_enum(
+            input.traffic_direction.as_str(),
+            "trafficDirection",
+            TRAFFIC_DIRECTION_VALUES,
+        )?;
+        let rule_action = requested_enum(
+            input.rule_action.as_str(),
+            "ruleAction",
+            TRAFFIC_MIRROR_RULE_ACTION_VALUES,
+        )?;
+
+        // "The number of the Traffic Mirror rule" (`$RuleNumber`), the number the rule is
+        // processed in ascending order by: the filter's rules are NUMBERED, and a numbered
+        // rule set starts at 1, so a number below that names no rule of the filter. The member
+        // is `@required` but modelled `clientOptional`, so a request that left it out reaches
+        // this handler as a ZERO — indistinguishable from one that sent zero — which is the
+        // missing parameter it is, while a number below the floor is a value the parameter
+        // cannot take.
+        if input.rule_number == 0 {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter ruleNumber",
+            ));
+        }
+        if input.rule_number < MIN_RULE_NUMBER {
+            return Err(state::invalid_parameter_value(format!(
+                "Value ({rule_number}) for parameter ruleNumber is invalid. A rule number \
+                 must be at least {MIN_RULE_NUMBER}",
+                rule_number = input.rule_number,
+            )));
+        }
+
+        // "The destination CIDR block to assign to the Traffic Mirror rule"
+        // (`$DestinationCidrBlock`) and "The source CIDR block" (`$SourceCidrBlock`): both are
+        // `@required`, and a value that is not an address prefix at all matches no traffic in
+        // either address family. The block is stored as the REQUEST spelled it — the modelled
+        // members say nothing about rewriting it — so it is read for its FORM only.
+        let destination_cidr_block =
+            requested_cidr_block(input.destination_cidr_block.as_str(), "destinationCidrBlock")?;
+        let source_cidr_block =
+            requested_cidr_block(input.source_cidr_block.as_str(), "sourceCidrBlock")?;
+
+        // "The protocol, for example UDP, to assign to the Traffic Mirror rule. For
+        // information about the protocol value, see Protocol Numbers on the Internet Assigned
+        // Numbers Authority (IANA) website" (`$Protocol`) — a NUMBER, so a value outside the
+        // single byte a protocol number occupies is no protocol at all, and is refused with
+        // the sentence EC2 words every unknown IP protocol with.
+        if let Some(protocol) = input.protocol {
+            if !(0..=state::MAX_PROTOCOL_NUMBER).contains(&protocol) {
+                return Err(state::invalid_parameter_value(format!(
+                    "Invalid value '{protocol}' for IP protocol. Unknown protocol."
+                )));
+            }
+        }
+
+        // "The destination port range" (`$DestinationPortRange`) and "The source port range"
+        // (`$SourcePortRange`): a range that IS given has to be a range of ports — "The first
+        // port in the Traffic Mirror port range" (`TrafficMirrorPortRangeRequest$FromPort`)
+        // and the last, both present and in order.
+        let destination_port_range =
+            requested_port_range(input.destination_port_range.as_ref(), "destinationPortRange")?;
+        let source_port_range =
+            requested_port_range(input.source_port_range.as_ref(), "sourcePortRange")?;
+
+        if input
+            .client_token
+            .as_ref()
+            .is_some_and(|token| token.chars().count() > state::MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(state::invalid_parameter_value(format!(
+                "clientToken accepts at most {max} characters",
+                max = state::MAX_CLIENT_TOKEN_CHARS,
+            )));
+        }
+
+        // "Traffic Mirroring tags specifications" (`$TagSpecifications`): the rule is the only
+        // resource this call creates, so a specification naming any other resource type is
+        // refused rather than accepted and discarded. The tag payload's own bounds are the ones
+        // every create in this crate holds its tags to, so they are applied by the one shared
+        // reader.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::TRAFFIC_MIRROR_FILTER_RULE_TAGGABLE_RESOURCE,
+            Self::NAME,
+        )?;
+
+        // The record this call would store, built BEFORE the store is locked. The rule's own
+        // id is minted by the store at the insert, so an id is never chosen twice.
+        let rule = TrafficMirrorFilterRule {
+            traffic_mirror_filter_rule_id: None,
+            traffic_mirror_filter_id: Some(traffic_mirror_filter_id.to_string()),
+            traffic_direction: Some(traffic_direction.to_string()),
+            rule_number: Some(input.rule_number),
+            rule_action: Some(rule_action.to_string()),
+            protocol: input.protocol,
+            destination_port_range,
+            source_port_range,
+            destination_cidr_block: Some(destination_cidr_block.to_string()),
+            source_cidr_block: Some(source_cidr_block.to_string()),
+            description: input.description.clone(),
+            tags: Some(tags),
+        };
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+
+        // "You need the Traffic Mirror filter ID when you create the rule"
+        // (`CreateTrafficMirrorFilterRule`): a rule has nowhere to live without the filter
+        // that holds it, so an id this account holds no filter for is refused before anything
+        // is written.
+        if !store
+            .traffic_mirror_filters
+            .contains_key(traffic_mirror_filter_id)
+        {
+            return Err(state::invalid_traffic_mirror_filter_id_not_found(
+                traffic_mirror_filter_id,
+            ));
+        }
+
+        // Idempotency: "Unique, case-sensitive identifier that you provide to ensure the
+        // idempotency of the request" (`$ClientToken`) — one token names the one rule it
+        // created, so a replay reports that rule and creates nothing. Read here, answered
+        // below the DryRun check, because a replay stores nothing and so passes the ceilings
+        // and the uniqueness a fresh create has to clear.
+        let replayed = input.client_token.as_deref().and_then(|token| {
+            store
+                .traffic_mirror_filter_rule_client_tokens
+                .get(token)
+                .cloned()
+        });
+
+        // "This number must be unique for each Traffic Mirror rule in a given direction"
+        // (`$RuleNumber`): one number in one direction of one filter names one rule, so a
+        // create that asks for a number the filter already has a rule at in that direction is
+        // refused rather than storing a second rule nothing could tell apart.
+        if replayed.is_none()
+            && store
+                .traffic_mirror_filter_rule_at(
+                    traffic_mirror_filter_id,
+                    traffic_direction,
+                    input.rule_number,
+                )
+                .is_some()
+        {
+            return Err(state::traffic_mirror_filter_rule_already_exists(
+                input.rule_number,
+            ));
+        }
+
+        // A count ceiling first, then the byte budget: a record count on its own admits
+        // gigabytes, because each record holds strings the caller chose the length of.
+        if replayed.is_none()
+            && store.traffic_mirror_filter_rules().count()
+                >= state::MAX_TRAFFIC_MIRROR_FILTER_RULES
+        {
+            return Err(state::traffic_mirror_filter_rule_limit_exceeded(format!(
+                "This emulator holds {max} Traffic Mirror filter rules, which is as many as \
+                 it stores",
+                max = state::MAX_TRAFFIC_MIRROR_FILTER_RULES,
+            )));
+        }
+        let payload_bytes =
+            state::traffic_mirror_filter_rule_payload_bytes(&rule, input.client_token.as_deref());
+        if replayed.is_none() && store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(state::traffic_mirror_filter_rule_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied data, \
+                 so it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // DryRun sits AFTER every parameter has been validated and every refusal asked, and
+        // BEFORE the first write: the flag asks whether the request WOULD have worked, so one
+        // that would have been refused is refused with that reason instead, and one that would
+        // have succeeded leaves state untouched.
+        if input.dry_run == Some(true) {
+            return Err(state::dry_run_operation());
+        }
+
+        let traffic_mirror_filter_rule_id = match replayed {
+            Some(traffic_mirror_filter_rule_id) => traffic_mirror_filter_rule_id,
+            None => store
+                .insert_traffic_mirror_filter_rule(rule, input.client_token.as_deref())
+                .ok_or_else(|| {
+                    // Every reason the store refuses a rule — an unknown filter, a direction
+                    // outside the enum, a rule number already taken in that direction, and
+                    // both ceilings — has been asked and refused above, so reaching here means
+                    // the store and this handler disagree about the request.
+                    state::internal_error(format!(
+                        "the Traffic Mirror filter rule for the filter \
+                         '{traffic_mirror_filter_id}' could not be stored"
+                    ))
+                })?,
+        };
+
+        // Read the response back OUT of the store, so the caller sees the rule a later
+        // describe of the filter will report rather than the request object.
+        store
+            .traffic_mirror_filter_rule(&traffic_mirror_filter_rule_id)
+            .cloned()
+            .map(|traffic_mirror_filter_rule| CreateTrafficMirrorFilterRuleOutput {
+                traffic_mirror_filter_rule: Some(traffic_mirror_filter_rule),
+                // "Unique, case-sensitive identifier that you provide"
+                // (`CreateTrafficMirrorFilterRuleResult$ClientToken`): the token the REQUEST
+                // carried, echoed, and nothing at all when it carried none.
+                client_token: input.client_token.clone(),
+            })
+            .ok_or_else(|| {
+                state::internal_error(format!(
+                    "the newly created Traffic Mirror filter rule \
+                     '{traffic_mirror_filter_rule_id}' could not be read back"
+                ))
+            })
     }
+}
+
+/// `requested` as one of the `allowed` members of a modelled enum, or the refusal the request
+/// earns: `MissingParameter` for a `@required` member a `clientOptional` request left out
+/// entirely (which reaches a handler as an empty string), and EC2's `InvalidParameterValue`
+/// for a word the enum does not carry.
+///
+/// Both of this operation's enum members are read through it, so neither can be refused for a
+/// different fault than the other. `parameter` is the member as EC2 names it in a message.
+fn requested_enum<'a>(
+    requested: &'a str,
+    parameter: &str,
+    allowed: &[&str],
+) -> Result<&'a str, CreateTrafficMirrorFilterRuleError> {
+    if requested.is_empty() {
+        return Err(crate::state::missing_parameter(format!(
+            "The request must contain the parameter {parameter}"
+        )));
+    }
+    if !allowed.contains(&requested) {
+        return Err(crate::state::invalid_parameter_value(format!(
+            "Invalid value '{requested}' for parameter {parameter}"
+        )));
+    }
+    Ok(requested)
+}
+
+/// `requested` as an address prefix in CIDR notation, or the refusal the request earns:
+/// `MissingParameter` for a `@required` block the request left out, and EC2's
+/// `InvalidParameterValue` for a value that is no address prefix of either family.
+///
+/// Both of this operation's blocks are read through it, so neither can be refused for a
+/// different fault than the other. `parameter` is the member as EC2 names it in a message.
+fn requested_cidr_block<'a>(
+    requested: &'a str,
+    parameter: &str,
+) -> Result<&'a str, CreateTrafficMirrorFilterRuleError> {
+    if requested.is_empty() {
+        return Err(crate::state::missing_parameter(format!(
+            "The request must contain the parameter {parameter}"
+        )));
+    }
+    if !crate::state::cidr_block_is_well_formed(requested) {
+        return Err(crate::state::invalid_parameter_value(format!(
+            "Value ({requested}) for parameter {parameter} is invalid. This is not a valid \
+             CIDR block."
+        )));
+    }
+    Ok(requested)
+}
+
+/// `requested` as the port range a rule stores, or the refusal the request earns: `None` when
+/// the request named no range at all, which is a rule over every port.
+///
+/// A range is BOTH of its ports, so a request that named only one of them has not named a
+/// range: what is missing from such a request is a LEAF of the member, and that leaf is what
+/// the refusal names. A range that is given has to be a range of ports — each within the port
+/// space, the first not above the last. Both of this operation's ranges are read through it,
+/// so neither can be refused for a different fault than the other; `parameter` is the member
+/// as EC2 names it in a message.
+fn requested_port_range(
+    requested: Option<&TrafficMirrorPortRangeRequest>,
+    parameter: &str,
+) -> Result<Option<TrafficMirrorPortRange>, CreateTrafficMirrorFilterRuleError> {
+    let Some(range) = requested.filter(|range| range.from_port.is_some() || range.to_port.is_some())
+    else {
+        return Ok(None);
+    };
+    let (Some(from_port), Some(to_port)) = (range.from_port, range.to_port) else {
+        return Err(crate::state::missing_parameter(format!(
+            "The request must contain the parameter {parameter}.{half}",
+            half = if range.from_port.is_none() {
+                "fromPort"
+            } else {
+                "toPort"
+            },
+        )));
+    };
+    for (member, port) in [("fromPort", from_port), ("toPort", to_port)] {
+        if !(0..=crate::state::MAX_PORT).contains(&port) {
+            return Err(crate::state::invalid_parameter_value(format!(
+                "Value ({port}) for parameter {parameter}.{member} is invalid. A port is \
+                 between 0 and {max}",
+                max = crate::state::MAX_PORT,
+            )));
+        }
+    }
+    if from_port > to_port {
+        return Err(crate::state::invalid_parameter_value(format!(
+            "Value ({from_port}, {to_port}) for parameter {parameter} is invalid. The first \
+             port of the range must not be above the last"
+        )));
+    }
+    Ok(Some(TrafficMirrorPortRange {
+        from_port: Some(from_port),
+        to_port: Some(to_port),
+    }))
 }

@@ -1383,6 +1383,11 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// minted, so a repeat of the same request answers with that filter instead of
     /// creating a second one.
     pub traffic_mirror_filter_client_tokens: HashMap<String, String>,
+    /// A `CreateTrafficMirrorFilterRule` `ClientToken` and the Traffic Mirror filter rule id
+    /// it minted, so a repeat of the same request answers with that rule instead of creating
+    /// a second one — the same seam [`Self::traffic_mirror_filter_client_tokens`] is for a
+    /// filter. The rules themselves live on the filter records, in the direction's own list.
+    pub traffic_mirror_filter_rule_client_tokens: HashMap<String, String>,
     /// Every Traffic Mirror session the account holds, by `TrafficMirrorSessionId`, as the
     /// modelled [`crate::ops::types::TrafficMirrorSession`] shape itself — so a member a
     /// writer sets round-trips through a describe without a field-by-field copy that can
@@ -3672,6 +3677,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
         let mut state = Self {
             traffic_mirror_filters: BTreeMap::new(),
             traffic_mirror_filter_client_tokens: HashMap::new(),
+            traffic_mirror_filter_rule_client_tokens: HashMap::new(),
             traffic_mirror_sessions: BTreeMap::new(),
             traffic_mirror_targets: BTreeMap::new(),
             traffic_mirror_target_client_tokens: HashMap::new(),
