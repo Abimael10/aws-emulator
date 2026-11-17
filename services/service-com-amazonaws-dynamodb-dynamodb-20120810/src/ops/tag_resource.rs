@@ -214,11 +214,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let incoming = crate::state::tag_set_from_request(&input.tags).map_err(lift)?;
 
+        // WHO this request speaks for, resolved before this service's store is locked: a
+        // control-plane call on a table is authorized exactly as a read or a write of its
+        // items is ([`crate::state::authorization`]).
+        let caller = crate::state::request_caller(&*self.engine, ctx);
         let mut store = state.lock();
         // Finish the transition the clock already made due, so a table whose
         // DeleteTable span has elapsed is not tagged after it is gone.
         store.apply_due_transitions(now);
         let table = store.table_by_arn_mut(&resource).map_err(lift)?;
+        // A caller the policies in force do not let tag this table is refused before
+        // anything is written.
+        if let Some(denial) = crate::state::authorization::control_denial(
+            &caller,
+            table,
+            "dynamodb:TagResource",
+            now,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(denial));
+        }
         // "The operation conflicts with the resource's availability" — a table being
         // deleted cannot take a configuration change, so the tag write is refused
         // rather than applied to a table that is on its way out.

@@ -145,12 +145,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
         let name = crate::state::resolve_table_name_in(&input.table_name, &region).map_err(lift)?;
 
+        // WHO this request speaks for, resolved before this service's store is locked: a
+        // control-plane call on a table is authorized exactly as a read or a write of its
+        // items is ([`crate::state::authorization`]).
+        let caller = crate::state::request_caller(&*self.engine, ctx);
         let mut store = state.lock();
         // Finish any transition the clock already made due before reporting: a table
         // whose DeleteTable span has elapsed is gone, and this is a read, so that is the
         // only write it makes.
         store.apply_due_transitions(now);
         let table = store.table(&region, &name).map_err(lift)?;
+        // A caller the policies in force do not let read this setting is answered the
+        // denial rather than the destinations.
+        if let Some(denial) = crate::state::authorization::control_denial(
+            &caller,
+            table,
+            "dynamodb:DescribeKinesisStreamingDestination",
+            now,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(denial));
+        }
 
         Ok(DescribeKinesisStreamingDestinationOutput {
             table_name: Some(table.name.clone()),

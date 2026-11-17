@@ -335,6 +335,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // recorded makes no log group either.
         let log_group = || crate::state::import_log_group(&*self.engine, &region, now);
 
+        // WHO this request speaks for, and whether the policies in force let it import a
+        // table of this name: the target table does not exist yet, so no resource-based
+        // policy is in force and the decision rests on the caller's own documents, against
+        // the ARN the imported table would carry ([`crate::state::authorization`]). Taken
+        // before the store is locked, so a refused import records nothing and makes no log
+        // group.
+        let caller = crate::state::request_caller(&*self.engine, ctx);
+        if let Some(denial) = crate::state::authorization::identity_only_denial(
+            &caller,
+            "dynamodb:ImportTable",
+            &crate::state::table_arn(&region, &name),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(denial));
+        }
+
         // Everything this call decides about the catalogue and the target name is decided
         // under the store's own guard, and the guard is released at the end of this
         // block: reading the source below must run with no lock held.

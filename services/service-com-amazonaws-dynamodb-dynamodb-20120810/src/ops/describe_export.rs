@@ -150,6 +150,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // held to the form and the scope such an ARN takes before anything is looked up.
         crate::state::check_export_arn(&input.export_arn, &region).map_err(lift)?;
 
+        // WHO this request speaks for, and whether the policies in force let it read this
+        // export: an export job carries no policy of its own, so the decision rests on the
+        // caller's documents, against the export ARN the request named
+        // ([`crate::state::authorization`]). Taken before the store is locked.
+        let caller = crate::state::request_caller(&*self.engine, ctx);
+        if let Some(denial) = crate::state::authorization::identity_only_denial(
+            &caller,
+            "dynamodb:DescribeExport",
+            &input.export_arn,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(denial));
+        }
+
         let mut store = state.lock();
         // Finish any transition the clock already made due before reporting; this is a
         // read, so that is the only write it makes. An export's own `IN_PROGRESS` ->

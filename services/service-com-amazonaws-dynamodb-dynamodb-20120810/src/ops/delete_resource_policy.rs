@@ -196,6 +196,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(lift)?;
 
+        // WHO this request speaks for, resolved before this service's store is locked, and
+        // whether the policies in force on that caller let it remove this table's policy: a
+        // policy-management call is decided on the caller's identity-based documents
+        // ([`crate::state::authorization`]) rather than on the document it removes.
+        let caller = crate::state::request_caller(&*self.engine, ctx);
+        if let Some(denial) = crate::state::authorization::identity_only_denial(
+            &caller,
+            "dynamodb:DeleteResourcePolicy",
+            &resource.arn,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(denial));
+        }
+
         let mut store = state.lock();
         store.apply_due_transitions(now);
         let table = store.table_for_policy_mut(&resource).map_err(lift)?;

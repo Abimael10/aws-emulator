@@ -187,6 +187,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
         let name = crate::state::resolve_table_name_in(&input.table_name, &region).map_err(lift)?;
 
+        // WHO this request speaks for, resolved before this service's store is locked: a
+        // control-plane call on a table is authorized exactly as a read or a write of its
+        // items is ([`crate::state::authorization`]).
+        let caller = crate::state::request_caller(&*self.engine, ctx);
         let mut store = state.lock();
         store.apply_due_transitions(now);
         // Whether a Region that has just SOURCED a replica add is what this call addresses,
@@ -197,6 +201,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let table = store
             .table_mut(&region, &name)
             .map_err(lift)?;
+
+        // A caller the policies in force do not let delete this table is refused before
+        // anything changes: the delete is not accepted, so the table and its items stay.
+        if let Some(denial) = crate::state::authorization::control_denial(
+            &caller,
+            table,
+            "dynamodb:DeleteTable",
+            now,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(denial));
+        }
 
         match table.status(now) {
             crate::state::TableStatus::Creating => {

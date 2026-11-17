@@ -238,6 +238,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(lift)?;
 
+        // WHO this request speaks for, and whether the policies in force let it restore a
+        // table of this name: the target table does not exist yet, so no resource-based
+        // policy is in force and the decision rests on the caller's own documents, against
+        // the ARN the restored table would carry ([`crate::state::authorization`]). Taken
+        // before the store is locked, so a refused restore reads and writes nothing.
+        let caller = crate::state::request_caller(&*self.engine, ctx);
+        if let Some(denial) = crate::state::authorization::identity_only_denial(
+            &caller,
+            "dynamodb:RestoreTableFromBackup",
+            &crate::state::table_arn(&region, &target),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(denial));
+        }
+
         let mut store = state.lock();
         store.apply_due_transitions(now);
 

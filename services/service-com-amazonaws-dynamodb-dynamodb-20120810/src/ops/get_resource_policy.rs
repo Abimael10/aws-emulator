@@ -192,6 +192,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // no such identity ([`crate::state::policy_principals`]).
         let identities = crate::state::request_principal_identities(&*self.engine);
 
+        // WHO this request speaks for, resolved before this service's store is locked, and
+        // whether the policies in force on that caller let it read this table's policy: a
+        // policy-management call is decided on the caller's identity-based documents
+        // ([`crate::state::authorization`]) rather than on the document it reports.
+        let caller = crate::state::request_caller(&*self.engine, ctx);
+        if let Some(denial) = crate::state::authorization::identity_only_denial(
+            &caller,
+            "dynamodb:GetResourcePolicy",
+            &resource.arn,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(denial));
+        }
+
         let mut store = state.lock();
         // The only write a reporting operation makes: finishing the status changes the
         // clock already made due.

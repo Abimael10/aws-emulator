@@ -156,10 +156,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // Which region's replicas are asked about is a MEMBER of this request
         // (`RegionName`) rather than the region its endpoint names, and a global table is
-        // one resource across regions, so nothing here is read out of `ctx`.
-        let _ = ctx;
+        // one resource across regions, so nothing of the WALK below is read out of `ctx`.
         let now = ::std::time::SystemTime::now();
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        // WHO this request speaks for, resolved before this service's store is locked: a
+        // listing of the account's global tables is authorized against the caller's own
+        // identity-based policies, over the table namespace of the endpoint the request
+        // reached ([`crate::state::authorization`]).
+        let caller = crate::state::request_caller(&*self.engine, ctx);
+        if let Some(denial) = crate::state::authorization::account_denial(
+            &caller,
+            "dynamodb:ListGlobalTables",
+            &crate::state::authorization::account_resource(
+                &crate::state::request_region(ctx.parts()),
+                None,
+            ),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(denial));
+        }
 
         let mut store = state.lock();
         store.apply_due_transitions(now);

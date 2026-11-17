@@ -479,6 +479,21 @@ impl RequestKeys {
         }
     }
 
+    /// A CONTROL-PLANE call on the table: it addresses no partition, names no attribute of
+    /// an item and asks for no selection, so it carries NO value for any of the data-plane
+    /// keys and answers that it carries none — IAM's empty set. A statement conditioned on
+    /// one of those keys therefore does not apply to such a call, whichever effect it
+    /// states, which is what AWS decides for a request whose context carries no value for
+    /// the key a clause names.
+    #[must_use]
+    pub fn control_plane() -> Self {
+        Self {
+            addressed: AddressedKeys::whole_table(),
+            attributes: Some(Vec::new()),
+            select: None,
+        }
+    }
+
     /// A read addressed by key, which has no `Select` member and implies one: the
     /// attributes its projection listed, or every attribute of the item when it listed
     /// none ("If no attribute names are specified, then all attributes are returned",
@@ -715,18 +730,30 @@ const ACCOUNT_TABLES_WILDCARD: &str = "*";
 /// `None` when they do.
 ///
 /// `action` is the IAM action the operation performs (`dynamodb:ListTables`) and `resource`
-/// what it acts on ([`account_resource`]). The rule is the module docs' rule with the two
-/// halves such a call has: no table is addressed, so no resource-based policy is in force and
-/// the decision rests on the caller's identity-based documents and the scope its credential
-/// was minted with. An explicit `Deny` in either refuses; otherwise the call needs an `Allow`
-/// in the identity-based documents, and with none it is refused — IAM's implicit deny,
-/// naming the document that withheld the grant — and the operation reports nothing.
+/// what it acts on ([`account_resource`]). The decision itself is
+/// [`identity_only_denial`]'s, which is the case this is one of.
+pub fn account_denial(caller: &Caller, action: &str, resource: &str) -> Option<String> {
+    identity_only_denial(caller, action, resource)
+}
+
+/// The `AccessDeniedException` message a request earns when the policies in force on the
+/// CALLER do not permit `action` on `resource`, or `None` when they do — the decision for a
+/// call whose addressed resource carries no policy of its own to grant or deny it: the
+/// account's table namespace ([`account_resource`]), a table that does not exist yet, or a
+/// backup, export or import job of one.
+///
+/// The rule is the module docs' rule with the two halves such a call has: no resource-based
+/// policy is in force, so the decision rests on the caller's identity-based documents and the
+/// scope its credential was minted with. An explicit `Deny` in either refuses; otherwise the
+/// call needs an `Allow` in the identity-based documents, and with none it is refused — IAM's
+/// implicit deny, naming the document that withheld the grant — and the operation has no
+/// effect.
 ///
 /// The condition keys such a call answers for are the CALLER's own
 /// ([`principal_context`]): it addresses no partition, names no attribute and asks for no
 /// selection, so it publishes no value for the keys a data-plane call answers for and a
 /// clause over one of those stays undecided rather than holding over an empty set.
-pub fn account_denial(caller: &Caller, action: &str, resource: &str) -> Option<String> {
+pub fn identity_only_denial(caller: &Caller, action: &str, resource: &str) -> Option<String> {
     let context = principal_context(caller);
     let published = principal_published_keys(caller);
     let granting = iam::Request::new(action, resource, &caller.principals)
@@ -736,6 +763,35 @@ pub fn account_denial(caller: &Caller, action: &str, resource: &str) -> Option<S
     // credential's scope alone: such a call addresses no resource whose own policy could
     // grant or deny it, so nothing is handed in for that half.
     identity_denial(caller, action, resource, &granting, || false)
+}
+
+/// The `AccessDeniedException` message a CONTROL-PLANE call on one table earns when the
+/// policies in force do not permit it, or `None` when they do.
+///
+/// A call that reads or changes the TABLE itself — its description, its settings, its tags,
+/// a backup or an export of it — is authorized exactly as a call that reads or writes its
+/// items is: against the table's own resource-based policy and the documents in force on
+/// the caller, for the IAM action the operation performs (`dynamodb:DescribeTable`) on the
+/// table's ARN. What it does NOT carry is a data-plane call's own context: it addresses no
+/// partition, names no attribute and asks for no selection, so it answers for each of those
+/// keys with no value at all ([`RequestKeys::control_plane`]) and a statement conditioned on
+/// one of them does not apply to it.
+///
+/// What one decision costs is what it READS: the documents the caller was resolved with
+/// ([`request_caller`], read before this service's store was locked) and the one document
+/// the table carries, each already held to the size the operation that accepted it admits
+/// (`service_common::iam_authorization::MAX_POLICY_BYTES`). Nothing here is parsed from the
+/// request being served, nothing grows with it, and the evaluation itself answers a decision
+/// for every input — the shared evaluator reports an undecidable clause as undecided rather
+/// than failing — so the work under the caller's store guard does not grow with what the
+/// caller sent.
+pub fn control_denial(
+    caller: &Caller,
+    table: &Table,
+    action: &str,
+    now: SystemTime,
+) -> Option<String> {
+    denial_keys(caller, table, action, now, &RequestKeys::control_plane())
 }
 
 /// The `AccessDeniedException` message a data-plane request that names no attribute of its

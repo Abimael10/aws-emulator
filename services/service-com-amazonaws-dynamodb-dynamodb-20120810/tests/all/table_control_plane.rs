@@ -19,23 +19,39 @@
 //!    `DescribeTable` answers `ResourceNotFoundException` and the name is free again;
 //! 4. `BillingModeSummary.LastUpdateToPayPerRequestDateTime` reports the instant
 //!    `PAY_PER_REQUEST` TOOK EFFECT as the capacity mode, so it is absent while the
-//!    call that sets that mode is still settling and stable afterwards.
+//!    call that sets that mode is still settling and stable afterwards;
+//!
+//! 5. a control-plane call is AUTHORIZED before it is served, against the policies in
+//!    force on the principal its access key id speaks for, for `dynamodb:<Action>` on the
+//!    ARN of what it addresses — the table, the ARN a table being created would carry, or
+//!    a backup of one. An explicit `Deny` refuses it whatever any grant says; otherwise it
+//!    needs an `Allow` about it, and with none it is refused with IAM's implicit deny and
+//!    the call has no effect. The refusal is `AccessDeniedException` with HTTP 400 (the
+//!    status the service framework behind DynamoDB answers an authorization refusal with),
+//!    worded from the request: the principal, the action and the resource. So an execution
+//!    role carrying a CRUD-shaped grant — the item, query and scan actions plus
+//!    `DescribeTable`, which is what the published SAM `DynamoDBCrudPolicy` shorthand
+//!    expands to — can read and write the table's items and cannot destroy the table,
+//!    change its settings, re-tag it or copy it.
 //!
 //! Every test drives the operations over the wire (`POST /` with
 //! `X-Amz-Target: DynamoDB_20120810.<OperationName>`) through the same
 //! `MultiServiceRouter` the emulator's front doors use, and each rule is asserted over a
-//! SET of inputs — the kind of update, the kind of table, the capacity mode — rather
-//! than one recorded example.
+//! SET of inputs — the kind of update, the kind of table, the capacity mode, the
+//! operation, the resource it addresses and what the caller's policy says — rather than
+//! one recorded example.
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_dynamodb_dynamodb_20120810::state::STATUS_TRANSITION;
 use smithy_server_runtime::MultiServiceRouter;
 
 // One harness for the whole test target: the router, the signed request and the two
 // assertions every suite makes come from `crate::emulator` rather than a fourth copy.
-use crate::emulator::{call, emulator, error_code, ok};
+use crate::emulator::{call, describe_when_active, emulator, error_code, message, ok, REGION};
 
 /// Wait out one transient span, so whatever the clock owes is due.
 async fn settle() {
@@ -630,5 +646,684 @@ async fn pay_per_request_is_dated_from_the_call_that_set_the_mode() {
         (json!("PROVISIONED"), switch_instant),
         "case switch back to provisioned: the recorded instant is when PAY_PER_REQUEST was last \
          set, got {back}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// Rule 5: who may make a control-plane call.
+//
+// The calls below need the two services the decision is read from beside this one on the
+// same engine — the role lives in IAM's store and its session credential is minted by STS,
+// exactly as `core/router` assembles the three — so they build their own router rather than
+// the single-service one the state-machine tests above drive.
+// ---------------------------------------------------------------------------------------
+
+/// The account every generated emulator presents.
+const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
+
+/// The session name every `AssumeRole` below asks for, which is the last segment of the
+/// assumed-role ARN a refusal names.
+const SESSION: &str = "probe";
+
+/// The policy-language version every document below states.
+const POLICY_VERSION: &str = "2012-10-17";
+
+/// The action set the published `DynamoDBCrudPolicy` SAM shorthand grants over one table:
+/// the item, query and scan actions plus `DescribeTable`, and nothing that changes the
+/// table itself ("AWS SAM policy templates", `DynamoDBCrudPolicy`, whose entries are the
+/// ones this crate's own expansion carries).
+const CRUD_ACTIONS: &[&str] = &[
+    "dynamodb:GetItem",
+    "dynamodb:DeleteItem",
+    "dynamodb:PutItem",
+    "dynamodb:Scan",
+    "dynamodb:Query",
+    "dynamodb:UpdateItem",
+    "dynamodb:BatchWriteItem",
+    "dynamodb:BatchGetItem",
+    "dynamodb:DescribeTable",
+    "dynamodb:ConditionCheckItem",
+];
+
+/// One control-plane call: the operation, the IAM action it performs, and the body that
+/// addresses the table.
+struct ControlCall {
+    operation: &'static str,
+    action: &'static str,
+    body: Value,
+}
+
+/// Every control-plane call these rows drive against the table `table`, each with the
+/// action it performs — `dynamodb:<OperationName>` ("Actions defined by Amazon DynamoDB",
+/// IAM Service Authorization Reference) — and the body that addresses that table. The
+/// class spans a describe, a change, a tag write and read, a backup, a policy read and the
+/// delete.
+fn control_calls(table: &str) -> Vec<ControlCall> {
+    vec![
+        ControlCall {
+            operation: "DescribeTable",
+            action: "dynamodb:DescribeTable",
+            body: json!({"TableName": table}),
+        },
+        ControlCall {
+            operation: "UpdateTable",
+            action: "dynamodb:UpdateTable",
+            body: json!({"TableName": table, "DeletionProtectionEnabled": true}),
+        },
+        ControlCall {
+            operation: "UpdateTimeToLive",
+            action: "dynamodb:UpdateTimeToLive",
+            body: json!({
+                "TableName": table,
+                "TimeToLiveSpecification": {"Enabled": true, "AttributeName": "ttl"},
+            }),
+        },
+        ControlCall {
+            operation: "DescribeTimeToLive",
+            action: "dynamodb:DescribeTimeToLive",
+            body: json!({"TableName": table}),
+        },
+        ControlCall {
+            operation: "DescribeContinuousBackups",
+            action: "dynamodb:DescribeContinuousBackups",
+            body: json!({"TableName": table}),
+        },
+        ControlCall {
+            operation: "DescribeKinesisStreamingDestination",
+            action: "dynamodb:DescribeKinesisStreamingDestination",
+            body: json!({"TableName": table}),
+        },
+        ControlCall {
+            operation: "DescribeContributorInsights",
+            action: "dynamodb:DescribeContributorInsights",
+            body: json!({"TableName": table}),
+        },
+        ControlCall {
+            operation: "TagResource",
+            action: "dynamodb:TagResource",
+            body: json!({
+                "ResourceArn": table_resource_arn(table),
+                "Tags": [{"Key": "owner", "Value": "probe"}],
+            }),
+        },
+        ControlCall {
+            operation: "ListTagsOfResource",
+            action: "dynamodb:ListTagsOfResource",
+            body: json!({"ResourceArn": table_resource_arn(table)}),
+        },
+        ControlCall {
+            operation: "CreateBackup",
+            action: "dynamodb:CreateBackup",
+            body: json!({"TableName": table, "BackupName": "control-plane-probe"}),
+        },
+        ControlCall {
+            operation: "GetResourcePolicy",
+            action: "dynamodb:GetResourcePolicy",
+            body: json!({"ResourceArn": table_resource_arn(table)}),
+        },
+        // The DELETE comes last, so a row whose policy allows everything still finds the
+        // table there for every call above it.
+        ControlCall {
+            operation: "DeleteTable",
+            action: "dynamodb:DeleteTable",
+            body: json!({"TableName": table}),
+        },
+    ]
+}
+
+/// The emulator the authorization rows drive: this service, IAM and STS over ONE engine.
+fn authorizing_emulator() -> MultiServiceRouter {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut router = MultiServiceRouter::new();
+    // Unsigned requests: the `Authorization` header still names the Region and the access
+    // key id, which is what the service reads the caller's identity from.
+    router.set_request_authentication(false);
+    router.register_service(
+        service_com_amazonaws_dynamodb_dynamodb_20120810::EmulatedService::new(Arc::clone(&engine)),
+    );
+    router.register_service(
+        service_com_amazonaws_iam_awsidentitymanagementv20100508::EmulatedService::new(Arc::clone(
+            &engine,
+        )),
+    );
+    router.register_service(
+        service_com_amazonaws_sts_awssecuritytokenservicev20110615::EmulatedService::new(engine),
+    );
+    router
+}
+
+/// Send one DynamoDB operation as the session `access_key_id` names.
+async fn as_session(
+    router: &MultiServiceRouter,
+    access_key_id: &str,
+    operation: &str,
+    body: Value,
+) -> (u16, Value) {
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("content-type", "application/x-amz-json-1.0")
+        .header("x-amz-target", format!("DynamoDB_20120810.{operation}"))
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential={access_key_id}/20260101/{REGION}/dynamodb/\
+                 aws4_request, SignedHeaders=host;x-amz-target, Signature=0000"
+            ),
+        )
+        .body(Bytes::from(
+            serde_json::to_vec(&body).expect("the request body serializes"),
+        ))
+        .expect("a well-formed request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let parsed = serde_json::from_slice(response.body()).unwrap_or(Value::Null);
+    (status, parsed)
+}
+
+/// Post one awsQuery form body to `signing_name` as the account's own credential.
+async fn query(router: &MultiServiceRouter, signing_name: &str, body: String) -> (u16, String) {
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("host", format!("{signing_name}.amazonaws.com"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDTEST/20260101/{REGION}/{signing_name}/\
+                 aws4_request, SignedHeaders=host, Signature=0000"
+            ),
+        )
+        .body(Bytes::from(body))
+        .expect("a well-formed request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    (status, String::from_utf8_lossy(response.body()).to_string())
+}
+
+/// Percent-encode one `application/x-www-form-urlencoded` component through the maintained
+/// encoder rather than by hand.
+fn form_encode(value: &str) -> String {
+    percent_encoding::utf8_percent_encode(value, percent_encoding::NON_ALPHANUMERIC).to_string()
+}
+
+/// The text of the first `<name>…</name>` element of an XML body.
+fn element(case: &str, body: &str, name: &str) -> String {
+    let open = format!("<{name}>");
+    let close = format!("</{name}>");
+    let (_, rest) = body
+        .split_once(&open)
+        .unwrap_or_else(|| panic!("case {case:?}: the answer must carry <{name}>, got {body}"));
+    let (text, _) = rest
+        .split_once(&close)
+        .unwrap_or_else(|| panic!("case {case:?}: <{name}> must be closed, got {body}"));
+    text.to_string()
+}
+
+/// A trust policy letting the account assume the role.
+fn trust_policy() -> String {
+    json!({
+        "Version": POLICY_VERSION,
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": {"AWS": format!("arn:aws:iam::{ACCOUNT}:root")},
+            "Action": "sts:AssumeRole",
+        }],
+    })
+    .to_string()
+}
+
+/// Create one IAM role carrying `document` as its inline policy (when it carries one) and
+/// answer the access key id of a session of it — the credential a call signs with, exactly
+/// as a function's execution role is reached.
+async fn session_of(
+    router: &MultiServiceRouter,
+    case: &str,
+    role: &str,
+    document: Option<&str>,
+) -> String {
+    let (status, body) = query(
+        router,
+        "iam",
+        format!(
+            "Action=CreateRole&Version=2010-05-08&RoleName={}&AssumeRolePolicyDocument={}",
+            form_encode(role),
+            form_encode(&trust_policy())
+        ),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: CreateRole({role}) must answer 200, got {status} with {body}"
+    );
+    let role_arn = element(case, &body, "Arn");
+    if let Some(document) = document {
+        let (status, body) = query(
+            router,
+            "iam",
+            format!(
+                "Action=PutRolePolicy&Version=2010-05-08&RoleName={}&PolicyName=probe&\
+                 PolicyDocument={}",
+                form_encode(role),
+                form_encode(document)
+            ),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: PutRolePolicy({role}) must answer 200, got {status} with {body}"
+        );
+    }
+    let (status, body) = query(
+        router,
+        "sts",
+        format!(
+            "Action=AssumeRole&Version=2011-06-15&RoleArn={}&RoleSessionName={SESSION}",
+            form_encode(&role_arn)
+        ),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: AssumeRole({role_arn}) must answer 200, got {status} with {body}"
+    );
+    element(case, &body, "AccessKeyId")
+}
+
+/// One identity-based statement list, as a document.
+fn identity_policy(statements: Value) -> String {
+    json!({"Version": POLICY_VERSION, "Statement": statements}).to_string()
+}
+
+/// The ARN of one table of this account in [`REGION`], in the format AWS documents for a
+/// DynamoDB table (`arn:aws:dynamodb:<region>:<account>:table/<name>`).
+fn table_resource_arn(name: &str) -> String {
+    format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/{name}")
+}
+
+/// The principal an assumed-role session of `role` speaks for, as `sts:GetCallerIdentity`
+/// reports it and a refusal names it.
+fn session_principal(role: &str) -> String {
+    format!("arn:aws:sts::{ACCOUNT}:assumed-role/{role}/{SESSION}")
+}
+
+/// The sentence AWS refuses an unauthorized request with.
+fn refusal(principal: &str, action: &str, resource: &str, reason: &str) -> String {
+    format!(
+        "User: {principal} is not authorized to perform: {action} on resource: {resource} {reason}"
+    )
+}
+
+/// The reason clause of IAM's implicit deny for `action`.
+fn no_grant(action: &str) -> String {
+    format!("because no identity-based policy allows the {action} action")
+}
+
+/// Create one on-demand table as the account's own credential and wait for it to be ACTIVE.
+async fn created_table(router: &MultiServiceRouter, case: &str, name: &str) {
+    ok(
+        router,
+        "CreateTable",
+        json!({
+            "TableName": name,
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "BillingMode": "PAY_PER_REQUEST",
+        }),
+    )
+    .await;
+    describe_when_active(router, case, name).await;
+}
+
+#[tokio::test]
+async fn a_crud_shaped_grant_serves_the_items_and_refuses_the_table_itself() {
+    let router = authorizing_emulator();
+    let case = "a CRUD-shaped grant";
+    let table = "CrudScoped";
+    let role = "ddb-crud-scoped";
+    created_table(&router, case, table).await;
+
+    let document = identity_policy(json!([{
+        "Effect": "Allow",
+        "Action": CRUD_ACTIONS,
+        "Resource": [
+            table_resource_arn(table),
+            format!("{}/index/*", table_resource_arn(table)),
+        ],
+    }]));
+    let session = session_of(&router, case, role, Some(&document)).await;
+
+    // The DATA plane the grant is for is served, so the row really does hold the grant.
+    let (status, written) = as_session(
+        &router,
+        &session,
+        "PutItem",
+        json!({"TableName": table, "Item": {"pk": {"S": "k0"}}}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?} / PutItem: the grant covers the item write, got {status} with {written}"
+    );
+
+    for ControlCall {
+        operation,
+        action,
+        body,
+    } in control_calls(table)
+    {
+        let (status, answered) = as_session(&router, &session, operation, body.clone()).await;
+        if CRUD_ACTIONS.contains(&action) {
+            assert_eq!(
+                status, 200,
+                "case {case:?} / {operation}: the grant covers {action}, so the call is served, \
+                 got {status} with {answered}"
+            );
+            continue;
+        }
+        assert_eq!(
+            (status, error_code(&answered).as_str()),
+            (400, "AccessDeniedException"),
+            "case {case:?} / {operation}: expected the denial of {action}, got {status} with \
+             {answered}"
+        );
+        assert_eq!(
+            message(&answered),
+            refusal(
+                &session_principal(role),
+                action,
+                &table_resource_arn(table),
+                &no_grant(action),
+            ),
+            "case {case:?} / {operation}: expected the refusal to be built from the request, got \
+             {:?}",
+            message(&answered)
+        );
+    }
+
+    // Nothing the refused calls asked for happened: the table is still there, carries no
+    // tag, no TTL and no deletion protection, and the account holds no backup of it.
+    let described = ok(&router, "DescribeTable", json!({"TableName": table})).await;
+    assert_eq!(
+        (
+            status_of(&described["Table"]).clone(),
+            described["Table"]["DeletionProtectionEnabled"].clone(),
+        ),
+        (json!("ACTIVE"), json!(false)),
+        "case {case:?}: the refused DeleteTable and UpdateTable changed nothing, got {described}"
+    );
+    let tags = ok(
+        &router,
+        "ListTagsOfResource",
+        json!({"ResourceArn": table_resource_arn(table)}),
+    )
+    .await;
+    assert_eq!(
+        tags["Tags"],
+        json!([]),
+        "case {case:?}: the refused TagResource stored no tag, got {tags}"
+    );
+    let ttl = ok(&router, "DescribeTimeToLive", json!({"TableName": table})).await;
+    assert_eq!(
+        ttl["TimeToLiveDescription"]["TimeToLiveStatus"],
+        json!("DISABLED"),
+        "case {case:?}: the refused UpdateTimeToLive stored no specification, got {ttl}"
+    );
+    let backups = ok(&router, "ListBackups", json!({"TableName": table})).await;
+    assert_eq!(
+        backups["BackupSummaries"],
+        json!([]),
+        "case {case:?}: the refused CreateBackup catalogued nothing, got {backups}"
+    );
+}
+
+#[tokio::test]
+async fn a_role_granted_nothing_is_refused_every_control_plane_call() {
+    let router = authorizing_emulator();
+    let case = "a role the account grants nothing";
+    let table = "GrantedNothing";
+    let role = "ddb-control-none";
+    created_table(&router, case, table).await;
+    let session = session_of(&router, case, role, None).await;
+
+    for ControlCall {
+        operation,
+        action,
+        body,
+    } in control_calls(table)
+    {
+        let (status, answered) = as_session(&router, &session, operation, body.clone()).await;
+        assert_eq!(
+            (status, error_code(&answered).as_str()),
+            (400, "AccessDeniedException"),
+            "case {case:?} / {operation}: expected the denial of {action}, got {status} with \
+             {answered}"
+        );
+        assert_eq!(
+            message(&answered),
+            refusal(
+                &session_principal(role),
+                action,
+                &table_resource_arn(table),
+                &no_grant(action),
+            ),
+            "case {case:?} / {operation}: expected the refusal to be built from the request, got \
+             {:?}",
+            message(&answered)
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_wildcard_grant_serves_every_control_plane_call() {
+    let router = authorizing_emulator();
+    let case = "a wildcard over this service";
+    let table = "WildcardGranted";
+    created_table(&router, case, table).await;
+    let document = identity_policy(json!([{
+        "Effect": "Allow",
+        "Action": "dynamodb:*",
+        "Resource": "*",
+    }]));
+    let session = session_of(&router, case, "ddb-control-wildcard", Some(&document)).await;
+
+    for ControlCall {
+        operation,
+        action,
+        body,
+    } in control_calls(table)
+    {
+        // The delete is driven below instead: the `UpdateTable` above turns deletion
+        // protection ON, which is a setting of the table rather than an authorization
+        // decision, and it has to be cleared before any caller may delete the table.
+        if operation == "DeleteTable" {
+            continue;
+        }
+        let (status, answered) = as_session(&router, &session, operation, body.clone()).await;
+        // Authorization is past for every one of them. What answers then is the
+        // operation's own business: a table carrying no resource-based policy has none to
+        // report, which is `GetResourcePolicy`'s own modelled refusal and not a denial.
+        if operation == "GetResourcePolicy" {
+            assert_eq!(
+                (status, error_code(&answered).as_str()),
+                (400, "PolicyNotFoundException"),
+                "case {case:?} / {operation}: the wildcard covers {action}, so the answer is the \
+                 operation's own refusal for a table with no policy, got {status} with {answered}"
+            );
+            continue;
+        }
+        assert_eq!(
+            status, 200,
+            "case {case:?} / {operation}: the wildcard covers {action}, so the call is served, \
+             got {status} with {answered}"
+        );
+    }
+
+    ok(
+        &router,
+        "UpdateTable",
+        json!({"TableName": table, "DeletionProtectionEnabled": false}),
+    )
+    .await;
+    let (status, answered) =
+        as_session(&router, &session, "DeleteTable", json!({"TableName": table})).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?} / DeleteTable: the wildcard covers dynamodb:DeleteTable, so the call is \
+         served, got {status} with {answered}"
+    );
+}
+
+#[tokio::test]
+async fn an_explicit_deny_refuses_one_action_of_a_wildcard_grant() {
+    let router = authorizing_emulator();
+    let case = "an explicit deny over a wildcard allow";
+    let table = "ExplicitlyDenied";
+    let role = "ddb-control-denied";
+    created_table(&router, case, table).await;
+    let document = identity_policy(json!([
+        {"Effect": "Allow", "Action": "dynamodb:*", "Resource": "*"},
+        {"Effect": "Deny", "Action": "dynamodb:DeleteTable", "Resource": "*"},
+    ]));
+    let session = session_of(&router, case, role, Some(&document)).await;
+
+    let (status, described) = as_session(
+        &router,
+        &session,
+        "DescribeTable",
+        json!({"TableName": table}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: the deny names one action, so describing the table is served, got \
+         {status} with {described}"
+    );
+
+    let (status, answered) =
+        as_session(&router, &session, "DeleteTable", json!({"TableName": table})).await;
+    assert_eq!(
+        (status, error_code(&answered).as_str()),
+        (400, "AccessDeniedException"),
+        "case {case:?}: an explicit deny refuses the delete, got {status} with {answered}"
+    );
+    assert_eq!(
+        message(&answered),
+        refusal(
+            &session_principal(role),
+            "dynamodb:DeleteTable",
+            &table_resource_arn(table),
+            "with an explicit deny in an identity-based policy",
+        ),
+        "case {case:?}: the refusal names the document that denied it, got {:?}",
+        message(&answered)
+    );
+    let described = ok(&router, "DescribeTable", json!({"TableName": table})).await;
+    assert_eq!(
+        status_of(&described["Table"]).clone(),
+        json!("ACTIVE"),
+        "case {case:?}: the refused DeleteTable left the table ACTIVE, got {described}"
+    );
+}
+
+#[tokio::test]
+async fn a_call_that_addresses_a_resource_of_its_own_is_decided_on_that_arn() {
+    let router = authorizing_emulator();
+    let case = "a create and a backup, which address a resource of their own";
+    let role = "ddb-control-absent";
+    let session = session_of(&router, case, role, None).await;
+
+    // A CREATE addresses the ARN the table WOULD carry: there is no table yet, so the
+    // decision rests on the caller's own documents and the refusal names that ARN.
+    let created = "NotCreated";
+    let (status, answered) = as_session(
+        &router,
+        &session,
+        "CreateTable",
+        json!({
+            "TableName": created,
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "BillingMode": "PAY_PER_REQUEST",
+        }),
+    )
+    .await;
+    assert_eq!(
+        (status, error_code(&answered).as_str()),
+        (400, "AccessDeniedException"),
+        "case {case:?} / CreateTable: expected the denial, got {status} with {answered}"
+    );
+    assert_eq!(
+        message(&answered),
+        refusal(
+            &session_principal(role),
+            "dynamodb:CreateTable",
+            &table_resource_arn(created),
+            &no_grant("dynamodb:CreateTable"),
+        ),
+        "case {case:?} / CreateTable: the refusal names the ARN the create addressed, got {:?}",
+        message(&answered)
+    );
+    let (status, missing) = call(&router, "DescribeTable", json!({"TableName": created})).await;
+    assert_eq!(
+        (status, error_code(&missing).as_str()),
+        (400, "ResourceNotFoundException"),
+        "case {case:?}: the refused create registered no table, got {status} with {missing}"
+    );
+
+    // A call that addresses a BACKUP is decided on the BACKUP's own ARN, which is read off
+    // the backup the account's own credential made rather than built here.
+    let table = "BackedUp";
+    created_table(&router, case, table).await;
+    let backup = ok(
+        &router,
+        "CreateBackup",
+        json!({"TableName": table, "BackupName": "control-plane-probe"}),
+    )
+    .await;
+    let backup_arn = backup["BackupDetails"]["BackupArn"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !backup_arn.is_empty(),
+        "case {case:?}: the backup reports its own ARN, got {backup}"
+    );
+    for (operation, action) in [
+        ("DescribeBackup", "dynamodb:DescribeBackup"),
+        ("DeleteBackup", "dynamodb:DeleteBackup"),
+    ] {
+        let (status, answered) = as_session(
+            &router,
+            &session,
+            operation,
+            json!({"BackupArn": backup_arn}),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&answered).as_str()),
+            (400, "AccessDeniedException"),
+            "case {case:?} / {operation}: expected the denial of {action}, got {status} with \
+             {answered}"
+        );
+        assert_eq!(
+            message(&answered),
+            refusal(
+                &session_principal(role),
+                action,
+                &backup_arn,
+                &no_grant(action),
+            ),
+            "case {case:?} / {operation}: the refusal names the backup the call addressed, got \
+             {:?}",
+            message(&answered)
+        );
+    }
+    let still = ok(&router, "DescribeBackup", json!({"BackupArn": backup_arn})).await;
+    assert_eq!(
+        still["BackupDescription"]["BackupDetails"]["BackupArn"],
+        json!(backup_arn),
+        "case {case:?}: the refused DeleteBackup removed nothing, got {still}"
     );
 }

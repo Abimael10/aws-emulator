@@ -393,11 +393,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // section.
         let declared_definitions = clamped_definitions(&input).map_err(lift)?;
 
+        // WHO this request speaks for, resolved before this service's store is locked: a
+        // control-plane call on a table is authorized exactly as a read or a write of its
+        // items is ([`crate::state::authorization`]).
+        let caller = crate::state::request_caller(&*self.engine, ctx);
         let mut store = state.lock();
         store.apply_due_transitions(now);
         // The table has to exist and be settled before anything is changed, so a
         // refused update leaves the stored table exactly as it was.
         let stored = store.table(&region, &name).map_err(lift)?;
+        // A caller the policies in force do not let change this table is refused before
+        // anything is written, so a refused update changes nothing.
+        if let Some(denial) = crate::state::authorization::control_denial(
+            &caller,
+            stored,
+            "dynamodb:UpdateTable",
+            now,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(denial));
+        }
         let stored_billing_mode = stored.billing_mode.clone();
         let stored_encryption = stored.encryption.clone();
         match stored.status(now) {

@@ -153,6 +153,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let name = crate::state::resolve_table_name_in(&input.table_name, &region)
             .map_err(|error| lift(&input.table_name, error))?;
 
+        // WHO this request speaks for, resolved before this service's store is locked: a
+        // control-plane call on a table is authorized exactly as a read or a write of its
+        // items is ([`crate::state::authorization`]).
+        let caller = crate::state::request_caller(&*self.engine, ctx);
         let mut store = state.lock();
         // Finish any transition the clock already made due before reporting: a table
         // whose DeleteTable span has elapsed is gone, and this is a read, so that is the
@@ -161,6 +165,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let table = store
             .table(&region, &name)
             .map_err(|error| lift(&name, error))?;
+        // A caller the policies in force do not let read this setting is answered the
+        // denial rather than the table's backup description.
+        if let Some(denial) = crate::state::authorization::control_denial(
+            &caller,
+            table,
+            "dynamodb:DescribeContinuousBackups",
+            now,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(denial));
+        }
 
         Ok(DescribeContinuousBackupsOutput {
             continuous_backups_description: Some(table.point_in_time_recovery.describe(now)),

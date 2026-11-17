@@ -175,12 +175,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::auto_scaling_role_pass_denied(&caller.arn, &role_arn),
             ));
         }
+        // WHO this request speaks for, read before the store is locked for the same reason:
+        // a control-plane call on a table is authorized exactly as a read or a write of its
+        // items is.
+        let scaling_caller = crate::state::request_caller(&*self.engine, ctx);
 
         let mut store = state.lock();
         // Whatever the clock already owes the group is materialised before the update is
         // applied, so a replica whose create has fallen due is one this request can scale
         // and a table whose delete has is one it cannot.
         store.apply_due_transitions(now);
+        // A caller the policies in force do not let scale this table is refused before
+        // anything is written ([`crate::state::authorization`]). Asked of a table this store
+        // HOLDS: a name it holds none under is refused by the update below, in that
+        // operation's own vocabulary.
+        if let Ok(table) = store.table(&region, &name) {
+            if let Some(denial) = crate::state::authorization::control_denial(
+                &scaling_caller,
+                table,
+                "dynamodb:UpdateTableReplicaAutoScaling",
+                now,
+            ) {
+                return Err(crate::scaffolded::Scaffolded::access_denied(denial));
+            }
+        }
         store
             .apply_replica_auto_scaling(&region, &name, &input)
             .map_err(lift)?;

@@ -156,6 +156,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
         let name = crate::state::resolve_table_name_in(&input.table_name, &region).map_err(lift)?;
 
+        // WHO this request speaks for, resolved before this service's store is locked: a
+        // control-plane call on a table is authorized exactly as a read or a write of its
+        // items is ([`crate::state::authorization`]).
+        let caller = crate::state::request_caller(&*self.engine, ctx);
+
         // How much of the table's creation the clock still owes when this poll lands
         // ([`crate::state::Table::creation_settles_in`]). The store guard is dropped with
         // the block, so nothing else is held while this request waits below.
@@ -185,6 +190,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.apply_due_transitions(now);
         let table = store.table(&region, &name).map_err(lift)?;
+        // A caller the policies in force do not let describe this table is answered the
+        // denial rather than the table's description.
+        if let Some(denial) = crate::state::authorization::control_denial(
+            &caller,
+            table,
+            "dynamodb:DescribeTable",
+            now,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(denial));
+        }
 
         Ok(DescribeTableOutput {
             table: Some(table.describe(now)),

@@ -264,12 +264,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(bad_request)?;
 
+        // WHO this request speaks for, resolved before this service's store is locked: the
+        // restore reads the SOURCE table, so it is authorized against that table's own
+        // policy and the caller's documents ([`crate::state::authorization`]).
+        let caller = crate::state::request_caller(&*self.engine, ctx);
         let mut store = state.lock();
         store.apply_due_transitions(now);
 
         let source = store
             .table(&region, &source_name)
             .map_err(|error| lift(&source_name, error))?;
+        // A caller the policies in force do not let restore this table is refused before
+        // anything is written, so no restored table is left behind.
+        if let Some(denial) = crate::state::authorization::control_denial(
+            &caller,
+            source,
+            "dynamodb:RestoreTableToPointInTime",
+            now,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(denial));
+        }
         // "Point in time recovery has not yet been enabled for this source table"
         // (`PointInTimeRecoveryUnavailableException`): a table whose recovery is off has
         // no restorable window at all, so there is no point in time to restore to.

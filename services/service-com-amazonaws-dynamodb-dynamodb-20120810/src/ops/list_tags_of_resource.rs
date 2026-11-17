@@ -176,6 +176,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // WHO this request speaks for, resolved before this service's store is locked: a
+        // control-plane call on a table is authorized exactly as a read or a write of its
+        // items is ([`crate::state::authorization`]).
+        let caller = crate::state::request_caller(&*self.engine, ctx);
         let mut store = state.lock();
         // Finish any transition the clock already made due before reporting: a table
         // whose DeleteTable span has elapsed is gone and a tag write whose propagation
@@ -183,6 +187,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // it makes.
         store.apply_due_transitions(now);
         let table = store.table_by_arn(&resource).map_err(lift)?;
+        // A caller the policies in force do not let read this table's tags is answered
+        // the denial rather than the tag set.
+        if let Some(denial) = crate::state::authorization::control_denial(
+            &caller,
+            table,
+            "dynamodb:ListTagsOfResource",
+            now,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(denial));
+        }
 
         Ok(ListTagsOfResourceOutput {
             // The set this eventually consistent read can see — the newest one whose

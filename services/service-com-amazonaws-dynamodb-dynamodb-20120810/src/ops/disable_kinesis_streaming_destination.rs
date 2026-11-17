@@ -190,9 +190,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // WHO this request speaks for, resolved before this service's store is locked: a
+        // control-plane call on a table is authorized exactly as a read or a write of its
+        // items is ([`crate::state::authorization`]).
+        let caller = crate::state::request_caller(&*self.engine, ctx);
         let mut store = state.lock();
         store.apply_due_transitions(now);
         let table = store.table_mut(&region, &name).map_err(lift)?;
+        // A caller the policies in force do not let change this setting is refused before
+        // anything is written.
+        if let Some(denial) = crate::state::authorization::control_denial(
+            &caller,
+            table,
+            "dynamodb:DisableKinesisStreamingDestination",
+            now,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(denial));
+        }
         // The answer below reports the table's STORED name, so reading it cannot overlap
         // the borrow of the destination it is looked up for.
         let table_name = table.name.clone();

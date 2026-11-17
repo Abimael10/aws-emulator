@@ -155,6 +155,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
         crate::state::check_backup_arn(&input.backup_arn, &region).map_err(lift)?;
 
+        // WHO this request speaks for, and whether the policies in force let it remove this
+        // backup: a backup carries no policy of its own, so the decision rests on the
+        // caller's documents, against the backup ARN the request named
+        // ([`crate::state::authorization`]). Taken before the store is locked, so a refused
+        // delete removes nothing.
+        let caller = crate::state::request_caller(&*self.engine, ctx);
+        if let Some(denial) = crate::state::authorization::identity_only_denial(
+            &caller,
+            "dynamodb:DeleteBackup",
+            &input.backup_arn,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(denial));
+        }
+
         let mut store = state.lock();
         store.apply_due_transitions(now);
         // "There is another ongoing conflicting backup control plane operation on the

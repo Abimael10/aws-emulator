@@ -215,6 +215,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a request that names none ([`requested_members`]).
         let request = requested_members(&input)?;
 
+        // WHO this request speaks for, resolved before this service's store is locked: a
+        // control-plane call on a table is authorized exactly as a read or a write of its
+        // items is ([`crate::state::authorization`]).
+        let caller = crate::state::request_caller(&*self.engine, ctx);
+
         // Everything this call decides about the table is decided under the store's own
         // guard, and the guard is released at the end of this block: the rendering below
         // must run with no lock held.
@@ -224,6 +229,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let table = store
                 .table(&region, &name)
                 .map_err(|error| lift(&name, error))?;
+            // A caller the policies in force do not let export this table is refused
+            // before any export is recorded.
+            if let Some(denial) = crate::state::authorization::control_denial(
+                &caller,
+                table,
+                "dynamodb:ExportTableToPointInTime",
+                now,
+            ) {
+                return Err(crate::scaffolded::Scaffolded::access_denied(denial));
+            }
             // "Providing a ClientToken makes the call to ExportTableToPointInTimeInput
             // idempotent, meaning that multiple identical calls have the same effect as one
             // single call" (`$ClientToken`): a token that still stands for an export

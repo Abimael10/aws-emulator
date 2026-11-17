@@ -274,6 +274,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // WHO this request speaks for, resolved before this service's store is locked, and
+        // whether the policies in force on that caller let it attach a policy to this
+        // table: a policy-management call is decided on the caller's identity-based
+        // documents ([`crate::state::authorization`]), because what the table's OWN policy
+        // says about managing it is read by the lock-out rule above.
+        let caller = crate::state::request_caller(&*self.engine, ctx);
+        if let Some(denial) = crate::state::authorization::identity_only_denial(
+            &caller,
+            "dynamodb:PutResourcePolicy",
+            &resource.arn,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(denial));
+        }
+
         let mut store = state.lock();
         store.apply_due_transitions(now);
         let table = store.table_for_policy_mut(&resource).map_err(lift)?;
