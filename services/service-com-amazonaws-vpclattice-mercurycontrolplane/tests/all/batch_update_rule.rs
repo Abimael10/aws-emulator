@@ -25,10 +25,10 @@
 //!    would leave two rules of the listener at one priority is refused with the modelled
 //!    409 `ConflictException` and stores nothing.
 //! 4. A partial failure keeps the successful updates: an entry naming no rule of this
-//!    listener is reported under `unsuccessful` with the code and message the single-rule
-//!    path refuses it with, while its sibling entries are applied. A value a documented
-//!    service rule refuses is refused for the whole call instead, the way the single-rule
-//!    path refuses it.
+//!    listener is reported under `unsuccessful` with the code the single-rule path refuses
+//!    it with and the BATCH channel's own failure message, while its sibling entries are
+//!    applied. A value a documented service rule refuses is refused for the whole call
+//!    instead, the way the single-rule path refuses it.
 //! 5. A `serviceIdentifier` or `listenerIdentifier` naming nothing persisted is a 404
 //!    `ResourceNotFoundException`; both modelled identifier forms (the bare id and the
 //!    ARN) reach the same listener and the same rule.
@@ -44,7 +44,7 @@
 
 use crate::list_rules::default_rule_id;
 use crate::listeners::{a_service, listener_kind, target_group};
-use crate::resource_not_found_messages::absent_id;
+use crate::resource_not_found_messages::{absent_id, assert_not_found};
 use crate::rules::{
     a_listener, assert_refused, create_rule, fixed_response_rule, get_rule, rule_kind,
 };
@@ -149,6 +149,27 @@ fn created_match() -> serde_json::Value {
             "headerMatches": [],
         },
     })
+}
+
+/// The PER-ENTRY failure message a batch reports an entry whose `ruleIdentifier` names no
+/// rule of the addressed listener with, written out here rather than read from the service
+/// so no row can pass by agreeing with the code under test: the kind's CamelCase resource
+/// name, the fixed " with identifier ", the identifier the caller submitted for that entry
+/// verbatim, and the fixed " doesn't exist".
+///
+/// Source: recorded vpc-lattice `BatchUpdateRule` 200 bodies. `failureMessage` is modelled
+/// as a plain string (`com.amazonaws.vpclattice#FailureMessage`, no constraints), so the
+/// batch channel's own template is what the recordings fix — deliberately NOT the sentence
+/// of the modelled `ResourceNotFoundException` the single-rule paths answer the same
+/// refusal with ([`single_rule_not_found_message`]).
+fn expected_batch_failure_message(identifier: &str) -> String {
+    format!("Rule with identifier {identifier} doesn't exist")
+}
+
+/// The message of the modelled 404 the SINGLE-rule paths answer the same refusal with, so
+/// a row can pin that the two channels carry different text.
+fn single_rule_not_found_message(identifier: &str) -> String {
+    format!("Rule {identifier} cannot be found.")
 }
 
 /// Rules 1 and 2, over a table that varies WHICH members an entry supplies (priority
@@ -623,12 +644,12 @@ async fn an_entry_naming_no_rule_of_this_listener_leaves_its_siblings_applied() 
         (
             "an identifier naming no rule",
             absent_rule.clone(),
-            format!("Rule {absent_rule} cannot be found."),
+            expected_batch_failure_message(&absent_rule),
         ),
         (
             "a rule of another listener of the same service",
             foreign.clone(),
-            format!("Rule {foreign} cannot be found."),
+            expected_batch_failure_message(&foreign),
         ),
     ];
 
@@ -711,6 +732,221 @@ async fn an_entry_naming_no_rule_of_this_listener_leaves_its_siblings_applied() 
             untouched.body
         );
     }
+}
+
+/// Rule 4's MESSAGE: every entry a batch cannot apply because its `ruleIdentifier` names
+/// no rule of the addressed listener carries the batch channel's own failure message —
+/// not the sentence of the modelled 404 the single-rule paths answer the same refusal
+/// with.
+///
+/// The table varies what the rule generalises over: WHY no rule is reachable (an id
+/// nothing ever created, a rule of another listener of the same service, a rule of a
+/// listener of ANOTHER service, a rule that existed and was deleted), the identifier FORM
+/// (the bare id and the rule ARN, the two forms `RuleIdentifier` models), and WHERE in the
+/// batch the failing entry sits. Each row also drives the SAME identifier through a
+/// single-rule path, so the two channels' texts are pinned apart rather than only pinned
+/// one at a time.
+#[tokio::test]
+async fn a_batch_entry_naming_no_rule_carries_the_batch_channels_own_message() {
+    let lattice = Lattice::new();
+    let (service_id, _) = a_service(&lattice, "entry-message-host").await;
+    let listener_id = a_listener(&lattice, &service_id, "entry-message-listener").await;
+    let elsewhere = a_listener(&lattice, &service_id, "entry-message-elsewhere").await;
+    let (other_service, _) = a_service(&lattice, "entry-message-other").await;
+    let other_listener = a_listener(&lattice, &other_service, "entry-message-other-l").await;
+
+    // Two rules that DO exist and are still not rules of the addressed listener: one of
+    // another listener of the same service, one of a listener of another service.
+    let foreign = a_rule(&lattice, &service_id, &elsewhere, "message-foreign", 10).await;
+    let far = a_rule(&lattice, &other_service, &other_listener, "message-far", 10).await;
+
+    // A rule of the addressed listener that existed and was deleted.
+    let gone = a_rule(&lattice, &service_id, &listener_id, "message-gone", 20).await;
+    let gone_arn = expected_arn(&rule_kind(&service_id, &listener_id), &gone);
+    let removed = lattice
+        .call(
+            "DELETE",
+            &format!("/services/{service_id}/listeners/{listener_id}/rules/{gone}"),
+            None,
+        )
+        .await;
+    assert_eq!(
+        removed.status, 204,
+        "case fixture: deleting the rule expected 204, got {} / {}",
+        removed.status, removed.body
+    );
+
+    // One rule of the addressed listener that every call of the table applies, so each
+    // call is a PARTIAL failure and the refused entry is the only one under test.
+    let applied = a_rule(&lattice, &service_id, &listener_id, "message-applied", 30).await;
+
+    // (why, the identifier the refused entry submits)
+    let mut rows: Vec<(String, String)> = Vec::new();
+    for fill in ["0", "z", "a1b2c3d4"] {
+        let absent = absent_id("rule-", fill);
+        rows.push((format!("never created ({fill}) by id"), absent.clone()));
+        rows.push((
+            format!("never created ({fill}) by arn"),
+            expected_arn(&rule_kind(&service_id, &listener_id), &absent),
+        ));
+    }
+    rows.push((
+        "a rule of another listener of the same service, by id".to_string(),
+        foreign.clone(),
+    ));
+    rows.push((
+        "a rule of another listener of the same service, by arn".to_string(),
+        expected_arn(&rule_kind(&service_id, &elsewhere), &foreign),
+    ));
+    rows.push((
+        "a rule of a listener of another service, by id".to_string(),
+        far.clone(),
+    ));
+    rows.push((
+        "a rule of a listener of another service, by arn".to_string(),
+        expected_arn(&rule_kind(&other_service, &other_listener), &far),
+    ));
+    rows.push(("a deleted rule, by id".to_string(), gone.clone()));
+    rows.push(("a deleted rule, by arn".to_string(), gone_arn));
+
+    for (index, (why, identifier)) in rows.iter().enumerate() {
+        let case = format!("BatchUpdateRule entry: {why}");
+        // The refused entry sits first on every other row and last in between, so no
+        // assertion can pass on the entry's position in the batch.
+        let entries = if index % 2 == 0 {
+            serde_json::json!([
+                { "ruleIdentifier": identifier, "priority": 900 },
+                { "ruleIdentifier": applied, "priority": 30 },
+            ])
+        } else {
+            serde_json::json!([
+                { "ruleIdentifier": applied, "priority": 30 },
+                { "ruleIdentifier": identifier, "priority": 900 },
+            ])
+        };
+        let answer = batch_update(&lattice, &service_id, &listener_id, entries).await;
+
+        assert_eq!(
+            successful_of(&case, &answer).len(),
+            1,
+            "case {case:?}: expected the sibling entry applied on its own, got {}",
+            answer.body
+        );
+        let refused = unsuccessful_of(&case, &answer);
+        assert_eq!(
+            refused.len(),
+            1,
+            "case {case:?}: expected exactly one refused entry, got {}",
+            answer.body
+        );
+        assert_eq!(
+            refused[0]["ruleIdentifier"].as_str(),
+            Some(identifier.as_str()),
+            "case {case:?}: a refused entry names the identifier it was sent for, got {}",
+            answer.body
+        );
+        assert_eq!(
+            refused[0]["failureCode"].as_str(),
+            Some("ResourceNotFoundException"),
+            "case {case:?}: expected the code the same refusal carries on one rule, got {}",
+            answer.body
+        );
+        let expected_message = expected_batch_failure_message(identifier);
+        assert_eq!(
+            refused[0]["failureMessage"].as_str(),
+            Some(expected_message.as_str()),
+            "case {case:?}: expected the batch channel's own message {expected_message:?}, \
+             got {}",
+            answer.body
+        );
+
+        // The SAME identifier through the single-rule read path: the modelled 404, whose
+        // message is the other construction. The two channels must not share one text.
+        let single = get_rule(&lattice, &service_id, &listener_id, &as_label(identifier)).await;
+        assert_not_found(&single, &case, "Rule", identifier);
+        let single_message = single_rule_not_found_message(identifier);
+        assert_eq!(
+            message_of(&case, &single),
+            single_message,
+            "case {case:?}: expected the single-rule exception text {single_message:?}, got {}",
+            single.body
+        );
+        assert_ne!(
+            refused[0]["failureMessage"].as_str().unwrap_or_default(),
+            single_message.as_str(),
+            "case {case:?}: the batch entry must not carry the single-rule exception text, \
+             got {}",
+            answer.body
+        );
+    }
+
+    // Several refused entries in ONE call — including the same identifier twice — each get
+    // their own message over the identifier THEY submitted, and the applicable entry still
+    // goes through.
+    let case = "several refused entries in one call";
+    let first = absent_id("rule-", "1");
+    let second = expected_arn(&rule_kind(&service_id, &listener_id), &absent_id("rule-", "2"));
+    let answer = batch_update(
+        &lattice,
+        &service_id,
+        &listener_id,
+        serde_json::json!([
+            { "ruleIdentifier": first, "priority": 901 },
+            { "ruleIdentifier": applied, "priority": 31 },
+            { "ruleIdentifier": second, "priority": 902 },
+            { "ruleIdentifier": first, "priority": 903 },
+        ]),
+    )
+    .await;
+    assert_eq!(
+        successful_of(case, &answer).len(),
+        1,
+        "case {case:?}: expected the one applicable entry applied, got {}",
+        answer.body
+    );
+    let refused = unsuccessful_of(case, &answer);
+    let reported: Vec<(Option<&str>, Option<&str>)> = refused
+        .iter()
+        .map(|entry| {
+            (
+                entry["ruleIdentifier"].as_str(),
+                entry["failureMessage"].as_str(),
+            )
+        })
+        .collect();
+    let expected: Vec<(Option<&str>, String)> = vec![
+        (Some(first.as_str()), expected_batch_failure_message(&first)),
+        (Some(second.as_str()), expected_batch_failure_message(&second)),
+        (Some(first.as_str()), expected_batch_failure_message(&first)),
+    ];
+    assert_eq!(
+        reported.len(),
+        expected.len(),
+        "case {case:?}: expected one entry per refused update, got {}",
+        answer.body
+    );
+    for (position, ((identifier, message), (expected_identifier, expected_message))) in
+        reported.iter().zip(expected.iter()).enumerate()
+    {
+        assert_eq!(
+            identifier, expected_identifier,
+            "case {case:?}: entry {position} must name the identifier it was sent for, got {}",
+            answer.body
+        );
+        assert_eq!(
+            *message,
+            Some(expected_message.as_str()),
+            "case {case:?}: entry {position} expected {expected_message:?}, got {}",
+            answer.body
+        );
+    }
+    let read = get_rule(&lattice, &service_id, &listener_id, &applied).await;
+    assert_eq!(
+        read.body["priority"].as_i64(),
+        Some(31),
+        "case {case:?}: expected the applicable entry persisted, got {}",
+        read.body
+    );
 }
 
 /// Rule 4's other half: a value a documented service rule refuses is refused for the

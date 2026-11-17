@@ -253,6 +253,26 @@ impl ResourceKind {
         format!("{} {identifier} cannot be found.", self.message_name())
     }
 
+    /// How a PER-ENTRY failure of a batch operation reports an entry whose identifier
+    /// names no resource of this kind under the parent the call addressed:
+    /// `"<ResourceType> with identifier <identifier> doesn't exist"`.
+    ///
+    /// A batch entry is refused through the response body, not through the error channel:
+    /// it carries no HTTP status and its `failureMessage` is modelled as a plain string,
+    /// so the sentence is the only thing distinguishing a missing resource from any other
+    /// per-entry refusal — and it is its OWN template, not the message of the exception
+    /// the single-resource path answers the same refusal with
+    /// ([`Self::not_found_message`]). `identifier` is the identifier the CALLER submitted
+    /// for that entry, in whichever modelled form it sent.
+    ///
+    /// SOURCE: recorded AWS behaviour for a batch entry naming no such resource.
+    pub fn batch_entry_not_found_message(self, identifier: &str) -> String {
+        format!(
+            "{} with identifier {identifier} doesn't exist",
+            self.message_name()
+        )
+    }
+
     /// The `@pattern` the model puts on this kind's `name` member, or `None` for a kind
     /// that has no name (an association is named by the pair it links).
     ///

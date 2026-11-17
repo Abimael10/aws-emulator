@@ -136,7 +136,9 @@ fn not_found(identifier: &str, kind: crate::state::ResourceKind) -> BatchUpdateR
 ///
 /// A per-entry failure carries the wire name of the modelled exception the single-rule
 /// path answers the SAME refusal with, so a caller reading `unsuccessful` sees the code
-/// it would have seen had it sent that entry on its own.
+/// it would have seen had it sent that entry on its own. The per-entry MESSAGE is the
+/// batch channel's own ([`crate::state::ResourceKind::batch_entry_not_found_message`]),
+/// not that exception's.
 const FAILURE_NOT_FOUND: &str = "ResourceNotFoundException";
 
 /// The answer for an entry the batch applied — every member read off the record that was
@@ -154,7 +156,8 @@ fn success_of(rule: &crate::state::Rule) -> RuleUpdateSuccess {
 }
 
 /// The answer for an entry the batch did not apply: the identifier the caller submitted
-/// for it, the code of the matching modelled refusal, and that refusal's own message.
+/// for it, the code of the matching modelled refusal, and the batch channel's own message
+/// for that refusal.
 fn failure(rule_identifier: &str, code: &str, message: String) -> RuleUpdateFailure {
     RuleUpdateFailure {
         rule_identifier: Some(rule_identifier.to_string()),
@@ -264,13 +267,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .is_some_and(|rule| rule.listener_id == listener_id)
             });
             if target.is_none() {
-                // The entry carries the code and the message the single-rule path refuses
-                // the same identifier with: this service's not-found construction over the
-                // identifier the caller submitted for that entry.
+                // The entry carries the code the single-rule path refuses the same
+                // identifier with, and the BATCH channel's own message template over the
+                // identifier the caller submitted for that entry — a per-entry failure is
+                // reported through the body, so it is not the modelled exception and does
+                // not carry that exception's sentence.
                 failures.push(failure(
                     &update.rule_identifier,
                     FAILURE_NOT_FOUND,
-                    crate::state::ResourceKind::Rule.not_found_message(&update.rule_identifier),
+                    crate::state::ResourceKind::Rule
+                        .batch_entry_not_found_message(&update.rule_identifier),
                 ));
             }
             targets.push(target);
