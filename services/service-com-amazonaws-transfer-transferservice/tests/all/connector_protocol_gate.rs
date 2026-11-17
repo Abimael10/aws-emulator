@@ -15,6 +15,12 @@
 //! that does not, because the gate is a fact about the CONNECTOR and so cannot depend on
 //! either.
 //!
+//! The last suite asserts the TEXT of each refusal: the whole `Message` is the service's
+//! fixed sentence for that operation, over a table of request forms (path forms and both
+//! published length bounds, the optional members at their published bounds, two
+//! differently configured AS2 connectors), since no part of that sentence comes from the
+//! request or from the connector.
+//!
 //! Every request goes over the real wire path (`POST /` with
 //! `X-Amz-Target: TransferService.<Op>`) through the shared [`crate::harness`], so what
 //! is asserted is what an SDK sees.
@@ -335,6 +341,275 @@ async fn a_connector_the_store_does_not_hold_is_still_reported_as_missing() {
             Some("Connector"),
             "case {case:?}: expected the missing connector to be reported, got {}",
             answer.body
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The TEXT of each refusal
+// ---------------------------------------------------------------------------
+
+/// The sentence the service states for a directory listing asked of an AS2 connector.
+const DIRECTORY_LISTING_UNSUPPORTED: &str = "Directory listing not supported for AS2 connectors";
+
+/// The sentence the service states for a remote delete asked of an AS2 connector.
+const REMOTE_DELETE_UNSUPPORTED: &str = "Remote delete not supported for AS2 connectors";
+
+/// The sentence the service states for a remote move asked of an AS2 connector.
+const REMOTE_MOVE_UNSUPPORTED: &str = "Remote move not supported for AS2 connectors";
+
+/// The sentence the service states for the per-file results of a transfer asked of an AS2
+/// connector.
+const LIST_FILE_TRANSFER_RESULTS_UNSUPPORTED: &str =
+    "ListFileTransferResults is not supported for AS2 connectors";
+
+/// The rows of one operation's refusal: the case, the members beside `ConnectorId`, and
+/// the output member a served call would have answered (`None` for the listing of
+/// results, which answers a collection rather than a minted identifier).
+type Row = (String, &'static str, Value, &'static str, Option<&'static str>);
+
+/// Every gated request this suite makes of one AS2 connector, with the fixed text each
+/// one must be refused in.
+///
+/// The rows of an operation differ along what the rule generalises over — the FORM and
+/// LENGTH of the paths (`FilePath` is modelled `len 1..1024`, so the shortest absolute
+/// path and one at the published maximum are both here), whether a relative path that
+/// would be refused on its own is sent, whether the optional members are sent (the
+/// listing's `MaxItems`, modelled `range 1..`, at its published minimum and at the
+/// 200,000-item list bound the operation documents; the results listing's `MaxResults`,
+/// modelled `range 1..1000`, at both published bounds, and a `NextToken`), and whether
+/// the identifier inside the connector is one the connector really holds — none of which
+/// the refusal may depend on.
+fn gated_rows(transfer_id: &str) -> Vec<Row> {
+    let shortest_path = "/".to_string();
+    let longest_path = format!("/{}", "p".repeat(1023));
+
+    vec![
+        (
+            "a directory listing of the shortest absolute paths".to_string(),
+            "StartDirectoryListing",
+            json!({
+                "RemoteDirectoryPath": &shortest_path,
+                "OutputDirectoryPath": &shortest_path,
+            }),
+            DIRECTORY_LISTING_UNSUPPORTED,
+            Some("ListingId"),
+        ),
+        (
+            "a directory listing capped at the modelled minimum MaxItems".to_string(),
+            "StartDirectoryListing",
+            json!({
+                "RemoteDirectoryPath": "/outbox",
+                "OutputDirectoryPath": "/bucket/listings",
+                "MaxItems": 1,
+            }),
+            DIRECTORY_LISTING_UNSUPPORTED,
+            Some("ListingId"),
+        ),
+        (
+            "a directory listing of the longest paths, capped at the documented list bound"
+                .to_string(),
+            "StartDirectoryListing",
+            json!({
+                "RemoteDirectoryPath": &longest_path,
+                "OutputDirectoryPath": &longest_path,
+                "MaxItems": 200_000,
+            }),
+            DIRECTORY_LISTING_UNSUPPORTED,
+            Some("ListingId"),
+        ),
+        (
+            "a directory listing of relative paths, which are refused on their own rule"
+                .to_string(),
+            "StartDirectoryListing",
+            json!({
+                "RemoteDirectoryPath": "outbox",
+                "OutputDirectoryPath": "bucket/listings",
+            }),
+            DIRECTORY_LISTING_UNSUPPORTED,
+            Some("ListingId"),
+        ),
+        (
+            "a remote delete of the shortest absolute path".to_string(),
+            "StartRemoteDelete",
+            json!({"DeletePath": &shortest_path}),
+            REMOTE_DELETE_UNSUPPORTED,
+            Some("DeleteId"),
+        ),
+        (
+            "a remote delete of a file".to_string(),
+            "StartRemoteDelete",
+            json!({"DeletePath": "/outbox/report.csv"}),
+            REMOTE_DELETE_UNSUPPORTED,
+            Some("DeleteId"),
+        ),
+        (
+            "a remote delete of the longest path".to_string(),
+            "StartRemoteDelete",
+            json!({"DeletePath": &longest_path}),
+            REMOTE_DELETE_UNSUPPORTED,
+            Some("DeleteId"),
+        ),
+        (
+            "a remote delete of a relative path, which is refused on its own rule".to_string(),
+            "StartRemoteDelete",
+            json!({"DeletePath": "outbox/report.csv"}),
+            REMOTE_DELETE_UNSUPPORTED,
+            Some("DeleteId"),
+        ),
+        (
+            "a remote move between two files".to_string(),
+            "StartRemoteMove",
+            json!({"SourcePath": "/outbox/report.csv", "TargetPath": "/archive/report.csv"}),
+            REMOTE_MOVE_UNSUPPORTED,
+            Some("MoveId"),
+        ),
+        (
+            "a remote move onto the longest target path".to_string(),
+            "StartRemoteMove",
+            json!({"SourcePath": &shortest_path, "TargetPath": &longest_path}),
+            REMOTE_MOVE_UNSUPPORTED,
+            Some("MoveId"),
+        ),
+        (
+            "the results of a transfer the connector accepted".to_string(),
+            "ListFileTransferResults",
+            json!({"TransferId": transfer_id}),
+            LIST_FILE_TRANSFER_RESULTS_UNSUPPORTED,
+            None,
+        ),
+        (
+            "the results of a transfer the connector never accepted".to_string(),
+            "ListFileTransferResults",
+            json!({"TransferId": NEVER_ACCEPTED_TRANSFER}),
+            LIST_FILE_TRANSFER_RESULTS_UNSUPPORTED,
+            None,
+        ),
+        (
+            "one page of the results, at the modelled minimum MaxResults".to_string(),
+            "ListFileTransferResults",
+            json!({"TransferId": transfer_id, "MaxResults": 1}),
+            LIST_FILE_TRANSFER_RESULTS_UNSUPPORTED,
+            None,
+        ),
+        (
+            "one page of the results, at the modelled maximum MaxResults".to_string(),
+            "ListFileTransferResults",
+            json!({"TransferId": transfer_id, "MaxResults": 1000}),
+            LIST_FILE_TRANSFER_RESULTS_UNSUPPORTED,
+            None,
+        ),
+        (
+            "a later page of the results".to_string(),
+            "ListFileTransferResults",
+            json!({"TransferId": transfer_id, "MaxResults": 1, "NextToken": "1"}),
+            LIST_FILE_TRANSFER_RESULTS_UNSUPPORTED,
+            None,
+        ),
+    ]
+}
+
+/// RULE: each remote-SFTP operation of the connector plane asked of an AS2 connector is
+/// refused with 400 `InvalidRequestException` whose WHOLE `Message` is the service's
+/// fixed text for that operation — the same sentence for every such request, carrying
+/// nothing the caller sent and nothing read out of the connector — and the call mints
+/// nothing.
+///
+/// The table spans the four gated operations and, per operation, the request forms
+/// [`gated_rows`] documents; every row is asked of TWO different AS2 connectors, so a
+/// text that varied with the connector addressed would fail here.
+#[tokio::test]
+async fn each_gated_operation_states_its_refusal_in_one_fixed_text() {
+    let emulator = Emulator::new();
+
+    // Two AS2 connectors, configured differently, so nothing in the refusal can be read
+    // out of the connector the request named.
+    let first = as2_connector(&emulator, "the first AS2 connector").await;
+    let second = create_connector(
+        &emulator,
+        "the second AS2 connector",
+        json!({
+            "AccessRole": ROLE,
+            "Url": "https://other-partner.example.com/as2/inbound",
+            "As2Config": {
+                "LocalProfileId": PARTNER_PROFILE,
+                "PartnerProfileId": LOCAL_PROFILE,
+                "MessageSubject": "invoices",
+            },
+        }),
+    )
+    .await;
+
+    for connector_id in [&first, &second] {
+        // An AS2 connector CAN be asked to send files, so each one holds a record the
+        // results rows can address.
+        let transfer_id = accept_transfer(&emulator, "the connector's transfer", connector_id).await;
+
+        for (case, op, members, expected, minted) in gated_rows(&transfer_id) {
+            let case = format!("{op}: {case}");
+            let mut request = json!({"ConnectorId": connector_id});
+            let object = request.as_object_mut().expect("the request is an object");
+            for (member, value) in members.as_object().expect("the row is an object") {
+                object.insert(member.clone(), value.clone());
+            }
+            let answer = emulator.call(op, request.clone()).await;
+
+            assert_eq!(
+                (answer.status, answer.error_code().as_str()),
+                (400, "InvalidRequestException"),
+                "case {case:?}: expected 400 InvalidRequestException, got {} with body {}",
+                answer.status,
+                answer.body
+            );
+            let message = message_of(&answer);
+            assert_eq!(
+                message, expected,
+                "case {case:?}: expected the service's fixed text {expected:?}, got {message:?}"
+            );
+            // Nothing the caller sent is quoted back: no path, no identifier, no token.
+            for value in request
+                .as_object()
+                .expect("the request is an object")
+                .values()
+                .filter_map(Value::as_str)
+                .filter(|value| value.len() >= 3)
+            {
+                assert!(
+                    !message.contains(value),
+                    "case {case:?}: expected no request data in Message, got {message:?} \
+                     carrying {value:?}"
+                );
+            }
+            if let Some(member) = minted {
+                assert!(
+                    member_of(&answer.body, member).is_null(),
+                    "case {case:?}: expected the refusal to mint no {member}, got {}",
+                    answer.body
+                );
+            }
+            assert!(
+                member_of(&answer.body, "FileTransferResults").is_null(),
+                "case {case:?}: expected the refusal to report no results, got {}",
+                answer.body
+            );
+        }
+
+        // The refusals recorded nothing: the connector still holds exactly the ONE
+        // operation it accepted before them, so no refused call minted a record on its
+        // way out.
+        let held: Vec<String> = emulator
+            .store()
+            .lock()
+            .connector_transfers
+            .keys()
+            .filter(|(held_connector, _)| held_connector == connector_id)
+            .map(|(_, id)| id.clone())
+            .collect();
+        assert_eq!(
+            held,
+            vec![transfer_id.clone()],
+            "case \"the AS2 connector after the refusals\": expected only the transfer it \
+             accepted to be held, got {held:?}"
         );
     }
 }

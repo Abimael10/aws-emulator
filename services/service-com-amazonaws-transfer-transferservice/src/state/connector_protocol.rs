@@ -31,19 +31,20 @@ pub const LIST_FILE_TRANSFER_RESULTS_UNSUPPORTED: &str =
 /// remote operation that is not supported.
 pub const REMOTE_MOVE_UNSUPPORTED: &str = "Remote move not supported for AS2 connectors";
 
-/// `StartRemoteDelete` asked of an AS2 connector.
+/// `StartRemoteDelete` asked of an AS2 connector: the service's fixed text, naming the
+/// remote action that is not supported.
 ///
-/// UNVERIFIED wording: nothing recorded states this operation's refusal, so the text
-/// follows the form the service states for the SIBLING remote operation
+/// It follows the form the service states for the SIBLING remote operation
 /// ([`REMOTE_MOVE_UNSUPPORTED`]) — the remote action, then that it is not supported for
-/// AS2 connectors — with this operation's action. The service is not uniform in that form
-/// ([`LIST_FILE_TRANSFER_RESULTS_UNSUPPORTED`] names the operation instead), so a
-/// recording of this refusal should correct this constant; what IS established is the
-/// refusal itself, its class and its status.
+/// AS2 connectors — with this operation's action, and a recorded refusal of this
+/// operation states that same sentence. The service is not uniform in that form
+/// ([`LIST_FILE_TRANSFER_RESULTS_UNSUPPORTED`] names the operation instead), so each
+/// operation's text is stated here once rather than rebuilt per handler.
 pub const REMOTE_DELETE_UNSUPPORTED: &str = "Remote delete not supported for AS2 connectors";
 
-/// `StartDirectoryListing` asked of an AS2 connector, on the same form and equally
-/// UNVERIFIED as [`REMOTE_DELETE_UNSUPPORTED`].
+/// `StartDirectoryListing` asked of an AS2 connector, on the same form as
+/// [`REMOTE_DELETE_UNSUPPORTED`] and likewise the sentence a recorded refusal of this
+/// operation states, with this operation's capability.
 pub const DIRECTORY_LISTING_UNSUPPORTED: &str =
     "Directory listing not supported for AS2 connectors";
 
