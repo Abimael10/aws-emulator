@@ -57,5 +57,9 @@ hex = { workspace = true }
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
+[dev-dependencies]
+# Declares one module per `tests/all/<name>.rs`, so a suite is picked up by being there.
+automod = { workspace = true }
+
 [lints]
 workspace = true

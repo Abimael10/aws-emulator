@@ -184,11 +184,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
             let Some(destination) = detector.publishing_destinations.get(&input.destination_id)
             else {
-                // The ONE fixed refusal this family answers a `DestinationId` it
-                // cannot resolve with
-                // ([`crate::state::DESTINATION_NOT_FOUND_MESSAGE`]): the same
-                // sentence the describe and the delete answer.
-                return Err(bad_request(crate::state::DESTINATION_NOT_FOUND_MESSAGE));
+                // The update of a destination's properties states the absence as
+                // its own class: no publishing destination exists for the
+                // `publishingDestinationId` it was handed
+                // ([`crate::state::PUBLISHING_DESTINATION_NOT_FOUND_MESSAGE`]).
+                // Whatever the FORM of the id — one a delete removed, one minted
+                // under another detector, one that could never have been minted —
+                // this is the one sentence, and it is not the sentence the read and
+                // the delete answer with.
+                return Err(bad_request(
+                    crate::state::PUBLISHING_DESTINATION_NOT_FOUND_MESSAGE,
+                ));
             };
             let destination_service =
                 crate::state::validate_destination_type(&destination.destination_type)
@@ -233,7 +239,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Unreachable: the same two lookups resolved above under the same lock.
             // The branch is kept rather than unwrapped so a lookup that ever stops
             // resolving answers the caller's own refusal instead of panicking.
-            return Err(bad_request(crate::state::DESTINATION_NOT_FOUND_MESSAGE));
+            return Err(bad_request(
+                crate::state::PUBLISHING_DESTINATION_NOT_FOUND_MESSAGE,
+            ));
         };
         // Materialise the verification the clock already made due before this call's
         // own change is applied, so an update neither skips it nor replays it.

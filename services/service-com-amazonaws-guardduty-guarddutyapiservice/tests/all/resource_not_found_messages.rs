@@ -16,7 +16,8 @@
 //!    with nothing of the request interpolated into it: the uploaded lists (an IPSet,
 //!    a threat list) and a filter READ say no such resource was found, the mutating
 //!    filter paths say the given filter name is invalid, the publishing-destination
-//!    operations report an unusable input parameter, a Malware Protection plan says
+//!    read and delete report an unusable input parameter while its properties UPDATE
+//!    says no publishing destination exists for the id, a Malware Protection plan says
 //!    the plan was not found, and a findings
 //!    write says an invalid finding identifier was specified.
 //! 2. The account-ownership sentence is the DETECTOR family's own refusal: it answers
@@ -59,10 +60,16 @@ const NO_SUCH_RESOURCE: &str = "The request is rejected since no such resource f
 /// What the mutating filter paths answer for a name they cannot act on.
 const INVALID_FILTER_NAME: &str = "The request is rejected because the given filter name is invalid.";
 
-/// What a publishing-destination operation answers for a destination id that names
-/// nothing — the read and the two writes alike.
+/// What the publishing-destination READ and DELETE answer for a destination id that
+/// names nothing.
 const INVALID_INPUT_PARAMETERS: &str =
     "The request is rejected because the one or more input parameters have invalid values.";
+
+/// What the publishing-destination properties UPDATE answers for the same id: the
+/// mutation states the absence of the destination itself, naming the
+/// `publishingDestinationId` member in fixed text.
+const NO_PUBLISHING_DESTINATION: &str =
+    "The request failed because no publishingDestination exists with the provided publishingDestinationId.";
 
 /// What the Malware Protection plan operations answer for a plan id this account and
 /// Region do not hold — absent and foreign collapsed into one wording.
@@ -538,8 +545,8 @@ async fn each_family_words_its_own_absent_resource_refusal() {
         });
     }
 
-    // The publishing-destination family: the read and the two writes all report an
-    // unusable input parameter.
+    // The publishing-destination family: the read and the delete report an unusable
+    // input parameter, and the properties update an absent publishing destination.
     for (id, why) in [
         (stored.destination.clone(), "an id whose delete was accepted"),
         (ABSENT_ID.to_string(), "an id no create minted"),
@@ -564,7 +571,7 @@ async fn each_family_words_its_own_absent_resource_refusal() {
             })),
             status: 400,
             class: INVALID_INPUT,
-            expected: INVALID_INPUT_PARAMETERS,
+            expected: NO_PUBLISHING_DESTINATION,
             sent: id.clone(),
         });
         rows.push(Row {

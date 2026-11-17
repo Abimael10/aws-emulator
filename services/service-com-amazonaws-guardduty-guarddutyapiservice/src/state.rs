@@ -1703,8 +1703,9 @@ pub const NEXT_TOKEN_MEMBER: &str = "nextToken";
 
 /// The wire name of the `DestinationId` member
 /// (`smithy_query(operation="DescribePublishingDestination")` renders it as the
-/// `destinationId` JSON name / URI label). The family's own absence refusal names no
-/// member ([`DESTINATION_NOT_FOUND_MESSAGE`]).
+/// `destinationId` JSON name / URI label). The family's own absence refusals name no
+/// member ([`DESTINATION_ID_UNRESOLVED_MESSAGE`],
+/// [`PUBLISHING_DESTINATION_NOT_FOUND_MESSAGE`]).
 pub const DESTINATION_ID_MEMBER: &str = "destinationId";
 
 /// The wire path of `DestinationProperties.DestinationArn`, as a rejection names
@@ -2389,18 +2390,33 @@ pub fn detector_id_rejection(detector_id: &str) -> String {
     minted_id_rejection(DETECTOR_ID_MEMBER, detector_id)
 }
 
-/// The message a publishing-destination operation refuses a `DestinationId` it
-/// cannot resolve with: GuardDuty reports a destination id that names nothing as an
-/// unusable input PARAMETER ([`INVALID_INPUT_PARAMETERS_MESSAGE`]) rather than as an
-/// absent resource or a foreign one, and interpolates nothing — so the one sentence
+/// The message the publishing-destination READ and DELETE refuse a `DestinationId`
+/// they cannot resolve with: those two report a destination id that names nothing as
+/// an unusable input PARAMETER ([`INVALID_INPUT_PARAMETERS_MESSAGE`]) rather than as
+/// an absent resource or a foreign one, and interpolate nothing — so the one sentence
 /// answers an id a delete removed, one minted under another detector and one that
 /// could never have been minted alike.
 ///
-/// It is the sentence for the WHOLE family, the read and the two writes together:
-/// the recorded `DeletePublishingDestination` refusal of an id the detector does not
-/// hold carries exactly the text `DescribePublishingDestination`'s does, so the
-/// family does not word absence two ways.
-pub const DESTINATION_NOT_FOUND_MESSAGE: &str = INVALID_INPUT_PARAMETERS_MESSAGE;
+/// It is NOT the sentence for the whole family: the wording of "that destinationId
+/// does not resolve" is recorded per OPERATION, and the properties update words it
+/// as an absent publishing destination instead
+/// ([`PUBLISHING_DESTINATION_NOT_FOUND_MESSAGE`]) — which is why the two texts are
+/// two constants rather than one aliased across the family.
+pub const DESTINATION_ID_UNRESOLVED_MESSAGE: &str = INVALID_INPUT_PARAMETERS_MESSAGE;
+
+/// The message `UpdatePublishingDestination` refuses a `DestinationId` the detector
+/// does not hold with: the update of a destination's properties states that no
+/// publishing destination exists for the id it was handed, naming the
+/// `publishingDestinationId` member as part of its FIXED text and interpolating
+/// nothing — neither the detector id nor the destination id.
+///
+/// The status (400) and the error shape (`BadRequestException`, one of the only two
+/// errors the operation models —
+/// `smithy_query(operation="UpdatePublishingDestination")`) are the read's, so this
+/// message is the only thing that tells a caller the destination is gone rather than
+/// its request malformed.
+pub const PUBLISHING_DESTINATION_NOT_FOUND_MESSAGE: &str =
+    "The request failed because no publishingDestination exists with the provided publishingDestinationId.";
 
 /// The wire name of the `FindingIds` member — `jsonName` `findingIds` on every
 /// operation that addresses findings by id

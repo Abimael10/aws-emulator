@@ -24,7 +24,7 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_guardduty_guarddutyapiservice::state;
-use service_com_amazonaws_guardduty_guarddutyapiservice::state::DESTINATION_NOT_FOUND_MESSAGE;
+use service_com_amazonaws_guardduty_guarddutyapiservice::state::PUBLISHING_DESTINATION_NOT_FOUND_MESSAGE;
 
 use crate::client_rejections::{invalid_parameter, not_owned};
 use crate::detector_lifecycle::{
@@ -541,12 +541,12 @@ async fn an_update_addressed_to_an_id_the_store_does_not_hold_is_refused() {
         (
             "an absent destination",
             format!("/detector/{detector_id}/publishingDestination/{ABSENT_DESTINATION_ID}"),
-            DESTINATION_NOT_FOUND_MESSAGE.to_string(),
+            PUBLISHING_DESTINATION_NOT_FOUND_MESSAGE.to_string(),
         ),
         (
             "a destination id that is not one",
             format!("/detector/{detector_id}/publishingDestination/not-a-destination-id"),
-            DESTINATION_NOT_FOUND_MESSAGE.to_string(),
+            PUBLISHING_DESTINATION_NOT_FOUND_MESSAGE.to_string(),
         ),
         (
             "a destination id the caller upper-cased",
@@ -554,7 +554,7 @@ async fn an_update_addressed_to_an_id_the_store_does_not_hold_is_refused() {
                 "/detector/{detector_id}/publishingDestination/{}",
                 destination_id.to_uppercase()
             ),
-            DESTINATION_NOT_FOUND_MESSAGE.to_string(),
+            PUBLISHING_DESTINATION_NOT_FOUND_MESSAGE.to_string(),
         ),
     ];
 
@@ -705,8 +705,8 @@ async fn an_update_through_another_regions_endpoint_does_not_reach_the_destinati
     );
     let message = response["message"].as_str().unwrap_or_default();
     assert_eq!(
-        message, DESTINATION_NOT_FOUND_MESSAGE,
+        message, PUBLISHING_DESTINATION_NOT_FOUND_MESSAGE,
         "case \"update under the {away} detector\": expected message \
-         {DESTINATION_NOT_FOUND_MESSAGE:?}, got {message:?}"
+         {PUBLISHING_DESTINATION_NOT_FOUND_MESSAGE:?}, got {message:?}"
     );
 }

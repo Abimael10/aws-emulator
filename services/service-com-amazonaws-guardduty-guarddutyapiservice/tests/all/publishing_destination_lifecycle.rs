@@ -764,14 +764,14 @@ async fn an_id_the_store_does_not_hold_is_refused_by_both_operations() {
             "GET",
             format!("/detector/{detector_id}/publishingDestination/{ABSENT_DESTINATION_ID}"),
             None,
-            state::DESTINATION_NOT_FOUND_MESSAGE.to_string(),
+            state::DESTINATION_ID_UNRESOLVED_MESSAGE.to_string(),
         ),
         (
             "describe a destination id that is not one",
             "GET",
             format!("/detector/{detector_id}/publishingDestination/not-a-destination-id"),
             None,
-            state::DESTINATION_NOT_FOUND_MESSAGE.to_string(),
+            state::DESTINATION_ID_UNRESOLVED_MESSAGE.to_string(),
         ),
         (
             "describe a destination id the caller upper-cased",
@@ -781,7 +781,7 @@ async fn an_id_the_store_does_not_hold_is_refused_by_both_operations() {
                 destination_id.to_uppercase()
             ),
             None,
-            state::DESTINATION_NOT_FOUND_MESSAGE.to_string(),
+            state::DESTINATION_ID_UNRESOLVED_MESSAGE.to_string(),
         ),
     ];
 

@@ -155,11 +155,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .publishing_destinations
             .contains_key(&input.destination_id)
         {
-            // The ONE fixed refusal this family answers a `DestinationId` it cannot
-            // resolve with ([`crate::state::DESTINATION_NOT_FOUND_MESSAGE`]): the
-            // same sentence the describe answers, naming no member and quoting
-            // nothing of the request back.
-            return Err(bad_request(crate::state::DESTINATION_NOT_FOUND_MESSAGE));
+            // The delete words a `DestinationId` it cannot resolve the way the
+            // describe does ([`crate::state::DESTINATION_ID_UNRESOLVED_MESSAGE`]):
+            // an unusable input parameter, naming no member and quoting nothing of
+            // the request back. The properties update words the same absence
+            // differently, which is why each carries its own constant.
+            return Err(bad_request(
+                crate::state::DESTINATION_ID_UNRESOLVED_MESSAGE,
+            ));
         }
 
         // Past the refusals this is a MUTATION, so it advances this state's clock:

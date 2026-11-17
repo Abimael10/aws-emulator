@@ -38,7 +38,7 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_guardduty_guarddutyapiservice::ops::types::shared_types::SCAN_CRITERION_KEY_VALUES;
 use service_com_amazonaws_guardduty_guarddutyapiservice::state::{
-    now_millis, DESTINATION_NOT_FOUND_MESSAGE, DETECTOR_ID_MEMBER, RESERVED_TAG_PREFIX,
+    now_millis, DESTINATION_ID_UNRESOLVED_MESSAGE, DETECTOR_ID_MEMBER, RESERVED_TAG_PREFIX,
     SCAN_RESOURCE_CRITERIA_MEMBER,
 };
 
@@ -180,7 +180,7 @@ fn rows() -> Vec<Row> {
             method: "DELETE",
             path: |detector_id, _| destination_path(detector_id, ABSENT_DESTINATION_ID),
             body: None,
-            message: DESTINATION_NOT_FOUND_MESSAGE.to_string(),
+            message: DESTINATION_ID_UNRESOLVED_MESSAGE.to_string(),
             probe: Probe::DeleteTheDestination,
         },
         Row {
@@ -189,7 +189,7 @@ fn rows() -> Vec<Row> {
             method: "DELETE",
             path: |detector_id, _| destination_path(detector_id, MALFORMED_ID),
             body: None,
-            message: DESTINATION_NOT_FOUND_MESSAGE.to_string(),
+            message: DESTINATION_ID_UNRESOLVED_MESSAGE.to_string(),
             probe: Probe::DeleteTheDestination,
         },
         Row {

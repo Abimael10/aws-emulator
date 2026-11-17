@@ -175,9 +175,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             // A `DestinationId` this detector does not hold — one a delete removed,
             // one minted elsewhere, or one that could never have been minted — is
-            // reported as an unusable input PARAMETER, which is this family's one
-            // fixed refusal ([`crate::state::DESTINATION_NOT_FOUND_MESSAGE`]).
-            return Err(bad_request(crate::state::DESTINATION_NOT_FOUND_MESSAGE));
+            // reported by the READ as an unusable input PARAMETER
+            // ([`crate::state::DESTINATION_ID_UNRESOLVED_MESSAGE`]), which is the
+            // read's own recorded wording and not the properties update's.
+            return Err(bad_request(
+                crate::state::DESTINATION_ID_UNRESOLVED_MESSAGE,
+            ));
         };
         destination.settle(now);
 
