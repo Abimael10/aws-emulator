@@ -174,15 +174,35 @@ pub fn address_list_not_found_message(address_list_id: &str) -> String {
 }
 
 /// The HTTP status this service answers a request naming an address-list resource it cannot
-/// resolve with.
+/// resolve with — an `AddressListId` that names no stored list, and equally an `Address`
+/// that names no member of a list that does resolve.
 ///
-/// This service classifies an id that resolves to nothing as a fault in the REQUEST, so the
-/// status line is the one a caller-input failure carries even where the error shape it
+/// This service classifies a lookup that resolves to nothing as a fault in the REQUEST, so
+/// the status line is the one a caller-input failure carries even where the error shape it
 /// carries is modelled `@httpError 404`: the error code names the condition, the status says
 /// whose fault it is. Returned through `crate::scaffolded::Scaffolded::modeled_with_status`,
 /// which keeps the modelled shape, its `Message` member and its wire error code and changes
 /// only the status.
 pub const ADDRESS_LIST_LOOKUP_STATUS: u16 = 400;
+
+/// How a member read words the refusal of an `Address` that is no member of an address list
+/// that DOES resolve.
+///
+/// The fixed text is "Could not find Address in AddressList " followed by " of AWS account ",
+/// and the two variable parts are the list id the request named, copied verbatim, and the
+/// account that OWNS that list — the one account this emulator presents
+/// ([`::engine::emulator_account_id`]), which is also the account segment of every
+/// [`address_list_arn`] it mints, so the clause is read off the emulator's own identity
+/// rather than written as a literal. `Address` is `@sensitive`, so the refusal states no
+/// address at all: neither the value it was handed nor the key that value folds to. See
+/// [`ADDRESS_LIST_LOOKUP_STATUS`] for the status it is answered with — a member that is not
+/// there is an unresolvable address-list resource like any other.
+pub fn member_of_address_list_not_found_message(address_list_id: &str) -> String {
+    format!(
+        "Could not find Address in AddressList {address_list_id} of AWS account {}",
+        ::engine::emulator_account_id()
+    )
+}
 
 /// How every address-list import-job operation words the refusal of a `JobId` that
 /// resolves to no stored import job.

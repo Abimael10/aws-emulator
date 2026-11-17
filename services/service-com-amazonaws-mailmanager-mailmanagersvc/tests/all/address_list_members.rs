@@ -180,6 +180,15 @@ fn error_code(body: &Value) -> String {
         .to_string()
 }
 
+/// The `Message` a failure body carries, under either spelling of the member.
+fn error_message(body: &Value) -> String {
+    body.get("Message")
+        .or_else(|| body.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
 /// The longest address `Address`'s modelled 3..320 length admits, spelled with an
 /// upper-case domain; `.1` is how it must be stored.
 fn longest_address() -> (String, String) {
@@ -381,7 +390,7 @@ async fn a_member_lookup_requires_the_stored_local_part_casing() {
                 )
                 .await;
             assert_eq!(
-                status, 404,
+                status, 400,
                 "case {case:?}: {lookup:?} differs from {stored:?} in its local part, so it must \
                  name no member, got {status} {out:?}"
             );
@@ -1051,8 +1060,8 @@ async fn deregister_drops_the_member_under_the_stored_key() {
                 )
                 .await;
             assert_eq!(
-                status, 404,
-                "case {case:?} ({lookup_case}): expected GetMemberOfAddressList to answer 404 \
+                status, 400,
+                "case {case:?} ({lookup_case}): expected GetMemberOfAddressList to answer 400 \
                  after the deregister, got {status} {out:?}"
             );
             assert_eq!(
@@ -1197,7 +1206,7 @@ async fn deregistering_an_address_that_is_no_member_is_served() {
             )
             .await;
         assert_eq!(
-            status, 404,
+            status, 400,
             "case {case:?}: a deregister must not create a member, got {status} {out:?}"
         );
     }
@@ -1213,7 +1222,7 @@ async fn deregistering_an_address_that_is_no_member_is_served() {
             )
             .await;
         assert_eq!(
-            status, 404,
+            status, 400,
             "case already-removed (attempt {attempt}): the member must stay gone, got {status} \
              {out:?}"
         );
@@ -1278,4 +1287,145 @@ async fn re_registering_a_deregistered_address_starts_a_new_membership() {
              {second_stamp}"
         );
     }
+}
+
+/// RULE: a member read of an address list that DOES resolve, for an address the list does
+/// not hold, is a lookup that resolved to nothing like every other one in this service: it
+/// is refused at the status such a lookup carries (400) and its message names BOTH its
+/// variable parts — the `AddressListId` the request spelled, copied verbatim, and the AWS
+/// account that owns that list — while disclosing no `@sensitive` address.
+///
+/// Rows span the class: each form an address list can hold (an email address, a bare domain,
+/// a multi-label domain), both ends of `Address`'s modelled 3..320 length, an address
+/// differing from a stored member only in its case-SENSITIVE local part, one that is a
+/// member of ANOTHER list, and one this list held until it was deregistered — each probed
+/// against a list that holds members and a list that holds none.
+#[tokio::test]
+async fn a_member_an_existing_address_list_does_not_hold_is_refused_as_a_request_fault() {
+    let harness = Harness::new();
+    // Three lists, so the id the message names is the one the REQUEST named rather than the
+    // only one in the store: one holding members, one holding none, and one holding a member
+    // the probes below look for in the other two.
+    let populated = harness.create_list("holds-members").await;
+    let empty = harness.create_list("holds-nothing").await;
+    let elsewhere = harness.create_list("another-list").await;
+
+    harness.register(&populated, "Member@Example.com").await;
+    harness.register(&populated, "kept.example.org").await;
+    harness.register(&elsewhere, "only.here@example.net").await;
+    // Held by the populated list until it was dropped again: afterwards it is no member, like
+    // an address nothing ever registered.
+    harness.register(&populated, "transient@example.com").await;
+    harness
+        .deregister(&populated, "transient@EXAMPLE.com")
+        .await;
+
+    let (longest, _) = longest_address();
+    let rows: [(&str, String); 8] = [
+        (
+            "an email address nothing registered",
+            "nobody@example.com".to_string(),
+        ),
+        (
+            "a bare domain nothing registered",
+            "Unknown.Example.NET".to_string(),
+        ),
+        (
+            "a multi-label domain nothing registered",
+            "mail.unknown.example.org".to_string(),
+        ),
+        (
+            "the shortest value the modelled length admits",
+            "a.b".to_string(),
+        ),
+        ("the longest value the modelled length admits", longest),
+        (
+            "a stored member's address in another local-part casing",
+            "member@Example.com".to_string(),
+        ),
+        (
+            "a member of another address list",
+            "only.here@example.net".to_string(),
+        ),
+        (
+            "a member this list no longer holds",
+            "transient@example.com".to_string(),
+        ),
+    ];
+
+    // The account the message must name: the one this emulator presents, which is the account
+    // segment of every ARN it mints.
+    let account = engine::emulator_account_id();
+    for (row, address) in &rows {
+        for (list_case, list) in [
+            ("a list holding members", &populated),
+            ("a list holding none", &empty),
+        ] {
+            let case = format!("{row} / {list_case}");
+            let (status, out) = harness
+                .call(
+                    "GetMemberOfAddressList",
+                    json!({ "AddressListId": list, "Address": address }),
+                )
+                .await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: an address the list does not hold is a request fault, got \
+                 {status} {out:?}"
+            );
+            assert_eq!(
+                error_code(&out),
+                "ResourceNotFoundException",
+                "case {case:?}: unexpected error code, got {out:?}"
+            );
+            let message = error_message(&out);
+            assert_eq!(
+                message,
+                format!("Could not find Address in AddressList {list} of AWS account {account}"),
+                "case {case:?}: the refusal must name the list and the owning account, got \
+                 {message:?}"
+            );
+            assert!(
+                !message.contains(address.as_str())
+                    && !message.contains(&address.to_lowercase())
+                    && !message.contains("Could not find AddressList with id"),
+                "case {case:?}: the refusal must disclose no address and must not claim the \
+                 list is missing, got {message:?}"
+            );
+        }
+    }
+
+    // The member the populated list DOES hold still reads back, so every refusal above is
+    // about the membership and not about the list.
+    let (status, out) = harness
+        .call(
+            "GetMemberOfAddressList",
+            json!({ "AddressListId": &populated, "Address": "Member@EXAMPLE.COM" }),
+        )
+        .await;
+    assert_eq!(
+        (status, out["Address"].as_str()),
+        (200, Some("Member@example.com")),
+        "case the-stored-member: the member the list holds must still read back, got {status} \
+         {out:?}"
+    );
+
+    // An address list that does not resolve is refused at the same status but with the
+    // address-LIST wording, so a caller can still tell the two misses apart.
+    let unknown = "no-such-address-list";
+    let (status, out) = harness
+        .call(
+            "GetMemberOfAddressList",
+            json!({ "AddressListId": unknown, "Address": "nobody@example.com" }),
+        )
+        .await;
+    assert_eq!(
+        status, 400,
+        "case an-unknown-list: expected 400, got {status} {out:?}"
+    );
+    assert_eq!(
+        error_message(&out),
+        format!("Could not find AddressList with id {unknown}"),
+        "case an-unknown-list: a list that does not resolve keeps its own wording, got {out:?}"
+    );
 }

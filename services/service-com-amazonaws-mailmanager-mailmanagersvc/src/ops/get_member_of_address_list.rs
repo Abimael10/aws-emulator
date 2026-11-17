@@ -6,8 +6,9 @@
 //! by that same stored key, so an address whose DOMAIN differs only in letter case names
 //! the same member and one whose LOCAL PART does names another; a member the list does not
 //! hold is the modelled `ResourceNotFoundException`, and so is an `AddressListId` that
-//! names no stored list — that one at the status this service answers an unresolvable
-//! address-list id with (`crate::state::ADDRESS_LIST_LOOKUP_STATUS`).
+//! names no stored list — both at the status this service answers an unresolvable
+//! address-list resource with (`crate::state::ADDRESS_LIST_LOOKUP_STATUS`), the member one
+//! worded by `crate::state::member_of_address_list_not_found_message`.
 //!
 //! ## Shape of an operation
 //!
@@ -194,19 +195,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let address = crate::state::member_address_key(&input.address);
         let Some(created_at_millis) = record.members.get(&address) else {
-            // The membership is what is missing, not the list: the refusal names the
-            // member that was looked for and the list it was looked for in. `Address` is
-            // `@sensitive`, so it states no address at all — neither the value it was
-            // handed nor the key that value folds to.
-            return Err(GetMemberOfAddressListErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "Could not find Address in AddressList {}",
-                        input.address_list_id
-                    )),
-                },
-            )
-            .into());
+            // The membership is what is missing, not the list, so the refusal names the
+            // list the member was looked for in and the account that owns it — never the
+            // `@sensitive` address itself. A member that resolves to nothing is an
+            // unresolvable address-list resource just as a list id that resolves to nothing
+            // is, so it carries the same request-fault status.
+            return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                GetMemberOfAddressListErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::member_of_address_list_not_found_message(
+                            &input.address_list_id,
+                        )),
+                    },
+                ),
+                crate::state::ADDRESS_LIST_LOOKUP_STATUS,
+            ));
         };
 
         Ok(GetMemberOfAddressListOutput {
