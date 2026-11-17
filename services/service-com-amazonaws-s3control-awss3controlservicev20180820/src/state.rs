@@ -3533,25 +3533,28 @@ pub fn no_such_access_point_policy<E>(name: &str) -> crate::scaffolded::Scaffold
     )
 }
 
-/// `InvalidRequest` (HTTP 400): a listing scoped to a bucket that has no access
-/// point attached to it.
+/// `InvalidRequest` (HTTP 400): a listing scoped to a bucket that is not there.
 ///
-/// An access point is a resource OF a bucket, so scoping the listing to one asks
-/// for that bucket's access points: a bucket with none attached carries no such
-/// collection, which is a request the service will not carry out rather than an
-/// empty page. The message is fixed text, naming no bucket: the caller asked
-/// about one bucket and the answer is about that same one.
-pub fn no_access_point_attached_to_bucket<E>() -> crate::scaffolded::Scaffolded<E> {
+/// An access point is a resource OF a bucket, so a scope names the bucket whose
+/// access points are to be listed: a bucket the object store does not hold is a
+/// request the service will not carry out, because there is no bucket to list
+/// the access points of. A bucket that EXISTS and has none attached is not this
+/// refusal — the scope is a filter over the account's access points, which may
+/// select none, so that listing is a successful empty page
+/// (`crate::ops::list_access_points`). The message is fixed text, naming no
+/// bucket: the caller asked about one bucket and the answer is about that same
+/// one.
+pub fn no_such_bucket_to_scope_by<E>() -> crate::scaffolded::Scaffolded<E> {
     crate::scaffolded::Scaffolded::service_failure(
         REQUEST_INVALID_CODE,
         REQUEST_INVALID_STATUS,
-        NO_ACCESS_POINT_ATTACHED_MESSAGE,
+        NO_SUCH_BUCKET_TO_SCOPE_BY_MESSAGE,
     )
 }
 
-/// The message of [`no_access_point_attached_to_bucket`]: fixed text, naming no
+/// The message of [`no_such_bucket_to_scope_by`]: fixed text, naming no
 /// bucket.
-pub const NO_ACCESS_POINT_ATTACHED_MESSAGE: &str = "No access point attached to this bucket";
+pub const NO_SUCH_BUCKET_TO_SCOPE_BY_MESSAGE: &str = "No access point attached to this bucket";
 
 /// `AccessDenied` (HTTP 403): a `BlockPublicPolicy` setting in force for the
 /// access point refuses a policy document that grants public access, so the

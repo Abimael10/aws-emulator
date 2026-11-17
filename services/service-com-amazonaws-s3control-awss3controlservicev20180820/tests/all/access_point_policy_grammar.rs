@@ -21,8 +21,10 @@
 //! * an access point that carries no policy is reported as such naming the
 //!   access point the request addressed;
 //! * an access point is a resource OF a bucket, so a listing scoped to a bucket
-//!   with none attached is refused `InvalidRequest` rather than answered with an
-//!   empty page;
+//!   the store that owns buckets does not hold is refused `InvalidRequest`:
+//!   there is no bucket whose access points could be listed (a bucket that IS
+//!   held and carries none is an empty page, pinned in the bucket-scope suite
+//!   beside this one);
 //! * the bucket routes address an S3 on Outposts bucket in one of the two forms
 //!   they document — the bucket's ARN in the label, or its name together with
 //!   the `x-amz-outpost-id` header the REST API requires — so a request in
@@ -586,22 +588,23 @@ async fn an_access_point_carrying_no_policy_is_reported_naming_that_access_point
 }
 
 #[tokio::test]
-async fn a_listing_scoped_to_a_bucket_with_no_access_point_is_refused() {
+async fn a_listing_scoped_to_a_bucket_that_is_not_there_is_refused() {
     let emulator = Emulator::start();
     create(&emulator, "reports-ap", "reports").await;
     create(&emulator, "finance-ap", "finance").await;
 
-    // One row per bucket: two that an access point fronts, and four that none
-    // does — a bucket name no access point used, one that is a PREFIX of one
-    // that is used, one that EXTENDS one that is used, and one differing only in
-    // case.
+    // One row per bucket: two the store holds and an access point fronts, and
+    // four it does not hold at all — a bucket name nothing created, one that is
+    // a PREFIX of a held one, one that EXTENDS a held one, and one differing
+    // only in case. A bucket that is HELD and carries no access point is an
+    // empty page rather than this refusal, which the bucket-scope suite pins.
     for (case, bucket, attached) in [
         ("a bucket one access point fronts", "reports", true),
         ("another bucket one access point fronts", "finance", true),
-        ("a bucket no access point fronts", "archive", false),
-        ("a prefix of a bucket that is fronted", "report", false),
-        ("an extension of a bucket that is fronted", "reportsx", false),
-        ("a fronted bucket's name in another case", "Reports", false),
+        ("a bucket the store does not hold", "archive", false),
+        ("a prefix of a bucket that is held", "report", false),
+        ("an extension of a bucket that is held", "reportsx", false),
+        ("a held bucket's name in another case", "Reports", false),
     ] {
         let listed = emulator
             .call(
@@ -635,7 +638,7 @@ async fn a_listing_scoped_to_a_bucket_with_no_access_point_is_refused() {
                 400,
                 "InvalidRequest",
                 Some(
-                    service_com_amazonaws_s3control_awss3controlservicev20180820::state::NO_ACCESS_POINT_ATTACHED_MESSAGE
+                    service_com_amazonaws_s3control_awss3controlservicev20180820::state::NO_SUCH_BUCKET_TO_SCOPE_BY_MESSAGE
                         .to_string()
                 )
             ),

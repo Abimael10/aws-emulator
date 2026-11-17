@@ -832,9 +832,10 @@ async fn list_access_points_filters_by_bucket_and_pages_through_every_access_poi
         &emulator.list(OTHER_ACCOUNT, "").await,
     );
 
-    // Filtering by bucket: one row per bucket the table uses. A bucket no
-    // access point fronts is NOT a row here — it carries no collection to page
-    // through, and the refusal it answers is pinned beside this suite.
+    // Filtering by bucket: one row per bucket the table uses. A bucket the
+    // store holds but no access point fronts is NOT a row here — it is a
+    // successful empty page, pinned together with the refusal a bucket that is
+    // not there earns in the bucket-scope suite beside this one.
     for bucket in ["reports", "finance", "partner"] {
         let expected: BTreeSet<String> = cases
             .iter()

@@ -4,10 +4,11 @@
 //!
 //! Lists the access points stored for the account the request names, in one
 //! stable scan order, cut at `MaxResults` with a `NextToken` that resumes the
-//! scan. A `Bucket` SCOPES the listing to that bucket's access points rather
-//! than merely filtering the account's: a bucket is the collection's owner, so a
-//! bucket with none attached carries no collection to page through and the
-//! request is refused rather than answered with an empty page.
+//! scan. A `Bucket` SCOPES the listing to the access points fronting that
+//! bucket: the scope is a FILTER over the account's access points, so a bucket
+//! that exists but has none attached is a successful EMPTY page, and only a
+//! bucket the object store does not hold is refused — there is then no bucket
+//! whose access points could be listed.
 //! A pure read: it writes nothing.
 //!
 //! ## Shape of an operation
@@ -218,26 +219,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         };
 
+        // Scoping the listing to a bucket NARROWS this account's access points
+        // to the ones fronting that bucket, so a bucket that exists and has none
+        // attached is an empty page rather than a refusal: the output's
+        // `AccessPointList` may be empty, exactly as a page past the last access
+        // point of an unscoped listing is. What a scope cannot name is a bucket
+        // that is not there — then there is no bucket whose access points could
+        // be listed, and the request is refused. The bucket is resolved in the
+        // store that OWNS it, by name alone, the same referential read
+        // `CreateAccessPoint` makes before it attaches an access point to one.
+        //
+        // LOCK ORDER: read with NO guard of this service's store held, which is
+        // the discipline `crate::state::bucket_regions` states — so it is read
+        // ahead of the scan below.
+        if let Some(bucket) = input.bucket.as_deref() {
+            if !crate::state::bucket_regions::bucket_exists(&*self.engine, bucket) {
+                return Err(crate::state::no_such_bucket_to_scope_by());
+            }
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::state::state_unavailable());
         };
         let store = state.lock();
-
-        // Scoping the listing to a bucket asks for THAT bucket's access points,
-        // so a bucket with none attached carries no collection to page through:
-        // the request is refused rather than answered with an empty page. Read
-        // over the whole account, not over the page the token resumes at, so the
-        // answer is about the bucket and not about where the scan happens to be.
-        if let Some(bucket) = input.bucket.as_deref() {
-            let attached = store
-                .access_points
-                .range((input.account_id.clone(), String::new())..)
-                .take_while(|((account_id, _), _)| account_id == &input.account_id)
-                .any(|(_, record)| record.bucket == bucket);
-            if !attached {
-                return Err(crate::state::no_access_point_attached_to_bucket());
-            }
-        }
 
         // Scan this account's slice of the keyspace in key order, starting just
         // after the name the token named. `Excluded` on the empty name — which no
