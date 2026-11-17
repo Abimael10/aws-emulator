@@ -6,7 +6,9 @@
 //!
 //! Every ARN comes from the `services` map in [`crate::state`] — the records
 //! `CreateService` wrote — narrowed by each filter the request sets and paged at
-//! `maxResults`. Nothing here mints, mutates or counts anything: this is a reporting
+//! `maxResults`. The listing resolves any cluster record this account HOLDS, the tombstone
+//! a delete left included, and reports the services there are left to list. Nothing here
+//! mints, mutates or counts anything: this is a reporting
 //! operation (`@readonly` in the model), and the only write on its path is
 //! [`crate::state::ComAmazonawsEcsAmazonec2containerservicev20141113State::advance_clock`],
 //! which materialises the transitions the CLOCK already owed (a drained service reaching
@@ -221,12 +223,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = state.lock();
         guard.advance_clock(::std::time::SystemTime::now());
 
-        if !guard.has_active_cluster(&cluster_name) {
+        // A listing of what a cluster holds is a READ of the records this account holds for
+        // it, so it resolves the cluster record whatever status that record is in: the
+        // tombstone a delete leaves is still one ("Clusters with an INACTIVE status may
+        // remain discoverable in your account for a period of time"), and the answer is the
+        // services there are left to list — none of the deleted ones, by the filter below.
+        // Only a reference that resolves to NO record at all leaves the listing nothing to
+        // answer about, which is what `ClusterNotFoundException` states
+        // ([`crate::state::holds_cluster`], the check `DescribeServices` makes too).
+        if !guard.holds_cluster(&cluster_name) {
             return Err(ListServicesErrorModeled::ClusterNotFoundException(
                 ClusterNotFoundException {
-                    message: Some(crate::state::cluster_refusal_message(
-                        guard.clusters.get(&cluster_name),
-                    )),
+                    message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());

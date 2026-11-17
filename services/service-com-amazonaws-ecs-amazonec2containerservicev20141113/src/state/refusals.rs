@@ -1284,11 +1284,9 @@ pub fn deployment_configuration(
                 .strategy
                 .unwrap_or_else(|| DEPLOYMENT_STRATEGY_ROLLING.to_string()),
         );
-        configuration.deployment_circuit_breaker = Some(
-            configuration
-                .deployment_circuit_breaker
-                .unwrap_or_else(default_deployment_circuit_breaker),
-        );
+        configuration.deployment_circuit_breaker = Some(defaulted_deployment_circuit_breaker(
+            configuration.deployment_circuit_breaker.take(),
+        ));
     }
     configuration
 }
@@ -1336,24 +1334,36 @@ pub fn merged_deployment_configuration(
     }
 }
 
-/// The deployment circuit breaker a service that configured none carries: off, with the
-/// documented failure threshold.
+/// The deployment circuit breaker a service STORES, from the one its request supplied:
+/// every member the request left out carries the default Amazon ECS applies to it.
 ///
+/// The defaults are per MEMBER, not per structure: a request that names the two flags and
+/// nothing else still leaves the other two members to the service, so what it stores — and
+/// so what every later read of the service reports — is the whole structure with those
+/// defaults in it, exactly as for a request that named no breaker at all.
 /// `DeploymentCircuitBreaker$enable` is what "determines whether to use the deployment
-/// circuit breaker logic for the service", so a service that configured none has it
-/// turned off and rolls nothing back. `resetOnHealthyTask`: "The default is true".
+/// circuit breaker logic for the service", so a service that configured none has it turned
+/// off and rolls nothing back. `resetOnHealthyTask`: "The default is true".
 /// `ThresholdConfiguration`: "By default, the threshold configuration uses a type of
-/// BOUNDED_PERCENT with a value of 50."
-pub(super) fn default_deployment_circuit_breaker() -> Defaulted<DeploymentCircuitBreaker> {
-    Defaulted(DeploymentCircuitBreaker {
-        enable: false,
-        rollback: false,
-        reset_on_healthy_task: Some(CIRCUIT_BREAKER_RESETS_ON_HEALTHY_TASK),
-        threshold_configuration: Some(Defaulted(ThresholdConfiguration {
+/// BOUNDED_PERCENT with a value of 50" — the default of that member as a whole, so a request
+/// that did supply a threshold keeps every part of it, the `value` the model's own `@default`
+/// fills in included.
+pub(super) fn defaulted_deployment_circuit_breaker(
+    requested: Option<Defaulted<DeploymentCircuitBreaker>>,
+) -> Defaulted<DeploymentCircuitBreaker> {
+    let Defaulted(mut breaker) = requested.unwrap_or_default();
+    breaker.reset_on_healthy_task = Some(
+        breaker
+            .reset_on_healthy_task
+            .unwrap_or(CIRCUIT_BREAKER_RESETS_ON_HEALTHY_TASK),
+    );
+    breaker.threshold_configuration = Some(breaker.threshold_configuration.unwrap_or_else(|| {
+        Defaulted(ThresholdConfiguration {
             r#type: THRESHOLD_BOUNDED_PERCENT.to_string(),
             value: THRESHOLD_DEFAULT_VALUE,
-        })),
-    })
+        })
+    }));
+    Defaulted(breaker)
 }
 
 /// The status a failure-detection mechanism of a rollout reports.

@@ -9,9 +9,11 @@
 //! promises. A cluster that still holds a task the caller has not asked to stop is
 //! refused with `ClusterContainsTasksException`, and one that still holds an `ACTIVE`
 //! service with `ClusterContainsServicesException` ("You can't delete a cluster that
-//! contains services"). The resources the deleted cluster held — its drained services,
-//! its stopping tasks and the container instances registered into it — go with it, so
-//! the tombstone it reports counts none of them.
+//! contains services"). The resources the deleted cluster held — its stopping tasks, the
+//! task sets of the services it held and the container instances registered into it — go
+//! with it, so the tombstone it reports counts none of them. The record a deleted SERVICE
+//! left is kept, because a deleted service stays viewable "with the DescribeServices API
+//! operation" (`DeleteService`) and is counted by none of those counters.
 //!
 //! ## Shape of an operation
 //!
@@ -313,18 +315,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The resources the cluster held go with it. Nothing still wanted can be among
         // them: a service that is not deleted and a task still wanted RUNNING were both
-        // refused above, so what is dropped here is a service already deleted and a task
-        // already asked to stop (whose `lastStatus` may still be settling). A container
-        // instance is registered INTO a cluster (`registeredContainerInstancesCount`:
-        // "the number of container instances registered into the cluster"), so once the
-        // cluster is gone its registrations are gone with it. Dropping them
-        // is what lets a cluster created over this tombstone start empty — all three maps
-        // are keyed by, or carry, the cluster NAME, which a new cluster of the same name
-        // reuses — and it settles the tombstone's counters at zero.
+        // refused above, so what is dropped here is a task already asked to stop (whose
+        // `lastStatus` may still be settling) and the task sets of a service already
+        // deleted. A container instance is registered INTO a cluster
+        // (`registeredContainerInstancesCount`: "the number of container instances
+        // registered into the cluster"), so once the cluster is gone its registrations are
+        // gone with it. Dropping them is what lets a cluster created over this tombstone
+        // start empty — each of these maps is keyed by, or carries, the cluster NAME, which
+        // a new cluster of the same name reuses — and it settles the tombstone's counters
+        // at zero.
+        //
+        // The SERVICE records are the exception and are KEPT: a service the caller deleted
+        // is a record in the terminal status its OWN deletion left it in, and
+        // `DeleteService` states that "Services in the DRAINING or INACTIVE status can
+        // still be viewed with the DescribeServices API operation" — which is what tells a
+        // service that was deleted apart from one that never existed. Deleting the cluster
+        // that hosted it ends neither, so the record stays describable, and it holds the
+        // tombstone's counters at zero all the same: a service that is not ACTIVE is not
+        // one `activeServicesCount` counts, and the tasks it held went with the cluster.
         guard.tasks.retain(|_, task| task.cluster_name != cluster_name);
-        guard
-            .services
-            .retain(|_, service| service.cluster_name != cluster_name);
         guard
             .task_sets
             .retain(|_, task_set| task_set.cluster_name != cluster_name);

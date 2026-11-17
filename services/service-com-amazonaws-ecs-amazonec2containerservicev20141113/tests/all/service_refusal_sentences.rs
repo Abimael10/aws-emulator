@@ -25,10 +25,11 @@
 //!    * a `networkConfiguration` the task definition's `networkMode` gives nothing to
 //!      configure points at that task definition rather than quoting the mode.
 //! 2. A cluster record this account still HOLDS, in the status a delete leaves it in, is
-//!    one `DescribeServices` resolves: the call answers, and each name it carries comes
-//!    back as a `MISSING` failure — the services the cluster held went with the delete.
-//!    `ClusterNotFoundException` ("Cluster not found.") is left to a reference that
-//!    resolves to no cluster record at all.
+//!    one `DescribeServices` resolves: the call answers per NAME — a service the caller
+//!    deleted is still described, since a deleted service "can still be viewed with the
+//!    DescribeServices API operation", and a name nothing ever created comes back as a
+//!    `MISSING` failure. `ClusterNotFoundException` ("Cluster not found.") is left to a
+//!    reference that resolves to no cluster record at all.
 //!
 //! Every table spans the inputs its rule generalises over — the shape of the name, the
 //! value of the count, the scheduling strategy, the network mode, the identifier form —
@@ -488,7 +489,7 @@ async fn a_network_configuration_the_revisions_mode_cannot_take_points_at_the_re
 }
 
 #[tokio::test]
-async fn describe_services_resolves_a_deleted_cluster_and_reports_its_names_missing() {
+async fn describe_services_resolves_a_deleted_cluster_and_answers_each_name_it_carries() {
     let router = service();
     let arn = create_cluster(&router, ALPHA, "setup").await;
     register_definition(&router, "tombstonefamily", "setup").await;
@@ -553,17 +554,31 @@ async fn describe_services_resolves_a_deleted_cluster_and_reports_its_names_miss
                 "case {case:?}: expected the held cluster record to be resolved, got \
                  {status} with {body}"
             );
-            assert!(
-                list(&body, "services", &case).is_empty(),
-                "case {case:?}: the delete took the cluster's services with it, got {body}"
+            // The deleted service's own record outlives the cluster's delete — "Services
+            // in the DRAINING or INACTIVE status can still be viewed with the
+            // DescribeServices API operation" — while a name nothing ever created is the
+            // `MISSING` failure, which is what tells the two apart.
+            let described = list(&body, "services", &case);
+            assert_eq!(
+                described
+                    .iter()
+                    .map(|service| string(service, "serviceName", &case))
+                    .collect::<Vec<String>>(),
+                vec!["web".to_string()],
+                "case {case:?}: expected the deleted service to still be described, got \
+                 {body}"
             );
+            let missing: Vec<&&str> = names
+                .iter()
+                .filter(|name| **name != "web")
+                .collect();
             let failures = list(&body, "failures", &case);
             assert_eq!(
                 failures.len(),
-                names.len(),
-                "case {case:?}: expected one failure per name asked about, got {body}"
+                missing.len(),
+                "case {case:?}: expected one failure per name nothing created, got {body}"
             );
-            for (failure, name) in failures.iter().zip(&names) {
+            for (failure, name) in failures.iter().zip(&missing) {
                 assert_eq!(
                     string(failure, "reason", &case),
                     "MISSING",

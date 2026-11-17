@@ -13,8 +13,11 @@
 //! * a cluster whose services have all been deleted deletes, because every service it ever
 //!   held is one a create actually stored;
 //! * a structure member the model gives a `@default` is satisfied by that default when the
-//!   request omits it, so a partial structure is accepted and reports the default, and an
-//!   update applies the members it supplies over the ones the service already holds;
+//!   request omits it, so a partial structure is accepted and reports the default, an
+//!   update applies the members it supplies over the ones the service already holds, and a
+//!   member the SERVICE defaults (the deployment circuit breaker's `resetOnHealthyTask` and
+//!   `thresholdConfiguration`) is materialised per member, so a partially supplied structure
+//!   reads back whole;
 //! * `ListTasks` answers the tasks that match the `desiredStatus` filter — "The default
 //!   status filter is RUNNING" — whichever of the enum's values a request names and however
 //!   it spells the cluster.
@@ -785,6 +788,225 @@ async fn an_update_applies_the_deployment_members_it_supplies_over_the_stored_on
                      {configuration}"
                 );
             }
+        }
+    }
+}
+
+/// One row of the circuit-breaker table: the `deploymentCircuitBreaker` a request carries
+/// (`None` for a request that carries no deployment configuration at all), and the WHOLE
+/// structure every read of the stored service must report for it.
+struct BreakerRow {
+    case: &'static str,
+    requested: Option<Value>,
+    reported: Value,
+}
+
+/// The threshold configuration a request that supplied none leaves the service to apply.
+/// Source: `smithy_query(query="shape", shape="ThresholdConfiguration")` — "By default, the
+/// threshold configuration uses a type of BOUNDED_PERCENT with a value of 50."
+fn default_threshold() -> Value {
+    json!({ "type": "BOUNDED_PERCENT", "value": 50 })
+}
+
+#[tokio::test]
+async fn a_circuit_breaker_reads_back_with_the_members_the_request_left_to_the_service() {
+    let router = service();
+    let cluster = "breakerscope";
+    cluster_with_capacity(&router, cluster, "setup").await;
+    register_fargate_capable(&router, "setup").await;
+
+    // The defaults the SERVICE applies, and their source:
+    // `smithy_query(query="shape", shape="DeploymentCircuitBreaker,ThresholdConfiguration")`
+    // — `resetOnHealthyTask` "The default is true", and the threshold configuration's own
+    // default above. Rows differ along WHICH of the four members the request carries: none
+    // of the structure at all, the two flags only, one flag, a `resetOnHealthyTask` set
+    // against its default, a threshold of the request's own, and a threshold whose `value`
+    // the MODEL defaults rather than the service.
+    let rows = [
+        BreakerRow {
+            case: "no deployment configuration at all",
+            requested: None,
+            reported: json!({
+                "enable": false,
+                "rollback": false,
+                "resetOnHealthyTask": true,
+                "thresholdConfiguration": default_threshold(),
+            }),
+        },
+        BreakerRow {
+            case: "the two flags only",
+            requested: Some(json!({ "enable": true, "rollback": true })),
+            reported: json!({
+                "enable": true,
+                "rollback": true,
+                "resetOnHealthyTask": true,
+                "thresholdConfiguration": default_threshold(),
+            }),
+        },
+        BreakerRow {
+            case: "enable only",
+            requested: Some(json!({ "enable": true })),
+            reported: json!({
+                "enable": true,
+                "rollback": false,
+                "resetOnHealthyTask": true,
+                "thresholdConfiguration": default_threshold(),
+            }),
+        },
+        BreakerRow {
+            case: "a resetOnHealthyTask the request turns off",
+            requested: Some(json!({
+                "enable": true,
+                "rollback": true,
+                "resetOnHealthyTask": false,
+            })),
+            reported: json!({
+                "enable": true,
+                "rollback": true,
+                "resetOnHealthyTask": false,
+                "thresholdConfiguration": default_threshold(),
+            }),
+        },
+        BreakerRow {
+            case: "a threshold of the request's own",
+            requested: Some(json!({
+                "enable": true,
+                "rollback": false,
+                "thresholdConfiguration": { "type": "COUNT", "value": 7 },
+            })),
+            reported: json!({
+                "enable": true,
+                "rollback": false,
+                "resetOnHealthyTask": true,
+                "thresholdConfiguration": { "type": "COUNT", "value": 7 },
+            }),
+        },
+        BreakerRow {
+            case: "a threshold whose value the model defaults",
+            requested: Some(json!({
+                "enable": false,
+                "rollback": false,
+                "thresholdConfiguration": { "type": "UNBOUNDED_PERCENT" },
+            })),
+            reported: json!({
+                "enable": false,
+                "rollback": false,
+                "resetOnHealthyTask": true,
+                "thresholdConfiguration": { "type": "UNBOUNDED_PERCENT", "value": 0 },
+            }),
+        },
+    ];
+
+    for (index, row) in rows.iter().enumerate() {
+        let case = row.case;
+        let name = format!("breakersvc{index}");
+        let mut extra = json!({ "launchType": "FARGATE" });
+        if let Some(requested) = &row.requested {
+            extra["deploymentConfiguration"] =
+                json!({ "deploymentCircuitBreaker": requested.clone() });
+        }
+        let created = ok(
+            &router,
+            "CreateService",
+            create_service_request(cluster, &name, extra),
+            case,
+        )
+        .await;
+        let read = ok(
+            &router,
+            "DescribeServices",
+            json!({ "cluster": cluster, "services": [name.clone()] }),
+            case,
+        )
+        .await;
+        let described = list(&read, "services", case)
+            .first()
+            .cloned()
+            .unwrap_or_else(|| panic!("case {case:?}: expected the service back, got {read}"));
+        // An update that carries no deployment configuration changes none of it, so the
+        // third projection of the same stored structure is the same structure.
+        let untouched = ok(
+            &router,
+            "UpdateService",
+            json!({ "cluster": cluster, "service": name.clone(), "desiredCount": 0 }),
+            case,
+        )
+        .await;
+        for (source, view) in [
+            ("CreateService", &created["service"]),
+            ("DescribeServices", &described),
+            ("UpdateService", &untouched["service"]),
+        ] {
+            let breaker = &view["deploymentConfiguration"]["deploymentCircuitBreaker"];
+            assert_eq!(
+                breaker, &row.reported,
+                "case {case:?}: {source} expected the breaker to read {}, got {breaker}",
+                row.reported
+            );
+        }
+    }
+
+    // The other half of the rule: an UPDATE that supplies a breaker of its own stores it
+    // the same way — the members it names, plus the ones it left to the service. Rows
+    // differ along which members the update supplies.
+    for (case, requested, expected) in [
+        (
+            "an update supplying the two flags only",
+            json!({ "enable": true, "rollback": true }),
+            json!({
+                "enable": true,
+                "rollback": true,
+                "resetOnHealthyTask": true,
+                "thresholdConfiguration": default_threshold(),
+            }),
+        ),
+        (
+            "an update supplying a threshold of its own",
+            json!({
+                "enable": true,
+                "rollback": true,
+                "thresholdConfiguration": { "type": "COUNT", "value": 3 },
+            }),
+            json!({
+                "enable": true,
+                "rollback": true,
+                "resetOnHealthyTask": true,
+                "thresholdConfiguration": { "type": "COUNT", "value": 3 },
+            }),
+        ),
+    ] {
+        let updated = ok(
+            &router,
+            "UpdateService",
+            json!({
+                "cluster": cluster,
+                "service": "breakersvc0",
+                "deploymentConfiguration": { "deploymentCircuitBreaker": requested },
+            }),
+            case,
+        )
+        .await;
+        let read = ok(
+            &router,
+            "DescribeServices",
+            json!({ "cluster": cluster, "services": ["breakersvc0"] }),
+            case,
+        )
+        .await;
+        let described = list(&read, "services", case)
+            .first()
+            .cloned()
+            .unwrap_or_else(|| panic!("case {case:?}: expected the service back, got {read}"));
+        for (source, view) in [
+            ("UpdateService", &updated["service"]),
+            ("DescribeServices", &described),
+        ] {
+            let breaker = &view["deploymentConfiguration"]["deploymentCircuitBreaker"];
+            assert_eq!(
+                breaker, &expected,
+                "case {case:?}: {source} expected the breaker to read {expected}, got \
+                 {breaker}"
+            );
         }
     }
 }

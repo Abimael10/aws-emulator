@@ -455,8 +455,18 @@ async fn a_poll_for_a_terminal_rollout_state_converges() {
         );
         assert_eq!(
             service["deploymentConfiguration"]["deploymentCircuitBreaker"],
-            json!({ "enable": true, "rollback": true }),
-            "case {case:?}: expected the breaker the create armed, got {service}"
+            json!({
+                "enable": true,
+                "rollback": true,
+                // The two members the create left to the service: "The default is true"
+                // (`DeploymentCircuitBreaker$resetOnHealthyTask`) and "By default, the
+                // threshold configuration uses a type of BOUNDED_PERCENT with a value of
+                // 50" (`ThresholdConfiguration`).
+                "resetOnHealthyTask": true,
+                "thresholdConfiguration": { "type": "BOUNDED_PERCENT", "value": 50 },
+            }),
+            "case {case:?}: expected the breaker the create armed, with the members it \
+             left to the service, got {service}"
         );
         let deployment = list(service, "deployments", case)
             .into_iter()

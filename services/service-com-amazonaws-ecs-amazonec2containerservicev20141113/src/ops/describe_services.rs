@@ -203,10 +203,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Clusters with an INACTIVE status may remain discoverable in your account for a
         // period of time": the tombstone a delete leaves is still a cluster record this
-        // account holds, and this read answers per NAME — the services the cluster held
-        // went with the delete, so each name comes back as a `MISSING` failure below. Only
-        // a reference that resolves to no record at all leaves nothing to report on, which
-        // is what `ClusterNotFoundException` states ([`crate::state::holds_cluster`]).
+        // account holds, and this read answers per NAME — a name that matches no service
+        // record comes back as a `MISSING` failure below, while a service the caller
+        // deleted is still described, since deleting its cluster does not end what
+        // `DeleteService` promises for it. Only a reference that resolves to no record at
+        // all leaves nothing to report on, which is what `ClusterNotFoundException` states
+        // ([`crate::state::holds_cluster`]).
         if !guard.holds_cluster(&cluster_name) {
             return Err(DescribeServicesErrorModeled::ClusterNotFoundException(
                 ClusterNotFoundException {

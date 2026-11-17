@@ -2819,17 +2819,15 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     }
 
     /// Whether this store HOLDS a cluster record under `cluster_name` at all, whatever
-    /// status it is in — the existence check a describe that reports its answers per NAME
-    /// makes.
+    /// status it is in — the existence check a READ of the records that cluster held makes.
     ///
     /// The tombstone a delete leaves is still a record this account holds
     /// (`Cluster$status`: "Clusters with an INACTIVE status may remain discoverable in
-    /// your account for a period of time"), and such a describe has a channel for every
-    /// name it cannot resolve: the resources the cluster held went with the delete, so each
-    /// name the request carries comes back as a `MISSING` failure and the call itself
-    /// answers. Only a reference that resolves to NO record leaves the describe nothing to
-    /// answer about, which is the condition `ClusterNotFoundException` reports
-    /// ([`CLUSTER_NOT_FOUND_MESSAGE`]).
+    /// your account for a period of time"), and a read of what it held reports per record:
+    /// a describe answers each name it cannot resolve in its `failures` channel, and a
+    /// listing answers with the records that are still there to list. Only a reference that
+    /// resolves to NO record leaves such a read nothing to answer about, which is the
+    /// condition `ClusterNotFoundException` reports ([`CLUSTER_NOT_FOUND_MESSAGE`]).
     pub fn holds_cluster(&self, cluster_name: &str) -> bool {
         self.clusters.contains_key(cluster_name)
     }

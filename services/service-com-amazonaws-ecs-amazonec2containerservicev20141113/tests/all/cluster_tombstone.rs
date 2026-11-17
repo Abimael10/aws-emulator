@@ -12,7 +12,10 @@
 //!    free for a new cluster.
 //! 2. A delete is refused ONLY while the cluster still holds a resource the caller has
 //!    not released: an `ACTIVE` service, or a task still wanted `RUNNING`. One already
-//!    being drained away or asked to stop does not hold the cluster open.
+//!    being drained away or asked to stop does not hold the cluster open. The record a
+//!    service's own delete left is KEPT when its cluster is deleted after it, because a
+//!    deleted service "can still be viewed with the DescribeServices API operation"
+//!    (`DeleteService`), and it counts for nothing on the cluster's tombstone.
 //! 3. Each refusal carries the FIXED sentence for its condition, naming no resource from
 //!    the request.
 //! 4. A described cluster always carries `settings`, `statistics` and `tags` as lists —
@@ -1126,4 +1129,239 @@ async fn a_tombstoned_cluster_is_no_longer_a_cluster_an_operation_can_work_in() 
         "INACTIVE",
         "case \"after\": expected the tombstone back, got {repeated}"
     );
+}
+
+/// One row of the deleted-service-outlives-its-cluster table: the cluster the row builds,
+/// the count the service was left at when it was deleted, whether that delete had to be
+/// forced, and which of the documented identifier forms the read after the cluster's own
+/// delete names the service and the cluster by.
+struct OutlivingServiceRow {
+    case: &'static str,
+    cluster: &'static str,
+    desired: i64,
+    force: bool,
+    by_arn: bool,
+}
+
+#[tokio::test]
+async fn a_deleted_service_is_still_described_after_its_cluster_is_deleted_too() {
+    let router = service();
+
+    // The record a service's own delete leaves is a record of ITS deletion, so deleting
+    // the cluster that hosted it does not take it away: rows differ along what the service
+    // was holding when it was deleted, whether the delete had to be forced, and whether
+    // the read that follows names the service and its cluster by name or by ARN.
+    let rows: [OutlivingServiceRow; 3] = [
+        OutlivingServiceRow {
+            case: "a service scaled to zero, read by name",
+            cluster: "teardownzero",
+            desired: 0,
+            force: false,
+            by_arn: false,
+        },
+        OutlivingServiceRow {
+            case: "a forced delete of a service holding two tasks, read by ARN",
+            cluster: "teardownheld",
+            desired: 2,
+            force: true,
+            by_arn: true,
+        },
+        OutlivingServiceRow {
+            case: "a forced delete of a single-task service, read by name",
+            cluster: "teardownone",
+            desired: 1,
+            force: true,
+            by_arn: false,
+        },
+    ];
+
+    for row in rows {
+        let (case, cluster) = (row.case, row.cluster);
+        let cluster_arn = create_cluster(&router, cluster, case).await;
+        let family = format!("{cluster}family");
+        register_definition(&router, &family, case).await;
+        // The EC2 launch type places a task on an instance registered to the cluster, so
+        // the cluster needs one before the scheduler places the service's task set.
+        register_capacity(&router, cluster, case).await;
+        ok(
+            &router,
+            "CreateService",
+            json!({
+                "cluster": cluster,
+                "serviceName": "web",
+                "taskDefinition": family,
+                "desiredCount": row.desired,
+                "launchType": "EC2",
+            }),
+            case,
+        )
+        .await;
+
+        let mut request = json!({ "cluster": cluster, "service": "web" });
+        if row.force {
+            request["force"] = json!(true);
+        }
+        let deleted = ok(&router, "DeleteService", request, case).await;
+        let service_arn = string(&deleted["service"], "serviceArn", case);
+
+        // A service that is draining away no longer holds its cluster open, so the cluster
+        // deletes — the teardown a stack performs, service first and cluster after.
+        let gone = ok(
+            &router,
+            "DeleteCluster",
+            json!({ "cluster": cluster }),
+            case,
+        )
+        .await;
+        assert_eq!(
+            string(&gone["cluster"], "status", case),
+            "INACTIVE",
+            "case {case:?}: expected the cluster of a deleted service to delete, got {gone}"
+        );
+
+        let (cluster_reference, service_reference) = if row.by_arn {
+            (cluster_arn.clone(), service_arn.clone())
+        } else {
+            (cluster.to_string(), "web".to_string())
+        };
+
+        // The record is there for every read in between, and the DRAINING -> INACTIVE move
+        // is owed by the CLOCK, so the read is repeated until the terminal status is there
+        // or a generous deadline passes — never for a fixed time.
+        let deadline = Instant::now() + POLL_BUDGET;
+        let settled = loop {
+            let body = ok(
+                &router,
+                "DescribeServices",
+                json!({
+                    "cluster": cluster_reference.clone(),
+                    "services": [service_reference.clone()],
+                }),
+                case,
+            )
+            .await;
+            let described = list(&body, "services", case);
+            assert_eq!(
+                described.len(),
+                1,
+                "case {case:?}: expected the deleted service to still be described, got \
+                 {body}"
+            );
+            assert!(
+                list(&body, "failures", case).is_empty(),
+                "case {case:?}: a deleted service is described, not MISSING, got {body}"
+            );
+            let reported = string(&described[0], "status", case);
+            if reported == "INACTIVE" {
+                break described[0].clone();
+            }
+            assert_eq!(
+                reported, "DRAINING",
+                "case {case:?}: a deleted service reports the status its own deletion left \
+                 it in, got {body}"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "case {case:?}: expected the owed move to INACTIVE to have fallen due, got \
+                 {body}"
+            );
+            tokio::time::sleep(POLL_STEP).await;
+        };
+        assert_eq!(
+            string(&settled, "serviceArn", case),
+            service_arn,
+            "case {case:?}: expected the deleted service's own ARN, got {settled}"
+        );
+        // Nothing of the workload is left: the tasks it held went with the cluster, and a
+        // deleted service wants none.
+        for counter in ["desiredCount", "runningCount", "pendingCount"] {
+            assert_eq!(
+                count(&settled, counter, case),
+                0,
+                "case {case:?}: expected {counter} 0 on the deleted service, got {settled}"
+            );
+        }
+
+        // The other half of the rule: the record says the service EXISTED, so a name in
+        // the same deleted cluster that nothing ever created is still the `MISSING`
+        // failure — which is what tells "deleted" apart from "never existed".
+        let unknown = ok(
+            &router,
+            "DescribeServices",
+            json!({
+                "cluster": cluster_reference.clone(),
+                "services": ["nosuchservice"],
+            }),
+            case,
+        )
+        .await;
+        assert!(
+            list(&unknown, "services", case).is_empty(),
+            "case {case:?}: expected no service for a name nothing created, got {unknown}"
+        );
+        let failures = list(&unknown, "failures", case);
+        assert_eq!(
+            failures.len(),
+            1,
+            "case {case:?}: expected one failure for the one name asked about, got {unknown}"
+        );
+        assert_eq!(
+            string(&failures[0], "reason", case),
+            "MISSING",
+            "case {case:?}: expected a MISSING failure, got {unknown}"
+        );
+
+        // And the kept record counts for nothing on the cluster's tombstone: a service
+        // that is not ACTIVE is not one the cluster counts.
+        let read = describe(&router, &cluster_reference, case).await;
+        for counter in [
+            "activeServicesCount",
+            "runningTasksCount",
+            "pendingTasksCount",
+            "registeredContainerInstancesCount",
+        ] {
+            assert_eq!(
+                count(&read, counter, case),
+                0,
+                "case {case:?}: expected {counter} 0 on the tombstone, got {read}"
+            );
+        }
+
+        // The LISTING of the same cluster record answers as well, and reports no service:
+        // a deleted service "is no longer visible in the console or in the ListServices
+        // API operation" (`DeleteService`), which is the other half of what that doc says
+        // about a service after its delete.
+        let listed = ok(
+            &router,
+            "ListServices",
+            json!({ "cluster": cluster_reference.clone() }),
+            case,
+        )
+        .await;
+        assert_eq!(
+            list(&listed, "serviceArns", case),
+            Vec::<Value>::new(),
+            "case {case:?}: expected the deleted service to be out of the listing, got \
+             {listed}"
+        );
+    }
+
+    // A reference that resolves to NO cluster record at all leaves both reads nothing to
+    // answer about, which is the condition the refusal reports.
+    for operation in ["DescribeServices", "ListServices"] {
+        let case = format!("{operation} against a cluster this account never held");
+        let mut request = json!({ "cluster": "teardown-never-created" });
+        if operation == "DescribeServices" {
+            request["services"] = json!(["web"]);
+        }
+        let (code, message) = refusal(&router, operation, request, &case).await;
+        assert_eq!(
+            code, "ClusterNotFoundException",
+            "case {case:?}: expected the not-found refusal, got {code:?} with {message:?}"
+        );
+        assert_eq!(
+            message, "Cluster not found.",
+            "case {case:?}: expected the fixed not-found sentence, got {message:?}"
+        );
+    }
 }
