@@ -22,12 +22,22 @@
 //! associated with reports that route beside the local one — which is what a client reads
 //! when it asks `DescribeRouteTables` which table its subnet uses.
 //!
+//! The attachment itself is a PAIR each side holds one of AT A TIME rather than a permanent
+//! claim: a `DetachInternetGateway` frees both sides, so the gateway goes on to another VPC
+//! and the freed VPC takes another gateway, while a `DryRun` of an attach is answered as a
+//! probe about the caller and records nothing at all.
+//!
 //! Every table row is a distinct input along what that rule generalises over — the
 //! destination block's value, size and address family, how many host bits the request set,
 //! the tag count, how many subnets an association covers, which side of a pair a
 //! request collides with, the endpoint service a gateway endpoint is created for, how many
 //! tables it names, how many endpoints one table is named by, and the order the estate is
 //! built in — so any one recorded call is one row among many rather than the specification.
+
+use service_com_amazonaws_ec2_amazonec2::state::{
+    DRY_RUN_OPERATION, DRY_RUN_OPERATION_MESSAGE, DRY_RUN_OPERATION_STATUS,
+    RESOURCE_ALREADY_ASSOCIATED,
+};
 
 use super::ec2_query::{element, elements, error_code, error_message, filters};
 use super::wire::{child, child_text, document, param, set_items, Param};
@@ -1910,4 +1920,198 @@ async fn a_subnets_table_reports_one_route_out_per_gateway_endpoint_it_is_named_
         )),
         "case {case:?}: expected the deleted endpoint's route gone, got {outbound:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// AttachInternetGateway: the probe, and the attachment as a pair that moves
+// ---------------------------------------------------------------------------
+
+/// `DryRun` "checks whether you have the required permissions for the action, WITHOUT
+/// ACTUALLY MAKING THE REQUEST … If you have the required permissions, the error response is
+/// DryRunOperation" (`AttachInternetGatewayRequest$DryRun`): an attach a permitted caller
+/// sends under the flag is answered with that code, on the status and in the fixed wording
+/// EC2 answers the probe with, and records NO attachment. The probe asks about the caller, so
+/// it is not consumed and does not spend either side of the pair: the same pair attaches
+/// afterwards and the describe then reports that one attachment.
+///
+/// The rows differ in how many probes precede the real call, in the VPC's block value and
+/// size, and in how the real call spells "not a dry run" — the flag absent, and `DryRun=false`
+/// sent explicitly.
+#[tokio::test]
+async fn a_dry_run_attach_is_answered_as_a_probe_and_records_no_attachment() {
+    let router = emulator();
+    // (case, the VPC's block, how many probes precede the real call, the real call's own flag)
+    let cases: [(&str, &str, usize, Option<&str>); 3] = [
+        (
+            "one probe, then an attach carrying no flag",
+            "10.70.0.0/16",
+            1,
+            None,
+        ),
+        (
+            "two probes, then an attach carrying DryRun=false",
+            "10.71.0.0/20",
+            2,
+            Some("false"),
+        ),
+        (
+            "three probes, then an attach carrying no flag",
+            "10.72.0.0/24",
+            3,
+            None,
+        ),
+    ];
+
+    for (case, vpc_cidr, probes, real_flag) in cases {
+        let vpc_id = create_vpc(case, &router, vpc_cidr).await;
+        let internet_gateway_id = create_internet_gateway(case, &router, &[]).await;
+        let pair = [
+            param("InternetGatewayId", &internet_gateway_id),
+            param("VpcId", &vpc_id),
+        ];
+
+        for probe in 1..=probes {
+            let mut params = pair.to_vec();
+            params.push(param("DryRun", "true"));
+            let (status, body) = call(&router, "AttachInternetGateway", &params).await;
+            assert_eq!(
+                status, DRY_RUN_OPERATION_STATUS,
+                "case {case:?} probe {probe}: expected HTTP {DRY_RUN_OPERATION_STATUS}, got \
+                 {status} with body {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                DRY_RUN_OPERATION,
+                "case {case:?} probe {probe}: expected {DRY_RUN_OPERATION}, got {body}"
+            );
+            assert_eq!(
+                error_message(&body),
+                DRY_RUN_OPERATION_MESSAGE,
+                "case {case:?} probe {probe}: expected EC2's own dry-run wording, got {body}"
+            );
+
+            // Nothing was attached: the gateway reads back exactly as a created one does.
+            let reported = describe_internet_gateway(case, &router, &internet_gateway_id).await;
+            assert!(
+                elements(&reported, "vpcId").is_empty(),
+                "case {case:?} probe {probe}: a dry run must record no attachment, got {reported}"
+            );
+        }
+
+        // And the pair is still attachable, under either spelling of "not a dry run".
+        let mut params = pair.to_vec();
+        if let Some(flag) = real_flag {
+            params.push(param("DryRun", flag));
+        }
+        ok(case, &router, "AttachInternetGateway", &params).await;
+        let reported = describe_internet_gateway(case, &router, &internet_gateway_id).await;
+        assert_eq!(
+            elements(&reported, "vpcId"),
+            vec![vpc_id.clone()],
+            "case {case:?}: expected the attachment to name {vpc_id:?} after the probes, got \
+             {reported}"
+        );
+        assert_eq!(
+            elements(&reported, "state"),
+            vec!["available".to_string()],
+            "case {case:?}: expected the attachment reported available, got {reported}"
+        );
+    }
+}
+
+/// An attachment is a PAIR each side holds one of at a time, not a permanent claim: while it
+/// holds, the VPC's side refuses a second gateway (`Resource.AlreadyAssociated`), and a
+/// `DetachInternetGateway` frees BOTH sides — the gateway goes on to attach another VPC and
+/// the freed VPC takes another gateway, each attachment being the only one its describe then
+/// reports.
+///
+/// The rows differ in the VPC the one gateway moves to and in that VPC's block value and
+/// size; the same gateway walks every row, so each row also differs in how many attachments
+/// it has already held.
+#[tokio::test]
+async fn an_internet_gateway_attachment_is_a_pair_that_moves_after_a_detach() {
+    let router = emulator();
+    let moving_gateway_id = create_internet_gateway("the gateway that moves", &router, &[]).await;
+    // (case, the VPC's block)
+    let cases = [
+        ("the first VPC it attaches, a /16", "10.73.0.0/16"),
+        ("the second, a /20", "10.74.0.0/20"),
+        ("the third, a /24 outside the private 10 block", "192.168.9.0/24"),
+    ];
+
+    for (case, vpc_cidr) in cases {
+        let vpc_id = create_vpc(case, &router, vpc_cidr).await;
+        let spare_gateway_id = create_internet_gateway(case, &router, &[]).await;
+        let attach = |gateway: &str, vpc: &str| {
+            vec![
+                param("InternetGatewayId", gateway),
+                param("VpcId", vpc),
+            ]
+        };
+
+        ok(
+            case,
+            &router,
+            "AttachInternetGateway",
+            &attach(&moving_gateway_id, &vpc_id),
+        )
+        .await;
+        let reported = describe_internet_gateway(case, &router, &moving_gateway_id).await;
+        assert_eq!(
+            elements(&reported, "vpcId"),
+            vec![vpc_id.clone()],
+            "case {case:?}: expected the gateway attached to {vpc_id:?} only, got {reported}"
+        );
+
+        // While it holds, the VPC's side of the pair is taken.
+        let (status, body) = call(
+            &router,
+            "AttachInternetGateway",
+            &attach(&spare_gateway_id, &vpc_id),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400 for a second gateway, got {status} with body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            RESOURCE_ALREADY_ASSOCIATED,
+            "case {case:?}: expected {RESOURCE_ALREADY_ASSOCIATED}, got {body}"
+        );
+
+        // The detach frees both sides: the gateway reports no attachment …
+        ok(
+            case,
+            &router,
+            "DetachInternetGateway",
+            &attach(&moving_gateway_id, &vpc_id),
+        )
+        .await;
+        let reported = describe_internet_gateway(case, &router, &moving_gateway_id).await;
+        assert!(
+            elements(&reported, "vpcId").is_empty(),
+            "case {case:?}: expected no attachment after the detach, got {reported}"
+        );
+
+        // … and the VPC takes the gateway that was refused a moment ago.
+        ok(
+            case,
+            &router,
+            "AttachInternetGateway",
+            &attach(&spare_gateway_id, &vpc_id),
+        )
+        .await;
+        let reported = describe_internet_gateway(case, &router, &spare_gateway_id).await;
+        assert_eq!(
+            elements(&reported, "vpcId"),
+            vec![vpc_id.clone()],
+            "case {case:?}: expected the freed VPC attached to the spare gateway, got {reported}"
+        );
+        let reported = describe_internet_gateway(case, &router, &moving_gateway_id).await;
+        assert!(
+            elements(&reported, "vpcId").is_empty(),
+            "case {case:?}: expected the moved gateway still attached to nothing, got {reported}"
+        );
+    }
 }
