@@ -515,6 +515,12 @@ fn group_cases() -> Vec<GroupCase> {
                 Grant {
                     is_egress: "true",
                     ip_protocol: "-1",
+                    // An all-protocols rule is on every port "regardless of any port range
+                    // you specify" (`IpPermission$IpProtocol`), so the rule view reports the
+                    // all-values sentinel at both ends even though the permission named no
+                    // range at all.
+                    from_port: Some("-1"),
+                    to_port: Some("-1"),
                     cidr_ipv4: Some("0.0.0.0/0"),
                     ..grant()
                 },
@@ -693,8 +699,10 @@ async fn a_new_group_reports_its_default_egress_rule_and_the_default_group_repor
                 Some("true"),
                 Some("-1"),
                 Some("0.0.0.0/0"),
-                None,
-                None,
+                // "All ports": an all-protocols rule carries the all-values sentinel at
+                // both ends of its range (`IpPermission$IpProtocol`).
+                Some("-1"),
+                Some("-1"),
                 Some(account.as_str()),
             ),
             "case {case:?}: expected the allow-all outbound rule, got {rule:#?}"

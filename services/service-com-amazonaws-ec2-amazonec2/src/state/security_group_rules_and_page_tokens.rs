@@ -2074,6 +2074,61 @@ pub fn protocol_is_icmp(protocol: &str) -> bool {
     protocol.eq_ignore_ascii_case(IP_PROTOCOL_ICMP) || protocol.eq_ignore_ascii_case(IP_PROTOCOL_ICMPV6)
 }
 
+/// Whether `protocol` is one whose rules HAVE a port range: the four protocols the model
+/// names, for which "you must specify a port range" (`tcp`, `udp`, `icmp`) or "the port
+/// range is optional" (`icmpv6`) — `IpPermission$IpProtocol`.
+///
+/// Every other protocol — `-1`, or a protocol number — admits none: "specifying `-1` or a
+/// protocol number other than `tcp`, `udp`, `icmp`, or `icmpv6` allows traffic on all ports,
+/// regardless of any port range you specify" (the same member), which is what
+/// [`rule_port_range`] and [`permission_port_range`] report such a rule with.
+pub fn protocol_admits_port_range(protocol: &str) -> bool {
+    protocol_requires_port_range(protocol) || protocol.eq_ignore_ascii_case(IP_PROTOCOL_ICMPV6)
+}
+
+/// The port range a STORED rule on `protocol` carries, given the one its permission named.
+///
+/// A rule on a protocol that admits no port range ([`protocol_admits_port_range`]) is on
+/// every port — "regardless of any port range you specify" (`IpPermission$IpProtocol`) — so
+/// the range the request named is not part of the rule: it carries [`ALL_PORTS`] at both
+/// ends, the value the model gives for "all" (`IpPermission$FromPort` and `$ToPort`), which
+/// is the form `DescribeSecurityGroupRules` and the authorize echo report the rule in. A
+/// rule on one of the four named protocols keeps the range exactly as given.
+///
+/// The ONE normalisation of a rule's range, so the stored rule, the aggregate permission
+/// ([`permission_port_range`]) and a rule's identity cannot come to read one rule's ports
+/// differently.
+pub fn rule_port_range(
+    protocol: &str,
+    from_port: Option<i32>,
+    to_port: Option<i32>,
+) -> (Option<i32>, Option<i32>) {
+    if protocol_admits_port_range(protocol) {
+        return (from_port, to_port);
+    }
+    (Some(ALL_PORTS), Some(ALL_PORTS))
+}
+
+/// The port range an [`IpPermission`] on `protocol` reports, given the one the rules under
+/// it carry.
+///
+/// The aggregate view a security group reports its rules in names a port range only where
+/// the protocol has one: a rule on a protocol that admits none
+/// ([`protocol_admits_port_range`]) is on every port, which that view says by carrying
+/// NEITHER end rather than the sentinel a single rule reports ([`rule_port_range`]). The
+/// same reading serves a permission a request named and one recomputed from stored rules, so
+/// what a group reports and what its rules say cannot disagree.
+pub fn permission_port_range(
+    protocol: &str,
+    from_port: Option<i32>,
+    to_port: Option<i32>,
+) -> (Option<i32>, Option<i32>) {
+    if protocol_admits_port_range(protocol) {
+        return (from_port, to_port);
+    }
+    (None, None)
+}
+
 /// `protocol` in the one form a stored rule carries it in.
 ///
 /// The model spells every protocol name in lower case (`tcp`, `udp`, `icmp`, `icmpv6` —

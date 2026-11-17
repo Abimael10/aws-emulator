@@ -116,6 +116,28 @@ struct Reported {
     tags: Vec<(String, String)>,
 }
 
+/// The port range a stored rule on `protocol` reports, for a modification that named
+/// `ports`.
+///
+/// "Specifying `-1` or a protocol number other than `tcp`, `udp`, `icmp`, or `icmpv6` allows
+/// traffic on all ports, regardless of any port range you specify"
+/// (`IpPermission$IpProtocol`), so a rule on any other protocol is on every port — the
+/// all-values sentinel at both ends — whatever range the request named; a rule on one of
+/// those four reports the range exactly as given.
+fn reported_ports(protocol: &str, ports: Option<(i32, i32)>) -> (Option<String>, Option<String>) {
+    // The four protocols the model gives a port range: `IpPermission$IpProtocol`.
+    let ported = ["tcp", "udp", "icmp", "icmpv6"]
+        .iter()
+        .any(|named| protocol.eq_ignore_ascii_case(named));
+    if ported {
+        return (
+            ports.map(|(from, _)| from.to_string()),
+            ports.map(|(_, to)| to.to_string()),
+        );
+    }
+    (Some("-1".to_string()), Some("-1".to_string()))
+}
+
 /// The rules a `DescribeSecurityGroupRules` body reports, in the order it reported them.
 fn reported(case: &str, body: &str) -> Vec<Reported> {
     let parsed = document(case, body);
@@ -615,9 +637,7 @@ async fn one_rule_keeps_its_identity_and_takes_the_requested_members() {
             expected = row.stored_protocol,
             actual = after.protocol
         );
-        let expected_ports = ports.map_or((None, None), |(from_port, to_port)| {
-            (Some(from_port.to_string()), Some(to_port.to_string()))
-        });
+        let expected_ports = reported_ports(row.stored_protocol, ports);
         assert_eq!(
             (after.from_port.clone(), after.to_port.clone()),
             expected_ports,
@@ -860,7 +880,7 @@ async fn one_call_modifies_every_rule_it_names_and_nothing_else() {
 
     let expected = [
         (&first, "tcp", Some("2222"), "ipv4=10.0.0.0/8", None),
-        (&second, "-1", None, "ipv6=::/0", None),
+        (&second, "-1", Some("-1"), "ipv6=::/0", None),
         (
             &third,
             "udp",

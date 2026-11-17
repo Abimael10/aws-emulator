@@ -295,6 +295,27 @@ struct ExpectedRule {
     description: Option<String>,
 }
 
+/// The port range a stored rule on `protocol` reports, for a permission that named `ports`.
+///
+/// "Specifying `-1` or a protocol number other than `tcp`, `udp`, `icmp`, or `icmpv6` allows
+/// traffic on all ports, regardless of any port range you specify"
+/// (`IpPermission$IpProtocol`), so a rule on any other protocol is on every port — the
+/// all-values sentinel at both ends — whatever range the request named; a rule on one of
+/// those four reports the range exactly as given.
+fn reported_ports(protocol: &str, ports: Option<(i32, i32)>) -> (Option<String>, Option<String>) {
+    // The four protocols the model gives a port range: `IpPermission$IpProtocol`.
+    let ported = ["tcp", "udp", "icmp", "icmpv6"]
+        .iter()
+        .any(|named| protocol.eq_ignore_ascii_case(named));
+    if ported {
+        return (
+            ports.map(|(from, _)| from.to_string()),
+            ports.map(|(_, to)| to.to_string()),
+        );
+    }
+    (Some("-1".to_string()), Some("-1".to_string()))
+}
+
 /// The emulator the tests drive, as [`super::ec2_query::emulator`] builds it.
 fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     super::ec2_query::emulator()
@@ -632,12 +653,14 @@ async fn each_destination_of_each_permission_becomes_one_stored_rule() {
         let expected: Vec<ExpectedRule> = permissions
             .iter()
             .flat_map(|permission| {
+                let (from_port, to_port) =
+                    reported_ports(permission.stored_protocol, permission.ports);
                 permission.destinations.iter().map(move |destination| {
                     ExpectedRule {
                         destination: destination.expected(),
                         protocol: permission.stored_protocol,
-                        from_port: permission.ports.map(|(from, _)| from.to_string()),
-                        to_port: permission.ports.map(|(_, to)| to.to_string()),
+                        from_port: from_port.clone(),
+                        to_port: to_port.clone(),
                         description: destination.description.clone(),
                     }
                 })

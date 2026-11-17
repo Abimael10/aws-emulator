@@ -1143,20 +1143,30 @@ impl ComAmazonawsEc2Amazonec2State {
             } else {
                 &mut inbound
             };
+            // The range this view reports for the rule's protocol: a rule on a protocol
+            // that admits none is on every port, which the aggregate view says by carrying
+            // neither end ([`permission_port_range`]) where the rule itself reports the
+            // all-ports sentinel. Read ONCE here, so the permission a rule is grouped under
+            // and the one that is pushed cannot read its ports differently.
+            let (from_port, to_port) = permission_port_range(
+                rule.ip_protocol.as_deref().unwrap_or(ALL_IP_PROTOCOLS),
+                rule.from_port,
+                rule.to_port,
+            );
             // One `IpPermission` per (protocol, from port, to port), in the order the rules
             // are held in — which is id order, so the view is stable across reads.
             let position = permissions.iter().position(|permission| {
                 permission.ip_protocol == rule.ip_protocol
-                    && permission.from_port == rule.from_port
-                    && permission.to_port == rule.to_port
+                    && permission.from_port == from_port
+                    && permission.to_port == to_port
             });
             let index = match position {
                 Some(index) => index,
                 None => {
                     permissions.push(IpPermission {
                         ip_protocol: rule.ip_protocol.clone(),
-                        from_port: rule.from_port,
-                        to_port: rule.to_port,
+                        from_port,
+                        to_port,
                         user_id_group_pairs: Some(Vec::new()),
                         ip_ranges: Some(Vec::new()),
                         ipv6_ranges: Some(Vec::new()),
@@ -2030,9 +2040,14 @@ impl SecurityGroupRuleAtom {
     /// carries them in ([`canonical_ip_protocol`], [`canonical_rule_source`]), so a request
     /// that spells either differently still names the same rule.
     ///
-    /// The port range is kept exactly as given — a rule's ports are values a request "must
-    /// match … exactly" (`RevokeSecurityGroupIngress`), so neither end is dropped or
-    /// defaulted for any protocol.
+    /// The port range is the one a rule on that protocol HAS
+    /// ([`permission_port_range`]): for the protocols that carry a range it is kept exactly
+    /// as given — those are values a request "must match … exactly"
+    /// (`RevokeSecurityGroupIngress`), so neither end is dropped or defaulted — while a rule
+    /// on a protocol that admits none is on every port "regardless of any port range you
+    /// specify" (`IpPermission$IpProtocol`), so the range is no part of it and both ends are
+    /// dropped. One rule therefore has ONE identity however the request that named it
+    /// spelled its ports.
     pub fn new(
         ip_protocol: Option<&str>,
         from_port: Option<i32>,
@@ -2041,6 +2056,7 @@ impl SecurityGroupRuleAtom {
         description: Option<String>,
     ) -> Self {
         let ip_protocol = canonical_ip_protocol(ip_protocol.unwrap_or(ALL_IP_PROTOCOLS).trim());
+        let (from_port, to_port) = permission_port_range(&ip_protocol, from_port, to_port);
         Self {
             ip_protocol,
             from_port,
@@ -2453,7 +2469,9 @@ pub fn ip_permission_grant_count(permission: &IpPermission) -> usize {
 ///
 /// The ONE definition of WHICH rules a permission describes: the protocol, the port range
 /// and the tags are facts of the permission, so every rule it grants carries them, while the
-/// one destination and the description belong to the grant.
+/// one destination and the description belong to the grant. The range is the one a rule on
+/// that protocol HAS ([`rule_port_range`]), which for a protocol that admits none is every
+/// port rather than whatever the permission named.
 ///
 /// Reached only from [`ComAmazonawsEc2Amazonec2State::insert_security_group_rules`], and only
 /// AFTER it has weighed the whole permission against the per-direction quota, so the rules
@@ -2466,6 +2484,14 @@ pub(super) fn security_group_rule_grants(
     permission: &IpPermission,
     tags: &[Tag],
 ) -> Vec<(SecurityGroupRule, Option<String>)> {
+    // "Specifying `-1` or a protocol number other than `tcp`, `udp`, `icmp`, or `icmpv6`
+    // allows traffic on all ports, regardless of any port range you specify"
+    // (`IpPermission$IpProtocol`): the range a permission named is not part of a rule on
+    // such a protocol, so the rules it grants carry the all-ports sentinel at both ends
+    // rather than whatever the request said — [`rule_port_range`] is the one reading of
+    // that, shared with the aggregate view and with a rule's identity.
+    let protocol = permission.ip_protocol.as_deref().unwrap_or(ALL_IP_PROTOCOLS);
+    let (from_port, to_port) = rule_port_range(protocol, permission.from_port, permission.to_port);
     // What every rule of this permission shares; the grant each one names is set on the
     // clones below.
     let template = SecurityGroupRule {
@@ -2473,8 +2499,8 @@ pub(super) fn security_group_rule_grants(
         group_owner_id: Some(::engine::emulator_account_id().to_string()),
         is_egress: Some(is_egress),
         ip_protocol: permission.ip_protocol.clone(),
-        from_port: permission.from_port,
-        to_port: permission.to_port,
+        from_port,
+        to_port,
         // "The tags applied to the security group rule"
         // (`AuthorizeSecurityGroupEgressRequest$TagSpecifications`): a tag specification
         // applies to the resources the call creates, which is every rule of the permission.
