@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! The per-type provisioning arms of Amazon S3 Tables: the `AWS::S3Tables::TableBucket` a
-//! stack creates there. One file of [`super`]'s per-type arms, dispatched to by its
-//! `Provisioner`.
+//! stack creates there, and the `AWS::S3Tables::Namespace` it creates INSIDE one. One file
+//! of [`super`]'s per-type arms, dispatched to by its `Provisioner`.
 //!
 //! This is the THIRD bucket variant, beside Amazon S3's own bucket
 //! ([`super::data_and_storage`]) and the Amazon S3 Vectors vector bucket
@@ -402,4 +402,183 @@ fn table_bucket_uri(table_bucket_arn: &str) -> String {
 pub(super) fn table_bucket_name(resource: &StoredResource) -> String {
     arn_bucket_of(&resource.physical_resource_id, S3TABLES_BUCKET_SEGMENT)
         .unwrap_or_else(|| resource.physical_resource_id.clone())
+}
+
+// ---------------------------------------------------------------------------
+// Amazon S3 Tables: AWS::S3Tables::Namespace
+// ---------------------------------------------------------------------------
+
+/// The URI `CreateNamespace` is bound to (`PUT /namespaces/{tableBucketARN}`), from that
+/// model's `@http` trait — the same URI `ListNamespaces` reads the bucket's namespaces off.
+const S3TABLES_NAMESPACES_URI: &str = "/namespaces";
+
+/// The operation that create is, as Amazon S3 Tables' own model names it.
+const S3TABLES_CREATE_NAMESPACE: &str = "CreateNamespace";
+
+/// The member `CreateNamespace` takes the namespace's name as: a `NamespaceList`
+/// (`@length(min: 1, max: 1)`), so one name travels as a one-element list — and the same
+/// member is what `GetNamespace` answers it under.
+const S3TABLES_NAMESPACE_MEMBER: &str = "namespace";
+
+/// Create the namespace an `AWS::S3Tables::Namespace` declares, in the table bucket its
+/// `TableBucketARN` names — so a client that deployed the stack and then calls
+/// `s3tables ListNamespaces` on that bucket, or `CreateTable` in that namespace, reaches the
+/// namespace the stack reported created rather than a `NotFoundException` for one nothing
+/// made.
+///
+/// Both of the type's properties ARE its identity ([`S3TABLES_NAMESPACE_IDENTITY`]): the
+/// bucket's ARN, which is what that service keys a table bucket by, and the namespace's own
+/// name, which `CreateNamespace` takes as the one-element `NamespaceList` its model declares.
+/// The type publishes no attribute of its own and its physical id is that pair
+/// ([`super::template::composite_identity_properties`]), so the create reports neither back.
+///
+/// A declaration naming any other property is REFUSED ([`refuse_unmapped_properties`]) rather
+/// than deployed with the property dropped.
+pub(super) async fn create_namespace(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Created, Refusal> {
+    refuse_unmapped_properties(resource, S3TABLES_NAMESPACE_IDENTITY)?;
+    let (table_bucket_arn, namespace) = namespace_identity(resource)?;
+    let answered = call_rest_json_named(
+        ctx,
+        S3TABLES_SIGNING_NAME,
+        region,
+        S3TABLES_CREATE_NAMESPACE,
+        "PUT",
+        &namespaces_uri(&table_bucket_arn),
+        Some(&serde_json::json!({
+            S3TABLES_NAMESPACE_MEMBER: [namespace.clone()],
+        })),
+    )
+    .await?;
+    // That create echoes the namespace it made. A resource is reported created only when the
+    // owning service really made THAT namespace, so an answer carrying another one — or none
+    // — is a failure rather than a success the stack records.
+    if answered_namespace(&answered).as_deref() != Some(namespace.as_str()) {
+        return Err(Refusal {
+            code: "InternalFailure".to_string(),
+            message: format!(
+                "Amazon S3 Tables answered {S3TABLES_CREATE_NAMESPACE} without the namespace \
+                 {namespace}"
+            ),
+        });
+    }
+    Ok(Created::default())
+}
+
+/// Delete the namespace a stack created, addressed by the pair Amazon S3 Tables keys one by:
+/// the table bucket it lives in and its own name, which together are this resource's physical
+/// id.
+///
+/// A namespace that service no longer holds — and a table bucket it no longer holds, which
+/// took the namespace with it — answers `NotFoundException`, judged on the CODE and never on
+/// a message that carries the request's own name, and is already in the state the delete asks
+/// for. A namespace that still holds tables is NOT deleted (`ConflictException`), and that
+/// refusal is what the stack reports.
+pub(super) async fn delete_namespace(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<(), Refusal> {
+    let (table_bucket_arn, namespace) = namespace_identity(resource)?;
+    match call_rest_json(
+        ctx,
+        S3TABLES_SIGNING_NAME,
+        region,
+        "DELETE",
+        &namespace_uri(&table_bucket_arn, &namespace),
+        None,
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == S3TABLES_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The namespace's configuration as Amazon S3 Tables reports it, for drift detection:
+/// `GetNamespace`'s own record, read by the same pair the delete uses. One it no longer holds
+/// (`NotFoundException`) was deleted.
+///
+/// The one property its read reports under a name this type declares is the namespace's own
+/// (`namespace`, answered as the one-element list the model declares, so the name itself is
+/// what is reported); the bucket is the handle the read was ADDRESSED by rather than
+/// something the answer carries, and a property the read does not report is not evidence of
+/// anything ([`super::drift`]).
+pub(super) async fn describe_namespace(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Option<Value>, Refusal> {
+    let (table_bucket_arn, namespace) = namespace_identity(resource)?;
+    match call_rest_json(
+        ctx,
+        S3TABLES_SIGNING_NAME,
+        region,
+        "GET",
+        &namespace_uri(&table_bucket_arn, &namespace),
+        None,
+    )
+    .await
+    {
+        Ok(answer) => {
+            let mut reported = Map::new();
+            if let Some(name) = answered_namespace(&answer) {
+                reported.insert(
+                    S3TABLES_NAMESPACE_PROPERTY.to_string(),
+                    Value::String(name),
+                );
+            }
+            Ok(Some(Value::Object(reported)))
+        }
+        Err(refusal) if refusal.code == S3TABLES_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The namespace an answer of that service carries: the single element of the `NamespaceList`
+/// both `CreateNamespace` and `GetNamespace` answer it as, or `None` for an answer that
+/// carries no one namespace.
+fn answered_namespace(answered: &Value) -> Option<String> {
+    match answered.get(S3TABLES_NAMESPACE_MEMBER)?.as_array()?.as_slice() {
+        [only] => only.as_str().map(ToString::to_string),
+        _ => None,
+    }
+}
+
+/// The pair that identifies one namespace: the table bucket holding it and its own name, both
+/// of them required properties of the type and both read off the resource's own declaration.
+///
+/// A declaration missing either names no namespace that could be created or addressed, so it
+/// is refused here rather than with a request Amazon S3 Tables would reject.
+fn namespace_identity(resource: &StoredResource) -> Result<(String, String), Refusal> {
+    Ok((
+        required_property(resource, S3TABLES_TABLE_BUCKET_ARN_ATTRIBUTE)?,
+        required_property(resource, S3TABLES_NAMESPACE_PROPERTY)?,
+    ))
+}
+
+/// The URI the namespaces OF one table bucket are bound to
+/// (`/namespaces/{tableBucketARN}`), with the ARN written as the single path segment that
+/// `@httpLabel` is ([`percent_encoded`]).
+fn namespaces_uri(table_bucket_arn: &str) -> String {
+    format!(
+        "{S3TABLES_NAMESPACES_URI}/{}",
+        percent_encoded(table_bucket_arn)
+    )
+}
+
+/// The URI that addresses ONE namespace (`/namespaces/{tableBucketARN}/{namespace}`): the two
+/// `@httpLabel`s of every operation on one, each percent-encoded, as a non-greedy label is
+/// sent — a table bucket ARN carries both `:` and `/`, so it reaches that service as one
+/// value rather than as extra URI structure.
+fn namespace_uri(table_bucket_arn: &str, namespace: &str) -> String {
+    format!(
+        "{}/{}",
+        namespaces_uri(table_bucket_arn),
+        percent_encoded(namespace)
+    )
 }

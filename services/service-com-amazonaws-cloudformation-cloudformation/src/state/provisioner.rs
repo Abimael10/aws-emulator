@@ -520,7 +520,8 @@ use super::template::{
     ROUTE53RESOLVER_RULE_ASSOCIATION, ROUTE53_HEALTH_CHECK, ROUTE53_HOSTED_ZONE,
     ROUTE53_CIDR_COLLECTION, ROUTE53_DELEGATION_SET, ROUTE53_TRAFFIC_POLICY,
     ROUTE53_RECORD_SET, ROUTE53_RECORD_SET_GROUP,
-    S3TABLES_BUCKET_SEGMENT, S3TABLES_TABLE_BUCKET, S3TABLES_TABLE_BUCKET_ARN_ATTRIBUTE,
+    S3TABLES_BUCKET_SEGMENT, S3TABLES_NAMESPACE, S3TABLES_NAMESPACE_IDENTITY,
+    S3TABLES_NAMESPACE_PROPERTY, S3TABLES_TABLE_BUCKET, S3TABLES_TABLE_BUCKET_ARN_ATTRIBUTE,
     S3VECTORS_BUCKET_SEGMENT, S3VECTORS_INDEX,
     S3VECTORS_VECTOR_BUCKET, SAGEMAKER_MODEL_PACKAGE_GROUP, SCHEDULER_SCHEDULE,
     SCHEDULER_SCHEDULE_GROUP, SES_CONFIGURATION_SET, SES_RECEIPT_RULE, SES_RECEIPT_RULE_SET,
@@ -709,6 +710,11 @@ pub(super) enum Provisioner {
     /// is this type's physical id and what every call on one takes, so the arms address it
     /// by that ARN rather than by the bucket's name.
     S3TablesTableBucket,
+    /// `AWS::S3Tables::Namespace`: the namespace Amazon S3 Tables' `CreateNamespace` creates
+    /// INSIDE the table bucket the declaration names and `DeleteNamespace` removes from it.
+    /// That service addresses one by the bucket's ARN and the namespace's name together,
+    /// which is this type's composite physical id and what the arms read the pair off.
+    S3TablesNamespace,
     S3VectorsVectorBucket,
     S3VectorsIndex,
     EmrCluster,
@@ -1225,6 +1231,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         S3_BUCKET => Some(Provisioner::S3Bucket),
         S3_BUCKET_POLICY => Some(Provisioner::S3BucketPolicy),
         S3TABLES_TABLE_BUCKET => Some(Provisioner::S3TablesTableBucket),
+        S3TABLES_NAMESPACE => Some(Provisioner::S3TablesNamespace),
         S3VECTORS_VECTOR_BUCKET => Some(Provisioner::S3VectorsVectorBucket),
         S3VECTORS_INDEX => Some(Provisioner::S3VectorsIndex),
         EMR_CLUSTER => Some(Provisioner::EmrCluster),
@@ -1478,6 +1485,9 @@ impl Provisioner {
             Self::S3TablesTableBucket => {
                 create_table_bucket(ctx, region, resource, propagated).await
             }
+            // `AWS::S3Tables::Namespace` publishes no `Tags` property and `CreateNamespace`
+            // takes none, so no tags are propagated to a namespace.
+            Self::S3TablesNamespace => create_namespace(ctx, region, resource).await,
             Self::S3VectorsVectorBucket => {
                 create_vector_bucket(ctx, region, resource, propagated).await
             }
@@ -3497,6 +3507,9 @@ impl Provisioner {
             Self::S3TablesTableBucket => {
                 delete_table_bucket(ctx, region, physical_resource_id).await
             }
+            // The namespace is addressed by the PAIR S3 Tables keys one by — the table bucket
+            // holding it and its own name — which the resource's own declaration carries.
+            Self::S3TablesNamespace => delete_namespace(ctx, region, resource).await,
             Self::S3VectorsVectorBucket => {
                 delete_vector_bucket(ctx, region, physical_resource_id).await
             }
@@ -4126,6 +4139,8 @@ impl Provisioner {
             Self::S3TablesTableBucket => {
                 describe_table_bucket(ctx, region, physical_resource_id).await
             }
+            // Read back by the same pair the delete addresses the namespace by.
+            Self::S3TablesNamespace => describe_namespace(ctx, region, resource).await,
             Self::S3VectorsVectorBucket => {
                 describe_vector_bucket(ctx, region, physical_resource_id).await
             }

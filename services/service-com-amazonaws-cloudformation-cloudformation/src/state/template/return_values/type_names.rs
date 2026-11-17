@@ -518,6 +518,29 @@ pub const S3_BUCKET: &str = "AWS::S3::Bucket";
 /// table bucket take as `tableBucketARN`.
 pub const S3TABLES_TABLE_BUCKET: &str = "AWS::S3Tables::TableBucket";
 
+/// The type of an Amazon S3 Tables NAMESPACE: the logical grouping of tables a table bucket
+/// holds, which `CreateNamespace` creates IN the bucket its declaration names and
+/// `DeleteNamespace` removes from it.
+///
+/// It declares no resource of its own beyond that pairing, so its primary identifier is
+/// COMPOSITE ([`S3TABLES_NAMESPACE_IDENTITY`]): the bucket's ARN and the namespace's own
+/// name, which is what every S3 Tables operation on one takes together
+/// (`GetNamespace`/`DeleteNamespace` bind `tableBucketARN` and `namespace` as the two labels
+/// of `/namespaces/{tableBucketARN}/{namespace}`) — and the type publishes no `Fn::GetAtt`
+/// value, both of its properties being its identity.
+pub const S3TABLES_NAMESPACE: &str = "AWS::S3Tables::Namespace";
+
+/// The property an `AWS::S3Tables::Namespace` states the namespace's own NAME as, which the
+/// owning service takes as `CreateNamespace`'s `namespace` member.
+pub const S3TABLES_NAMESPACE_PROPERTY: &str = "Namespace";
+
+/// The pair that identifies one namespace, in the order the parts of a composite physical
+/// resource id are joined in: the table bucket it lives in and its own name.
+pub const S3TABLES_NAMESPACE_IDENTITY: &[&str] = &[
+    S3TABLES_TABLE_BUCKET_ARN_ATTRIBUTE,
+    S3TABLES_NAMESPACE_PROPERTY,
+];
+
 /// Amazon S3 Tables' ARN namespace, which is its model's own `awsService.arnNamespace`
 /// (`s3tables`) rather than the `S3Tables` its resource types are spelled with.
 pub const S3TABLES_ARN_NAMESPACE: &str = "s3tables";

@@ -981,7 +981,9 @@ pub(super) const COMPOSITE_IDENTITY_SEPARATOR: &str = "|";
 /// same case: an `AWS::Glue::TableOptimizer` is
 /// `<CatalogId>|<DatabaseName>|<TableName>|<Type>`, the four `CreateTableOptimizer`,
 /// `GetTableOptimizer` and `DeleteTableOptimizer` each take to address one optimizer, and the
-/// type declares no name of its own.
+/// type declares no name of its own. An `AWS::S3Tables::Namespace` is
+/// `<TableBucketARN>|<Namespace>` for that reason too: `GetNamespace` and `DeleteNamespace`
+/// bind both as the labels of `/namespaces/{tableBucketARN}/{namespace}`.
 ///
 /// Because the identity IS the pair, a declaration that re-points either side of it names a
 /// DIFFERENT resource: the deployment replaces the one the stack has
@@ -1004,6 +1006,7 @@ pub fn composite_identity_properties(resource_type: &str) -> &'static [&'static 
         COGNITO_IDENTITY_POOL_PRINCIPAL_TAG => &["IdentityPoolId", "IdentityProviderName"],
         ACMPCA_PERMISSION => &["CertificateAuthorityArn", "Principal"],
         GLUE_TABLE_OPTIMIZER => &["CatalogId", "DatabaseName", "TableName", "Type"],
+        S3TABLES_NAMESPACE => S3TABLES_NAMESPACE_IDENTITY,
         AMPLIFYUIBUILDER_COMPONENT | AMPLIFYUIBUILDER_FORM | AMPLIFYUIBUILDER_THEME => {
             AMPLIFYUIBUILDER_ATTRIBUTES
         }
