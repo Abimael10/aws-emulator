@@ -28,6 +28,11 @@
 //! * both sides of the entitlement split: the ARN's account decides it, while its Region, its
 //!   uuid and that uuid's hex case do not, and the three reasons an ARN the caller IS entitled
 //!   to names nothing here: never minted, torn down, or minted by another Region's endpoint;
+//! * the predicate's independence from the store: against an EMPTY store, where there is
+//!   nothing to look up, the ARNs that name nothing here and the other-account twins of them
+//!   are sent on every route, and the twins of a manager that IS served are sent too, so no
+//!   state of the store can make the caller's own ARN unaddressable and none can make another
+//!   account's addressable;
 //! * behind the front door nothing else stands in front of the handlers, so a label the
 //!   caller is entitled to that falls outside the modelled `@pattern` of the member it binds
 //!   to is the constraint walk's own `400 ValidationException`, while the tag plane, whose
@@ -959,5 +964,122 @@ async fn an_arn_carried_in_the_body_is_the_same_modelled_not_found() {
     assert_eq!(
         status, 200,
         "the live manager must be listable, got {status} / {answer:?}"
+    );
+}
+
+/// Accounts that are NOT the one every request here is signed for, so an ARN naming one of
+/// them is a resource of someone else. Three of them, so no row is about one account id; they
+/// are the accounts [`FOREIGN_TARGETS`] names, kept as a list of their own because what is
+/// built from them here is a twin of an ARN the test only learns at run time.
+const OTHER_ACCOUNTS: &[&str] = &["123456789012", "987654321098", "111122223333"];
+
+/// `arn` with its ACCOUNT field replaced and every other field left as it was.
+///
+/// The twin this builds differs from the ARN it is built from in the one field entitlement is
+/// decided by — same partition, same service, same Region, same resource — so a row that pairs
+/// them isolates the account from everything else about the value.
+fn in_account(arn: &str, account: &str) -> String {
+    let fields: Vec<&str> = arn.splitn(6, ':').collect();
+    let [prefix, partition, service, region, _owner, resource] = fields.as_slice() else {
+        panic!("{arn:?} is not a six-field ARN");
+    };
+    format!("{prefix}:{partition}:{service}:{region}:{account}:{resource}")
+}
+
+/// Assert the request reached this service rather than the front door: whatever it was
+/// answered, that answer is not the refusal of a target the caller may not address.
+///
+/// What follows this at each call site — the modelled not-found, or the served 200 — already
+/// excludes that refusal; this states the half of the rule under test on its own, so a
+/// failure names the front door rather than only the answer that was expected instead.
+fn assert_not_refused_by_the_front_door(case: &str, status: u16, answer: &Value) {
+    assert_ne!(
+        status, UNAUTHORIZED_STATUS,
+        "case {case:?}: an ARN of the caller's own account must reach the service, \
+         got {status} / {answer:?}"
+    );
+    let code = error_code(answer);
+    assert_ne!(
+        code, UNAUTHORIZED_CODE,
+        "case {case:?}: an ARN of the caller's own account must reach the service, \
+         got {code:?} in {answer:?}"
+    );
+}
+
+/// Every other-account twin of `arn` is refused by the front door, on every route that carries
+/// a resource ARN as a path label. `target` names what the twins were built from, for the case
+/// an assertion reports.
+async fn assert_twins_refused(
+    router: &MultiServiceRouter,
+    target: &str,
+    arn: &str,
+    definition_id: &str,
+) {
+    for account in OTHER_ACCOUNTS {
+        let twin = in_account(arn, account);
+        for operation in ARN_LABELLED_OPERATIONS {
+            let case = format!("{operation} on the {account} twin of {target}");
+            let (status, answer) = call_naming(router, operation, &twin, definition_id).await;
+            assert_unauthorized(&case, status, &answer);
+        }
+    }
+}
+
+/// The front door's predicate is the ARN's own entitlement and NOTHING about the store: the
+/// same ARN earns the same answer whether this endpoint holds a resource under it or not, so no
+/// row of the store can make an ARN of the caller's own account unaddressable, and none can
+/// make another account's ARN addressable.
+///
+/// The rows below take that over the two stores the cases above never use. First an EMPTY
+/// store, where entitlement cannot be a lookup because there is nothing to look up: every ARN
+/// of [`UNSERVED_ARNS`] reaches the handler and earns its operation's modelled not-found, and
+/// every twin of it that differs only in naming another account is refused by the front door,
+/// on every route that carries a resource ARN as a path label. Then the twins of the ARN of a
+/// manager this endpoint DOES serve, which close the other direction: an ARN differing from a
+/// served one in nothing but its account is refused all the same, so what decides is the
+/// account and not a lookup. The store a teardown leaves behind is the third state this rule
+/// holds over, and [`the_arn_of_a_torn_down_manager_earns_the_modelled_not_found`] is where
+/// that one is taken.
+#[tokio::test]
+async fn entitlement_is_decided_on_the_arn_alone_whatever_the_store_holds() {
+    /// Every ARN the caller is entitled to reaches the handler and earns its operation's
+    /// modelled not-found, while every other-account twin of it is refused by the front door.
+    /// `store` names what this endpoint was holding when the rows were taken.
+    async fn assert_rows(router: &MultiServiceRouter, store: &str) {
+        for (arn_case, arn) in UNSERVED_ARNS {
+            for operation in ARN_LABELLED_OPERATIONS {
+                let case = format!("{operation} on {arn_case}, with {store}");
+                let (status, answer) =
+                    call_naming(router, operation, arn, SOME_DEFINITION_ID).await;
+                assert_not_refused_by_the_front_door(&case, status, &answer);
+                assert_not_found(&case, operation, arn, status, &answer);
+            }
+            let target = format!("{arn_case}, with {store}");
+            assert_twins_refused(router, &target, arn, SOME_DEFINITION_ID).await;
+        }
+    }
+
+    let router = emulator();
+
+    // Nothing is stored at all, so no row below can have been decided by a lookup.
+    assert_rows(&router, "an empty store").await;
+
+    // The twins of a manager this endpoint does serve: an ARN with nothing changed but the
+    // account it names.
+    let live = create_manager(&router, "a stored manager", "store-independence").await;
+    assert_twins_refused(&router, "the stored manager", &live, SOME_DEFINITION_ID).await;
+
+    // Positive control: the manager is still served through its own ARN, so the refusals above
+    // are about the account their ARNs named.
+    let (status, answer) = call(
+        &router,
+        "GET",
+        &format!("/configurationManager/{}", label(&live)),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the stored manager must be readable, got {status} / {answer:?}"
     );
 }
