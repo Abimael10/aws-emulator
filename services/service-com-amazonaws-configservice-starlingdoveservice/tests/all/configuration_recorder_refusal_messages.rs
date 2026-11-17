@@ -9,10 +9,13 @@
 //! The rule pinned here: where the service FIXES the text of a refusal — the model
 //! states the sentence, or the condition is one the service words
 //! request-independently — the emulator emits that sentence, the same one however the
-//! request named the recorder or the service, so a client that matches it separates the
-//! legs of an error code that is shared between several conditions. Each sentence is
-//! spelled out in this suite rather than read from the handler's own constant, so these
-//! cases PIN the text instead of restating whatever the code happens to say.
+//! request named the recorder or the service; and where the refusal is about a recorder
+//! the request NAMED, the text identifies it, opening with the operation that was
+//! refused and the recorder it was refused on. Either way a client that matches the
+//! message separates the legs of an error code shared between several conditions. Each
+//! sentence is spelled out in this suite rather than read from the handler's own
+//! constant or builder, so these cases PIN the text instead of restating whatever the
+//! code happens to say.
 //!
 //! The rows of every table differ along what the rule generalises over: which service
 //! the recorder is linked to, which operation refused the call, and which name carried
@@ -37,25 +40,35 @@ const CONFLICT_MESSAGE: &str =
      already exists.";
 
 /// The sentence `StartConfigurationRecorder` and `StopConfigurationRecorder` answer a
-/// SERVICE-LINKED recorder with, stated verbatim by the model
+/// SERVICE-LINKED recorder with: the operation that was refused and the recorder it was
+/// refused on, followed by the reason neither applies — the recorder is always recording
 /// (`UnmodifiableEntityException`: "these operations do not affect service-linked
 /// configuration recorders. Service-linked configuration recorders are always
-/// recording. To stop recording, you must delete the service-linked configuration
-/// recorder. Use the DeleteServiceLinkedConfigurationRecorder operation to delete a
-/// service-linked configuration recorder").
-const ALWAYS_RECORDING_MESSAGE: &str =
-    "This operation does not affect service-linked configuration recorders. \
-     Service-linked configuration recorders are always recording. To stop recording, \
-     you must delete the service-linked configuration recorder. Use the \
-     DeleteServiceLinkedConfigurationRecorder operation to delete a service-linked \
-     configuration recorder.";
+/// recording"). Spelled out here rather than read from the handler's own builder, so
+/// these cases PIN the text.
+fn always_recording_message(operation: &str, recorder: &str) -> String {
+    format!(
+        "{operation} operation does not apply to a service-linked configuration recorder \
+         {recorder} because it's always recording"
+    )
+}
 
-/// The sentence `DeleteConfigurationRecorder` answers a service-linked recorder with,
-/// also stated by `UnmodifiableEntityException`'s own documentation.
-const NOT_DELETABLE_HERE_MESSAGE: &str =
-    "You cannot use this operation to delete a service-linked configuration recorder. \
-     Use the DeleteServiceLinkedConfigurationRecorder operation to delete a \
-     service-linked configuration recorder.";
+/// The sentence `DeleteConfigurationRecorder` answers a service-linked recorder with:
+/// the same opening clause, followed by the rejection — such a recorder is a protected
+/// AWS resource — and the operation that does delete it.
+fn not_deletable_here_message(operation: &str, recorder: &str) -> String {
+    format!(
+        "{operation} operation does not apply to a service-linked configuration recorder \
+         {recorder}. The request was rejected because service-linked configuration \
+         recorders are protected AWS resources. Please use \
+         DeleteServiceLinkedConfigurationRecorder API to attempt the deletion."
+    )
+}
+
+/// The sentence `PutConfigurationRecorder` answers EVERY recording group it refuses
+/// with (`InvalidRecordingGroupException`): one fixed statement that the group is not
+/// valid, naming no member of the group and echoing no value the request carried.
+const INVALID_RECORDING_GROUP_MESSAGE: &str = "The recording group provided is not valid";
 
 /// The sentence `PutConfigurationRecorder` answers a request asking it for a
 /// service-linked recorder with, from the same documentation.
@@ -172,13 +185,16 @@ async fn starting_or_stopping_a_service_linked_recorder_reports_that_it_always_r
                 "UnmodifiableEntityException",
             )
             .await;
+            let expected = always_recording_message(operation, &name);
             assert_eq!(
-                message, ALWAYS_RECORDING_MESSAGE,
-                "case {case:?}: expected {ALWAYS_RECORDING_MESSAGE:?}, got {message:?}"
+                message, expected,
+                "case {case:?}: expected {expected:?}, got {message:?}"
             );
+            // The two variable parts are what identify the refused call: the operation
+            // the caller used and the recorder it named.
             assert!(
-                message.contains("always recording"),
-                "case {case:?}: the refusal must report that the recorder always records, \
+                message.starts_with(operation) && message.contains(&name),
+                "case {case:?}: the refusal must name the operation and the recorder, \
                  got {message:?}"
             );
         }
@@ -195,9 +211,10 @@ async fn starting_or_stopping_a_service_linked_recorder_reports_that_it_always_r
             "UnmodifiableEntityException",
         )
         .await;
+        let expected = not_deletable_here_message("DeleteConfigurationRecorder", &name);
         assert_eq!(
-            message, NOT_DELETABLE_HERE_MESSAGE,
-            "case {case:?}: expected {NOT_DELETABLE_HERE_MESSAGE:?}, got {message:?}"
+            message, expected,
+            "case {case:?}: expected {expected:?}, got {message:?}"
         );
 
         // Every refusal left the recorder recording for its service.
@@ -325,4 +342,109 @@ async fn asking_the_standard_create_for_a_service_linked_recorder_names_the_righ
             "case {case:?}: expected {NOT_CREATABLE_HERE_MESSAGE:?}, got {message:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn every_invalid_recording_group_is_refused_with_the_one_fixed_sentence() {
+    // Rows differ along WHICH documented combination makes the group invalid and along
+    // the values each carries: `allSupported` beside one explicit resource type, beside
+    // several of them, beside a global one, beside the exclusion recording strategy, and
+    // a group whose every parameter is null, false or empty. The resource types and the
+    // strategy value are named from
+    // `smithy_query(query="shape", shape="ResourceType")` and
+    // `smithy_query(query="shape", shape="RecordingStrategyType")`.
+    let exclusion_strategy = "EXCLUSION_BY_RESOURCE_TYPES";
+    let cases: Vec<(&str, Value)> = vec![
+        (
+            "allSupported beside one resource type",
+            json!({ "allSupported": true, "resourceTypes": ["AWS::EC2::Instance"] }),
+        ),
+        (
+            "allSupported beside several resource types",
+            json!({
+                "allSupported": true,
+                "resourceTypes": ["AWS::S3::Bucket", "AWS::IAM::Role", "AWS::EC2::Volume"],
+            }),
+        ),
+        (
+            "allSupported beside a global resource type",
+            json!({ "allSupported": true, "resourceTypes": ["AWS::IAM::User"] }),
+        ),
+        (
+            "allSupported beside the exclusion recording strategy",
+            json!({
+                "allSupported": true,
+                "recordingStrategy": { "useOnly": exclusion_strategy },
+            }),
+        ),
+        (
+            "a group whose every parameter is null, false or empty",
+            json!({ "allSupported": false }),
+        ),
+        (
+            "a group that is empty on the wire",
+            json!({ "resourceTypes": [] }),
+        ),
+    ];
+
+    for (case, group) in cases {
+        let emulator = Emulator::new();
+        let message = refusal(
+            &emulator,
+            case,
+            "PutConfigurationRecorder",
+            &recorder_request(json!({ "roleARN": ROLE_ARN, "recordingGroup": group.clone() })),
+            "InvalidRecordingGroupException",
+        )
+        .await;
+        assert_eq!(
+            message, INVALID_RECORDING_GROUP_MESSAGE,
+            "case {case:?}: expected {INVALID_RECORDING_GROUP_MESSAGE:?}, got {message:?}"
+        );
+        // The sentence is request-independent: no member of the group is named and no
+        // value the request carried is echoed back.
+        for leaked in [
+            "allSupported",
+            "resourceTypes",
+            "recordingStrategy",
+            "exclusionByResourceTypes",
+            exclusion_strategy,
+        ] {
+            assert!(
+                !message.contains(leaked),
+                "case {case:?}: the sentence must not carry {leaked:?}, got {message:?}"
+            );
+        }
+        let no_types = Vec::new();
+        for resource_type in group["resourceTypes"].as_array().unwrap_or(&no_types) {
+            let resource_type = resource_type.as_str().unwrap_or_default();
+            assert!(
+                !message.contains(resource_type),
+                "case {case:?}: the sentence must not echo {resource_type:?}, got {message:?}"
+            );
+        }
+
+        // The refused create persisted nothing.
+        let described = emulator
+            .ok("DescribeConfigurationRecorders", &json!({}))
+            .await;
+        assert_eq!(
+            described["ConfigurationRecorders"],
+            json!([]),
+            "case {case:?}: the refused create must persist no recorder, got {described}"
+        );
+    }
+
+    // A recording group the operation ACCEPTS is accepted, so the refusal is about the
+    // group and nothing else.
+    let emulator = Emulator::new();
+    emulator
+        .ok(
+            "PutConfigurationRecorder",
+            &recorder_request(json!({
+                "roleARN": ROLE_ARN,
+                "recordingGroup": { "allSupported": true },
+            })),
+        )
+        .await;
 }

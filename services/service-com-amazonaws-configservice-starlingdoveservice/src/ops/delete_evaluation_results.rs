@@ -13,6 +13,10 @@
 //! can call the StartConfigRulesEvaluation API to start evaluating your … resources
 //! against the rule").
 //!
+//! A rule an AWS SERVICE owns ([`crate::state::ConfigRuleEntry::owning_service`]) is not
+//! the caller's to act on: this delete is refused for it, naming that owner, before any
+//! verdict is touched.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -176,6 +180,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
+
+        // A rule an AWS SERVICE owns is not this caller's to act on: the verdicts
+        // recorded against it belong to the service that created the rule, so the
+        // delete is refused naming the owner the rule records. Taken BEFORE the clear
+        // below, which is what keeps a delivered evaluation alive across the refused
+        // call.
+        if let Some(owner) = rule.owning_service() {
+            return Err(crate::scaffolded::Scaffolded::access_denied(
+                crate::state::service_owned_config_rule_denied_message(owner),
+            ));
+        }
 
         // Every verdict recorded against the rule goes, whichever resource, evaluation
         // mode or writer it came from: what the rule found is discarded while the rule

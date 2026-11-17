@@ -183,17 +183,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // A service-linked configuration recorder is deleted by
-        // `DeleteServiceLinkedConfigurationRecorder`, not by this operation, and the
-        // model states the message this refusal carries ("you cannot use this operation
-        // to delete a service-linked configuration recorder. Use the
-        // DeleteServiceLinkedConfigurationRecorder operation ...").
+        // A service-linked configuration recorder is a PROTECTED resource of the service
+        // it is linked to, and the delete that applies to it is
+        // `DeleteServiceLinkedConfigurationRecorder`, not this operation
+        // (`UnmodifiableEntityException`). The refusal names the operation that was
+        // refused and the recorder it was refused on.
         if recorder.is_service_linked() {
             return Err(
                 DeleteConfigurationRecorderErrorModeled::UnmodifiableEntityException(
                     UnmodifiableEntityException {
                         message: Some(
-                            crate::state::DELETE_RECORDER_IS_NOT_SERVICE_LINKED.to_string(),
+                            crate::state::service_linked_recorder_is_protected_message(
+                                Self::NAME,
+                                &name,
+                            ),
                         ),
                     },
                 )

@@ -190,6 +190,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A rule an AWS SERVICE owns is not this caller's to delete: the service that
+        // created it is the one that removes it — deleting the conformance pack that
+        // deployed it, for one — so the delete is refused naming the owner the rule
+        // records, and the rule and everything recorded against it stay.
+        if let Some(owner) = store
+            .config_rules
+            .get(&name)
+            .and_then(crate::state::ConfigRuleEntry::owning_service)
+        {
+            return Err(crate::scaffolded::Scaffolded::access_denied(
+                crate::state::service_owned_config_rule_denied_message(owner),
+            ));
+        }
+
         // "For DeleteConfigRule, a remediation action is associated with the rule and
         // Config cannot delete this rule. Delete the remediation action associated
         // with the rule before deleting the rule" (`ResourceInUseException`). The rule

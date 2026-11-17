@@ -11,6 +11,11 @@
 //! and the rule rolls up to `INSUFFICIENT_DATA`, which is what a rule nothing has
 //! evaluated reports. Because there is then nothing left to delete, the call repeats as
 //! a no-op; a name this account holds no rule under is refused and deletes nothing.
+//! A rule an AWS SERVICE owns is not the caller's to act on at all: the delete is
+//! refused with `AccessDeniedException` naming that owner and every verdict recorded
+//! against the rule survives, as are the two sibling calls that would act on such a
+//! rule (`DeleteConfigRule`, `PutConfigRule`) — while a verdict DELIVERED for it is
+//! still accepted, because reporting to a rule is not acting on it.
 //!
 //! Every case drives the emulator the way a client does — an `awsJson1_1` `POST /`
 //! through the same `MultiServiceRouter` the production router builds — over a TABLE of
@@ -23,7 +28,8 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_configservice_starlingdoveservice::state::{
-    EvaluationResultEntry, EVALUATION_MODE_DETECTIVE, EVALUATION_MODE_PROACTIVE,
+    EvaluationResultEntry, CONFORMANCE_PACK_SERVICE_PRINCIPAL, EVALUATION_MODE_DETECTIVE,
+    EVALUATION_MODE_PROACTIVE,
 };
 use service_com_amazonaws_configservice_starlingdoveservice::ComAmazonawsConfigserviceStarlingdoveserviceState as ConfigState;
 
@@ -517,4 +523,282 @@ async fn refuses_a_name_this_account_holds_no_rule_under_and_deletes_nothing() {
         "case \"a held name padded with whitespace\": expected the rule's results to be \
          discarded, got {after:#?}"
     );
+}
+
+/// The fixed text the refusal of a call on a rule an AWS service owns OPENS with.
+const DENIED_PREFIX: &str = "An AWS service owns ";
+
+/// The fixed text that same refusal ENDS with.
+const DENIED_SUFFIX: &str = ". You do not have permissions to take action on this rule.";
+
+/// How long a poll waits for a condition the service owes before giving up. Generous:
+/// nothing here asserts on elapsed time, the loop only has to outlast a loaded host.
+const POLL_DEADLINE: Duration = Duration::from_secs(30);
+
+/// How often a poll looks again.
+const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// The resource type a conformance pack template declares a Config rule as, from
+/// `PutConformancePack`'s own model doc.
+const CONFIG_RULE_TYPE: &str = "AWS::Config::ConfigRule";
+
+/// The Config Managed rule a process check IS, named from *List of Config Managed
+/// Rules*: the rule whose verdicts are delivered from outside Config.
+const PROCESS_CHECK_IDENTIFIER: &str = "AWS_CONFIG_PROCESS_CHECK";
+
+/// Record `owner` as the service that created the rule `name`, the way a service that
+/// deploys a rule leaves `CreatedBy` on it — through the crate's own store seam, which
+/// is how this suite seeds state no operation of this API mints for a caller.
+fn owned_by(emulator: &Emulator, name: &str, owner: &str) {
+    let state = emulator.engine.state::<ConfigState>();
+    let mut store = state.lock();
+    let rule = store
+        .config_rules
+        .get_mut(name)
+        .unwrap_or_else(|| panic!("the rule {name:?} must have been created first"));
+    rule.created_by = Some(owner.to_string());
+}
+
+/// Deliver one verdict for the process check rule `name`.
+async fn deliver(emulator: &Emulator, name: &str, annotation: &str) {
+    emulator
+        .ok(
+            "PutExternalEvaluation",
+            &json!({
+                "ConfigRuleName": name,
+                "ExternalEvaluation": {
+                    "ComplianceResourceType": ACCOUNT,
+                    "ComplianceResourceId": account(),
+                    "ComplianceType": NON_COMPLIANT,
+                    "Annotation": annotation,
+                    "OrderingTimestamp": now_seconds(),
+                },
+            }),
+        )
+        .await;
+}
+
+/// Call `operation` and require the refusal a call on a rule owned by `owner` answers:
+/// HTTP 400 `AccessDeniedException`, naming that owner between the two fixed texts.
+async fn refused_as_owned(
+    emulator: &Emulator,
+    case: &str,
+    operation: &str,
+    body: &Value,
+    owner: &str,
+) {
+    let (status, parsed) = emulator.call(operation, body).await;
+    let code = parsed["__type"]
+        .as_str()
+        .map(|wire| wire.rsplit('#').next().unwrap_or(wire))
+        .unwrap_or("<none>")
+        .to_string();
+    assert_eq!(
+        (status, code.as_str()),
+        (400, "AccessDeniedException"),
+        "case {case:?}: expected 400 AccessDeniedException from {operation}, got {status} \
+         {code:?} with {parsed}"
+    );
+    let message = parsed["message"].as_str().unwrap_or("<none>");
+    let expected = format!("{DENIED_PREFIX}{owner}{DENIED_SUFFIX}");
+    assert_eq!(
+        message, expected,
+        "case {case:?}: expected {expected:?} from {operation}, got {message:?}"
+    );
+}
+
+/// A conformance pack template declaring one process check Config rule named
+/// `rule_name`.
+fn pack_template(rule_name: &str) -> String {
+    format!(
+        "Resources:\n  OnlyRule:\n    Type: {CONFIG_RULE_TYPE}\n    Properties:\n      \
+         ConfigRuleName: {rule_name}\n      Source:\n        Owner: AWS\n        \
+         SourceIdentifier: {PROCESS_CHECK_IDENTIFIER}\n"
+    )
+}
+
+/// Wait for a pack to have deployed the rule it declared as `declared` and answer the
+/// name Config gave it, polling for the CONDITION rather than for a span.
+async fn deployed_rule_name(emulator: &Emulator, declared: &str) -> String {
+    let started = ::std::time::Instant::now();
+    loop {
+        let held = rule_names("a pack-deployed rule", emulator).await;
+        if let Some(name) = held.iter().find(|name| name.starts_with(declared)) {
+            return name.clone();
+        }
+        assert!(
+            started.elapsed() < POLL_DEADLINE,
+            "the rule the pack declares as {declared:?} must be deployed, got {held:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+#[tokio::test]
+async fn a_pack_deployed_rules_verdicts_survive_the_delete_its_owner_denies() {
+    let emulator = Emulator::new();
+    emulator
+        .ok(
+            "PutConformancePack",
+            &json!({
+                "ConformancePackName": "owned-pack",
+                "TemplateBody": pack_template("process-check"),
+            }),
+        )
+        .await;
+    let rule = deployed_rule_name(&emulator, "process-check").await;
+    let case = "a pack-deployed rule";
+
+    // The pack's own deployment is what recorded the owner, so the rule reports it.
+    let described = emulator.ok("DescribeConfigRules", &json!({})).await;
+    let detail = described["ConfigRules"]
+        .as_array()
+        .and_then(|rules| {
+            rules
+                .iter()
+                .find(|held| held["ConfigRuleName"] == json!(rule))
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("case {case:?}: the deployed rule must be readable"));
+    assert_eq!(
+        detail["CreatedBy"],
+        json!(CONFORMANCE_PACK_SERVICE_PRINCIPAL),
+        "case {case:?}: the pack's rule reports the service that created it, got {detail}"
+    );
+
+    // A verdict DELIVERED for the rule is accepted: reporting to a rule a service owns
+    // is not acting on it.
+    deliver(&emulator, &rule, "delivered for the pack's rule").await;
+    let delivered = reported(case, &emulator, &rule).await;
+    assert_eq!(
+        delivered.len(),
+        1,
+        "case {case:?}: the delivered verdict must be recorded, got {delivered:#?}"
+    );
+
+    // Every call that would act on the rule is refused, each naming the owner.
+    let body = json!({ "ConfigRuleName": rule });
+    for operation in ["DeleteEvaluationResults", "DeleteConfigRule"] {
+        refused_as_owned(
+            &emulator,
+            case,
+            operation,
+            &body,
+            CONFORMANCE_PACK_SERVICE_PRINCIPAL,
+        )
+        .await;
+    }
+    refused_as_owned(
+        &emulator,
+        case,
+        "PutConfigRule",
+        &managed_rule(&rule),
+        CONFORMANCE_PACK_SERVICE_PRINCIPAL,
+    )
+    .await;
+
+    // Nothing moved: the rule is still the one the pack deployed, and the delivered
+    // verdict survived the delete that was refused.
+    let after = emulator.ok("DescribeConfigRules", &json!({})).await;
+    let still = after["ConfigRules"]
+        .as_array()
+        .and_then(|rules| {
+            rules
+                .iter()
+                .find(|held| held["ConfigRuleName"] == json!(rule))
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("case {case:?}: the refused delete must leave the rule"));
+    assert_eq!(
+        still, detail,
+        "case {case:?}: the refused calls must leave the rule as the pack deployed it, \
+         got {still}"
+    );
+    assert_eq!(
+        reported(case, &emulator, &rule).await,
+        delivered,
+        "case {case:?}: the refused delete must leave every verdict recorded against \
+         the rule"
+    );
+}
+
+#[tokio::test]
+async fn whichever_service_owns_a_rule_the_calls_that_act_on_it_are_refused() {
+    // Rows: the service principals a Config rule can carry in `CreatedBy` — the one a
+    // conformance pack deploys through, and two other Amazon Web Services service
+    // principals — so the refusal is shown to be about the ownership rather than about
+    // one owner. `None` is the control: a rule this account created itself.
+    let owners: [(&str, Option<&str>); 4] = [
+        (
+            "a conformance pack's own rule",
+            Some(CONFORMANCE_PACK_SERVICE_PRINCIPAL),
+        ),
+        (
+            "a rule another service created",
+            Some("securityhub.amazonaws.com"),
+        ),
+        (
+            "a rule a third service created",
+            Some("config-multiaccountsetup.amazonaws.com"),
+        ),
+        ("a rule this account created itself", None),
+    ];
+
+    for (case, owner) in owners {
+        let emulator = Emulator::new();
+        with_recorder_and_channel(&emulator).await;
+        put_process_check_rule(&emulator, UNDER_TEST).await;
+        if let Some(owner) = owner {
+            owned_by(&emulator, UNDER_TEST, owner);
+        }
+        // A verdict is delivered either way, so the delete has something to destroy.
+        deliver(&emulator, UNDER_TEST, "a delivered verdict").await;
+        let delivered = reported(case, &emulator, UNDER_TEST).await;
+        assert_eq!(
+            delivered.len(),
+            1,
+            "case {case:?}: the delivered verdict must be recorded, got {delivered:#?}"
+        );
+
+        let body = json!({ "ConfigRuleName": UNDER_TEST });
+        match owner {
+            Some(owner) => {
+                refused_as_owned(&emulator, case, "DeleteEvaluationResults", &body, owner).await;
+                assert_eq!(
+                    reported(case, &emulator, UNDER_TEST).await,
+                    delivered,
+                    "case {case:?}: the refused delete must leave the verdict"
+                );
+
+                refused_as_owned(
+                    &emulator,
+                    case,
+                    "PutConfigRule",
+                    &managed_rule(UNDER_TEST),
+                    owner,
+                )
+                .await;
+
+                refused_as_owned(&emulator, case, "DeleteConfigRule", &body, owner).await;
+                assert!(
+                    rule_names(case, &emulator).await.contains(UNDER_TEST),
+                    "case {case:?}: the refused delete must leave the rule"
+                );
+            }
+            None => {
+                // The control: this account's own rule is served by all three calls.
+                delete_results(case, &emulator, UNDER_TEST).await;
+                assert!(
+                    reported(case, &emulator, UNDER_TEST).await.is_empty(),
+                    "case {case:?}: the delete must discard the rule's verdicts"
+                );
+                emulator.ok("PutConfigRule", &managed_rule(UNDER_TEST)).await;
+                emulator.ok("DeleteConfigRule", &body).await;
+                assert!(
+                    !rule_names(case, &emulator).await.contains(UNDER_TEST),
+                    "case {case:?}: the delete must remove the rule"
+                );
+            }
+        }
+    }
 }

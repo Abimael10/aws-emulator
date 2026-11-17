@@ -182,17 +182,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-        // This operation does not affect a service-linked configuration recorder, and
-        // the model states the message for exactly these two operations: "these
-        // operations do not affect service-linked configuration recorders.
-        // Service-linked configuration recorders are always recording." A recorder that
-        // always records has nothing for a caller to start.
+        // This operation does not affect a service-linked configuration recorder: that
+        // recorder is ALWAYS RECORDING, so there is nothing for this call to start
+        // (`UnmodifiableEntityException`). The refusal names the operation that was
+        // refused and the recorder it was refused on, the same way the stop of such a
+        // recorder is refused.
         if recorder.is_service_linked() {
             return Err(
                 StartConfigurationRecorderErrorModeled::UnmodifiableEntityException(
                     UnmodifiableEntityException {
                         message: Some(
-                            crate::state::SERVICE_LINKED_RECORDER_ALWAYS_RECORDING.to_string(),
+                            crate::state::service_linked_recorder_always_recording_message(
+                                Self::NAME,
+                                &name,
+                            ),
                         ),
                     },
                 )

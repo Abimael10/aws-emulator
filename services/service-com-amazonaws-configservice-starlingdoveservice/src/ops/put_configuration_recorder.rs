@@ -278,11 +278,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        if let Some(violation) = recording_group_violation(requested.recording_group.as_ref()) {
+        if recording_group_is_invalid(requested.recording_group.as_ref()) {
             return Err(
                 PutConfigurationRecorderErrorModeled::InvalidRecordingGroupException(
                     InvalidRecordingGroupException {
-                        message: Some(violation),
+                        message: Some(
+                            crate::state::INVALID_RECORDING_GROUP_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into(),
@@ -377,14 +379,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// Why `group` is not a valid `RecordingGroup`, or `None` when it is.
+/// Whether `group` is a `RecordingGroup` this operation refuses.
 ///
 /// The combinations refused here are the ones `InvalidRecordingGroupException`
 /// documents: `allSupported` together with an explicit resource-type list,
 /// `allSupported` together with the exclusion recording strategy, and a group in
-/// which every parameter is null, false or empty.
-fn recording_group_violation(group: Option<&RecordingGroup>) -> Option<String> {
-    let group = group?;
+/// which every parameter is null, false or empty. WHICH of them failed is not part of
+/// the answer, because it is not part of the refusal either: the exception carries one
+/// fixed sentence for every case
+/// ([`crate::state::INVALID_RECORDING_GROUP_MESSAGE`]).
+fn recording_group_is_invalid(group: Option<&RecordingGroup>) -> bool {
+    let Some(group) = group else {
+        return false;
+    };
     let resource_types = group.resource_types.as_deref().unwrap_or(&[]);
     let excluded = group
         .exclusion_by_resource_types
@@ -397,28 +404,14 @@ fn recording_group_violation(group: Option<&RecordingGroup>) -> Option<String> {
         .and_then(|strategy| strategy.use_only.as_deref());
 
     if group.all_supported && !resource_types.is_empty() {
-        return Some(
-            "RecordingGroup.allSupported is true, so RecordingGroup.resourceTypes must be empty"
-                .to_string(),
-        );
+        return true;
     }
     if group.all_supported && strategy == Some(crate::state::RECORDING_STRATEGY_EXCLUSION) {
-        return Some(format!(
-            "RecordingGroup.allSupported is true, so RecordingStrategy.useOnly must not be {}",
-            crate::state::RECORDING_STRATEGY_EXCLUSION,
-        ));
+        return true;
     }
-    if !group.all_supported
+    !group.all_supported
         && !group.include_global_resource_types
         && resource_types.is_empty()
         && excluded.is_empty()
         && strategy.is_none()
-    {
-        return Some(
-            "every RecordingGroup parameter is null, false or empty; specify allSupported, \
-             resourceTypes, exclusionByResourceTypes or recordingStrategy"
-                .to_string(),
-        );
-    }
-    None
 }

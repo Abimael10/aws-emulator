@@ -301,6 +301,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request refused by any of them has read nothing of another service.
         let existing_rule_arn = {
             let store = state.lock();
+            // A rule an AWS SERVICE owns is not this caller's to redefine: the service
+            // that created it is the one that maintains its definition, so the write is
+            // refused naming the owner the rule records, and the rule stays exactly as
+            // that service left it. Decided BEFORE the account's own preconditions,
+            // because whether the caller may act on the rule at all does not depend on
+            // them.
+            if let Some(owner) = service_owner_of(&store, name) {
+                return Err(crate::scaffolded::Scaffolded::access_denied(
+                    crate::state::service_owned_config_rule_denied_message(&owner),
+                ));
+            }
             if let Some(refusal) = store_refusal(&store, name) {
                 return Err(refusal.into());
             }
@@ -350,8 +361,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The guard was RELEASED for the read above, so what this store decides is asked
         // again under the guard that writes: a precondition that stopped holding while it
-        // was released — the account's last customer managed recorder deleted, or another
-        // write taking the last place under the quota — is one no rule may be written under.
+        // was released — a rule a service deployed under this name, the account's last
+        // customer managed recorder deleted, or another write taking the last place under
+        // the quota — is one no rule may be written under.
+        if let Some(owner) = service_owner_of(&store, name) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(
+                crate::state::service_owned_config_rule_denied_message(&owner),
+            ));
+        }
         if let Some(refusal) = store_refusal(&store, name) {
             return Err(refusal.into());
         }
@@ -425,6 +442,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(PutConfigRuleOutput)
     }
+}
+
+/// The AWS service that owns the rule `name`, where this account holds one under that
+/// name and a service created it, or `None` otherwise.
+///
+/// Asked TWICE for the same reason `store_refusal` is: the store's guard is RELEASED
+/// while the rule's evaluator is read from AWS Lambda, and a rule a service owns is one
+/// no write may land on.
+fn service_owner_of(
+    store: &crate::state::ComAmazonawsConfigserviceStarlingdoveserviceState,
+    name: &str,
+) -> Option<String> {
+    store
+        .config_rules
+        .get(name)
+        .and_then(crate::state::ConfigRuleEntry::owning_service)
+        .map(str::to_string)
 }
 
 /// The refusal THIS STORE alone decides for a write of the rule `name`, or `None` when it

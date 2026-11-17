@@ -4702,51 +4702,33 @@ pub fn reserved_recorder_name_prefix_message() -> String {
     )
 }
 
-/// How `StartConfigurationRecorder` and `StopConfigurationRecorder` word
-/// `UnmodifiableEntityException` for a SERVICE-LINKED configuration recorder.
-///
-/// The MODEL STATES THIS MESSAGE, verbatim, for exactly these two operations
-/// (`UnmodifiableEntityException`: "For StartConfigurationRecorder and
-/// StopConfigurationRecorder, you will see this exception because these operations do
-/// not affect service-linked configuration recorders. Service-linked configuration
-/// recorders are ALWAYS RECORDING. To stop recording, you must delete the
-/// service-linked configuration recorder. Use the
-/// DeleteServiceLinkedConfigurationRecorder operation to delete a service-linked
-/// configuration recorder"). The property the refusal is about is that the recorder
-/// always records — so the call is not permitted for this recorder class, rather than a
-/// call that had no effect — and the recovery it indicates is the service-linked delete.
-///
-/// A FIXED sentence for the class: it quotes nothing the caller sent, because what is
-/// wrong is the KIND of recorder named, not its name.
-pub const SERVICE_LINKED_RECORDER_ALWAYS_RECORDING: &str =
-    "This operation does not affect service-linked configuration recorders. \
-     Service-linked configuration recorders are always recording. To stop recording, \
-     you must delete the service-linked configuration recorder. Use the \
-     DeleteServiceLinkedConfigurationRecorder operation to delete a service-linked \
-     configuration recorder.";
-
 /// How `PutConfigurationRecorder` words `UnmodifiableEntityException` for a request
-/// asking it for a service-linked configuration recorder — also stated by the model
-/// ("For PutConfigurationRecorder, you will see this exception because you cannot use
-/// this operation to create a service-linked configuration recorder. Use the
+/// asking it for a service-linked configuration recorder — stated by the model ("For
+/// PutConfigurationRecorder, you will see this exception because you cannot use this
+/// operation to create a service-linked configuration recorder. Use the
 /// PutServiceLinkedConfigurationRecorder operation to create a service-linked
-/// configuration recorder"), and fixed for the same reason as
-/// [`SERVICE_LINKED_RECORDER_ALWAYS_RECORDING`].
+/// configuration recorder").
+///
+/// A FIXED sentence: this request names no recorder — it asks for one to be created —
+/// so there is nothing of the request for the refusal to identify, which is what makes
+/// it word differently from the refusal of a call made ON a service-linked recorder
+/// ([`service_linked_recorder_always_recording_message`]).
 pub const PUT_RECORDER_IS_NOT_SERVICE_LINKED: &str =
     "You cannot use this operation to create a service-linked configuration recorder. \
      Use the PutServiceLinkedConfigurationRecorder operation to create a service-linked \
      configuration recorder.";
 
-/// How `DeleteConfigurationRecorder` words `UnmodifiableEntityException` for a
-/// service-linked configuration recorder — the model's own sentence again ("For
-/// DeleteConfigurationRecorder, you will see this exception because you cannot use this
-/// operation to delete a service-linked configuration recorder. Use the
-/// DeleteServiceLinkedConfigurationRecorder operation to delete a service-linked
-/// configuration recorder").
-pub const DELETE_RECORDER_IS_NOT_SERVICE_LINKED: &str =
-    "You cannot use this operation to delete a service-linked configuration recorder. \
-     Use the DeleteServiceLinkedConfigurationRecorder operation to delete a \
-     service-linked configuration recorder.";
+/// How `PutConfigurationRecorder` words `InvalidRecordingGroupException`.
+///
+/// ONE fixed, request-independent sentence for every recording group this operation
+/// refuses — the combinations the shape documents: `allSupported` beside an explicit
+/// resource-type list, `allSupported` beside the exclusion recording strategy, a group
+/// whose every parameter is null, false or empty, resource types or a recording strategy
+/// that are not valid, and more resource types than the group may carry. RECORDED
+/// behaviour: the refusal states that the group provided is not valid and nothing else —
+/// it names no member of the group and echoes no value the caller sent, so which
+/// combination failed is not readable from the message.
+pub const INVALID_RECORDING_GROUP_MESSAGE: &str = "The recording group provided is not valid";
 
 /// How `PutConfigRule` words `NoAvailableConfigurationRecorderException`.
 ///
@@ -4898,9 +4880,14 @@ mod identifier;
 // How a tagging request's `ResourceArn` is resolved to the tag set of the resource it
 // names, for every taggable resource type this store holds.
 mod tagging;
+// How Config words the refusal of a call made on a resource an AWS SERVICE owns rather
+// than this account: a service-linked configuration recorder, and a Config rule a
+// service created.
+mod protected_resource;
 pub use aggregator::*;
 pub use config_rule::*;
 pub use conformance_pack::*;
 pub use delivery_channel::*;
 pub use discovered_resource::*;
 pub use identifier::*;
+pub use protected_resource::*;
