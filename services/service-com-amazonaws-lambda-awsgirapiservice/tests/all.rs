@@ -477,6 +477,8 @@ mod kinesis_event_source_handler_writes_dynamodb;
 mod kinesis_event_source_handler_writes_kinesis;
 #[path = "all/layer_archive_unzipped_size.rs"]
 mod layer_archive_unzipped_size;
+#[path = "all/layer_content_identity.rs"]
+mod layer_content_identity;
 #[path = "all/layer_cross_account_access.rs"]
 mod layer_cross_account_access;
 #[path = "all/layer_listing.rs"]

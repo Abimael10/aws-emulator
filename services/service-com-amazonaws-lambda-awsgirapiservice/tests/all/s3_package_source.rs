@@ -51,7 +51,7 @@ const UNHELD_BUCKET: &str = "packages-of-another-account";
 /// The bytes of a .zip archive holding one entry of `length` bytes — a real archive, which
 /// is what Lambda unzips the package it stores out of. Written in memory, so the object the
 /// bucket holds is exactly these bytes.
-fn archive_bytes(length: usize) -> Vec<u8> {
+pub(crate) fn archive_bytes(length: usize) -> Vec<u8> {
     let mut buffer = std::io::Cursor::new(Vec::new());
     {
         let mut writer = zip::ZipWriter::new(&mut buffer);
@@ -77,7 +77,7 @@ fn s3_authorization() -> String {
 /// Lambda and Amazon S3 on one engine, the shape `core/router/src/lib.rs` mounts them in:
 /// the object a package names is read out of S3's own store, so it is written through S3's
 /// own surface.
-fn emulator(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
+pub(crate) fn emulator(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(
@@ -89,8 +89,15 @@ fn emulator(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     router
 }
 
-/// One path-style Amazon S3 request that must be served.
-async fn s3_ok(router: &MultiServiceRouter, case: &str, method: &str, uri: &str, body: &[u8]) {
+/// One path-style Amazon S3 request, answered as it came back — the one place a suite of
+/// this crate builds an Amazon S3 request, so a request that must succeed ([`s3_ok`]) and one
+/// whose refusal is the point cannot disagree about how it is addressed or signed.
+pub(crate) async fn s3_request(
+    router: &MultiServiceRouter,
+    method: &str,
+    uri: &str,
+    body: &[u8],
+) -> Answer {
     let host = format!("s3.{REGION}.amazonaws.com");
     let request = ::http::Request::builder()
         .method(method)
@@ -101,11 +108,27 @@ async fn s3_ok(router: &MultiServiceRouter, case: &str, method: &str, uri: &str,
         .expect("the test request is well formed");
     let response = router.dispatch(request).await;
     let (parts, answered) = response.into_parts();
+    Answer {
+        status: parts.status.as_u16(),
+        headers: parts.headers,
+        body: answered,
+    }
+}
+
+/// One path-style Amazon S3 request that must be served.
+pub(crate) async fn s3_ok(
+    router: &MultiServiceRouter,
+    case: &str,
+    method: &str,
+    uri: &str,
+    body: &[u8],
+) {
+    let answer = s3_request(router, method, uri, body).await;
     assert!(
-        (200..300).contains(&parts.status.as_u16()),
+        (200..300).contains(&answer.status),
         "case {case:?}: S3 {method} {uri} must succeed, got {} {}",
-        parts.status.as_u16(),
-        String::from_utf8_lossy(&answered)
+        answer.status,
+        String::from_utf8_lossy(&answer.body)
     );
 }
 
@@ -122,7 +145,7 @@ async fn put_object(router: &MultiServiceRouter, case: &str, key: &str, bytes: &
 
 /// The base64 SHA-256 of `bytes`, computed here so the test never reads the digest it is
 /// checking out of the answer it is checking.
-fn digest_of(bytes: &[u8]) -> String {
+pub(crate) fn digest_of(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(bytes))
 }
 
@@ -176,7 +199,7 @@ async fn update_function_code(
 }
 
 /// `PublishLayerVersion` on a layer name.
-async fn publish_layer_version(
+pub(crate) async fn publish_layer_version(
     router: &MultiServiceRouter,
     name: &str,
     body: &Value,
@@ -192,7 +215,11 @@ async fn list_layer_versions(router: &MultiServiceRouter, name: &str) -> Answer 
 }
 
 /// `GetLayerVersion` on a layer name and a version number.
-async fn get_layer_version(router: &MultiServiceRouter, name: &str, version: i64) -> Answer {
+pub(crate) async fn get_layer_version(
+    router: &MultiServiceRouter,
+    name: &str,
+    version: i64,
+) -> Answer {
     let uri = format!("/2018-10-31/layers/{name}/versions/{version}");
     json_call(router, "GET", &uri, &Value::Null).await
 }
