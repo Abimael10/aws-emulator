@@ -176,10 +176,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) else {
             return Err(GetIngestionJobErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "could not find ingestion job with identifier {} for data source {} \
-                         in knowledge base {}",
-                        input.ingestion_job_id, input.data_source_id, input.knowledge_base_id
+                    message: Some(crate::state::ingestion_job_not_found_message(
+                        &input.ingestion_job_id,
+                        &input.data_source_id,
+                        &input.knowledge_base_id,
                     )),
                 },
             )

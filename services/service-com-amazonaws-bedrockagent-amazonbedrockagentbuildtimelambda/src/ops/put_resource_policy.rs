@@ -11,6 +11,12 @@
 //! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
 //! so leaving it on an implemented operation under-reports progress.
 //!
+//! The two readings a resource policy of a knowledge base turns on — which knowledge
+//! base a `resourceArn` names, and which kind of knowledge base carries a policy at
+//! all — are in [`crate::state::resource_policies`]. What is NOT written down
+//! anywhere this emulator can read is the wording of the refusals AWS answers here,
+//! so they have to come from the recorded responses.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements

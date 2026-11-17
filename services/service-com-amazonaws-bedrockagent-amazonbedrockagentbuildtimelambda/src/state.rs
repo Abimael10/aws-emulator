@@ -180,6 +180,11 @@ mod ingestion_job_listing;
 /// refusal a second knowledge base under it gets.
 mod knowledge_base_names;
 
+/// The resource-based policy a knowledge base carries: which knowledge base a
+/// resource-policy operation's ARN names, and which kind of knowledge base carries
+/// a policy at all.
+mod resource_policies;
+
 pub use bound_vector_index::*;
 pub use data_source_listing::*;
 pub use flow_aliases::*;
@@ -189,6 +194,7 @@ pub use ingestion_record::*;
 pub use knowledge_base_names::*;
 pub use opensearch_serverless_store::*;
 pub use pushed_documents::*;
+pub use resource_policies::*;
 pub use service_role::*;
 pub use tagged_resources::*;
 pub use vector_store::*;
@@ -1300,7 +1306,8 @@ pub fn knowledge_base_not_found_message(knowledge_base_id: &str) -> String {
 pub const DATA_SOURCE_QUOTA: usize = 1_000;
 
 /// The `KnowledgeBaseType` of a service-managed knowledge base: the one kind
-/// whose data sources have a documented `dataDeletionPolicy` default.
+/// whose data sources have a documented `dataDeletionPolicy` default, and the one
+/// kind that carries a resource-based policy ([`resource_policies`]).
 pub const MANAGED_KNOWLEDGE_BASE_TYPE: &str = "MANAGED";
 
 /// The `dataDeletionPolicy` a data source of a service-managed knowledge base
@@ -2038,13 +2045,23 @@ pub const INGESTION_JOB_START_SPAN: Duration = Duration::from_millis(450);
 /// progression inside three quarters of a second.
 pub const INGESTION_JOB_RUN_SPAN: Duration = Duration::from_millis(300);
 
+/// How long after `StopIngestionJob` a job leaves `STOPPING` for `STOPPED`.
+///
+/// CHOSEN, not documented, and non-zero for the same reason as
+/// [`INGESTION_JOB_START_SPAN`]: `STOPPING` is a status the model declares, so a
+/// caller that reads the job back immediately still observes it. It is the span a
+/// run of the job takes ([`INGESTION_JOB_RUN_SPAN`]), so halting a job converges
+/// on the same scale as finishing one.
+pub const INGESTION_JOB_STOP_SPAN: Duration = INGESTION_JOB_RUN_SPAN;
+
 /// The `IngestionJobStatus` values this slice of the service can hold, named as
 /// the model's `IngestionJobStatus` enum names them on the wire.
 ///
-/// `StartIngestionJob` mints only [`IngestionJobStatus::Starting`]; the rest of
-/// the chain is owed by the clock. The modelled enum also declares `STOPPING`,
-/// `STOPPED` and `FAILED`, which nothing in this slice reaches: stopping a job is
-/// `StopIngestionJob`'s own operation, and no job here fails.
+/// `StartIngestionJob` mints only [`IngestionJobStatus::Starting`] and
+/// `StopIngestionJob` moves a job that has not finished to
+/// [`IngestionJobStatus::Stopping`]; the rest of each chain is owed by the clock.
+/// The modelled enum also declares `FAILED`, which nothing in this slice reaches:
+/// no job here fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IngestionJobStatus {
     /// `StartIngestionJob` accepted; the job reaches
@@ -2056,6 +2073,13 @@ pub enum IngestionJobStatus {
     InProgress,
     /// The job finished — a terminal status, so the clock owes it nothing more.
     Complete,
+    /// `StopIngestionJob` accepted; the job reaches
+    /// [`IngestionJobStatus::Stopped`] once [`INGESTION_JOB_STOP_SPAN`] has
+    /// elapsed, and the run it was in the middle of reaches nothing else.
+    Stopping,
+    /// The job was halted — a terminal status, so the clock owes it nothing more
+    /// and the data source it ran for serves a new job again.
+    Stopped,
 }
 
 impl IngestionJobStatus {
@@ -2065,7 +2089,15 @@ impl IngestionJobStatus {
             Self::Starting => "STARTING",
             Self::InProgress => "IN_PROGRESS",
             Self::Complete => "COMPLETE",
+            Self::Stopping => "STOPPING",
+            Self::Stopped => "STOPPED",
         }
+    }
+
+    /// Whether this status is one the job never leaves: the run is over, whether
+    /// it finished or was halted, so the clock owes the job nothing more.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Complete | Self::Stopped)
     }
 
     /// The status the clock owes a job in this one next, and how long after it
@@ -2074,9 +2106,41 @@ impl IngestionJobStatus {
         match self {
             Self::Starting => Some((INGESTION_JOB_START_SPAN, Self::InProgress)),
             Self::InProgress => Some((INGESTION_JOB_RUN_SPAN, Self::Complete)),
-            Self::Complete => None,
+            Self::Stopping => Some((INGESTION_JOB_STOP_SPAN, Self::Stopped)),
+            Self::Complete | Self::Stopped => None,
         }
     }
+}
+
+/// The `ResourceNotFoundException` message an ingestion-job operation answers when
+/// the triple the request addresses resolves to no stored job: a job is identified
+/// by the knowledge base and data source it ran for as well as by its own id, so
+/// the refusal names all three — each taken from the request — and the rest is
+/// fixed text. Stated here rather than in a handler so the operations that address
+/// one job cannot come to word the same refusal differently.
+pub fn ingestion_job_not_found_message(
+    ingestion_job_id: &str,
+    data_source_id: &str,
+    knowledge_base_id: &str,
+) -> String {
+    format!(
+        "could not find ingestion job with identifier {ingestion_job_id} for data source \
+         {data_source_id} in knowledge base {knowledge_base_id}"
+    )
+}
+
+/// The `ValidationException` message `StopIngestionJob` answers for a job whose
+/// run is already over: the job's current `IngestionJobStatus`, read from the
+/// stored record, fills the one variable part of AWS's own sentence for this error
+/// class, whose text is otherwise fixed.
+///
+/// The operation "stops a currently running data ingestion job", so a job that has
+/// reached a terminal status is not one there is a run to stop.
+pub fn stop_blocked_by_status_message(status: IngestionJobStatus) -> String {
+    format!(
+        "Ingestion job is already in a terminal state: {}.",
+        status.as_wire()
+    )
 }
 
 /// One stored ingestion job: the single source of truth for every
@@ -2153,9 +2217,28 @@ impl IngestionJobRecord {
 
     /// Whether the clock still owes this job a status, i.e. it has not reached a
     /// terminal one. A data source ingests one job at a time, so this is what a
-    /// second `StartIngestionJob` conflicts with.
+    /// second `StartIngestionJob` conflicts with — and a job that was stopped is
+    /// not one of them, which is what lets the caller "send a StartIngestionJob
+    /// request again to ingest the rest of your data".
     pub fn is_running(&self) -> bool {
-        self.status != IngestionJobStatus::Complete
+        !self.status.is_terminal()
+    }
+
+    /// Halt this job: it reports the modelled `STOPPING` status from now on and
+    /// the clock owes it [`IngestionJobStatus::Stopped`], at which point the run
+    /// is over.
+    ///
+    /// The accounting is left exactly as it stands. The modelled statistics are
+    /// the service's accounting OF A RUN, published when the run finishes — and a
+    /// run the caller halted never finishes, so what it had accounted for when the
+    /// stop was accepted is what it keeps reporting and the completion accounting
+    /// ([`Self::completed_statistics`]) is never published for it. `textReadyAt`
+    /// stays absent for the same reason: text extraction over the documents never
+    /// completed.
+    pub fn begin_stop(&mut self, now: SystemTime) {
+        self.status = IngestionJobStatus::Stopping;
+        self.pending_status = Some((now + INGESTION_JOB_STOP_SPAN, IngestionJobStatus::Stopped));
+        self.updated_at = now;
     }
 
     /// This record as the modelled `IngestionJob` shape: every member is
@@ -2955,6 +3038,22 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
             record.knowledge_base_id == knowledge_base_id
                 && record.data_source_id == data_source_id
         })
+    }
+
+    /// The same record as [`Self::ingestion_job_of`], for an operation that
+    /// writes it.
+    pub fn ingestion_job_of_mut(
+        &mut self,
+        knowledge_base_id: &str,
+        data_source_id: &str,
+        ingestion_job_id: &str,
+    ) -> Option<&mut IngestionJobRecord> {
+        self.ingestion_jobs
+            .get_mut(ingestion_job_id)
+            .filter(|record| {
+                record.knowledge_base_id == knowledge_base_id
+                    && record.data_source_id == data_source_id
+            })
     }
 
     /// The data source's job that has not reached a terminal status, if it has

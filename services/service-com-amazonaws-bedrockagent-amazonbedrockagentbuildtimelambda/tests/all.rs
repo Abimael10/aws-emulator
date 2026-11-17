@@ -77,6 +77,8 @@ mod ingestion_crawl_whichever_store_the_knowledge_base_names;
 mod ingestion_job_lifecycle;
 #[path = "all/ingestion_job_listing.rs"]
 mod ingestion_job_listing;
+#[path = "all/ingestion_job_stop.rs"]
+mod ingestion_job_stop;
 #[path = "all/ingestion_statistics_measure_their_own_run.rs"]
 mod ingestion_statistics_measure_their_own_run;
 #[path = "all/ingestion_writes_the_bound_collection_index.rs"]
@@ -95,6 +97,8 @@ mod knowledge_base_role_and_vector_store_access;
 mod knowledge_base_listing;
 #[path = "all/knowledge_base_name_conflict.rs"]
 mod knowledge_base_name_conflict;
+#[path = "all/knowledge_base_resource_policy.rs"]
+mod knowledge_base_resource_policy;
 #[path = "all/managed_connector_defaults.rs"]
 mod managed_connector_defaults;
 #[path = "all/preparation_mutual_exclusion.rs"]

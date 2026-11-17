@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopIngestionJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopIngestionJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Stops a data ingestion job that is still running: the stored
+//! [`crate::state::IngestionJobRecord`] the knowledge base, data source and job
+//! triple names moves to the `STOPPING` status the model declares, the clock owes
+//! it `STOPPED` from there, and the answer is that stored record.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopIngestionJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A job whose run is already over has none to stop: every terminal status is
+//! refused with the modelled `ValidationException`
+//! ([`crate::state::stop_blocked_by_status_message`]) and the record is left
+//! exactly as it stands. A stopped job frees its data source, so the caller can
+//! "send a StartIngestionJob request again to ingest the rest of your data".
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +157,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopIngestionJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopIngestionJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopIngestionJob"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StopIngestionJobErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the bedrock-agent store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        // Every status the clock had already made due, applied before the job is
+        // judged: a job the clock finished a moment ago has no run left to stop,
+        // whether or not anyone had read it since.
+        state.materialise_due_transitions(now);
+
+        // A job ingests one data source of one knowledge base, so both have to
+        // exist for this call to address a job at all — and a resource a delete
+        // has already been accepted for is as absent as one nothing holds, which
+        // is the same reading `StartIngestionJob` makes of the pair.
+        if state
+            .live_knowledge_base(&input.knowledge_base_id)
+            .is_none()
+        {
+            return Err(StopIngestionJobErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::knowledge_base_not_found_message(
+                        &input.knowledge_base_id,
+                    )),
+                },
+            )
+            .into());
+        }
+        if state
+            .live_data_source_of(&input.knowledge_base_id, &input.data_source_id)
+            .is_none()
+        {
+            return Err(StopIngestionJobErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::data_source_not_found_message(
+                        &input.data_source_id,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // An ingestion job is identified by the knowledge base and data source it
+        // ran for as well as its own id, so an id of another data source's job is
+        // as absent here as one nothing holds.
+        let Some(record) = state.ingestion_job_of_mut(
+            &input.knowledge_base_id,
+            &input.data_source_id,
+            &input.ingestion_job_id,
+        ) else {
+            return Err(StopIngestionJobErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::ingestion_job_not_found_message(
+                        &input.ingestion_job_id,
+                        &input.data_source_id,
+                        &input.knowledge_base_id,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // What this operation stops is "a currently running data ingestion job":
+        // a job that has reached a terminal status has no run left, so the
+        // request is refused and the stored record is left untouched.
+        let status = record.status;
+        if status.is_terminal() {
+            return Err(StopIngestionJobErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::stop_blocked_by_status_message(status)),
+                    // The refusal is about the state the job is in, not about one
+                    // member's value, so there is no field to list.
+                    field_list: None,
+                },
+            )
+            .into());
+        }
+
+        record.begin_stop(now);
+        Ok(StopIngestionJobOutput {
+            ingestion_job: record.to_ingestion_job(),
+        })
     }
 }
