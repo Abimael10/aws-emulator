@@ -74,7 +74,10 @@ async fn invoke(emulator: &Emulator, chain: &Chain, act_id: &str, body: Value) -
 }
 
 /// One `InvokeActStep` call carrying `results` and no `previousStepId`.
-async fn step_with(
+///
+/// `pub(crate)` with the three helpers below so a sibling suite that needs an act DRIVEN by
+/// its steps drives this one reading of the operation rather than a second copy of it.
+pub(crate) async fn step_with(
     emulator: &Emulator,
     chain: &Chain,
     act_id: &str,
@@ -87,7 +90,7 @@ async fn step_with(
 /// handed out. `CallResult$callId` is optional and `content` is a `CallResultContents` of
 /// 1..100 `CallResultContent` unions, whose one member is `text`
 /// (`smithy_query(query="closure",operation="InvokeActStep")`).
-fn unattributed_result(content: &str) -> Value {
+pub(crate) fn unattributed_result(content: &str) -> Value {
     json!({ "content": [{ "text": content }] })
 }
 
@@ -98,7 +101,7 @@ fn result_for(call_id: &str, content: &str) -> Value {
 
 /// One `ToolSpec` as the model shapes it: a name, a description and an input schema, all
 /// three required (`smithy_query(query="shape",shape="ToolSpec")`).
-fn tool_spec(name: &str, schema: Value) -> Value {
+pub(crate) fn tool_spec(name: &str, schema: Value) -> Value {
     json!({
         "name": name,
         "description": format!("what {name} does"),
@@ -107,7 +110,7 @@ fn tool_spec(name: &str, schema: Value) -> Value {
 }
 
 /// One new act declaring `tools`, in the status `CreateAct` stores a new act in.
-async fn act_declaring(
+pub(crate) async fn act_declaring(
     emulator: &Emulator,
     chain: &Chain,
     task: &str,

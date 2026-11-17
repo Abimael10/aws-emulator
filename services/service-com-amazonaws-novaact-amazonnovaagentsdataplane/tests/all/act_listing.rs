@@ -48,13 +48,17 @@ const MAX_RESULTS_MAX: i64 = 100;
 const TOKEN_SEPARATOR: char = '\u{1f}';
 
 /// The members of one `ListActs` request beside the definition it lists.
+///
+/// `pub(crate)` with [`list`] and [`summaries`] below so a sibling suite asserting what the
+/// listing REPORTS for each act drives this one reading of the request rather than a second
+/// copy of it.
 #[derive(Debug, Default, Clone)]
-struct Query {
-    workflow_run_id: Option<String>,
-    session_id: Option<String>,
-    max_results: Option<i64>,
-    next_token: Option<String>,
-    sort_order: Option<String>,
+pub(crate) struct Query {
+    pub(crate) workflow_run_id: Option<String>,
+    pub(crate) session_id: Option<String>,
+    pub(crate) max_results: Option<i64>,
+    pub(crate) next_token: Option<String>,
+    pub(crate) sort_order: Option<String>,
 }
 
 impl Query {
@@ -84,7 +88,7 @@ impl Query {
 /// One `ListActs` call: `workflowRunId`, `sessionId`, `maxResults` and `nextToken` are
 /// `@httpQuery` members and `sortOrder` travels in the body
 /// (`smithy_query(query="operation",operation="ListActs")`).
-async fn list(emulator: &Emulator, definition: &str, query: &Query) -> (u16, Value) {
+pub(crate) async fn list(emulator: &Emulator, definition: &str, query: &Query) -> (u16, Value) {
     let mut members: Vec<String> = Vec::new();
     if let Some(run_id) = &query.workflow_run_id {
         members.push(format!("workflowRunId={run_id}"));
@@ -114,7 +118,7 @@ async fn list(emulator: &Emulator, definition: &str, query: &Query) -> (u16, Val
 }
 
 /// The summaries of one page, refused when the required member is missing or not a list.
-fn summaries(body: &Value) -> Vec<Value> {
+pub(crate) fn summaries(body: &Value) -> Vec<Value> {
     body["actSummaries"]
         .as_array()
         .unwrap_or_else(|| panic!("actSummaries must be a list in {body}"))
