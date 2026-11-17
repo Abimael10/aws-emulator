@@ -69,6 +69,11 @@ const PUBLISHED_ENUM_ORDERS: &[&[&str]] = &[
     // The token version the account's global STS endpoint issues
     // (`iam#globalEndpointTokenVersion`, declared by the model as `v1Token, v2Token`).
     &["v2Token", "v1Token"],
+    // The status of a credential IAM holds — an access key, an SSH public key, a signing
+    // certificate, a service-specific credential (`iam#statusType`, declared by the model as
+    // `Active, Inactive, Expired`). Every member of this service targeting that enum is
+    // stated this way, since the order belongs to the enum rather than to one member.
+    &["Expired", "Active", "Inactive"],
 ];
 
 /// The order this service states the admissible set `allowed` in, or `None` when the

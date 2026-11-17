@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateSSHPublicKey
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateSSHPublicKey`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateSSHPublicKey::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +160,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateSSHPublicKey` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateSSHPublicKeyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateSSHPublicKey"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Neither modelled error is about the store: "an invalid or out-of-range value
+            // was supplied for an input parameter" is about the request, and a store that
+            // is not there is not an entity the request named being absent.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "the IAM store is unavailable",
+            ));
+        };
+        // A mutation: the operation "sets the status of an IAM user's SSH public key to
+        // active or inactive", so the lock is held across the lookup and the write.
+        let mut store = state.lock();
+
+        let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
+        let user_key = crate::state::name_key(&input.user_name);
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before anything is written. The decision is made on the ARN of the user
+        // the key is associated with — the held user's own ARN, or, for a name the account
+        // holds no user under, the ARN that name would carry at the default path, since
+        // there is no other path to attribute it to. A refusal names that user as the
+        // request named it and writes nothing.
+        let resource = store.users.get(&user_key).map_or_else(
+            || crate::state::user_arn(crate::state::DEFAULT_PATH, &input.user_name),
+            |user| user.arn.clone(),
+        );
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::UPDATE_SSH_PUBLIC_KEY,
+            &resource,
+            &format!("user {}", input.user_name),
+        )?;
+
+        // A key is held by an IAM user the account holds: a name the account does not hold
+        // names no user whose key could be moved, which "referenced a resource entity that
+        // does not exist" — worded in the one form this service words an absent user with,
+        // naming the user as the request spelled it.
+        if !store.users.contains_key(&user_key) {
+            ::tracing::info!(
+                audit = true,
+                operation = "UpdateSSHPublicKey",
+                outcome = "refused_no_such_user",
+                caller_akid = %caller_akid,
+                "no SSH public key was updated"
+            );
+            return Err(UpdateSSHPublicKeyErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "The user with name {} cannot be found.",
+                        input.user_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // An SSH public key is reachable only through the user it is associated with, so an
+        // id the account never minted, an id another user holds and an id a delete already
+        // took away are one answer: that user holds no such key, and nothing is written.
+        let Some(record) = store.held_ssh_public_key_mut(&user_key, &input.ssh_public_key_id)
+        else {
+            ::tracing::info!(
+                audit = true,
+                operation = "UpdateSSHPublicKey",
+                outcome = "refused_no_such_ssh_public_key",
+                caller_akid = %caller_akid,
+                ssh_public_key_id = %input.ssh_public_key_id,
+                "no SSH public key was updated"
+            );
+            return Err(UpdateSSHPublicKeyErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "The SSH Public Key with id {} cannot be found.",
+                        input.ssh_public_key_id
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // The ONE member this operation moves: `Status`, to the value the request carries.
+        // `statusType`'s value set is enforced before this handler runs, so the value
+        // reaching here is one the enum declares, and it is stored as the enum spells it —
+        // which is what makes a second update back to the previous value the documented
+        // "active or inactive" direction, and an update to the status the key already
+        // carries a no-op rather than an error. Every other member of the key belongs to
+        // the upload that stored it (its id, its body, its fingerprint, its `UploadDate`)
+        // and is left as the account holds it. `InvalidInputException` is declined: the
+        // only value this operation takes is the status, and a value outside its enum is
+        // refused by the model-level walk before the handler runs.
+        let previous = ::std::mem::replace(&mut record.status, input.status.clone());
+
+        ::tracing::info!(
+            audit = true,
+            operation = "UpdateSSHPublicKey",
+            outcome = "updated",
+            caller_akid = %caller_akid,
+            ssh_public_key_id = %input.ssh_public_key_id,
+            previous_status = %previous,
+            status = %input.status,
+            "the SSH public key's status was updated"
+        );
+
+        // The operation's output shape is `Unit`: the new status is reported by
+        // `GetSSHPublicKey` and `ListSSHPublicKeys`, which read the record this call just
+        // wrote.
+        Ok(UpdateSSHPublicKeyOutput)
     }
 }

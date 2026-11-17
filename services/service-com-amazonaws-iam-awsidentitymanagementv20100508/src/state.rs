@@ -1565,13 +1565,11 @@ pub const DEFAULT_MINIMUM_PASSWORD_LENGTH: i32 = 6;
 /// a character against: the characters `PasswordPolicy$RequireSymbols` itself lists.
 const PASSWORD_POLICY_SYMBOLS: &str = "!@#$%^&*()_+-=[]{}|'";
 
-/// The same set as the refusal SPELLS it — "! @ # $ % ^ & * ( ) _ + - = [ ] { } | '",
-/// space-separated, exactly as `PasswordPolicy$RequireSymbols` writes it out. Held beside
-/// [`PASSWORD_POLICY_SYMBOLS`] rather than rendered from it so the sentence is the
-/// documented one character for character; `tests/all/account_password_policy.rs` drives a
-/// password carrying each of these symbols and one carrying none, so the two cannot drift
-/// apart unnoticed.
-const PASSWORD_POLICY_SYMBOL_LIST: &str = "! @ # $ % ^ & * ( ) _ + - = [ ] { } | '";
+/// The whole sentence AWS names the `RequireSymbols` rule with. Fixed text: it states the
+/// rule and nothing else — neither the password nor the set of symbols that satisfies it,
+/// which `PasswordPolicy$RequireSymbols` documents and [`PASSWORD_POLICY_SYMBOLS`] decides
+/// the rule by.
+const PASSWORD_SHOULD_HAVE_A_SYMBOL: &str = "Password should have at least one symbol";
 
 impl AccountPasswordPolicy {
     /// The policy an `UpdateAccountPasswordPolicy` request sets, with every member the
@@ -1626,10 +1624,7 @@ impl AccountPasswordPolicy {
                 .chars()
                 .any(|character| PASSWORD_POLICY_SYMBOLS.contains(character))
         {
-            return Some(format!(
-                "Password should have at least one of the following symbols: \
-                 {PASSWORD_POLICY_SYMBOL_LIST}"
-            ));
+            return Some(PASSWORD_SHOULD_HAVE_A_SYMBOL.to_string());
         }
         if self.require_numbers && !password.chars().any(|character| character.is_ascii_digit()) {
             return Some("Password should have at least one numeric character (0 to 9)".to_string());

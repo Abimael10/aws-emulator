@@ -234,7 +234,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 GetSSHPublicKeyErrorModeled::UnrecognizedPublicKeyEncodingException(
                     UnrecognizedPublicKeyEncodingException {
-                        message: Some(UNRECOGNIZED_ENCODING.to_string()),
+                        message: Some(crate::state::UNRECOGNIZED_PUBLIC_KEY_ENCODING.to_string()),
                     },
                 )
                 .into(),
@@ -246,9 +246,3 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
-
-/// What IAM answers an `Encoding` the key cannot be written in with — one fixed sentence
-/// for the refusal class, naming no part of the request, exactly as the upload words the
-/// same modelled refusal.
-const UNRECOGNIZED_ENCODING: &str =
-    "The public key encoding format is unsupported or unrecognized.";

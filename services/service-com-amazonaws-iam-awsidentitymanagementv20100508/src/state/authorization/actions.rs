@@ -503,6 +503,12 @@ pub const LIST_SSH_PUBLIC_KEYS: &str = "iam:ListSSHPublicKeys";
 /// `iam:GetSSHPublicKey`.
 pub const GET_SSH_PUBLIC_KEY: &str = "iam:GetSSHPublicKey";
 
+/// `iam:DeleteSSHPublicKey`.
+pub const DELETE_SSH_PUBLIC_KEY: &str = "iam:DeleteSSHPublicKey";
+
+/// `iam:UpdateSSHPublicKey`.
+pub const UPDATE_SSH_PUBLIC_KEY: &str = "iam:UpdateSSHPublicKey";
+
 /// `iam:CreateServiceSpecificCredential`.
 pub const CREATE_SERVICE_SPECIFIC_CREDENTIAL: &str = "iam:CreateServiceSpecificCredential";
 

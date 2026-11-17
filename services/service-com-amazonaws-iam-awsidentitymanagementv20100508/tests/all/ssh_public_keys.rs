@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! The SSH public keys an IAM user holds, end to end over the awsQuery wire:
-//! `UploadSSHPublicKey` writes one and `ListSSHPublicKeys` reports what the account holds.
+//! `UploadSSHPublicKey` writes one, `ListSSHPublicKeys` reports what the account holds and
+//! `DeleteSSHPublicKey` takes one away.
 //!
 //! The rules under test:
 //!
@@ -11,16 +12,26 @@
 //!    by a minted `SSHPublicKeyId`, fingerprints it as "the MD5 message digest of the SSH
 //!    public key" (`SSHPublicKey$Fingerprint`) and holds it `Active`; and what it stored is
 //!    what a later read reports. The two refusals the operation models are told apart by
-//!    the ENCODING: material in neither encoding is `UnrecognizedPublicKeyEncoding`, while
-//!    material in one of them that is no usable key is `InvalidPublicKey`.
+//!    the ENCODING: material in neither encoding is `UnrecognizedPublicKeyEncoding`, whose
+//!    `Message` is one fixed sentence for the whole class, while material in one of them
+//!    that is no usable key is `InvalidPublicKey`.
 //! 2. the list "returns information about the SSH public keys associated with the specified
 //!    IAM user. If none exists, the operation returns an empty list" — so it reports exactly
 //!    the keys that user holds, pages over them under `MaxItems`, and refuses a name the
 //!    account holds no user under with `NoSuchEntity` (404).
+//! 3. "deletes the specified SSH public key" (`DeleteSSHPublicKey`) — the key leaves the
+//!    user's collection, so every later reader of it stops reporting the key and its
+//!    material can be associated again, while a delete naming no key THAT user holds
+//!    removes nothing and is refused with the operation's one modelled error,
+//!    `NoSuchEntity` (404).
+//! 4. "sets the status of an IAM user's SSH public key" (`UpdateSSHPublicKey`) — the named
+//!    key's `Status` becomes the value the request carries and nothing else about the key
+//!    moves, so every later read reports the new status beside the key the upload stored.
 //!
 //! Each suite is a TABLE whose rows differ along what the rules generalise over: which
 //! encoding carries the key, how long the key is, whether the line carries a comment, which
-//! way the material fails, how many keys a user holds and how many a page asks for. The
+//! way the material fails, how many keys a user holds, how many a page asks for, and which
+//! of a user's keys a delete names. The
 //! material itself is built by the crates that implement those encodings, so no row depends
 //! on a blob written out by hand.
 //!
@@ -37,6 +48,9 @@ use service_com_amazonaws_iam_awsidentitymanagementv20100508::state::{
 };
 
 use crate::identity_policy_enforcement::{principal, statement};
+// The read a deleted key must stop being served by is `tests/all/ssh_public_key_reads.rs`'s,
+// which owns the rest of what a read reports.
+use crate::ssh_public_key_reads::get;
 use crate::user_lifecycle::{call, call_signed_by, element, elements, error_code, router};
 
 /// The bounds AWS publishes for an uploaded key, written out here rather than read from the
@@ -716,6 +730,406 @@ pub(crate) async fn upload(
 /// One `ListSSHPublicKeys` call.
 async fn list(router: &MultiServiceRouter, params: &[(&str, &str)]) -> (u16, String) {
     call(router, "ListSSHPublicKeys", params).await
+}
+
+/// One `DeleteSSHPublicKey` call.
+async fn delete(
+    router: &MultiServiceRouter,
+    user_name: &str,
+    ssh_public_key_id: &str,
+) -> (u16, String) {
+    call(
+        router,
+        "DeleteSSHPublicKey",
+        &[
+            ("UserName", user_name),
+            ("SSHPublicKeyId", ssh_public_key_id),
+        ],
+    )
+    .await
+}
+
+/// One `UpdateSSHPublicKey` call.
+async fn update_status(
+    router: &MultiServiceRouter,
+    user_name: &str,
+    ssh_public_key_id: &str,
+    status: &str,
+) -> (u16, String) {
+    call(
+        router,
+        "UpdateSSHPublicKey",
+        &[
+            ("UserName", user_name),
+            ("SSHPublicKeyId", ssh_public_key_id),
+            ("Status", status),
+        ],
+    )
+    .await
+}
+
+/// RULE 4: an update moves the named key's status to the value the request carries, and
+/// NOTHING else about the key — so every later read of it reports the new status beside the
+/// key the upload stored, and a key the user does not hold is refused.
+///
+/// The rows differ along what the rule generalises over: which value of `statusType` the
+/// update names (every value the enum declares, including the status the key already
+/// carries), and which reader the new status is read back through.
+#[tokio::test]
+async fn an_update_moves_the_named_keys_status_and_nothing_else() {
+    let router = router();
+    let user_name = "statusholder";
+    create_user(&router, "the status rows", user_name).await;
+    let body = openssh_line(&modulus(PUBLISHED_MINIMUM_BITS, 81), "");
+    let (status, uploaded) = upload(&router, user_name, &body).await;
+    assert_eq!(
+        status, 200,
+        "the fixture upload must be served, got {status}: {uploaded}"
+    );
+    let ssh_public_key_id = element(&uploaded, "SSHPublicKeyId");
+    let fingerprint = element(&uploaded, "Fingerprint");
+    let upload_date = element(&uploaded, "UploadDate");
+    assert_eq!(
+        element(&uploaded, "Status"),
+        "Active",
+        "an uploaded key is Active, got {uploaded}"
+    );
+
+    // Every value `statusType` declares (`smithy_query(query="shape", shape="statusType")`),
+    // the one the key already carries among them, and then back again: the move is the
+    // documented "active or inactive" direction in either direction.
+    for named in ["Inactive", "Active", "Expired", "Expired", "Active"] {
+        let (status, answered) = update_status(&router, user_name, &ssh_public_key_id, named).await;
+        assert_eq!(
+            status, 200,
+            "case {named:?}: expected the update to be served, got {status}: {answered}"
+        );
+
+        let (status, read) = get(&router, user_name, &ssh_public_key_id, "SSH").await;
+        assert_eq!(
+            status, 200,
+            "case {named:?}: the read must be served, got {status}: {read}"
+        );
+        assert_eq!(
+            element(&read, "Status"),
+            named,
+            "case {named:?}: expected the read to report the status just set, got {read}"
+        );
+        // Nothing else about the key moved with it.
+        assert_eq!(
+            (
+                element(&read, "Fingerprint"),
+                element(&read, "SSHPublicKeyBody"),
+                element(&read, "UploadDate")
+            ),
+            (fingerprint.clone(), body.clone(), upload_date.clone()),
+            "case {named:?}: an update must move the status alone, got {read}"
+        );
+        // And the listing, which reads the same record, agrees with the read.
+        let (status, listed) = list(&router, &[("UserName", user_name)]).await;
+        assert_eq!(
+            status, 200,
+            "case {named:?}: the list must be served, got {status}: {listed}"
+        );
+        assert_eq!(
+            element(&listed, "Status"),
+            named,
+            "case {named:?}: expected the listing to report the same status, got {listed}"
+        );
+    }
+
+    // A key the user does not hold is the operation's modelled absence, and an id a delete
+    // took away is one of those.
+    let (status, answered) = delete(&router, user_name, &ssh_public_key_id).await;
+    assert_eq!(
+        status, 200,
+        "the fixture delete must be served, got {status}: {answered}"
+    );
+    for (case, named_user, id) in [
+        ("an id a delete took away", user_name, ssh_public_key_id.clone()),
+        (
+            "an id the account never minted",
+            user_name,
+            "APKANEVERMINTEDEXAMPLE".to_string(),
+        ),
+        (
+            "a user the account does not hold",
+            "nosuchstatususer",
+            ssh_public_key_id.clone(),
+        ),
+    ] {
+        let (status, refused) = update_status(&router, named_user, &id, "Inactive").await;
+        assert_eq!(
+            (status, error_code(&refused)),
+            (404, "NoSuchEntity".to_string()),
+            "case {case:?}: expected the modelled absence refusal, got {status}: {refused}"
+        );
+    }
+}
+
+/// The whole `Message` AWS refuses material in neither of the encodings a public key is
+/// written in with — `UnrecognizedPublicKeyEncodingException`'s own sentence, spelled out
+/// here rather than read from the service so a change of the wording fails this suite
+/// instead of following it. It interpolates nothing: the sentence names neither the material
+/// nor the encodings the upload takes.
+const UNRECOGNIZED_ENCODING_MESSAGE: &str = "Invalid public key uploaded.";
+
+/// RULE 1's refusal SENTENCE for an unrecognized encoding: every body in neither encoding is
+/// refused with that one fixed sentence, which carries no part of the request.
+///
+/// The rows differ along what the rule generalises over: the FORM of the body (prose, a bare
+/// base64 blob, a JSON document, an XML document, a key fingerprint, PEM-like framing that is
+/// not PEM) and its SIZE (one character, and a body thousands of characters long) — the
+/// sentence is a property of the refusal class, so no row's own text appears in it.
+#[tokio::test]
+async fn an_unrecognized_encoding_is_refused_with_one_sentence() {
+    let router = router();
+    let user_name = "encodingrefused";
+    create_user(&router, "the unrecognized-encoding rows", user_name).await;
+
+    for (case, body) in [
+        ("prose in no public-key encoding", "this is not a public key".to_string()),
+        (
+            "a bare base64 blob with no key type in front of it",
+            "AAAAB3NzaC1yc2EAAAADAQAB".to_string(),
+        ),
+        ("a single character", "x".to_string()),
+        (
+            "a JSON document",
+            r#"{"publicKey":"AAAAB3NzaC1yc2EAAAADAQAB"}"#.to_string(),
+        ),
+        (
+            "an XML document",
+            "<publicKey>AAAAB3NzaC1yc2EAAAADAQAB</publicKey>".to_string(),
+        ),
+        (
+            "a colon-separated key fingerprint",
+            "ee:4e:1a:8f:17:aa:00:fa:9e:e4:7d:d2:69:a4:13:c1".to_string(),
+        ),
+        (
+            "PEM-like framing that is not PEM",
+            "BEGIN PUBLIC KEY AAAAB3NzaC1yc2EAAAADAQAB END PUBLIC KEY".to_string(),
+        ),
+        // `publicKeyMaterialType` is len 1..16384, so a body well inside that bound is
+        // still read as material and still refused by its encoding alone.
+        ("a body four thousand characters long", "z".repeat(4_000)),
+    ] {
+        let (status, refused) = upload(&router, user_name, &body).await;
+        assert_eq!(
+            (status, error_code(&refused)),
+            (400, "UnrecognizedPublicKeyEncoding".to_string()),
+            "case {case:?}: expected the modelled encoding refusal, got {status}: {refused}"
+        );
+        let message = element(&refused, "Message");
+        assert_eq!(
+            message, UNRECOGNIZED_ENCODING_MESSAGE,
+            "case {case:?}: expected {UNRECOGNIZED_ENCODING_MESSAGE:?}, got {message:?}"
+        );
+    }
+}
+
+/// RULE 3: a delete takes the key away from the user that held it — every later reader of
+/// that user's keys stops reporting it, the user's OTHER keys are untouched, and the
+/// material becomes uploadable again because the user no longer holds it.
+///
+/// The rows differ along what the rule generalises over: which encoding carried the deleted
+/// key in, how long the key is, which position among the user's keys it occupies, and the
+/// case the request spells the user's name in.
+#[tokio::test]
+async fn a_deleted_key_leaves_the_users_collection() {
+    let router = router();
+    let user_name = "keyholder";
+    create_user(&router, "the deletion rows", user_name).await;
+
+    // Three keys of one user, each carried in by a different encoding and of a different
+    // length, so which one is deleted is a property of the id and not of the material.
+    let rows: Vec<(&str, Vec<u8>, String)> = vec![
+        (
+            "an ssh-rsa line carrying the shortest key AWS takes",
+            modulus(PUBLISHED_MINIMUM_BITS, 61),
+            String::new(),
+        ),
+        (
+            "a SubjectPublicKeyInfo PEM carrying a 3072-bit key",
+            modulus(3072, 62),
+            String::new(),
+        ),
+        (
+            "a PKCS#1 PEM carrying a 4096-bit key",
+            modulus(4096, 63),
+            String::new(),
+        ),
+    ];
+    let bodies: Vec<String> = vec![
+        openssh_line(&rows[0].1, "a comment names no key"),
+        spki_pem(&rows[1].1),
+        pkcs1_pem(&rows[2].1),
+    ];
+
+    let mut held: Vec<(&str, String, String)> = Vec::new();
+    for (index, (case, _, _)) in rows.iter().enumerate() {
+        let (status, uploaded) = upload(&router, user_name, &bodies[index]).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the fixture upload must be served, got {status}: {uploaded}"
+        );
+        held.push((
+            case,
+            element(&uploaded, "SSHPublicKeyId"),
+            bodies[index].clone(),
+        ));
+    }
+
+    // The MIDDLE key first, and under the user's name in another case: IAM names "are not
+    // distinguished by case", so the delete reaches the same user.
+    let (case, deleted_id, deleted_body) = held.remove(1);
+    let (status, answered) = delete(&router, &user_name.to_uppercase(), &deleted_id).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected the delete to be served, got {status}: {answered}"
+    );
+    assert!(
+        answered.contains("DeleteSSHPublicKeyResponse"),
+        "case {case:?}: expected the modelled response envelope, got {answered}"
+    );
+
+    // Every reader of that user's keys has stopped reporting it, and the keys it did not
+    // name are still there.
+    let (status, listed) = list(&router, &[("UserName", user_name)]).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: the list must be served, got {status}: {listed}"
+    );
+    let listed_ids = elements(&listed, "SSHPublicKeyId");
+    assert!(
+        !listed_ids.contains(&deleted_id),
+        "case {case:?}: the deleted key must not be listed, got {listed}"
+    );
+    assert_eq!(
+        listed_ids.len(),
+        held.len(),
+        "case {case:?}: the user's other keys must stay listed, got {listed}"
+    );
+    let (status, read) = get(&router, user_name, &deleted_id, "SSH").await;
+    assert_eq!(
+        (status, error_code(&read)),
+        (404, "NoSuchEntity".to_string()),
+        "case {case:?}: expected the read of a deleted key to be refused, got {status}: {read}"
+    );
+    for (other, id, _) in &held {
+        let (status, read) = get(&router, user_name, id, "SSH").await;
+        assert_eq!(
+            status, 200,
+            "case {other:?}: an untouched key must still be read, got {status}: {read}"
+        );
+    }
+
+    // The user no longer holds that key, so the SAME material is a fresh association
+    // rather than a duplicate — which is what makes a rotation loop converge.
+    let (status, reuploaded) = upload(&router, user_name, &deleted_body).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: the material must be uploadable again, got {status}: {reuploaded}"
+    );
+
+    // And deleting every key the user holds leaves the list empty rather than draining
+    // partway: "if none exists, the operation returns an empty list".
+    for id in elements(&list(&router, &[("UserName", user_name)]).await.1, "SSHPublicKeyId") {
+        let (status, answered) = delete(&router, user_name, &id).await;
+        assert_eq!(
+            status, 200,
+            "case {id:?}: expected the delete to be served, got {status}: {answered}"
+        );
+    }
+    let (status, listed) = list(&router, &[("UserName", user_name)]).await;
+    assert_eq!(
+        status, 200,
+        "the list must be served, got {status}: {listed}"
+    );
+    assert!(
+        elements(&listed, "SSHPublicKeyId").is_empty(),
+        "a user whose every key was deleted holds none, got {listed}"
+    );
+}
+
+/// RULE 3's refusal: a delete that names no key THAT user holds removes nothing and is
+/// refused with the one modelled error, whether the id was never minted, belongs to another
+/// user or was already deleted — and a user the account holds none of is refused the same
+/// way.
+#[tokio::test]
+async fn a_delete_of_a_key_the_user_does_not_hold_is_refused() {
+    let router = router();
+    create_user(&router, "the refused deletions", "deleter").await;
+    create_user(&router, "the refused deletions", "bystander").await;
+
+    let (status, mine) = upload(
+        &router,
+        "deleter",
+        &openssh_line(&modulus(PUBLISHED_MINIMUM_BITS, 71), ""),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the fixture upload must be served, got {status}: {mine}"
+    );
+    let my_id = element(&mine, "SSHPublicKeyId");
+
+    let (status, theirs) = upload(
+        &router,
+        "bystander",
+        &openssh_line(&modulus(3072, 72), ""),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the bystander's upload must be served, got {status}: {theirs}"
+    );
+    let their_id = element(&theirs, "SSHPublicKeyId");
+
+    // One key of the caller's own, deleted once, so the third row below is an id this
+    // account DID mint and this user no longer holds.
+    let (status, answered) = delete(&router, "deleter", &my_id).await;
+    assert_eq!(
+        status, 200,
+        "the first delete must be served, got {status}: {answered}"
+    );
+
+    // `publicKeyIdType` is len 20..128, pattern `^[\w]+$`, so every id below is one the
+    // member's own constraints admit and the refusal is about what the account holds.
+    for (case, user_name, ssh_public_key_id) in [
+        (
+            "an id the account never minted",
+            "deleter",
+            "APKANEVERMINTEDEXAMPLE".to_string(),
+        ),
+        ("an id another user holds", "deleter", their_id.clone()),
+        ("an id already deleted", "deleter", my_id.clone()),
+        (
+            "an id under a user the account does not hold",
+            "nosuchuser",
+            their_id.clone(),
+        ),
+    ] {
+        let (status, refused) = delete(&router, user_name, &ssh_public_key_id).await;
+        assert_eq!(
+            (status, error_code(&refused)),
+            (404, "NoSuchEntity".to_string()),
+            "case {case:?}: expected the modelled absence refusal, got {status}: {refused}"
+        );
+        assert!(
+            !element(&refused, "Message").is_empty(),
+            "case {case:?}: the refusal must name what was not found, got {refused}"
+        );
+    }
+
+    // Nothing of the bystander's was removed by any of those calls.
+    let (status, listed) = list(&router, &[("UserName", "bystander")]).await;
+    assert_eq!(status, 200, "the list must be served, got {status}: {listed}");
+    assert_eq!(
+        elements(&listed, "SSHPublicKeyId"),
+        vec![their_id],
+        "a refused delete must remove nothing, got {listed}"
+    );
 }
 
 /// Create the user `user_name`, which every row needs to exist before it uploads.

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteSSHPublicKey
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteSSHPublicKey`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteSSHPublicKey::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +151,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteSSHPublicKey` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteSSHPublicKeyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteSSHPublicKey"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The operation models ONE error, and a store that is not there is not the
+            // absence of the entity the request named, so the refusal is the one this
+            // service answers a request it cannot act on with rather than a 501.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "the IAM store is unavailable",
+            ));
+        };
+        // A MUTATION: "deletes the specified SSH public key", so the lock is held across
+        // the lookup and the removal and two concurrent deletes of one key cannot both
+        // report having removed it.
+        let mut store = state.lock();
+
+        let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
+        let user_key = crate::state::name_key(&input.user_name);
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before anything is removed. The decision is made on the ARN of the user
+        // the key is associated with — the held user's own ARN, or, for a name the account
+        // holds no user under, the ARN that name would carry at the default path, since
+        // there is no other path to attribute it to. A refusal names that user as the
+        // request named it and removes nothing, because the decision precedes the write.
+        let resource = store.users.get(&user_key).map_or_else(
+            || crate::state::user_arn(crate::state::DEFAULT_PATH, &input.user_name),
+            |user| user.arn.clone(),
+        );
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::DELETE_SSH_PUBLIC_KEY,
+            &resource,
+            &format!("user {}", input.user_name),
+        )?;
+
+        // A key is held by an IAM user the account holds: a name the account does not hold
+        // names no user whose key could be removed, which "referenced a resource entity
+        // that does not exist" — worded in the one form this service words an absent user
+        // with, naming the user as the request spelled it.
+        if !store.users.contains_key(&user_key) {
+            ::tracing::info!(
+                audit = true,
+                operation = "DeleteSSHPublicKey",
+                outcome = "refused_no_such_user",
+                caller_akid = %caller_akid,
+                "no SSH public key was deleted"
+            );
+            return Err(DeleteSSHPublicKeyErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "The user with name {} cannot be found.",
+                        input.user_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // An SSH public key is reachable only through the user it is associated with, so an
+        // id the account never minted, an id ANOTHER user holds and an id a previous delete
+        // already took away are one answer: that user holds no such key, and nothing is
+        // removed. Taking the record out of the collection every reader of a user's keys
+        // reads IS the delete, so the read, the listing and the next upload's duplicate
+        // test all stop seeing it at once, and a repeat delete is refused rather than
+        // removing something twice.
+        if !store.remove_ssh_public_key(&user_key, &input.ssh_public_key_id) {
+            ::tracing::info!(
+                audit = true,
+                operation = "DeleteSSHPublicKey",
+                outcome = "refused_no_such_ssh_public_key",
+                caller_akid = %caller_akid,
+                ssh_public_key_id = %input.ssh_public_key_id,
+                "no SSH public key was deleted"
+            );
+            return Err(DeleteSSHPublicKeyErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "The SSH Public Key with id {} cannot be found.",
+                        input.ssh_public_key_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Audit record for a call that takes away material a repository authenticates
+        // against: who asked, which key, how it ended. Only wire metadata and the
+        // server-minted id — never the key material.
+        ::tracing::info!(
+            audit = true,
+            operation = "DeleteSSHPublicKey",
+            outcome = "deleted",
+            caller_akid = %caller_akid,
+            ssh_public_key_id = %input.ssh_public_key_id,
+            "SSH public key deleted"
+        );
+
+        Ok(DeleteSSHPublicKeyOutput)
     }
 }

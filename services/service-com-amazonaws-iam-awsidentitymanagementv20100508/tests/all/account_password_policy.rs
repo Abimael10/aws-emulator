@@ -67,11 +67,10 @@ const POLICY_SYMBOLS: &[char] = &[
     '\'',
 ];
 
-/// The sentence AWS names the symbol rule with, in the spelling
-/// `PasswordPolicy$RequireSymbols` writes the set out in.
-const SYMBOL_RULE_MESSAGE: &str =
-    "Password should have at least one of the following symbols: ! @ # $ % ^ & * ( ) _ + - = \
-     [ ] { } | '";
+/// The whole sentence AWS names the symbol rule with: it states the rule and nothing else —
+/// no password, and not the set of symbols that satisfies it, which
+/// `PasswordPolicy$RequireSymbols` documents and [`POLICY_SYMBOLS`] drives the rows with.
+const SYMBOL_RULE_MESSAGE: &str = "Password should have at least one symbol";
 
 /// One rule of the policy, as a row states it: the policy to put in force, a password that
 /// breaks exactly that rule, the sentence naming it, and a password the same policy admits.
@@ -555,8 +554,9 @@ async fn a_second_write_replaces_the_whole_policy() {
 }
 
 /// RULE: the symbol rule is satisfied by EVERY symbol
-/// `PasswordPolicy$RequireSymbols` lists, and by none outside that set — so the catalog the
-/// refusal spells out is the catalog the check reads.
+/// `PasswordPolicy$RequireSymbols` lists, and by none outside that set — so the documented
+/// catalog is the catalog the check reads, while the refusal names the RULE and spells no
+/// catalog at all.
 #[tokio::test]
 async fn every_published_symbol_satisfies_the_symbol_rule() {
     let router = router();
@@ -596,8 +596,15 @@ async fn every_published_symbol_satisfies_the_symbol_rule() {
         let message = element(&body, "Message");
         assert_eq!(
             message, SYMBOL_RULE_MESSAGE,
-            "case {outside:?}: expected the refusal to spell the published set out, got \
-             {message:?}"
+            "case {outside:?}: expected the sentence naming the symbol rule, got {message:?}"
+        );
+        // The sentence states the rule alone: no symbol of the documented catalog is
+        // enumerated in it, so a client reading it is given the rule and not a list.
+        assert!(
+            POLICY_SYMBOLS
+                .iter()
+                .all(|symbol| !message.contains(*symbol)),
+            "case {outside:?}: the refusal must enumerate no symbol, got {message:?}"
         );
     }
 }

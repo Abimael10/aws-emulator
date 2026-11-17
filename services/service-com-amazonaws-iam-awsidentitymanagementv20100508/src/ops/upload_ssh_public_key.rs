@@ -182,7 +182,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     UploadSSHPublicKeyErrorModeled::UnrecognizedPublicKeyEncodingException(
                         UnrecognizedPublicKeyEncodingException {
-                            message: Some(UNRECOGNIZED_ENCODING.to_string()),
+                            message: Some(
+                                crate::state::UNRECOGNIZED_PUBLIC_KEY_ENCODING.to_string(),
+                            ),
                         },
                     )
                     .into(),
@@ -301,12 +303,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
-
-/// What IAM answers a body in neither of the encodings the upload names with. One fixed
-/// sentence for the refusal class: the material itself is what the caller has to correct,
-/// and IAM names the encodings it takes rather than quoting the body back.
-const UNRECOGNIZED_ENCODING: &str =
-    "The public key encoding format is unsupported or unrecognized.";
 
 /// What IAM answers a body in a recognised encoding that carries no usable key with —
 /// "the public key is malformed or otherwise invalid" (`InvalidPublicKeyException`).

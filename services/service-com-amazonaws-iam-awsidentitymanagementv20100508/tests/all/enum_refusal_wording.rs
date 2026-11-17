@@ -36,31 +36,41 @@ struct EnumCase {
     rejected: String,
 }
 
-/// The admissible set of a managed-policy listing's `Scope` (`iam#policyScopeType`), and
-/// of the account's global-endpoint token version
-/// (`iam#globalEndpointTokenVersion`), in the order this service states each.
+/// The admissible set of a managed-policy listing's `Scope` (`iam#policyScopeType`), of the
+/// account's global-endpoint token version (`iam#globalEndpointTokenVersion`), and of the
+/// status of a credential the account holds (`iam#statusType`), in the order this service
+/// states each.
 ///
 /// These are the enums of this service whose published order is not the order the model
-/// declares the values in (`All, AWS, Local` and `v1Token, v2Token` respectively); the
-/// renderer's order is replaced by them in `src/service.rs`.
+/// declares the values in (`All, AWS, Local`, `v1Token, v2Token` and `Active, Inactive,
+/// Expired` respectively); the renderer's order is replaced by them in
+/// `src/service/refusal_clauses.rs`.
 const POLICY_SCOPE: &[&str] = &["All", "Local", "AWS"];
 const GLOBAL_ENDPOINT_TOKEN_VERSION: &[&str] = &["v2Token", "v1Token"];
+const CREDENTIAL_STATUS: &[&str] = &["Expired", "Active", "Inactive"];
 
 /// The admissible sets of the other enums under test, each in the model's declaration
 /// order (`smithy_query(query="shape",
-/// shape="PolicyUsageType,assignmentStatusType,statusType,EntityType,encodingType")`),
+/// shape="PolicyUsageType,assignmentStatusType,EntityType,encodingType")`),
 /// which is the order the clause states when this service publishes no order of its own.
 ///
 /// The model order is asserted here DELIBERATELY: the service's refusal states a set in
 /// the model's order unless an order AWS itself states for that enum is carried in
-/// `src/service.rs`'s published-order table, and no such statement is in hand for these
-/// enums. A row here must not be reordered, and no entry added to that table, from a
-/// guess about what AWS would print.
+/// `src/service/refusal_clauses.rs`'s published-order table, and no such statement is in
+/// hand for these enums. A row here must not be reordered, and no entry added to that
+/// table, from a guess about what AWS would print.
 const POLICY_USAGE: &[&str] = &["PermissionsPolicy", "PermissionsBoundary"];
 const ASSIGNMENT_STATUS: &[&str] = &["Assigned", "Unassigned", "Any"];
-const ACCESS_KEY_STATUS: &[&str] = &["Active", "Inactive", "Expired"];
 const ENTITY_TYPE: &[&str] = &["User", "Role", "Group", "LocalManagedPolicy", "AWSManagedPolicy"];
 const KEY_ENCODING: &[&str] = &["SSH", "PEM"];
+
+/// A signing-certificate id the request's own member constraints admit (`certificateIdType`,
+/// length 24..128, pattern `^[\w]+$`).
+const CERTIFICATE_ID: &str = "CERTIFICATEIDEXAMPLE1234";
+
+/// A service-specific credential id the request's own member constraints admit
+/// (`serviceSpecificCredentialId`, length 20..128, pattern `^[\w]+$`).
+const SERVICE_SPECIFIC_CREDENTIAL_ID: &str = "ACCAEXAMPLECREDENTIAL";
 
 /// An access key id the request's own member constraints admit (`accessKeyIdType`, length
 /// 16..128, pattern `^[\w]+$`), so the enum is the only thing the request breaks.
@@ -154,7 +164,9 @@ fn enum_cases() -> Vec<EnumCase> {
             rejected: "Allocated".to_string(),
         },
         // A REQUIRED enum member, supplied with a value outside its set: the refusal is
-        // the enum class, not an absent member.
+        // the enum class, not an absent member. `statusType` is reached through EVERY
+        // credential of the account whose status an update moves, so the same set is stated
+        // for each of them — the order belongs to the enum, not to one member.
         EnumCase {
             case: "an access key status outside its set".to_string(),
             action: "UpdateAccessKey",
@@ -164,8 +176,47 @@ fn enum_cases() -> Vec<EnumCase> {
                 param("Status", "Disabled"),
             ],
             member: "status",
-            admissible: ACCESS_KEY_STATUS,
+            admissible: CREDENTIAL_STATUS,
             rejected: "Disabled".to_string(),
+        },
+        EnumCase {
+            case: "an SSH public key status outside its set".to_string(),
+            action: "UpdateSSHPublicKey",
+            params: vec![
+                param("UserName", "a-user"),
+                param("SSHPublicKeyId", SSH_PUBLIC_KEY_ID),
+                param("Status", "Enabled"),
+            ],
+            member: "status",
+            admissible: CREDENTIAL_STATUS,
+            rejected: "Enabled".to_string(),
+        },
+        EnumCase {
+            case: "a signing certificate status in the wrong case".to_string(),
+            action: "UpdateSigningCertificate",
+            params: vec![
+                param("UserName", "a-user"),
+                param("CertificateId", CERTIFICATE_ID),
+                param("Status", "active"),
+            ],
+            member: "status",
+            admissible: CREDENTIAL_STATUS,
+            rejected: "active".to_string(),
+        },
+        EnumCase {
+            case: "a service-specific credential status outside its set".to_string(),
+            action: "UpdateServiceSpecificCredential",
+            params: vec![
+                param("UserName", "a-user"),
+                param(
+                    "ServiceSpecificCredentialId",
+                    SERVICE_SPECIFIC_CREDENTIAL_ID,
+                ),
+                param("Status", "Revoked"),
+            ],
+            member: "status",
+            admissible: CREDENTIAL_STATUS,
+            rejected: "Revoked".to_string(),
         },
         EnumCase {
             case: "an SSH key encoding outside its set".to_string(),
@@ -329,7 +380,7 @@ async fn a_mixed_refusal_states_each_class_its_own_way() {
         message.contains(&format!(
             "Value at 'status' failed to satisfy constraint: Member must satisfy enum value \
              set: [{}]",
-            ACCESS_KEY_STATUS.join(", ")
+            CREDENTIAL_STATUS.join(", ")
         )),
         "expected the enum clause to be stated without the value, got {message:?}"
     );

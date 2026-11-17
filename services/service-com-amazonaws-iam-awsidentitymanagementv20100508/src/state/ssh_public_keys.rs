@@ -63,6 +63,16 @@ const PEM_LABEL_SUBJECT_PUBLIC_KEY_INFO: &str = "PUBLIC KEY";
 /// `ssh-keygen -e -m PEM` writes for an RSA key.
 const PEM_LABEL_RSA_PUBLIC_KEY: &str = "RSA PUBLIC KEY";
 
+/// The whole `Message` AWS answers `UnrecognizedPublicKeyEncodingException` with, wherever
+/// this service answers that refusal — the upload of material in neither of the encodings a
+/// public key is written in, and a read asked for an encoding the held key cannot be written
+/// in.
+///
+/// Fixed text with no variable part: the sentence names neither the material nor the
+/// encoding, because the caller supplied both. Held here, beside the reading that decides
+/// the refusal, so the two operations that answer it cannot word it differently.
+pub const UNRECOGNIZED_PUBLIC_KEY_ENCODING: &str = "Invalid public key uploaded.";
+
 /// `encodingType`'s `SSH` (`smithy_query(query="shape", shape="encodingType")` gives
 /// `SSH`, `PEM`): "to retrieve the public key in ssh-rsa format, use SSH"
 /// (`GetSSHPublicKey$Encoding`).
@@ -250,6 +260,36 @@ impl IamState {
         self.ssh_public_keys
             .get(ssh_public_key_id)
             .filter(|record| record.user_key == user_key)
+    }
+
+    /// The key `ssh_public_key_id` names among that user's keys, to be WRITTEN.
+    ///
+    /// Scoped exactly as [`held_ssh_public_key`](Self::held_ssh_public_key) scopes the read
+    /// of one, so an update reaches a key only through the user it is associated with.
+    pub fn held_ssh_public_key_mut(
+        &mut self,
+        user_key: &str,
+        ssh_public_key_id: &str,
+    ) -> Option<&mut SshPublicKeyRecord> {
+        self.ssh_public_keys
+            .get_mut(ssh_public_key_id)
+            .filter(|record| record.user_key == user_key)
+    }
+
+    /// Remove the key `ssh_public_key_id` names from the user keyed by `user_key`, and
+    /// answer whether that user held one.
+    ///
+    /// The one write that takes an SSH public key away, scoped exactly as
+    /// [`held_ssh_public_key`](Self::held_ssh_public_key) scopes the read of one: a key
+    /// another user holds is not this user's to remove, so nothing is removed and the
+    /// answer is the same as for an id the account never minted. The record is dropped from
+    /// the collection every reader of a user's keys reads, so one removal is what the read,
+    /// the listing and the next upload's duplicate test all see.
+    pub fn remove_ssh_public_key(&mut self, user_key: &str, ssh_public_key_id: &str) -> bool {
+        if self.held_ssh_public_key(user_key, ssh_public_key_id).is_none() {
+            return false;
+        }
+        self.ssh_public_keys.remove(ssh_public_key_id).is_some()
     }
 }
 
