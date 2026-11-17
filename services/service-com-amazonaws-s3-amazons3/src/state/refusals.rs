@@ -1439,9 +1439,16 @@ pub const INVALID_ACCESS_TIER_STATUS: u16 = 400;
 /// rather than as a bare bad argument.
 pub const INVALID_CONFIG_ID_CODE: &str = "InvalidConfigId";
 
-/// See [`INVALID_CONFIG_ID_CODE`] — the fixed text S3 sends for that condition, which
-/// states the bound rather than repeating the id the request named, so nothing of the
-/// request reaches it.
+/// See [`INVALID_CONFIG_ID_CODE`] — the fixed text the ANALYTICS family sends for that
+/// condition, which states the bound rather than repeating the id the request named, so
+/// nothing of the request reaches it.
+///
+/// The SENTENCE belongs to the family whose sub-resource the call addressed, not to the code:
+/// S3 words the one id-length rule differently per family, and the S3 Intelligent-Tiering
+/// family's own wording of it is [`INTELLIGENT_TIERING_INVALID_CONFIG_ID_MESSAGE`]
+/// ([`ConfigurationIdFamily::invalid_config_id_length_message`] is the one reading of which
+/// family states which). Neither sentence is derived from the other: each is read off that
+/// family's own wire answer.
 ///
 /// Its wording is the service's own, down to the missing full stop, and it is NOT literal at
 /// either end: the enforced bound is the inclusive range `1..=`[`MAX_CONFIGURATION_ID_CHARS`]
@@ -1451,6 +1458,20 @@ pub const INVALID_CONFIG_ID_CODE: &str = "InvalidConfigId";
 /// it verbatim.
 pub const INVALID_CONFIG_ID_MESSAGE: &str =
     "Config Id should not be more than 1 char and less than 64 chars in length";
+
+/// See [`INVALID_CONFIG_ID_CODE`] — the fixed text the S3 INTELLIGENT-TIERING family sends
+/// for that condition, which states the bound rather than repeating the id the request named,
+/// so nothing of the request reaches it either.
+///
+/// A sentence of its own beside the analytics family's [`INVALID_CONFIG_ID_MESSAGE`], because
+/// that is what the two sub-resources answer on the wire: this one spells "character" and
+/// "characters" in full, states the rule without the analytics sentence's "not", and ends in
+/// a full stop. Like that one it is NOT literal at either end — the enforced bound is the
+/// inclusive range `1..=`[`MAX_CONFIGURATION_ID_CHARS`], so an id of exactly that many
+/// characters is recorded while the sentence says "less than 64" — so the prose is reproduced
+/// as the service words it rather than rewritten to match the bound it enforces.
+pub const INTELLIGENT_TIERING_INVALID_CONFIG_ID_MESSAGE: &str =
+    "Config Id should be more than 1 character and less than 64 characters in length.";
 
 /// The HTTP status [`INVALID_CONFIG_ID_CODE`] is rendered with: 400, the status S3 gives a
 /// configuration it cannot apply.
@@ -1790,8 +1811,14 @@ impl ConfigurationIdFault {
         }
     }
 
-    /// The `<Message>` that refusal carries: the fixed sentence S3 publishes for the rule the
-    /// value broke, with nothing of the request in it.
+    /// The `<Message>` that refusal carries on the ANALYTICS sub-resource: the fixed sentence
+    /// S3 publishes there for the rule the value broke, with nothing of the request in it.
+    ///
+    /// The rule a value broke is one rule for every family ([`configuration_id_fault`]); the
+    /// WORDING is each sub-resource's own, so a family that states a class in different words
+    /// carries its own text instead — the length class on the S3 Intelligent-Tiering
+    /// sub-resource is [`INTELLIGENT_TIERING_INVALID_CONFIG_ID_MESSAGE`] rather than the
+    /// [`INVALID_CONFIG_ID_MESSAGE`] below.
     pub fn message(self) -> &'static str {
         match self {
             Self::Unstated => INVALID_CONFIGURATION_ID_MESSAGE,

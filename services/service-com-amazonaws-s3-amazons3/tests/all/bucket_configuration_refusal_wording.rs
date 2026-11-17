@@ -14,11 +14,13 @@
 //!   — one code (`TooManyConfigurations`), one status (400) and ONE sentence for all four, with
 //!   nothing of the request in it: neither the id the put asked for nor which family it
 //!   addressed.
-//! * The id LENGTH bound, stated by the same sentence (`InvalidConfigId`, 400) for the
-//!   families whose operations publish that code: it states the bound rather than the id that
-//!   broke it. The metrics and S3 Inventory families publish no such code and report the same
-//!   id rule through their own class, which is their own operations' business and not this
-//!   sentence's.
+//! * The id LENGTH bound (`InvalidConfigId`, 400) on each family whose operations publish that
+//!   code: every one of those sentences states the bound rather than the id that broke it, and
+//!   each is the sentence THAT family answers on the wire — the analytics and S3
+//!   Intelligent-Tiering sub-resources word the one rule differently, so the wording is pinned
+//!   per family. The metrics and S3 Inventory families publish no such code and report the same
+//!   id rule through their own class, which is their own operations' business and not these
+//!   sentences'.
 //! * The UNIQUENESS of an S3 Intelligent-Tiering configuration's access tiers
 //!   (`InvalidAccessTier`, 400): fixed text except the tier the document repeated, which is the
 //!   one part of it that comes from the request.
@@ -45,10 +47,16 @@ const XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 /// it is the published ceiling and nothing else of it comes from the request.
 const LIMIT_MESSAGE: &str = "You have attempted to create more configurations than the 1000 allowed.";
 
-/// The sentence S3 sends beside `InvalidConfigId` for an id longer than the bound, likewise
-/// written out: it states the bound and echoes nothing of the id.
-const INVALID_ID_MESSAGE: &str =
+/// The sentence S3 sends beside `InvalidConfigId` for an id longer than the bound on the
+/// ANALYTICS sub-resource, likewise written out: it states the bound and echoes nothing of the
+/// id.
+const ANALYTICS_INVALID_ID_MESSAGE: &str =
     "Config Id should not be more than 1 char and less than 64 chars in length";
+
+/// The same refusal's sentence on the S3 INTELLIGENT-TIERING sub-resource, which S3 words in
+/// full words and ends in a full stop: one rule, one code, two published sentences.
+const INTELLIGENT_TIERING_INVALID_ID_MESSAGE: &str =
+    "Config Id should be more than 1 character and less than 64 characters in length.";
 
 /// The two values `IntelligentTieringAccessTier` publishes
 /// (`smithy_query(query="shape",shape="IntelligentTieringAccessTier")`), and the fewest days a
@@ -68,10 +76,11 @@ struct Family {
     subresource: &'static str,
     /// The document for one id, which has to carry that id as its own `Id` member.
     document: fn(&str) -> String,
-    /// Whether this family's `PUT` publishes `InvalidConfigId` for an id outside the bound.
-    /// The metrics and S3 Inventory operations publish no such code and report the same rule
-    /// through their own class, so the sentence below is not theirs to carry.
-    reports_invalid_config_id: bool,
+    /// The sentence this family's `PUT` answers `InvalidConfigId` with for an id outside the
+    /// length bound, or `None` when it publishes no such code: the metrics and S3 Inventory
+    /// operations report the same rule through their own class, so neither sentence is theirs
+    /// to carry.
+    invalid_config_id_message: Option<&'static str>,
 }
 
 /// The four families a bucket holds per-id configurations of. Each document is the minimal one
@@ -82,25 +91,25 @@ const FAMILIES: [Family; 4] = [
         case: "analytics",
         subresource: "analytics",
         document: analytics_document,
-        reports_invalid_config_id: true,
+        invalid_config_id_message: Some(ANALYTICS_INVALID_ID_MESSAGE),
     },
     Family {
         case: "metrics",
         subresource: "metrics",
         document: metrics_document,
-        reports_invalid_config_id: false,
+        invalid_config_id_message: None,
     },
     Family {
         case: "S3 Inventory",
         subresource: "inventory",
         document: inventory_document,
-        reports_invalid_config_id: false,
+        invalid_config_id_message: None,
     },
     Family {
         case: "S3 Intelligent-Tiering",
         subresource: "intelligent-tiering",
         document: intelligent_tiering_document,
-        reports_invalid_config_id: true,
+        invalid_config_id_message: Some(INTELLIGENT_TIERING_INVALID_ID_MESSAGE),
     },
 ];
 
@@ -225,9 +234,10 @@ async fn the_configuration_limit_refusal_carries_the_published_sentence_on_every
     }
 }
 
-/// RULE: the refusal of a configuration id longer than the published bound carries ONE
-/// published sentence, which states the bound and nothing of the id — on every family whose
-/// operation publishes that code, and whatever the id's length or spelling.
+/// RULE: the refusal of a configuration id longer than the published bound carries the
+/// sentence that family's own sub-resource publishes, which states the bound and nothing of
+/// the id — on every family whose operation publishes that code, and whatever the id's length
+/// or spelling.
 ///
 /// The lengths are one past the bound, far past it, and one past it spelled across the whole id
 /// character class. An id AT the bound is recorded, which is what keeps the refusal about the
@@ -236,9 +246,9 @@ async fn the_configuration_limit_refusal_carries_the_published_sentence_on_every
 async fn an_over_long_configuration_id_is_refused_with_the_published_sentence() {
     let router = router();
 
-    for family in FAMILIES
+    for (family, message) in FAMILIES
         .iter()
-        .filter(|family| family.reports_invalid_config_id)
+        .filter_map(|family| family.invalid_config_id_message.map(|text| (family, text)))
     {
         let case = family.case;
         let name = format!("configuration-id-length-{}", family.subresource);
@@ -291,8 +301,8 @@ async fn an_over_long_configuration_id_is_refused_with_the_published_sentence() 
             );
             assert_eq!(
                 refused.error_message(),
-                INVALID_ID_MESSAGE,
-                "case {case:?}/{length_case}: expected {INVALID_ID_MESSAGE:?}, got {:?}",
+                message,
+                "case {case:?}/{length_case}: expected {message:?}, got {:?}",
                 refused.error_message()
             );
         }

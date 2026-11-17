@@ -280,16 +280,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The id is the configuration's KEY on the bucket, and AWS bounds its length: an id
         // S3 records is non-empty and at most
         // [`crate::state::MAX_CONFIGURATION_ID_CHARS`] characters, which is what the
-        // refusal's published wording states. The model carries no `@length` for
-        // `IntelligentTieringId`, so the boundary validator lets any length through and
-        // this is where one outside the bound is refused — before anything is written, so
-        // an id S3 would never record cannot become a key in this bucket's map.
+        // refusal's published wording states — this sub-resource's own wording of that rule
+        // ([`crate::state::INTELLIGENT_TIERING_INVALID_CONFIG_ID_MESSAGE`]), which is not
+        // the sentence the analytics sub-resource states the same rule in. The model carries
+        // no `@length` for `IntelligentTieringId`, so the boundary validator lets any length
+        // through and this is where one outside the bound is refused — before anything is
+        // written, so an id S3 would never record cannot become a key in this bucket's map.
         let id_length = input.id.chars().count();
         if id_length == 0 || id_length > crate::state::MAX_CONFIGURATION_ID_CHARS {
             return Err(crate::scaffolded::Scaffolded::unmodeled(
                 crate::state::INVALID_CONFIG_ID_CODE,
                 crate::state::INVALID_CONFIG_ID_STATUS,
-                crate::state::INVALID_CONFIG_ID_MESSAGE,
+                crate::state::INTELLIGENT_TIERING_INVALID_CONFIG_ID_MESSAGE,
             ));
         }
 
