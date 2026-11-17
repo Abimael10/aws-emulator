@@ -6,11 +6,11 @@
 //! request that exposed the defect: a read of a type (`GetType`, `ListTypes`) reports
 //! `Type$definition` as the service's own rendering of the type it holds — the declaring
 //! keyword and the type's name on a line of their own, a blank line, the body's opening
-//! brace on its own line, each member unindented and followed by a blank line,
-//! consecutive members separated by one further blank line, the closing brace, and a
-//! terminating newline — whatever text the definition arrived as and whichever way it got
-//! into the API, while the call that STATED a definition (`CreateType`, `UpdateType`)
-//! reports that definition back as the request wrote it.
+//! brace on its own line, each member unindented and separated from the next by a blank
+//! line (a member that NAMES A TYPE followed by one further blank line, an enum value not),
+//! the closing brace, and a terminating newline — whatever text the definition arrived as
+//! and whichever way it got into the API, while the call that STATED a definition
+//! (`CreateType`, `UpdateType`) reports that definition back as the request wrote it.
 //!
 //! The table spans the shapes the rule generalises over: every kind of type a GraphQL SDL
 //! definition declares, bodies of none, one, two and three members, definitions arriving
@@ -98,7 +98,7 @@ pub(crate) fn rows() -> Vec<Row> {
             label: "an enum type written with tab-indented values",
             name: "Shelf",
             stated: "enum Shelf {\n\tNEW\n\tOLD\n}\n",
-            rendered: "enum Shelf\n\n{\nNEW\n\n\nOLD\n\n}\n",
+            rendered: "enum Shelf\n\n{\nNEW\n\nOLD\n}\n",
         },
         Row {
             label: "an interface type",
@@ -124,7 +124,7 @@ pub(crate) fn rows() -> Vec<Row> {
             stated: "\"\"\"How posts are ordered.\"\"\"\n\
                      enum PostOrder {\n  NEWEST\n  OLDEST @deprecated\n}\n",
             rendered: "\"\"\"How posts are ordered.\"\"\"\n\
-                       enum PostOrder\n\n{\nNEWEST\n\n\nOLDEST @deprecated\n\n}\n",
+                       enum PostOrder\n\n{\nNEWEST\n\nOLDEST @deprecated\n}\n",
         },
         Row {
             label: "a union type, which has no body at all",

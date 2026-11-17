@@ -368,17 +368,16 @@ fn assert_json_definition(row: &Row, definition: &str, format: &str, source: &st
         row.name,
         parsed["name"]
     );
-    // Introspection reports only the members the kind carries, and null for the rest.
+    // Introspection reports only the members the kind carries, and null for the rest: an
+    // object type names the interfaces it implements, an interface type states its fields
+    // alone, and only a union names the types it can resolve to.
     let carries_fields = row.kind == state::OBJECT_KIND || row.kind == state::INTERFACE_KIND;
     for (member, carried) in [
         ("fields", carries_fields),
-        ("interfaces", carries_fields),
+        ("interfaces", row.kind == state::OBJECT_KIND),
         ("inputFields", row.kind == state::INPUT_OBJECT_KIND),
         ("enumValues", row.kind == state::ENUM_KIND),
-        (
-            "possibleTypes",
-            row.kind == state::UNION_KIND || row.kind == state::INTERFACE_KIND,
-        ),
+        ("possibleTypes", row.kind == state::UNION_KIND),
     ] {
         assert_eq!(
             parsed[member].is_array(),
@@ -527,13 +526,18 @@ async fn the_json_rendering_states_what_the_definition_says() {
         );
     }
 
-    // The interface reports the object types that implement it — the state at the time
-    // of the READ, so what implements it is never frozen at create time.
-    assert_eq!(
-        rendered_json(&router, &api_id, "Node").await["possibleTypes"],
-        json!([{"name": "Post"}]),
-        "case Node with one implementor: expected Post among its possible types"
-    );
+    // An interface type states its fields alone: what implements it is a property of the
+    // API's whole type system rather than of this definition, so the document a READ of
+    // the interface answers names no possible types and no interfaces at all — however
+    // many of the API's object types implement it, before and after they are created.
+    let node = rendered_json(&router, &api_id, "Node").await;
+    for member in ["possibleTypes", "interfaces"] {
+        assert!(
+            node.get(member).is_none(),
+            "case Node with one implementor: expected no {member} member at all, got {:?}",
+            node.get(member)
+        );
+    }
 
     for definition in [author, comment] {
         let created = create_type(&router, &api_id, definition, state::SDL_FORMAT).await;
@@ -543,12 +547,11 @@ async fn the_json_rendering_states_what_the_definition_says() {
             created.status, created.body
         );
     }
-    // The type that implements the interface joins its possible types; the one that
-    // implements nothing does not.
+    // Creating another implementor does not change the interface's own document.
     assert_eq!(
-        rendered_json(&router, &api_id, "Node").await["possibleTypes"],
-        json!([{"name": "Comment"}, {"name": "Post"}]),
-        "case Node after another implementor: expected both implementors"
+        rendered_json(&router, &api_id, "Node").await,
+        node,
+        "case Node after another implementor: expected the same document"
     );
 }
 
@@ -797,14 +800,13 @@ async fn the_json_rendering_reports_arguments_defaults_and_deprecations() {
     );
 
     // An enum reports its values in the order the definition writes them, each with
-    // its own deprecation.
+    // its own deprecation and the directives the definition wrote on it.
     assert_eq!(
         rendered_json(&router, &api_id, "PostOrder").await["enumValues"],
         json!([
-            {"name": "NEWEST", "directives": [], "isDeprecated": false},
+            {"name": "NEWEST", "isDeprecated": false},
             {
                 "name": "OLDEST",
-                "directives": [],
                 "isDeprecated": true,
                 "deprecationReason": "unordered",
             },

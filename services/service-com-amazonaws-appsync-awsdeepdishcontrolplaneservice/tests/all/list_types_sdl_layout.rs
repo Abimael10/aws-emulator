@@ -192,10 +192,11 @@ async fn the_reported_document_is_rendered_rather_than_echoed() {
             row.label
         );
         if row.rendered.contains('{') {
-            // A body opens on its own line after a blank one, so the document a client
-            // line-parses is multi-line whatever the request wrote.
+            // A body opens on its own line after a blank one and closes on a line of its
+            // own, so the document a client line-parses is multi-line whatever the
+            // request wrote.
             assert!(
-                definition.contains("\n\n{\n") && definition.ends_with("\n\n}\n"),
+                definition.contains("\n\n{\n") && definition.ends_with("\n}\n"),
                 "case {}: expected the body written over its own lines, got {definition:?}",
                 row.label
             );

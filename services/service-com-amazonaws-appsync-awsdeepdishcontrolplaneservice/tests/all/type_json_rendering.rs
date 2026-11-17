@@ -6,8 +6,8 @@
 //! request that exposed the defect: a read asked for the `JSON` format reports
 //! `Type$definition` as the type's own introspection document, written the way this
 //! service writes one — compact, with its members in a fixed order, with every member the
-//! type has no value for left OUT rather than written as null, and with each type
-//! REFERENCE stating only what the reference itself says (the name it names, or the
+//! KIND's definition does not carry left OUT rather than written as null, and with each
+//! type REFERENCE stating only what the reference itself says (the name it names, or the
 //! wrapper's kind around the reference it wraps).
 //!
 //! The table spans the shapes the rule generalises over: every kind of type a GraphQL SDL
@@ -47,8 +47,9 @@ struct Row {
 ///
 /// Source: GraphQL's SDL type definitions and the `__TypeKind` values this service reports
 /// them under (`state::OBJECT_KIND` and the rest), with the introspection members each
-/// kind carries (`fields`, `inputFields`, `interfaces`, `enumValues`, `possibleTypes`) as
-/// GraphQL's introspection system defines them.
+/// kind's DEFINITION carries (`fields`, `inputFields`, an object type's `interfaces`, an
+/// enum's `enumValues`, a union's `possibleTypes`) as GraphQL's introspection system names
+/// them.
 fn rows() -> Vec<Row> {
     vec![
         Row {
@@ -94,7 +95,7 @@ fn rows() -> Vec<Row> {
                        {\"name\":\"after\",\"type\":{\"name\":\"String\"}}],\
                        \"directives\":[],\"isDeprecated\":false},\
                        {\"name\":\"legacyTitle\",\"type\":{\"name\":\"String\"},\
-                       \"args\":[],\"directives\":[],\"isDeprecated\":true,\
+                       \"args\":[],\"directives\":[{\"name\":\"deprecated\",\"args\":[{\"name\":\"reason\",\"value\":\"\\\"use title\\\"\"}]}],\"isDeprecated\":true,\
                        \"deprecationReason\":\"use title\"}],\
                        \"interfaces\":[{\"name\":\"Node\"},{\"name\":\"Timestamped\"}],\
                        \"directives\":[]}",
@@ -106,7 +107,7 @@ fn rows() -> Vec<Row> {
             document: "{\"name\":\"Node\",\"kind\":\"INTERFACE\",\"fields\":[\
                        {\"name\":\"id\",\"type\":{\"kind\":\"NON_NULL\",\"ofType\":{\"name\":\"ID\"}},\
                        \"args\":[],\"directives\":[],\"isDeprecated\":false}],\
-                       \"interfaces\":[],\"possibleTypes\":[],\"directives\":[]}",
+                       \"directives\":[]}",
         },
         Row {
             label: "an input object type with a default value",
@@ -126,8 +127,8 @@ fn rows() -> Vec<Row> {
                      enum PostOrder {\n  NEWEST\n  OLDEST @deprecated\n}\n",
             document: "{\"name\":\"PostOrder\",\"kind\":\"ENUM\",\
                        \"description\":\"How posts are ordered.\",\"enumValues\":[\
-                       {\"name\":\"NEWEST\",\"directives\":[],\"isDeprecated\":false},\
-                       {\"name\":\"OLDEST\",\"directives\":[],\"isDeprecated\":true,\
+                       {\"name\":\"NEWEST\",\"isDeprecated\":false},\
+                       {\"name\":\"OLDEST\",\"isDeprecated\":true,\
                        \"deprecationReason\":\"No longer supported\"}],\"directives\":[]}",
         },
         Row {
@@ -214,26 +215,20 @@ async fn a_json_read_answers_the_types_own_introspection_document() {
 }
 
 #[tokio::test]
-async fn what_an_interface_can_resolve_to_is_what_the_api_holds_when_it_is_read() {
+async fn an_interfaces_document_states_its_own_definition_and_not_what_implements_it() {
     let router = router();
     let api_id = create_api(&router, "type-json-implementors").await;
 
-    // The interface first, then the object types: one implements it, one does not, so
-    // what the read reports can only come from the type system the API holds.
-    for (definition, expected) in [
-        ("interface Node {\n  id: ID!\n}\n", serde_json::json!([])),
-        (
-            "type Post implements Node {\n  id: ID!\n}\n",
-            serde_json::json!([{"name": "Post"}]),
-        ),
-        (
-            "type Money {\n  amount: Int\n}\n",
-            serde_json::json!([{"name": "Post"}]),
-        ),
-        (
-            "type Comment implements Node {\n  id: ID!\n}\n",
-            serde_json::json!([{"name": "Comment"}, {"name": "Post"}]),
-        ),
+    // The interface first, then the object types: one implements it, one does not. What
+    // implements an interface is a property of the API's whole type system rather than of
+    // the interface's own definition, so the interface's document is the same one before
+    // and after each of them is created, and it names no possible types at all.
+    let mut documents: Vec<(String, Value)> = Vec::new();
+    for definition in [
+        "interface Node {\n  id: ID!\n}\n",
+        "type Post implements Node {\n  id: ID!\n}\n",
+        "type Money {\n  amount: Int\n}\n",
+        "type Comment implements Node {\n  id: ID!\n}\n",
     ] {
         let created = create_type(&router, &api_id, definition, state::SDL_FORMAT).await;
         assert_eq!(
@@ -241,13 +236,27 @@ async fn what_an_interface_can_resolve_to_is_what_the_api_holds_when_it_is_read(
             "case create {definition:?}: expected 200, got {created:?}"
         );
         let read = get_type(&router, &api_id, "Node", state::JSON_FORMAT).await;
-        let document: Value = serde_json::from_str(definition_of(&read.body["type"]))
+        let text = definition_of(&read.body["type"]).to_string();
+        let document: Value = serde_json::from_str(&text)
             .unwrap_or_else(|error| panic!("case after {definition:?}: expected JSON: {error}"));
-        // Only the types that implement the interface are what it can resolve to.
+        for member in ["possibleTypes", "interfaces"] {
+            assert!(
+                document.get(member).is_none(),
+                "case after {definition:?}: expected no {member} member at all, got {:?}",
+                document.get(member)
+            );
+        }
+        documents.push((definition.to_string(), document));
+    }
+
+    let (first, expected) = documents
+        .first()
+        .cloned()
+        .unwrap_or_else(|| panic!("case the first read: expected a document"));
+    for (definition, document) in &documents {
         assert_eq!(
-            document["possibleTypes"], expected,
-            "case after {definition:?}: expected {expected:?}, got {:?}",
-            document["possibleTypes"]
+            document, &expected,
+            "case after {definition:?}: expected the document read after {first:?}, got {document:?}"
         );
     }
 }

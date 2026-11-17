@@ -9,22 +9,24 @@
 //! document — and a client can diff, hash or line-parse what it reads.
 //!
 //! The layout is recorded behaviour: the declaring keyword and the type's name on a line
-//! of their own, then a blank line, then the body's opening brace on its own line, each
-//! member written unindented and followed by a blank line, consecutive members separated
-//! by one further blank line, the closing brace on its own line, and the whole document
-//! terminated by a newline. A kind whose definition has no `{ … }` body — a union, a
-//! scalar — is the declaration alone, terminated the same way.
+//! of their own, then a blank line, then the body's opening brace on its own line, then
+//! the body's members, one per line and unindented, separated by a blank line — and a
+//! member that NAMES A TYPE (a field, an input field) is followed by one further blank
+//! line, while a member that is a name alone (an enum value) is not — then the closing
+//! brace on its own line, and the whole document terminated by a newline. A kind whose
+//! definition has no `{ … }` body — a union, a scalar — is the declaration alone,
+//! terminated the same way.
 //!
 //! Everything the document says comes from the parsed definition
 //! ([`super::TypeDefinition`]): the kind's keyword, the interfaces it implements, the
-//! members that kind carries with their arguments, default values, descriptions and
-//! `@deprecated` directives. Nothing is taken from the request.
+//! directives the definition and its members carry, and the members that kind carries
+//! with their arguments, default values and descriptions. Nothing is taken from the
+//! request.
 
 use super::schema_types::{
-    Deprecation, EnumValueDefinition, FieldDefinition, InputValueDefinition, TypeDefinition,
-    TypeRef, TypeWrapper, DEFAULT_DEPRECATION_REASON, DEPRECATED_DIRECTIVE,
-    DEPRECATED_REASON_ARGUMENT, ENUM_KIND, INPUT_OBJECT_KIND, INTERFACE_KIND, OBJECT_KIND,
-    SCALAR_KIND, UNION_KIND,
+    DirectiveUse, EnumValueDefinition, FieldDefinition, InputValueDefinition, TypeDefinition,
+    TypeRef, TypeWrapper, ENUM_KIND, INPUT_OBJECT_KIND, INTERFACE_KIND, OBJECT_KIND, SCALAR_KIND,
+    UNION_KIND,
 };
 
 /// The line a rendered body opens with.
@@ -56,13 +58,12 @@ impl TypeDefinition {
             lines.push(String::new());
             lines.push(BLOCK_OPEN.to_string());
             for (index, member) in members.into_iter().enumerate() {
-                // Consecutive members are separated by one blank line on top of the one
-                // each member is followed by.
+                // One blank line separates consecutive members; the lines a member is
+                // written over carry whatever follows it (see `field_lines`).
                 if index > 0 {
                     lines.push(String::new());
                 }
                 lines.extend(member);
-                lines.push(String::new());
             }
             lines.push(BLOCK_CLOSE.to_string());
         }
@@ -73,13 +74,15 @@ impl TypeDefinition {
     }
 
     /// The line that declares this type: its keyword and name, the interfaces an object
-    /// or interface type implements, and the members a union names.
+    /// or interface type implements, the directives the definition carries and the
+    /// members a union names — each where GraphQL's SDL grammar writes it.
     fn declaration_line(&self) -> String {
         let mut line = format!("{} {}", keyword(self.kind), self.name);
         if !self.interfaces.is_empty() {
             line.push_str(" implements ");
             line.push_str(&self.interfaces.join(" & "));
         }
+        line.push_str(&directives_text(&self.directives));
         if self.kind == UNION_KIND && !self.members.is_empty() {
             line.push_str(" = ");
             line.push_str(&self.members.join(" | "));
@@ -116,7 +119,8 @@ fn keyword(kind: &str) -> &'static str {
 }
 
 /// One field of an object or interface type: its description, then its name, the
-/// arguments it takes, the type it resolves to and the deprecation it carries.
+/// arguments it takes, the type it resolves to and the directives it carries — and then
+/// the blank line a member that names a type is followed by.
 fn field_lines(field: &FieldDefinition) -> Vec<String> {
     let mut lines = description_lines(field.description.as_deref());
     let mut line = field.name.clone();
@@ -130,25 +134,32 @@ fn field_lines(field: &FieldDefinition) -> Vec<String> {
         line.push_str(": ");
         line.push_str(&type_text(value_type));
     }
-    line.push_str(&deprecation_text(&field.deprecation));
+    line.push_str(&directives_text(&field.directives));
     lines.push(line);
+    lines.push(String::new());
     lines
 }
 
-/// One field of an input object type: its description, then the field itself — the same
-/// shape an argument has.
+/// One field of an input object type: its description, then the field itself and the
+/// blank line that follows it — the same shape a field of an object type has, since it
+/// names a type the same way.
 fn input_field_lines(input: &InputValueDefinition) -> Vec<String> {
     let mut lines = description_lines(input.description.as_deref());
     lines.push(input_value_text(input));
+    lines.push(String::new());
     lines
 }
 
-/// One value of an enum type: its description, then the value and the deprecation it
+/// One value of an enum type: its description, then the value and the directives it
 /// carries.
+///
+/// RECORDED behaviour: an enum value is a name alone — it names no type — and is written
+/// WITHOUT the further blank line a field is followed by, so an enum's values are written
+/// one blank line apart and the closing brace follows the last of them directly.
 fn enum_value_lines(value: &EnumValueDefinition) -> Vec<String> {
     let mut lines = description_lines(value.description.as_deref());
     let mut line = value.name.clone();
-    line.push_str(&deprecation_text(&value.deprecation));
+    line.push_str(&directives_text(&value.directives));
     lines.push(line);
     lines
 }
@@ -165,6 +176,7 @@ fn input_value_text(input: &InputValueDefinition) -> String {
         text.push_str(" = ");
         text.push_str(default);
     }
+    text.push_str(&directives_text(&input.directives));
     text
 }
 
@@ -186,23 +198,32 @@ fn type_text(value_type: &TypeRef) -> String {
     text
 }
 
-/// The directive a deprecated field or enum value carries, or nothing for one that is not
-/// deprecated.
+/// The directives written on a definition or on one of its members, each preceded by the
+/// space that separates it from what it is written on, or nothing at all for one that
+/// carries none.
 ///
-/// The reason is written only when the definition states one of its own: the directive's
-/// own default reason is what `@deprecated` alone already means, so writing it would add
-/// to the definition rather than render it.
-fn deprecation_text(deprecation: &Deprecation) -> String {
-    if !deprecation.is_deprecated {
-        return String::new();
+/// Every directive the definition states is written back, with the arguments it states
+/// and in the order it wrote them: a directive is part of the definition — GraphQL's
+/// `@deprecated` and AppSync's authorization directives are what a schema states about a
+/// type — so a rendering that dropped one would report a type the caller never declared.
+fn directives_text(directives: &[DirectiveUse]) -> String {
+    let mut text = String::new();
+    for directive in directives {
+        text.push_str(" @");
+        text.push_str(&directive.name);
+        if directive.arguments.is_empty() {
+            continue;
+        }
+        let arguments: Vec<String> = directive
+            .arguments
+            .iter()
+            .map(|argument| format!("{}: {}", argument.name, argument.value))
+            .collect();
+        text.push('(');
+        text.push_str(&arguments.join(", "));
+        text.push(')');
     }
-    match deprecation.reason.as_deref() {
-        Some(reason) if reason != DEFAULT_DEPRECATION_REASON => format!(
-            " @{DEPRECATED_DIRECTIVE}({DEPRECATED_REASON_ARGUMENT}: {})",
-            quoted(reason)
-        ),
-        _ => format!(" @{DEPRECATED_DIRECTIVE}"),
-    }
+    text
 }
 
 /// The lines a description is written over, or none at all for a definition or member
@@ -223,23 +244,4 @@ fn description_lines(description: Option<&str>) -> Vec<String> {
         return lines;
     }
     vec![format!("{BLOCK_QUOTE}{text}{BLOCK_QUOTE}")]
-}
-
-/// `text` as a GraphQL string value, with everything the grammar escapes inside one
-/// escaped.
-fn quoted(text: &str) -> String {
-    let mut quoted = String::with_capacity(text.len() + 2);
-    quoted.push('"');
-    for character in text.chars() {
-        match character {
-            '"' => quoted.push_str("\\\""),
-            '\\' => quoted.push_str("\\\\"),
-            '\n' => quoted.push_str("\\n"),
-            '\r' => quoted.push_str("\\r"),
-            '\t' => quoted.push_str("\\t"),
-            _ => quoted.push(character),
-        }
-    }
-    quoted.push('"');
-    quoted
 }

@@ -287,6 +287,8 @@ pub struct TypeDefinition {
     pub enum_values: Vec<EnumValueDefinition>,
     /// The member types a union type names.
     pub members: Vec<String>,
+    /// The directives written on the definition itself, in the order it writes them.
+    pub directives: Vec<DirectiveUse>,
 }
 
 /// One field of a parsed object or interface type.
@@ -299,6 +301,8 @@ pub struct FieldDefinition {
     /// none.
     pub value_type: Option<TypeRef>,
     pub deprecation: Deprecation,
+    /// The directives written on the field, in the order the definition writes them.
+    pub directives: Vec<DirectiveUse>,
 }
 
 /// One argument of a field, or one field of an input object type: the two are the same
@@ -311,6 +315,9 @@ pub struct InputValueDefinition {
     /// The default value as GraphQL writes it, which is the form introspection reports
     /// it in ("a GraphQL-formatted string representing the default value").
     pub default_value: Option<String>,
+    /// The directives written on the argument or input field, in the order the
+    /// definition writes them.
+    pub directives: Vec<DirectiveUse>,
 }
 
 /// One value of a parsed enum type.
@@ -319,6 +326,31 @@ pub struct EnumValueDefinition {
     pub name: String,
     pub description: Option<String>,
     pub deprecation: Deprecation,
+    /// The directives written on the value, in the order the definition writes them.
+    pub directives: Vec<DirectiveUse>,
+}
+
+/// One directive written on a type definition or on a member of one: the directive's
+/// name and the arguments it states.
+///
+/// A directive is part of the definition it is written on — GraphQL's `@deprecated` and
+/// AppSync's own authorization directives are what a schema states ABOUT a type — so a
+/// stored definition keeps every one of them and every report of the type writes them
+/// back, rather than reporting a definition the caller never stated.
+#[derive(Debug, Clone)]
+pub struct DirectiveUse {
+    /// The directive's name, without the leading `@`.
+    pub name: String,
+    /// The arguments the directive states, in the order it writes them.
+    pub arguments: Vec<DirectiveArgument>,
+}
+
+/// One argument of a [`DirectiveUse`]: its name and its value as GraphQL writes one, so a
+/// string value carries its quotation and a list or object value its brackets.
+#[derive(Debug, Clone)]
+pub struct DirectiveArgument {
+    pub name: String,
+    pub value: String,
 }
 
 /// Whether a field or enum value is deprecated, and why.
@@ -437,6 +469,7 @@ fn declared_type(
                 description: description_text(object.description()),
                 interfaces: implemented_interfaces(object.implements_interfaces()),
                 fields: field_definitions(object.fields_definition()),
+                directives: directive_uses(object.directives()),
                 ..TypeDefinition::default()
             })
         })(),
@@ -447,6 +480,7 @@ fn declared_type(
                 description: description_text(interface.description()),
                 interfaces: implemented_interfaces(interface.implements_interfaces()),
                 fields: field_definitions(interface.fields_definition()),
+                directives: directive_uses(interface.directives()),
                 ..TypeDefinition::default()
             })
         })(),
@@ -456,6 +490,7 @@ fn declared_type(
                 name: name_text(input.name())?,
                 description: description_text(input.description()),
                 input_fields: input_field_definitions(input.input_fields_definition()),
+                directives: directive_uses(input.directives()),
                 ..TypeDefinition::default()
             })
         })(),
@@ -465,6 +500,7 @@ fn declared_type(
                 name: name_text(enumeration.name())?,
                 description: description_text(enumeration.description()),
                 enum_values: enum_value_definitions(enumeration.enum_values_definition()),
+                directives: directive_uses(enumeration.directives()),
                 ..TypeDefinition::default()
             })
         })(),
@@ -474,6 +510,7 @@ fn declared_type(
                 name: name_text(union.name())?,
                 description: description_text(union.description()),
                 members: union_members(union.union_member_types()),
+                directives: directive_uses(union.directives()),
                 ..TypeDefinition::default()
             })
         })(),
@@ -482,6 +519,7 @@ fn declared_type(
                 kind: SCALAR_KIND,
                 name: name_text(scalar.name())?,
                 description: description_text(scalar.description()),
+                directives: directive_uses(scalar.directives()),
                 ..TypeDefinition::default()
             })
         })(),
@@ -503,6 +541,7 @@ fn extended_type(node: &cst::Definition) -> Option<Result<TypeDefinition, TypeDe
                 name: name_text(object.name())?,
                 interfaces: implemented_interfaces(object.implements_interfaces()),
                 fields: field_definitions(object.fields_definition()),
+                directives: directive_uses(object.directives()),
                 ..TypeDefinition::default()
             })
         })(),
@@ -512,6 +551,7 @@ fn extended_type(node: &cst::Definition) -> Option<Result<TypeDefinition, TypeDe
                 name: name_text(interface.name())?,
                 interfaces: implemented_interfaces(interface.implements_interfaces()),
                 fields: field_definitions(interface.fields_definition()),
+                directives: directive_uses(interface.directives()),
                 ..TypeDefinition::default()
             })
         })(),
@@ -520,6 +560,7 @@ fn extended_type(node: &cst::Definition) -> Option<Result<TypeDefinition, TypeDe
                 kind: INPUT_OBJECT_KIND,
                 name: name_text(input.name())?,
                 input_fields: input_field_definitions(input.input_fields_definition()),
+                directives: directive_uses(input.directives()),
                 ..TypeDefinition::default()
             })
         })(),
@@ -528,6 +569,7 @@ fn extended_type(node: &cst::Definition) -> Option<Result<TypeDefinition, TypeDe
                 kind: ENUM_KIND,
                 name: name_text(enumeration.name())?,
                 enum_values: enum_value_definitions(enumeration.enum_values_definition()),
+                directives: directive_uses(enumeration.directives()),
                 ..TypeDefinition::default()
             })
         })(),
@@ -536,6 +578,7 @@ fn extended_type(node: &cst::Definition) -> Option<Result<TypeDefinition, TypeDe
                 kind: UNION_KIND,
                 name: name_text(union.name())?,
                 members: union_members(union.union_member_types()),
+                directives: directive_uses(union.directives()),
                 ..TypeDefinition::default()
             })
         })(),
@@ -543,6 +586,7 @@ fn extended_type(node: &cst::Definition) -> Option<Result<TypeDefinition, TypeDe
             Ok(TypeDefinition {
                 kind: SCALAR_KIND,
                 name: name_text(scalar.name())?,
+                directives: directive_uses(scalar.directives()),
                 ..TypeDefinition::default()
             })
         })(),
@@ -640,6 +684,7 @@ fn field_definitions(fields: Option<cst::FieldsDefinition>) -> Vec<FieldDefiniti
                         .unwrap_or_default(),
                     value_type: type_reference(field.ty()),
                     deprecation: deprecation(field.directives()),
+                    directives: directive_uses(field.directives()),
                 })
                 .collect()
         })
@@ -659,6 +704,7 @@ pub(crate) fn input_value_definition(input: cst::InputValueDefinition) -> InputV
             .default_value()
             .and_then(|default| default.value())
             .map(|value| value.syntax().text().to_string().trim().to_string()),
+        directives: directive_uses(input.directives()),
     }
 }
 
@@ -672,7 +718,47 @@ fn enum_value_definition(value: cst::EnumValueDefinition) -> EnumValueDefinition
             .unwrap_or_default(),
         description: description_text(value.description()),
         deprecation: deprecation(value.directives()),
+        directives: directive_uses(value.directives()),
     }
+}
+
+/// The directives a definition or one of its members carries, each with the arguments it
+/// states, in the order the definition writes them.
+///
+/// What is kept is what the definition WROTE: an argument's value is kept as GraphQL
+/// writes one, so a report of the type can write the directive back as the type declares
+/// it instead of dropping it.
+fn directive_uses(directives: Option<cst::Directives>) -> Vec<DirectiveUse> {
+    let Some(directives) = directives else {
+        return Vec::new();
+    };
+    directives
+        .directives()
+        .filter_map(|directive| {
+            let name = directive.name()?.text().to_string();
+            let arguments = directive
+                .arguments()
+                .map(|arguments| {
+                    arguments
+                        .arguments()
+                        .filter_map(|argument| {
+                            Some(DirectiveArgument {
+                                name: argument.name()?.text().to_string(),
+                                value: argument
+                                    .value()?
+                                    .syntax()
+                                    .text()
+                                    .to_string()
+                                    .trim()
+                                    .to_string(),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(DirectiveUse { name, arguments })
+        })
+        .collect()
 }
 
 /// The type a field or argument names, as a reference tree.
@@ -1157,6 +1243,7 @@ impl TypeDefinition {
         self.input_fields.extend(extension.input_fields);
         self.enum_values.extend(extension.enum_values);
         self.members.extend(extension.members);
+        self.directives.extend(extension.directives);
     }
 
     /// Every type name this definition references: the interfaces it implements, the
@@ -1185,7 +1272,6 @@ impl TypeDefinition {
 impl TypeRef {
     /// This reference flattened: the wrappers it nests, outermost first, and the NAME at
     /// its root.
-    ///
     /// The chain is walked ITERATIVELY, so reading a reference costs one step per wrapper
     /// and no stack frame per wrapper however deeply the definition it was parsed from
     /// nested it — and every reader of a reference goes through here rather than

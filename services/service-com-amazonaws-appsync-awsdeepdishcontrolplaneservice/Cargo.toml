@@ -139,6 +139,9 @@ service-com-amazonaws-acm-certificatemanager = { workspace = true }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Declares one module per `tests/all/<name>.rs` from this crate's single integration-test
+# target root (`tests/all/main.rs`), so a new suite is a new file and needs no declaration.
+automod = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 # The client half of the data-plane tests: a case dials the API's own announced sockets over

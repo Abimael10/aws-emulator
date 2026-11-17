@@ -5,40 +5,48 @@
 //!
 //! The type's JSON representation is the type's own introspection document, written the
 //! way this service writes one (recorded behaviour): compact — no newlines and no
-//! indentation — with its members in a fixed order, and with every member a type has no
-//! value for left OUT rather than written as null. A type REFERENCE carries only what it
-//! says itself: the name for a named reference, and the wrapper's kind with the reference
-//! it wraps for a list or non-null one, so nothing of the referenced type is resolved
-//! into it.
+//! indentation — with its members in a fixed order, and with every member the KIND's
+//! definition does not carry left OUT rather than written as null. So an object type
+//! states the interfaces it implements and an interface type does not; a union states the
+//! types it names and an interface does not name any, because nothing of the API's OTHER
+//! types is resolved into one type's document. A type REFERENCE likewise carries only what
+//! it says itself: the name for a named reference, and the wrapper's kind with the
+//! reference it wraps for a list or non-null one.
 //!
 //! This is the representation of ONE type. The whole SCHEMA's introspection document
 //! (`super::introspection_schema`) is the result of an introspection query over the type
-//! system and is written as that system defines it, which is a different document.
+//! system and is written as that system defines it, which is a different document — that
+//! one does report what an interface resolves to, since it is written from the whole
+//! system.
 //!
-//! Everything here comes from the parsed definition ([`super::TypeDefinition`]) and, for
-//! the object types that implement an interface, from the other types the API holds —
-//! never from the request.
+//! Everything here comes from the parsed definition ([`super::TypeDefinition`]) — never
+//! from the request, and never from another type.
 
 use std::collections::BTreeMap;
 
 use serde::Serialize;
-use serde_json::Value;
 
 use super::schema_types::{
-    EnumValueDefinition, FieldDefinition, InputValueDefinition, TypeDefinition, TypeRecord,
-    TypeRef, TypeWrapper, ENUM_KIND, INPUT_OBJECT_KIND, INTERFACE_KIND, LIST_KIND, NON_NULL_KIND,
-    OBJECT_KIND, UNION_KIND,
+    DirectiveUse, EnumValueDefinition, FieldDefinition, InputValueDefinition, TypeDefinition,
+    TypeRecord, TypeRef, TypeWrapper, ENUM_KIND, INPUT_OBJECT_KIND, INTERFACE_KIND, LIST_KIND,
+    NON_NULL_KIND, OBJECT_KIND, UNION_KIND,
 };
 
 impl TypeDefinition {
     /// This type's definition as the service renders it in JSON, for a type held by an
     /// API that holds `api_types`.
     pub fn render_json(&self, api_types: &BTreeMap<String, TypeRecord>) -> String {
-        serde_json::to_string(&self.json_document(api_types)).unwrap_or_default()
+        let _ = api_types;
+        serde_json::to_string(&self.json_document()).unwrap_or_default()
     }
 
     /// The document [`Self::render_json`] writes.
-    fn json_document(&self, api_types: &BTreeMap<String, TypeRecord>) -> TypeDocument {
+    ///
+    /// RECORDED behaviour for which member each kind carries: an object type states its
+    /// fields and the interfaces it implements, an interface type its fields alone, an
+    /// input object its input fields, an enum its values and a union the types it names —
+    /// and every type states the directives written on it, even when it carries none.
+    fn json_document(&self) -> TypeDocument {
         let has_fields = self.kind == OBJECT_KIND || self.kind == INTERFACE_KIND;
         TypeDocument {
             name: self.name.clone(),
@@ -47,33 +55,22 @@ impl TypeDefinition {
             fields: has_fields.then(|| self.fields.iter().map(field_document).collect()),
             input_fields: (self.kind == INPUT_OBJECT_KIND)
                 .then(|| self.input_fields.iter().map(input_value_document).collect()),
-            interfaces: has_fields.then(|| self.interfaces.iter().map(named_document).collect()),
+            interfaces: (self.kind == OBJECT_KIND)
+                .then(|| self.interfaces.iter().map(named_document).collect()),
             enum_values: (self.kind == ENUM_KIND)
                 .then(|| self.enum_values.iter().map(enum_value_document).collect()),
-            possible_types: self.possible_type_documents(api_types),
-            directives: Vec::new(),
+            possible_types: self.possible_type_documents(),
+            directives: directive_documents(&self.directives),
         }
     }
 
-    /// The types this one can resolve to at runtime, as the documents they are reported
-    /// as: a union's members, and the object types of the API that implement an
-    /// interface. Every other kind can resolve to none, which leaves the member out.
-    fn possible_type_documents(
-        &self,
-        api_types: &BTreeMap<String, TypeRecord>,
-    ) -> Option<Vec<TypeReferenceDocument>> {
+    /// The types this one NAMES as the ones it can resolve to, as the documents they are
+    /// reported as: a union's member types. Every other kind names none in its own
+    /// definition — what implements an interface is a property of the whole type system,
+    /// not of the interface's definition — which leaves the member out.
+    fn possible_type_documents(&self) -> Option<Vec<TypeReferenceDocument>> {
         match self.kind {
             UNION_KIND => Some(self.members.iter().map(named_document).collect()),
-            INTERFACE_KIND => Some(
-                api_types
-                    .values()
-                    .filter(|record| {
-                        record.parsed.kind == OBJECT_KIND
-                            && record.parsed.interfaces.contains(&self.name)
-                    })
-                    .map(|record| named_document(&record.parsed.name))
-                    .collect(),
-            ),
             _ => None,
         }
     }
@@ -100,10 +97,9 @@ struct TypeDocument {
     enum_values: Option<Vec<EnumValueDocument>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     possible_types: Option<Vec<TypeReferenceDocument>>,
-    /// The directives written on the type. A type definition this service stores carries
-    /// none of its own, so the list is written empty rather than left out: the document
-    /// always states which directives a type carries.
-    directives: Vec<Value>,
+    /// The directives written on the type. The list is written even when the type carries
+    /// none, so the document always states which directives a type carries.
+    directives: Vec<DirectiveDocument>,
 }
 
 /// One field of an object or interface type, as the document writes it.
@@ -116,7 +112,7 @@ struct FieldDocument {
     #[serde(skip_serializing_if = "Option::is_none")]
     r#type: Option<TypeReferenceDocument>,
     args: Vec<InputValueDocument>,
-    directives: Vec<Value>,
+    directives: Vec<DirectiveDocument>,
     is_deprecated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     deprecation_reason: Option<String>,
@@ -137,16 +133,56 @@ struct InputValueDocument {
 }
 
 /// One value of an enum type, as the document writes it.
+///
+/// RECORDED behaviour: an enum value states its deprecation but NOT the directives
+/// written on it, unlike a field — so `@deprecated` reaches the document through
+/// `isDeprecated`/`deprecationReason` and nothing else of it is written.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct EnumValueDocument {
     name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     description: Option<String>,
-    directives: Vec<Value>,
     is_deprecated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     deprecation_reason: Option<String>,
+}
+
+/// One directive written on a type or on one of its members, as the document writes it:
+/// the directive's name and the arguments it states.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DirectiveDocument {
+    name: String,
+    args: Vec<DirectiveArgumentDocument>,
+}
+
+/// One argument of a directive: its name and its value as GraphQL writes one, the same
+/// form an input value's default is written in.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DirectiveArgumentDocument {
+    name: String,
+    value: String,
+}
+
+/// The directives written on a type or on one of its members, in the order the definition
+/// writes them.
+fn directive_documents(directives: &[DirectiveUse]) -> Vec<DirectiveDocument> {
+    directives
+        .iter()
+        .map(|directive| DirectiveDocument {
+            name: directive.name.clone(),
+            args: directive
+                .arguments
+                .iter()
+                .map(|argument| DirectiveArgumentDocument {
+                    name: argument.name.clone(),
+                    value: argument.value.clone(),
+                })
+                .collect(),
+        })
+        .collect()
 }
 
 /// One type reference: the name a named reference states, or the kind a list or non-null
@@ -170,7 +206,7 @@ fn field_document(field: &FieldDefinition) -> FieldDocument {
         description: field.description.clone(),
         r#type: field.value_type.as_ref().map(type_reference_document),
         args: field.arguments.iter().map(input_value_document).collect(),
-        directives: Vec::new(),
+        directives: directive_documents(&field.directives),
         is_deprecated: field.deprecation.is_deprecated,
         deprecation_reason: field.deprecation.reason.clone(),
     }
@@ -191,7 +227,6 @@ fn enum_value_document(value: &EnumValueDefinition) -> EnumValueDocument {
     EnumValueDocument {
         name: value.name.clone(),
         description: value.description.clone(),
-        directives: Vec::new(),
         is_deprecated: value.deprecation.is_deprecated,
         deprecation_reason: value.deprecation.reason.clone(),
     }
