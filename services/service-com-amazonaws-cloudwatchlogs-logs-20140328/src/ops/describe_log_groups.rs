@@ -4,8 +4,9 @@
 //! Implemented: enumerates the log groups in the shared store, honouring the prefix,
 //! pattern, class and identifier filters and the page bounds. A lookup by
 //! `logGroupNamePattern` answers the REDUCED projection of each group the service serves
-//! for a pattern search — its identity and classification members only. This is the ONLY
-//! file to touch for this operation.
+//! for a pattern search — its identity and classification members only — and is a WALK over
+//! the account's log groups, so its `nextToken` reports how far that walk got rather than
+//! what is left to report. This is the ONLY file to touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`DescribeLogGroups::handle`] with real behaviour and
@@ -354,39 +355,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .collect()
         });
 
-        // The store keys groups by name, so iteration is already in name order.
-        let matching: Vec<&crate::state::LogGroupRecord> = store
-            .log_groups
-            .values()
-            .filter(|group| {
-                input
-                    .log_group_name_prefix
-                    .as_deref()
-                    .is_none_or(|prefix| group.name.starts_with(prefix))
-            })
-            // "the operation returns only log groups that have names that match the
-            // string based on a case-sensitive substring search".
-            .filter(|group| {
-                input
+        // Which log groups this request selects, whichever members it selects them with.
+        let selects = |group: &crate::state::LogGroupRecord| {
+            input
+                .log_group_name_prefix
+                .as_deref()
+                .is_none_or(|prefix| group.name.starts_with(prefix))
+                // "the operation returns only log groups that have names that match the
+                // string based on a case-sensitive substring search".
+                && input
                     .log_group_name_pattern
                     .as_deref()
                     .is_none_or(|pattern| group.name.contains(pattern))
-            })
-            .filter(|group| {
-                input
+                && input
                     .log_group_class
                     .as_deref()
                     .is_none_or(|class| group.log_group_class == class)
-            })
-            .filter(|group| {
-                wanted
+                && wanted
                     .as_ref()
                     .is_none_or(|names| names.contains(&group.name.as_str()))
-            })
-            .collect();
+        };
 
-        let first = match &cursor {
-            Some(cursor) => matching.partition_point(|group| group.name <= cursor.after),
+        // A `logGroupNamePattern` selection is a case-sensitive SUBSTRING search, which no
+        // index over log group names can serve: the service WALKS the account's log groups and
+        // reports the matches it comes across. A name prefix, an identifier list and a class
+        // each select a known set of groups instead, which the walk below reaches directly.
+        let pattern_search = input.log_group_name_pattern.is_some();
+
+        // The account's log groups in the ASCII name order a listing reports them in ("The
+        // results are ASCII-sorted by log group name"); the store is keyed by name, so
+        // iteration is already that order, and it is the order the walk takes them in.
+        let scanned: Vec<&crate::state::LogGroupRecord> = store.log_groups.values().collect();
+
+        // Where this page starts: just past the group the inbound token left off at.
+        let from = match &cursor {
+            Some(cursor) => scanned.partition_point(|group| group.name <= cursor.after),
             None => 0,
         };
         // `limit` is modelled `range 1..50`, so the boundary validator has already
@@ -394,27 +397,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let limit = usize::try_from(input.limit.unwrap_or(crate::state::DEFAULT_DESCRIBE_LIMIT))
             .unwrap_or(0)
             .max(1);
-        let last = first.saturating_add(limit).min(matching.len());
-        let page = &matching[first..last];
 
-        // "The token for the next set of items to return": a paginated read hands one back only
-        // while items the request selected remain UNREPORTED, so the page that reported the
-        // last match carries none — the absence of the token is how a client learns the
-        // enumeration is finished. The token is minted from the position of the last group
-        // reported, and only when the scan has more matches past it.
-        let next_token = (last < matching.len())
-            .then(|| page.last())
-            .flatten()
-            .map(|group| {
-                Cursor {
-                    log_group_name_prefix: input.log_group_name_prefix.clone(),
-                    log_group_name_pattern: input.log_group_name_pattern.clone(),
-                    log_group_class: input.log_group_class.clone(),
-                    log_group_identifiers: input.log_group_identifiers.clone(),
-                    after: group.name.clone(),
+        // The walk: take the selected groups in name order until the page holds `limit` of
+        // them ("The maximum number of items returned") or the account's groups run out.
+        // `walked` ends one past the last group the walk EXAMINED, which is the last one it
+        // reported when the page filled and the last group of the account when it did not.
+        let mut page: Vec<&crate::state::LogGroupRecord> = Vec::new();
+        let mut walked = from;
+        while walked < scanned.len() {
+            let group = scanned[walked];
+            walked = walked.saturating_add(1);
+            if selects(group) {
+                page.push(group);
+                if page.len() >= limit {
+                    break;
                 }
-                .encode()
-            });
+            }
+        }
+
+        // "The token for the next set of items to return." What the token reports is where
+        // this read STOPPED, and how much that says about what is left depends on how the
+        // request selected its groups:
+        //
+        // * a substring search knows only how far its walk got, so the page it stopped on is
+        //   reported as resumable from the last group the walk examined — whether or not that
+        //   group matched, and whether or not the page it filled was full. Only a page whose
+        //   walk examined nothing is past the end of the account's log groups, and that page
+        //   finishes the enumeration;
+        // * a selection the service can address directly (a name prefix, an identifier list,
+        //   a class, or no filter at all) knows what it has left: the page that reported the
+        //   last selected group carries no token, and the absence of the token is how a client
+        //   learns the enumeration is finished.
+        let stopped_at = match pattern_search {
+            true => (walked > from).then(|| scanned[walked.saturating_sub(1)].name.clone()),
+            false => scanned[walked..]
+                .iter()
+                .any(|group| selects(group))
+                .then(|| page.last().map(|group| group.name.clone()))
+                .flatten(),
+        };
+        let next_token = stopped_at.map(|after| {
+            Cursor {
+                log_group_name_prefix: input.log_group_name_prefix.clone(),
+                log_group_name_pattern: input.log_group_name_pattern.clone(),
+                log_group_class: input.log_group_class.clone(),
+                log_group_identifiers: input.log_group_identifiers.clone(),
+                after,
+            }
+            .encode()
+        });
 
         // A pattern lookup answers a REDUCED projection of each log group: the identity and
         // classification members — `arn`, `creationTime`, `logGroupArn`, `logGroupClass`,
@@ -422,7 +453,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the group HOLDS or how it is configured (its retention, its stored bytes, its
         // encryption, its data protection and its per-group switches), which only the prefix
         // lookup of the same group carries.
-        let pattern_search = input.log_group_name_pattern.is_some();
 
         Ok(DescribeLogGroupsOutput {
             log_groups: Some(

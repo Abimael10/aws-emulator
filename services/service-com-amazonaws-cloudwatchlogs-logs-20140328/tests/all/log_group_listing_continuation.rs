@@ -9,20 +9,26 @@
 //!
 //! The rules under test:
 //!
-//! * **A page hands back a `nextToken` exactly while selected log groups remain
-//!   UNREPORTED**: the token is "the token for the next set of items to return", so the page
-//!   that reported the last match carries none and its absence is how a client learns the
-//!   enumeration is finished. Walking the tokens covers the selected groups exactly once, in
-//!   name order, in as many pages as the page size divides the selection into — never an
-//!   extra round trip for a set that is already complete.
+//! * **A page hands back a `nextToken` reporting where the read STOPPED.** For a selection
+//!   the service addresses directly — a name prefix, an identifier list, a class, or no
+//!   filter at all — that is the position of the last group it reported while selected groups
+//!   remain UNREPORTED, so the page that reported the last match carries none and its absence
+//!   is how a client learns the enumeration is finished; walking the tokens covers the
+//!   selected groups exactly once, in name order, in as many pages as the page size divides
+//!   the selection into, never an extra round trip for a set that is already complete. A
+//!   `logGroupNamePattern` selection is a substring WALK over the account's log groups
+//!   instead — no index over log group names serves a substring — so every page whose walk
+//!   examined a group is resumable from the group it stopped on, and only the page whose walk
+//!   is past every log group of the account finishes the enumeration.
 //! * **`logGroupNamePattern` is LITERAL TEXT for a case-sensitive substring search**, not an
 //!   expression: a value carrying a character a log group name can never hold matches no log
 //!   group, which is a success whose `logGroups` is the EMPTY LIST rather than a refusal. The
 //!   member's length is still a bound on what the service takes.
 //!
-//! The tables span what the rules generalise over — how many groups are selected, the page
-//!   size, and which character outside a log group name's own class the pattern carries —
-//! rather than one recorded query.
+//! The tables span what the rules generalise over — how the groups were selected, how many
+//!   of the account's groups match (none, one, several, all), WHERE those matches sit in the
+//!   account's name order (first, middle, last), the page size, and which character outside a
+//!   log group name's own class the pattern carries — rather than one recorded query.
 
 use serde_json::{json, Value};
 
@@ -64,6 +70,43 @@ fn names(case: &str, page: &Value) -> Vec<String> {
         .collect()
 }
 
+/// Whether a request selects its log groups by SUBSTRING SEARCH, which the service answers by
+/// walking the account's log groups, rather than by a selection it addresses directly.
+fn is_substring_search(selector: &Value) -> bool {
+    selector.get("logGroupNamePattern").is_some()
+}
+
+/// Follow `token` to the end of the walk, reporting every log group name the pages past it
+/// carry. The walk ends on the page that carries no token.
+async fn drained(
+    logs: &Logs,
+    case: &str,
+    selector: &Value,
+    limit: usize,
+    token: &str,
+) -> Vec<String> {
+    let mut token = Some(token.to_string());
+    let mut left: Vec<String> = Vec::new();
+    let mut pages = 0usize;
+    while let Some(next) = token.take() {
+        pages += 1;
+        assert!(
+            pages <= GROUPS.len() + 2,
+            "case {case:?}: the walk must terminate, got {pages} pages past the first"
+        );
+        let mut request = selector.clone();
+        request["limit"] = json!(limit);
+        request["nextToken"] = json!(next);
+        let page = logs.ok(DESCRIBE, &request).await;
+        left.extend(names(case, &page));
+        token = page
+            .get("nextToken")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+    }
+    left
+}
+
 /// The groups of [`GROUPS`], created.
 async fn account_with_groups(logs: &Logs) {
     for group in GROUPS {
@@ -72,10 +115,12 @@ async fn account_with_groups(logs: &Logs) {
     }
 }
 
-/// A page carries a token exactly while selected groups remain unreported, the walk covers
-/// the selection exactly once in name order, and it ends on the page that reported the last
-/// match — over a grid of selection sizes and page sizes, page sizes that divide the
-/// selection exactly included.
+/// Whether a page carries a token, over a grid of selection sizes and page sizes (page sizes
+/// that divide the selection exactly included): for a selection the service addresses
+/// directly, exactly while selected groups remain unreported, so the walk ends on the page
+/// that reported the last match; for a substring search, on every page that reported a group,
+/// so the walk only ends once it is past every log group of the account. Either walk covers
+/// the selection exactly once, in name order.
 #[tokio::test]
 async fn a_page_hands_back_a_continuation_exactly_while_groups_remain() {
     let logs = Logs::new();
@@ -107,6 +152,7 @@ async fn a_page_hands_back_a_continuation_exactly_while_groups_remain() {
     ];
 
     for (case, selector, selected) in &selections {
+        let scan = is_substring_search(selector);
         // Page sizes from one group per page up to one past the whole selection, so every row
         // is walked with a size that divides it exactly (the page that reports the last match
         // is FULL) as well as with sizes that leave a remainder.
@@ -118,7 +164,7 @@ async fn a_page_hands_back_a_continuation_exactly_while_groups_remain() {
             loop {
                 pages += 1;
                 assert!(
-                    pages <= selected.len() + 2,
+                    pages <= GROUPS.len() + selected.len() + 2,
                     "case {case:?}: the walk must terminate, got {pages} pages"
                 );
                 let mut request = selector.clone();
@@ -134,14 +180,25 @@ async fn a_page_hands_back_a_continuation_exactly_while_groups_remain() {
                 );
                 walked.extend(reported.clone());
                 let next = page.get("nextToken").and_then(Value::as_str);
-                assert_eq!(
-                    next.is_some(),
-                    walked.len() < selected.len(),
-                    "case {case:?}: a page carries a token exactly while selected groups \
-                     remain unreported ({} of {} reported so far), got {page}",
-                    walked.len(),
-                    selected.len()
-                );
+                if scan {
+                    // A substring search reports where its walk stopped: a page that reported
+                    // a group walked over at least that group, so it is resumable, and the
+                    // walk only ends once it is past every group of the account — which is a
+                    // page that reports nothing.
+                    assert!(
+                        next.is_some() || reported.is_empty(),
+                        "case {case:?}: a page that reported a group is resumable, got {page}"
+                    );
+                } else {
+                    assert_eq!(
+                        next.is_some(),
+                        walked.len() < selected.len(),
+                        "case {case:?}: a page carries a token exactly while selected groups \
+                         remain unreported ({} of {} reported so far), got {page}",
+                        walked.len(),
+                        selected.len()
+                    );
+                }
                 match next {
                     Some(next) => token = Some(next.to_string()),
                     None => break,
@@ -155,28 +212,43 @@ async fn a_page_hands_back_a_continuation_exactly_while_groups_remain() {
                     .collect::<Vec<String>>(),
                 "case {case:?}: the walk covers the selection once, in name order"
             );
-            // No round trip beyond the pages the selection itself fills: a selection of `n`
-            // groups read `limit` at a time is exactly ceil(n / limit) pages, and an empty
-            // selection is the one page that reports nothing.
-            let expected_pages = selected.len().div_ceil(limit).max(1);
-            assert_eq!(
-                pages, expected_pages,
-                "case {case:?}: expected {expected_pages} page(s) for {} group(s), got {pages}",
-                selected.len()
-            );
+            if scan {
+                // A walk examines each of the account's groups once, so it cannot take more
+                // pages than there are groups to examine, plus the page that examines none.
+                assert!(
+                    pages <= GROUPS.len() + 1,
+                    "case {case:?}: a walk over {} group(s) takes at most {} page(s), got \
+                     {pages}",
+                    GROUPS.len(),
+                    GROUPS.len() + 1
+                );
+            } else {
+                // No round trip beyond the pages the selection itself fills: a selection of
+                // `n` groups read `limit` at a time is exactly ceil(n / limit) pages, and an
+                // empty selection is the one page that reports nothing.
+                let expected_pages = selected.len().div_ceil(limit).max(1);
+                assert_eq!(
+                    pages, expected_pages,
+                    "case {case:?}: expected {expected_pages} page(s) for {} group(s), got \
+                     {pages}",
+                    selected.len()
+                );
+            }
         }
     }
 }
 
-/// The page that reports the last selected group carries NO token, whichever member made the
-/// selection and whether that page is full or short — and a page with groups still behind it
-/// does carry one, which resumes at exactly those groups.
+/// Where the page that reported the last selected group leaves the enumeration: for a
+/// selection the service addresses directly it carries NO token, whether that page is full or
+/// short; for a substring search it carries one, and the pages past it report no further group
+/// before the walk ends. Either way a page with selected groups still behind it carries a
+/// token that resumes at exactly those groups.
 ///
 /// The rows span the members this listing selects with (none, the name prefix, the substring
-/// pattern, the identifier list and the log group class), because the rule is about what is
-/// left unreported rather than about which filter left it.
+/// pattern, the identifier list and the log group class), because the rule is about how the
+/// selection was made rather than about which filter left what.
 #[tokio::test]
-async fn the_page_that_reports_the_last_selected_group_carries_no_token() {
+async fn the_page_that_reports_the_last_selected_group_ends_an_addressed_listing() {
     let logs = Logs::new();
     account_with_groups(&logs).await;
 
@@ -207,8 +279,11 @@ async fn the_page_that_reports_the_last_selected_group_carries_no_token() {
 
     for (case, selector, selected) in &selections {
         let count = selected.len();
-        // A page sized exactly to the selection reports all of it and ends there: the page is
-        // FULL, and a token would promise a set that does not exist.
+        let scan = is_substring_search(selector);
+        // A page sized exactly to the selection reports all of it. For a selection the service
+        // addresses directly that is the end of the enumeration, and a token would promise a
+        // set that does not exist; a substring search can only report where its walk stopped,
+        // so the same page is resumable and the pages past it report nothing more.
         let mut exact = selector.clone();
         exact["limit"] = json!(count);
         let page = logs.ok(DESCRIBE, &exact).await;
@@ -220,15 +295,34 @@ async fn the_page_that_reports_the_last_selected_group_carries_no_token() {
                 .collect::<Vec<String>>(),
             "case {case:?}: a page sized to the selection reports all of it, got {page}"
         );
-        assert_eq!(
-            page.get("nextToken"),
-            None,
-            "case {case:?}: the page that reported the last of {count} group(s) carries no \
-             token, got {page}"
-        );
+        let token = page
+            .get("nextToken")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        match (scan, &token) {
+            (false, token) => assert_eq!(
+                *token, None,
+                "case {case:?}: the page that reported the last of {count} group(s) carries no \
+                 token, got {page}"
+            ),
+            (true, None) => panic!(
+                "case {case:?}: a substring search reports where its walk stopped, so the page \
+                 that reported the last of {count} group(s) is resumable, got {page}"
+            ),
+            (true, Some(token)) => {
+                let left = drained(&logs, case, selector, count, token).await;
+                assert_eq!(
+                    left,
+                    Vec::<String>::new(),
+                    "case {case:?}: the pages past the last match report no further group, got \
+                     {left:?}"
+                );
+            }
+        }
 
         // A page one group short of the selection DOES carry a token, and continuing it
-        // reports exactly the group left over — itself the last page, so it carries none.
+        // reports exactly the group left over — the end of an addressed listing, and the last
+        // match of a substring search's walk.
         let mut short = selector.clone();
         short["limit"] = json!(count - 1);
         let page = logs.ok(DESCRIBE, &short).await;
@@ -248,12 +342,27 @@ async fn the_page_that_reports_the_last_selected_group_carries_no_token() {
             vec![selected[count - 1].to_string()],
             "case {case:?}: the continuation reports exactly the group left over, got {page}"
         );
-        assert_eq!(
-            page.get("nextToken"),
-            None,
-            "case {case:?}: the continuation that reported the last group carries no token, \
-             got {page}"
-        );
+        match page.get("nextToken").and_then(Value::as_str) {
+            None => assert!(
+                !scan,
+                "case {case:?}: a substring search's page that reported a group is resumable, \
+                 got {page}"
+            ),
+            Some(token) => {
+                assert!(
+                    scan,
+                    "case {case:?}: the continuation that reported the last group carries no \
+                     token, got {page}"
+                );
+                let left = drained(&logs, case, selector, count, token).await;
+                assert_eq!(
+                    left,
+                    Vec::<String>::new(),
+                    "case {case:?}: the pages past the last match report no further group, got \
+                     {left:?}"
+                );
+            }
+        }
     }
 }
 
@@ -462,5 +571,251 @@ async fn a_pattern_that_cannot_match_is_an_empty_page_and_not_a_refusal() {
         ),
         "case \"one character past the length bound\": expected the member's length \
          constraint, got {refusal}"
+    );
+}
+
+/// A wider account for the page-sequence table below, in the ASCII order the listing reports
+/// it in: the groups the patterns of that table select sit at the START, in the MIDDLE and at
+/// the END of the order, and two of them share no name prefix, so a row's page sequence turns
+/// on where the walk stopped rather than on which names happened to be adjacent.
+const WALK_ACCOUNT: [&str; 5] = [
+    "/aws/lambda/alpha-handler",
+    "/aws/opensearch/domains/beta/audit-logs",
+    "alpha-app-logs",
+    "beta-app-logs",
+    "gamma-metrics",
+];
+
+/// One page of a walk, as a row of the table states it: the names it reported, and whether it
+/// was resumable (it carried a `nextToken`).
+type Page = (Vec<&'static str>, bool);
+
+/// The account of [`WALK_ACCOUNT`], created.
+async fn account_with_walk_groups(logs: &Logs) {
+    for group in WALK_ACCOUNT {
+        logs.ok("CreateLogGroup", &json!({"logGroupName": group}))
+            .await;
+    }
+}
+
+/// Walk `selector` at page size `limit` to the end, reporting what every page carried: the
+/// names it reported and whether it was resumable.
+async fn walked_pages(
+    logs: &Logs,
+    case: &str,
+    selector: &Value,
+    limit: usize,
+) -> Vec<(Vec<String>, bool)> {
+    let mut walked: Vec<(Vec<String>, bool)> = Vec::new();
+    let mut token: Option<String> = None;
+    loop {
+        assert!(
+            walked.len() <= WALK_ACCOUNT.len() + 2,
+            "case {case:?}: the walk must terminate, got {} pages: {walked:?}",
+            walked.len()
+        );
+        let mut request = selector.clone();
+        request["limit"] = json!(limit);
+        if let Some(token) = &token {
+            request["nextToken"] = json!(token);
+        }
+        let page = logs.ok(DESCRIBE, &request).await;
+        let reported = names(case, &page);
+        assert!(
+            reported.len() <= limit,
+            "case {case:?}: a page holds at most {limit} group(s), got {page}"
+        );
+        let next = page
+            .get("nextToken")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        walked.push((reported, next.is_some()));
+        match next {
+            Some(next) => token = Some(next),
+            None => break,
+        }
+    }
+    walked
+}
+
+/// The whole page sequence each selection must be walked in: every page's reported names and
+/// whether it was resumable, so an extra or a missing round trip fails.
+fn page_sequences() -> Vec<(&'static str, Value, usize, Vec<Page>)> {
+    vec![
+        // A substring search, one match per page: each page stops on the group it matched and
+        // is resumable from there; the pages past the last match report nothing, and only the
+        // page whose walk is past every group of the account ends the enumeration.
+        (
+            "a substring held by two names, one per page",
+            json!({"logGroupNamePattern": "alpha"}),
+            1,
+            vec![
+                (vec![WALK_ACCOUNT[0]], true),
+                (vec![WALK_ACCOUNT[2]], true),
+                (vec![], true),
+                (vec![], false),
+            ],
+        ),
+        (
+            "the same substring, both matches on one page",
+            json!({"logGroupNamePattern": "alpha"}),
+            2,
+            vec![
+                (vec![WALK_ACCOUNT[0], WALK_ACCOUNT[2]], true),
+                (vec![], true),
+                (vec![], false),
+            ],
+        ),
+        // The match is the LAST group of the account, so the page that reported it stopped on
+        // the last group there is — and is still resumable, because a substring search reports
+        // only how far it got.
+        (
+            "a substring held by the last name in order",
+            json!({"logGroupNamePattern": "gamma"}),
+            1,
+            vec![(vec![WALK_ACCOUNT[4]], true), (vec![], false)],
+        ),
+        // A substring no name holds: the walk reports nothing and is still resumable until it
+        // is past every group of the account.
+        (
+            "a substring no name holds",
+            json!({"logGroupNamePattern": "zeta"}),
+            1,
+            vec![(vec![], true), (vec![], false)],
+        ),
+        // `@length(min: 0)`: the empty value is legal, and every name holds it.
+        (
+            "the empty substring, which every name holds",
+            json!({"logGroupNamePattern": ""}),
+            5,
+            vec![(WALK_ACCOUNT.to_vec(), true), (vec![], false)],
+        ),
+        (
+            "a substring held by names under two different prefixes",
+            json!({"logGroupNamePattern": "beta"}),
+            2,
+            vec![
+                (vec![WALK_ACCOUNT[1], WALK_ACCOUNT[3]], true),
+                (vec![], true),
+                (vec![], false),
+            ],
+        ),
+        // The selections the service addresses directly: the page that reported the last
+        // selected group ends the walk, whether that page is full or short.
+        (
+            "a name prefix selecting two groups, one per page",
+            json!({"logGroupNamePrefix": "/aws/"}),
+            1,
+            vec![
+                (vec![WALK_ACCOUNT[0]], true),
+                (vec![WALK_ACCOUNT[1]], false),
+            ],
+        ),
+        (
+            "a name prefix selecting two groups on one full page",
+            json!({"logGroupNamePrefix": "/aws/"}),
+            2,
+            vec![(vec![WALK_ACCOUNT[0], WALK_ACCOUNT[1]], false)],
+        ),
+        (
+            "a name prefix no group carries",
+            json!({"logGroupNamePrefix": "zeta"}),
+            1,
+            vec![(vec![], false)],
+        ),
+        (
+            "an identifier list naming the first and the last group",
+            json!({"logGroupIdentifiers": [WALK_ACCOUNT[0], WALK_ACCOUNT[4]]}),
+            1,
+            vec![
+                (vec![WALK_ACCOUNT[0]], true),
+                (vec![WALK_ACCOUNT[4]], false),
+            ],
+        ),
+        (
+            "the class every group of the account is in",
+            json!({"logGroupClass": "STANDARD"}),
+            2,
+            vec![
+                (vec![WALK_ACCOUNT[0], WALK_ACCOUNT[1]], true),
+                (vec![WALK_ACCOUNT[2], WALK_ACCOUNT[3]], true),
+                (vec![WALK_ACCOUNT[4]], false),
+            ],
+        ),
+        (
+            "a class no group of the account is in",
+            json!({"logGroupClass": "INFREQUENT_ACCESS"}),
+            1,
+            vec![(vec![], false)],
+        ),
+        (
+            "no filter at all",
+            json!({}),
+            2,
+            vec![
+                (vec![WALK_ACCOUNT[0], WALK_ACCOUNT[1]], true),
+                (vec![WALK_ACCOUNT[2], WALK_ACCOUNT[3]], true),
+                (vec![WALK_ACCOUNT[4]], false),
+            ],
+        ),
+        (
+            "no filter, one page holding the whole account",
+            json!({}),
+            5,
+            vec![(WALK_ACCOUNT.to_vec(), false)],
+        ),
+    ]
+}
+
+/// Every row's whole page sequence: what each page reported, and whether it was resumable.
+#[tokio::test]
+async fn a_walk_reports_where_it_stopped_and_an_addressed_listing_what_is_left() {
+    let logs = Logs::new();
+    account_with_walk_groups(&logs).await;
+
+    for (case, selector, limit, expected) in page_sequences() {
+        let walked = walked_pages(&logs, case, &selector, limit).await;
+        let expected: Vec<(Vec<String>, bool)> = expected
+            .into_iter()
+            .map(|(names, resumable)| {
+                (
+                    names.into_iter().map(ToString::to_string).collect(),
+                    resumable,
+                )
+            })
+            .collect();
+        assert_eq!(
+            walked, expected,
+            "case {case:?} at page size {limit}: expected the pages {expected:?}, got {walked:?}"
+        );
+    }
+}
+
+/// Walking a substring search to its end is a READ: it leaves the account exactly as it was,
+/// so the same walk repeated reports the same pages and every group is still listed once.
+#[tokio::test]
+async fn walking_a_substring_search_leaves_the_account_as_it_was() {
+    let logs = Logs::new();
+    account_with_walk_groups(&logs).await;
+
+    let selector = json!({"logGroupNamePattern": "alpha"});
+    let first = walked_pages(&logs, "the first walk", &selector, 1).await;
+    let again = walked_pages(&logs, "the same walk repeated", &selector, 1).await;
+    assert_eq!(
+        again, first,
+        "a repeated walk reports the same pages, got {again:?} after {first:?}"
+    );
+
+    let whole = walked_pages(&logs, "the whole account after the walks", &json!({}), 5).await;
+    assert_eq!(
+        whole,
+        vec![(
+            WALK_ACCOUNT
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<String>>(),
+            false
+        )],
+        "every group of the account is still listed once, got {whole:?}"
     );
 }
