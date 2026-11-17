@@ -61,7 +61,7 @@ fn inner_doc_comments(source: &str) -> Vec<String> {
         .collect()
 }
 
-/// How many `#[path = "all/<name>.rs"]` attributes `source` holds — the declarations the file
+/// How many `#[path = "all/<name>.rs"]` attributes `source` holds — the declarations a root
 /// exists for, counted so that a file read as empty cannot satisfy the rule above by holding
 /// nothing.
 fn declaration_count(source: &str) -> usize {

@@ -13,8 +13,8 @@
 //! rules for every root in the workspace, and the build-time layout check already fails the
 //! build for a suite file no `mod` names. This one pins the shape that keeps a root out of
 //! their way: the list holds one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite,
-//! sorted by name, and no other line — so two branches landing at once insert two lines in
-//! two places and have no prose to duplicate, re-word or mistype as `//!`.
+//! sorted by name, and no other line — so two branches landing at once insert two
+//! lines in two places and have no prose to duplicate, re-word or mistype as `//!`.
 //!
 //! Sorted STRICTLY, so the same name twice is a report here as well as the `E0428` the
 //! sibling reports, and a declaration appended past the end of the list rather than into it

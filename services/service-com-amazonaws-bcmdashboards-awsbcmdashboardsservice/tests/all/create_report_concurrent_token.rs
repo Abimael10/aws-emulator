@@ -28,11 +28,37 @@ use super::scheduled_report_lifecycle::source_dashboard;
 /// (`smithy_query(query="shape",shape="ScheduledReportArn")`:
 /// `^arn:aws[-a-z0-9]*:bcm-dashboards::[0-9]{12}:scheduled-report/(\*|[-a-z0-9]+)$`), as
 /// much of it as this suite needs to tell a minted ARN from anything else.
-const ARN_PREFIX: &str = "arn:aws:bcm-dashboards::";
-const ARN_RESOURCE: &str = ":scheduled-report/";
+pub(crate) const ARN_PREFIX: &str = "arn:aws:bcm-dashboards::";
+pub(crate) const ARN_RESOURCE: &str = ":scheduled-report/";
 
 /// One outcome of a racing call: its HTTP status and body.
 type Outcome = (u16, Value);
+
+/// Fire every call of `requests` concurrently through one router and answer what each of them
+/// was told, each tagged with the KEY the call presented so a caller can judge one token's
+/// crowd on its own.
+///
+/// Shared with the sibling suite that races a fleet partitioned over several tokens
+/// (`tests/all/create_report_concurrent_token_partition.rs`), so the two readings of what a
+/// concurrent fleet is cannot drift apart.
+pub(crate) async fn race_keyed<Key: Send + 'static>(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    requests: Vec<(Key, Value)>,
+) -> Vec<(Key, u16, Value)> {
+    let mut handles = Vec::with_capacity(requests.len());
+    for (key, request) in requests {
+        let router = router.clone();
+        handles.push(tokio::spawn(async move {
+            let (status, body) = call(&router, "CreateScheduledReport", &request).await;
+            (key, status, body)
+        }));
+    }
+    let mut outcomes = Vec::with_capacity(handles.len());
+    for handle in handles {
+        outcomes.push(handle.await.expect("a racing call does not panic"));
+    }
+    outcomes
+}
 
 /// Fire `racers` calls of `request` concurrently through one router and answer what each of
 /// them was told, in completion order.
@@ -41,19 +67,40 @@ async fn race(
     request: &Value,
     racers: usize,
 ) -> Vec<Outcome> {
-    let mut handles = Vec::with_capacity(racers);
-    for _ in 0..racers {
-        let router = router.clone();
-        let request = request.clone();
-        handles.push(tokio::spawn(async move {
-            call(&router, "CreateScheduledReport", &request).await
-        }));
-    }
-    let mut outcomes = Vec::with_capacity(racers);
-    for handle in handles {
-        outcomes.push(handle.await.expect("a racing call does not panic"));
-    }
-    outcomes
+    let requests = (0..racers).map(|_| ((), request.clone())).collect();
+    race_keyed(router, requests)
+        .await
+        .into_iter()
+        .map(|((), status, body)| (status, body))
+        .collect()
+}
+
+/// Assert the refusal one loser of a token is answered with: the modelled `ConflictException`
+/// (409) in one of its two wordings — the fixed in-progress text while the winner has not
+/// stored its report, the already-exists text naming `winner` once it has — and no ARN.
+///
+/// Shared with the sibling suite that races a partitioned fleet, so one reading of the two
+/// admitted wordings serves both.
+pub(crate) fn assert_conflict_refusal(case: &str, winner: &str, status: u16, body: &Value) {
+    assert_eq!(
+        status, 409,
+        "case {case:?}: a loser is refused with 409, got {status} with {body}"
+    );
+    assert!(
+        error_code(body).ends_with("ConflictException"),
+        "case {case:?}: a loser is refused with ConflictException, got {body}"
+    );
+    let allowed = [IN_PROGRESS_MESSAGE.to_string(), already_exists_message(winner)];
+    let message = body["message"].as_str().unwrap_or_default();
+    assert!(
+        allowed.contains(&message.to_string()),
+        "case {case:?}: expected one of {allowed:?}, got {message:?}"
+    );
+    assert_eq!(
+        body["arn"],
+        Value::Null,
+        "case {case:?}: a refused create answers no arn, got {body}"
+    );
 }
 
 /// Assert the rule over `outcomes`: exactly one success carrying a minted ARN, and every
@@ -79,26 +126,8 @@ fn assert_one_winner(case: &str, outcomes: &[Outcome]) -> String {
         "case {case:?}: the winner's arn is a minted scheduled-report arn, got {arn:?}"
     );
 
-    let allowed = [IN_PROGRESS_MESSAGE.to_string(), already_exists_message(&arn)];
     for (status, body) in outcomes.iter().filter(|(status, _)| *status != 200) {
-        assert_eq!(
-            *status, 409,
-            "case {case:?}: a loser is refused with 409, got {status} with {body}"
-        );
-        assert!(
-            error_code(body).ends_with("ConflictException"),
-            "case {case:?}: a loser is refused with ConflictException, got {body}"
-        );
-        let message = body["message"].as_str().unwrap_or_default();
-        assert!(
-            allowed.contains(&message.to_string()),
-            "case {case:?}: expected one of {allowed:?}, got {message:?}"
-        );
-        assert_eq!(
-            body["arn"],
-            Value::Null,
-            "case {case:?}: a refused create answers no arn, got {body}"
-        );
+        assert_conflict_refusal(case, &arn, *status, body);
     }
     arn
 }
