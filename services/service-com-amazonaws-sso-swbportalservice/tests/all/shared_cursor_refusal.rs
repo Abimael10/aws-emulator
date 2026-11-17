@@ -21,11 +21,24 @@
 //! constant `crate::state` defines, so a handler that worded or classified this refusal
 //! for itself again fails here.
 //!
+//! The second half of the suite pins the same rule where it is hardest to keep: a cursor
+//! names its listing by bytes the codec wrote into it, so WHICH listing a presented cursor
+//! belongs to may not depend on how that listing's name is spelt. A role listing's name
+//! embeds the requested account id, and an account id is an unconstrained string
+//! (`smithy_query(query="shape", shape="AccountIdType")` reports no `@pattern` and no
+//! `@length`), so the rows there spell account ids that contain the codec's own separator —
+//! including ones that spell another account's whole cursor scope — and assert both that no
+//! two listings can mint the same cursor bytes and that the cursor codec is an exact
+//! inverse pair over every such spelling.
+//!
 //! The harness is `portal_session`'s, so every suite here speaks to one mounted router.
 
-use http::StatusCode;
-use service_com_amazonaws_sso_swbportalservice::state::INVALID_CURSOR_MESSAGE;
-use std::collections::BTreeSet;
+use bytes::Bytes;
+use http::{Response, StatusCode};
+use service_com_amazonaws_sso_swbportalservice::state::{
+    self, InvalidCursor, INVALID_CURSOR_MESSAGE,
+};
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::portal_session::{assert_refusal, body_json, body_text, Portal};
 
@@ -236,4 +249,372 @@ async fn every_paginated_listing_refuses_an_unissued_page_token_with_the_one_sha
              bytes as case {first_case:?}, expected {first_body:?}, got {body:?}"
         );
     }
+}
+
+// Which listing a presented cursor belongs to, when the listing's own NAME carries the
+// separator the codec writes between a cursor's fields.
+
+/// The sign-in the rows below are read with, and a second one, so a cursor's scope differs
+/// in the session that asked for it as well as in the listing it walks.
+const BOUNDARY_TOKEN: &str = "tok-cursor-boundary";
+const OTHER_BOUNDARY_TOKEN: &str = "tok-cursor-boundary-other";
+
+/// The account id the adversarial spellings below are built around, and the one account id
+/// under test that carries no separator at all.
+const PLAIN_ACCOUNT: &str = "604444444444";
+
+/// The 32 hex characters a cursor's scope carries for the sign-in session it is bound to,
+/// derived the way `state::cursor_scope` derives them (`src/state.rs`).
+///
+/// A row needs them because the account ids under test are built to SPELL another
+/// account's whole cursor scope, which ends in exactly these characters. A sign-in seeded
+/// into this store is held under the one token it was seeded with, so that token is the
+/// sign-in session identifier the scope digests.
+fn session_digest(sign_in_session: &str) -> String {
+    let digest = <sha2::Sha256 as sha2::Digest>::digest(sign_in_session.as_bytes());
+    hex::encode(&digest[..16])
+}
+
+/// The accounts the boundary rows assign the sign-in, each with the roles assigned in it:
+/// `(account id, roles)`.
+///
+/// The ids differ along what the rule generalises over — how the account id is spelt: no
+/// separator at all, another account's whole cursor scope plus a segment, that scope
+/// exactly, that scope followed by something spelt like a session digest, and segments
+/// spelt like the byte counts a framed field carries. Each account holds more than one
+/// role, so every role listing here is cut short and hands out a cursor, and the role
+/// names carry the separator too, so a cursor's resume key is not one shape of string
+/// only.
+fn boundary_accounts() -> Vec<(String, Vec<String>)> {
+    let digest = session_digest(BOUNDARY_TOKEN);
+    let roles = |names: &[&str]| -> Vec<String> {
+        names.iter().map(|name| (*name).to_string()).collect()
+    };
+    vec![
+        (
+            PLAIN_ACCOUNT.to_string(),
+            roles(&["AdministratorAccess", "ReadOnly"]),
+        ),
+        (
+            format!("{PLAIN_ACCOUNT}:{digest}:Z"),
+            roles(&["Role:One", "RoleTwo"]),
+        ),
+        (
+            format!("{PLAIN_ACCOUNT}:{digest}"),
+            roles(&["Admin", "Role:Two"]),
+        ),
+        (
+            format!("{PLAIN_ACCOUNT}:{digest}:{digest}"),
+            roles(&["0:Zero", "ReadOnly"]),
+        ),
+        (
+            "605555555555:2:00:12".to_string(),
+            roles(&["3:Three", "Role_1"]),
+        ),
+    ]
+}
+
+/// The request reading all of `listing` in one page: the modelled `MaxResultType` maximum
+/// (`smithy_query(query="shape", shape="MaxResultType")` gives the range 1..100) is more
+/// than any row seeds.
+fn whole_listing_uri(listing: &Listing) -> String {
+    let separator = if listing.path.contains('?') { '&' } else { '?' };
+    format!("{}{separator}max_result=100", listing.path)
+}
+
+/// The member of an item that identifies it in `listing`, and the key its cursor walks.
+fn id_key(listing: &Listing) -> &'static str {
+    if listing.items == "accountList" {
+        "accountId"
+    } else {
+        "roleName"
+    }
+}
+
+/// The ids `listing` reported in `response`, in the order it reported them.
+fn reported_ids(listing: &Listing, response: &Response<Bytes>) -> Vec<String> {
+    body_json(response)
+        .get(listing.items)
+        .and_then(|items| items.as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .map(|item| {
+            item[id_key(listing)]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect()
+}
+
+/// The ids `listing` must report, in order, for the sign-in `accounts` seeds: the account
+/// ids ascending, or the roles ascending in the account the listing's route names.
+fn expected_ids(accounts: &[(String, Vec<String>)], listing: &Listing) -> Vec<String> {
+    let mut expected: Vec<String> = if listing.items == "accountList" {
+        accounts.iter().map(|(id, _)| id.clone()).collect()
+    } else {
+        let account_id = listing
+            .path
+            .split_once("account_id=")
+            .map(|(_, id)| id)
+            .unwrap_or_default();
+        accounts
+            .iter()
+            .find(|(id, _)| id == account_id)
+            .map(|(_, roles)| roles.clone())
+            .unwrap_or_default()
+    };
+    expected.sort();
+    expected
+}
+
+/// Every paginated listing the boundary fixture seeds: the session's accounts, and the
+/// roles in each of them.
+fn boundary_listings(accounts: &[(String, Vec<String>)]) -> Vec<Listing> {
+    let mut rows = vec![Listing {
+        operation: "ListAccounts",
+        path: "/assignment/accounts".to_string(),
+        items: "accountList",
+    }];
+    for (account_id, _) in accounts {
+        rows.push(Listing {
+            operation: "ListAccountRoles",
+            path: format!("/assignment/roles?account_id={account_id}"),
+            items: "roleList",
+        });
+    }
+    rows
+}
+
+/// RULE: a presented cursor belongs to the listing whose scope the codec wrote into it and
+/// to no other, so a cursor minted for one listing of a sign-in is refused by every other
+/// listing of that same sign-in — however the account ids naming those listings are spelt,
+/// the codec's own separator included — while the listing that refused it goes on
+/// reporting its own assignments in full.
+#[tokio::test]
+async fn a_cursor_belongs_to_one_listing_however_the_account_ids_are_spelt() {
+    let portal = Portal::new();
+    let accounts = boundary_accounts();
+    portal.sign_in_assigned(BOUNDARY_TOKEN, accounts.clone());
+    let rows = boundary_listings(&accounts);
+
+    // The cursor each listing hands out, in the order of `rows`.
+    let mut issued: Vec<String> = Vec::new();
+    for listing in &rows {
+        issued.push(first_cursor(&portal, listing, BOUNDARY_TOKEN).await);
+    }
+    let distinct: BTreeSet<&String> = issued.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        issued.len(),
+        "two listings minted the same cursor, which no listing could then refuse: got \
+         {issued:?}"
+    );
+
+    for (minted_by, token) in rows.iter().zip(&issued) {
+        for presented_to in &rows {
+            let case = format!(
+                "the cursor {} minted for {:?}, presented to {:?}",
+                minted_by.operation, minted_by.path, presented_to.path
+            );
+            let response = portal
+                .get(&uri(presented_to, Some(token)), Some(BOUNDARY_TOKEN))
+                .await;
+            if presented_to.path == minted_by.path {
+                // The positive control: its own listing resumes it, with the entries that
+                // follow the page that issued it.
+                assert_eq!(
+                    response.status(),
+                    StatusCode::OK,
+                    "case {case:?}: a listing must resume the cursor it issued, got {} {:?}",
+                    response.status(),
+                    body_text(&response)
+                );
+                let expected: Vec<String> = expected_ids(&accounts, presented_to)
+                    .into_iter()
+                    .skip(PAGE_SIZE)
+                    .take(PAGE_SIZE)
+                    .collect();
+                let served = reported_ids(presented_to, &response);
+                assert_eq!(
+                    served, expected,
+                    "case {case:?}: expected the page after the one that issued it, \
+                     {expected:?}, got {served:?}"
+                );
+            } else {
+                assert_refusal(
+                    &case,
+                    &response,
+                    StatusCode::BAD_REQUEST,
+                    "InvalidRequestException",
+                    INVALID_CURSOR_MESSAGE,
+                );
+                let body = body_json(&response);
+                assert!(
+                    body.get(presented_to.items).is_none() && body.get("nextToken").is_none(),
+                    "case {case:?}: a refused cursor carries no page and no cursor, got {body}"
+                );
+            }
+        }
+    }
+
+    // What the refusal protects: every listing still reports all of its own entries, so a
+    // foreign cursor costs a caller nothing it is entitled to see.
+    for listing in &rows {
+        let case = format!("{} reading all of {:?}", listing.operation, listing.path);
+        let response = portal
+            .get(&whole_listing_uri(listing), Some(BOUNDARY_TOKEN))
+            .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "case {case:?}: expected 200, got {} {:?}",
+            response.status(),
+            body_text(&response)
+        );
+        let expected = expected_ids(&accounts, listing);
+        let served = reported_ids(listing, &response);
+        assert_eq!(
+            served, expected,
+            "case {case:?}: expected the whole listing {expected:?}, got {served:?}"
+        );
+    }
+}
+
+/// RULE: the cursor codec mints one token per (scope, resume key) — no two pairs spell the
+/// same token — and is an exact inverse pair for each, so a cursor decodes under the scope
+/// it was minted for and under no other, whatever bytes either field carries.
+///
+/// The table is the codec's own fields: every listing name this service walks (a role
+/// listing's carries the requested account id verbatim, which is unconstrained), under two
+/// sign-in sessions, with every resume key shape a listing hands out plus keys that spell
+/// a scope's own tail.
+#[test]
+fn the_cursor_codec_mints_one_token_per_scope_and_key_and_decodes_it_under_no_other_scope() {
+    let digest = session_digest(BOUNDARY_TOKEN);
+    let listings = vec![
+        "accounts".to_string(),
+        format!("roles:{PLAIN_ACCOUNT}"),
+        format!("roles:{PLAIN_ACCOUNT}:{digest}:Z"),
+        format!("roles:{PLAIN_ACCOUNT}:{digest}"),
+        format!("roles:{PLAIN_ACCOUNT}:{digest}:{digest}"),
+        "roles:605555555555:2:00:12".to_string(),
+        "roles:".to_string(),
+        format!("roles:{PLAIN_ACCOUNT}:"),
+    ];
+    let keys = vec![
+        String::new(),
+        PLAIN_ACCOUNT.to_string(),
+        "AdministratorAccess".to_string(),
+        "Role:One".to_string(),
+        format!("Z:{digest}:RoleOne"),
+        format!("{digest}:RoleOne"),
+        "3:Three".to_string(),
+        "0".to_string(),
+        // A multibyte key: a field's byte count is not its character count.
+        "rôle-é".to_string(),
+    ];
+
+    // Every token minted, against the (scope, key) it was minted for.
+    let mut minted: BTreeMap<String, (String, String)> = BTreeMap::new();
+    for listing in &listings {
+        for session in [BOUNDARY_TOKEN, OTHER_BOUNDARY_TOKEN] {
+            let scope = state::cursor_scope(listing, session);
+            for key in &keys {
+                let case = format!("listing {listing:?}, session {session:?}, key {key:?}");
+                let token = state::encode_cursor(&scope, key);
+                let decoded = state::decode_cursor(&scope, &token);
+                assert_eq!(
+                    decoded.as_deref(),
+                    Ok(key.as_str()),
+                    "case {case:?}: a cursor must decode to the key it was minted for, got \
+                     {decoded:?}"
+                );
+                if let Some(previous) = minted.insert(token.clone(), (scope.clone(), key.clone()))
+                {
+                    panic!(
+                        "case {case:?}: expected a token no other scope and key mints, but \
+                         {token:?} was already minted for {previous:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    let scopes: BTreeSet<String> = minted.values().map(|(scope, _)| scope.clone()).collect();
+    for (token, (scope, key)) in &minted {
+        for other in &scopes {
+            if other == scope {
+                continue;
+            }
+            let case = format!(
+                "the cursor for scope {scope:?} and key {key:?}, read under scope {other:?}"
+            );
+            let decoded = state::decode_cursor(other, token);
+            assert_eq!(
+                decoded,
+                Err(InvalidCursor),
+                "case {case:?}: a cursor of another scope must be refused, got {decoded:?}"
+            );
+        }
+    }
+}
+
+/// RULE: only the ONE spelling the mint writes is admitted, so a payload merely shaped like
+/// a cursor — the fields run together with a bare separator, a field's byte count spelt
+/// another way, a field cut short or run long — is refused rather than mis-read.
+#[test]
+fn a_cursor_payload_the_mint_never_wrote_is_refused() {
+    let scope = state::cursor_scope(&format!("roles:{PLAIN_ACCOUNT}"), BOUNDARY_TOKEN);
+    let width = scope.len();
+    let key = "AdministratorAccess";
+    let crafted = [
+        (
+            "the fields run together with a bare separator",
+            format!("v1:{scope}:{key}"),
+        ),
+        (
+            "a resume key whose byte count carries a leading zero",
+            format!("2:v1{width}:{scope}0{}:{key}", key.len()),
+        ),
+        (
+            "a resume key shorter than its own byte count claims",
+            format!("2:v1{width}:{scope}{}:{key}", key.len() + 1),
+        ),
+        (
+            "a resume key longer than its own byte count claims",
+            format!("2:v1{width}:{scope}{}:{key}", key.len() - 1),
+        ),
+        (
+            "a payload that stops before the resume key",
+            format!("2:v1{width}:{scope}"),
+        ),
+        (
+            "a version this codec never stamped",
+            format!("2:v2{width}:{scope}{}:{key}", key.len()),
+        ),
+        (
+            "a scope framed with no byte count at all",
+            format!("2:v1{scope}{}:{key}", key.len()),
+        ),
+    ];
+
+    for (why, payload) in crafted {
+        let token = hex::encode(&payload);
+        let decoded = state::decode_cursor(&scope, &token);
+        assert_eq!(
+            decoded,
+            Err(InvalidCursor),
+            "case {why:?}: expected the payload {payload:?} to be refused, got {decoded:?}"
+        );
+    }
+
+    // The positive control: the spelling the mint DOES write is admitted.
+    let token = state::encode_cursor(&scope, key);
+    let decoded = state::decode_cursor(&scope, &token);
+    assert_eq!(
+        decoded.as_deref(),
+        Ok(key),
+        "case \"the token as minted\": expected the key {key:?}, got {decoded:?}"
+    );
 }

@@ -665,6 +665,49 @@ pub fn invalid_cursor() -> crate::ops::types::InvalidRequestException {
 /// refused rather than silently misread.
 const CURSOR_VERSION: &str = "v1";
 
+/// One field of a composite string, written so the reader takes back exactly the bytes
+/// the writer put in: the field's length in bytes, a `:`, then the field itself.
+///
+/// A composite string is only as trustworthy as the boundaries between its fields. Joining
+/// variable-length fields with a bare separator leaves the split to be GUESSED whenever a
+/// field may carry that separator itself, and then two different field tuples spell the
+/// same string: whoever reads it back cannot tell which tuple it is holding, and a check
+/// that re-writes what it read agrees with itself either way. Fields here do carry
+/// anything — a cursor's scope names the listing, which for a role listing embeds the
+/// requested account id, and `AccountIdType` is an unconstrained string
+/// (`smithy_query(query="shape", shape="AccountIdType")` reports no `@pattern` and no
+/// `@length`) — so the length goes in front of the field, terminated by the `:`. The
+/// reader then knows each field's extent before reading it and no byte inside a field can
+/// be taken for a boundary, which makes the join INJECTIVE: one string, one tuple.
+///
+/// A composition whose only variable-length field comes last needs no framing (the
+/// remainder of the string IS that field), which is why a listing name may still be built
+/// by a handler as a constant prefix followed by the account id.
+fn framed_field(field: &str) -> String {
+    format!("{}:{field}", field.len())
+}
+
+/// The field [`framed_field`] wrote at the start of `framed`, and whatever follows it.
+/// `None` when `framed` does not begin with a field this crate could have written.
+///
+/// The length is admitted only in the ONE spelling [`framed_field`] writes — plain ASCII
+/// digits, no sign and no leading zero — so a framed field has a single encoding and the
+/// framing stays injective in both directions.
+fn take_framed_field(framed: &str) -> Option<(&str, &str)> {
+    let (length, rest) = framed.split_once(':')?;
+    if length.is_empty()
+        || !length.bytes().all(|digit| digit.is_ascii_digit())
+        || (length.len() > 1 && length.starts_with('0'))
+    {
+        return None;
+    }
+    let length: usize = length.parse().ok()?;
+    if rest.len() < length || !rest.is_char_boundary(length) {
+        return None;
+    }
+    Some(rest.split_at(length))
+}
+
 /// The scope a cursor is bound to: the listing it walks, and the SIGN-IN SESSION that
 /// asked for it. A cursor presented to another listing or by another sign-in is refused.
 ///
@@ -681,9 +724,17 @@ const CURSOR_VERSION: &str = "v1";
 /// The identifier is digested rather than carried, and only its first half is kept: a
 /// cursor travels back out in a response and into a client's next URL, so neither the
 /// session identifier nor anything else the store holds may be recoverable from it.
+///
+/// The two parts are joined by [`framed_field`], so one scope string names one (listing,
+/// sign-in) pair whatever the listing name carries — a scope is what a cursor is bound
+/// to, and a binding two different pairs could spell is no binding.
 pub fn cursor_scope(listing: &str, sign_in_session: &str) -> String {
     let digest = <sha2::Sha256 as sha2::Digest>::digest(sign_in_session.as_bytes());
-    format!("{listing}:{}", hex::encode(&digest[..16]))
+    format!(
+        "{}{}",
+        framed_field(listing),
+        framed_field(&hex::encode(&digest[..16]))
+    )
 }
 
 /// An opaque continuation cursor for `scope`, resuming after `last_key`.
@@ -695,8 +746,18 @@ pub fn cursor_scope(listing: &str, sign_in_session: &str) -> String {
 /// already report (the items are built from that session's own assignments), and
 /// authenticating it would need either a server secret or per-request state written by
 /// a reporting operation.
+///
+/// Its fields are joined by [`framed_field`], which is what makes the mint injective over
+/// (version, scope, key): a cursor minted for one scope is bytes no other scope's mint can
+/// produce, so it cannot be read back under another scope at all, however the two scopes
+/// or the resume key are spelt.
 pub fn encode_cursor(scope: &str, last_key: &str) -> String {
-    hex::encode(format!("{CURSOR_VERSION}:{scope}:{last_key}"))
+    hex::encode(format!(
+        "{}{}{}",
+        framed_field(CURSOR_VERSION),
+        framed_field(scope),
+        framed_field(last_key)
+    ))
 }
 
 /// The key a cursor resumes after, when it is one [`encode_cursor`] produced for the
@@ -709,12 +770,22 @@ pub fn encode_cursor(scope: &str, last_key: &str) -> String {
 /// digits), and such a spelling is a token no response of this service ever carried, so
 /// re-minting the decoded key and comparing is what holds the two to exact inverses —
 /// whatever the encoding is, and without a second grammar maintained beside it.
+///
+/// The version and the scope are matched as the FRAMED fields [`encode_cursor`] wrote, so
+/// the key this answers is the one that was minted and never a tail some other scope's
+/// cursor happens to leave behind: the re-mint check cannot catch a mis-split, because
+/// re-minting the halves it split into spells the very same bytes.
 pub fn decode_cursor(scope: &str, token: &str) -> Result<String, InvalidCursor> {
     let bytes = hex::decode(token).map_err(|_| InvalidCursor)?;
     let decoded = String::from_utf8(bytes).map_err(|_| InvalidCursor)?;
-    let last_key = decoded
-        .strip_prefix(&format!("{CURSOR_VERSION}:{scope}:"))
+    let rest = decoded
+        .strip_prefix(&framed_field(CURSOR_VERSION))
+        .and_then(|rest| rest.strip_prefix(&framed_field(scope)))
         .ok_or(InvalidCursor)?;
+    let (last_key, trailing) = take_framed_field(rest).ok_or(InvalidCursor)?;
+    if !trailing.is_empty() {
+        return Err(InvalidCursor);
+    }
     if encode_cursor(scope, last_key) != token {
         return Err(InvalidCursor);
     }
