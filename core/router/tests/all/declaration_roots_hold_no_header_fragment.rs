@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Every declaration root whose list is prose-free opens each header sentence it writes.
+//! Every declaration root opens each header sentence it writes.
 //!
 //! The sibling [`super::all_rs_header_holds_no_sentence_fragment`] owns the READING of that
 //! rule: the header ahead of the first item is the region every list guard skips, so it is
@@ -16,11 +16,10 @@
 //! the one target that links them all — the crate whose root breaks the rule cannot report it,
 //! because its own `all` target is what stops running.
 //!
-//! It is read for a root whose declaration LIST is prose-free, the shape
-//! [`super::declaration_roots_carry_no_duplicated_comment_line`] selects for the same reason: a
-//! root that keeps a note beside each declaration states those sentences in its header too, so
-//! reading a prose rule there would report how that root is written rather than the hazard this
-//! rule is about.
+//! No shape of the list beneath that header changes the reading: the reader takes the block
+//! from [`super::all_rs_carries_one_header_block::header_of`], which ends at the first item, so
+//! a note a root keeps among its declarations states no sentence of the block this rule is
+//! about.
 //!
 //! The reader, the roots, and which of their lines contribute prose to a paragraph are the
 //! siblings' own, so one rule keeps one reading.
@@ -34,7 +33,6 @@ use crate::all_rs_declares_each_suite_once::{declaration_roots, relative, worksp
 use crate::all_rs_header_holds_no_sentence_fragment::{
     header_lines_beginning_mid_sentence, paragraph_prose_of,
 };
-use crate::declaration_roots_carry_no_duplicated_comment_line::the_list_is_prose_free;
 
 /// How many lines of `source`'s header carry prose, counted — through the same two readers the
 /// rule itself is read with — so that roots read as holding no header at all cannot satisfy the
@@ -47,11 +45,12 @@ fn header_prose_lines(source: &str) -> usize {
 }
 
 #[test]
-fn every_prose_free_declaration_root_opens_each_header_sentence() {
-    // The cases are every declaration root in the workspace whose list is prose-free: they
-    // differ in how long their header block is, in whether it is written as an inner doc
-    // comment or as ordinary comments, in how many paragraphs it holds, in whether it closes
-    // with an inner attribute, and in how many suites they declare.
+fn every_declaration_root_opens_each_header_sentence() {
+    // The cases are every declaration root in the workspace: they differ in how long their
+    // header block is, in whether it is written as an inner doc comment or as ordinary
+    // comments, in how many paragraphs it holds, in whether it closes with an inner attribute,
+    // in how many suites they declare, and in whether they keep a note among those
+    // declarations.
     let roots = declaration_roots();
     assert!(
         roots.len() > 400,
@@ -61,16 +60,11 @@ fn every_prose_free_declaration_root_opens_each_header_sentence() {
         roots.len()
     );
 
-    let mut read = 0_usize;
     let mut prose = 0_usize;
     let mut reports = Vec::new();
     for root in &roots {
         let source = fs::read_to_string(root)
             .unwrap_or_else(|error| panic!("read {}: {error}", root.display()));
-        if !the_list_is_prose_free(&source) {
-            continue;
-        }
-        read += 1;
         prose += header_prose_lines(&source);
         let case = relative(root);
         for report in header_lines_beginning_mid_sentence(&source) {
@@ -78,22 +72,19 @@ fn every_prose_free_declaration_root_opens_each_header_sentence() {
         }
     }
 
-    // Without these, roots read as holding no header at all — or a filter that selected none of
-    // them — would satisfy the report below by having nothing to break it.
+    // Without this, roots read as holding no header at all would satisfy the report below by
+    // having nothing to break it.
     assert!(
-        read > 300,
-        "expected most crates to keep a prose-free declaration list, read {read} of the {} roots",
+        prose > 100,
+        "expected the {} declaration roots to open with their header blocks, read {prose} \
+         line(s) of prose across all of them",
         roots.len()
     );
     assert!(
-        prose > 100,
-        "expected the {read} prose-free declaration roots to open with their header blocks, read \
-         {prose} line(s) of prose across all of them"
-    );
-    assert!(
         reports.is_empty(),
-        "expected every header line of the {read} prose-free declaration roots to open the \
-         sentence it starts, got {} report(s), each a paragraph left half-written: {reports:#?}",
+        "expected every header line of the {} declaration roots to open the sentence it starts, \
+         got {} report(s), each a paragraph left half-written: {reports:#?}",
+        roots.len(),
         reports.len()
     );
 }

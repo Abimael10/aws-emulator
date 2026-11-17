@@ -16,13 +16,14 @@
 //! the same reason the sibling over the header half of the duplication rule
 //! ([`super::declaration_roots_carry_no_duplicated_comment_line`]) reads those roots from here.
 //!
-//! It is read for a root whose list is PROSE-FREE, the same restriction
-//! [`super::declaration_roots_carry_no_duplicated_comment_line`] reads the header half of the
-//! duplication rule under, and for the same reason: a root that keeps a note beside each
+//! It is read for a root whose list is PROSE-FREE: a root that keeps a note beside each
 //! declaration was written by repeating one sentence per note, so its list carries copies by
 //! its own style rather than by a merge, and reading the rule there would report how that root
 //! is written rather than the hazard the rule is about. Folding those notes into the suites
-//! they explain brings such a root under this rule by itself.
+//! they explain brings such a root under this rule by itself. The HEADER half of the same
+//! duplication rule needs no such restriction — a line of the list is no line of a header — so
+//! [`super::declaration_roots_carry_no_duplicated_comment_line`] reads it for every root, and
+//! keeps the selector this suite reads itself under.
 //!
 //! The OTHER two rules of a canonical list — that the list holds nothing but pairs, and that
 //! they are sorted — are not read here, and the sibling that owns their reader says so: the

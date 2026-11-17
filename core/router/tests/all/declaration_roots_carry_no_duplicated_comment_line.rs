@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Every declaration root whose list is prose-free carries one header block too.
+//! Every declaration root carries one header block too.
 //!
 //! The sibling [`super::all_rs_carries_one_header_block`] owns the reader for that rule: the
 //! header ahead of the first item is the region every list guard skips, so it is where each
@@ -11,13 +11,15 @@
 //! root on disk, from the one target that links them all (the crate that breaks it cannot
 //! report it: its own target no longer compiles).
 //!
-//! It is read for a root whose declaration LIST is prose-free, the shape
-//! [`super::all_rs_is_a_canonical_declaration_list`] pins. A root that keeps a note beside
-//! each declaration was written by re-typing one sentence per note, and those sentences stand
-//! in its header as well, so its header carries copies by its own style rather than by a
-//! merge: reading the rule there would report how that root is written, not the hazard this
-//! rule is about. Folding those notes into the suites they explain brings such a root under
-//! this rule by itself.
+//! No shape of the list beneath that header changes the reading. The reader takes the block
+//! from [`super::all_rs_carries_one_header_block::header_of`], which ends at the first item, so
+//! a note a root keeps among its declarations contributes no line to what the reader compares
+//! and cannot bring that root under the rule by its own style — the same reading under which
+//! [`super::declaration_roots_state_each_header_paragraph_once`] takes the whole set of roots,
+//! one paragraph at a time. The LIST half of this duplication rule is the half that does have
+//! to be read under that restriction, and
+//! [`super::declaration_roots_hold_canonical_lists`] reads it there, through the selector this
+//! module keeps for it.
 //!
 //! The reader, and the header boundary it reads a root against, are the sibling's: one rule
 //! has one reading, so no root is held to a different rule from another's.
@@ -31,7 +33,14 @@ use crate::all_rs_declares_each_suite_once::{declaration_roots, relative, worksp
 use crate::all_rs_inner_doc_comments_precede_the_first_item::first_item_line;
 
 /// Whether the declaration list of `source` — everything from its first item on — holds no
-/// prose, which is what makes a root one this rule is read for.
+/// prose.
+///
+/// The two header rules — this one and
+/// [`super::declaration_roots_hold_no_header_fragment`]'s — are read for every root, because a
+/// line of the list is no line of the header. The selector is kept here for the sibling that
+/// reads the LIST half of this duplication rule,
+/// [`super::declaration_roots_hold_canonical_lists`], where a note standing among the
+/// declarations does repeat a line of the file by a root's own style rather than by a merge.
 pub(crate) fn the_list_is_prose_free(source: &str) -> bool {
     let Some(item_line) = first_item_line(source) else {
         return true;
@@ -47,11 +56,11 @@ pub(crate) fn the_list_is_prose_free(source: &str) -> bool {
 }
 
 #[test]
-fn every_prose_free_declaration_root_carries_one_header_block() {
-    // The cases are the workspace's declaration roots whose list is prose-free: they differ in
-    // how long their header block is, in whether it is written as an inner doc comment or as
-    // ordinary comments, in how many suites they declare, and in whether they carry an inner
-    // attribute at all.
+fn every_declaration_root_carries_one_header_block() {
+    // The cases are the workspace's declaration roots: they differ in how long their header
+    // block is, in whether it is written as an inner doc comment or as ordinary comments, in how
+    // many suites they declare, in whether they carry an inner attribute at all, and in whether
+    // they keep a note among those declarations.
     let roots = declaration_roots();
     assert!(
         roots.len() > 100,
@@ -60,42 +69,42 @@ fn every_prose_free_declaration_root_carries_one_header_block() {
         roots.len()
     );
 
-    let mut read = 0_usize;
+    let mut header_lines = 0_usize;
     let mut reports = Vec::new();
     for root in &roots {
         let source = fs::read_to_string(root)
             .unwrap_or_else(|error| panic!("read {}: {error}", root.display()));
-        if !the_list_is_prose_free(&source) {
-            continue;
-        }
-        read += 1;
+        header_lines += header_of(&source).len();
         let case = relative(root);
         for report in repeated_header_lines(&source) {
             reports.push(format!("case {case}: {report}"));
         }
     }
 
+    // Without this, roots read as holding no header at all would satisfy the report below by
+    // having nothing to break it.
     assert!(
-        read > 100,
-        "expected most service crates to keep a prose-free declaration list, read {read} of the \
-         {} roots on disk",
+        header_lines > 100,
+        "expected the {} declaration roots to open with their header blocks, read \
+         {header_lines} header line(s) across all of them",
         roots.len()
     );
     assert!(
         reports.is_empty(),
-        "expected each of the {read} prose-free declaration roots to write its header block \
-         once, got {} report(s), each a paragraph the next landing has two places to keep: \
-         {reports:#?}",
+        "expected each of the {} declaration roots to write its header block once, got {} \
+         report(s), each a paragraph the next landing has two places to keep: {reports:#?}",
+        roots.len(),
         reports.len()
     );
 }
 
 #[test]
 fn the_reader_reads_the_roots_whose_list_holds_no_prose() {
-    // One synthetic root per shape a list can take, and whether this rule is read for it: a
-    // root that keeps notes among its declarations is written by repeating a sentence per note,
-    // so it is left to the siblings. The rows differ in where a comment sits relative to the
-    // declarations, in its kind, and in whether the file has an item at all.
+    // One synthetic root per shape a list can take, and whether that list holds prose: it is
+    // what the sibling reading the LIST half of this rule selects on, since a root keeping notes
+    // among its declarations repeats a sentence per note there by its own style. The rows differ
+    // in where a comment sits relative to the declarations, in its kind, and in whether the file
+    // has an item at all.
     let license = "// SPDX-License-Identifier: CC0-1.0\n";
     let first = "#[path = \"all/boot_serve.rs\"]\nmod boot_serve;\n";
     let second = "#[path = \"all/query_wire.rs\"]\nmod query_wire;\n";
