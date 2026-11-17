@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDataAutomationLibraryEntity
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDataAutomationLibraryEntity`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the ONE entity a (library, entity type, entity id) triple addresses. A READ: it
+//! projects what the ingestion jobs accepted against that library have made of it
+//! (`crate::state::library_entities`) and writes nothing of its own, beyond materialising
+//! the library removals the clock has already made due.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDataAutomationLibraryEntity::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An entity is a resource of one (library, entity type) pair, so a triple naming another
+//! library, another entity type or an id no completed ingestion has stood up resolves to
+//! nothing, and is refused with the modelled `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +153,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDataAutomationLibraryEntity` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDataAutomationLibraryEntityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDataAutomationLibraryEntity"))
+        // The `libraryArn` this entity is addressed through has to be one this endpoint
+        // admits: refused on the INPUT, before any lookup, with the rule and the sentence
+        // single-homed in `crate::state::library_arn`.
+        if let Some(refusal) = crate::state::library_arn::region_refusal(ctx, &input.library_arn) {
+            return Err(
+                GetDataAutomationLibraryEntityErrorModeled::ValidationException(refusal).into(),
+            );
+        }
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetDataAutomationLibraryEntityError::Modeled(
+                GetDataAutomationLibraryEntityErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the Bedrock Data Automation store is unavailable".to_string(),
+                        ),
+                    },
+                ),
+            )
+        })?;
+        // A read: it projects what is already stored, having first materialised the library
+        // removals the clock has already made due — the entities of a library whose delete
+        // has settled went with it (`crate::state::library_deletion`).
+        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        store.settle_library_deletions(now);
+
+        // The request addresses an entity THROUGH its library, so the library has to resolve
+        // first: an unresolved `libraryArn` is refused with the service's fixed sentence for
+        // it, whichever operation was handed it.
+        if !store.libraries.contains_key(&input.library_arn) {
+            return Err(
+                GetDataAutomationLibraryEntityErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::LIBRARY_ARN_NOT_FOUND_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // What the COMPLETED ingestions have left under that (library, entity type) pair is
+        // what this read resolves the `entityId` against: an id nothing has upserted, one a
+        // completed delete has taken out, and one of another library or another entity type
+        // are equally absent here.
+        let entity = store
+            .library_entity(&input.library_arn, &input.entity_type, &input.entity_id, now)
+            .ok_or_else(|| {
+                GetDataAutomationLibraryEntityErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(
+                            crate::state::library_entities::ENTITY_NOT_FOUND_MESSAGE
+                                .to_string(),
+                        ),
+                    },
+                )
+            })?;
+
+        Ok(GetDataAutomationLibraryEntityOutput {
+            entity: Some(entity.to_entity_details()),
+        })
     }
 }

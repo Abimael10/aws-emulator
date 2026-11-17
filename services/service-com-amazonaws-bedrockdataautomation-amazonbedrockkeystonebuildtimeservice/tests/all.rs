@@ -41,6 +41,8 @@ mod identity_authorization;
 mod ingestion_submission_consistency;
 #[path = "all/library_arn_region_admission.rs"]
 mod library_arn_region_admission;
+#[path = "all/library_entity_retrieval.rs"]
+mod library_entity_retrieval;
 #[path = "all/library_ingestion_jobs.rs"]
 mod library_ingestion_jobs;
 #[path = "all/optimization_profile_resolution.rs"]

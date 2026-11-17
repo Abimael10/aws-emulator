@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! No line of the router's `tests/all.rs` header begins in the middle of a sentence.
+//! No line of a declaration root's header begins in the middle of a sentence.
+//!
+//! Read against THIS crate's root only while its target keeps one: where the suites are
+//! declared with `automod` from the vendored `tests/all/main.rs` instead, the rule has no
+//! subject here and the workspace-wide siblings read it for every crate that does keep a
+//! hand-maintained root.
 //!
 //! The header ahead of the first declaration is the one region every list guard skips, so it
 //! is where each landing's re-typed copy of the module's prose accumulates. The sibling

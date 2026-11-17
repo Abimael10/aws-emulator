@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The router's `tests/all.rs` is a canonical declaration list: pairs, sorted, nothing else.
+//! A canonical declaration list: pairs, sorted, nothing else.
+//!
+//! Read against THIS crate's root only while its target keeps one: where the suites are
+//! declared with `automod` from the vendored `tests/all/main.rs` instead, the rule has no
+//! subject here and the workspace-wide siblings read it for every crate that does keep a
+//! hand-maintained root.
 //!
 //! A declaration root is appended to by every landing branch, and it is the one file in the
 //! target whose breakage takes every suite down with it: a module declared twice is `E0428`,

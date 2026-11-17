@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The router's `tests/all.rs` carries no inner doc comment at all.
+//! A declaration root carries no inner doc comment at all.
+//!
+//! Read against THIS crate's root only while its target keeps one: where the suites are
+//! declared with `automod` from the vendored `tests/all/main.rs` instead, the rule has no
+//! subject here, and the rule that an inner doc comment stands only ahead of a module's first
+//! item is read for every root the workspace keeps, and for every suite file, by
+//! `all/all_rs_inner_doc_comments_precede_the_first_item.rs`.
 //!
 //! An inner doc comment (`//!`, `/*!`) documents the module it stands in, so the language
 //! accepts it only ahead of that module's first item: one written lower down is `E0753` and

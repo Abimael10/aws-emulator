@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The router's `tests/all.rs` carries ONE header block: no line of it is written twice.
+//! ONE header block: no line of a declaration root's header is written twice.
+//!
+//! Read against THIS crate's root only while its target keeps one: where the suites are
+//! declared with `automod` from the vendored `tests/all/main.rs` instead, the rule has no
+//! subject here and the workspace-wide siblings read it for every crate that does keep a
+//! hand-maintained root.
 //!
 //! A declaration root is appended to by every landing branch, and the sibling guards read the
 //! declaration LIST: that it holds nothing but pairs, that they are sorted, that each suite is

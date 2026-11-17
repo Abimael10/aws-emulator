@@ -66,6 +66,11 @@ pub mod ingestion_locations;
 /// `GetDataAutomationLibrary`.
 pub mod library_entity_types;
 
+/// The ENTITIES a DataAutomationLibrary holds: what the ingestion jobs accepted against it
+/// have made of it, and the projection a read of one entity serves. Used by
+/// `GetDataAutomationLibraryEntity`.
+pub mod library_entities;
+
 /// Which `DataAutomationLibraryArn` this service admits on its input, and what it answers
 /// for one it does not. Used by every operation that resolves a `libraryArn`.
 pub mod library_arn;

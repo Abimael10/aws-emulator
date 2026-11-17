@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! `tests/all.rs` says nothing twice in its LIST either: past the first item, no line of the
-//! router's declaration root repeats a line the file has already said.
+//! A declaration root says nothing twice in its LIST either: past the first item, no line of
+//! it repeats a line the file has already said.
+//!
+//! Read against THIS crate's root only while its target keeps one: where the suites are
+//! declared with `automod` from the vendored `tests/all/main.rs` instead, the rule has no
+//! subject here and the workspace-wide siblings read it for every crate that does keep a
+//! hand-maintained root.
 //!
 //! [`super::all_rs_carries_one_header_block`] reads the header — the block ahead of the first
 //! item, where the module's own prose belongs — and stops there on purpose: past that item a
