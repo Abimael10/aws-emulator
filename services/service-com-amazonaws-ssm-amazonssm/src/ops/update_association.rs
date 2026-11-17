@@ -15,6 +15,14 @@
 //! call alone rather than from the version before it; the only member carried over is the
 //! document, for a call that names none, since an association always applies one.
 //!
+//! The association also RUNS on this call: "when you update an association, the association
+//! immediately runs against the specified targets. You can add the ApplyOnlyAtCronInterval
+//! parameter to run the association during the next schedule run", so the run is dispatched
+//! to the nodes the version this call applied selects — through the one dispatch a create and
+//! an update share
+//! ([`crate::state::ComAmazonawsSsmAmazonssmState::dispatch_association_as_applied`]) — and a
+//! call that asks for the schedule to be the only trigger dispatches none.
+//!
 //! What the call is held to is what the create is held to, through the same readings: the
 //! document and its version are RESOLVED against the store, the parameter values are held to
 //! the parameters that document version declares, the schedule has to be one of the two forms
@@ -330,6 +338,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
+        // "When you update an association, the association immediately runs against the
+        // specified targets", so the nodes it is dispatched to are resolved below — which
+        // means the registrations the clock already owed are materialised first, with no
+        // guard of the store held, the way a create materialises them.
+        crate::state::node_registration::settle_registrations(&*self.engine, &region);
         let mut store = state.lock();
 
         let does_not_exist = || {
@@ -494,18 +507,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             alarm_configuration: input.alarm_configuration.clone(),
             association_dispatch_assume_role: input.association_dispatch_assume_role.clone(),
         };
-        let record = store
-            .association_mut(&region, &input.association_id)
+        {
+            let record = store
+                .association_mut(&region, &input.association_id)
+                .ok_or_else(does_not_exist)?;
+            // `AssociationDescription$Name` is "the name of the SSM document", so the name
+            // the document is held under is what the association applies from now on,
+            // whichever spelling named it.
+            record.name = document.name.clone();
+            record.push_version(applied);
+        }
+        // "When you update an association, the association immediately runs against the
+        // specified targets. You can add the ApplyOnlyAtCronInterval parameter to run the
+        // association during the next schedule run": the run is dispatched through the one
+        // dispatch a create and an update share, so it reaches the nodes the version THIS
+        // call applied selects.
+        store.dispatch_association_as_applied(&region, &input.association_id, now);
+        // The association is read back under the same guard the version was pushed under,
+        // and an id that names none at this point is the refusal the lookups above give:
+        // reporting no description beside a 200 would say the update was applied to nothing.
+        let description = store
+            .association(&region, &input.association_id)
+            .and_then(|held| held.latest_description(now))
             .ok_or_else(does_not_exist)?;
-        // `AssociationDescription$Name` is "the name of the SSM document", so the name the
-        // document is held under is what the association applies from now on, whichever
-        // spelling named it.
-        record.name = document.name.clone();
-        record.push_version(applied);
-        let description = record.latest_description(now);
 
         Ok(UpdateAssociationOutput {
-            association_description: description,
+            association_description: Some(description),
         })
     }
 }

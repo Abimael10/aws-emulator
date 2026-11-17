@@ -424,6 +424,20 @@ impl AssociationRecord {
         });
     }
 
+    /// Whether State Manager runs this association on the CALL that applied the version it
+    /// holds last, rather than leaving its next run to the schedule that version carries.
+    ///
+    /// "By default, when you update an association, the system runs it immediately after it
+    /// is updated and then according to the schedule you specified. Specify true for
+    /// ApplyOnlyAtCronInterval if you want the association to run only according to the
+    /// schedule you specified" (`UpdateAssociationRequest$ApplyOnlyAtCronInterval`), and the
+    /// create's own member says the same of a create — so the flag the version in force
+    /// carries is what decides it, whichever call wrote that version.
+    pub fn runs_when_applied(&self) -> bool {
+        self.latest()
+            .is_none_or(|version| !version.apply_only_at_cron_interval)
+    }
+
     /// The run of this association that had finished by `now`, or `None` when it has never
     /// been dispatched to a node or its latest run is still in progress.
     pub fn finished_run(&self, now: SystemTime) -> Option<&AssociationRunRecord> {
@@ -879,6 +893,36 @@ impl ComAmazonawsSsmAmazonssmState {
             nodes.extend(selected.into_iter().map(str::to_string));
         }
         nodes.into_iter().collect()
+    }
+
+    /// Dispatch `region`'s association of that id to the managed nodes the version it holds
+    /// last selects, which is what the call that APPLIED that version does: "when you update
+    /// an association, the association immediately runs against the specified targets"
+    /// (`UpdateAssociation`), and State Manager "applies the configuration when the
+    /// association is created" the same way.
+    ///
+    /// The run REPLACES whatever this association last ran
+    /// ([`AssociationRecord::start_run`]), and the nodes are resolved before it is written,
+    /// so the targets the call applied are the ones it reaches. Nothing is dispatched for a
+    /// version that asks to be run only on its schedule
+    /// ([`AssociationRecord::runs_when_applied`]) or for an id this Region holds no
+    /// association of.
+    pub fn dispatch_association_as_applied(
+        &mut self,
+        region: &str,
+        association_id: &str,
+        now: SystemTime,
+    ) {
+        let Some(held) = self.association(region, association_id) else {
+            return;
+        };
+        if !held.runs_when_applied() {
+            return;
+        }
+        let nodes = self.association_run_nodes(held);
+        if let Some(held) = self.association_mut(region, association_id) {
+            held.start_run(nodes, now);
+        }
     }
 
     /// Whether `record` applies to the managed node `instance_id`.

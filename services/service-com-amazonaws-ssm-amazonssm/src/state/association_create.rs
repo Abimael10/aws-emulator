@@ -322,9 +322,13 @@ impl ComAmazonawsSsmAmazonssmState {
             tags,
         );
         // An association that selects no registered node reaches none, which is why the
-        // nodes are resolved here rather than assumed.
-        let nodes = self.association_run_nodes(&record);
-        record.start_run(nodes, now);
+        // nodes are resolved here rather than assumed — and a create that asks for the
+        // schedule to be the only trigger dispatches nothing at all
+        // ([`super::associations::AssociationRecord::runs_when_applied`]).
+        if record.runs_when_applied() {
+            let nodes = self.association_run_nodes(&record);
+            record.start_run(nodes, now);
+        }
         let description = record.to_association_description(&first, now);
         self.insert_association(record);
         capacity.created_one();
