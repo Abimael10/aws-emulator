@@ -40,15 +40,24 @@
 //!   function — and the distribution's `Restrictions.GeoRestriction` then decides which
 //!   viewers are served from it at all, a viewer a `blacklist` names (or one a `whitelist`
 //!   leaves out) being refused by CloudFront itself with `403`,
-//!   `X-Cache: Error from cloudfront` and none of the origin's bytes.
+//!   `X-Cache: Error from cloudfront` and none of the origin's bytes;
+//! * the ORIGIN is asked for `Origin$OriginPath` followed by the viewer's path — "an optional
+//!   path that CloudFront appends to the origin domain name when CloudFront requests
+//!   content" — so the origin of a behaviour that carries one never sees the unprefixed path,
+//!   while a second origin on the SAME backend carrying none sees the viewer's path bare; and
+//!   the request the origin receives carries the headers the EDGE generates about the viewer's
+//!   connection (the country it is in, the scheme it dialled, the address it came from), which
+//!   is what an origin doing geo- or scheme-dependent work reads.
 //!
 //! The rows differ along what each rule generalises over: every method a client can send (the
 //! two the behaviour lists, and five it does not), the scheme the viewer dialled, the
 //! behaviour the viewer path matches (the open one and the one that trusts a key group), the
 //! policy form (canned and custom), the key that signed it (one in the group and one that is
 //! not), whether the policy's source-address condition holds for the address the edge
-//! observed, and whether the request reaching the function came through the edge or straight
-//! from a client.
+//! observed, whether the request reaching the function came through the edge or straight
+//! from a client, and the `OriginPath` the matched behaviour's origin carries (none, one
+//! segment, several) against the viewer path it is prefixed to (a file, a nested path, the
+//! root, one carrying a query).
 //!
 //! What is staged through the SERVICES that own it: the execution role through IAM, the
 //! function, its function URL and the resource policy that admits a caller through Lambda, the
@@ -72,7 +81,7 @@ use crate::edge_signed_access::{
     canned_policy, canned_query, create_key_group, custom_policy, custom_query, far_future,
     upload_public_key, Signer, CACHING_DISABLED,
 };
-use crate::published_edge_address::dial;
+use crate::published_edge_address::{dial, dial_with};
 
 /// The Region every setup call below is made in, and the Region CloudFront's own calls are
 /// signed for.
@@ -115,9 +124,10 @@ const MISS: &str = "Miss from cloudfront";
 const ERROR: &str = "Error from cloudfront";
 
 /// The handler behind the function URL: it reports the request it was handed — the method, the
-/// path, the two `CloudFront-*` headers the edge generates and the names of every header that
-/// reached it — so what the viewer is served says what reached the origin. It imports only the
-/// standard library, so the report is the handler's own work.
+/// path, the `CloudFront-*` headers the edge generates (the viewer's country, the scheme it
+/// dialled and the address it came from) and the names of every header that reached it — so
+/// what the viewer is served says what reached the origin. It imports only the standard
+/// library, so the report is the handler's own work.
 const HANDLER_SOURCE: &str = r#"
 import json
 
@@ -134,6 +144,7 @@ def lambda_handler(event, context):
                 "method": request.get("method", ""),
                 "path": event.get("rawPath", ""),
                 "country": headers.get("cloudfront-viewer-country", ""),
+                "proto": headers.get("cloudfront-forwarded-proto", ""),
                 "address": headers.get("cloudfront-viewer-address", ""),
                 "header_names": sorted(headers.keys()),
             }
@@ -648,6 +659,25 @@ impl Answered {
     /// The answer of one viewer request to `domain`, dialled in the clear with no credential.
     async fn of(case: &str, domain: &str, method: &str, path_and_query: &str) -> Self {
         let raw = dial(domain, method, path_and_query).await;
+        Self::read(case, raw)
+    }
+
+    /// [`Answered::of`] for a viewer that STATES `headers` of its own beside the `Host` — a
+    /// browser that carries a header the edge reads about the connection it opened.
+    async fn of_stating(
+        case: &str,
+        domain: &str,
+        method: &str,
+        path_and_query: &str,
+        headers: &[(&str, &str)],
+    ) -> Self {
+        let raw = dial_with(domain, method, path_and_query, domain, headers).await;
+        Self::read(case, raw)
+    }
+
+    /// One answer as it came off the connection, split into the status, the whole exchange and
+    /// the body — the one reading both constructors above share.
+    fn read(case: &str, raw: String) -> Self {
         let status = raw
             .split_whitespace()
             .nth(1)
@@ -1562,3 +1592,357 @@ async fn the_geo_restriction_decides_a_function_url_origin_reached_by_its_author
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// What the ORIGIN is asked for: `OriginPath` ahead of the viewer path, and the
+// headers the EDGE generates for the request it makes
+// ---------------------------------------------------------------------------
+
+/// The other two `CloudFront-*` headers the edge generates for an origin request beside the
+/// country: the scheme the viewer dialled and the address it came from. Lower case, as an
+/// origin request carries them.
+const FORWARDED_PROTO_HEADER: &str = "cloudfront-forwarded-proto";
+const VIEWER_ADDRESS_HEADER: &str = "cloudfront-viewer-address";
+
+/// The `OriginPath` the default behaviour's origin carries, which every path the other
+/// behaviours do not match is asked for under.
+const PREFIXED_ORIGIN_PATH: &str = "/content";
+
+/// One origin of the distribution the table below drives: its id, the `OriginPath` it carries
+/// (`None` for the origin that carries none at all) and the path pattern of the behaviour that
+/// targets it (`None` for the DEFAULT behaviour, which every other viewer path reaches).
+struct OriginRow {
+    id: &'static str,
+    origin_path: Option<&'static str>,
+    pattern: Option<&'static str>,
+}
+
+/// What every behaviour of that distribution carries after its target: the methods a viewer may
+/// send, the AWS-managed `CachingDisabled` cache policy — so each row's request is an origin
+/// fetch rather than another row's cached answer — and the origin request policy that forwards
+/// the headers the edge generates, without which no behaviour sees them.
+fn behavior_tail() -> String {
+    format!(
+        "<ViewerProtocolPolicy>allow-all</ViewerProtocolPolicy>\
+         <AllowedMethods><Quantity>2</Quantity>\
+         <Items><Method>GET</Method><Method>HEAD</Method></Items></AllowedMethods>\
+         <CachePolicyId>{CACHING_DISABLED}</CachePolicyId>\
+         <OriginRequestPolicyId>{ALL_VIEWER_AND_CLOUDFRONT}</OriginRequestPolicyId>"
+    )
+}
+
+/// One `DistributionConfig` whose origins ALL name the same backend `host` and differ only in
+/// the `OriginPath` each carries, with one behaviour per origin: the first is the default
+/// behaviour and each of the others is an ordered behaviour on its own path pattern. So the one
+/// thing deciding what the origin is asked for is the `OriginPath` of the origin the matched
+/// behaviour targets.
+fn origin_path_config_xml(caller_reference: &str, host: &str, origins: &[OriginRow]) -> String {
+    let items: String = origins
+        .iter()
+        .map(|row| {
+            let origin_path = row
+                .origin_path
+                .map(|path| format!("<OriginPath>{path}</OriginPath>"))
+                .unwrap_or_default();
+            format!(
+                "<Origin><Id>{}</Id><DomainName>{host}</DomainName>{origin_path}\
+                 <CustomOriginConfig><HTTPPort>80</HTTPPort><HTTPSPort>443</HTTPSPort>\
+                 <OriginProtocolPolicy>https-only</OriginProtocolPolicy>\
+                 <OriginSslProtocols><Quantity>1</Quantity>\
+                 <Items><SslProtocol>TLSv1.2</SslProtocol></Items></OriginSslProtocols>\
+                 </CustomOriginConfig></Origin>",
+                row.id
+            )
+        })
+        .collect();
+    let tail = behavior_tail();
+    let ordered: Vec<&OriginRow> = origins.iter().filter(|row| row.pattern.is_some()).collect();
+    let behaviors: String = ordered
+        .iter()
+        .map(|row| {
+            format!(
+                "<CacheBehavior><PathPattern>{}</PathPattern>\
+                 <TargetOriginId>{}</TargetOriginId>{tail}</CacheBehavior>",
+                row.pattern.unwrap_or_default(),
+                row.id
+            )
+        })
+        .collect();
+    let cache_behaviors = if ordered.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<CacheBehaviors><Quantity>{}</Quantity><Items>{behaviors}</Items></CacheBehaviors>",
+            ordered.len()
+        )
+    };
+    let default_target = origins.first().map(|row| row.id).unwrap_or_default();
+    format!(
+        "<DistributionConfig xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">\
+         <CallerReference>{caller_reference}</CallerReference>\
+         <Origins><Quantity>{}</Quantity><Items>{items}</Items></Origins>\
+         <DefaultCacheBehavior><TargetOriginId>{default_target}</TargetOriginId>{tail}\
+         </DefaultCacheBehavior>{cache_behaviors}\
+         <Comment>origin paths over one backend</Comment>\
+         <Enabled>true</Enabled>\
+         </DistributionConfig>",
+        origins.len()
+    )
+}
+
+/// One viewer request of the table: what it asks the edge for, what it states about itself, the
+/// path the ORIGIN must then be asked for, and the country the origin must be told.
+struct PathRow {
+    case: &'static str,
+    /// The path and query the viewer asks the edge for.
+    viewer: &'static str,
+    /// The country code the viewer states, where it states one.
+    stated_country: Option<&'static str>,
+    /// The path the origin must be asked for: the matched behaviour's origin's `OriginPath`
+    /// followed by the viewer path.
+    origin_sees: &'static str,
+    /// The country the origin must be told, or `None` where the edge's OWN country is what it
+    /// reports — one value for every such request, which the row holds it to.
+    country: Option<&'static str>,
+}
+
+/// A request the edge serves from an origin is asked of that origin under the origin's
+/// `OriginPath` followed by the viewer's path, and carries the headers the edge GENERATES about
+/// the viewer's connection — the country it is in and the scheme it dialled.
+///
+/// One distribution, four origins on ONE function URL backend differing only in the
+/// `OriginPath` each carries, and rows that span what the rule generalises over: no
+/// `OriginPath` at all, one segment, several segments, and one spelled like the viewer's own
+/// first segment; a viewer path that is a file, a nested path, the root, and one carrying a
+/// query; and a viewer that states its country, one that states something that is no country,
+/// and one that states nothing. Each row reads what the origin was asked for from the origin's
+/// OWN report, and holds Lambda's `Invocations` series to having counted the fetch, so "the
+/// origin was reached" is a fact of the owning service's records.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_origin_sees_its_origin_path_ahead_of_the_viewer_path_and_the_edges_own_headers() {
+    let topology = Topology::new();
+    let case = "origin paths over one function URL backend";
+    let function = "cf-edge-origin-path";
+    let backend = topology.public_function_url_host(case, function).await;
+    let origins = [
+        OriginRow {
+            id: "prefixed",
+            origin_path: Some(PREFIXED_ORIGIN_PATH),
+            pattern: None,
+        },
+        OriginRow {
+            id: "bare",
+            origin_path: None,
+            pattern: Some("/bare/*"),
+        },
+        OriginRow {
+            id: "deep",
+            origin_path: Some("/deep/nested"),
+            pattern: Some("/under/*"),
+        },
+        OriginRow {
+            id: "doubled",
+            origin_path: Some("/echo"),
+            pattern: Some("/echo/*"),
+        },
+    ];
+    let (id, _arn, domain) = topology
+        .created_distribution(
+            case,
+            &origin_path_config_xml("edge-origin-path", &backend, &origins),
+        )
+        .await;
+    topology.awaited_deployment(case, &id).await;
+
+    let rows: &[PathRow] = &[
+        PathRow {
+            case: "the default behaviour's prefixed origin",
+            viewer: OPEN_PATH,
+            stated_country: None,
+            origin_sees: "/content/whoami",
+            country: None,
+        },
+        PathRow {
+            case: "a nested viewer path under the same origin",
+            viewer: "/assets/img/logo.png",
+            stated_country: None,
+            origin_sees: "/content/assets/img/logo.png",
+            country: None,
+        },
+        PathRow {
+            case: "a viewer query, which is no part of the path",
+            viewer: "/whoami?b=2&a=1",
+            stated_country: None,
+            origin_sees: "/content/whoami",
+            country: None,
+        },
+        PathRow {
+            case: "the root path",
+            viewer: "/",
+            stated_country: None,
+            origin_sees: "/content/",
+            country: None,
+        },
+        PathRow {
+            case: "a second origin on the same backend carrying no OriginPath",
+            viewer: "/bare/whoami",
+            stated_country: None,
+            origin_sees: "/bare/whoami",
+            country: None,
+        },
+        PathRow {
+            case: "an OriginPath several segments deep",
+            viewer: "/under/whoami",
+            stated_country: None,
+            origin_sees: "/deep/nested/under/whoami",
+            country: None,
+        },
+        PathRow {
+            case: "an OriginPath spelled like the viewer's own first segment",
+            viewer: "/echo/whoami",
+            stated_country: None,
+            origin_sees: "/echo/echo/whoami",
+            country: None,
+        },
+        PathRow {
+            case: "a viewer that states the country it is in",
+            viewer: OPEN_PATH,
+            stated_country: Some("de"),
+            origin_sees: "/content/whoami",
+            country: Some("DE"),
+        },
+        PathRow {
+            case: "a viewer that states something that is no country",
+            viewer: OPEN_PATH,
+            stated_country: Some("Elbonia"),
+            origin_sees: "/content/whoami",
+            country: None,
+        },
+    ];
+
+    // The country the edge reports for a viewer it is told nothing about: read off the first
+    // such row and held to being the same for every other one.
+    let mut edge_country = String::new();
+    for row in rows {
+        let stated: Vec<(&str, &str)> = row
+            .stated_country
+            .map(|country| vec![(VIEWER_COUNTRY_HEADER, country)])
+            .unwrap_or_default();
+        let before = topology.invocations(row.case, function).await;
+        let answered = Answered::of_stating(row.case, &domain, "GET", row.viewer, &stated).await;
+        let after = topology.invocations(row.case, function).await;
+        assert_eq!(
+            answered.status, 200,
+            "case {:?}: expected the origin's answer through the edge, got {} with {:?}",
+            row.case, answered.status, answered.raw
+        );
+        assert!(
+            answered.reports_cache(MISS),
+            "case {:?}: expected an answer the origin produced for this request ({MISS:?}), got \
+             {:?}",
+            row.case,
+            answered.raw
+        );
+        assert!(
+            answered.carries_the_origins_bytes(),
+            "case {:?}: expected the origin's own bytes, got {:?}",
+            row.case,
+            answered.body
+        );
+        assert!(
+            after > before,
+            "case {:?}: the fetch must reach the origin, but the function's invocations stayed \
+             at {before} (now {after})",
+            row.case
+        );
+        let report = answered.report(row.case);
+        let seen = report["path"].as_str().unwrap_or_default();
+        assert_eq!(
+            seen, row.origin_sees,
+            "case {:?}: expected the origin to be asked for {:?}, got {seen:?} ({report})",
+            row.case, row.origin_sees
+        );
+        let names = header_names(&report);
+        for generated in [
+            VIEWER_COUNTRY_HEADER,
+            FORWARDED_PROTO_HEADER,
+            VIEWER_ADDRESS_HEADER,
+        ] {
+            assert!(
+                names.iter().any(|name| name == generated),
+                "case {:?}: expected the edge to generate {generated:?} for the origin request, \
+                 got the headers {names:?}",
+                row.case
+            );
+        }
+        let country = report["country"].as_str().unwrap_or_default().to_string();
+        assert!(
+            country.len() == 2 && country.chars().all(|letter| letter.is_ascii_uppercase()),
+            "case {:?}: expected a two-letter uppercase country code at the origin, got \
+             {country:?} ({report})",
+            row.case
+        );
+        match row.country {
+            Some(expected) => assert_eq!(
+                country, expected,
+                "case {:?}: expected the origin to be told the country {expected:?}, got \
+                 {country:?}",
+                row.case
+            ),
+            None => {
+                if edge_country.is_empty() {
+                    edge_country = country.clone();
+                }
+                assert_eq!(
+                    country, edge_country,
+                    "case {:?}: expected the edge's own country {edge_country:?} for a viewer it \
+                     was told no code for, got {country:?}",
+                    row.case
+                );
+            }
+        }
+        let proto = report["proto"].as_str().unwrap_or_default();
+        assert_eq!(
+            proto,
+            PLAINTEXT_SCHEME,
+            "case {:?}: expected the origin to be told the scheme the viewer dialled, got \
+             {proto:?}",
+            row.case
+        );
+        let reported_address = report["address"].as_str().unwrap_or_default().to_string();
+        let observed = viewer_ip(&reported_address);
+        assert!(
+            observed.parse::<::std::net::IpAddr>().is_ok(),
+            "case {:?}: expected the origin to be told the viewer's address, got \
+             {reported_address:?} ({report})",
+            row.case
+        );
+    }
+
+    // The scheme the origin is told is the one the VIEWER dialled rather than a constant: the
+    // same path over the `https://` half of that one published address is reported as `https`,
+    // and is asked of the origin under the same `OriginPath`.
+    let tls_case = "the same viewer path dialled over TLS";
+    let (status, body) = dial_over_tls(tls_case, format!("https://{domain}{OPEN_PATH}")).await;
+    assert_eq!(
+        status, 200,
+        "case {tls_case:?}: expected the origin's answer over TLS, got {status} with {body:?}"
+    );
+    let report: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+    assert_eq!(
+        report["path"].as_str().unwrap_or_default(),
+        format!("{PREFIXED_ORIGIN_PATH}{OPEN_PATH}"),
+        "case {tls_case:?}: expected the origin to be asked for the prefixed path, got {report}"
+    );
+    assert_eq!(
+        report["proto"].as_str().unwrap_or_default(),
+        SECURE_SCHEME,
+        "case {tls_case:?}: expected the origin to be told the scheme the viewer dialled, got \
+         {report}"
+    );
+}
+
+/// The two schemes a viewer may dial the one published address over, as the edge reports them
+/// to the origin.
+const PLAINTEXT_SCHEME: &str = "http";
+const SECURE_SCHEME: &str = "https";
