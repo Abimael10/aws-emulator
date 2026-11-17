@@ -12,14 +12,18 @@
 //! qualifier resolved to, and `X-Amz-Log-Result` carries the base64 log tail when
 //! `LogType=Tail` asked for one. `InvokeWithResponseStream` answers the same run as an
 //! `application/vnd.amazon.eventstream` body: the response as a `PayloadChunk`, then the
-//! terminating `InvokeComplete`.
+//! terminating `InvokeComplete`. A run the PLATFORM ended rather than the handler is still a
+//! 200 carrying that signal, and the class it reports names the bound that ended it — the
+//! out-of-memory class for a run that held more than its function's `MemorySize`, the
+//! sandbox-timeout class for one past its `Timeout` — and the capacity such a run held of the
+//! function's reserved concurrency is given back when it ends, however it ended.
 //!
 //! Every row drives real HTTP requests through the router, and the rows differ along what
 //! the rule generalises over: what the handler computes (a literal, a value computed from
 //! the event, one read from the function's environment, a value from the standard library),
-//! how it ends (a return, a raise), which qualifier the invocation names (the unpublished
-//! version, a published version, an alias), whether a log tail was asked for, and what the
-//! function's runtime is.
+//! how it ends (a return, a raise, a bound the platform stopped it at), which qualifier the
+//! invocation names (the unpublished version, a published version, an alias), whether a log
+//! tail was asked for, and what the function's runtime is.
 
 use std::io::Write as _;
 use std::sync::Arc;
@@ -745,6 +749,366 @@ async fn a_response_stream_invocation_streams_what_the_handler_produced() {
         assert_eq!(
             deleted.status, 204,
             "case {case}: the function must be removable between rows"
+        );
+    }
+}
+
+/// The smallest `MemorySize` a function may have
+/// (`smithy_query(query="shape", shape="MemorySize")`: `@range(min: 128, max: 32768)`).
+const SMALLEST_MEMORY_SIZE_MB: i64 = 128;
+
+/// A second `MemorySize`, above the smallest the model allows: the class a run killed for
+/// memory is reported under is a property of the KILL and not of the value configured, so one
+/// row carries a size of its own.
+const LARGER_MEMORY_SIZE_MB: i64 = 192;
+
+/// A `MemorySize` no row about another bound comes near, so the memory ceiling ends none of
+/// them.
+const MEMORY_SIZE_OUT_OF_REACH_MB: i64 = 512;
+
+/// A `Timeout` far above the span a row about the MEMORY ceiling needs, so what ends such a
+/// run is the memory bound and never the clock. Well inside the range the model allows the
+/// member (`smithy_query(query="shape", shape="Timeout")`: `@range(min: 1, max: 5400)`).
+const GENEROUS_TIMEOUT_SECS: i64 = 120;
+
+/// The `Timeout` the row about the DEADLINE carries: the smallest the model allows, which is
+/// the bound that row is about.
+const SHORTEST_TIMEOUT_SECS: i64 = 1;
+
+/// A python handler that allocates a megabyte at a time and keeps every one of it, so what
+/// ends its run is the memory its function is configured for rather than the size of one
+/// allocation.
+const PYTHON_ALLOCATES_WITHOUT_STOPPING: &str = "def lambda_handler(event, context):\n    \
+     kept = []\n    \
+     while True:\n        \
+         kept.append(bytearray(b'x' * (1024 * 1024)))\n";
+
+/// The same handler for a node function.
+const NODE_ALLOCATES_WITHOUT_STOPPING: &str =
+    "exports.handler = async () => { const held = []; \
+     for (;;) { held.push(new Array(100000).fill(7)); } };";
+
+/// A python handler that outlives any `Timeout` a row gives it.
+const PYTHON_NEVER_RETURNS: &str = "import time\n\
+     def lambda_handler(event, context):\n    \
+         time.sleep(600)\n";
+
+/// A python handler that ends the way its event asks: holding memory until it is killed,
+/// raising, or returning a value.
+const PYTHON_ENDS_AS_ASKED: &str = "def lambda_handler(event, context):\n    \
+     mode = event.get('mode')\n    \
+     if mode == 'fill':\n        \
+         kept = []\n        \
+         while True:\n            \
+             kept.append(bytearray(b'x' * (1024 * 1024)))\n    \
+     if mode == 'raise':\n        \
+         raise ValueError('boom')\n    \
+     return {'ok': True}\n";
+
+/// What the error document of a stopped run carries as its `errorMessage`.
+enum StopMessage {
+    /// The PLATFORM's own frame: `RequestId: <the invocation's id> Error: <this text>`.
+    Framed(&'static str),
+    /// The handler's own message, as its runtime serialized it.
+    Raised(&'static str),
+}
+
+/// One row of the stop-class table: the case, the function it needs, and what the invocation
+/// has to answer.
+struct StopRow {
+    case: &'static str,
+    runtime: &'static str,
+    source: &'static str,
+    memory_size: i64,
+    timeout: i64,
+    error_type: &'static str,
+    message: StopMessage,
+}
+
+/// Every row of the stop-class table: one per bound the platform ends a run at, with a second
+/// `MemorySize` and a second runtime for the memory one, and the handler's own exception
+/// beside them.
+fn stop_rows() -> Vec<StopRow> {
+    vec![
+        StopRow {
+            case: "a python handler that holds more than the smallest MemorySize",
+            runtime: "python3.12",
+            source: PYTHON_ALLOCATES_WITHOUT_STOPPING,
+            memory_size: SMALLEST_MEMORY_SIZE_MB,
+            timeout: GENEROUS_TIMEOUT_SECS,
+            error_type: "Runtime.OutOfMemory",
+            message: StopMessage::Framed("Runtime exited with error: signal: killed"),
+        },
+        StopRow {
+            case: "a python handler that holds more than a larger MemorySize",
+            runtime: "python3.12",
+            source: PYTHON_ALLOCATES_WITHOUT_STOPPING,
+            memory_size: LARGER_MEMORY_SIZE_MB,
+            timeout: GENEROUS_TIMEOUT_SECS,
+            error_type: "Runtime.OutOfMemory",
+            message: StopMessage::Framed("Runtime exited with error: signal: killed"),
+        },
+        StopRow {
+            case: "a node handler that holds more than its MemorySize",
+            runtime: "nodejs20.x",
+            source: NODE_ALLOCATES_WITHOUT_STOPPING,
+            memory_size: SMALLEST_MEMORY_SIZE_MB,
+            timeout: GENEROUS_TIMEOUT_SECS,
+            error_type: "Runtime.OutOfMemory",
+            message: StopMessage::Framed("Runtime exited with error: signal: killed"),
+        },
+        StopRow {
+            case: "a python handler that outlives its Timeout",
+            runtime: "python3.12",
+            source: PYTHON_NEVER_RETURNS,
+            memory_size: MEMORY_SIZE_OUT_OF_REACH_MB,
+            timeout: SHORTEST_TIMEOUT_SECS,
+            error_type: "Sandbox.Timedout",
+            message: StopMessage::Framed("Task timed out after 1.00 seconds"),
+        },
+        StopRow {
+            case: "a python handler that raises an exception of its own",
+            runtime: "python3.12",
+            source: "def lambda_handler(event, context):\n    raise ValueError('boom')\n",
+            memory_size: MEMORY_SIZE_OUT_OF_REACH_MB,
+            timeout: GENEROUS_TIMEOUT_SECS,
+            error_type: "ValueError",
+            message: StopMessage::Raised("boom"),
+        },
+    ]
+}
+
+/// The deployment package of one row, written by the writer for the row's own language so
+/// this target keeps one archive writer per language.
+fn package_of(runtime: &str, source: &str) -> Vec<u8> {
+    if runtime.starts_with("nodejs") {
+        return crate::node_invoke_run::package(&[("index.js", source)]);
+    }
+    package(source)
+}
+
+/// The `Handler` a package written for `runtime` is entered through.
+fn handler_of(runtime: &str) -> &'static str {
+    if runtime.starts_with("nodejs") {
+        "index.handler"
+    } else {
+        HANDLER
+    }
+}
+
+/// Create the function `name` holding `source` with the `MemorySize` and `Timeout` a row
+/// needs, and wait out the provisioning window the create documents.
+async fn create_bounded_function(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+    runtime: &str,
+    source: &str,
+    memory_size: i64,
+    timeout: i64,
+) {
+    let created = call(
+        router,
+        "POST",
+        FUNCTIONS_URI,
+        &serde_json::to_vec(&json!({
+            "FunctionName": name,
+            "Role": ROLE,
+            "Runtime": runtime,
+            "Handler": handler_of(runtime),
+            "Timeout": timeout,
+            "MemorySize": memory_size,
+            "Code": {
+                "ZipFile": base64::engine::general_purpose::STANDARD
+                    .encode(package_of(runtime, source)),
+            },
+        }))
+        .expect("the create body serializes"),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        created.status,
+        201,
+        "case {case}: CreateFunction {name:?} must succeed, got {} {}",
+        created.status,
+        created.text()
+    );
+    tokio::time::sleep(ACTIVATION_DELAY + SLACK).await;
+}
+
+/// A member of an error document as text, or the empty string when it is absent.
+fn document_member(document: &Value, name: &str) -> String {
+    document
+        .get(name)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// A run the PLATFORM ended is still an HTTP 200 carrying the `Unhandled` signal, and the
+/// class it reports names the bound that ended it: the out-of-memory class for a run that
+/// held more memory than its function's `MemorySize`, the sandbox-timeout class for one past
+/// its `Timeout`, while a handler's own exception keeps the exception's own class.
+///
+/// The rows differ along what the rule generalises over: which bound ended the run, the
+/// `MemorySize` the function carries, and the runtime the handler is written for.
+#[tokio::test]
+async fn a_run_the_platform_ended_reports_the_class_of_the_bound_that_ended_it() {
+    let _stream = crate::invoke_request_id::one_invocation_stream_at_a_time().await;
+    let engine = Arc::new(engine::InMemoryEngine::new());
+    let router = router_on(&engine);
+    for row in stop_rows() {
+        let case = row.case;
+        let name = "probe-stop-class";
+        create_bounded_function(
+            &router,
+            case,
+            name,
+            row.runtime,
+            row.source,
+            row.memory_size,
+            row.timeout,
+        )
+        .await;
+        let answered = invoke(&router, name, b"{}", &[]).await;
+        assert_eq!(
+            answered.status,
+            200,
+            "case {case}: a run the platform ended is still a 200, got {} {}",
+            answered.status,
+            answered.text()
+        );
+        assert_eq!(
+            answered.header("x-amz-function-error").as_deref(),
+            Some("Unhandled"),
+            "case {case}: expected the Unhandled signal, got {:?} with {}",
+            answered.header("x-amz-function-error"),
+            answered.text()
+        );
+        let document = answered.json();
+        let reported = document_member(&document, "errorType");
+        assert_eq!(
+            reported, row.error_type,
+            "case {case}: expected the class {:?}, got {reported:?} in {document}",
+            row.error_type
+        );
+        let stated = document_member(&document, "errorMessage");
+        match row.message {
+            StopMessage::Framed(happened) => {
+                let named = stated
+                    .strip_prefix("RequestId: ")
+                    .and_then(|rest| rest.strip_suffix(&format!(" Error: {happened}")))
+                    .unwrap_or_default()
+                    .to_string();
+                assert!(
+                    crate::invoke_request_id::is_request_id(&named),
+                    "case {case}: expected the message \"RequestId: <the invocation> Error: \
+                     {happened}\", got {stated:?}"
+                );
+                assert_eq!(
+                    Some(named.clone()),
+                    answered.header("x-amzn-requestid"),
+                    "case {case}: the message must name the invocation the answer names, got \
+                     {named:?} against {:?}",
+                    answered.header("x-amzn-requestid")
+                );
+            }
+            StopMessage::Raised(raised) => {
+                assert_eq!(
+                    stated, raised,
+                    "case {case}: expected the handler's own message {raised:?}, got {stated:?} \
+                     in {document}"
+                );
+            }
+        }
+        let deleted = call(&router, "DELETE", &format!("{FUNCTIONS_URI}/{name}"), &[], &[]).await;
+        assert_eq!(
+            deleted.status, 204,
+            "case {case}: the function must be removable between rows"
+        );
+    }
+}
+
+/// The capacity an invocation holds of its function's reserved concurrency is given back when
+/// the invocation ENDS, however it ended — a handler that returned, one that raised, and a run
+/// the platform killed for memory all leave a reservation of one free for the next caller.
+///
+/// One row per way the invocation that held the reservation ended, which is what the rule
+/// generalises over.
+#[tokio::test]
+async fn a_reservation_of_one_serves_the_next_caller_however_the_last_run_ended() {
+    let _stream = crate::invoke_request_id::one_invocation_stream_at_a_time().await;
+    let engine = Arc::new(engine::InMemoryEngine::new());
+    let router = router_on(&engine);
+    let name = "probe-stop-release";
+    create_bounded_function(
+        &router,
+        "the reservation fixture",
+        name,
+        "python3.12",
+        PYTHON_ENDS_AS_ASKED,
+        SMALLEST_MEMORY_SIZE_MB,
+        GENEROUS_TIMEOUT_SECS,
+    )
+    .await;
+    let reserved = call(
+        &router,
+        "PUT",
+        &format!("/2017-10-31/functions/{name}/concurrency"),
+        &serde_json::to_vec(&json!({ "ReservedConcurrentExecutions": 1 }))
+            .expect("the concurrency body serializes"),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        reserved.status,
+        200,
+        "PutFunctionConcurrency must succeed, got {} {}",
+        reserved.status,
+        reserved.text()
+    );
+    // (the case, the event that ends the holding invocation that way)
+    let endings: &[(&str, Value)] = &[
+        ("a handler that returned", json!({ "mode": "return" })),
+        ("a handler that raised", json!({ "mode": "raise" })),
+        ("a run the memory ceiling ended", json!({ "mode": "fill" })),
+    ];
+    for (case, event) in endings {
+        let held = invoke(
+            &router,
+            name,
+            &serde_json::to_vec(event).expect("the event serializes"),
+            &[],
+        )
+        .await;
+        assert_eq!(
+            held.status,
+            200,
+            "case {case}: the invocation holding the reservation must be served, got {} {}",
+            held.status,
+            held.text()
+        );
+        let after = invoke(&router, name, br#"{"mode": "return"}"#, &[]).await;
+        assert_eq!(
+            after.status,
+            200,
+            "case {case}: the reservation must be free once that run ended, got {} {}",
+            after.status,
+            after.text()
+        );
+        assert_eq!(
+            after.json(),
+            json!({ "ok": true }),
+            "case {case}: expected the handler's own value from the admitted caller, got {}",
+            after.text()
+        );
+        assert_eq!(
+            after.header("x-amz-function-error"),
+            None,
+            "case {case}: the admitted caller's own run must not fail, got {:?} with {}",
+            after.header("x-amz-function-error"),
+            after.text()
         );
     }
 }

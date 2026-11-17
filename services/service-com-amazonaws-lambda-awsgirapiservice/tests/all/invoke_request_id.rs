@@ -252,10 +252,10 @@ async fn invoke(
     .await
 }
 
-/// The `errorType` an answer carries for a run whose RUNTIME ended instead of answering,
-/// and the message this emulator reports for the one such ending the HOST decides: a run
-/// stopped on a memory bound (`state::execution`'s report for `Stop::Memory`).
-const RUNTIME_EXIT_ERROR: &str = "Runtime.ExitError";
+/// The `errorType` an answer carries for a run the HOST's own memory bound stopped, and the
+/// message this emulator reports for it: a run stopped on a memory bound is reported under
+/// the out-of-memory class (`state::execution`'s report for `Stop::Memory`).
+const RUNTIME_OUT_OF_MEMORY: &str = "Runtime.OutOfMemory";
 const RUNTIME_KILLED: &str = "signal: killed";
 
 /// How many times a row re-drives its invocation while the host keeps refusing or stopping
@@ -478,7 +478,7 @@ pub(crate) fn is_host_bound(status: u16, body: &str) -> bool {
     if status != 200 {
         return body.contains("invocations are running in this emulator");
     }
-    body.contains(RUNTIME_EXIT_ERROR) && body.contains(RUNTIME_KILLED)
+    body.contains(RUNTIME_OUT_OF_MEMORY) && body.contains(RUNTIME_KILLED)
 }
 
 /// Whether `class` is an error class a runtime reports for a failure it raised while it

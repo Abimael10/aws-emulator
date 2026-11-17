@@ -125,9 +125,10 @@ fn expected_refusal_message(identity: &str) -> String {
 /// what the email service answered — so the invocation below looks again when it sees it, the
 /// way a client polling its own handler's flag does, rather than reading it as the service's
 /// reply. A run that outlived the function's own `Timeout` is NOT in this set: that is an
-/// answer about the call, and this suite fails on it. Source: the class this crate's runtime
-/// reports for a run whose runtime ended instead of answering (`state::execution`).
-const HOST_ENDED_THE_RUN: &str = "Runtime.ExitError";
+/// answer about the call, and this suite fails on it. Source: the classes this crate's
+/// runtime reports for a run whose runtime ended instead of answering and for one the memory
+/// ceiling ended (`state::execution`).
+const HOST_ENDED_THE_RUN: [&str; 2] = ["Runtime.ExitError", "Runtime.OutOfMemory"];
 
 /// The state a function that can be invoked reports, and the one it is created in.
 const ACTIVE: &str = "Active";
@@ -491,7 +492,9 @@ async fn invoke(
             .get("x-amz-function-error")
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
-        let host_ended = payload["errorType"] == json!(HOST_ENDED_THE_RUN);
+        let host_ended = HOST_ENDED_THE_RUN
+            .iter()
+            .any(|class| payload["errorType"] == json!(class));
         if !host_ended {
             return (signal, payload);
         }

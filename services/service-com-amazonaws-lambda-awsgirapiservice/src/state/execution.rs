@@ -1108,11 +1108,13 @@ fn answered(
             Some(FUNCTION_ERROR_UNHANDLED.to_string()),
         ),
         // A run the memory ceiling ended is one whose runtime was killed, which is what
-        // AWS reports it as: "Runtime exited with error: signal: killed".
+        // AWS reports it as: "Runtime exited with error: signal: killed". The CLASS is the
+        // out-of-memory one rather than the runtime's generic exit, because what ended the
+        // run is known: it held more memory than its function is configured for.
         Completion::Stopped(Stop::Memory) => (
             sandbox_error_document(
                 &format!("RequestId: {request_id} Error: {RUNTIME_KILLED}"),
-                RUNTIME_EXIT_ERROR,
+                RUNTIME_OUT_OF_MEMORY,
             ),
             Some(FUNCTION_ERROR_UNHANDLED.to_string()),
         ),
@@ -1189,6 +1191,12 @@ fn answered(
 
 /// The `errorType` of a run whose runtime ended instead of answering.
 const RUNTIME_EXIT_ERROR: &str = "Runtime.ExitError";
+
+/// The `errorType` of a run the platform ended because it held more memory than the
+/// function's own `MemorySize` allows. Running out of memory is a failure the platform can
+/// NAME, so it is reported under its own class rather than under the class of a runtime that
+/// ended for an unstated reason ([`RUNTIME_EXIT_ERROR`]).
+const RUNTIME_OUT_OF_MEMORY: &str = "Runtime.OutOfMemory";
 
 /// The `errorType` of a run the SANDBOX ended because it ran past the function's own
 /// `Timeout`. The failure is the sandbox's rather than the handler's, so it is the class
@@ -1986,7 +1994,7 @@ mod tests {
         // The bound the run was stopped by, and the class the platform reports it under.
         let stops: &[(Stop, &str)] = &[
             (Stop::Deadline, SANDBOX_TIMEDOUT),
-            (Stop::Memory, RUNTIME_EXIT_ERROR),
+            (Stop::Memory, RUNTIME_OUT_OF_MEMORY),
             (Stop::Response, RESPONSE_SIZE_TOO_LARGE),
             (Stop::Steps, RUNTIME_EXIT_ERROR),
             (Stop::HostCeiling, RUNTIME_EXIT_ERROR),

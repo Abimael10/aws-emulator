@@ -714,7 +714,7 @@ async fn a_run_past_the_functions_own_bounds_ends_with_lambdas_error() {
             10,
             128,
             "Runtime exited with error: signal: killed",
-            Some("Runtime.ExitError"),
+            Some("Runtime.OutOfMemory"),
         ),
     ];
     let engine = Arc::new(engine::InMemoryEngine::new());
