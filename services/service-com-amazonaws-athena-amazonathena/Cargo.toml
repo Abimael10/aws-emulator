@@ -94,6 +94,8 @@ tracing = { workspace = true }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Declares one module per `tests/all/<name>.rs`, so a suite is picked up by being there.
+automod = { workspace = true }
 sha2 = { workspace = true }
 # Lake Formation, mounted beside Athena, Glue and Amazon S3 on one engine in the
 # lake-formation suite: a query over a governed Data Catalog table is answered from the

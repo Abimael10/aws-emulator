@@ -142,12 +142,12 @@ use ::service_com_amazonaws_glue_awsglue::ops::types::Column as GlueColumn;
 use ::service_com_amazonaws_glue_awsglue::state as glue_state;
 
 use crate::ops::types::{
-    Column, DataCatalog, DataCatalogSummary, EngineVersion, ManagedQueryResultsConfiguration,
-    ManagedQueryResultsTimeToLive, QueryExecution, QueryExecutionContext, QueryExecutionDetail,
-    QueryExecutionDetailStats, QueryExecutionDetailStatus, QueryExecutionStatistics,
-    QueryExecutionStatus, ResultConfiguration, ResultReuseConfiguration, ResultReuseInformation,
-    TableMetadata, Tag, WorkGroup, WorkGroupConfiguration, WorkGroupSummary,
-    CONNECTION_TYPE_VALUES, DATA_CATALOG_TYPE_VALUES,
+    Column, DataCatalog, DataCatalogSummary, EngineConfiguration, EngineVersion,
+    ManagedQueryResultsConfiguration, ManagedQueryResultsTimeToLive, MonitoringConfiguration,
+    QueryExecution, QueryExecutionContext, QueryExecutionDetail, QueryExecutionDetailStats,
+    QueryExecutionDetailStatus, QueryExecutionStatistics, QueryExecutionStatus, ResultConfiguration,
+    ResultReuseConfiguration, ResultReuseInformation, TableMetadata, Tag, WorkGroup,
+    WorkGroupConfiguration, WorkGroupSummary, CONNECTION_TYPE_VALUES, DATA_CATALOG_TYPE_VALUES,
 };
 
 /// The `WorkGroupState` a freshly created workgroup is in. One of
@@ -451,8 +451,28 @@ pub fn tag_list_error(tags: &[Tag]) -> Option<String> {
 ///
 /// Linear in the size of the request it measures, and it allocates nothing.
 pub fn open_configuration_bytes(configuration: &WorkGroupConfiguration) -> usize {
+    open_collection_bytes(
+        configuration.engine_configuration.as_ref(),
+        configuration.monitoring_configuration.as_ref(),
+    )
+}
+
+/// The bytes of keys and values held in the OPEN collections of an engine configuration and
+/// a monitoring configuration — the ones the model bounds neither in length nor in element
+/// count.
+///
+/// The measurement [`open_configuration_bytes`] makes of a workgroup's configuration, stated
+/// over the two members that carry those collections, so a session started with its own
+/// engine and monitoring configuration is measured by the same rule and against the same
+/// ceiling ([`MAX_WORK_GROUP_CONFIGURATION_BYTES`]).
+///
+/// Linear in the size of the request it measures, and it allocates nothing.
+pub fn open_collection_bytes(
+    engine_configuration: Option<&EngineConfiguration>,
+    monitoring_configuration: Option<&MonitoringConfiguration>,
+) -> usize {
     let mut bytes = 0usize;
-    if let Some(engine) = configuration.engine_configuration.as_ref() {
+    if let Some(engine) = engine_configuration {
         for map in [
             engine.additional_configs.as_ref(),
             engine.spark_properties.as_ref(),
@@ -472,9 +492,7 @@ pub fn open_configuration_bytes(configuration: &WorkGroupConfiguration) -> usize
             }
         }
     }
-    let log_types = configuration
-        .monitoring_configuration
-        .as_ref()
+    let log_types = monitoring_configuration
         .and_then(|monitoring| monitoring.cloud_watch_logging_configuration.as_ref())
         .and_then(|logging| logging.log_types.as_ref());
     for (key, values) in log_types.into_iter().flatten() {

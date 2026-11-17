@@ -33,7 +33,7 @@ pub struct GetSessionOutput {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.athena#SessionConfiguration")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct SessionConfiguration {
     pub execution_role: Option<String>,
     pub working_directory: Option<String>,

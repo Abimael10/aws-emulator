@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartSession
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartSession`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartSession::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A session this account's Spark enabled workgroup runs calculations in, written into
+//! this service's [`crate::state::SessionRegistry`]: the start stores everything the
+//! request carried in a [`crate::state::SessionRecord`] and every later read of that
+//! session — its status, its configuration, a notebook's session listing — answers out of
+//! that same record, so no value a read reports is one derived from the reading request.
+//!
+//! A session has a LIFECYCLE the clock owes: "The session is ready when it reaches an IDLE
+//! state", so the start stores when the session's resources are due and the state every
+//! read reports follows from that instant ([`crate::state::SessionRecord::state_at`]). A
+//! caller reading the session straight back still observes the documented CREATING state,
+//! and the session becomes idle whether or not anybody polls it.
+//!
+//! The one "already exists" condition the model words for a session
+//! (`SessionAlreadyExistsException`) is not reachable through a `ClientRequestToken`
+//! repeat: that member documents the repeat as answering with the session the token
+//! already minted rather than as a failure, which is what this handler does.
 //!
 //! ## Shape of an operation
 //!
@@ -184,18 +192,190 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartSession` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartSessionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartSession"))
+        // A session runs IN a workgroup, and the workgroup is the IAM resource this action
+        // is scoped by, so the start is authorized against that workgroup's ARN before
+        // anything is read or written. See `crate::state::authorization`.
+        crate::state::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::authorization::work_group_arn(ctx, &input.work_group),
+        )
+        .map_err(StartSessionError::AccessDenied)?;
+
+        // Check the caller-supplied collections FIRST, before any lock is taken: a request
+        // that is going to be refused never walks the registry.
+        let tags = input.tags.unwrap_or_default();
+        // The rules a `TagList` carries, stated once for every operation that takes one.
+        if let Some(message) = crate::state::tag_list_error(&tags) {
+            return Err(invalid_request(message));
+        }
+
+        // The engine and monitoring configurations carry the collections the model bounds in
+        // neither length nor element count, and a started session holds them for as long as
+        // the registry keeps its record — so they are measured against the same ceiling a
+        // stored workgroup configuration is, before anything is stored.
+        let open_bytes = crate::state::open_collection_bytes(
+            Some(&input.engine_configuration),
+            input.monitoring_configuration.as_ref(),
+        );
+        if open_bytes > crate::state::MAX_WORK_GROUP_CONFIGURATION_BYTES {
+            return Err(invalid_request(format!(
+                "EngineConfiguration and MonitoringConfiguration carry {open_bytes} bytes of \
+                 Spark properties, classifications and log types, more than the {} bytes a \
+                 session configuration can hold.",
+                crate::state::MAX_WORK_GROUP_CONFIGURATION_BYTES
+            )));
+        }
+
+        // "To specify an Athena notebook that the Jupyter server will download and serve,
+        // specify a value for the StartSessionRequest$NotebookVersion field, and then add a
+        // key named NotebookId to AdditionalConfigs" — so which notebook the session belongs
+        // to travels in the engine configuration, and a version without a notebook names no
+        // notebook to serve.
+        let notebook_id = crate::state::notebook_of_engine_configuration(Some(
+            &input.engine_configuration,
+        ));
+        if input.notebook_version.is_some() && notebook_id.is_none() {
+            return Err(invalid_request(crate::state::NOTEBOOK_ID_REQUIRED));
+        }
+
+        let Some(session_state) = crate::state::service_state(&*self.engine) else {
+            return Err(StartSessionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("Athena state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = session_state.lock();
+
+        // "A unique case-sensitive string used to ensure the request to create the session
+        // is idempotent (executes only once). If another StartSessionRequest is received,
+        // the same response is returned and another session is not created. If a parameter
+        // has changed, an error is returned." The comparison is made against the record the
+        // token already minted, below, once this request's own record is built — so every
+        // parameter the start persists takes part in it.
+        let minted = input
+            .client_request_token
+            .as_deref()
+            .and_then(|token| store.sessions.session_of_token(token))
+            .cloned();
+
+        // A session runs in a workgroup, so one this account does not hold runs none.
+        if !store.holds_work_group(&input.work_group) {
+            return Err(invalid_request(crate::state::WORK_GROUP_NOT_FOUND));
+        }
+        // The one workgroup the registry holds no record for is the account's default
+        // workgroup, which nothing created and which runs Athena SQL — so it runs no
+        // session either, the same refusal a named SQL workgroup gets below.
+        let Some(work_group) = store.work_groups.get(&input.work_group).cloned() else {
+            return Err(invalid_request(
+                crate::state::work_group_not_spark_enabled(&input.work_group),
+            ));
+        };
+        // "The state of the workgroup: ENABLED or DISABLED" — a disabled workgroup accepts
+        // no work, and a session is work submitted to it.
+        if store.work_group_is_disabled(&input.work_group) {
+            return Err(invalid_request(crate::state::work_group_disabled(
+                &input.work_group,
+            )));
+        }
+        // "Creates a session for running calculations within a workgroup": the calculations
+        // a session runs are Spark ones, and the DPU configuration this operation requires
+        // is documented to apply "only to Spark enabled workgroups". An Athena SQL
+        // workgroup — Athena's own default workgroup among them — runs no session.
+        if !crate::state::is_spark_enabled(&work_group) {
+            return Err(invalid_request(
+                crate::state::work_group_not_spark_enabled(&input.work_group),
+            ));
+        }
+        // A session bound to a notebook is bound to one this account holds: the same miss a
+        // read of that notebook reports, worded the same way.
+        if let Some(notebook) = &notebook_id {
+            if store.notebooks.notebook(notebook).is_none() {
+                return Err(StartSessionError::invalid_request(
+                    crate::state::ERROR_CODE_NOTEBOOK_NOT_FOUND,
+                    crate::state::notebook_not_found(notebook),
+                ));
+            }
+        }
+
+        // The session's resources are not acquired yet: the start stores WHEN they are due
+        // and every read derives the state from that instant, so the session reaches IDLE
+        // whether or not anybody polls it.
+        let now = ::std::time::SystemTime::now();
+        let mut record = crate::state::SessionRecord::started(
+            crate::state::new_session_id(),
+            input.work_group.clone(),
+            notebook_id,
+            now,
+        );
+        record.description = input.description;
+        record.notebook_version = input.notebook_version;
+        // The version the workgroup SELECTED, which is the engine the session's calculations
+        // run on; resolved once here rather than read off the workgroup at every later read.
+        record.engine_version = work_group
+            .configuration
+            .engine_version
+            .as_ref()
+            .and_then(|version| version.selected_engine_version.clone());
+        record.engine_configuration = Some(input.engine_configuration);
+        record.monitoring_configuration = input.monitoring_configuration;
+        // What the request ASKED for is kept beside what the session RUNS under: the
+        // resolved configuration below takes the workgroup's role, working directory and
+        // encryption where the request named none, and the idempotency comparison is about
+        // the request's own parameters.
+        record.requested_execution_role = input.execution_role.clone();
+        record.configuration = crate::state::session_configuration(
+            &work_group,
+            input.execution_role,
+            input.session_idle_timeout_in_minutes,
+        );
+        record.copy_work_group_tags = input.copy_work_group_tags;
+        record.requested_tags = tags.clone();
+        record.tags = crate::state::session_tags(
+            &work_group,
+            tags,
+            input.copy_work_group_tags.unwrap_or(false),
+        );
+
+        // The idempotent repeat: the token already minted a session, so this request either
+        // describes that same session — answered with it, starting nothing further — or
+        // describes another one under a token that is not free.
+        if let Some(minted) = minted {
+            if !minted.same_parameters(&record) {
+                return Err(invalid_request(
+                    crate::state::IDEMPOTENT_PARAMETERS_DO_NOT_MATCH,
+                ));
+            }
+            return Ok(StartSessionOutput {
+                session_id: Some(minted.id.clone()),
+                state: Some(minted.state_at(now).to_string()),
+            });
+        }
+        record.client_request_token = input.client_request_token;
+
+        let session_id = record.id.clone();
+        let started_state = record.state_at(now).to_string();
+        store.sessions.insert(record);
+
+        Ok(StartSessionOutput {
+            session_id: Some(session_id),
+            // The state the stored instants put the session in, not a state written beside
+            // them: the same answer a read taken in this instant reports.
+            state: Some(started_state),
+        })
     }
+}
+
+/// The operation's own client error (HTTP 400), carrying `message`.
+///
+/// Every refusal above is a bad request rather than an unwritten operation, and
+/// `InvalidRequestException` is the client error this operation models: "Indicates that
+/// something is wrong with the input to the request. For example, a required parameter may
+/// be missing or out of range." Each one is caused by the request itself, which is the
+/// class [`crate::state::ERROR_CODE_INVALID_INPUT`] names.
+fn invalid_request(message: impl Into<String>) -> StartSessionError {
+    StartSessionError::invalid_request(crate::state::ERROR_CODE_INVALID_INPUT, message)
 }

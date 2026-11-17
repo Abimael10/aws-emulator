@@ -143,7 +143,7 @@ pub struct ResultConfiguration {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.athena#EncryptionConfiguration")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct EncryptionConfiguration {
     pub encryption_option: String,
     pub kms_key: Option<String>,
@@ -231,7 +231,7 @@ pub struct QueryResultsS3AccessGrantsConfiguration {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.athena#Tag")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Tag {
     pub key: Option<String>,
     pub value: Option<String>,
@@ -284,7 +284,7 @@ pub struct WorkGroupConfiguration {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.athena#MonitoringConfiguration")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct MonitoringConfiguration {
     pub cloud_watch_logging_configuration: Option<CloudWatchLoggingConfiguration>,
     pub managed_logging_configuration: Option<ManagedLoggingConfiguration>,
@@ -292,7 +292,7 @@ pub struct MonitoringConfiguration {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.athena#CloudWatchLoggingConfiguration")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct CloudWatchLoggingConfiguration {
     pub enabled: bool,
     pub log_group: Option<String>,
@@ -301,14 +301,14 @@ pub struct CloudWatchLoggingConfiguration {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.athena#ManagedLoggingConfiguration")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ManagedLoggingConfiguration {
     pub enabled: bool,
     pub kms_key: Option<String>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.athena#S3LoggingConfiguration")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct S3LoggingConfiguration {
     pub enabled: bool,
     pub kms_key: Option<String>,
@@ -316,7 +316,7 @@ pub struct S3LoggingConfiguration {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.athena#EngineConfiguration")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct EngineConfiguration {
     pub coordinator_dpu_size: Option<i32>,
     pub max_concurrent_dpus: Option<i32>,
@@ -327,7 +327,7 @@ pub struct EngineConfiguration {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.athena#Classification")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Classification {
     pub name: Option<String>,
     pub properties: Option<std::collections::HashMap<String, String>>,
