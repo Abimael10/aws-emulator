@@ -152,6 +152,68 @@ pub fn kms_key_refusal<Eng: Send + Sync + 'static>(
     })
 }
 
+/// The `EncryptionAtRestOptions` a domain STORES for the container a request carried: the
+/// same container, with the key its data is encrypted under NAMED.
+///
+/// `EncryptionAtRestOptions` is "whether the domain should encrypt data at rest, and if so,
+/// the Key Management Service (KMS) key to use", and `KmsKeyId` is "the KMS key ID"
+/// (`smithy_query(query="doc",shape="EncryptionAtRestOptions"[,member="KmsKeyId"])`). A
+/// domain whose encryption at rest is ENABLED is provisioned through exactly one key whether
+/// or not the request named one — a request that names none asks for the Amazon Web Services
+/// managed key of this service ([`AWS_MANAGED_KEY_ALIAS`]), which is also the key the
+/// service's grant goes on ([`super::encryption_grant`]) — so the service resolves that key
+/// and the stored configuration carries the ARN KMS answered for it. Every read of the domain
+/// then reports the key its data is encrypted under rather than an enabled configuration
+/// naming no key at all.
+///
+/// A container that names a key of its own is stored as WRITTEN: the reference the caller
+/// gave is the one its configuration carries, in the spelling it gave it in. A container that
+/// enables no encryption uses no key, so it has none to name.
+///
+/// `region` is the Region the request was signed for, which is the Region the domain lives in
+/// and so the Region its key answers at. An engine with no KMS to ask resolves no key and the
+/// container is stored as written: nothing is named on evidence that is not there.
+///
+/// LOCKING: this takes the KMS store's guard, so it is called with this service's own
+/// released — the way [`kms_key_refusal`] above is.
+pub fn container_with_resolved_key<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    region: &str,
+    options: Option<EncryptionAtRestOptions>,
+) -> Option<EncryptionAtRestOptions> {
+    let mut options = options?;
+    if !options.enabled.unwrap_or(false) {
+        return Some(options);
+    }
+    if options
+        .kms_key_id
+        .as_deref()
+        .is_some_and(|named| !named.is_empty())
+    {
+        return Some(options);
+    }
+    if let Some(arn) = aws_managed_key_arn(engine, region) {
+        options.kms_key_id = Some(arn);
+    }
+    Some(options)
+}
+
+/// The ARN of the Amazon Web Services managed key of THIS service at `region`, as KMS
+/// answers for it.
+///
+/// A predefined Amazon Web Services alias carries no key until one is asked for — "if you
+/// specify a predefined Amazon Web Services alias (an Amazon Web Services alias with no key
+/// ID), KMS associates the alias with an Amazon Web Services managed key"
+/// (`smithy_query(query="doc",shape="DescribeKeyRequest",member="KeyId")` in the KMS model) —
+/// and the service asking for the key to encrypt a domain with is such a call, so the
+/// association happens once and every later call resolves the same key.
+fn aws_managed_key_arn<Eng: Send + Sync + 'static>(engine: &Eng, region: &str) -> Option<String> {
+    let state = kms_store::service_state(engine)?;
+    let mut keys = state.lock();
+    keys.associate_predefined_aws_alias(region, AWS_MANAGED_KEY_ALIAS)
+        .map(|key| key.arn.clone())
+}
+
 /// The detail for a key KMS answered for whose key state is not the one a domain's
 /// encryption at rest requires: the key, by the ARN KMS named it, and the state it is not
 /// in — the requirement rather than the state it happens to be in, so every state outside

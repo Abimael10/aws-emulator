@@ -157,9 +157,9 @@ use super::types::*;
 use std::time::SystemTime;
 
 use crate::state::vpc_network::{
-    placed_vpc, placed_vpc_options, resolve_security_groups, resolve_subnets,
-    security_groups_outside_vpc_refusal, subnets_not_in_one_vpc, subnets_span_two_vpcs,
-    SubnetPlacement,
+    malformed_security_group_refusal, placed_vpc, placed_vpc_options, resolve_security_groups,
+    resolve_subnets, security_groups_outside_vpc_refusal, subnets_not_in_one_vpc,
+    subnets_span_two_vpcs, ResolvedSecurityGroups, SubnetPlacement,
 };
 use crate::state::{
     stored_advanced_security_options, stored_aiml_options,
@@ -441,7 +441,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
     async fn handle(
         &self,
-        input: Self::Input,
+        mut input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state =
@@ -463,6 +463,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::log_type_key_refusal(input.log_publishing_options.as_ref()),
             crate::state::custom_endpoint::custom_endpoint_refusal(
                 input.domain_endpoint_options.as_ref(),
+            ),
+            // ... and a `VPCOptions` security group outside the identifier form the service
+            // that issues them mints an id in is a value no security group could be held
+            // under: an input constraint too, stated before anything is resolved
+            // ([`crate::state::vpc_network::malformed_security_group_refusal`]) and by the
+            // same rule the create path applies.
+            malformed_security_group_refusal(
+                input
+                    .vpc_options
+                    .as_ref()
+                    .and_then(|options| options.security_group_ids.as_deref()),
             ),
             // And an `AccessPolicies` document that is not JSON denotes no access policy
             // at all: it is refused by the rule the create path applies
@@ -512,7 +523,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_ref()
             .and_then(|options| options.security_group_ids.as_deref())
         {
-            None => Vec::new(),
+            None => ResolvedSecurityGroups::default(),
             Some(group_ids) => {
                 resolve_security_groups(ctx, &crate::state::request_region(ctx.parts()), group_ids)
                     .await
@@ -561,6 +572,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &crate::state::request_region(ctx.parts()),
             input.encryption_at_rest_options.as_ref(),
         );
+        // A change that ENABLES encryption at rest without naming a key leaves the domain
+        // encrypted under the Amazon Web Services managed key of this service, and `KmsKeyId`
+        // is the member that reports WHICH key that is: the key is resolved here, beside the
+        // access above and before this store is locked and before the merge consumes the
+        // request, so the configuration the change stores names the key the data is encrypted
+        // under, by the same rule the create path applies
+        // ([`crate::state::encryption_at_rest::container_with_resolved_key`]).
+        input.encryption_at_rest_options =
+            crate::state::encryption_at_rest::container_with_resolved_key(
+                &*self.engine,
+                &crate::state::request_region(ctx.parts()),
+                input.encryption_at_rest_options.take(),
+            );
 
         let mut store = state.lock();
 
@@ -622,7 +646,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         });
         if let Some(refusal) = security_groups_outside_vpc_refusal(
             placement_vpc.as_deref(),
-            &security_group_placements,
+            &security_group_placements.placements,
         ) {
             return Err(UpdateDomainConfigErrorModeled::ValidationException(refusal).into());
         }

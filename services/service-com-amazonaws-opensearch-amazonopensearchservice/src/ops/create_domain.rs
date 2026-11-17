@@ -143,8 +143,9 @@ use super::types::*;
 use std::collections::{BTreeMap, VecDeque};
 
 use crate::state::vpc_network::{
-    placed_vpc, placed_vpc_options, resolve_security_groups, resolve_subnets,
-    security_groups_outside_vpc_refusal, subnets_not_in_one_vpc, subnets_span_two_vpcs,
+    malformed_security_group_refusal, placed_vpc, placed_vpc_options, resolve_security_groups,
+    resolve_subnets, security_groups_outside_vpc_refusal, subnets_not_in_one_vpc,
+    subnets_span_two_vpcs, ResolvedSecurityGroups,
 };
 use crate::state::{
     domain_arn, domain_endpoint, domain_id, stored_advanced_security_options, stored_aiml_options,
@@ -269,6 +270,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let name = input.domain_name;
 
+        // A `VPCOptions` security group outside the identifier form the service that issues
+        // them mints an id in is a value no security group could be held under, in any
+        // account: an INPUT constraint, so it is stated before anything is resolved or
+        // written ([`crate::state::vpc_network::malformed_security_group_refusal`]) — there is
+        // nothing to ask the account's network about a value that is no identifier — and by
+        // the same rule the update and the endpoint paths apply.
+        if let Some(refusal) = malformed_security_group_refusal(
+            input
+                .vpc_options
+                .as_ref()
+                .and_then(|options| options.security_group_ids.as_deref()),
+        ) {
+            return Err(CreateDomainErrorModeled::ValidationException(refusal).into());
+        }
+
         // The VPC and the Availability Zones a VPC-access domain reports are DERIVED from
         // the subnets the request names, and a subnet is the resource of the service that
         // owns subnets: they are RESOLVED there, before the store is touched, because an
@@ -295,7 +311,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_ref()
             .and_then(|options| options.security_group_ids.as_deref())
         {
-            None => Vec::new(),
+            None => ResolvedSecurityGroups::default(),
             Some(group_ids) => resolve_security_groups(ctx, &region, group_ids).await,
         };
 
@@ -341,6 +357,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &region,
             input.encryption_at_rest_options.as_ref(),
         );
+        // A create that ENABLES encryption at rest without naming a key leaves the domain
+        // encrypted under the Amazon Web Services managed key of this service, and `KmsKeyId`
+        // is the member that reports WHICH key that is: the key is resolved here, beside the
+        // access above and before this store is locked, so the configuration the domain is
+        // created with names the key its data is encrypted under
+        // ([`crate::state::encryption_at_rest::container_with_resolved_key`]).
+        let encryption_at_rest_options =
+            crate::state::encryption_at_rest::container_with_resolved_key(
+                &*self.engine,
+                &region,
+                input.encryption_at_rest_options,
+            );
 
         let mut store = state.lock();
 
@@ -429,7 +457,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::advanced_security::requested_enabled(
                     input.advanced_security_options.as_ref(),
                 ),
-                input.encryption_at_rest_options.as_ref(),
+                encryption_at_rest_options.as_ref(),
                 input.node_to_node_encryption_options.as_ref(),
                 input.domain_endpoint_options.as_ref(),
             ),
@@ -584,7 +612,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // it resolved nothing for refuse nothing.
         if let Some(refusal) = security_groups_outside_vpc_refusal(
             placed_vpc(&placements).as_deref(),
-            &security_group_placements,
+            &security_group_placements.placements,
         ) {
             return Err(CreateDomainErrorModeled::ValidationException(refusal).into());
         }
@@ -675,7 +703,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .vpc_options
                 .map(|options| placed_vpc_options(options, &placements)),
             cognito_options: input.cognito_options,
-            encryption_at_rest_options: input.encryption_at_rest_options,
+            encryption_at_rest_options,
             node_to_node_encryption_options: input.node_to_node_encryption_options,
             advanced_options: input
                 .advanced_options

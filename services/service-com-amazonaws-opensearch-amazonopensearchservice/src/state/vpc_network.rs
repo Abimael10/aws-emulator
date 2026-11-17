@@ -318,13 +318,47 @@ pub struct SecurityGroupPlacement {
     pub vpc_id: Option<String>,
 }
 
+/// What the service that OWNS security groups answered about the groups a request named:
+/// the groups it reported, and which identifiers it answered about at all.
+///
+/// The two travel together because a group that is ABSENT from the answer means one of two
+/// different things — EC2 holds no such group, or EC2 was never asked (no EC2 in this
+/// process, a hop that failed, an identifier past the resolution's own ceiling) — and only
+/// the first is evidence about the account's network ([`unknown_security_group_refusal`]).
+#[derive(Debug, Clone, Default)]
+pub struct ResolvedSecurityGroups {
+    /// The groups EC2 reported, in the order the request named them.
+    pub placements: Vec<SecurityGroupPlacement>,
+    /// The identifiers EC2 ANSWERED about — the ones a question was put to it about and
+    /// answered. An identifier outside this list is one nothing is known about.
+    answered: Vec<String>,
+}
+
+impl ResolvedSecurityGroups {
+    /// Whether EC2 answered about `group_id`, so what it reported for it — a group, or
+    /// nothing — is evidence about the account's network.
+    #[must_use]
+    pub fn answered_about(&self, group_id: &str) -> bool {
+        self.answered.iter().any(|asked| asked == group_id)
+    }
+
+    /// Whether EC2 reported a security group for `group_id`.
+    fn reported(&self, group_id: &str) -> bool {
+        self.placements
+            .iter()
+            .any(|placement| placement.group_id == group_id)
+    }
+}
+
 /// Every security group of `group_ids` the account has in `region`, as EC2 reports it, in
 /// the order the request named them.
 ///
-/// A security group is Amazon EC2's resource, so which VPC one governs traffic in is EC2's
-/// to say, and this resolves exactly that: an identifier EC2 reports no group for is simply
-/// ABSENT from the answer, and so is every identifier when there is no EC2 to ask. Nothing
-/// of this service's own is said about what could not be resolved.
+/// A security group is Amazon EC2's resource, so which VPC one governs traffic in — and
+/// whether the account holds one at all — is EC2's to say, and this resolves exactly that:
+/// an identifier EC2 reports no group for is simply ABSENT from the answer, and so is every
+/// identifier when there is no EC2 to ask. Nothing of this service's own is said about what
+/// could not be resolved, which is why the identifiers EC2 ANSWERED about travel back beside
+/// the groups ([`ResolvedSecurityGroups`]).
 ///
 /// Asked about in the same hops a placement's subnets are ([`asked_ids`]), for the same
 /// reason.
@@ -332,15 +366,18 @@ pub async fn resolve_security_groups(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     group_ids: &[String],
-) -> Vec<SecurityGroupPlacement> {
+) -> ResolvedSecurityGroups {
     let asked = asked_ids(group_ids);
     if asked.is_empty() {
-        return Vec::new();
+        return ResolvedSecurityGroups::default();
     }
     let Some(client) = ec2(ctx, region) else {
-        return Vec::new();
+        return ResolvedSecurityGroups::default();
     };
     let mut reported: Vec<::aws_sdk_ec2::types::SecurityGroup> = Vec::new();
+    // The identifiers a hop that ANSWERED carried: what EC2 said nothing about is the rest,
+    // and a hop that failed leaves its own identifiers among them.
+    let mut answered: Vec<String> = Vec::new();
     for hop in asked.chunks(IDS_PER_HOP) {
         let by_id = ::aws_sdk_ec2::types::Filter::builder()
             .name(SECURITY_GROUP_ID_FILTER)
@@ -352,7 +389,10 @@ pub async fn resolve_security_groups(
             .send()
             .await
         {
-            Ok(output) => reported.extend(output.security_groups().iter().cloned()),
+            Ok(output) => {
+                reported.extend(output.security_groups().iter().cloned());
+                answered.extend(hop.iter().cloned());
+            }
             Err(error) => {
                 // At `warn`, for the reason the subnet hop warns: a deployment where this
                 // hop fails is one where the network a placement is judged against is
@@ -371,7 +411,7 @@ pub async fn resolve_security_groups(
         .iter()
         .filter_map(|group| group.group_id().map(|id| (id, group)))
         .collect();
-    asked
+    let placements = asked
         .iter()
         .filter_map(|group_id| {
             let group = by_id.get(group_id.as_str())?;
@@ -380,7 +420,86 @@ pub async fn resolve_security_groups(
                 vpc_id: group.vpc_id().map(str::to_owned),
             })
         })
-        .collect()
+        .collect();
+    ResolvedSecurityGroups {
+        placements,
+        answered,
+    }
+}
+
+/// The prefix every security group identifier carries, which is also the form the refusal
+/// below tells a caller to write: a security group is Amazon EC2's resource and `sg-` is the
+/// prefix that service issues one under.
+const SECURITY_GROUP_ID_PREFIX: &str = "sg-";
+
+/// How many hexadecimal digits follow that prefix: the short and the long identifier form
+/// EC2 issues a group id in (8 and 17 digits), which is the whole of the id space — a value
+/// of any other width names no group any account could hold.
+const SECURITY_GROUP_ID_DIGITS: [usize; 2] = [8, 17];
+
+/// Whether `id` is an identifier a security group could be held under at all: the `sg-`
+/// prefix followed by one of the two widths of hexadecimal digits EC2 issues
+/// ([`SECURITY_GROUP_ID_DIGITS`]).
+///
+/// The digits are LOWERCASE hexadecimal, which is the only case that service issues an
+/// identifier in, so an uppercase digit names no group either.
+fn names_a_security_group(id: &str) -> bool {
+    let Some(digits) = id.strip_prefix(SECURITY_GROUP_ID_PREFIX) else {
+        return false;
+    };
+    SECURITY_GROUP_ID_DIGITS.contains(&digits.len())
+        && digits
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// The fixed text both identifier refusals open with, followed by the offending value from
+/// the REQUEST in double quotes — the one rendering of "this value is not an identifier of
+/// the id space it was given for", so the two classes differ only in what follows it.
+fn invalid_id(id: &str) -> String {
+    format!("Invalid id: \"{id}\"")
+}
+
+/// The first entry of `group_ids` that is not of the security-group identifier FORM, and the
+/// refusal naming it, or `None` where every entry could name a group.
+///
+/// A value outside that form names nothing in any account, so it is refused for its SYNTAX —
+/// a fact of the id space rather than of the account's network, which is why this resolves
+/// nothing, and why it is decided before existence: a value that is no identifier cannot be
+/// looked up. The sentence closes with the form the caller should have written.
+pub fn malformed_security_group_refusal(
+    group_ids: Option<&[String]>,
+) -> Option<ValidationException> {
+    let malformed = group_ids?.iter().find(|id| !names_a_security_group(id))?;
+    Some(ValidationException {
+        message: Some(format!(
+            "{} (expecting \"{SECURITY_GROUP_ID_PREFIX}...\")",
+            invalid_id(malformed)
+        )),
+    })
+}
+
+/// The first entry of `group_ids` the account holds no security group for, and the refusal
+/// naming it, or `None` where every entry names a group — which includes every entry EC2 was
+/// not asked about.
+///
+/// `VPCOptions$SecurityGroupIds` names groups of the service that OWNS them, so an identifier
+/// that service answered for no group names nothing a network interface of the placement
+/// could carry: the call is refused with the identifier the request sent, and nothing is
+/// written. Grounded only in what EC2 ANSWERED
+/// ([`ResolvedSecurityGroups::answered_about`]): an identifier it was never asked about — an
+/// emulator with no EC2 mounted, a hop that failed — is evidence of nothing and refuses
+/// nothing.
+pub fn unknown_security_group_refusal(
+    group_ids: Option<&[String]>,
+    resolved: &ResolvedSecurityGroups,
+) -> Option<ValidationException> {
+    let unknown = group_ids?
+        .iter()
+        .find(|id| resolved.answered_about(id) && !resolved.reported(id))?;
+    Some(ValidationException {
+        message: Some(invalid_id(unknown)),
+    })
 }
 
 /// How this service states that the security groups a VPC-access placement names do not

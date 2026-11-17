@@ -453,10 +453,10 @@ async fn the_conflict_refusal_states_the_change_already_in_progress() {
         ),
         (
             "an update of the security groups has not landed",
-            Some(json!({ "SecurityGroupIds": ["sg-0333000000000001"] })),
+            Some(json!({ "SecurityGroupIds": ["sg-03330000000000001"] })),
             json!({
                 "SubnetIds": ["subnet-0333000000000001"],
-                "SecurityGroupIds": ["sg-0333000000000002"],
+                "SecurityGroupIds": ["sg-03330000000000002"],
                 "EgressEnabled": false,
             }),
             VPC_ENDPOINT_CHANGE_UPDATE,

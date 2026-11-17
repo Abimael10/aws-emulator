@@ -15,7 +15,10 @@
 //! for at the domain's OWN Region and answers for in the `Enabled` key state; anything else
 //! is refused with `ValidationException` (HTTP 400) and neither creates a domain nor changes
 //! the encryption of one. A configuration that enables no encryption, or names no key of its
-//! own, uses no caller-named key and so has none to access.
+//! own, uses no caller-named key and so has none to access — and one that enables encryption
+//! without naming a key is STORED naming the key it is encrypted under, the Amazon Web
+//! Services managed key of this service, whose ARN is read from KMS itself
+//! ([`aws_managed_key_arn`]) rather than written here.
 //!
 //! Both refusals are stated under the one sentence the service states a failed key access
 //! in, and the detail after it is the half that differs: a FAILED KMS call relays KMS's own
@@ -431,6 +434,44 @@ async fn encryption(emulator: &Emulator, name: &str) -> Option<Value> {
         .cloned()
 }
 
+/// The ARN of the Amazon Web Services managed key of THIS service at [`REGION`], as KMS
+/// itself answers for it.
+///
+/// A predefined Amazon Web Services alias carries no key until one is asked for, and
+/// `DescribeKey` on it is such a call, so this is the key a domain that enables encryption
+/// without naming one is encrypted under — read from the service that HOLDS it rather than
+/// written here.
+async fn aws_managed_key_arn(emulator: &Emulator) -> String {
+    let answer = emulator
+        .kms_call(REGION, "DescribeKey", json!({ "KeyId": AWS_MANAGED_ALIAS }))
+        .await;
+    assert_eq!(
+        answer.status, 200,
+        "case DescribeKey({AWS_MANAGED_ALIAS:?}): expected 200, got {} with {:?}",
+        answer.status, answer.body
+    );
+    answer.body["KeyMetadata"]["Arn"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!(
+                "case DescribeKey({AWS_MANAGED_ALIAS:?}): expected a key ARN, got {:?}",
+                answer.body
+            )
+        })
+        .to_string()
+}
+
+/// The container a read of the domain reports for the container a request CARRIED: the same
+/// one, except that a configuration which ENABLES encryption without naming a key is stored
+/// naming the key its data is encrypted under — this service's managed key, `managed_key`.
+fn reported_for(options: &Value, managed_key: &str) -> Value {
+    let mut expected = options.clone();
+    if options["Enabled"] == json!(true) && options.get("KmsKeyId").is_none() {
+        expected["KmsKeyId"] = json!(managed_key);
+    }
+    expected
+}
+
 /// Look at `name` through `DescribeDomain` until it reports no work in flight — the
 /// condition a further change waits for, since the service applies one configuration
 /// change of a domain at a time. The wait is for the CONDITION: nothing here asserts on how
@@ -456,6 +497,7 @@ async fn settled(emulator: &Emulator, name: &str) {
 async fn an_enabled_encryption_at_rest_option_must_name_a_usable_key_of_the_domains_region() {
     let emulator = Emulator::with_kms();
     let keys = keys(&emulator).await;
+    let managed_key = aws_managed_key_arn(&emulator).await;
 
     for (index, row) in rows(&keys).into_iter().enumerate() {
         let Row {
@@ -483,10 +525,11 @@ async fn an_enabled_encryption_at_rest_option_must_name_a_usable_key_of_the_doma
                     answer.status, answer.body
                 );
                 let reported = encryption(&emulator, &created).await;
+                let expected = reported_for(&options, &managed_key);
                 assert_eq!(
                     reported.as_ref(),
-                    Some(&options),
-                    "case DescribeDomain({case}): expected the domain to report {options:?}, \
+                    Some(&expected),
+                    "case DescribeDomain({case}): expected the domain to report {expected:?}, \
                      got {reported:?}"
                 );
             }
@@ -498,6 +541,7 @@ async fn an_enabled_encryption_at_rest_option_must_name_a_usable_key_of_the_doma
 async fn the_same_key_rule_governs_a_change_to_a_domains_encryption() {
     let emulator = Emulator::with_kms();
     let keys = keys(&emulator).await;
+    let managed_key = aws_managed_key_arn(&emulator).await;
 
     // One settled domain for the rows that CHANGE a domain's encryption: a domain with
     // work in flight refuses a further change, so the create's own change lands first.
@@ -539,7 +583,7 @@ async fn the_same_key_rule_governs_a_change_to_a_domains_encryption() {
                 );
                 // An accepted change lands before the next row starts another.
                 settled(&emulator, changed).await;
-                held = Some(options.clone());
+                held = Some(reported_for(&options, &managed_key));
                 let reported = encryption(&emulator, changed).await;
                 assert_eq!(
                     reported, held,
@@ -595,5 +639,214 @@ async fn the_decision_follows_the_key_state_kms_holds_at_the_time_of_the_call() 
                 .stated_in(&message(&answer, case), &format!("CreateDomain({case})"));
             assert_no_domain(&emulator, &name).await;
         }
+    }
+}
+
+/// One row of the default-key table: the container a request carries, and the key the stored
+/// configuration must then NAME.
+struct KeyRow {
+    case: &'static str,
+    options: Value,
+    /// The key the configuration must report, or `None` where it reports none at all.
+    reported_key: Option<String>,
+}
+
+/// The default-key table: whether encryption is enabled, and whether the request names a key
+/// — and, where it does, in which of the spellings KMS takes one. `managed` is this service's
+/// Amazon Web Services managed key and `created` a customer managed key of this account, both
+/// read out of KMS.
+fn key_rows(managed: &str, created: &str, alias_arn: &str) -> Vec<KeyRow> {
+    vec![
+        KeyRow {
+            case: "encryption enabled naming no key at all",
+            options: json!({ "Enabled": true }),
+            reported_key: Some(managed.to_string()),
+        },
+        KeyRow {
+            case: "encryption enabled naming a created key by its ARN",
+            options: enabled(created),
+            reported_key: Some(created.to_string()),
+        },
+        KeyRow {
+            case: "encryption enabled naming that key by its bare key id",
+            options: enabled(&key_id_of(created)),
+            reported_key: Some(key_id_of(created)),
+        },
+        KeyRow {
+            case: "encryption enabled naming that key by an alias",
+            options: enabled(KEY_ALIAS),
+            reported_key: Some(KEY_ALIAS.to_string()),
+        },
+        KeyRow {
+            case: "encryption enabled naming that alias by its ARN",
+            options: enabled(alias_arn),
+            reported_key: Some(alias_arn.to_string()),
+        },
+        KeyRow {
+            case: "encryption enabled naming the managed alias itself",
+            options: enabled(AWS_MANAGED_ALIAS),
+            reported_key: Some(AWS_MANAGED_ALIAS.to_string()),
+        },
+        KeyRow {
+            case: "encryption disabled",
+            options: json!({ "Enabled": false }),
+            reported_key: None,
+        },
+    ]
+}
+
+/// The container `DescribeDomainConfig` reports for `name`, inside its `OptionStatus`.
+async fn configured_encryption(emulator: &Emulator, name: &str) -> Value {
+    let answer = emulator.describe_config(name).await;
+    assert_eq!(
+        answer.status, 200,
+        "case DescribeDomainConfig({name:?}): expected 200, got {} with {:?}",
+        answer.status, answer.body
+    );
+    answer.body["DomainConfig"]["EncryptionAtRestOptions"]["Options"].clone()
+}
+
+/// Assert both reads of `name` report `expected` as the key the domain is encrypted under,
+/// and that the encryption they report is the one the request asked for.
+async fn assert_reports_key(
+    emulator: &Emulator,
+    name: &str,
+    sent: &Value,
+    expected: Option<&String>,
+    case: &str,
+) {
+    let described = encryption(emulator, name)
+        .await
+        .unwrap_or_else(|| panic!("case {case}: expected a reported container"));
+    for (source, reported) in [
+        ("DescribeDomain", described),
+        ("DescribeDomainConfig", configured_encryption(emulator, name).await),
+    ] {
+        assert_eq!(
+            reported["Enabled"], sent["Enabled"],
+            "case {case}: {source} must report the encryption the request asked for, got \
+             {reported:?}"
+        );
+        assert_eq!(
+            reported.get("KmsKeyId").and_then(Value::as_str),
+            expected.map(String::as_str),
+            "case {case}: {source} must report {expected:?} as the key the domain is \
+             encrypted under, got {reported:?}"
+        );
+        // A domain encrypted under the service's own key reports a RESOLVED key: a key ARN,
+        // not the alias the service asked KMS for it by.
+        if sent.get("KmsKeyId").is_none() && sent["Enabled"] == json!(true) {
+            let named = reported["KmsKeyId"].as_str().unwrap_or_default();
+            assert!(
+                named.starts_with("arn:aws:kms:"),
+                "case {case}: {source} must report the resolved key ARN, got {named:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_created_domain_reports_the_key_its_data_is_encrypted_under() {
+    let emulator = Emulator::with_kms();
+    let managed = aws_managed_key_arn(&emulator).await;
+    let created = emulator.created_key(REGION).await;
+    emulator
+        .kms_key_operation(
+            REGION,
+            "CreateAlias",
+            json!({ "AliasName": KEY_ALIAS, "TargetKeyId": created.clone() }),
+        )
+        .await;
+    let alias_arn = kms_arn(REGION, KEY_ALIAS);
+
+    for (index, row) in key_rows(&managed, &created, &alias_arn)
+        .into_iter()
+        .enumerate()
+    {
+        let KeyRow {
+            case,
+            options,
+            reported_key,
+        } = row;
+        let name = format!("ear-key-create-{index}");
+        let mut body = baseline_create(&name);
+        body["EncryptionAtRestOptions"] = options.clone();
+        let answer = emulator.create(body).await;
+        assert_eq!(
+            answer.status, 200,
+            "case CreateDomain({case}): expected 200, got {} with {:?}",
+            answer.status, answer.body
+        );
+        // The create's own answer carries the stored configuration too, so the key is
+        // reported from the first call rather than only on a later read.
+        assert_eq!(
+            answer.body["DomainStatus"]["EncryptionAtRestOptions"]
+                .get("KmsKeyId")
+                .and_then(Value::as_str),
+            reported_key.as_deref(),
+            "case CreateDomain({case}): the create must answer with the key the domain is \
+             encrypted under, got {:?}",
+            answer.body["DomainStatus"]["EncryptionAtRestOptions"]
+        );
+        assert_reports_key(
+            &emulator,
+            &name,
+            &options,
+            reported_key.as_ref(),
+            &format!("CreateDomain({case})"),
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn a_changed_domain_reports_the_key_its_data_is_encrypted_under() {
+    let emulator = Emulator::with_kms();
+    let managed = aws_managed_key_arn(&emulator).await;
+    let created = emulator.created_key(REGION).await;
+    emulator
+        .kms_key_operation(
+            REGION,
+            "CreateAlias",
+            json!({ "AliasName": KEY_ALIAS, "TargetKeyId": created.clone() }),
+        )
+        .await;
+    let alias_arn = kms_arn(REGION, KEY_ALIAS);
+
+    // One domain the rows change in turn: the service applies one configuration change of a
+    // domain at a time, so each row waits for the CONDITION that nothing is in flight.
+    let name = "ear-key-change";
+    let mut body = baseline_create(name);
+    body["EncryptionAtRestOptions"] = json!({ "Enabled": false });
+    let created_answer = emulator.create(body).await;
+    assert_eq!(
+        created_answer.status, 200,
+        "setup: CreateDomain({name:?}) must be served, got {} with {:?}",
+        created_answer.status, created_answer.body
+    );
+
+    for row in key_rows(&managed, &created, &alias_arn) {
+        let KeyRow {
+            case,
+            options,
+            reported_key,
+        } = row;
+        settled(&emulator, name).await;
+        let changed = emulator
+            .update_config(name, json!({ "EncryptionAtRestOptions": options.clone() }))
+            .await;
+        assert_eq!(
+            changed.status, 200,
+            "case UpdateDomainConfig({case}): expected 200, got {} with {:?}",
+            changed.status, changed.body
+        );
+        assert_reports_key(
+            &emulator,
+            name,
+            &options,
+            reported_key.as_ref(),
+            &format!("UpdateDomainConfig({case})"),
+        )
+        .await;
     }
 }

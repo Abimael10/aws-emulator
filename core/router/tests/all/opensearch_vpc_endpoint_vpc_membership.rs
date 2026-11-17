@@ -45,17 +45,19 @@ const EC2_API_VERSION: &str = "2016-11-15";
 /// The API version every path of the OpenSearch Service control plane is prefixed with.
 pub(crate) const PREFIX: &str = "/2021-01-01";
 
-/// Long enough for the span the clock owes a VPC endpoint's create or update to have
-/// fallen due, so the endpoint is idle again and the next change is served.
+/// How long a poll waits for the span the clock owes a VPC endpoint's create or update to
+/// fall due, so the endpoint is idle again and the next change is served.
 ///
-/// That span is the one the endpoint's own lifecycle states
-/// (`state::VPC_ENDPOINT_CHANGE`), not this service's generic provisioning span: the
-/// statuses an endpoint rests in while a change is in flight are sized for a client's own
-/// poll, so they outlast the shorter one.
-fn settle_wait() -> Duration {
-    service_com_amazonaws_opensearch_amazonopensearchservice::state::VPC_ENDPOINT_CHANGE
-        + Duration::from_millis(250)
-}
+/// Generous on purpose: what a case waits for is the CONDITION — the endpoint resting in
+/// `ACTIVE` ([`await_active_endpoint`]) — so a loaded host only makes the loop go round more
+/// times, and this is only the point at which waiting is called a failure.
+const READY_DEADLINE: Duration = Duration::from_secs(120);
+
+/// How long one turn of that poll pauses before looking again.
+const POLL_PAUSE: Duration = Duration::from_millis(50);
+
+/// The status an endpoint rests in once the change in flight has landed.
+const ENDPOINT_ACTIVE: &str = "ACTIVE";
 
 /// One emulator carrying Amazon EC2 and Amazon OpenSearch Service over ONE shared
 /// engine, as the production router mounts them.
@@ -195,6 +197,28 @@ pub(crate) async fn vpc_with_subnets(
     (vpc, subnets)
 }
 
+/// One security group of `vpc_id`, minted by EC2 itself: the identifier that service handed
+/// out, which is what a `VPCOptions$SecurityGroupIds` naming a group of the account carries.
+pub(crate) async fn security_group(
+    router: &MultiServiceRouter,
+    vpc_id: &str,
+    group_name: &str,
+) -> String {
+    element(
+        &ec2(
+            router,
+            "CreateSecurityGroup",
+            &[
+                ("GroupName", group_name),
+                ("GroupDescription", "a group a placement names"),
+                ("VpcId", vpc_id),
+            ],
+        )
+        .await,
+        "groupId",
+    )
+}
+
 /// A VPC-provisioned domain, answering with its ARN — what a `CreateVpcEndpoint`
 /// addresses the domain by.
 async fn vpc_domain(router: &MultiServiceRouter, name: &str, subnet: &str) -> String {
@@ -309,6 +333,26 @@ async fn read_endpoint(router: &MultiServiceRouter, id: &str) -> Value {
     read.body["VpcEndpoints"][0].clone()
 }
 
+/// Look again until the endpoint rests in `ACTIVE`, so the next change is served on it, or
+/// a generous deadline passes.
+///
+/// The CONDITION is what is waited for: the status the clock owes the change in flight has
+/// landed. Nothing here asserts on how long that took.
+async fn await_active_endpoint(router: &MultiServiceRouter, id: &str) -> Value {
+    let deadline = std::time::Instant::now() + READY_DEADLINE;
+    loop {
+        let endpoint = read_endpoint(router, id).await;
+        if endpoint["Status"] == json!(ENDPOINT_ACTIVE) {
+            return endpoint;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the endpoint {id:?} never became active: {endpoint}"
+        );
+        tokio::time::sleep(POLL_PAUSE).await;
+    }
+}
+
 /// One change to apply: how its `VpcOptions` differ from the other rows', and whether the
 /// endpoint's own VPC admits it.
 struct Row {
@@ -316,8 +360,9 @@ struct Row {
     /// The subnets the change names, as `(own VPC, index)` pairs: `true` means a subnet
     /// of the endpoint's own VPC. `None` names no subnets at all.
     named: Option<&'static [(bool, usize)]>,
-    /// The security groups the change names, if any.
-    security_groups: &'static [&'static str],
+    /// Whether the change also names a security group — the one EC2 created in the
+    /// endpoint's own VPC, so every identifier in a request is one that service handed out.
+    own_group: bool,
     /// Whether the change is served.
     accepted: bool,
 }
@@ -327,61 +372,61 @@ const ROWS: &[Row] = &[
     Row {
         case: "one subnet of the endpoint's own VPC",
         named: Some(&[(true, 1)]),
-        security_groups: &[],
+        own_group: false,
         accepted: true,
     },
     Row {
         case: "a subnet of another VPC",
         named: Some(&[(false, 0)]),
-        security_groups: &[],
+        own_group: false,
         accepted: false,
     },
     Row {
         case: "two subnets of the own VPC, one per zone",
         named: Some(&[(true, 0), (true, 2)]),
-        security_groups: &["sg-0aaa0000000000002"],
+        own_group: true,
         accepted: true,
     },
     Row {
         case: "one own subnet and one of another VPC",
         named: Some(&[(true, 0), (false, 0)]),
-        security_groups: &[],
+        own_group: false,
         accepted: false,
     },
     Row {
         case: "the subnet of another VPC named first",
         named: Some(&[(false, 1), (true, 1)]),
-        security_groups: &["sg-0aaa0000000000003"],
+        own_group: true,
         accepted: false,
     },
     Row {
         case: "two subnets of another VPC",
         named: Some(&[(false, 0), (false, 1)]),
-        security_groups: &[],
+        own_group: false,
         accepted: false,
     },
     Row {
         case: "three subnets of the own VPC",
         named: Some(&[(true, 0), (true, 1), (true, 2)]),
-        security_groups: &[],
+        own_group: false,
         accepted: true,
     },
     Row {
         case: "security groups alone, naming no subnet",
         named: None,
-        security_groups: &["sg-0aaa0000000000004"],
+        own_group: true,
         accepted: true,
     },
     Row {
         case: "three subnets of the own VPC with the foreign one last",
         named: Some(&[(true, 0), (true, 1), (false, 0)]),
-        security_groups: &[],
+        own_group: false,
         accepted: false,
     },
     Row {
         case: "one subnet of the own VPC again",
         named: Some(&[(true, 2)]),
-        security_groups: &[],
+        own_group: false,
         accepted: true,
     },
 ];
@@ -422,13 +467,10 @@ async fn a_vpc_endpoint_cannot_be_moved_into_another_vpc() {
     );
 
     let domain_arn = vpc_domain(&router, "endpoint-vpc-membership", &own_subnets[0]).await;
-    let created = create_endpoint(
-        &router,
-        &domain_arn,
-        &own_subnets[..1],
-        &["sg-0aaa0000000000001"],
-    )
-    .await;
+    // The group every call below names: one EC2 created in the endpoint's own VPC, so each
+    // identifier a request carries is one that service handed out.
+    let own_group = security_group(&router, &own_vpc, "endpoint-vpc-membership").await;
+    let created = create_endpoint(&router, &domain_arn, &own_subnets[..1], &[&own_group]).await;
     let id = created["VpcEndpointId"]
         .as_str()
         .unwrap_or_else(|| panic!("setup: the create reported no VpcEndpointId: {created}"))
@@ -447,8 +489,9 @@ async fn a_vpc_endpoint_cannot_be_moved_into_another_vpc() {
         "the endpoint reports the zone its subnet is in, got {created}"
     );
 
-    // The create's own span falls due before the first change is made.
-    tokio::time::sleep(settle_wait()).await;
+    // The create's own span falls due before the first change is made: the endpoint rests in
+    // ACTIVE, which is the CONDITION a client polls for rather than a stretch of time.
+    await_active_endpoint(&router, &id).await;
 
     // A create whose subnets span the TWO VPCs names no placement an endpoint can have —
     // an endpoint lives in one VPC, and its `VPCId` is derived from those subnets — so it
@@ -475,7 +518,7 @@ async fn a_vpc_endpoint_cannot_be_moved_into_another_vpc() {
     ];
     for (case, subnets) in spanning {
         let refused =
-            attempt_create_endpoint(&router, &domain_arn, &subnets, &["sg-0aaa0000000000009"]).await;
+            attempt_create_endpoint(&router, &domain_arn, &subnets, &[&own_group]).await;
         assert_eq!(
             (refused.status, refused.error_code()),
             (400, "ValidationException"),
@@ -513,8 +556,8 @@ async fn a_vpc_endpoint_cannot_be_moved_into_another_vpc() {
         if let Some(subnets) = named.as_ref() {
             vpc_options["SubnetIds"] = json!(subnets);
         }
-        if !row.security_groups.is_empty() {
-            vpc_options["SecurityGroupIds"] = json!(row.security_groups);
+        if row.own_group {
+            vpc_options["SecurityGroupIds"] = json!([&own_group]);
         }
 
         let before = read_endpoint(&router, &id).await;
@@ -542,8 +585,9 @@ async fn a_vpc_endpoint_cannot_be_moved_into_another_vpc() {
                 Some(own_vpc.as_str()),
                 "case {case:?}: the endpoint stays in its own VPC, got {applied}"
             );
-            // The change's span falls due before the next row's.
-            tokio::time::sleep(settle_wait()).await;
+            // The change's span falls due before the next row's: the endpoint is ACTIVE
+            // again, which is the condition the next change is served from.
+            await_active_endpoint(&router, &id).await;
         } else {
             let foreign = named
                 .as_ref()

@@ -95,8 +95,9 @@
 use super::types::*;
 
 use crate::state::vpc_network::{
-    placed_vpc, placed_vpc_options, resolve_security_groups, resolve_subnets,
-    security_groups_outside_vpc_refusal, security_groups_refusal, subnets_span_two_vpcs,
+    malformed_security_group_refusal, placed_vpc, placed_vpc_options, resolve_security_groups,
+    resolve_subnets, security_groups_outside_vpc_refusal, security_groups_refusal,
+    subnets_span_two_vpcs, unknown_security_group_refusal, ResolvedSecurityGroups,
 };
 use crate::state::{
     request_region, subnets_in_two_vpcs, vpc_endpoint_domain_unavailable, vpc_endpoint_host,
@@ -212,11 +213,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // Which VPC each security group the request names governs traffic in is EC2's to say
-        // too, so the groups are resolved there beside the subnets, before the store is
-        // touched; the pair is judged below.
+        // A value that is no security-group identifier at all names nothing in any account,
+        // so it is refused for its FORM before anything is resolved or minted
+        // ([`crate::state::vpc_network::malformed_security_group_refusal`]), by the same rule
+        // the change path applies.
+        if let Some(refusal) =
+            malformed_security_group_refusal(input.vpc_options.security_group_ids.as_deref())
+        {
+            return Err(CreateVpcEndpointErrorModeled::ValidationException(refusal).into());
+        }
+
+        // Which VPC each security group the request names governs traffic in — and whether
+        // the account holds such a group at all — is EC2's to say too, so the groups are
+        // resolved there beside the subnets, before the store is touched; what it answered is
+        // judged below.
         let security_group_placements = match input.vpc_options.security_group_ids.as_deref() {
-            None => Vec::new(),
+            None => ResolvedSecurityGroups::default(),
             Some(group_ids) => {
                 resolve_security_groups(ctx, &request_region(ctx.parts()), group_ids).await
             }
@@ -245,6 +257,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request failing both is answered the same way whichever placement it asked for.
         if let Some(refusal) = security_groups_outside_vpc_refusal(
             placed_vpc(&placements).as_deref(),
+            &security_group_placements.placements,
+        ) {
+            return Err(CreateVpcEndpointErrorModeled::ValidationException(refusal).into());
+        }
+
+        // ... and each group has to be one the account HOLDS: an identifier EC2 answered for
+        // no group names nothing the endpoint's network interfaces could carry, so nothing is
+        // minted for it ([`crate::state::vpc_network::unknown_security_group_refusal`]).
+        // Stated last of the placement refusals, and on nothing at all where EC2 was never
+        // asked, by the same rule the change path applies.
+        if let Some(refusal) = unknown_security_group_refusal(
+            input.vpc_options.security_group_ids.as_deref(),
             &security_group_placements,
         ) {
             return Err(CreateVpcEndpointErrorModeled::ValidationException(refusal).into());
