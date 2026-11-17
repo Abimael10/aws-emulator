@@ -40,9 +40,9 @@ use crate::synchronous_invoke_run::package;
 
 /// The namespace Lambda's own metrics live in, the series under test and the unit it is
 /// reported in (the AWS Lambda metric reference).
-const NAMESPACE: &str = "AWS/Lambda";
-const ERRORS_SERIES: &str = "Errors";
-const COUNT_UNIT: &str = "Count";
+pub(crate) const NAMESPACE: &str = "AWS/Lambda";
+pub(crate) const ERRORS_SERIES: &str = "Errors";
+pub(crate) const COUNT_UNIT: &str = "Count";
 
 /// The dimensions that reference reports it per: the function, and the resource of it an
 /// invocation addressed.
@@ -62,7 +62,7 @@ const PERIOD_SECS: i64 = 60;
 
 /// How far either side of now a query's window reaches, in seconds — wide enough that every
 /// invocation of a row falls inside it whatever the phase of the clock.
-const WINDOW_SECS: f64 = 600.0;
+pub(crate) const WINDOW_SECS: f64 = 600.0;
 
 /// The `Timeout` every function here is given, in seconds. Generous on purpose: no assertion
 /// here is about the timeout, and a run stopped at it would be reported as a failure the handler
@@ -72,9 +72,9 @@ const TIMEOUT_SECS: u32 = 300;
 /// How long the series is waited for after the invocations, and how often it is looked at. The
 /// publication happens off the response path, so the wait is for the datapoints having arrived;
 /// the ceiling is generous because only a publication that never happens may fail a row.
-const PUBLICATION_BUDGET: Duration = Duration::from_secs(60);
+pub(crate) const PUBLICATION_BUDGET: Duration = Duration::from_secs(60);
 /// See [`PUBLICATION_BUDGET`].
-const LOOK_INTERVAL: Duration = Duration::from_millis(50);
+pub(crate) const LOOK_INTERVAL: Duration = Duration::from_millis(50);
 
 /// The handler every row runs: it fails the way the event asks, or returns a value.
 const SOURCE: &str = r#"
@@ -86,7 +86,7 @@ def lambda_handler(event, context):
 
 /// Lambda and CloudWatch on one engine: the series Lambda publishes is CloudWatch's, so it is
 /// read through CloudWatch's own surface — the shape `core/router/src/lib.rs` mounts them in.
-fn emulator(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
+pub(crate) fn emulator(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(
@@ -101,7 +101,7 @@ fn emulator(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
 }
 
 /// Now, in the epoch seconds a stored datapoint is stamped with.
-fn now_secs() -> f64 {
+pub(crate) fn now_secs() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -109,7 +109,7 @@ fn now_secs() -> f64 {
 }
 
 /// Create the function `name` and bring it to `Active`, which is the state an invocation needs.
-async fn given_function(
+pub(crate) async fn given_function(
     router: &MultiServiceRouter,
     engine: &Arc<engine::InMemoryEngine>,
     case: &str,
@@ -144,7 +144,7 @@ async fn given_function(
 }
 
 /// One synchronous invocation of `name`, whose handler raises when `raises`.
-async fn invoke(router: &MultiServiceRouter, case: &str, name: &str, raises: bool) {
+pub(crate) async fn invoke(router: &MultiServiceRouter, case: &str, name: &str, raises: bool) {
     let answer = send(
         router,
         "POST",
@@ -171,7 +171,7 @@ async fn invoke(router: &MultiServiceRouter, case: &str, name: &str, raises: boo
 
 /// The dimension sets Lambda reports an invocation of `function` on: the function's own, and the
 /// resource the unqualified call addressed.
-fn dimension_sets(function: &str) -> Vec<Value> {
+pub(crate) fn dimension_sets(function: &str) -> Vec<Value> {
     vec![
         json!([{ "Name": FUNCTION_DIMENSION, "Value": function }]),
         json!([
@@ -212,7 +212,7 @@ async fn error_datapoints(
 }
 
 /// The total of one statistic over every datapoint of a series.
-fn total(points: &[Value], statistic: &str) -> f64 {
+pub(crate) fn total(points: &[Value], statistic: &str) -> f64 {
     points
         .iter()
         .filter_map(|point| point[statistic].as_f64())
