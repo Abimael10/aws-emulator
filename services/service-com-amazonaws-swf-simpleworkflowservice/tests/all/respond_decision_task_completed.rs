@@ -24,11 +24,13 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_swf_simpleworkflowservice::ops::types::{
     CLOSE_STATUS_VALUES, DECISION_TASK_TIMEOUT_TYPE_VALUES, EVENT_TYPE_VALUES,
+    START_LAMBDA_FUNCTION_FAILED_CAUSE_VALUES,
 };
 use service_com_amazonaws_swf_simpleworkflowservice::state::MAX_EXECUTIONS_PER_DOMAIN;
 
 use super::workflow_execution_lifecycle::{
-    error_code, full_defaults, i64_at, merge, seeded, string_at, whole_history, Emulator,
+    error_code, full_defaults, i64_at, merge, seeded, string_at, whole_history, Emulator, ACCOUNT,
+    REGION,
 };
 
 /// The workflow type every run in this suite is started with.
@@ -40,6 +42,14 @@ const DECIDER_LIST: &str = "deciders";
 
 /// The activity type the `ScheduleActivityTask` rows schedule tasks of.
 const ACTIVITY_TYPE: (&str, &str) = ("send-email", "2.0");
+
+/// How long a case looks for the events of work the service performs off the response path
+/// (a Lambda task's invocation). Generous: it bounds a hang, and a settled history is seen
+/// long before it.
+const PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long one look waits before the next.
+const LOOK: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// Register the domain and the workflow type this suite starts runs of.
 async fn seed(emulator: &Emulator, domain: &str) {
@@ -138,6 +148,30 @@ async fn event_types(emulator: &Emulator, domain: &str, workflow_id: &str, run_i
         .iter()
         .map(|event| string_at(event, "/eventType"))
         .collect()
+}
+
+/// The `eventType`s of a run's history, looked at until they are `expected` or a generous
+/// deadline passes — the last reading either way, so the caller's own assertion reports
+/// what the history actually held.
+///
+/// For a decision whose work the service performs off the response path: the completion
+/// answers before that work has, so what the history settles to is read by looking again
+/// rather than by waiting a guessed span.
+async fn settled_history(
+    emulator: &Emulator,
+    domain: &str,
+    workflow_id: &str,
+    run_id: &str,
+    expected: &[String],
+) -> Vec<String> {
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    loop {
+        let seen = event_types(emulator, domain, workflow_id, run_id).await;
+        if seen == expected || tokio::time::Instant::now() >= deadline {
+            return seen;
+        }
+        tokio::time::sleep(LOOK).await;
+    }
 }
 
 /// The one event of `event_type` a run's history holds, or a panic naming what it holds
@@ -436,8 +470,19 @@ async fn each_decision_records_the_event_its_type_documents() {
                     "name": "resize-image",
                 },
             }]),
-            expected_tail: &["DecisionTaskCompleted", "LambdaFunctionScheduled"],
-            open_counts: (0, 0, 1, 0),
+            // The run has a role to assume, so the task is dispatched: it starts, and then
+            // reaches a terminal event — here the failure, because this harness mounts SWF
+            // alone, so no AWS Lambda serves the invocation and the task has no result.
+            // Either way the task never stays Scheduled, and its outcome is carried to a
+            // decider by a decision task of its own.
+            expected_tail: &[
+                "DecisionTaskCompleted",
+                "LambdaFunctionScheduled",
+                "LambdaFunctionStarted",
+                "LambdaFunctionFailed",
+                "DecisionTaskScheduled",
+            ],
+            open_counts: (0, 0, 0, 1),
             close_status: None,
         },
         DecisionCase {
@@ -522,7 +567,6 @@ async fn each_decision_records_the_event_its_type_documents() {
 
         respond(&emulator, case.case, &token, case.decisions.clone(), json!({})).await;
 
-        let seen = event_types(&emulator, &domain, &workflow_id, &run_id).await;
         let mut expected = vec![
             "WorkflowExecutionStarted".to_string(),
             "DecisionTaskScheduled".to_string(),
@@ -532,6 +576,12 @@ async fn each_decision_records_the_event_its_type_documents() {
             modelled_event_type(case.case, event_type);
             expected.push((*event_type).to_string());
         }
+        // Looked at until it holds rather than read once: a decision that dispatches work of
+        // its own — a Lambda task, which the service invokes off the response path — records
+        // the events of that work when the work answers, not when the completion does. A
+        // case whose events are all recorded by the completion itself matches on the first
+        // look.
+        let seen = settled_history(&emulator, &domain, &workflow_id, &run_id, &expected).await;
         assert_eq!(
             seen, expected,
             "case {:?}: expected the history {expected:?}, got {seen:?}",
@@ -2069,4 +2119,355 @@ async fn a_decision_this_service_cannot_read_is_refused_and_records_nothing() {
         Some("MarkerRecorded"),
         "case \"bad\": the still-outstanding task is answerable, got {seen:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// ScheduleLambdaFunction: the Lambda task the decision creates always ends
+// ---------------------------------------------------------------------------
+
+/// The three events a Lambda task can END on, as `EventType` names them. One of these is
+/// what every DISPATCHED task reaches.
+const TERMINAL_LAMBDA_EVENTS: &[&str] = &[
+    "LambdaFunctionCompleted",
+    "LambdaFunctionFailed",
+    "LambdaFunctionTimedOut",
+];
+
+/// One `ScheduleLambdaFunction` decision, and what must become of the task it creates.
+struct LambdaRow {
+    case: &'static str,
+    /// The `lambdaRole` the run is started with, or `None` for a run with no role at all.
+    lambda_role: Option<String>,
+    /// The `scheduleLambdaFunctionDecisionAttributes` of each decision this row makes.
+    tasks: Vec<Value>,
+}
+
+fn lambda_rows() -> Vec<LambdaRow> {
+    let role = format!("arn:aws:iam::{ACCOUNT}:role/swf-lambda-task");
+    // A function named by its own ARN, the other form `name` documents ("the name, or ARN,
+    // of the Lambda function to schedule").
+    let by_arn = format!("arn:aws:lambda:{REGION}:{ACCOUNT}:function:summer");
+    vec![
+        LambdaRow {
+            case: "a bare function name, no input and no timeout",
+            lambda_role: Some(role.clone()),
+            tasks: vec![json!({ "id": "lam-1", "name": "summer" })],
+        },
+        LambdaRow {
+            case: "an input document and the lowest published startToCloseTimeout",
+            lambda_role: Some(role.clone()),
+            tasks: vec![json!({
+                "id": "lam-2",
+                "name": "summer",
+                "input": "{\"numbers\":[1,2,3]}",
+                "startToCloseTimeout": "1",
+            })],
+        },
+        LambdaRow {
+            case: "the highest published startToCloseTimeout, a control value and a long id",
+            lambda_role: Some(role.clone()),
+            tasks: vec![json!({
+                "id": "a-task-id-of-some-length-0123456789",
+                "name": "summer",
+                "control": "carried for the decider",
+                "input": "{\"numbers\":[]}",
+                "startToCloseTimeout": "900",
+            })],
+        },
+        LambdaRow {
+            case: "the function named by its full ARN",
+            lambda_role: Some(role.clone()),
+            tasks: vec![json!({ "id": "lam-4", "name": by_arn, "input": "\"text\"" })],
+        },
+        LambdaRow {
+            case: "two Lambda tasks scheduled by one completion",
+            lambda_role: Some(role),
+            tasks: vec![
+                json!({ "id": "lam-5a", "name": "summer", "input": "{\"n\":1}" }),
+                json!({ "id": "lam-5b", "name": "summer", "input": "{\"n\":2}" }),
+            ],
+        },
+        LambdaRow {
+            case: "a run with no lambdaRole has no role to assume",
+            lambda_role: None,
+            tasks: vec![json!({ "id": "lam-6", "name": "summer" })],
+        },
+        LambdaRow {
+            case: "a run with no lambdaRole, with an input and a timeout",
+            lambda_role: None,
+            tasks: vec![json!({
+                "id": "lam-7",
+                "name": "summer",
+                "input": "{\"numbers\":[4]}",
+                "startToCloseTimeout": "30",
+            })],
+        },
+    ]
+}
+
+/// A scheduled Lambda task never stays scheduled.
+///
+/// A run that carries a `lambdaRole` has one to assume, so the service invokes the named
+/// function for the task: `LambdaFunctionStarted` names the scheduling event, exactly one
+/// terminal event of [`TERMINAL_LAMBDA_EVENTS`] names both, and a decision task carries the
+/// outcome to a decider with the task out of flight. A run with NO role has none to assume,
+/// so the task never starts at all: `StartLambdaFunctionFailed` carrying the one modelled
+/// cause, and no start and no terminal event ever.
+///
+/// This harness mounts SWF alone, so no AWS Lambda serves the invocation and the terminal
+/// event of a dispatched task is its failure. What a function's own RESULT is belongs where
+/// a real function can be created, and is asserted over the assembled emulator in
+/// `core/router/tests/all/swf_lambda_task_invocation.rs`.
+#[tokio::test]
+async fn every_scheduled_lambda_task_reaches_a_terminal_event() {
+    for (index, row) in lambda_rows().into_iter().enumerate() {
+        let emulator = Emulator::new();
+        let domain = format!("lambda-tasks-{index}");
+        seed(&emulator, &domain).await;
+
+        let workflow_id = format!("lambda-run-{index}");
+        let start_extra = match &row.lambda_role {
+            Some(lambda_role) => json!({ "lambdaRole": lambda_role }),
+            None => json!({}),
+        };
+        let run_id = start(&emulator, row.case, &domain, &workflow_id, start_extra).await;
+        let token = poll_token(&emulator, row.case, &domain, DECIDER_LIST).await;
+        let decisions: Vec<Value> = row
+            .tasks
+            .iter()
+            .map(|attributes| {
+                json!({
+                    "decisionType": "ScheduleLambdaFunction",
+                    "scheduleLambdaFunctionDecisionAttributes": attributes,
+                })
+            })
+            .collect();
+        respond(
+            &emulator,
+            row.case,
+            &token,
+            Value::Array(decisions),
+            json!({}),
+        )
+        .await;
+
+        // Every task of this row has to be answered for, so the history is looked at until
+        // each one has left the Scheduled state — which is the rule itself.
+        let events = settled_lambda_tasks(
+            &emulator,
+            &domain,
+            &workflow_id,
+            &run_id,
+            row.tasks.len(),
+        )
+        .await;
+        for attributes in &row.tasks {
+            let id = string_at(attributes, "/id");
+            let scheduled = lambda_event_for(row.case, &events, "LambdaFunctionScheduled", &id);
+            let scheduled_event_id = i64_at(&scheduled, "/eventId");
+
+            // The scheduling event carries what the decision asked for, from the decision
+            // alone.
+            for member in ["id", "name", "input", "control", "startToCloseTimeout"] {
+                let asked = attributes.get(member).and_then(Value::as_str);
+                let recorded = scheduled
+                    .pointer(&format!("/lambdaFunctionScheduledEventAttributes/{member}"))
+                    .and_then(Value::as_str);
+                assert_eq!(
+                    recorded, asked,
+                    "case {:?}: the scheduling event's {member} must be the decision's, got \
+                     {recorded:?} in {scheduled:?}",
+                    row.case
+                );
+            }
+
+            let started: Vec<&Value> = events
+                .iter()
+                .filter(|event| {
+                    string_at(event, "/eventType") == "LambdaFunctionStarted"
+                        && i64_at(
+                            event,
+                            "/lambdaFunctionStartedEventAttributes/scheduledEventId",
+                        ) == scheduled_event_id
+                })
+                .collect();
+            let terminal: Vec<&Value> = events
+                .iter()
+                .filter(|event| {
+                    TERMINAL_LAMBDA_EVENTS.contains(&string_at(event, "/eventType").as_str())
+                        && lambda_attribute(event, "scheduledEventId") == scheduled_event_id
+                })
+                .collect();
+            let unstarted: Vec<&Value> = events
+                .iter()
+                .filter(|event| {
+                    string_at(event, "/eventType") == "StartLambdaFunctionFailed"
+                        && i64_at(
+                            event,
+                            "/startLambdaFunctionFailedEventAttributes/scheduledEventId",
+                        ) == scheduled_event_id
+                })
+                .collect();
+
+            if row.lambda_role.is_none() {
+                // No role to assume: the task never starts, and the one event it ends on
+                // says exactly that.
+                assert!(
+                    started.is_empty() && terminal.is_empty(),
+                    "case {:?}: a run with no lambdaRole invokes nothing, so task {id:?} must \
+                     have no start and no terminal event, got {started:?} {terminal:?}",
+                    row.case
+                );
+                assert_eq!(
+                    unstarted.len(),
+                    1,
+                    "case {:?}: task {id:?} must record exactly one StartLambdaFunctionFailed, \
+                     got {unstarted:?}",
+                    row.case
+                );
+                let cause = string_at(
+                    unstarted[0],
+                    "/startLambdaFunctionFailedEventAttributes/cause",
+                );
+                assert!(
+                    START_LAMBDA_FUNCTION_FAILED_CAUSE_VALUES.contains(&cause.as_str()),
+                    "case {:?}: {cause:?} is not a modelled StartLambdaFunctionFailedCause",
+                    row.case
+                );
+                continue;
+            }
+
+            assert!(
+                unstarted.is_empty(),
+                "case {:?}: a run WITH a lambdaRole has one to assume, so task {id:?} must not \
+                 fail to start, got {unstarted:?}",
+                row.case
+            );
+            assert_eq!(
+                started.len(),
+                1,
+                "case {:?}: task {id:?} must record exactly one LambdaFunctionStarted naming \
+                 its scheduling event {scheduled_event_id}, got {started:?}",
+                row.case
+            );
+            assert_eq!(
+                terminal.len(),
+                1,
+                "case {:?}: task {id:?} must reach exactly one of {TERMINAL_LAMBDA_EVENTS:?}, \
+                 got {terminal:?}",
+                row.case
+            );
+            let terminal = terminal[0];
+            let event_type = string_at(terminal, "/eventType");
+            modelled_event_type(row.case, &event_type);
+            let started_event_id = i64_at(started[0], "/eventId");
+            assert_eq!(
+                lambda_attribute(terminal, "startedEventId"),
+                started_event_id,
+                "case {:?}: the {event_type} of task {id:?} must name the start event \
+                 {started_event_id}, got {terminal:?}",
+                row.case
+            );
+            assert!(
+                i64_at(terminal, "/eventId") > started_event_id,
+                "case {:?}: the {event_type} of task {id:?} must follow its start event, got \
+                 {terminal:?}",
+                row.case
+            );
+        }
+
+        // Whatever each task ended on, the decider is told: one decision task is waiting, no
+        // Lambda task is left in flight, and the run is still open to carry on with.
+        let described = describe(&emulator, row.case, &domain, &workflow_id, &run_id).await;
+        assert_eq!(
+            (
+                i64_at(&described, "/openCounts/openLambdaFunctions"),
+                i64_at(&described, "/openCounts/openDecisionTasks"),
+                string_at(&described, "/executionInfo/executionStatus"),
+            ),
+            (0, 1, "OPEN".to_string()),
+            "case {:?}: every Lambda task must be out of flight with a decision task carrying \
+             its outcome, got {described:?}",
+            row.case
+        );
+        let next = poll(&emulator, row.case, &domain, DECIDER_LIST).await;
+        assert!(
+            !string_at(&next, "/taskToken").is_empty(),
+            "case {:?}: the decision task recorded for the outcome must be handed to the next \
+             poll, got {next:?}",
+            row.case
+        );
+    }
+}
+
+/// The history of a run, looked at until every Lambda task it holds has left the Scheduled
+/// state, or a generous deadline passes.
+///
+/// "Left the Scheduled state" is counted as the events that END a task: a terminal event or
+/// a failure to start, one per task. Looking again is what replaces a guessed wait — the
+/// invocation runs off the response path, so the completion answers before it has.
+async fn settled_lambda_tasks(
+    emulator: &Emulator,
+    domain: &str,
+    workflow_id: &str,
+    run_id: &str,
+    tasks: usize,
+) -> Vec<Value> {
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    loop {
+        let events = whole_history(emulator, domain, workflow_id, run_id).await;
+        let ended = events
+            .iter()
+            .filter(|event| {
+                let event_type = string_at(event, "/eventType");
+                TERMINAL_LAMBDA_EVENTS.contains(&event_type.as_str())
+                    || event_type == "StartLambdaFunctionFailed"
+            })
+            .count();
+        if ended >= tasks || tokio::time::Instant::now() >= deadline {
+            return events;
+        }
+        tokio::time::sleep(LOOK).await;
+    }
+}
+
+/// The one event of `event_type` whose attributes name the Lambda task `id`.
+fn lambda_event_for(case: &str, events: &[Value], event_type: &str, id: &str) -> Value {
+    let member = format!("/{}EventAttributes/id", attributes_member(event_type));
+    let matching: Vec<&Value> = events
+        .iter()
+        .filter(|event| {
+            string_at(event, "/eventType") == event_type
+                && event.pointer(&member).and_then(Value::as_str) == Some(id)
+        })
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "case {case:?}: expected exactly one {event_type} for task {id:?}, got {:?}",
+        events
+            .iter()
+            .map(|event| string_at(event, "/eventType"))
+            .collect::<Vec<_>>()
+    );
+    matching[0].clone()
+}
+
+/// One `eventId` member of a terminal Lambda event, whichever of the three it is.
+fn lambda_attribute(event: &Value, member: &str) -> i64 {
+    let event_type = string_at(event, "/eventType");
+    i64_at(
+        event,
+        &format!("/{}EventAttributes/{member}", attributes_member(&event_type)),
+    )
+}
+
+/// An `eventType` as the matching `HistoryEvent` attributes member is spelled: the same name
+/// with its first letter lowercased, which is how the model binds every one of them.
+fn attributes_member(event_type: &str) -> String {
+    let mut characters = event_type.chars();
+    match characters.next() {
+        Some(first) => first.to_lowercase().collect::<String>() + characters.as_str(),
+        None => String::new(),
+    }
 }

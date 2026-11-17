@@ -10,6 +10,12 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
+// The Lambda TASK a `ScheduleLambdaFunction` decision creates: the invocation it is
+// dispatched as, and the events its outcome records. A child module of its own because it
+// is the one part of this store that calls another service.
+mod lambda_task;
+pub use lambda_task::*;
+
 use ::aws_smithy_types::DateTime;
 use ::sha2::{Digest, Sha256};
 
@@ -28,7 +34,9 @@ use crate::ops::types::{
     DecisionTaskStartedEventAttributes, DecisionTaskTimedOutEventAttributes, DomainConfiguration,
     DomainInfo, ExecutionTimeFilter, ExternalWorkflowExecutionCancelRequestedEventAttributes,
     ExternalWorkflowExecutionSignaledEventAttributes, FailWorkflowExecutionFailedEventAttributes,
-    HistoryEvent, LambdaFunctionScheduledEventAttributes, MarkerRecordedEventAttributes,
+    HistoryEvent, LambdaFunctionCompletedEventAttributes, LambdaFunctionFailedEventAttributes,
+    LambdaFunctionScheduledEventAttributes, LambdaFunctionStartedEventAttributes,
+    LambdaFunctionTimedOutEventAttributes, MarkerRecordedEventAttributes,
     RequestCancelActivityTaskFailedEventAttributes,
     RequestCancelExternalWorkflowExecutionFailedEventAttributes,
     RequestCancelExternalWorkflowExecutionInitiatedEventAttributes, ResourceTag,
@@ -583,6 +591,10 @@ pub enum EventAttributes {
         RequestCancelExternalWorkflowExecutionFailedEventAttributes,
     ),
     LambdaFunctionScheduled(LambdaFunctionScheduledEventAttributes),
+    LambdaFunctionStarted(LambdaFunctionStartedEventAttributes),
+    LambdaFunctionCompleted(LambdaFunctionCompletedEventAttributes),
+    LambdaFunctionFailed(LambdaFunctionFailedEventAttributes),
+    LambdaFunctionTimedOut(LambdaFunctionTimedOutEventAttributes),
     ScheduleLambdaFunctionFailed(ScheduleLambdaFunctionFailedEventAttributes),
     StartLambdaFunctionFailed(StartLambdaFunctionFailedEventAttributes),
 }
@@ -683,6 +695,10 @@ impl EventAttributes {
                 "RequestCancelExternalWorkflowExecutionFailed"
             }
             Self::LambdaFunctionScheduled(_) => "LambdaFunctionScheduled",
+            Self::LambdaFunctionStarted(_) => "LambdaFunctionStarted",
+            Self::LambdaFunctionCompleted(_) => "LambdaFunctionCompleted",
+            Self::LambdaFunctionFailed(_) => "LambdaFunctionFailed",
+            Self::LambdaFunctionTimedOut(_) => "LambdaFunctionTimedOut",
             Self::ScheduleLambdaFunctionFailed(_) => "ScheduleLambdaFunctionFailed",
             Self::StartLambdaFunctionFailed(_) => "StartLambdaFunctionFailed",
         }
@@ -764,6 +780,24 @@ impl EventAttributes {
                 needs_decision: true,
                 ..Default::default()
             },
+            // The three terminal reports of a Lambda task the service invoked: each takes
+            // the task named by its `scheduledEventId` out of flight, and the decider has
+            // to see the result, the failure or the timeout it carries.
+            Self::LambdaFunctionCompleted(completed) => EventEffect {
+                lambda_function_closed: Some(completed.scheduled_event_id),
+                needs_decision: true,
+                ..Default::default()
+            },
+            Self::LambdaFunctionFailed(failed) => EventEffect {
+                lambda_function_closed: Some(failed.scheduled_event_id),
+                needs_decision: true,
+                ..Default::default()
+            },
+            Self::LambdaFunctionTimedOut(timed_out) => EventEffect {
+                lambda_function_closed: Some(timed_out.scheduled_event_id),
+                needs_decision: true,
+                ..Default::default()
+            },
             // Everything a decider has to act on but that takes nothing out of flight:
             // what arrived from outside the run, what a decision of its own failed on,
             // and what a child run reported back.
@@ -814,7 +848,10 @@ impl EventAttributes {
             | Self::ChildWorkflowExecutionStarted(_)
             | Self::SignalExternalWorkflowExecutionInitiated(_)
             | Self::RequestCancelExternalWorkflowExecutionInitiated(_)
-            | Self::LambdaFunctionScheduled(_) => EventEffect::default(),
+            | Self::LambdaFunctionScheduled(_)
+            // A Lambda task that has STARTED is still in flight: the invocation is under
+            // way, and what a decider acts on is the terminal event that follows.
+            | Self::LambdaFunctionStarted(_) => EventEffect::default(),
         }
     }
 
@@ -1012,6 +1049,18 @@ impl HistoryEventRecord {
             }
             EventAttributes::LambdaFunctionScheduled(attributes) => {
                 event.lambda_function_scheduled_event_attributes = Some(attributes.clone());
+            }
+            EventAttributes::LambdaFunctionStarted(attributes) => {
+                event.lambda_function_started_event_attributes = Some(attributes.clone());
+            }
+            EventAttributes::LambdaFunctionCompleted(attributes) => {
+                event.lambda_function_completed_event_attributes = Some(attributes.clone());
+            }
+            EventAttributes::LambdaFunctionFailed(attributes) => {
+                event.lambda_function_failed_event_attributes = Some(attributes.clone());
+            }
+            EventAttributes::LambdaFunctionTimedOut(attributes) => {
+                event.lambda_function_timed_out_event_attributes = Some(attributes.clone());
             }
             EventAttributes::ScheduleLambdaFunctionFailed(attributes) => {
                 event.schedule_lambda_function_failed_event_attributes = Some(attributes.clone());
@@ -1945,6 +1994,27 @@ impl Execution {
                     Some(event.event_id)
                 }
                 _ => None,
+            })
+    }
+
+    /// Whether the Lambda task whose `LambdaFunctionScheduled` event is `scheduled_event_id`
+    /// is still in flight: that event is in this run's history, and no later event has taken
+    /// the task out of flight ([`EventEffect::lambda_function_closed`]).
+    ///
+    /// What the invoking side asks before it records anything about a task it was dispatched
+    /// for: the run may have closed, or the task may already have ended, between the decision
+    /// that scheduled it and the invocation's own answer.
+    pub fn lambda_function_is_in_flight(&self, scheduled_event_id: i64) -> bool {
+        let scheduled = self.history.iter().any(|event| {
+            event.event_id == scheduled_event_id
+                && matches!(
+                    event.attributes,
+                    EventAttributes::LambdaFunctionScheduled(_)
+                )
+        });
+        scheduled
+            && !self.history.iter().any(|event| {
+                event.attributes.effect().lambda_function_closed == Some(scheduled_event_id)
             })
     }
 

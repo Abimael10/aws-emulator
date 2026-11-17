@@ -314,7 +314,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             RespondDecisionTaskCompletedErrorModeled::OperationNotPermittedFault(
@@ -346,6 +346,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = crate::state::now();
+        let region = crate::state::request_region(ctx);
         let mut guard = state.lock();
 
         // `taskToken` is "the opaque string used as a handle on the task" and is derived
@@ -462,6 +463,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 });
         }
 
+        // The Lambda tasks this completion scheduled, collected as the decisions are
+        // applied and dispatched once the store lock is given back: the invocation is served
+        // by this same process, and nothing of its outcome is decided here.
+        let mut lambda_tasks: Vec<crate::state::LambdaTask> = Vec::new();
         for decision in &decisions {
             // A closed run's history takes no further events, so the decisions after one
             // that closed the run are not applied.
@@ -472,7 +477,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             {
                 break;
             }
-            apply_decision(domain, &key, decision, completed_event_id, unseen_events, now);
+            apply_decision(
+                domain,
+                &key,
+                decision,
+                completed_event_id,
+                unseen_events,
+                now,
+                &domain_name,
+                &region,
+                &mut lambda_tasks,
+            );
         }
 
         // The events this decider has not seen — the ones that arrived while it was
@@ -485,6 +500,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 execution.schedule_decision_task_if_idle(now);
             }
         }
+
+        // Off the response path, and with the store lock already given back: a Lambda task
+        // runs for as long as its function does, while the decider goes back to polling.
+        drop(guard);
+        crate::state::dispatch_lambda_tasks(&self.engine, ctx.callback(), lambda_tasks);
 
         Ok(RespondDecisionTaskCompletedOutput)
     }
@@ -726,6 +746,7 @@ fn requested_task_list(task_list: &Option<TaskList>) -> Option<String> {
 /// Every outcome is an event of a stored history: the one the decision's own doc gives
 /// it, or the `*Failed` event whose modelled `cause` says why the decision could not be
 /// applied to the run as it stands.
+#[allow(clippy::too_many_arguments)]
 fn apply_decision(
     domain: &mut Domain,
     key: &(String, String),
@@ -733,6 +754,9 @@ fn apply_decision(
     completed_event_id: i64,
     unseen_events: bool,
     at: DateTime,
+    domain_name: &str,
+    region: &str,
+    lambda_tasks: &mut Vec<crate::state::LambdaTask>,
 ) {
     match decision.decision_type.as_str() {
         "ScheduleActivityTask" => {
@@ -886,7 +910,15 @@ fn apply_decision(
         }
         "ScheduleLambdaFunction" => {
             if let Some(attributes) = &decision.schedule_lambda_function_decision_attributes {
-                schedule_lambda_function(domain, key, attributes, completed_event_id, at);
+                lambda_tasks.extend(schedule_lambda_function(
+                    domain,
+                    key,
+                    attributes,
+                    completed_event_id,
+                    at,
+                    domain_name,
+                    region,
+                ));
             }
         }
         // Every modelled `DecisionType` is handled above, and a type outside the
@@ -1679,16 +1711,21 @@ fn resolve_run_config(
 /// no such role has none to assume, so the scheduled task cannot start: that is
 /// `StartLambdaFunctionFailed` with the one modelled cause for a role that cannot be
 /// assumed, and the task is no longer in flight.
+///
+/// A run that DOES carry a role has one to assume, so the task is dispatched: the answer
+/// carries it, and the invocation and the terminal event it records are
+/// [`crate::state::LambdaTask`]'s. A task that was not scheduled at all, and one that could
+/// not start, are answered `None` — there is nothing left in flight to invoke for.
 fn schedule_lambda_function(
     domain: &mut Domain,
     key: &(String, String),
     attributes: &ScheduleLambdaFunctionDecisionAttributes,
     completed_event_id: i64,
     at: DateTime,
-) {
-    let Some(execution) = domain.executions.get_mut(key) else {
-        return;
-    };
+    domain_name: &str,
+    region: &str,
+) -> Option<crate::state::LambdaTask> {
+    let execution = domain.executions.get_mut(key)?;
     if execution.open_lambda_function(&attributes.id).is_some() {
         execution.append_event(
             at,
@@ -1701,7 +1738,7 @@ fn schedule_lambda_function(
                 },
             ),
         );
-        return;
+        return None;
     }
 
     let scheduled_event_id = execution.append_event(
@@ -1731,5 +1768,17 @@ fn schedule_lambda_function(
             }),
         );
         execution.open_lambda_functions = execution.open_lambda_functions.saturating_sub(1);
+        return None;
     }
+
+    Some(crate::state::LambdaTask {
+        domain: domain_name.to_string(),
+        workflow_id: key.0.clone(),
+        run_id: key.1.clone(),
+        scheduled_event_id,
+        name: attributes.name.clone(),
+        input: attributes.input.clone(),
+        start_to_close_timeout: crate::state::non_empty(&attributes.start_to_close_timeout),
+        region: region.to_string(),
+    })
 }

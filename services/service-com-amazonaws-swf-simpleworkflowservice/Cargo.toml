@@ -16,11 +16,18 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true }
+# `time` for the bound on how long a Lambda task waits for its invocation.
+tokio = { workspace = true, features = ["time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Invokes the Lambda function a `ScheduleLambdaFunction` decision names, in process through
+# the emulator's own AWS Lambda, so a Lambda task reaches a terminal event.
+aws-sdk-lambda = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# Reads the Region out of a Lambda function ARN a decision names, so the invocation is
+# addressed to the Region that ARN names.
+service-common = { path = "../common" }
 # Hashes the unique, server-generated `runId` StartWorkflowExecution mints and stores
 # (moved up from `[dev-dependencies]`, where the scaffold placed them).
 sha2 = { workspace = true }
