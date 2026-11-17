@@ -54,9 +54,12 @@ const TEMPLATE: &str = "lifecycle-template";
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// How long a poll keeps trying before it gives up: the lifecycle span the service owes a
-/// transition, with ample margin for a loaded test machine.
+/// transition, with ample margin for a loaded test machine — the whole workspace's suites
+/// run in parallel, so the margin is generous rather than tight. A poll waits for the
+/// CONDITION and returns as soon as it holds, so the margin costs nothing when the
+/// publication is prompt.
 fn poll_budget() -> Duration {
-    autoscaling::state::LIFECYCLE_TRANSITION + Duration::from_secs(5)
+    autoscaling::state::LIFECYCLE_TRANSITION + Duration::from_secs(60)
 }
 
 /// How long a row waits before asserting that NOTHING was delivered: long enough that a
@@ -252,20 +255,10 @@ async fn collect_events(
     detail_type: &str,
     wanted: usize,
 ) -> Vec<Value> {
-    let deadline = Instant::now() + poll_budget();
-    let mut collected: Vec<Value> = Vec::new();
-    loop {
-        collected.extend(
-            drain(router, case, url)
-                .await
-                .into_iter()
-                .filter(|event| event["detail-type"] == json!(detail_type)),
-        );
-        if collected.len() >= wanted || Instant::now() >= deadline {
-            return collected;
-        }
-        tokio::time::sleep(POLL_INTERVAL).await;
-    }
+    // ONE polling loop in this suite ([`poll_for_detail_type`]); this caller keeps nothing of
+    // the other detail type, so its buffer is its own and dropped with the call.
+    let mut buffer: Vec<Value> = Vec::new();
+    poll_for_detail_type(router, case, url, detail_type, wanted, &mut buffer).await
 }
 
 /// Create the launch template and the subnet every group of this suite launches into, and
@@ -698,5 +691,313 @@ async fn correcting_a_rules_pattern_delivers_the_next_scale_out() {
         tag_values(&body, "InstanceId").contains(&instance_id),
         "case {case:?}: the group must report the instance {instance_id} the event named, \
          got {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The DIRECTION of a lifecycle step.
+//
+// The RULE: a lifecycle event's `detail` names the two ends of the move the step made —
+// `Origin`, where the instance came from, and `Destination`, where it went — as fixed text
+// decided by the step's direction alone, never by anything in the request: a group that
+// LAUNCHES an instance takes it from Amazon EC2 into the group ("EC2" -> "AutoScalingGroup")
+// and a group that SCALES ONE IN hands it back ("AutoScalingGroup" -> "EC2"), so the two are
+// each other's reverse. The two spellings are written out here, not imported, so a wrong
+// constant in the implementation cannot make these tests pass.
+// ---------------------------------------------------------------------------
+
+/// The endpoint outside the group: Amazon EC2 itself.
+const ENDPOINT_EC2: &str = "EC2";
+/// The endpoint inside it: the group.
+const ENDPOINT_GROUP: &str = "AutoScalingGroup";
+
+/// The `(Origin, Destination)` pair the event of `detail_type` must carry.
+fn expected_direction(detail_type: &str) -> (&'static str, &'static str) {
+    if detail_type == LAUNCH_SUCCESSFUL {
+        (ENDPOINT_EC2, ENDPOINT_GROUP)
+    } else {
+        (ENDPOINT_GROUP, ENDPOINT_EC2)
+    }
+}
+
+/// A rule pattern matching every event of this service, whichever step it reports.
+fn any_lifecycle_pattern() -> Value {
+    json!({ "source": [EVENT_SOURCE] })
+}
+
+/// Poll the queue at `url` until `buffer` holds `wanted` events of `detail_type`, or the
+/// budget runs out; answer those events.
+///
+/// Everything drained goes into `buffer`, so a step whose events arrive while another step's
+/// are being waited for is kept rather than thrown away — the queue carries both directions.
+async fn poll_for_detail_type(
+    router: &MultiServiceRouter,
+    case: &str,
+    url: &str,
+    detail_type: &str,
+    wanted: usize,
+    buffer: &mut Vec<Value>,
+) -> Vec<Value> {
+    let deadline = Instant::now() + poll_budget();
+    loop {
+        buffer.extend(drain(router, case, url).await);
+        let found: Vec<Value> = buffer
+            .iter()
+            .filter(|event| event["detail-type"] == json!(detail_type))
+            .cloned()
+            .collect();
+        if found.len() >= wanted || Instant::now() >= deadline {
+            return found;
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Assert every event of `detail_type` delivered so far carries the direction that step
+/// moves in, and that there are `wanted` of them.
+async fn assert_direction_of_step(
+    router: &MultiServiceRouter,
+    case: &str,
+    url: &str,
+    detail_type: &str,
+    wanted: usize,
+    buffer: &mut Vec<Value>,
+) {
+    let delivered =
+        poll_for_detail_type(router, case, url, detail_type, wanted, buffer).await;
+    assert_eq!(
+        delivered.len(),
+        wanted,
+        "case {case:?}: expected {wanted} {detail_type} event(s), got {delivered:?}"
+    );
+    let (origin, destination) = expected_direction(detail_type);
+    for event in &delivered {
+        assert_eq!(
+            (event["detail"]["Origin"].clone(), event["detail"]["Destination"].clone()),
+            (json!(origin), json!(destination)),
+            "case {case:?}: a {detail_type} event must flow {origin} -> {destination}, got \
+             {event}"
+        );
+    }
+}
+
+/// One row of the direction table: the capacity the group is created with, the capacities a
+/// later `SetDesiredCapacity` asks for, and whether a forced delete finishes it off.
+struct DirectionRow {
+    case: &'static str,
+    created_with: i32,
+    steps: &'static [i32],
+    forced_delete: bool,
+}
+
+/// The rows span what the rule generalises over: which door moved the capacity (the create,
+/// a later `SetDesiredCapacity`, a forced delete), how many instances one change moves, and
+/// which of the two steps — in both orders, so neither direction is read off the other.
+const DIRECTION_ROWS: &[DirectionRow] = &[
+    DirectionRow {
+        case: "one instance launched by the create, then scaled in to none",
+        created_with: 1,
+        steps: &[0],
+        forced_delete: false,
+    },
+    DirectionRow {
+        case: "two launched by the create, one of them scaled in",
+        created_with: 2,
+        steps: &[1],
+        forced_delete: false,
+    },
+    DirectionRow {
+        case: "an empty group scaled out by SetDesiredCapacity, then back in",
+        created_with: 0,
+        steps: &[2, 0],
+        forced_delete: false,
+    },
+    DirectionRow {
+        case: "two launched by the create and taken out by a forced delete",
+        created_with: 2,
+        steps: &[],
+        forced_delete: true,
+    },
+];
+
+#[tokio::test]
+async fn a_lifecycle_event_names_where_the_instance_came_from_and_went() {
+    for (index, row) in DIRECTION_ROWS.iter().enumerate() {
+        let case = row.case;
+        // A fresh emulator per row, so one row's events cannot be counted for another.
+        let (router, engine) = emulator();
+        let subnet = given_launch_source(&router, &engine).await;
+        let (url, queue_arn) = given_queue(&router, case, "autoscaling-events").await;
+        // ONE rule for both steps: the direction is read off the event, not off which rule
+        // delivered it.
+        given_rule(
+            &router,
+            case,
+            MATCHING_RULE,
+            &any_lifecycle_pattern(),
+            &queue_arn,
+        )
+        .await;
+        grant_delivery(&router, case, &url, &queue_arn).await;
+
+        let group = format!("direction-{index}");
+        let _arn = given_group(&router, case, &group, &subnet, row.created_with).await;
+        let mut buffer: Vec<Value> = Vec::new();
+        let mut launched = usize::try_from(row.created_with).unwrap_or(0);
+        let mut terminated = 0usize;
+        let mut capacity = row.created_with;
+        if launched > 0 {
+            assert_direction_of_step(
+                &router,
+                case,
+                &url,
+                LAUNCH_SUCCESSFUL,
+                launched,
+                &mut buffer,
+            )
+            .await;
+        }
+        for step in row.steps {
+            // The events of the previous step have been delivered by now (they were waited
+            // for), so the group has settled before the next door moves it.
+            set_desired_capacity(&router, case, &group, *step).await;
+            let moved = usize::try_from((*step - capacity).abs()).unwrap_or(0);
+            if *step > capacity {
+                launched += moved;
+                assert_direction_of_step(
+                    &router,
+                    case,
+                    &url,
+                    LAUNCH_SUCCESSFUL,
+                    launched,
+                    &mut buffer,
+                )
+                .await;
+            } else if *step < capacity {
+                terminated += moved;
+                assert_direction_of_step(
+                    &router,
+                    case,
+                    &url,
+                    TERMINATE_SUCCESSFUL,
+                    terminated,
+                    &mut buffer,
+                )
+                .await;
+            }
+            capacity = *step;
+        }
+        if row.forced_delete {
+            let (status, body) = query(
+                &router,
+                "DeleteAutoScalingGroup",
+                &[
+                    ("AutoScalingGroupName", group.as_str()),
+                    ("ForceDelete", "true"),
+                ],
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: DeleteAutoScalingGroup expected 200, got {status}: {body}"
+            );
+            terminated += usize::try_from(capacity).unwrap_or(0);
+            assert_direction_of_step(
+                &router,
+                case,
+                &url,
+                TERMINATE_SUCCESSFUL,
+                terminated,
+                &mut buffer,
+            )
+            .await;
+        }
+        // Both halves of the row were observed: every row both launches and scales in, so a
+        // row that silently skipped one of the two directions fails here instead of passing
+        // the half it never reached.
+        assert!(
+            launched > 0 && terminated > 0,
+            "case {case:?}: the row must move instances in both directions, launched \
+             {launched} and terminated {terminated}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_rule_pattern_on_the_direction_separates_scale_in_from_scale_out() {
+    // What the fields are FOR: an EventBridge pattern keyed on the direction routes a
+    // scale-in apart from a scale-out, without either rule naming a detail-type.
+    let case = "rules keyed on detail.Origin alone";
+    let (router, engine) = emulator();
+    let subnet = given_launch_source(&router, &engine).await;
+    let (out_url, out_arn) = given_queue(&router, case, "scale-out-events").await;
+    let (in_url, in_arn) = given_queue(&router, case, "scale-in-events").await;
+    given_rule(
+        &router,
+        case,
+        "direction-out",
+        &json!({ "source": [EVENT_SOURCE], "detail": { "Origin": [ENDPOINT_EC2] } }),
+        &out_arn,
+    )
+    .await;
+    given_rule(
+        &router,
+        case,
+        "direction-in",
+        &json!({ "source": [EVENT_SOURCE], "detail": { "Origin": [ENDPOINT_GROUP] } }),
+        &in_arn,
+    )
+    .await;
+    grant_delivery(&router, case, &out_url, &out_arn).await;
+    grant_delivery(&router, case, &in_url, &in_arn).await;
+
+    let group = "direction-routed";
+    let arn = given_group(&router, case, group, &subnet, 2).await;
+    let mut out_buffer: Vec<Value> = Vec::new();
+    let launches =
+        poll_for_detail_type(&router, case, &out_url, LAUNCH_SUCCESSFUL, 2, &mut out_buffer).await;
+    assert_eq!(
+        launches.len(),
+        2,
+        "case {case:?}: the rule matching Origin {ENDPOINT_EC2} receives the two launches, \
+         got {launches:?}"
+    );
+    for event in &launches {
+        assert_envelope(case, event, LAUNCH_SUCCESSFUL, group, &arn);
+    }
+
+    set_desired_capacity(&router, case, group, 0).await;
+    let mut in_buffer: Vec<Value> = Vec::new();
+    let terminations = poll_for_detail_type(
+        &router,
+        case,
+        &in_url,
+        TERMINATE_SUCCESSFUL,
+        2,
+        &mut in_buffer,
+    )
+    .await;
+    assert_eq!(
+        terminations.len(),
+        2,
+        "case {case:?}: the rule matching Origin {ENDPOINT_GROUP} receives the two \
+         terminations, got {terminations:?}"
+    );
+    for event in &terminations {
+        assert_envelope(case, event, TERMINATE_SUCCESSFUL, group, &arn);
+    }
+    // Neither rule received the other direction: every envelope each queue holds is the
+    // step its pattern named.
+    assert!(
+        out_buffer
+            .iter()
+            .all(|event| event["detail-type"] == json!(LAUNCH_SUCCESSFUL)),
+        "case {case:?}: the scale-out rule must receive only launches, got {out_buffer:?}"
+    );
+    assert!(
+        in_buffer
+            .iter()
+            .all(|event| event["detail-type"] == json!(TERMINATE_SUCCESSFUL)),
+        "case {case:?}: the scale-in rule must receive only terminations, got {in_buffer:?}"
     );
 }

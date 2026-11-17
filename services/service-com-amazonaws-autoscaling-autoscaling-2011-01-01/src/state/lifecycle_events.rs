@@ -78,6 +78,17 @@ pub const INSTANCE_TERMINATE_SUCCESSFUL: &str = "EC2 Instance Terminate Successf
 /// bus a rule carrying no `EventBusName` is created on.
 pub const DEFAULT_EVENT_BUS: &str = "default";
 
+/// Amazon EC2 itself, as one end of the move a lifecycle step made: where an instance a
+/// group launched came FROM, and where one it scaled in went TO.
+///
+/// Fixed text naming a place an instance can be, never a value of the request: the pair of
+/// endpoints is read off the direction of the step alone
+/// ([`InstanceLifecycle::origin`], [`InstanceLifecycle::destination`]).
+pub const LIFECYCLE_ENDPOINT_EC2: &str = "EC2";
+
+/// The group itself, as the other end of both of those moves.
+pub const LIFECYCLE_ENDPOINT_AUTO_SCALING_GROUP: &str = "AutoScalingGroup";
+
 /// How many lifecycle events the queue holds at once.
 ///
 /// This module's OWN ceiling, not an AWS quota: the queue lives in memory and every
@@ -154,6 +165,31 @@ impl InstanceLifecycle {
         match self {
             Self::Launched => super::sns_notifications::EC2_INSTANCE_LAUNCH,
             Self::Terminated => super::sns_notifications::EC2_INSTANCE_TERMINATE,
+        }
+    }
+
+    /// Where the instance this step moved came FROM — the event's `detail.Origin`.
+    ///
+    /// A step moves an instance between two places, and which two is decided by the step's
+    /// DIRECTION alone: a group that launches one takes it from Amazon EC2 into itself, and
+    /// a group that scales one in hands it back to Amazon EC2. So the pair is fixed text
+    /// per direction, with nothing of the request in it, and the two reads are each other's
+    /// reverse.
+    #[must_use]
+    pub fn origin(self) -> &'static str {
+        match self {
+            Self::Launched => LIFECYCLE_ENDPOINT_EC2,
+            Self::Terminated => LIFECYCLE_ENDPOINT_AUTO_SCALING_GROUP,
+        }
+    }
+
+    /// Where it went — the event's `detail.Destination`, the other end of the same move
+    /// ([`Self::origin`]).
+    #[must_use]
+    pub fn destination(self) -> &'static str {
+        match self {
+            Self::Launched => LIFECYCLE_ENDPOINT_AUTO_SCALING_GROUP,
+            Self::Terminated => LIFECYCLE_ENDPOINT_EC2,
         }
     }
 
@@ -483,6 +519,11 @@ fn group_due_instants(group: &StoredGroup) -> Vec<SystemTime> {
 /// same instant reports and never a second, invented copy of it. The activity has completed
 /// by the instant the event is published — that completion is what the event reports — so
 /// its status is [`ACTIVITY_SUCCESSFUL`] and it carries no status message.
+///
+/// Beside the activity, the detail names the two ENDS of the move the step made — `Origin`
+/// and `Destination` — so a consumer branches on the direction (a rule pattern on
+/// `detail.Origin`, say) instead of reading the step out of the description. They come from
+/// the step's direction alone, never from the request.
 fn lifecycle_event_detail(event: &PendingLifecycleEvent) -> ::serde_json::Value {
     let mut placement = ::serde_json::Map::new();
     if let Some(zone) = event.availability_zone.as_ref() {
@@ -543,6 +584,16 @@ fn lifecycle_event_detail(event: &PendingLifecycleEvent) -> ::serde_json::Value 
     detail.insert(
         "Cause".to_string(),
         ::serde_json::Value::String(event.cause.clone()),
+    );
+    // Which WAY the instance moved, so a consumer can branch on direction without parsing
+    // the description: the two endpoints of the step, read off its direction alone.
+    detail.insert(
+        "Origin".to_string(),
+        ::serde_json::Value::String(event.kind.origin().to_string()),
+    );
+    detail.insert(
+        "Destination".to_string(),
+        ::serde_json::Value::String(event.kind.destination().to_string()),
     );
     ::serde_json::Value::Object(detail)
 }
