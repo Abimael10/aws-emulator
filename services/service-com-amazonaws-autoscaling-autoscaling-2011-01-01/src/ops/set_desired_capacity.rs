@@ -246,10 +246,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 SetDesiredCapacityErrorModeled::ScalingActivityInProgressFault(
                     ScalingActivityInProgressFault {
-                        message: Some(format!(
-                            "The AutoScalingGroup {name} still holds instances from an earlier \
-                             scaling activity: retry once they have finished terminating"
-                        )),
+                        message: Some(crate::state::instances_still_terminating_message(&name)),
                     },
                 )
                 .into(),
@@ -275,6 +272,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 desired_capacity,
                 due,
                 cause,
+                // A capacity set outright carries no cooldown of its own, so the group's
+                // `DefaultCooldown` is the one this change leaves behind.
+                cooldown_override: None,
             });
             crate::state::audit(
                 ctx.parts(),

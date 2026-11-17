@@ -44,8 +44,11 @@ use super::*;
 /// Amazon EC2 Auto Scaling's signing name and the API version a request names beside the
 /// action, from its model (`sigv4Name: autoscaling`, service shape `AutoScaling_2011_01_01`,
 /// `version: 2011-01-01`), which speaks `awsQuery` — so its calls ride on [`call_query`].
-const AUTOSCALING_SIGNING_NAME: &str = "autoscaling";
-const AUTOSCALING_API_VERSION: &str = "2011-01-01";
+///
+/// Shared with the scaling-policy arms ([`super::auto_scaling_policies`]), so the two sets of
+/// calls to this service cannot be signed for two different endpoints.
+pub(super) const AUTOSCALING_SIGNING_NAME: &str = "autoscaling";
+pub(super) const AUTOSCALING_API_VERSION: &str = "2011-01-01";
 
 /// The error code Amazon EC2 answers for a launch template it does not hold
 /// (`InvalidLaunchTemplateId.NotFound`, that service's own API error code), which is a delete

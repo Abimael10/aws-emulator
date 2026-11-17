@@ -152,6 +152,16 @@ pub mod scaling_policies;
 
 pub use scaling_policies::{PolicyKey, StoredScalingPolicy};
 
+/// Performing one of those policies — `ExecutePolicy` — which policy a request names, the
+/// capacity the policy's own adjustment moves the group to, and the cooldowns it honours
+/// and leaves behind.
+pub mod policy_execution;
+
+pub use policy_execution::{
+    MetricBreach, PolicyExecution, PolicyExecutionRefusal, PolicyExecutionRequest,
+    PolicyLookupFailure,
+};
+
 /// The Amazon SNS notification configurations of a group: the named collection
 /// `PutNotificationConfiguration` upserts into and `DescribeNotificationConfigurations`
 /// projects from, and the rules every writer of it shares.
@@ -665,6 +675,26 @@ pub struct PendingCapacity {
     pub desired_capacity: i32,
     pub due: SystemTime,
     pub cause: String,
+    /// The cooldown, in seconds, this change leaves the group in once it is applied, where
+    /// the change carries one of its OWN rather than the group's `DefaultCooldown`: a
+    /// performed scaling policy's `Cooldown` "overrides the default cooldown period defined
+    /// for the Auto Scaling group" ([`policy_execution`]), and a deferred execution owes that
+    /// override exactly as an immediate one does. `None` for a change that leaves the
+    /// group's own default in force.
+    pub cooldown_override: Option<i32>,
+}
+
+/// One deferred capacity change the clock has made due, as the pass that applies them reads
+/// it: which group it moves, the capacity it moves to inside the bounds in force, what it
+/// records as the reason, the instant it came due, and the cooldown of its own it leaves
+/// behind.
+#[derive(Debug, Clone)]
+struct DueCapacityChange {
+    group_name: String,
+    desired_capacity: i32,
+    cause: String,
+    due: SystemTime,
+    cooldown_override: Option<i32>,
 }
 
 /// A stored Auto Scaling group — the `AutoScalingGroup` resource, as created and
@@ -1449,7 +1479,7 @@ impl AutoScalingState {
     /// launches and terminates the account's own Amazon EC2 instances when it comes
     /// due, exactly as the change a request applies straight away does.
     pub fn materialize_due<Eng: Send + Sync + 'static>(&mut self, engine: &Eng, now: SystemTime) {
-        let due_changes: Vec<(String, i32, String, SystemTime)> = self
+        let due_changes: Vec<DueCapacityChange> = self
             .groups
             .values()
             .filter_map(|group| {
@@ -1457,19 +1487,18 @@ impl AutoScalingState {
                     .pending_capacity
                     .as_ref()
                     .filter(|pending| pending.due <= now)
-                    .map(|pending| {
-                        (
-                            group.name.clone(),
-                            // The group's bounds may have been narrowed while the
-                            // change waited, and a group never holds a capacity
-                            // outside its own bounds, so the deferred value is
-                            // brought inside the ones in force when it is applied.
-                            pending
-                                .desired_capacity
-                                .clamp(group.min_size, group.max_size),
-                            pending.cause.clone(),
-                            pending.due,
-                        )
+                    .map(|pending| DueCapacityChange {
+                        group_name: group.name.clone(),
+                        // The group's bounds may have been narrowed while the
+                        // change waited, and a group never holds a capacity
+                        // outside its own bounds, so the deferred value is
+                        // brought inside the ones in force when it is applied.
+                        desired_capacity: pending
+                            .desired_capacity
+                            .clamp(group.min_size, group.max_size),
+                        cause: pending.cause.clone(),
+                        due: pending.due,
+                        cooldown_override: pending.cooldown_override,
                     })
             })
             .collect();
@@ -1477,8 +1506,18 @@ impl AutoScalingState {
         // the instances it launches and the cooldown it starts are anchored there,
         // so the passes below retire whatever that instant has itself made due and
         // the state a caller sees does not depend on when they read.
-        for (name, desired_capacity, cause, due) in due_changes {
-            self.apply_capacity(engine, &name, desired_capacity, &cause, due);
+        for change in due_changes {
+            self.apply_capacity(
+                engine,
+                &change.group_name,
+                change.desired_capacity,
+                &change.cause,
+                change.due,
+            );
+            // A change carrying a cooldown of its OWN leaves the group in that one rather
+            // than in the group's `DefaultCooldown` the convergence above started, whether
+            // it was applied straight away or waited for this instant.
+            self.override_cooldown(&change.group_name, change.cooldown_override, change.due);
         }
         // Before the lifecycle pass below, so an instance a replacement launched at
         // an instant already past leaves its transient state in this same call.
@@ -1654,6 +1693,27 @@ impl AutoScalingState {
                 now,
             );
         }
+    }
+
+    /// Leave the group in the cooldown `seconds` names, counted from `applied_at` — the
+    /// cooldown the CHANGE carries rather than the group's `DefaultCooldown`, which
+    /// [`Self::apply_capacity`] has just started.
+    ///
+    /// THE ONE place a capacity change overrides that default, so an execution applied at
+    /// once and one the clock applied when its deferral came due leave the same cooldown
+    /// behind. Does nothing for a change that carries none, and nothing for a name no group
+    /// answers to.
+    pub fn override_cooldown(
+        &mut self,
+        group_name: &str,
+        seconds: Option<i32>,
+        applied_at: SystemTime,
+    ) {
+        let Some((seconds, group)) = seconds.zip(self.groups.get_mut(group_name)) else {
+            return;
+        };
+        group.cooldown_until =
+            Some(applied_at + Duration::from_secs(u64::from(seconds.max(0).unsigned_abs())));
     }
 
     /// Take the instances `instance_ids` names out of service because a CALLER asked
@@ -2499,10 +2559,25 @@ pub const TERMINATION_POLICY_TYPES: &[&str] = &[
 /// type. The valid values are ChangeInCapacity, ExactCapacity, and
 /// PercentChangeInCapacity." In ASCII order.
 pub const ADJUSTMENT_TYPES: &[&str] = &[
-    "ChangeInCapacity",
-    "ExactCapacity",
-    "PercentChangeInCapacity",
+    ADJUSTMENT_TYPE_CHANGE_IN_CAPACITY,
+    ADJUSTMENT_TYPE_EXACT_CAPACITY,
+    ADJUSTMENT_TYPE_PERCENT_CHANGE_IN_CAPACITY,
 ];
+
+/// The adjustment type that moves a group's capacity BY the number the policy carries: "a
+/// positive value adds to the current capacity while a negative number removes from the
+/// current capacity" (`StepAdjustment$ScalingAdjustment`).
+///
+/// Named beside its siblings so the ONE catalogue above is also what the arithmetic that
+/// applies an adjustment reads ([`policy_execution::adjusted_capacity`]), rather than a
+/// second copy of the three spellings.
+pub const ADJUSTMENT_TYPE_CHANGE_IN_CAPACITY: &str = "ChangeInCapacity";
+
+/// The adjustment type whose number IS the capacity the group is moved to.
+pub const ADJUSTMENT_TYPE_EXACT_CAPACITY: &str = "ExactCapacity";
+
+/// The adjustment type that moves the capacity by a percentage of itself.
+pub const ADJUSTMENT_TYPE_PERCENT_CHANGE_IN_CAPACITY: &str = "PercentChangeInCapacity";
 
 /// The catalog `DescribeLifecycleHookTypes` reports: the lifecycle transitions a
 /// lifecycle hook may name, from the model's own documentation for
@@ -2942,6 +3017,22 @@ pub fn min_size_breach_message(desired_capacity: i32, min_size: i32, terminating
              size constraint. {remedy}"
         )
     }
+}
+
+/// The sentence Amazon EC2 Auto Scaling states for `ScalingActivityInProgressFault` when
+/// the instances an earlier change of the group is still taking out of service are what
+/// blocks this one.
+///
+/// THE ONE COPY for this service: every operation that changes a group's size — the
+/// desired-capacity set, the group update and the policy execution — answers that error
+/// class with this sentence, so one class of one service has one wording. The group's name
+/// is its only variable part and comes from the request.
+#[must_use]
+pub fn instances_still_terminating_message(group_name: &str) -> String {
+    format!(
+        "The AutoScalingGroup {group_name} still holds instances from an earlier scaling \
+         activity: retry once they have finished terminating"
+    )
 }
 
 /// The sentence Amazon EC2 Auto Scaling states for `InstanceRefreshInProgressFault`:

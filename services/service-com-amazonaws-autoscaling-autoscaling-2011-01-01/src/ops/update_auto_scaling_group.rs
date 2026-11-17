@@ -647,10 +647,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 UpdateAutoScalingGroupErrorModeled::ScalingActivityInProgressFault(
                     ScalingActivityInProgressFault {
-                        message: Some(format!(
-                            "The AutoScalingGroup {name} still holds instances from an earlier \
-                             scaling activity: retry once they have finished terminating"
-                        )),
+                        message: Some(crate::state::instances_still_terminating_message(&name)),
                     },
                 )
                 .into(),

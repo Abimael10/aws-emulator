@@ -287,6 +287,9 @@ impl AutoScalingState {
                         new_desired,
                         desired_capacity,
                     ),
+                    // A retried launch leaves the group's own `DefaultCooldown` in force:
+                    // nothing of its own overrides it.
+                    cooldown_override: None,
                 });
             }
         }

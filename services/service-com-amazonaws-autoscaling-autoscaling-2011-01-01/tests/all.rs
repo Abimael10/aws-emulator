@@ -29,6 +29,8 @@ mod client_error_refusal_wording;
 mod cross_region_target_group_attachment;
 #[path = "all/delete_notification_configuration.rs"]
 mod delete_notification_configuration;
+#[path = "all/delete_policy.rs"]
+mod delete_policy;
 #[path = "all/describe_lifecycle_hooks_projection.rs"]
 mod describe_lifecycle_hooks_projection;
 #[path = "all/describe_load_balancer_target_groups.rs"]
@@ -41,6 +43,8 @@ mod describe_tags;
 mod enter_standby_instance_set;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
+#[path = "all/execute_policy.rs"]
+mod execute_policy;
 #[path = "all/group_configuration_refusals.rs"]
 mod group_configuration_refusals;
 #[path = "all/group_state_and_standby_transitions.rs"]

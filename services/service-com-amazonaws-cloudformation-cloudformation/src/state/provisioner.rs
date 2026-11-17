@@ -675,6 +675,12 @@ pub(super) enum Provisioner {
     /// type's `Ref` returns — and `DeleteAutoScalingGroup` deletes by that name, together
     /// with the instances the group launched.
     AutoScalingGroup,
+    /// `AWS::AutoScaling::ScalingPolicy`: a scaling policy of such a group, which
+    /// `PutScalingPolicy` creates "or updates" under the name the stack decided — the name
+    /// this type's physical id is — and `DeletePolicy` removes by that name. The policy's
+    /// ARN is the one Amazon EC2 Auto Scaling minted, published through `Fn::GetAtt`
+    /// ([`auto_scaling_policies`]).
+    AutoScalingScalingPolicy,
     OpenSearchServerlessCollection,
     OpenSearchServerlessSecurityPolicy,
     /// `AWS::OpenSearchService::Domain`: a domain of Amazon OpenSearch Service, which is a
@@ -1197,6 +1203,9 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         EC2_VOLUME => Some(Provisioner::Ec2Volume),
         EC2_LAUNCH_TEMPLATE => Some(Provisioner::Ec2LaunchTemplate),
         AUTOSCALING_GROUP => Some(Provisioner::AutoScalingGroup),
+        auto_scaling_policies::AUTOSCALING_SCALING_POLICY => {
+            Some(Provisioner::AutoScalingScalingPolicy)
+        }
         AOSS_COLLECTION => Some(Provisioner::OpenSearchServerlessCollection),
         AOSS_SECURITY_POLICY => Some(Provisioner::OpenSearchServerlessSecurityPolicy),
         OPENSEARCH_DOMAIN => Some(Provisioner::OpenSearchServiceDomain),
@@ -1433,6 +1442,9 @@ impl Provisioner {
             Self::AutoScalingGroup => {
                 create_auto_scaling_group(ctx, region, resource, propagated).await
             }
+            // `AWS::AutoScaling::ScalingPolicy` publishes no `Tags` property and
+            // `PutScalingPolicy` takes none, so no tag is propagated to a scaling policy.
+            Self::AutoScalingScalingPolicy => put_scaling_policy(ctx, region, resource).await,
             // Boxed, as the deeper arms of this match are: a bucket's create sends the
             // declared access controls and notification configuration after the create,
             // so this arm's own future is one of the largest here and a stack it shares
@@ -3080,6 +3092,12 @@ impl Provisioner {
             Self::AutoScalingGroup => {
                 update_auto_scaling_group(ctx, region, resource, declared).await
             }
+            // `PutScalingPolicy` "creates or updates a scaling policy for an Auto Scaling
+            // group", so a changed declaration reaches the policy through the same call that
+            // created it, under the name it was created with.
+            Self::AutoScalingScalingPolicy => {
+                update_scaling_policy(ctx, region, resource, declared).await
+            }
             // A LAUNCH TEMPLATE is a versioned document: `CreateLaunchTemplateVersion`
             // "creates a new version of a launch template", so a changed declaration of its
             // launch data reaches Amazon EC2 as a new version of the template the stack
@@ -3424,6 +3442,9 @@ impl Provisioner {
             Self::AutoScalingGroup => {
                 delete_auto_scaling_group(ctx, region, physical_resource_id).await
             }
+            // The policy is addressed by the group it belongs to and the name it was created
+            // under, and only the resource's own declaration says which group that is.
+            Self::AutoScalingScalingPolicy => delete_scaling_policy(ctx, region, resource).await,
             Self::OpenSearchServerlessSecurityPolicy => {
                 delete_security_policy(ctx, region, resource).await
             }
@@ -4040,6 +4061,17 @@ impl Provisioner {
             }
             Self::AutoScalingGroup => {
                 describe_auto_scaling_group(ctx, region, physical_resource_id).await
+            }
+            // Read back by the group and the name the policy was created under, which the
+            // resource's own record carries.
+            Self::AutoScalingScalingPolicy => {
+                describe_scaling_policy(
+                    ctx,
+                    region,
+                    &resource.properties,
+                    &declared_name(resource),
+                )
+                .await
             }
             Self::S3Bucket => describe_bucket(ctx, region, physical_resource_id).await,
             // A policy resource's configuration is the document the named bucket carries
@@ -4660,6 +4692,8 @@ mod route53_policies;
 /// `CreationPolicy` waits for are accounted for
 /// ([`super::provisioning::instance_signals`]).
 pub(super) mod compute_fleet;
+/// The scaling policies a stack attaches to an Auto Scaling group of [`compute_fleet`]'s.
+pub(in crate::state) mod auto_scaling_policies;
 mod network_and_delivery;
 /// The Amazon EKS arms of the two types a stack declares ON a cluster — the add-on and the
 /// managed node group — beside the cluster's own arms in [`network_and_delivery`]: each is a
@@ -4704,6 +4738,7 @@ use ssm_associations::*;
 use ssm_maintenance_windows::*;
 use ssm_documents::*;
 use resource_groups::*;
+use auto_scaling_policies::*;
 use batch_job_definitions::*;
 use compute_fleet::*;
 pub(crate) use network_and_delivery::*;

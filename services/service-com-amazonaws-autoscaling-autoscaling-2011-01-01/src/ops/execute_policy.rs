@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ExecutePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ExecutePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ExecutePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Performs the scaling policy a request names: the policy's own adjustment is applied to
+//! the capacity the group maintains, held inside the group's `MinSize`..`MaxSize`, and the
+//! group then launches or scales in the account's own Amazon EC2 instances to match,
+//! recording a scaling activity that names the policy. The rules — which policy a name or
+//! ARN resolves to, which types can be performed at all, how a step is selected from the
+//! metric value, and the two cooldowns involved — live in
+//! [`crate::state::policy_execution`], so the alarm-driven path to the same execution has
+//! one place to reach it.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +173,126 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ExecutePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ExecutePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ExecutePolicy"))
+        use crate::state::policy_execution as execution;
+
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(ExecutePolicyErrorModeled::ResourceContentionFault(
+                ResourceContentionFault {
+                    message: Some(
+                        "the Auto Scaling store is not mounted on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let policy_name = input.policy_name.clone();
+        let named_group = input.auto_scaling_group_name.clone();
+
+        // Which policy the request names, resolved before anything is written: the group it
+        // belongs to is what the call is authorized on, and a request naming no group takes
+        // it from the policy itself.
+        let key = {
+            let mut state = store.lock();
+            state.materialize_due(&*self.engine, now);
+            // A group name the request DOES carry has to name a stored group, and that is
+            // resolved before the policy is: a request naming no such group is refused for
+            // the group whatever policy it names.
+            if let Some(group_name) = named_group.as_deref() {
+                if !state.groups.contains_key(group_name) {
+                    return Err(crate::scaffolded::Scaffolded::validation_error(
+                        crate::state::absent_group_message(group_name),
+                    ));
+                }
+            }
+            match execution::resolve_policy(&state, named_group.as_deref(), &policy_name) {
+                Ok(key) => key,
+                Err(execution::PolicyLookupFailure::NotFound) => {
+                    return Err(crate::scaffolded::Scaffolded::validation_error(
+                        execution::absent_policy_message(&policy_name),
+                    ))
+                }
+                Err(execution::PolicyLookupFailure::Ambiguous) => {
+                    return Err(crate::scaffolded::Scaffolded::validation_error(
+                        execution::ambiguous_policy_message(&policy_name),
+                    ))
+                }
+            }
+        };
+        let group_name = key.auto_scaling_group_name.clone();
+
+        // Whether IAM lets this caller perform a policy of THIS group, decided against the
+        // group's own ARN with no store lock held and before anything is written
+        // ([`crate::service::authorization`]).
+        if let Some(refusal) = crate::service::authorization::group_action_refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &group_name,
+        ) {
+            crate::state::audit(
+                ctx.parts(),
+                Self::NAME,
+                &group_name,
+                "refused: not authorized",
+            );
+            return Err(refusal);
+        }
+
+        let request = execution::PolicyExecutionRequest {
+            // "By default, Amazon EC2 Auto Scaling does not honor the cooldown period
+            // during manual scaling activities" — a request that says nothing asks for the
+            // policy to be performed now.
+            honor_cooldown: input.honor_cooldown.unwrap_or(false),
+            metric_value: input.metric_value,
+            breach_threshold: input.breach_threshold,
+        };
+
+        let mut state = store.lock();
+        state.materialize_due(&*self.engine, now);
+        let outcome = state.execute_scaling_policy(&*self.engine, &key, request, now);
+        let performed = match outcome {
+            Ok(performed) => performed,
+            Err(refusal) => {
+                let message = refusal.message(&policy_name, &group_name);
+                crate::state::audit(ctx.parts(), Self::NAME, &group_name, "refused");
+                // The one refusal of this operation the model declares an error for: the
+                // group is still taking instances out of service for an earlier change, so
+                // this one cannot be started yet. Every other one is the service's own
+                // `ValidationError` about the request or the policy it names.
+                return Err(match refusal {
+                    execution::PolicyExecutionRefusal::InstancesStillTerminating => {
+                        ExecutePolicyErrorModeled::ScalingActivityInProgressFault(
+                            ScalingActivityInProgressFault {
+                                message: Some(message),
+                            },
+                        )
+                        .into()
+                    }
+                    _ => crate::scaffolded::Scaffolded::validation_error(message),
+                });
+            }
+        };
+        crate::state::audit(
+            ctx.parts(),
+            Self::NAME,
+            &group_name,
+            if performed.deferred_until.is_some() {
+                "capacity change deferred until the cooldown has elapsed"
+            } else {
+                "scaling policy executed"
+            },
+        );
+
+        // The instances this change launched or scaled in settle on the clock, as do a
+        // deferred change and the events that report either, with no further call from
+        // anybody. The store's lock is released first: the pump takes it itself.
+        drop(state);
+        // Those instances are also targets of the target groups the group is attached to, so
+        // one launched is registered and one scaled in deregisters.
+        crate::state::elbv2_targets::settle_group(&*self.engine, &group_name);
+        crate::state::drive_lifecycle_clock(ctx, &self.engine);
+        Ok(ExecutePolicyOutput)
     }
 }
