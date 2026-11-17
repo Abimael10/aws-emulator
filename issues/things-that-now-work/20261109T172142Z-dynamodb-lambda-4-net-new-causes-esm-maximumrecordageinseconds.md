@@ -57,3 +57,25 @@ Cause 1: write records to a DynamoDB stream, wait past 60s, then CreateEventSour
 Cause 2: CreateEventSourceMapping with TumblingWindowInSeconds>0 on a DynamoDB stream; write records; inspect the event for 'window', 'shardId', 'isFinalInvokeForWindow' and state propagation.
 Cause 3: CreateFunction with a zip, then lambda:GetFunction and GET the returned Code.Location.
 Cause 4: deploy a Go-runtime handler behind a DynamoDB-stream ESM; PutItem/UpdateItem/DeleteItem and look for INSERT/MODIFY/REMOVE in the handler's log.
+
+## Resolution
+Cause 1 (`MaximumRecordAgeInSeconds`) and cause 2 (tumbling windows) are FIXED in the shard-source
+event source mapping poller: a record older than the finite age its mapping states is handed to no
+invocation and the shard reads on past it, and a mapping with a tumbling window tells every
+invocation which window it is in, hands the state the handler returned to the next invocation of
+that window and ends each window with one final invocation carrying that state. Both rules hold for
+either stream source, since the two share one reader
+(`services/service-com-amazonaws-lambda-awsgirapiservice/src/state/event_source_poller/`), and each
+is pinned by a table-driven suite in that crate's `tests/all/`.
+
+Cause 3 (`GetFunction`'s `Code.Location`) was already correct by the time this was picked up: the
+location is presigned against the base URL this emulator is reached on
+(`state/download_location.rs`) and served back by the crate's own download plane, which
+`tests/all/announced_download_locations.rs` pins.
+
+Cause 4 (a Go managed-runtime handler) is NOT fixed and is NOT reported as working: it needs an
+execution substrate for a compiled native program image, which is a capability of its own rather
+than anything in the delivery path above. It is carried forward as its own open report,
+`issues/things-that-do-not-work/20261109T172143Z-lambda-a-handler-on-a-compiled-native-runtime-is-never-run.md`,
+so the tracker still holds it; a function on such a runtime is still answered with the modelled
+`InvalidRuntimeException`, exactly as before.

@@ -41,6 +41,22 @@
 //!   moves past a record an invocation processed — which is what lets the records behind one
 //!   the criteria reject be delivered — and a batch they reject every record of is a pass
 //!   that made no invocation at all.
+//! * A RECORD PAST THE MAPPING'S RECORD AGE IS DISCARDED. "Discard records older than the
+//!   specified age. The default value is infinite (-1)" (`MaximumRecordAgeInSeconds`): a
+//!   mapping stating a finite age hands no record older than that to its function
+//!   ([`record_age`]), and such a record is accounted for by the pass exactly as one the
+//!   criteria rejected — so the shard reads on past it, and a mapping whose whole backlog has
+//!   aged out makes no invocation at all while still reading on. A mapping carrying the
+//!   infinite default discards nothing.
+//! * A MAPPING WITH A TUMBLING WINDOW AGGREGATES OVER IT. "(Kinesis and DynamoDB Streams
+//!   only) The duration in seconds of a processing window" (`TumblingWindowInSeconds`): every
+//!   invocation of such a mapping carries the window it falls in, the shard and the stream
+//!   its records came from and the state that window has reached, the state the handler
+//!   returns is what the next invocation of that window is handed, and each window ends in
+//!   one final invocation carrying that state ([`tumbling_window`]). What is read, batched
+//!   and checkpointed is not changed by a window, but such a mapping reads one shard
+//!   SERIALLY ([`in_flight_batches_of`]): the state is the shard's, and it is handed from one
+//!   invocation of the window to the next.
 //! * A BATCH IS CHECKPOINTED PAST ONLY ONCE DELIVERED. An invocation that did not succeed
 //!   leaves the cursor where it was, so the same batch is read again — "The default value
 //!   is infinite (-1). When set to infinite (-1), failed records are retried until the
@@ -128,8 +144,12 @@ pub mod dynamodb_stream;
 pub mod failure_destination;
 /// How a Kinesis data stream is listed, read and handed over.
 pub mod kinesis_stream;
+/// Which records of a batch are too old for the mapping's own record age to hand over.
+mod record_age;
 /// What a mapping's `FilterCriteria` admit of one batch, and what each record is matched as.
 mod record_filter;
+/// The tumbling window a mapping aggregates one shard's records over.
+mod tumbling_window;
 use record_filter::admitted_of;
 
 /// How long the poller waits before looking at an idle shard again. Short enough that a
@@ -229,6 +249,29 @@ pub(crate) fn in_flight_batches_per_shard(
         configured.clamp(MIN_PARALLELIZATION_FACTOR, MAX_PARALLELIZATION_FACTOR),
         reserved_concurrent_executions,
     )
+}
+
+/// How many batches of ONE shard a mapping has in flight once its TUMBLING WINDOW is taken
+/// into account: what [`in_flight_batches_per_shard`] answers, or exactly one while the
+/// mapping aggregates over a window.
+///
+/// A window's state is the SHARD's: the state one invocation of a window returns is what the
+/// NEXT invocation of that window is handed ([`tumbling_window`]), which only holds while the
+/// invocations of one shard's window are made one after another. Two invocations of the same
+/// window in flight beside each other would each be handed the state the other had not
+/// returned yet, and one of the two aggregates would be lost — a plausible figure that is not
+/// the aggregate over the window. So a mapping that configures a window reads its shard
+/// serially, whatever `ParallelizationFactor` it also carries, and the records it reads are
+/// unchanged: a pass takes one batch instead of several.
+fn in_flight_batches_of(
+    tumbling_window: Option<Duration>,
+    parallelization_factor: Option<i32>,
+    reserved_concurrent_executions: Option<i32>,
+) -> usize {
+    if tumbling_window.is_some() {
+        return ONE_BATCH_PER_SHARD;
+    }
+    in_flight_batches_per_shard(parallelization_factor, reserved_concurrent_executions)
 }
 
 /// Start the in-process poller for the event source mapping `uuid` names, if one is not
@@ -397,6 +440,13 @@ struct ShardSourcedMapping {
     /// The destination the mapping's `DestinationConfig$OnFailure` names, when it names one:
     /// where the record of a discarded batch is written ([`failure_destination`]).
     on_failure_destination: Option<String>,
+    /// How old a record of this mapping may be and still be handed to the function, from
+    /// `MaximumRecordAgeInSeconds`; `None` for the infinite default, which discards no
+    /// record at all ([`record_age`]).
+    maximum_record_age: Option<Duration>,
+    /// The tumbling window this mapping aggregates each shard's records over, from
+    /// `TumblingWindowInSeconds`; `None` for a mapping with no window ([`tumbling_window`]).
+    tumbling_window: Option<Duration>,
     /// Where the mapping reads next in each shard it has already read from.
     cursors: BTreeMap<String, ShardCursor>,
     /// Where it reads a shard it has not read from yet.
@@ -643,6 +693,11 @@ struct PollerWork {
     /// on is being SPLIT, keyed by shard id ([`BisectedBatch`]). Bounded and given up like
     /// [`Self::attempts`], and empty for a mapping that does not ask for the split.
     bisected: BTreeMap<String, BisectedBatch>,
+    /// The tumbling window each shard is aggregating into, keyed by shard id
+    /// ([`tumbling_window`]). Bounded like [`Self::attempts`] by the shards of the one
+    /// stream this poller reads, an entry is given up as soon as its window is finalised,
+    /// and the map is empty for a mapping that configures no window.
+    windows: BTreeMap<String, tumbling_window::OpenWindow>,
 }
 
 /// How many records one batch of ONE shard holds while the mapping is splitting a batch its
@@ -802,6 +857,11 @@ fn run_of(
         ));
     };
     let region = parsed.region.to_string();
+    // "The duration in seconds of a processing window" (`TumblingWindowInSeconds`), for a
+    // mapping that states one ([`tumbling_window`]). Read before the batches in flight,
+    // because a window decides how many of them one shard may have
+    // ([`in_flight_batches_of`]).
+    let tumbling_window = tumbling_window::tumbling_window(mapping.tumbling_window_in_seconds);
     // The role the invocation is attributed to, read from the VERSION this mapping
     // invokes: "The ARN of the Lambda function" the mapping carries may be qualified, and
     // an alias names the version it invokes.
@@ -822,8 +882,10 @@ fn run_of(
         invoke_identity_arn,
         batch_size: mapping.batch_size.clamp(1, MAX_RECORDS_PER_BATCH),
         // "The number of batches to process from each shard concurrently", held to what the
-        // function's own concurrency admits ([`in_flight_batches_per_shard`]).
-        in_flight_batches: in_flight_batches_per_shard(
+        // function's own concurrency admits and to what the mapping's own tumbling window
+        // admits ([`in_flight_batches_of`]).
+        in_flight_batches: in_flight_batches_of(
+            tumbling_window,
             mapping.parallelization_factor,
             store
                 .functions
@@ -841,6 +903,10 @@ fn run_of(
         on_failure_destination: failure_destination::on_failure_destination(
             mapping.destination_config.as_ref(),
         ),
+        // "Discard records older than the specified age" (`MaximumRecordAgeInSeconds`),
+        // for a mapping that states a finite one ([`record_age`]).
+        maximum_record_age: record_age::maximum_record_age(mapping.maximum_record_age_in_seconds),
+        tumbling_window,
         cursors: mapping.shard_cursors.clone(),
         initial_cursor: mapping.initial_shard_cursor(),
     })
@@ -893,6 +959,14 @@ async fn move_batches(
     let mut undelivered = false;
     for shard in &listed.shards {
         let shard = shard.as_str();
+        // A tumbling window the clock has ENDED is finalised before anything more is read
+        // off this shard, so the records that follow aggregate into the window the clock is
+        // in rather than into the one that is over ([`close_due_window`]).
+        if let Err(detail) = close_due_window(callback, work, run, shard, SystemTime::now()).await {
+            failure = Some(detail);
+            undelivered = true;
+            continue;
+        }
         let cursor = run
             .cursors
             .get(shard)
@@ -942,15 +1016,21 @@ async fn move_batches(
                 );
             }
         }
-        // What the mapping's criteria admit of what was read, decided before anything is
-        // handed over: a record no pattern matches is not handed to the function at all, and
-        // the shard still reads on past it ([`admitted_of`]).
-        let admitted = admitted_of(&criteria, run, &records);
+        // What the mapping's own record age discards of what was read: "Discard records
+        // older than the specified age" (`MaximumRecordAgeInSeconds`), decided at the
+        // instant the batch was read, so a record past that age is handed to no invocation
+        // and the pass itself accounts for it ([`record_age`]).
+        let aged_out = record_age::aged_out(run.maximum_record_age, &records, SystemTime::now());
+        // What the mapping's criteria admit of the records it did not discard, decided
+        // before anything is handed over: a record no pattern matches is not handed to the
+        // function at all, and the shard still reads on past it ([`admitted_of`]).
+        let admitted = admitted_of(&criteria, run, &records, &aged_out);
         let Some(invoking) = admitted.invoking() else {
-            // The criteria admitted nothing of what was read, so there is no invocation to
-            // make for it: the pass handled it all by discarding what the filter rejected,
-            // which is a pass that came to no problem, and the shard reads on from past
-            // those records so the ones behind them are delivered.
+            // The pass handed nothing over for what it read — its criteria admitted none of
+            // it, or the mapping's record age discarded all of it — so there is no
+            // invocation to make for it: the pass handled it all by discarding it, which is
+            // a pass that came to no problem, and the shard reads on from past those records
+            // so the ones behind them are delivered.
             checkpoint(
                 state,
                 uuid,
@@ -973,14 +1053,25 @@ async fn move_batches(
             run.in_flight_batches,
             work.batch_limit(shard, position, batch_records(run)),
         );
+        // The tumbling window this pass's invocations aggregate into, for a mapping that
+        // configures one: the window the clock is in, opened for a shard aggregating into
+        // none yet, which every invocation of it carries the bounds, the shard, the stream
+        // and the state of ([`tumbling_window`]).
+        let window = run.tumbling_window.map(|duration| {
+            tumbling_window::open(&mut work.windows, shard, duration, SystemTime::now())
+        });
         // What each of them is handed over as, and the records it is the function's report
         // about ([`super::batch_item_failures`]): a function can only report about the
         // records it was HANDED.
         let handing: Vec<(Value, Vec<String>)> = batches
             .iter()
             .map(|batch| {
+                let mut payload = batch_event(batch);
+                if let Some(window) = window.as_ref() {
+                    tumbling_window::attach(&mut payload, &run.stream_arn, shard, window, false);
+                }
                 (
-                    batch_event(batch),
+                    payload,
                     batch
                         .iter()
                         .map(|record| record.sequence_number.clone())
@@ -1002,13 +1093,28 @@ async fn move_batches(
             )
             .await,
         );
+        // What an invocation of a TUMBLING WINDOW returned as its state is what the next
+        // invocation of that window is handed, and a state that outgrew its bound ends the
+        // window at once ([`tumbling_window::carry_state`]). Only an attempt the function
+        // processed the batch in carries its state on: a batch that is to be attempted again
+        // is aggregated once, when it is processed.
+        if window.is_some() && attempt.failure.is_none() {
+            if let Some(answered) = attempt.answered.as_ref() {
+                tumbling_window::carry_state(
+                    &mut work.windows,
+                    shard,
+                    answered.payload.as_deref(),
+                );
+            }
+        }
         // The mapping reads on from past the records the pass processed, and the attempt at
         // the head of what it read is reported as what the mapping last came to. A shard has
         // ONE position, so what it reads on from is the run of records at the head that were
         // processed: the first record its function reported it did not process — or one no
         // batch of this pass took — is where the next read starts, whatever became of the
-        // records behind that one. A record the criteria REJECTED is consumed by the pass
-        // itself, so it counts as handled for that position.
+        // records behind that one. A record the pass itself discarded — one the criteria
+        // REJECTED, or one past the mapping's record age — is consumed by the pass, so it
+        // counts as handled for that position.
         let through = attempt
             .failure
             .is_none()
@@ -1420,6 +1526,64 @@ fn batch_event(records: &[ShardRecord]) -> Value {
     })
 }
 
+/// Make the FINAL invocation the tumbling window of `shard` owes, for a window that is over.
+///
+/// A window that has ended is finalised before anything more is read off that shard: the
+/// function is invoked once more with NO records, the state the window reached and
+/// `isFinalInvokeForWindow` true ([`tumbling_window`]), which is where a handler aggregating
+/// over the window writes its result. Only then does the shard read on, so the records that
+/// follow aggregate into the window the clock is in rather than into the one that is over.
+///
+/// An invocation the function did not answer leaves the window where it is and reports the
+/// pass as failed, so nothing is read off the shard on this pass and the final invocation is
+/// attempted again — until the mapping has spent on it every attempt it allows, which is the
+/// same allowance a batch its function keeps failing gets ([`attempts_allowed`]). A mapping
+/// that configures no window, and a shard whose window is still open, owe nothing here.
+async fn close_due_window(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    work: &mut PollerWork,
+    run: &ShardSourcedMapping,
+    shard: &str,
+    now: SystemTime,
+) -> Result<(), String> {
+    if run.tumbling_window.is_none() {
+        return Ok(());
+    }
+    let Some(window) = tumbling_window::due_to_close(&work.windows, shard, now) else {
+        return Ok(());
+    };
+    // "Lambda ... a final invocation": the records of the window have already been handed
+    // over, so what this invocation carries is the window itself and the state it reached.
+    let mut payload = batch_event(&[]);
+    tumbling_window::attach(&mut payload, &run.stream_arn, shard, &window, true);
+    let client = work.clients.lambda(callback, &run.region).clone();
+    let detail = match invoke_function(&client, run, &payload).await {
+        Ok(answered) => match answered.function_error {
+            None => {
+                tumbling_window::closed(&mut work.windows, shard);
+                return Ok(());
+            }
+            // "If present, indicates that an error occurred during function execution"
+            // (`InvocationResponse$FunctionError`): the window was not finalised.
+            Some(failure) => format!(
+                "{} answered a {failure} error for the final invocation of {shard}'s tumbling \
+                 window",
+                run.function_arn
+            ),
+        },
+        Err(detail) => detail,
+    };
+    if tumbling_window::final_attempt_failed(&mut work.windows, shard, run.attempts_allowed) {
+        return Err(format!(
+            "{detail}, and the mapping allows no further attempt at it, so that window is \
+             given up on and {shard} aggregates into the window the clock is in"
+        ));
+    }
+    Err(format!(
+        "{detail}, so the final invocation of that window is attempted again"
+    ))
+}
+
 /// Every open and closed shard of the mapped stream, in the order the stream reports them,
 /// and how the records of one shard are grouped into the concurrent batches of a pass —
 /// through the listing the source's own data plane publishes.
@@ -1508,11 +1672,10 @@ fn iterator_age_millis(
     arrived_at: Option<&::aws_smithy_types::DateTime>,
     read_at: SystemTime,
 ) -> f64 {
-    let Some(arrived_at) = arrived_at else {
-        return 0.0;
-    };
-    let read_at = ::aws_smithy_types::DateTime::from(read_at);
-    ((read_at.as_secs_f64() - arrived_at.as_secs_f64()) * 1_000.0).max(0.0)
+    // The age itself is the ONE reading of how old a record is ([`record_age::age_of`]) —
+    // the same one the mapping's own record age is decided by — so the figure a client
+    // reads and the decision the poller takes cannot drift apart.
+    record_age::age_of(arrived_at, read_at).map_or(0.0, |age| age.as_secs_f64() * 1_000.0)
 }
 
 /// Hand one batch to the function and read what became of the records it held: the ones the
@@ -1757,6 +1920,44 @@ mod tests {
                 actual, expected,
                 "case {case:?}: a mapping configuring {configured:?} with a reservation of \
                  {reserved:?} must have {expected} batch(es) of one shard in flight, got \
+                 {actual}"
+            );
+        }
+    }
+
+    /// RULE: a mapping that aggregates over a tumbling window reads one shard SERIALLY —
+    /// one batch of it in flight — whatever `ParallelizationFactor` it also carries, because
+    /// the state of that window is the shard's and is handed from one invocation of it to the
+    /// next; a mapping with no window has what that factor asks for.
+    ///
+    /// The rows differ along what the rule generalises over: the window configured (none,
+    /// durations either side of the range it admits) crossed with the factor configured.
+    #[test]
+    fn a_mapping_aggregating_over_a_window_reads_its_shard_serially() {
+        // (case, the tumbling window, `ParallelizationFactor`, the batches in flight)
+        let rows: Vec<(&str, Option<Duration>, Option<i32>, usize)> = vec![
+            ("no-window-no-factor", None, None, 1),
+            ("no-window-with-a-factor", None, Some(4), 4),
+            ("a-one-second-window", Some(Duration::from_secs(1)), None, 1),
+            (
+                "a-window-with-a-factor-beside-it",
+                Some(Duration::from_secs(30)),
+                Some(4),
+                1,
+            ),
+            (
+                "the-largest-window-with-the-largest-factor",
+                Some(Duration::from_secs(900)),
+                Some(10),
+                1,
+            ),
+        ];
+        for (case, window, configured, expected) in rows {
+            let actual = super::in_flight_batches_of(window, configured, None);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: a mapping aggregating over {window:?} and configuring \
+                 {configured:?} must have {expected} batch(es) of one shard in flight, got \
                  {actual}"
             );
         }

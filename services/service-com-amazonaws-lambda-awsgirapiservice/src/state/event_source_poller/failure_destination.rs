@@ -647,6 +647,8 @@ mod tests {
             on_failure_destination: Some(
                 "arn:aws:sqs:us-east-1:000000000000:failed-batches".to_string(),
             ),
+            maximum_record_age: None,
+            tumbling_window: None,
             cursors: BTreeMap::new(),
             initial_cursor: ShardCursor::TrimHorizon,
         }

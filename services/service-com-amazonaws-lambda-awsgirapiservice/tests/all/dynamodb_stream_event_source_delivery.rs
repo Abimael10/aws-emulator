@@ -31,6 +31,16 @@
 //! change by writing a DERIVED item into a second table through the AWS SDK, and that item
 //! is read back through `GetItem` — so the record's own values have to have reached the
 //! handler for the row to pass.
+//!
+//! The third suite is the same hand-over for a mapping that aggregates over a TUMBLING
+//! WINDOW: "(Kinesis and DynamoDB Streams only) The duration in seconds of a processing
+//! window for DynamoDB and Kinesis Streams event sources. A value of 0 seconds indicates no
+//! tumbling window" (`TumblingWindowInSeconds`), so an invocation of such a mapping is told
+//! which window it is in, which shard and stream its records came from and the state that
+//! window has reached, the state the handler returns is handed to the next invocation of
+//! that window, and each window ends in one final invocation carrying that state and no
+//! records. Its rows differ along the window configured, and each row's verdict is the
+//! envelope the handler audited into a second table, so nothing it was not handed can pass.
 
 use std::io::Write as _;
 use std::sync::Arc;
@@ -965,6 +975,378 @@ async fn a_delivered_change_reaches_a_handler_that_writes_it_downstream() {
             Some(RESULT_OK),
             "case {case:?}: a mapping whose batch was processed must report it, saw {seen:?}"
         );
+
+        // The trigger is torn down as a client tears one down, which is also what stops the
+        // mapping from reading its source any further.
+        stop_mapping(&router, case, &uuid).await;
+    }
+}
+
+/// The value `TumblingWindowInSeconds` documents as no window: "A value of 0 seconds
+/// indicates no tumbling window."
+const NO_TUMBLING_WINDOW: i64 = 0;
+
+/// The key the handler of the third suite audits a windowed invocation under, and the one it
+/// audits the window's FINAL invocation under. Each is overwritten by the next invocation of
+/// its kind, so what the row reads is what the last of them was handed.
+const WINDOWED_AUDIT: &str = "windowed";
+/// See [`WINDOWED_AUDIT`].
+const FINAL_AUDIT: &str = "final";
+
+/// The handler the third suite runs: it audits the envelope of EVERY invocation it is handed
+/// into the output table — the window it was told it is in, the shard and stream its records
+/// came from, the state it was handed and how many records it was given — and returns the
+/// aggregate as the window's next state.
+///
+/// Everything it writes is taken out of the event, so a member the invocation did not carry
+/// is audited as absent and no row can pass on a value the handler was never handed. What
+/// each window's FINAL invocation was handed is ACCUMULATED rather than overwritten: the
+/// records of a row may fall into more than one window — where they are read in two passes
+/// either side of a window's end, which is the clock's to decide and not the rule's — and the
+/// aggregate over the row is then the sum of what those windows' finals were handed.
+fn aggregating_handler() -> String {
+    format!(
+        r#"
+import json
+import os
+
+import boto3
+
+AUDIT_TABLE = os.environ["AUDIT_TABLE"]
+KEY = "{KEY}"
+
+
+def lambda_handler(event, context):
+    client = boto3.client("dynamodb")
+    records = event.get("Records") or []
+    window = event.get("window") or {{}}
+    state = event.get("state")
+    if state is None:
+        state = {{}}
+    final = bool(event.get("isFinalInvokeForWindow"))
+    carried = int(state.get("seen", 0))
+    seen = carried + len(records)
+    audited = "{FINAL_AUDIT}" if final else "{WINDOWED_AUDIT}"
+    item = {{
+        KEY: {{"S": audited}},
+        "has_window": {{"S": "true" if event.get("window") else "false"}},
+        "window_start": {{"S": window.get("start") or ""}},
+        "window_end": {{"S": window.get("end") or ""}},
+        "shard_id": {{"S": event.get("shardId") or ""}},
+        "source_arn": {{"S": event.get("eventSourceARN") or ""}},
+        "state_in": {{"S": json.dumps(state, sort_keys=True)}},
+        "records": {{"N": str(len(records))}},
+        "early": {{"S": "true" if event.get("isWindowTerminatedEarly") else "false"}},
+        "seen": {{"N": str(seen)}},
+    }}
+    if final:
+        held = client.get_item(
+            TableName=AUDIT_TABLE, Key={{KEY: {{"S": audited}}}}
+        ).get("Item") or {{}}
+        item["finals_seen"] = {{
+            "N": str(int(held.get("finals_seen", {{}}).get("N", "0")) + carried)
+        }}
+        item["finals_count"] = {{
+            "N": str(int(held.get("finals_count", {{}}).get("N", "0")) + 1)
+        }}
+    client.put_item(TableName=AUDIT_TABLE, Item=item)
+    return {{"state": {{"seen": seen}}}}
+"#
+    )
+}
+
+/// The row's mapping on `stream_arn`, carrying the tumbling window the row states; read back
+/// from the create's own answer, so a row cannot pass against a window the mapping never
+/// carried.
+async fn given_windowed_mapping(
+    router: &MultiServiceRouter,
+    case: &str,
+    function: &str,
+    stream_arn: &str,
+    window_seconds: Option<i64>,
+) -> String {
+    let mut request = json!({
+        "FunctionName": function,
+        "EventSourceArn": stream_arn,
+        "StartingPosition": TRIM_HORIZON,
+        "BatchSize": 10,
+        "Enabled": true,
+    });
+    if let Some(seconds) = window_seconds {
+        request["TumblingWindowInSeconds"] = json!(seconds);
+    }
+    let (status, created) = lambda(router, "POST", MAPPINGS_URI, &request).await;
+    assert_eq!(
+        status, 202,
+        "case {case:?}: CreateEventSourceMapping answered {status} {created}"
+    );
+    assert_eq!(
+        created["TumblingWindowInSeconds"],
+        json!(window_seconds.unwrap_or(NO_TUMBLING_WINDOW)),
+        "case {case:?}: the mapping must carry the window it was created with, got {created}"
+    );
+    created["UUID"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: no UUID in {created}"))
+        .to_string()
+}
+
+/// The audited invocation `key` names, looked for again until `deadline`; `None` when none
+/// was audited by then.
+async fn audited(
+    router: &MultiServiceRouter,
+    case: &str,
+    table: &str,
+    key: &str,
+    deadline: Instant,
+) -> Option<Value> {
+    loop {
+        let (status, read) = dynamodb(
+            router,
+            "GetItem",
+            &json!({ "TableName": table, "Key": { KEY: { "S": key } } }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: GetItem answered {status} {read}"
+        );
+        if read["Item"].is_object() {
+            return Some(read["Item"].clone());
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(LOOK_AGAIN).await;
+    }
+}
+
+/// One audited member, as the string the handler wrote it as.
+fn audited_text(item: &Value, member: &str) -> String {
+    item[member]["S"].as_str().unwrap_or_default().to_string()
+}
+
+/// One audited count, as the number the handler wrote it as; a member it wrote none for
+/// answers a count no row expects.
+fn audited_count(item: &Value, member: &str) -> i64 {
+    item[member]["N"]
+        .as_str()
+        .and_then(|held| held.parse::<i64>().ok())
+        .unwrap_or(-1)
+}
+
+/// One instant the handler audited, in whole seconds since the epoch.
+fn audited_instant(case: &str, item: &Value, member: &str) -> i64 {
+    let held = audited_text(item, member);
+    ::aws_smithy_types::DateTime::from_str(&held, ::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_else(|error| {
+            panic!("case {case:?}: {member} must be an ISO-8601 instant, got {held:?} ({error})")
+        })
+        .secs()
+}
+
+/// The audited FINAL invocations of `table` once the states they were handed together reach
+/// `expected`, looked for again until `deadline`; the record as it last stood when they do
+/// not, which is what the row then reports.
+///
+/// The records of a row can fall into more than one window — they are read in one pass here,
+/// but where a window's end falls between two passes is the clock's to decide — so the figure
+/// the rule is about is the sum of what those windows' finals were handed, and it is complete
+/// only once every window that took a record has finalised.
+async fn await_aggregate(
+    router: &MultiServiceRouter,
+    case: &str,
+    table: &str,
+    expected: i64,
+    deadline: Instant,
+) -> Value {
+    loop {
+        let held = audited(router, case, table, FINAL_AUDIT, deadline).await;
+        let reached = held
+            .as_ref()
+            .is_some_and(|item| audited_count(item, "finals_seen") >= expected);
+        if reached || Instant::now() >= deadline {
+            return held.unwrap_or(Value::Null);
+        }
+        tokio::time::sleep(LOOK_AGAIN).await;
+    }
+}
+
+/// RULE: a mapping carrying a `TumblingWindowInSeconds` window tells every invocation which
+/// window it is in — the window's own bounds, the shard and the stream its records came from
+/// and the state that window has reached — carries the state the handler returned into the
+/// next invocation of that window, and ends each window with one final invocation holding
+/// that state and no records; a mapping with no window tells an invocation none of it.
+///
+/// The rows differ along what the rule generalises over: the window configured (the member
+/// absent, and two different durations), and so the bounds the window's own invocations
+/// report. The value the model documents as no window (0) and both ends of the member's own
+/// range are read off the member by the unit table in
+/// `state/event_source_poller/tumbling_window.rs`; the rows here are the ones that need a
+/// stream, a function and a delivery to decide.
+#[tokio::test]
+async fn a_tumbling_window_mapping_carries_its_window_and_its_state_into_each_invocation() {
+    // (case, `TumblingWindowInSeconds` as the create states it, the window it aggregates
+    //  over)
+    let rows: Vec<(&str, Option<i64>, Option<i64>)> = vec![
+        ("no-window-configured", None, None),
+        ("a-one-second-window", Some(1), Some(1)),
+        ("a-three-second-window", Some(3), Some(3)),
+    ];
+
+    for (case, configured, window_seconds) in rows {
+        let router = emulator();
+        let source = format!("windowed-{case}");
+        let audit = format!("windowed-audit-{case}");
+        let function = format!("aggregate-{case}");
+        let stream_arn = given_table(&router, case, &source, Some(NEW_AND_OLD_IMAGES)).await;
+        given_table(&router, case, &audit, None).await;
+        given_function(
+            &router,
+            case,
+            &function,
+            &aggregating_handler(),
+            json!({ "AUDIT_TABLE": audit }),
+        )
+        .await;
+
+        // The records are written BEFORE the mapping exists, so the mapping reads them as the
+        // backlog of the window it opens: what the row is about is the envelope they are
+        // handed over in, not when they arrived.
+        for key in ["window-1", "window-2"] {
+            write_item(&router, case, &source, key, Write::Insert).await;
+        }
+        let uuid = given_windowed_mapping(&router, case, &function, &stream_arn, configured).await;
+
+        let deadline = Instant::now() + BUDGET + BUDGET;
+        let windowed = audited(&router, case, &audit, WINDOWED_AUDIT, deadline)
+            .await
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: the records must be handed to the function at all")
+            });
+        match window_seconds {
+            // A mapping with no window hands over an event carrying no window member at all,
+            // and so names neither the shard nor the stream beside the records either.
+            None => {
+                assert_eq!(
+                    audited_text(&windowed, "has_window"),
+                    "false",
+                    "case {case:?}: a mapping with no tumbling window carries no window on \
+                     its invocations, got {windowed}"
+                );
+                assert_eq!(
+                    audited_text(&windowed, "shard_id"),
+                    String::new(),
+                    "case {case:?}: a mapping with no tumbling window names no shard on its \
+                     invocations, got {windowed}"
+                );
+                assert_eq!(
+                    audited_text(&windowed, "source_arn"),
+                    String::new(),
+                    "case {case:?}: a mapping with no tumbling window names no event source \
+                     on its invocations, got {windowed}"
+                );
+                // And no window ever finalises, so there is no final invocation to make: the
+                // batch above was delivered before this is read.
+                let ended = audited(&router, case, &audit, FINAL_AUDIT, Instant::now()).await;
+                assert!(
+                    ended.is_none(),
+                    "case {case:?}: a mapping with no tumbling window makes no final \
+                     invocation, got {ended:?}"
+                );
+            }
+            Some(seconds) => {
+                assert_eq!(
+                    audited_text(&windowed, "has_window"),
+                    "true",
+                    "case {case:?}: an invocation inside a window carries that window, got \
+                     {windowed}"
+                );
+                let start = audited_instant(case, &windowed, "window_start");
+                let end = audited_instant(case, &windowed, "window_end");
+                assert_eq!(
+                    end - start,
+                    seconds,
+                    "case {case:?}: the window must span the {seconds} second(s) the mapping \
+                     configures, got {windowed}"
+                );
+                assert_eq!(
+                    start % seconds,
+                    0,
+                    "case {case:?}: the windows of one duration tile the clock from a whole \
+                     multiple of it, got {windowed}"
+                );
+                assert!(
+                    audited_text(&windowed, "shard_id").starts_with("shardId-"),
+                    "case {case:?}: an invocation inside a window names the shard its records \
+                     came off, got {windowed}"
+                );
+                assert_eq!(
+                    audited_text(&windowed, "source_arn"),
+                    stream_arn,
+                    "case {case:?}: an invocation inside a window names the stream its \
+                     records were read from, got {windowed}"
+                );
+                assert_eq!(
+                    audited_text(&windowed, "early"),
+                    "false",
+                    "case {case:?}: a window whose state is inside its bound is not \
+                     terminated early, got {windowed}"
+                );
+
+                // The window ENDS in one final invocation, carrying the state the handler
+                // built over the window and no records of its own.
+                let ended = audited(&router, case, &audit, FINAL_AUDIT, deadline + BUDGET)
+                    .await
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "case {case:?}: every window ends in a final invocation carrying \
+                             its state"
+                        )
+                    });
+                assert_eq!(
+                    audited_count(&ended, "records"),
+                    0,
+                    "case {case:?}: the final invocation of a window carries no records of \
+                     its own, got {ended}"
+                );
+                assert_eq!(
+                    audited_text(&ended, "has_window"),
+                    "true",
+                    "case {case:?}: the final invocation names the window it finalises, got \
+                     {ended}"
+                );
+                assert_eq!(
+                    audited_text(&ended, "source_arn"),
+                    stream_arn,
+                    "case {case:?}: the final invocation names the stream the window's \
+                     records were read from, got {ended}"
+                );
+                // The state it was handed is the one the window's invocations returned: the
+                // handler counted the records itself, so what the finals of the row's windows
+                // were handed TOGETHER is the proof the state carried from one invocation of a
+                // window to the next — 2 for the two records written, and 0 had no state
+                // carried at all. It is the sum over the windows rather than one window's own
+                // figure, because which window a record falls into is the clock's to decide.
+                let aggregated = await_aggregate(&router, case, &audit, 2, deadline + BUDGET).await;
+                assert_eq!(
+                    audited_count(&aggregated, "finals_seen"),
+                    2,
+                    "case {case:?}: the final invocation of each window is handed the state \
+                     that window reached, which over the row's windows counts every record \
+                     written, got {aggregated}"
+                );
+                assert!(
+                    audited_count(&aggregated, "finals_count") >= 1,
+                    "case {case:?}: every window ends in a final invocation, got {aggregated}"
+                );
+                assert!(
+                    audited_text(&aggregated, "state_in").contains("\"seen\""),
+                    "case {case:?}: the final invocation is handed the window's own state, got \
+                     {aggregated}"
+                );
+            }
+        }
 
         // The trigger is torn down as a client tears one down, which is also what stops the
         // mapping from reading its source any further.

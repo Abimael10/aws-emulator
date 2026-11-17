@@ -268,6 +268,8 @@ mod tests {
             attempts_allowed: None,
             bisects_on_function_error: false,
             on_failure_destination: None,
+            maximum_record_age: None,
+            tumbling_window: None,
             cursors: std::collections::BTreeMap::new(),
             initial_cursor: ShardCursor::TrimHorizon,
         }
