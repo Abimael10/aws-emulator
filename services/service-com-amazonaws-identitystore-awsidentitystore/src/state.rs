@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ::aws_smithy_types::Document;
+use ::service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts_state;
 
 use crate::ops::types::{
     Address, ConflictException, Email, ExternalId, GroupMembership, InternalServerException,
@@ -1205,18 +1206,65 @@ pub fn new_request_id() -> String {
 /// The principal that made this call, as the `CreatedBy` / `UpdatedBy` of what it
 /// writes.
 ///
-/// Derived from the CALLER's own identity — the access key id its SigV4 credential
-/// scope names — and never from the request body, so two different callers creating the
-/// same resource are recorded as different principals. The emulator resolves no
-/// identity-store principal for a caller, so the value is the caller's IAM identity,
-/// which is what an audit consumer reads here.
+/// `User$CreatedBy` and `Group$CreatedBy` are "the IDENTIFIER of the user or system that
+/// created the user/group" (`smithy_query(query="operation",operation="DescribeUser")`,
+/// `smithy_query(query="operation",operation="DescribeGroup")`), and what IDENTIFIES a
+/// principal on AWS is its unique id — the value `sts:GetCallerIdentity` answers as
+/// `UserId` and a policy reads as `${aws:userid}`: `AIDA…` for an IAM user, and
+/// `AROA…:<session name>` for a role session. An ARN ADDRESSES a principal; the id names
+/// it, and it is what an audit member carries.
 ///
-/// An unsigned request has no access key id to read, and the framework's
-/// [`::engine::extract_akid`] answers its own fallback for one rather than an empty
-/// string, so the principal is a whole ARN whoever the caller is.
-pub fn caller_principal(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
-    let akid = ::engine::extract_akid(&ctx.parts().headers);
-    ::engine::emulator_arn("iam", "", &format!("user/{akid}"))
+/// The id is ASKED OF the identity service rather than spelled here: the session the
+/// request's access key id names, through STS's own resolution of a request's caller
+/// ([`sts_state::resolve_request_caller`]), falling back to the identity a LONG-TERM key
+/// speaks for — the IAM user that holds it ([`sts_state::long_term_identity`]), or the
+/// principal of the key this emulator publishes when no record holds it. So a client that
+/// reads its own identity and then reads who created a resource it just created sees one
+/// principal, two callers that are two IAM identities are recorded as two principals, and
+/// nothing about the value comes from the credential's key TEXT, which no identity
+/// service resolves to a principal.
+///
+/// An engine with no STS mounted can hold no session at all, and a request whose
+/// credential has expired resolves to no session either; both answer the long-term
+/// identity, which is the resolution STS itself reports for a key that names no session.
+/// An EXPIRED credential never reaches a handler in the first place — the emulator
+/// verifies a request's credential before any operation runs — so the expired arm is the
+/// same "this key names no session here" case rather than a principal this service
+/// decides to substitute.
+pub fn caller_principal<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+) -> String {
+    let access_key_id = ::engine::extract_akid(&ctx.parts().headers);
+    let long_term = long_term_caller_identity(engine, &access_key_id);
+    let Some(sessions) = sts_state::service_state(engine) else {
+        return long_term.user_id;
+    };
+    let resolved = sts_state::resolve_request_caller(
+        &mut sessions.lock(),
+        &access_key_id,
+        SystemTime::now(),
+        ctx.credential_store(),
+        long_term.clone(),
+    )
+    .map_or(long_term, |caller| caller.identity);
+    resolved.user_id
+}
+
+/// The identity a LONG-TERM access key speaks for, as STS resolves it against the
+/// account's IAM records ([`sts_state::long_term_identity`]): the user that holds the key,
+/// and the principal of the key this emulator publishes for a key no record holds.
+///
+/// STS's resolution is CALLED rather than reproduced, so the principal this service
+/// records for a credential and the one `sts:GetCallerIdentity` reports for it are one
+/// value.
+fn long_term_caller_identity<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    access_key_id: &str,
+) -> sts_state::Identity {
+    let iam = sts_state::iam_state(engine);
+    let guard = iam.as_ref().map(|iam| iam.lock());
+    sts_state::long_term_identity(guard.as_deref(), access_key_id)
 }
 
 // ---------------------------------------------------------------------------

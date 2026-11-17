@@ -188,7 +188,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // Who is making the change: recorded as the user's `UpdatedBy`.
-        let updated_by = crate::state::caller_principal(ctx);
+        let updated_by = crate::state::caller_principal(&*self.engine, ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UpdateUserErrorModeled::InternalServerException(crate::state::store_unavailable())
         })?;

@@ -8,6 +8,11 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
+# The STS session registry and its resolution of a request's caller, so the principal a
+# resource records as its `CreatedBy`/`UpdatedBy` is the identity
+# `sts:GetCallerIdentity` reports for the credential the request was signed with
+# (see `crate::state::caller_principal`).
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }

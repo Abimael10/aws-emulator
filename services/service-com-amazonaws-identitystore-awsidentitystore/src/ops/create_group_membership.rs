@@ -176,7 +176,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // Who is creating this membership: recorded as its `CreatedBy`, which a later
         // `ListGroupMemberships` reports.
-        let created_by = crate::state::caller_principal(ctx);
+        let created_by = crate::state::caller_principal(&*self.engine, ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateGroupMembershipErrorModeled::InternalServerException(
                 crate::state::store_unavailable(),

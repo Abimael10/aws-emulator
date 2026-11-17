@@ -9,8 +9,9 @@
 //!    is refused, with the modelled `ResourceNotFoundException` having written
 //!    nothing;
 //! 2. a user this API creates reports a `UserStatus`, and it is `ENABLED`;
-//! 3. a resource created or updated through the API records the CALLING principal, so
-//!    a describe reports `CreatedBy` and `UpdatedBy` — the latter naming the principal
+//! 3. a resource created or updated through the API records the IDENTIFIER of the
+//!    principal whose credential the request was signed with, so a describe reports
+//!    `CreatedBy` and `UpdatedBy` — the latter naming the principal
 //!    of the LAST write, which is the create until something changes the resource;
 //! 4. an update refuses an `AttributePath` the service does not let it change — the
 //!    resource's own identifiers and service-generated values among them — with the
@@ -389,9 +390,9 @@ async fn every_well_formed_identity_store_id_is_served_and_only_another_accounts
 }
 
 /// Rules 2 and 3: a created user reports `UserStatus` `ENABLED`, and every resource
-/// created through the API records the principal that created it — a different one per
-/// caller — while `UpdatedBy` names the principal of the LAST write, which is that same
-/// create until something updates the resource.
+/// created through the API records the identifier of the principal that created it, while
+/// `UpdatedBy` names the principal of the LAST write, which is that same create until
+/// something updates the resource.
 ///
 /// Rows differ along which caller creates the resource and how much of a profile the
 /// create carried.
@@ -441,10 +442,14 @@ async fn a_created_resource_reports_its_status_and_the_principal_that_created_it
             !created_by.is_empty(),
             "case {case:?}: expected CreatedBy populated on a fresh user, got {described}"
         );
+        // The value is the IDENTIFIER of the principal the credential speaks for, in the
+        // class AWS reports a principal in — never anything spelled out of the access key
+        // id, which no identity service resolves to a principal.
+        crate::audit_principal_identifier::assert_principal_identifier(&created_by, case);
         assert!(
-            created_by.contains(akid),
-            "case {case:?}: expected CreatedBy to name the calling principal {akid}, \
-             got {created_by:?}"
+            !created_by.contains(akid),
+            "case {case:?}: expected CreatedBy to name the principal the credential speaks \
+             for rather than the access key id {akid}, got {created_by:?}"
         );
         assert_eq!(
             described.get("UpdatedBy").and_then(Value::as_str),
@@ -512,27 +517,33 @@ async fn a_created_resource_reports_its_status_and_the_principal_that_created_it
         );
     }
 
-    // Two different callers are two different principals, and one caller is always the
-    // same principal.
+    // This router mounts this service alone, so the account holds no identity record for
+    // any of the key ids above and every one of them speaks for the principal the
+    // published credential speaks for: one caller is one principal, and so is every other
+    // caller the account knows nothing about. Two callers that ARE two identities — an IAM
+    // user holding its own access key, a role session — are two principals, which the
+    // cross-service suite `identitystore_records_the_calling_principal` in
+    // `core/router/tests/all/` pins against the identity service that resolves them.
     for (akid, principal) in &by_caller {
         for (other_akid, other_principal) in &by_caller {
-            if akid == other_akid {
-                assert_eq!(
-                    principal, other_principal,
-                    "expected one caller ({akid}) to be recorded as one principal"
-                );
-            } else {
-                assert_ne!(
-                    principal, other_principal,
-                    "expected callers {akid} and {other_akid} to be different principals"
-                );
-            }
+            assert_eq!(
+                principal, other_principal,
+                "expected the callers {akid} and {other_akid}, neither of which the account \
+                 holds an identity record for, to speak for one principal"
+            );
         }
     }
 }
 
-/// Rule 3, the update half: an update records the UPDATING principal as `UpdatedBy`,
+/// Rule 3, the update half: an update records the principal that MADE it as `UpdatedBy`,
 /// leaves `CreatedBy` alone and bumps the revision.
+///
+/// The updating caller here presents another access key id, which the account holds no
+/// identity record for either, so it speaks for the same principal as the creating one:
+/// what this suite pins is that the member is re-stamped from the UPDATING request's
+/// credential, in the principal-identifier class, with `CreatedBy` untouched. The case of
+/// an updater that is a DIFFERENT identity is the cross-service suite
+/// `identitystore_records_the_calling_principal`'s.
 #[tokio::test]
 async fn an_update_records_the_principal_that_made_it() {
     let router = emulator();
@@ -566,9 +577,11 @@ async fn an_update_records_the_principal_that_made_it() {
         "case {case:?}: expected CreatedBy to survive an update, got {after}"
     );
     let updated_by = after["UpdatedBy"].as_str().unwrap_or_default();
+    crate::audit_principal_identifier::assert_principal_identifier(updated_by, case);
     assert!(
-        updated_by.contains("AKIDUPDATER"),
-        "case {case:?}: expected UpdatedBy to name the updating principal, got {after}"
+        !updated_by.contains("AKIDUPDATER"),
+        "case {case:?}: expected UpdatedBy to name the principal the updating credential \
+         speaks for rather than its access key id, got {after}"
     );
     assert!(
         after["UpdatedAt"].as_f64() >= after["CreatedAt"].as_f64(),
@@ -600,11 +613,16 @@ async fn an_update_records_the_principal_that_made_it() {
         "case {case:?}: expected CreatedBy to survive an update, got {after}"
     );
     assert!(
-        after["UpdatedBy"]
+        !after["UpdatedBy"]
             .as_str()
             .unwrap_or_default()
             .contains("AKIDUPDATER"),
-        "case {case:?}: expected UpdatedBy to name the updating principal, got {after}"
+        "case {case:?}: expected UpdatedBy to name the principal the updating credential \
+         speaks for rather than its access key id, got {after}"
+    );
+    crate::audit_principal_identifier::assert_principal_identifier(
+        after["UpdatedBy"].as_str().unwrap_or_default(),
+        case,
     );
     assert_eq!(
         after["Description"].as_str().unwrap_or_default(),

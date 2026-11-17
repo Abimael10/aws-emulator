@@ -174,7 +174,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // Who is creating this group: recorded on the record as its `CreatedBy`, which a
         // later `DescribeGroup` reports.
-        let created_by = crate::state::caller_principal(ctx);
+        let created_by = crate::state::caller_principal(&*self.engine, ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateGroupErrorModeled::InternalServerException(crate::state::store_unavailable())
         })?;

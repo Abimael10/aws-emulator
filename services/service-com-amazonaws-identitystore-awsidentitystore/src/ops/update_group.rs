@@ -418,7 +418,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // Who is making the change: recorded as the group's `UpdatedBy`.
-        let updated_by = crate::state::caller_principal(ctx);
+        let updated_by = crate::state::caller_principal(&*self.engine, ctx);
         // Resolved first, from the request alone: an operation this service cannot
         // apply refuses the whole request, so nothing below it is ever half-written.
         // The list itself is never empty — `AttributeOperations` is modelled
