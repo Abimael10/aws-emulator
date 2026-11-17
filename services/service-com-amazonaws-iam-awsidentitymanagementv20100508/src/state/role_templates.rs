@@ -8,92 +8,137 @@
 //! ([`published_role_template`], [`published_role_template_version`]), the `@{parameter}`
 //! substitution every templated member goes through ([`substitute_parameters`]), the FORM a
 //! caller-supplied `TemplateArn` has to take ([`role_template_arn_refusal`]) and the wording
-//! of a call addressing a template nothing resolves ([`role_template_not_found`] for
-//! `AcquireRole`, [`role_template_version_not_found`] for `GetRoleTemplateVersion`).
+//! of a call addressing a template nothing resolves ([`role_template_arn_not_found`]) or a
+//! version nothing resolves ([`role_template_not_found`]).
 
 #[allow(unused_imports)]
 use super::*;
 
-/// The message a call addressing a role template the account holds none of is refused with
-/// — the `NoSuchEntityException` message, whose fixed text is `Role template not found: `
-/// followed by the ARN the request supplied, with no trailing stop.
+/// The message a call that resolves no VERSION of a role template is refused with — the
+/// `NoSuchEntityException` message, whose fixed text is `Role template not found: ` followed
+/// by the ARN the request supplied, with no trailing stop.
 ///
-/// Measured wording: the `<Entity> not found: <identifier>` form the newer IAM API families
-/// word an absence with, which is also how the delegation-request family words its own
-/// ([`delegation_request_not_found_message`]) and not the `The <entity> with name <name>
-/// cannot be found.` form IAM words its user, role and group reads with.
+/// MEASURED wording, for two readings of a template: what `GetRoleTemplateVersion` reports
+/// when the ARN resolves a template but that template carries no version the request
+/// addresses, and what `AcquireRole` reports for a template it can create no role from. The
+/// ARN comes from the REQUEST, so the fixed text is the sentence and the ARN is the slot.
 ///
-/// It names the TEMPLATE and nothing else: the resource such a call addresses is the role
-/// template, which its ARN identifies — the minor version is a separate parameter of the
-/// request rather than part of what identifies the resource — so a minor version the
-/// account holds no such version of is described by this one sentence too.
+/// It names the TEMPLATE and nothing else, the resource whose ARN the request supplied: the
+/// minor version is a separate parameter rather than part of what identifies the resource,
+/// so the sentence quotes no version.
 ///
-/// This is the sentence `AcquireRole` refuses a template it cannot create from with.
-/// `GetRoleTemplateVersion` answers its own, measured sentence
-/// ([`role_template_version_not_found`]): both live here, so the wording of an absent role
-/// template is stated in ONE module and a reader sees at a glance which operation answers
+/// A READ addressed by an ARN that resolves NO template at all answers the other measured
+/// sentence ([`role_template_arn_not_found`]): the two live here, so the wording of each
+/// absence is stated in ONE module and a reader sees at a glance which absence answers
 /// which.
 pub fn role_template_not_found(template_arn: &str) -> String {
     format!("Role template not found: {template_arn}")
 }
 
-/// The message a READ of a role template version nothing resolves is refused with — the
-/// `NoSuchEntityException` message, whose fixed text is `Role Template `, the ARN the request
-/// supplied, and ` cannot be found.`
+/// The message a READ addressed by an ARN that resolves NO role template is refused with —
+/// the `NoSuchEntityException` message, whose fixed text is `Role Template `, the ARN the
+/// request supplied, and ` cannot be found.`
 ///
 /// MEASURED wording, for `GetRoleTemplateVersion`: the `<Entity> … cannot be found.` form IAM
 /// words an absent entity with, with the entity named by the ARN that identifies it and
-/// nothing else quoted. The ARN comes from the REQUEST, so the fixed text is the sentence and
-/// the ARN is the slot.
+/// nothing else quoted.
 ///
-/// It names the TEMPLATE and nothing else, for the reason [`role_template_not_found`] gives,
-/// so a minor version the resolved template does not carry is described by this one sentence
-/// too.
-pub fn role_template_version_not_found(template_arn: &str) -> String {
+/// This is the absence of the TEMPLATE the request addressed — nothing is published or
+/// recorded under that ARN — which is a different missing resource from a template that
+/// resolves but carries no such version ([`role_template_not_found`]), so the two are
+/// reported with the sentence measured for each.
+pub fn role_template_arn_not_found(template_arn: &str) -> String {
     format!("Role Template {template_arn} cannot be found.")
 }
 
-/// How IAM refuses a role-template ARN whose ACCOUNT field is not the publisher every role
-/// template's ARN carries ([`AWS_MANAGED_POLICY_ACCOUNT`]).
+/// How IAM refuses a value supplied for a role template's ARN whose FORM is not one
+/// ([`role_template_arn_refusal`]).
 ///
-/// MEASURED wording, entirely fixed: it quotes neither the member nor the value, and states
-/// the field and the form the ARN has to take instead.
-///
-/// A stronger rule than [`TEMPLATE_ARN_WITH_ACCOUNT_NUMBER`], which refuses only an account
-/// field of digits and so admits the account-less and other-publisher forms this one refuses.
-/// That sentence stays what `CreateDelegationRequest` refuses a POLICY-template ARN with,
-/// whose own wording this rule does not speak to.
-pub const ROLE_TEMPLATE_ARN_WRONG_ACCOUNT: &str =
-    "The specified role template ARN is not valid. The ARN must use 'aws' as the account \
-     field (e.g., arn:aws:iam::aws:role-template/...).";
+/// MEASURED wording, entirely fixed: it quotes neither the member nor the value it refused,
+/// and states the form the ARN has to take instead — the braced tokens are the message's own
+/// placeholder text rather than fields of the value, so every value whose form is wrong is
+/// told the same rule.
+pub const ROLE_TEMPLATE_ARN_NOT_VALID: &str =
+    "The specified role template ARN is not valid. Expected format is: \
+     arn:{partition}:iam::aws:role-template/{servicePrincipal}/{templateName}:{majorVersion} \
+     (majorVersion must be a positive integer with no leading zeros).";
 
-/// What `value` is not, as a role template's ARN — the sentence the reading that refused it
-/// is stated with — or `None` when it IS one.
+/// Why `value` is not a role template's ARN — the one sentence that reading is stated with —
+/// or `None` when it IS one.
 ///
 /// `arnType` bounds only the length (20..2048), so the FORM of a caller-supplied `TemplateArn`
 /// is read here, in ONE place, before any template is resolved: a member documented as "the
 /// Amazon Resource Name (ARN) of the role template" has to carry that ARN, and a value that
 /// does not is one IAM cannot accept rather than a template that happens to be missing.
 ///
-/// The three readings narrow one parse down in the order they exclude more — it has to be an
-/// ARN ([`ARN_UNPARSEABLE`]), then the ARN of a role template in IAM's own namespace
-/// ([`ARN_WRONG_RESOURCE_TYPE`]), then one whose account field names the publisher
-/// ([`ROLE_TEMPLATE_ARN_WRONG_ACCOUNT`]) — so one value cannot answer two sentences. The six
-/// fields come from the crate's ONE caller-supplied-ARN parse (`service_common::arn`).
+/// The form is the WHOLE ARN a publishing service mints, as
+/// [`ROLE_TEMPLATE_ARN_NOT_VALID`] states it and [`PublishedRoleTemplate::arn`] builds it:
+/// IAM's own namespace, no Region, the publisher as the account field
+/// ([`AWS_MANAGED_POLICY_ACCOUNT`]), and a resource field of the role-template type carrying
+/// the publishing service's principal, the template's name and its major version. A value
+/// missing any of that names no role template under any publisher, so it answers the one
+/// sentence rather than a reading of its own. The six fields come from the crate's ONE
+/// caller-supplied-ARN parse (`service_common::arn`).
 pub fn role_template_arn_refusal(value: &str) -> Option<&'static str> {
+    (!is_role_template_arn(value)).then_some(ROLE_TEMPLATE_ARN_NOT_VALID)
+}
+
+/// Whether `value` is of the form a role template's ARN takes
+/// ([`ROLE_TEMPLATE_ARN_NOT_VALID`] states it).
+fn is_role_template_arn(value: &str) -> bool {
     let Some(arn) = ::service_common::arn::parse(value) else {
-        return Some(ARN_UNPARSEABLE);
+        return false;
     };
-    if arn.vendor != IAM_ARN_VENDOR || arn.resource_type() != ROLE_TEMPLATE_ARN_RESOURCE {
-        return Some(ARN_WRONG_RESOURCE_TYPE);
+    if arn.vendor != IAM_ARN_VENDOR
+        || !arn.region.is_empty()
+        || arn.account != AWS_MANAGED_POLICY_ACCOUNT
+    {
+        return false;
     }
-    (arn.account != AWS_MANAGED_POLICY_ACCOUNT).then_some(ROLE_TEMPLATE_ARN_WRONG_ACCOUNT)
+    let Some(identity) = arn
+        .resource
+        .strip_prefix(ROLE_TEMPLATE_ARN_RESOURCE)
+        .and_then(|rest| rest.strip_prefix('/'))
+    else {
+        return false;
+    };
+    // `<service principal>/<template name>:<major version>`: three parts, none of them
+    // empty, and the major version a positive integer — "the major version number of the
+    // role template" (`RoleTemplateVersion$MajorVersion`) — written as a number is.
+    let Some((service_principal, named)) = identity.split_once('/') else {
+        return false;
+    };
+    let Some((template_name, major_version)) = named.split_once(':') else {
+        return false;
+    };
+    !service_principal.is_empty()
+        && !template_name.is_empty()
+        && !template_name.contains('/')
+        && is_major_version(major_version)
+}
+
+/// Whether `value` spells a role template's major version: a positive integer in decimal,
+/// with no sign, no leading zero and nothing else beside it.
+fn is_major_version(value: &str) -> bool {
+    let mut characters = value.chars();
+    characters.next().is_some_and(|first| first.is_ascii_digit() && first != '0')
+        && characters.all(|character| character.is_ascii_digit())
 }
 
 /// The ARN vendor field an IAM resource carries — the service namespace that says a value
 /// names something of IAM's at all, which a role template's ARN has to spell
 /// ([`role_template_arn_refusal`]).
 const IAM_ARN_VENDOR: &str = "iam";
+
+/// The prefix an IAM unique id naming a ROLE TEMPLATE VERSION carries, in the family the
+/// "IAM identifiers" page of the IAM User Guide lists under "unique ID prefixes" beside the
+/// `AIDA`, `AROA`, `AGPA`, `AIPA`, `ANPA` and `ASCA` entries this crate already mints with.
+///
+/// `RoleTemplateVersion$TemplateVersionId` is modelled as `idType` (len 16..128, pattern
+/// `^[\w]+$`), which this prefix plus the 17 base32 characters each catalog entry carries
+/// after it satisfies — 21 characters, the length every other IAM unique id of this family
+/// has.
+pub const ROLE_TEMPLATE_VERSION_ID_PREFIX: &str = "AVTA";
 
 /// The `@{` ... `}` placeholder a role template's patterns carry, as
 /// `RoleTemplateVersion$RoleNamePattern` states it: "the pattern can include
@@ -169,10 +214,24 @@ pub struct PublishedTemplateParameter {
     pub description: &'static str,
     /// "Whether you must supply a value for the parameter when you create a role from the
     /// template" (`ParameterDefinition$IsRequired`).
+    ///
+    /// Carried per parameter, because it is a fact the publishing service states about the
+    /// parameter rather than something to read off its name. A parameter the template
+    /// publishes a value for ([`Self::default_value`]) is one "the service uses … when you do
+    /// not supply one", so it is never one you must supply — the invariant the suite asserts
+    /// over the whole catalog.
     pub is_required: bool,
     /// "The value that the service uses for the parameter when you do not supply one"
     /// (`ParameterDefinition$DefaultValue`), or `None` where the template publishes none.
     pub default_value: Option<&'static str>,
+    /// "Specifies whether you can change the parameter value after you create the role"
+    /// (`ParameterDefinition$Immutable`).
+    ///
+    /// Carried per parameter, like every other fact a published template states about one:
+    /// the member's modelled default is `false`, so a parameter a publishing service does
+    /// not freeze is reported as one a caller may later change, and only a template that
+    /// publishes a parameter as immutable has it reported so.
+    pub immutable: bool,
 }
 
 /// One role template a SERVICE publishes, as every account can create roles from it.
@@ -209,10 +268,16 @@ pub struct PublishedRoleTemplate {
     /// This entry's `TemplateVersionId`, carried as catalog data beside the template's
     /// name and version.
     ///
-    /// AWS publishes no version identifier for a role template, so this is a value the
-    /// EMULATOR assigns, of the modelled `idType` (len 16..128, `^[\w]+$`). It is fixed
-    /// per entry, so every read in every run reports the same identifier for the same
-    /// template version.
+    /// Of the modelled `idType` (len 16..128, `^[\w]+$`), in the form AWS mints an IAM
+    /// unique id in: a fixed uppercase type prefix for the kind of thing identified
+    /// ([`ROLE_TEMPLATE_VERSION_ID_PREFIX`]) followed by [`UNIQUE_ID_SUFFIX_LEN`] base32
+    /// characters, exactly as a role's `AROA…`, a policy's `ANPA…` and a user's `AIDA…` id
+    /// are built. It is OPAQUE: it carries none of the template's name, version or
+    /// publisher, so a client that persists or validates it is handling the same kind of
+    /// value IAM hands it everywhere else, and renaming nothing about an entry but its id
+    /// changes which version a client pinning one is pinning. It is fixed per entry, so
+    /// every read in every run reports the same identifier for the same template version,
+    /// and the suite asserts the catalog's ids are distinct.
     pub template_version_id: &'static str,
     /// "The description of the role template" (`RoleTemplateVersion$Description`).
     pub description: &'static str,
@@ -309,11 +374,10 @@ impl PublishedRoleTemplate {
                         is_required: parameter.is_required,
                         default_value: parameter.default_value.map(str::to_string),
                         // "Specifies whether you can change the parameter value after you
-                        // create the role" (`ParameterDefinition$Immutable`): a published
-                        // template renders the role's name, path and trust policy from its
-                        // parameters, and no operation of this API re-renders a role from
-                        // the template it came from, so none of those values can change.
-                        immutable: true,
+                        // create the role" (`ParameterDefinition$Immutable`): what the
+                        // publishing service states about this parameter, carried per
+                        // parameter rather than stamped on the whole catalog.
+                        immutable: parameter.immutable,
                     })
                     .collect(),
             ),
@@ -346,6 +410,15 @@ impl PublishedRoleTemplate {
 /// policy, the role id, the creation instant and the ARN — is computed per call from the
 /// request and the account's state.
 ///
+/// Every entry carries its OWN metadata beside its identity and its patterns: the opaque
+/// unique id of the version it publishes ([`PublishedRoleTemplate::template_version_id`]),
+/// the description the publishing service gives it, and per parameter its description, the
+/// value the service fills it with where it publishes one, whether a caller must supply one
+/// and whether the value can be changed afterwards. None of those is derived from the
+/// template's name or stamped on the catalog as a whole, so two entries differ in them
+/// exactly as two published templates do, and a client that reads the catalog to decide
+/// which parameters to supply reads the publisher's own answer.
+///
 /// An `arn:aws:iam::aws:role-template/` ARN this catalog does not carry resolves to no
 /// template, and a call addressing one is refused as the missing entity
 /// `NoSuchEntityException` names ([`role_template_not_found`]).
@@ -355,7 +428,7 @@ pub const PUBLISHED_ROLE_TEMPLATES: &[PublishedRoleTemplate] = &[
         template_name: "AWSBackupDefaultServiceRoleTemplate",
         major_version: 1,
         minor_version: 0,
-        template_version_id: "roletemplateversion_backup_default_service_role_1_0",
+        template_version_id: "AVTA4KXZQ7JMW2PVNHLRD",
         description: "Standard service role the provides AWS Backup service permission to create and restore backups on your behalf across AWS services",
         role_name_pattern: "@{RoleName}",
         // AWS Backup's default service role is one AWS files under the path it reserves for
@@ -373,16 +446,18 @@ pub const PUBLISHED_ROLE_TEMPLATES: &[PublishedRoleTemplate] = &[
             PublishedTemplateParameter {
                 name: "RoleName",
                 parameter_type: "String",
-                description: "The name of the role to create from this template",
+                description: "Name of the role to create",
                 is_required: true,
                 default_value: None,
+                immutable: false,
             },
             PublishedTemplateParameter {
                 name: "accountId",
                 parameter_type: "String",
-                description: "The account that the service acts on behalf of when it assumes the role",
+                description: "Account that the service acts on behalf of",
                 is_required: true,
                 default_value: None,
+                immutable: false,
             },
         ],
     },
@@ -391,8 +466,8 @@ pub const PUBLISHED_ROLE_TEMPLATES: &[PublishedRoleTemplate] = &[
         template_name: "PowerUserRoleTemplate",
         major_version: 1,
         minor_version: 0,
-        template_version_id: "roletemplateversion_iam_power_user_1_0",
-        description: "Power user role for the service principal that you specify",
+        template_version_id: "AVTAJ5QZWK3MTPVNHLYRB",
+        description: "Grants power-user access to the service principal that you specify. Roles that you create from this template can use the Amazon Web Services services and resources of the account, but cannot manage IAM users, groups, policies or account settings.",
         role_name_pattern: "@{RoleName}",
         // A power-user role is a role of the account's own rather than a service role, so it
         // is created where every entity whose create names no path goes: the account root.
@@ -405,16 +480,21 @@ pub const PUBLISHED_ROLE_TEMPLATES: &[PublishedRoleTemplate] = &[
             PublishedTemplateParameter {
                 name: "AWSServiceName",
                 parameter_type: "String",
-                description: "The service principal that may assume the role",
+                description: "Service principal of the service",
                 is_required: true,
                 default_value: None,
+                immutable: false,
             },
             PublishedTemplateParameter {
                 name: "RoleName",
                 parameter_type: "String",
-                description: "The name of the role to create from this template",
-                is_required: true,
-                default_value: None,
+                description: "Name of the role",
+                // The template publishes the name the service gives the role when the
+                // request supplies none, so this parameter is one "the service uses … when
+                // you do not supply one" rather than one a caller must supply.
+                is_required: false,
+                default_value: Some("PowerUserRole"),
+                immutable: false,
             },
         ],
     },

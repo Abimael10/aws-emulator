@@ -1191,6 +1191,21 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
         .cloned()
     }
 
+    /// Whether ANY role template resolves under `template_arn` — one the account recorded
+    /// itself, or one a service publishes.
+    ///
+    /// The resolution [`Self::role_template_version`] performs, stopped one step short of
+    /// the version: it answers whether the resource the request's `TemplateArn` names exists
+    /// at all. That is a different absence from a template that exists and carries no
+    /// version the request addresses, and the two are reported with the sentence measured
+    /// for each ([`role_template_arn_not_found`], [`role_template_not_found`]).
+    pub fn resolves_role_template(&self, template_arn: &str) -> bool {
+        self.role_templates
+            .get(template_arn)
+            .is_some_and(|versions| !versions.is_empty())
+            || published_role_template(template_arn).is_some()
+    }
+
     /// Mint the next SAML provider's `SAMLProviderUUID`.
     ///
     /// Unique and stable for the same reason [`next_user_id`](Self::next_user_id) is:

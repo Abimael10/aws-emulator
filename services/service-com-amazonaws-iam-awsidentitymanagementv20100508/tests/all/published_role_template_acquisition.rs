@@ -432,9 +432,9 @@ async fn a_published_template_is_rendered_only_with_the_parameters_it_defines() 
                        parameter AWSServiceName",
         },
         Row {
-            case: "no name for the role the power-user template creates",
-            template_arn: POWER_USER_TEMPLATE_ARN,
-            values: &[("AWSServiceName", &["lambda.amazonaws.com"])],
+            case: "no name for the role the AWS Backup template creates",
+            template_arn: BACKUP_TEMPLATE_ARN,
+            values: &[("accountId", &["111122223333"])],
             expected: "No replacement value was supplied for the required role template \
                        parameter RoleName",
         },

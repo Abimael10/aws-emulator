@@ -21,9 +21,15 @@
 //!   role is created from;
 //! * the version is reported as held, a disabled template included: this operation models
 //!   no refusal for one, and refusing an acquisition from it is `AcquireRole`'s half;
-//! * an ARN no template resolves under, and a minor version no resolved template carries,
-//!   reference "a resource entity that does not exist", so the call is refused
-//!   `NoSuchEntityException` (HTTP 404, awsQuery code `NoSuchEntity`);
+//! * a published version is reported from the publishing service's own catalog data — the
+//!   opaque version id in IAM's unique-id format, and per parameter its description, its
+//!   published default, whether a caller must supply one and whether it can be changed
+//!   afterwards;
+//! * an ARN no template resolves under names a missing TEMPLATE and a minor version a
+//!   resolved template does not carry names a missing VERSION of a template that exists:
+//!   both reference "a resource entity that does not exist", so both are refused
+//!   `NoSuchEntityException` (HTTP 404, awsQuery code `NoSuchEntity`), each with the sentence
+//!   measured for that absence;
 //! * a `TemplateArn` whose FORM is not that of a role template's ARN is a value IAM cannot
 //!   accept rather than a template that happens to be missing (HTTP 400, awsQuery code
 //!   `ValidationError`);
@@ -58,8 +64,15 @@ use crate::user_lifecycle::{
 const MIN_ARN_CHARACTERS: usize = 20;
 const MAX_ARN_CHARACTERS: usize = 2048;
 
-/// The ARN the account's own fixture template is recorded under.
-const RECORDED_ARN: &str = "arn:aws:iam::aws:role-template/ReadFixture";
+/// The ARN the account's own fixture template is recorded under, in the form every role
+/// template's ARN takes:
+/// `arn:<partition>:iam::aws:role-template/<publishing service>/<name>:<major version>`.
+const RECORDED_ARN: &str =
+    "arn:aws:iam::aws:role-template/deploy.amazonaws.com/ReadFixture:1";
+
+/// The publishing service and the name the fixture template's ARN spells, so a row that
+/// builds another ARN of the same shape builds it from the same parts.
+const RECORDED_PUBLISHER: &str = "deploy.amazonaws.com";
 
 /// The minor version the fixture template declares as its default, with two other minor
 /// versions recorded beside it so "the template's default minor version" is a choice rather
@@ -91,18 +104,44 @@ const POWER_USER_TEMPLATE_ARN: &str =
 /// The single minor version each catalog entry carries, which is also its default.
 const PUBLISHED_MINOR_VERSION: i32 = 0;
 
-/// The sentence IAM refuses a role-template ARN whose account field is not the publisher
-/// `aws` with, written out here rather than read from the implementation's constant: what
-/// this suite pins is the SENTENCE, so a reworded constant has to fail here rather than
-/// agree with itself.
-const WRONG_ACCOUNT_IN_TEMPLATE_ARN: &str =
-    "The specified role template ARN is not valid. The ARN must use 'aws' as the account \
-     field (e.g., arn:aws:iam::aws:role-template/...).";
+/// The one sentence IAM refuses a value whose form is not a role template's ARN with,
+/// written out here rather than read from the implementation's constant: what this suite
+/// pins is the SENTENCE, so a reworded constant has to fail here rather than agree with
+/// itself.
+const TEMPLATE_ARN_NOT_VALID: &str =
+    "The specified role template ARN is not valid. Expected format is: \
+     arn:{partition}:iam::aws:role-template/{servicePrincipal}/{templateName}:{majorVersion} \
+     (majorVersion must be a positive integer with no leading zeros).";
 
-/// AWS's sentence for a role template nothing resolves: the `<Entity> … cannot be found.`
-/// form, with the template named by the ARN the request supplied.
+/// AWS's sentence for an ARN that resolves no role template at all: the
+/// `<Entity> … cannot be found.` form, with the template named by the ARN the request
+/// supplied.
 fn template_not_found(template_arn: &str) -> String {
     format!("Role Template {template_arn} cannot be found.")
+}
+
+/// AWS's sentence for a template that resolves but carries no version the request
+/// addresses: the `<entity> not found: <identifier>` form, with the template named by the
+/// ARN the request supplied.
+fn template_version_not_found(template_arn: &str) -> String {
+    format!("Role template not found: {template_arn}")
+}
+
+/// The `<member>` blocks of the `ParametersDefinition` list the body carries, in document
+/// order, so each parameter's own members can be read without a member absent from one
+/// parameter shifting another's position.
+fn parameter_members(body: &str) -> Vec<String> {
+    section(body, "ParametersDefinition")
+        .split("<member>")
+        .skip(1)
+        .map(|member| {
+            member
+                .split("</member>")
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect()
 }
 
 /// The trust policy template the fixture carries, with a placeholder in it so the rendering
@@ -574,19 +613,20 @@ async fn a_disabled_template_is_reported_rather_than_refused() {
     }
 }
 
-/// RULE: an ARN no role template resolves under, and a minor version no resolved template
-/// carries, reference "a resource entity that does not exist", so the call is refused
-/// `NoSuchEntityException` (HTTP 404, awsQuery code `NoSuchEntity`) naming the template the
-/// request addressed.
+/// RULE: an ARN no role template resolves under names a resource that does not exist, so the
+/// call is refused `NoSuchEntityException` (HTTP 404, awsQuery code `NoSuchEntity`) with the
+/// sentence naming the template that cannot be found.
 ///
 /// Rows span the ARN's shape — including the published MAXIMUM length of `arnType`
-/// (20..2048) and an account-less template ARN — the recorded template and the published
-/// catalog, and a minor version each of them does not carry.
+/// (20..2048) — the recorded template's own publisher and the published catalog, each
+/// addressed at a name, a case and a major version nothing resolves.
 #[tokio::test]
 async fn an_arn_no_template_resolves_under_is_refused_as_a_missing_entity() {
+    let name_padding = MAX_ARN_CHARACTERS
+        - format!("arn:aws:iam::aws:role-template/{RECORDED_PUBLISHER}/:1").chars().count();
     let longest = format!(
-        "arn:aws:iam::aws:role-template/{}",
-        "L".repeat(MAX_ARN_CHARACTERS - "arn:aws:iam::aws:role-template/".len())
+        "arn:aws:iam::aws:role-template/{RECORDED_PUBLISHER}/{}:1",
+        "L".repeat(name_padding)
     );
     assert_eq!(
         longest.chars().count(),
@@ -595,50 +635,39 @@ async fn an_arn_no_template_resolves_under_is_refused_as_a_missing_entity() {
         longest.chars().count()
     );
 
-    let rows: Vec<(&str, String, Option<i32>)> = vec![
-        ("the published maximum length", longest, None),
+    let rows: Vec<(&str, String)> = vec![
+        ("the published maximum length", longest),
         (
             "another template of the same publisher",
-            "arn:aws:iam::aws:role-template/NeverRecorded".to_string(),
-            None,
+            format!("arn:aws:iam::aws:role-template/{RECORDED_PUBLISHER}/NeverRecorded:1"),
+        ),
+        (
+            "a template of a publisher nothing publishes for",
+            "arn:aws:iam::aws:role-template/nowhere.amazonaws.com/ReadFixture:1".to_string(),
         ),
         (
             "the recorded template's ARN in another partition",
-            "arn:aws-us-gov:iam::aws:role-template/ReadFixture".to_string(),
-            None,
+            format!("arn:aws-us-gov:iam::aws:role-template/{RECORDED_PUBLISHER}/ReadFixture:1"),
         ),
         (
             "the recorded template's ARN in another case",
-            "arn:aws:iam::aws:role-template/readfixture".to_string(),
-            None,
+            format!("arn:aws:iam::aws:role-template/{RECORDED_PUBLISHER}/readfixture:1"),
         ),
         (
-            "a minor version the recorded template does not carry",
-            RECORDED_ARN.to_string(),
-            Some(7),
-        ),
-        (
-            "the minor version just past the recorded template's highest",
-            RECORDED_ARN.to_string(),
-            Some(RECORDED_DEFAULT_MINOR_VERSION + 1),
-        ),
-        (
-            "a minor version the published template does not carry",
-            BACKUP_TEMPLATE_ARN.to_string(),
-            Some(PUBLISHED_MINOR_VERSION + 1),
+            "the recorded template at another major version",
+            format!("arn:aws:iam::aws:role-template/{RECORDED_PUBLISHER}/ReadFixture:2"),
         ),
         (
             "a published template addressed at another major version",
             "arn:aws:iam::aws:role-template/iam.amazonaws.com/PowerUserRoleTemplate:2".to_string(),
-            None,
         ),
     ];
 
-    for (case, template_arn, minor_version) in rows {
+    for (case, template_arn) in rows {
         let (router, engine) = router_with_engine();
         seed_recorded(&engine);
 
-        let (status, body) = read(&router, None, &template_arn, minor_version).await;
+        let (status, body) = read(&router, None, &template_arn, None).await;
         assert_eq!(
             status, 404,
             "case {case:?}: expected the missing template to be refused, got {status}: {body}"
@@ -659,17 +688,79 @@ async fn an_arn_no_template_resolves_under_is_refused_as_a_missing_entity() {
     }
 }
 
+/// RULE: a minor version a resolved role template does not carry is a different missing
+/// resource from a template nothing resolves — the version of a template that DOES exist —
+/// so the call is refused `NoSuchEntityException` (HTTP 404, awsQuery code `NoSuchEntity`)
+/// with the sentence for a version that was not found, naming the template the request
+/// addressed.
+///
+/// Rows span where the resolved template comes from — the account's own record and each
+/// published catalog entry — and which version is missing: one well past the versions held,
+/// the one just past the highest, and the one just below the published entry's only version.
+#[tokio::test]
+async fn a_minor_version_a_resolved_template_does_not_carry_is_refused_as_missing() {
+    let rows: Vec<(&str, &str, i32)> = vec![
+        (
+            "a minor version the recorded template does not carry",
+            RECORDED_ARN,
+            7,
+        ),
+        (
+            "the minor version just past the recorded template's highest",
+            RECORDED_ARN,
+            RECORDED_DEFAULT_MINOR_VERSION + 1,
+        ),
+        (
+            "a minor version the published AWS Backup template does not carry",
+            BACKUP_TEMPLATE_ARN,
+            PUBLISHED_MINOR_VERSION + 1,
+        ),
+        (
+            "a minor version the published power-user template does not carry",
+            POWER_USER_TEMPLATE_ARN,
+            PUBLISHED_MINOR_VERSION + 9,
+        ),
+    ];
+
+    for (case, template_arn, minor_version) in rows {
+        let (router, engine) = router_with_engine();
+        seed_recorded(&engine);
+
+        let (status, body) = read(&router, None, template_arn, Some(minor_version)).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: expected the missing version to be refused, got {status}: {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "NoSuchEntity",
+            "case {case:?}: expected NoSuchEntity, got {:?}: {body}",
+            error_code(&body)
+        );
+        let expected = template_version_not_found(template_arn);
+        assert_eq!(
+            element(&body, "Message"),
+            expected,
+            "case {case:?}: expected the refusal to read {expected:?}, got {:?}",
+            element(&body, "Message")
+        );
+    }
+}
+
 /// RULE: a value supplied for a member documented as the ARN of a role template is read for
 /// its FORM before anything is resolved, and a value whose form is not that ARN is one IAM
 /// cannot accept rather than a template that happens to be missing: HTTP 400 with the
 /// awsQuery code `ValidationError` — the code IAM answers a value it cannot accept with —
-/// and the sentence this crate states for the reading that refused it.
+/// and the one sentence stating the form such an ARN takes.
 ///
 /// Rows span every way the form can be wrong: a value nothing can be read as an ARN from, an
 /// ARN of another service, an ARN of another resource type in IAM's own namespace (at the
-/// published MINIMUM length of `arnType`, 20), and a role-template ARN whose account field is
-/// not the publisher `aws` — an account number, no account at all, and another publisher's
-/// name.
+/// published MINIMUM length of `arnType`, 20), an ARN whose account field is not the
+/// publisher `aws` (an account number, no account at all, and another publisher's name), one
+/// that names a Region, and a role-template ARN whose identity is not
+/// `<service principal>/<template name>:<major version>` — a single segment, no major
+/// version, an empty part, and a major version that is not a positive integer without
+/// leading zeros.
 #[tokio::test]
 async fn a_template_arn_whose_form_is_not_a_role_templates_is_refused_as_a_bad_value() {
     let shortest = "arn:aws:iam:::rt/aaa".to_string();
@@ -680,64 +771,93 @@ async fn a_template_arn_whose_form_is_not_a_role_templates_is_refused_as_a_bad_v
     );
 
     let rows = [
-        (
-            "a value that is no ARN at all",
-            "not-an-arn-but-long-enough".to_string(),
-            state::ARN_UNPARSEABLE.to_string(),
-        ),
-        (
-            "a value of colons alone",
-            "::::::::::::::::::::".to_string(),
-            state::ARN_UNPARSEABLE.to_string(),
-        ),
+        ("a value that is no ARN at all", "not-an-arn-but-long-enough".to_string()),
+        ("a value of colons alone", "::::::::::::::::::::".to_string()),
         (
             "a well-formed ARN of another service",
             "arn:aws:s3:::role-template/ReadFixture".to_string(),
-            state::ARN_WRONG_RESOURCE_TYPE.to_string(),
         ),
         (
             "a well-formed ARN of another identity service",
-            "arn:aws:sts::123456789012:role-template/ReadFixture".to_string(),
-            state::ARN_WRONG_RESOURCE_TYPE.to_string(),
+            format!("arn:aws:sts::aws:role-template/{RECORDED_PUBLISHER}/ReadFixture:1"),
         ),
         (
             "an ARN of another resource type in IAM's own namespace",
             "arn:aws:iam::aws:policy/ReadOnlyAccess".to_string(),
-            state::ARN_WRONG_RESOURCE_TYPE.to_string(),
         ),
         (
             "an ARN naming an IAM role rather than a role template",
             format!("arn:aws:iam::{}:role/ReadFixture", account_id()),
-            state::ARN_WRONG_RESOURCE_TYPE.to_string(),
         ),
-        (
-            "another resource type at the published minimum length",
-            shortest,
-            state::ARN_WRONG_RESOURCE_TYPE.to_string(),
-        ),
+        ("another resource type at the published minimum length", shortest),
         (
             "a role-template ARN carrying this account's number",
-            format!("arn:aws:iam::{}:role-template/ReadFixture", account_id()),
-            WRONG_ACCOUNT_IN_TEMPLATE_ARN.to_string(),
+            format!(
+                "arn:aws:iam::{}:role-template/{RECORDED_PUBLISHER}/ReadFixture:1",
+                account_id()
+            ),
         ),
         (
             "a role-template ARN carrying another account's number",
-            "arn:aws:iam::000000000000:role-template/ReadFixture".to_string(),
-            WRONG_ACCOUNT_IN_TEMPLATE_ARN.to_string(),
+            format!("arn:aws:iam::000000000000:role-template/{RECORDED_PUBLISHER}/ReadFixture:1"),
         ),
         (
             "a role-template ARN naming no account at all",
-            "arn:aws:iam:::role-template/ReadFixture".to_string(),
-            WRONG_ACCOUNT_IN_TEMPLATE_ARN.to_string(),
+            format!("arn:aws:iam:::role-template/{RECORDED_PUBLISHER}/ReadFixture:1"),
         ),
         (
             "a role-template ARN whose account field names another publisher",
-            "arn:aws:iam::amazonaws:role-template/ReadFixture".to_string(),
-            WRONG_ACCOUNT_IN_TEMPLATE_ARN.to_string(),
+            format!("arn:aws:iam::amazonaws:role-template/{RECORDED_PUBLISHER}/ReadFixture:1"),
+        ),
+        (
+            "a role-template ARN naming a Region",
+            format!(
+                "arn:aws:iam:us-east-1:aws:role-template/{RECORDED_PUBLISHER}/ReadFixture:1"
+            ),
+        ),
+        (
+            "a role-template ARN of a single trailing segment",
+            "arn:aws:iam::aws:role-template/nonexistent-role-template".to_string(),
+        ),
+        (
+            "a role-template ARN naming no major version",
+            format!("arn:aws:iam::aws:role-template/{RECORDED_PUBLISHER}/ReadFixture"),
+        ),
+        (
+            "a role-template ARN naming no template",
+            format!("arn:aws:iam::aws:role-template/{RECORDED_PUBLISHER}/:1"),
+        ),
+        (
+            "a role-template ARN naming no publishing service",
+            "arn:aws:iam::aws:role-template//ReadFixture:1".to_string(),
+        ),
+        (
+            "a role-template ARN carrying a further segment",
+            format!("arn:aws:iam::aws:role-template/{RECORDED_PUBLISHER}/team/ReadFixture:1"),
+        ),
+        (
+            "a major version of zero",
+            format!("arn:aws:iam::aws:role-template/{RECORDED_PUBLISHER}/ReadFixture:0"),
+        ),
+        (
+            "a major version with a leading zero",
+            format!("arn:aws:iam::aws:role-template/{RECORDED_PUBLISHER}/ReadFixture:01"),
+        ),
+        (
+            "a negative major version",
+            format!("arn:aws:iam::aws:role-template/{RECORDED_PUBLISHER}/ReadFixture:-1"),
+        ),
+        (
+            "a major version that is no number",
+            format!("arn:aws:iam::aws:role-template/{RECORDED_PUBLISHER}/ReadFixture:v1"),
+        ),
+        (
+            "an empty major version",
+            format!("arn:aws:iam::aws:role-template/{RECORDED_PUBLISHER}/ReadFixture:"),
         ),
     ];
 
-    for (case, template_arn, message) in rows {
+    for (case, template_arn) in rows {
         let (router, engine) = router_with_engine();
         seed_recorded(&engine);
 
@@ -754,11 +874,204 @@ async fn a_template_arn_whose_form_is_not_a_role_templates_is_refused_as_a_bad_v
         );
         assert_eq!(
             element(&body, "Message"),
-            message,
-            "case {case:?}: expected the refusal to read {message:?}, got {:?}",
+            TEMPLATE_ARN_NOT_VALID,
+            "case {case:?}: expected the refusal to read {TEMPLATE_ARN_NOT_VALID:?}, got {:?}",
             element(&body, "Message")
         );
     }
+}
+
+/// RULE: a published role template version is reported from the publishing service's OWN
+/// catalog data — the opaque unique id of the version, minted in IAM's unique-id format, and
+/// per parameter its description, the value the service fills it with where it publishes one,
+/// whether a caller must supply one and whether the value can be changed afterwards — rather
+/// than from values derived from the template's name or stamped on every entry alike.
+///
+/// Rows are EVERY entry of the published catalog (`state::PUBLISHED_ROLE_TEMPLATES`), so an
+/// entry added later is held to the same rule, and each entry's every parameter is checked
+/// against the catalog row the publisher states.
+#[tokio::test]
+async fn a_published_version_reports_the_publishers_own_catalog_data() {
+    /// The characters an IAM unique id's suffix is drawn from: base32, as the uppercase
+    /// `AROA`/`ANPA`/`AIDA` ids this service mints are.
+    const BASE32: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    /// How many of them follow the prefix in an id of this family.
+    const SUFFIX_CHARACTERS: usize = 17;
+
+    let (router, _engine) = router_with_engine();
+    let mut reported_ids = Vec::new();
+
+    // The one parameter description AWS's own wording is published for, pinned as a literal
+    // beside the catalog comparison below, so a reworded entry fails here rather than
+    // agreeing with itself.
+    let (status, power_user) = read(&router, None, POWER_USER_TEMPLATE_ARN, None).await;
+    assert_eq!(
+        status, 200,
+        "expected the published power-user version to be reported, got {status}: {power_user}"
+    );
+    let principal_parameter = parameter_members(&power_user)
+        .into_iter()
+        .find(|member| element(member, "Name") == "AWSServiceName")
+        .expect("the published power-user template defines the service-principal parameter");
+    assert_eq!(
+        element(&principal_parameter, "Description"),
+        "Service principal of the service",
+        "expected the publisher's own wording for the service-principal parameter, got {:?}",
+        element(&principal_parameter, "Description")
+    );
+
+    for template in state::PUBLISHED_ROLE_TEMPLATES {
+        let case = format!("{}/{}", template.managed_by_value, template.template_name);
+        let template_arn = template.arn();
+        let (status, body) = read(&router, None, &template_arn, None).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the published version to be reported, got {status}: {body}"
+        );
+
+        // The version id: IAM's unique-id format, carrying none of the template's own text,
+        // so a client that validates or persists it is handling the kind of value IAM hands
+        // it everywhere else.
+        let version_id = element(&body, "TemplateVersionId");
+        let suffix = version_id
+            .strip_prefix(state::ROLE_TEMPLATE_VERSION_ID_PREFIX)
+            .unwrap_or_default();
+        assert!(
+            suffix.chars().count() == SUFFIX_CHARACTERS
+                && suffix.chars().all(|character| BASE32.contains(character)),
+            "case {case:?}: expected a {} id of {SUFFIX_CHARACTERS} base32 characters, got \
+             {version_id:?}",
+            state::ROLE_TEMPLATE_VERSION_ID_PREFIX
+        );
+        assert!(
+            !version_id
+                .to_lowercase()
+                .contains(&template.template_name.to_lowercase()),
+            "case {case:?}: expected an opaque id carrying none of the template's name, got \
+             {version_id:?}"
+        );
+        reported_ids.push(version_id);
+
+        // The version's own `Description`, which precedes the parameter descriptions the
+        // same tag names inside `ParametersDefinition`.
+        let descriptions = elements(&body, "Description");
+        assert_eq!(
+            descriptions.first().map(String::as_str),
+            Some(template.description),
+            "case {case:?}: expected the publisher's description {:?}, got {:?}",
+            template.description,
+            descriptions.first()
+        );
+
+        let members = parameter_members(&body);
+        assert_eq!(
+            members.len(),
+            template.parameters.len(),
+            "case {case:?}: expected one member per published parameter, got {members:?}"
+        );
+        for (member, parameter) in members.iter().zip(template.parameters) {
+            let case = format!("{case} parameter {}", parameter.name);
+            assert_eq!(
+                element(member, "Name"),
+                parameter.name,
+                "case {case:?}: expected the parameters in the order the catalog carries \
+                 them, got {:?}",
+                element(member, "Name")
+            );
+            assert_eq!(
+                element(member, "Description"),
+                parameter.description,
+                "case {case:?}: expected the publisher's description {:?}, got {:?}",
+                parameter.description,
+                element(member, "Description")
+            );
+            assert_eq!(
+                element(member, "IsRequired"),
+                parameter.is_required.to_string(),
+                "case {case:?}: expected IsRequired {}, got {:?}",
+                parameter.is_required,
+                element(member, "IsRequired")
+            );
+            assert_eq!(
+                element(member, "Immutable"),
+                parameter.immutable.to_string(),
+                "case {case:?}: expected Immutable {}, got {:?}",
+                parameter.immutable,
+                element(member, "Immutable")
+            );
+            assert_eq!(
+                elements(member, "DefaultValue"),
+                parameter
+                    .default_value
+                    .map(str::to_string)
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                "case {case:?}: expected the published default {:?}, got {:?}",
+                parameter.default_value,
+                elements(member, "DefaultValue")
+            );
+            // The invariant between the two members: a parameter the service fills from a
+            // published default is never one a caller must supply.
+            assert!(
+                parameter.default_value.is_none() || !parameter.is_required,
+                "case {case:?}: a parameter with a published default must not be required"
+            );
+        }
+    }
+
+    reported_ids.sort();
+    let distinct = reported_ids.len();
+    reported_ids.dedup();
+    assert_eq!(
+        reported_ids.len(),
+        distinct,
+        "every published version must carry its own id, got {reported_ids:?}"
+    );
+}
+
+/// RULE: the metadata a read reports is the metadata the acquisition is held to, so a
+/// parameter the read reports as not required, with a published default, is one `AcquireRole`
+/// renders with that default when the request supplies no value for it.
+#[tokio::test]
+async fn a_parameter_the_read_reports_a_default_for_is_rendered_with_it() {
+    let (router, _engine) = router_with_engine();
+
+    let (status, reported) = read(&router, None, POWER_USER_TEMPLATE_ARN, None).await;
+    assert_eq!(
+        status, 200,
+        "expected the published version to be reported, got {status}: {reported}"
+    );
+    let defaulted = parameter_members(&reported)
+        .into_iter()
+        .find(|member| element(member, "IsRequired") == "false")
+        .expect("the published power-user template defines a parameter with a default");
+    let name = element(&defaulted, "Name");
+    let default_value = element(&defaulted, "DefaultValue");
+
+    // Only the parameters the read reports as required are supplied, so the rendering has
+    // nothing but the published default to fill this one with.
+    let (status, created) = acquire(
+        &router,
+        None,
+        POWER_USER_TEMPLATE_ARN,
+        None,
+        &[("AWSServiceName", &["lambda.amazonaws.com"])],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "expected the role to be created from the published defaults, got {status}: {created}"
+    );
+    let expected_name = element(&reported, "RoleNamePattern").replace(
+        &format!("@{{{name}}}"),
+        &default_value,
+    );
+    assert_eq!(
+        element(&created, "RoleName"),
+        expected_name,
+        "expected the name rendered with the published default {expected_name:?}, got {:?}",
+        element(&created, "RoleName")
+    );
 }
 
 /// RULE: IAM decides the call against the caller's identity-based policies before it
@@ -802,7 +1115,9 @@ async fn a_caller_whose_policies_do_not_allow_the_read_is_refused() {
 
         // Both a template the account holds and one it does not: a refused caller learns
         // which action it may not take, never which templates the account holds.
-        for template_arn in [RECORDED_ARN, "arn:aws:iam::aws:role-template/NeverRecorded"] {
+        let unresolved =
+            format!("arn:aws:iam::aws:role-template/{RECORDED_PUBLISHER}/NeverRecorded:1");
+        for template_arn in [RECORDED_ARN, unresolved.as_str()] {
             let case = format!("{case} reading {template_arn}");
             let (status, body) = read(&router, Some(&access_key_id), template_arn, None).await;
             assert_eq!(
@@ -869,7 +1184,12 @@ async fn reading_a_template_version_changes_nothing_a_later_caller_sees() {
         ),
         (
             "an ARN no template resolves under",
-            "arn:aws:iam::aws:role-template/NeverRecorded",
+            "arn:aws:iam::aws:role-template/nowhere.amazonaws.com/NeverRecorded:1",
+            None,
+        ),
+        (
+            "a value whose form is not a role template's ARN",
+            "arn:aws:iam::aws:role-template/nonexistent-role-template",
             None,
         ),
     ];

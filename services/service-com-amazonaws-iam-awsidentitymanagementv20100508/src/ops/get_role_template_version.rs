@@ -28,14 +28,15 @@
 //!   operation's refusal of such a value, and the code IAM answers a value it cannot accept
 //!   with throughout this API (`CreateDelegationRequest` answers its own two ARN members with
 //!   it), rather than the modelled `InvalidInputException`'s `<Code>InvalidInput</Code>`,
-//!   which no reading of this member produces — worded with the sentence for the reading that
-//!   refused it, through the ONE reading of a caller-supplied role-template ARN this crate
-//!   holds ([`crate::state::role_template_arn_refusal`]).
-//! * an ARN this service resolves no template under, and a minor version no such template
-//!   carries, reference "a resource entity that does not exist": `404`
-//!   `<Code>NoSuchEntity</Code>` naming the template the request addressed
-//!   ([`crate::state::role_template_version_not_found`], the sentence measured for this
-//!   READ, which `crate::state::role_templates` holds beside the one `AcquireRole` refuses a
+//!   which no reading of this member produces — worded with the one sentence that states the
+//!   form such an ARN takes, through the ONE reading of a caller-supplied role-template ARN
+//!   this crate holds ([`crate::state::role_template_arn_refusal`]).
+//! * an ARN this service resolves no template under reference "a resource entity that does
+//!   not exist": `404` `<Code>NoSuchEntity</Code>` naming the template that cannot be found
+//!   ([`crate::state::role_template_arn_not_found`]), while an ARN that DOES resolve a
+//!   template the request addresses no held version of names a missing version of a template
+//!   that exists, which carries the sentence measured for that absence
+//!   ([`crate::state::role_template_not_found`], the sentence `AcquireRole` refuses a
 //!   template it cannot create from with).
 //!
 //! A caller whose identity-based policies do not permit the call is refused before the
@@ -197,8 +198,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `arnType` bounds only the length (20..2048), so the FORM of the value is read
         // before the store is touched at all, through the ONE reading of a caller-supplied
         // role-template ARN this crate holds: a value whose form is not that ARN is one IAM
-        // cannot accept rather than a template that happens to be missing, and the sentence
-        // it answers is the one for the reading that refused it.
+        // cannot accept rather than a template that happens to be missing, and what it is
+        // answered with is the one sentence stating the form such an ARN takes.
         if let Some(refusal) = crate::state::role_template_arn_refusal(&input.template_arn) {
             return Err(crate::scaffolded::Scaffolded::validation_error(refusal));
         }
@@ -225,14 +226,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // would be created from.
         let Some(version) = store.role_template_version(&input.template_arn, input.minor_version)
         else {
-            // An ARN this service resolves no template under and a minor version no such
-            // template carries are the same missing resource — the role template the
-            // request addressed — so both carry the family's one sentence.
+            // Two different missing resources, each reported with the sentence measured for
+            // it: an ARN nothing resolves a template under names no template, while an ARN
+            // that does resolve one names a template carrying no version the request
+            // addressed.
+            let message = if store.resolves_role_template(&input.template_arn) {
+                crate::state::role_template_not_found(&input.template_arn)
+            } else {
+                crate::state::role_template_arn_not_found(&input.template_arn)
+            };
             return Err(GetRoleTemplateVersionErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {
-                    message: Some(crate::state::role_template_version_not_found(
-                        &input.template_arn,
-                    )),
+                    message: Some(message),
                 },
             )
             .into());
