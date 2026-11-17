@@ -43,7 +43,9 @@ use crate::http_api_backend_dispatch::given_function;
 use crate::websocket_stage_metrics::{
     closed, emulator, given_api, given_route, given_stage, pushed, ECHO_HANDLER, OK_HANDLER,
 };
-use crate::websocket_transport_data_plane::{dial_loopback, exchange, handshake_at, ClientSocket};
+use crate::websocket_transport_data_plane::{
+    dial_loopback, exchanged_reply, handshake_at, ClientSocket,
+};
 
 /// The Region every request below is signed for.
 const REGION: &str = "us-east-1";
@@ -535,15 +537,15 @@ async fn each_message_a_carried_connection_exchanges_raises_the_stage_counters()
 
         let mut connection_id: Option<String> = None;
         for frame in 0..*frames {
-            let replied = exchange(
+            // The reply MUST come, so it is awaited for as long as `exchanged_reply` waits
+            // rather than for one frame deadline: the route's function has to run first, and
+            // on a loaded host that start takes longer than one.
+            let replied = exchanged_reply(
                 case,
                 &mut socket,
                 &format!(r#"{{"action":"reply","frame":{frame}}}"#),
             )
-            .await
-            .unwrap_or_else(|| {
-                panic!("case {case:?}: the two-way route must reply to frame {frame}")
-            });
+            .await;
             let event: Value = serde_json::from_str(&replied).unwrap_or_else(|error| {
                 panic!("case {case:?}: expected the route's event back, got {error}: {replied:?}")
             });

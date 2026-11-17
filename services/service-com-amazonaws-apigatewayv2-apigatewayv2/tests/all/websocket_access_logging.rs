@@ -35,7 +35,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::api_lifecycle::{as_str, call_in_region};
 use crate::http_api_access_logging::{create_log_group, delivered_to, emulator, log_group_arn};
 use crate::http_api_backend_dispatch::given_function;
-use crate::websocket_transport_data_plane::{exchange, handshake_at, ClientSocket};
+use crate::websocket_transport_data_plane::{exchanged_reply, handshake_at, ClientSocket};
 
 /// The Region every request below is signed for and every ARN names — the one the Lambda
 /// harness creates its functions in, so the api and the function it names live in the same
@@ -310,9 +310,7 @@ async fn every_call_of_a_session_leaves_one_record_rendered_by_the_stages_format
     // A message a route serves: the record names that route and the status its integration
     // answered, and the id the record names is the id the INTEGRATION was told the call is —
     // the handler answers it, so the two can be compared rather than the record with itself.
-    let replied = exchange(case, &mut socket, r#"{"action":"ping"}"#).await;
-    let reply = replied
-        .unwrap_or_else(|| panic!("case {case:?}: the two-way route must answer the frame"));
+    let reply = exchanged_reply(case, &mut socket, r#"{"action":"ping"}"#).await;
     let observed = parsed(case, &reply);
     let observed_id = as_text(&observed, "requestId");
     assert!(
@@ -338,10 +336,11 @@ async fn every_call_of_a_session_leaves_one_record_rendered_by_the_stages_format
 
     // A message the api routes nowhere is a call the gateway refused, and a refused call is
     // one the stage logged.
-    let replied = exchange(case, &mut socket, r#"{"action":"nowhere"}"#).await;
+    let replied = exchanged_reply(case, &mut socket, r#"{"action":"nowhere"}"#).await;
     assert!(
-        replied.is_some_and(|reply| reply.contains("Forbidden")),
-        "case {case:?}: an unrouted action must be answered the gateway's own frame"
+        replied.contains("Forbidden"),
+        "case {case:?}: an unrouted action must be answered the gateway's own frame, got \
+         {replied:?}"
     );
     let records = records_once_at_least(&router, case, 3).await;
     let unrouted = parsed(case, &records[2]);
@@ -459,7 +458,7 @@ async fn a_common_log_format_stage_renders_the_same_calls_in_that_format() {
         .unwrap_or_else(|status| {
             panic!("case {case:?}: the handshake must be completed, got {status}")
         });
-    exchange(case, &mut socket, r#"{"action":"ping"}"#).await;
+    exchanged_reply(case, &mut socket, r#"{"action":"ping"}"#).await;
     let records = records_once_at_least(&router, case, 2).await;
     for (what, expected) in [
         ("the connection request", "\"CONNECT $connect\" 101 "),
@@ -489,11 +488,9 @@ async fn a_stage_with_no_access_log_settings_delivers_nothing() {
         .unwrap_or_else(|status| {
             panic!("case {case:?}: the handshake must be completed, got {status}")
         });
-    let replied = exchange(case, &mut socket, r#"{"action":"ping"}"#).await;
-    assert!(
-        replied.is_some(),
-        "case {case:?}: the stage must keep serving its session"
-    );
+    // The reply MUST come — the stage keeps serving its session — so it is awaited for as long
+    // as `exchanged_reply` waits rather than for one frame deadline.
+    exchanged_reply(case, &mut socket, r#"{"action":"ping"}"#).await;
     assert_eq!(
         delivered(&router).await,
         None,

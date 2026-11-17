@@ -32,7 +32,7 @@ use crate::websocket_stage_metrics::{
     closed, counter, emulator, given_api, given_route, given_stage, latency_samples, per_route,
     reached, samples, Expected,
 };
-use crate::websocket_transport_data_plane::{exchange, handshake_at, ClientSocket};
+use crate::websocket_transport_data_plane::{exchange, exchanged_reply, handshake_at, ClientSocket};
 
 /// The three series a stage publishes once per call, in the order a failing assertion names
 /// them.
@@ -354,25 +354,25 @@ async fn a_failing_call_is_counted_in_exactly_one_error_class() {
                     panic!("case {case:?}: the handshake must complete, got {status}")
                 });
                 if let Some(frame) = frame {
-                    let replied = exchange(case, &mut socket, frame).await;
                     match row.answer {
                         Some(expected) => {
-                            let replied = replied.unwrap_or_else(|| {
-                                panic!(
-                                    "case {case:?}: the api must answer a frame carrying \
-                                     {expected:?}, got nothing"
-                                )
-                            });
+                            // The reply MUST come, so it is awaited for as long as
+                            // `exchanged_reply` waits: the route's function has to run first.
+                            let replied = exchanged_reply(case, &mut socket, frame).await;
                             assert!(
                                 replied.contains(expected),
                                 "case {case:?}: the api must answer a frame carrying \
                                  {expected:?}, got {replied:?}"
                             );
                         }
-                        None => assert!(
-                            replied.is_none(),
-                            "case {case:?}: a one-way route sends nothing back, got {replied:?}"
-                        ),
+                        None => {
+                            let replied = exchange(case, &mut socket, frame).await;
+                            assert!(
+                                replied.is_none(),
+                                "case {case:?}: a one-way route sends nothing back, got \
+                                 {replied:?}"
+                            );
+                        }
                     }
                 }
                 closed(case, socket).await;

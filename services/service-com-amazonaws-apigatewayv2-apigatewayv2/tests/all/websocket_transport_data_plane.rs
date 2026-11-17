@@ -317,41 +317,51 @@ pub(crate) async fn exchange(
     socket: &mut ClientSocket,
     message: &str,
 ) -> Option<String> {
+    sent(case, socket, message).await;
+    read_frame(case, socket, FRAME_DEADLINE).await
+}
+
+/// [`exchange`] for a case that MUST be answered: the message is sent ONCE and the frame it is
+/// answered with is awaited for as long as [`REPLY_DEADLINE`].
+///
+/// The first invocation of a function starts its runtime, and on a loaded host that start can
+/// take longer than [`FRAME_DEADLINE`] — a wait that is not the limit any case here tests, so
+/// it is given generous room. The wait is for the api's REPLY, a condition, and nothing
+/// asserts on the clock. The message is never sent a second time: a connection carries the
+/// reply to each call it was given, so a second send would leave the case reading the FIRST
+/// call's reply as the second's.
+pub(crate) async fn exchanged_reply(
+    case: &str,
+    socket: &mut ClientSocket,
+    message: &str,
+) -> String {
+    sent(case, socket, message).await;
+    read_frame(case, socket, REPLY_DEADLINE)
+        .await
+        .unwrap_or_else(|| panic!("case {case:?}: the api must answer the message {message:?}"))
+}
+
+/// Send one message over the connection.
+async fn sent(case: &str, socket: &mut ClientSocket, message: &str) {
     socket
         .send(Message::Text(message.to_string().into()))
         .await
         .unwrap_or_else(|error| panic!("case {case:?}: the message must be sent, got {error}"));
-    match tokio::time::timeout(FRAME_DEADLINE, socket.next()).await {
+}
+
+/// Read the next frame the api sends, or `None` when it sends nothing `within` that span.
+async fn read_frame(
+    case: &str,
+    socket: &mut ClientSocket,
+    within: Duration,
+) -> Option<String> {
+    match tokio::time::timeout(within, socket.next()).await {
         Ok(Some(Ok(Message::Text(text)))) => Some(text.as_str().to_string()),
         Ok(Some(Ok(Message::Binary(bytes)))) => Some(String::from_utf8_lossy(&bytes).to_string()),
         Ok(Some(Ok(other))) => panic!("case {case:?}: unexpected frame {other:?}"),
         Ok(Some(Err(error))) => panic!("case {case:?}: the socket failed: {error}"),
         Ok(None) => panic!("case {case:?}: the socket closed instead of answering"),
         Err(_elapsed) => None,
-    }
-}
-
-/// [`exchange`] for a case that MUST be answered: the message is sent again while no frame
-/// has arrived, until one does or [`REPLY_DEADLINE`] passes.
-///
-/// The first invocation of a function starts its runtime, and on a loaded host that start can
-/// take longer than one exchange waits — a wait that is not the limit any case here tests, so
-/// it is given generous room. The wait is for the api's REPLY, a condition, and nothing
-/// asserts on the clock.
-pub(crate) async fn exchanged_reply(
-    case: &str,
-    socket: &mut ClientSocket,
-    message: &str,
-) -> String {
-    let deadline = tokio::time::Instant::now() + REPLY_DEADLINE;
-    loop {
-        if let Some(reply) = exchange(case, socket, message).await {
-            return reply;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "case {case:?}: the api must answer the message {message:?}"
-        );
     }
 }
 

@@ -1377,3 +1377,290 @@ async fn a_permission_added_or_revoked_decides_the_next_connection_request() {
          {refused:?}"
     );
 }
+
+/// A handler that RAISES: its route's integration ran and produced no reply the gateway could
+/// deliver, which is the one call a client reads the gateway's own frame for.
+const RAISING_HANDLER: &str = "def lambda_handler(event, context):\n\
+     \x20   raise ValueError(\"the backend failed\")\n";
+
+/// The fixed text of that frame. It is the gateway's sentence for a call it could not serve,
+/// never an answer for a healthy integration.
+const INTERNAL_SERVER_ERROR_FRAME: &str = "Internal server error";
+
+/// What one frame of the established connection must be answered with.
+#[derive(Debug, Clone, Copy)]
+enum Answered {
+    /// The reply of the route carrying this key — the payload ITS OWN function returned.
+    By(&'static str),
+    /// The gateway's own frame, carrying this sentence and naming the connection and the call.
+    GatewayFrame(&'static str),
+}
+
+/// One frame a client sends over the established connection, and what must come back.
+struct Frame {
+    case: &'static str,
+    sent: &'static str,
+    answered: Answered,
+}
+
+/// The rows span what the dispatch rule generalises over: an action each custom route holds, an
+/// action no route holds, a frame carrying no value at that path at all (absent, and present as
+/// `null`), a value at it that is not a string, a frame that is no JSON object, an action whose
+/// route's integration FAILED, and the first action once more over the same connection.
+const FRAMES: &[Frame] = &[
+    Frame {
+        // The recorded case: the action a custom route is bound to.
+        case: "an action a custom route holds",
+        sent: r#"{"action":"alpha","marker":"mk-alpha"}"#,
+        answered: Answered::By("alpha"),
+    },
+    Frame {
+        case: "another action, which is another route's own function",
+        sent: r#"{"action":"sendmessage","text":"hello"}"#,
+        answered: Answered::By("sendmessage"),
+    },
+    Frame {
+        case: "an action no route of the api holds",
+        sent: r#"{"action":"nowhere"}"#,
+        answered: Answered::By("$default"),
+    },
+    Frame {
+        case: "a frame carrying no action member at all",
+        sent: r#"{"greeting":"hello"}"#,
+        answered: Answered::By("$default"),
+    },
+    Frame {
+        case: "a frame whose action is null",
+        sent: r#"{"action":null}"#,
+        answered: Answered::By("$default"),
+    },
+    Frame {
+        case: "a frame whose action is not a string",
+        sent: r#"{"action":{"name":"alpha"}}"#,
+        answered: Answered::By("$default"),
+    },
+    Frame {
+        case: "a frame that is no JSON object",
+        sent: "plain text, no JSON",
+        answered: Answered::By("$default"),
+    },
+    Frame {
+        case: "an action whose route's integration FAILED",
+        sent: r#"{"action":"boom"}"#,
+        answered: Answered::GatewayFrame(INTERNAL_SERVER_ERROR_FRAME),
+    },
+    Frame {
+        case: "the first action once more, after that failure",
+        sent: r#"{"action":"alpha","marker":"mk-alpha-again"}"#,
+        answered: Answered::By("alpha"),
+    },
+];
+
+/// One answered frame, read as the JSON document it is.
+fn parsed(case: &str, row: &str, answer: &str) -> Value {
+    serde_json::from_str(answer).unwrap_or_else(|error| {
+        panic!("case {case:?} / {row}: expected a JSON frame, got {answer:?}: {error}")
+    })
+}
+
+/// Offer the handshake at the announced socket until it is COMPLETED, or [`DECISION_WAIT`]
+/// passes.
+///
+/// A loaded host can answer the gateway's own `500` for a connection request whose function
+/// runtime is still starting ([`INTERNAL_SERVER_ERROR`], the transient [`DECISION_WAIT`] is
+/// there for), so the wait is for the UPGRADE — a condition — and nothing here asserts on the
+/// clock. Any other refusal fails the case at once.
+async fn upgraded(case: &str, authority: &str) -> ClientSocket {
+    let deadline = std::time::Instant::now() + DECISION_WAIT;
+    loop {
+        match handshake_at(case, authority, &format!("/{STAGE}")).await {
+            Ok(socket) => return socket,
+            Err(status) => {
+                assert!(
+                    status == INTERNAL_SERVER_ERROR
+                        && std::time::Instant::now() < deadline,
+                    "case {case:?}: the handshake against the announced socket {authority:?} \
+                     must be completed, got {status}"
+                );
+                tokio::time::sleep(LOOK_INTERVAL).await;
+            }
+        }
+    }
+}
+
+/// Send `sent` until a ROUTE answered it, or `patience` passes: the same transient the
+/// handshake waits out above reaches a message too, where it arrives as the gateway's own
+/// `Internal server error` frame for a route whose function the invocation could not get an
+/// answer out of in time. The wait is for the route's own reply — a condition — and a frame
+/// that carries anything else fails the case at once; `patience` is ONE budget for the whole
+/// table, since every row of it waits for the same thing.
+async fn route_reply(
+    case: &str,
+    row: &str,
+    socket: &mut ClientSocket,
+    sent: &str,
+    patience: std::time::Instant,
+) -> Value {
+    loop {
+        let answered = parsed(case, row, &exchanged_reply(row, socket, sent).await);
+        if member(&answered, "/fn") != Value::Null {
+            return answered;
+        }
+        assert!(
+            member(&answered, "/message") == json!(INTERNAL_SERVER_ERROR_FRAME)
+                && std::time::Instant::now() < patience,
+            "case {case:?} / {row}: expected the reply of the route the frame selects, got \
+             {answered}"
+        );
+        tokio::time::sleep(LOOK_INTERVAL).await;
+    }
+}
+
+/// The connection a frame's answer names: the event's own `connectionId` for a route's reply,
+/// and the gateway frame's for the gateway's.
+fn named_connection(answered: &Value, frame: &Frame) -> Value {
+    match frame.answered {
+        Answered::By(_) => member(answered, "/event/requestContext/connectionId"),
+        Answered::GatewayFrame(_) => member(answered, "/connectionId"),
+    }
+}
+
+/// The whole chain a WebSocket client drives, against the address the api ANNOUNCED: the
+/// handshake completes there, each frame is then dispatched to the route the api's
+/// `RouteSelectionExpression` selects — the `$default` route where it selects nothing the api
+/// holds — and the client reads back THAT route's integration's own payload. The gateway's
+/// `Internal server error` frame is reserved for the one route whose integration failed, and
+/// the connection is still served by its healthy routes afterwards.
+#[tokio::test]
+async fn each_frame_is_answered_by_its_selected_routes_integration_and_only_a_failure_by_the_gateway()
+{
+    let case = "an api holding two custom routes, a $default route and a failing route, each \
+                fronting its own function";
+    let (emulator, engine) = emulator();
+
+    // One function per route key, as a client provisions them.
+    let connect =
+        given_function(&emulator, &engine, case, "connect-route", &echoing_handler("$connect"))
+            .await;
+    let alpha =
+        given_function(&emulator, &engine, case, "alpha-route", &echoing_handler("alpha")).await;
+    let sendmessage = given_function(
+        &emulator,
+        &engine,
+        case,
+        "sendmessage-route",
+        &echoing_handler("sendmessage"),
+    )
+    .await;
+    let fallback =
+        given_function(&emulator, &engine, case, "default-route", &echoing_handler("$default"))
+            .await;
+    let failing =
+        given_function(&emulator, &engine, case, "failing-route", RAISING_HANDLER).await;
+
+    let api = given_api(&emulator, case).await;
+    for (route_key, function, two_way) in [
+        ("$connect", &connect, false),
+        ("alpha", &alpha, true),
+        ("sendmessage", &sendmessage, true),
+        ("$default", &fallback, true),
+        ("boom", &failing, true),
+    ] {
+        given_route(
+            &emulator,
+            case,
+            &api.api_id,
+            route_key,
+            function,
+            two_way,
+            None,
+        )
+        .await;
+    }
+    given_stage(&emulator, case, &api.api_id).await;
+
+    // The handshake is offered at the address the api announced as its `ApiEndpoint`
+    // (`api.authority` is read off that value), and completes `101` on the connection
+    // request's own 2xx.
+    let mut socket: ClientSocket = upgraded(case, &api.authority).await;
+
+    let mut connection: Option<Value> = None;
+    // One budget for the whole table (see [`route_reply`]), so a loaded host cannot stretch the
+    // case row by row.
+    let patience = std::time::Instant::now() + DECISION_WAIT;
+    for frame in FRAMES {
+        let row = frame.case;
+        let answered = match frame.answered {
+            Answered::By(_) => route_reply(case, row, &mut socket, frame.sent, patience).await,
+            Answered::GatewayFrame(_) => {
+                parsed(case, row, &exchanged_reply(row, &mut socket, frame.sent).await)
+            }
+        };
+        match frame.answered {
+            Answered::By(route_key) => {
+                assert_eq!(
+                    member(&answered, "/fn"),
+                    json!(route_key),
+                    "case {case:?} / {row}: expected the reply of {route_key:?}'s own function, \
+                     got {answered}"
+                );
+                for (what, pointer, expected) in [
+                    (
+                        "the kind of call",
+                        "/event/requestContext/eventType",
+                        json!("MESSAGE"),
+                    ),
+                    (
+                        "the route that served it",
+                        "/event/requestContext/routeKey",
+                        json!(route_key),
+                    ),
+                    ("the frame itself", "/event/body", json!(frame.sent)),
+                ] {
+                    assert_eq!(
+                        member(&answered, pointer),
+                        expected,
+                        "case {case:?} / {row}: expected {what} at {pointer} to be {expected}, \
+                         got {answered}"
+                    );
+                }
+            }
+            Answered::GatewayFrame(sentence) => {
+                assert_eq!(
+                    member(&answered, "/message"),
+                    json!(sentence),
+                    "case {case:?} / {row}: expected the gateway's {sentence:?} frame, got \
+                     {answered}"
+                );
+                assert_eq!(
+                    member(&answered, "/fn"),
+                    Value::Null,
+                    "case {case:?} / {row}: the gateway's frame is no route's reply, got \
+                     {answered}"
+                );
+                assert!(
+                    member(&answered, "/requestId")
+                        .as_str()
+                        .is_some_and(|id| !id.trim().is_empty()),
+                    "case {case:?} / {row}: the gateway's frame must name the call, got \
+                     {answered}"
+                );
+            }
+        }
+
+        // Whichever answered it, the call belongs to the ONE connection the handshake minted.
+        let named = named_connection(&answered, frame);
+        assert!(
+            named.as_str().is_some_and(|id| !id.trim().is_empty()),
+            "case {case:?} / {row}: the answer must name the connection, got {answered}"
+        );
+        match &connection {
+            None => connection = Some(named),
+            Some(first) => assert_eq!(
+                &named, first,
+                "case {case:?} / {row}: every call of this connection names {first}, got \
+                 {answered}"
+            ),
+        }
+    }
+}

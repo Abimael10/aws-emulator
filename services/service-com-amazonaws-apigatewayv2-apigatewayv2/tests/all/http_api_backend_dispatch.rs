@@ -32,7 +32,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_lambda_awsgirapiservice::state::ComAmazonawsLambdaAwsgirapiserviceState;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::websocket_handshake_data_plane::{message, send, send_with_body};
+use crate::websocket_handshake_data_plane::{message, send, send_with_body, Answer};
 
 /// The Region every request below is signed for, and the Region of the functions the
 /// integrations name.
@@ -43,6 +43,15 @@ const HANDLER: &str = "lambda_function.lambda_handler";
 
 /// A well-formed execution role ARN, satisfying the model's `RoleArn` pattern.
 const ROLE: &str = "arn:aws:iam::000000000000:role/service-role/lambda-exec";
+
+/// The `Timeout` every function below is configured with, in seconds: a run's own wall clock,
+/// which on a loaded host has to cover starting that function's runtime as well as the handler
+/// itself. It is held just under the integration timeout API Gateway defaults to
+/// (`state::DEFAULT_WEBSOCKET_TIMEOUT_MILLIS`, the lower of the two), so the gateway's wait is
+/// still what bounds a route's answer and no case here waits on a function the gateway has
+/// already given up on. No case asserts on it: a case about a backend that does not answer in
+/// time states a `TimeoutInMillis` of its own.
+const FUNCTION_TIMEOUT_SECONDS: i32 = 29;
 
 /// The status and sentence an HTTP api answers for an integration that produced no
 /// response.
@@ -217,7 +226,7 @@ pub(crate) async fn given_ungranted_function(
             "Role": ROLE,
             "Runtime": "python3.12",
             "Handler": HANDLER,
-            "Timeout": 10,
+            "Timeout": FUNCTION_TIMEOUT_SECONDS,
             "Code": {
                 "ZipFile": base64::engine::general_purpose::STANDARD.encode(package(source)),
             },
@@ -1032,29 +1041,7 @@ async fn a_request_authorizers_own_decision_gates_the_route() {
             &emulator, &engine, case, source, payload_format, simple, 300,
         )
         .await;
-        // The request is made again while the gateway is still answering its own `500` and
-        // this row expects another status: the authorizer's FIRST invocation starts that
-        // function's runtime, and on a loaded host that start can overrun the deadline the
-        // gateway gives it — a transient refusal the next request does not get. The wait is
-        // for a decision, and nothing here asserts on the clock.
-        let deadline = std::time::Instant::now() + DECISION_WAIT;
-        let answer = loop {
-            let answer = send(
-                &emulator,
-                &host,
-                "GET",
-                "/orders",
-                &[("authorization", token)],
-            )
-            .await;
-            if answer.status != INTEGRATION_FAULT
-                || expected == INTEGRATION_FAULT
-                || std::time::Instant::now() >= deadline
-            {
-                break answer;
-            }
-            tokio::time::sleep(LOOK_INTERVAL).await;
-        };
+        let answer = decided(&emulator, &host, token, expected).await;
         assert_eq!(
             answer.status, expected,
             "case {case:?}: expected {expected} from the gated route, got {}",
@@ -1112,6 +1099,39 @@ async fn the_context_the_authorizer_returned_reaches_the_integration_unchanged()
     );
 }
 
+/// One request to the gated route, presenting `token`, asked again while the gateway is still
+/// answering its own `500` and `expected` is another status.
+///
+/// A function's FIRST invocation starts that function's runtime — and replacing its code starts
+/// the new one — and on a loaded host that start can overrun the deadline the gateway gives it,
+/// a transient refusal the next request does not get. The wait is for a DECISION, and nothing
+/// here asserts on the clock.
+async fn decided(
+    emulator: &MultiServiceRouter,
+    host: &str,
+    token: &str,
+    expected: u16,
+) -> Answer {
+    let deadline = std::time::Instant::now() + DECISION_WAIT;
+    loop {
+        let answer = send(
+            emulator,
+            host,
+            "GET",
+            "/orders",
+            &[("authorization", token)],
+        )
+        .await;
+        if answer.status != INTEGRATION_FAULT
+            || expected == INTEGRATION_FAULT
+            || std::time::Instant::now() >= deadline
+        {
+            return answer;
+        }
+        tokio::time::sleep(LOOK_INTERVAL).await;
+    }
+}
+
 #[tokio::test]
 async fn a_decision_is_cached_for_its_ttl_and_a_reset_takes_it_away() {
     // The function is REPLACED between the two requests, so the second request's answer
@@ -1128,14 +1148,7 @@ async fn a_decision_is_cached_for_its_ttl_and_a_reset_takes_it_away() {
             &emulator, &engine, case, SIMPLE_GATE, "2.0", true, ttl,
         )
         .await;
-        let first = send(
-            &emulator,
-            &host,
-            "GET",
-            "/orders",
-            &[("authorization", "let-me-in")],
-        )
-        .await;
+        let first = decided(&emulator, &host, "let-me-in", 200).await;
         assert_eq!(
             first.status,
             200,
@@ -1151,14 +1164,7 @@ async fn a_decision_is_cached_for_its_ttl_and_a_reset_takes_it_away() {
             "def lambda_handler(event, context):\n    return {'isAuthorized': False}\n",
         )
         .await;
-        let second = send(
-            &emulator,
-            &host,
-            "GET",
-            "/orders",
-            &[("authorization", "let-me-in")],
-        )
-        .await;
+        let second = decided(&emulator, &host, "let-me-in", after_replacement).await;
         assert_eq!(
             second.status, after_replacement,
             "case {case:?}: expected {after_replacement} once the function was replaced, \
@@ -1167,14 +1173,7 @@ async fn a_decision_is_cached_for_its_ttl_and_a_reset_takes_it_away() {
         );
         // A DIFFERENT identity is a different cache key, so it is decided by the function
         // as it stands now — which refuses it — whatever was cached for the first.
-        let other = send(
-            &emulator,
-            &host,
-            "GET",
-            "/orders",
-            &[("authorization", "another-token")],
-        )
-        .await;
+        let other = decided(&emulator, &host, "another-token", FORBIDDEN).await;
         assert_eq!(
             other.status,
             FORBIDDEN,
@@ -1190,14 +1189,7 @@ async fn a_decision_is_cached_for_its_ttl_and_a_reset_takes_it_away() {
     let host =
         given_authorized_api(&emulator, &engine, case, SIMPLE_GATE, "2.0", true, 3600).await;
     let api_id = host.split('.').next().unwrap_or_default().to_string();
-    let authorized = send(
-        &emulator,
-        &host,
-        "GET",
-        "/orders",
-        &[("authorization", "let-me-in")],
-    )
-    .await;
+    let authorized = decided(&emulator, &host, "let-me-in", 200).await;
     assert_eq!(
         authorized.status,
         200,
@@ -1225,14 +1217,7 @@ async fn a_decision_is_cached_for_its_ttl_and_a_reset_takes_it_away() {
         status, 200,
         "case {case:?}: ResetAuthorizersCache answered {status} {reset}"
     );
-    let after = send(
-        &emulator,
-        &host,
-        "GET",
-        "/orders",
-        &[("authorization", "let-me-in")],
-    )
-    .await;
+    let after = decided(&emulator, &host, "let-me-in", FORBIDDEN).await;
     assert_eq!(
         after.status,
         FORBIDDEN,

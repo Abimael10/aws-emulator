@@ -37,7 +37,9 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::http_api_backend_dispatch::given_function;
-use crate::websocket_transport_data_plane::{exchange, handshake_at, ClientSocket};
+use crate::websocket_transport_data_plane::{
+    exchange, exchanged_reply, handshake_at, ClientSocket,
+};
 
 /// The Region every request below is signed for.
 const REGION: &str = "us-east-1";
@@ -523,9 +525,7 @@ async fn each_stage_publishes_the_counters_its_own_traffic_produced() {
     let mut basic: ClientSocket = handshake_at(case, &api.authority, "/basic")
         .await
         .unwrap_or_else(|status| panic!("case {case:?}: the handshake must complete, got {status}"));
-    let replied = exchange(case, &mut basic, r#"{"action":"reply","n":1}"#)
-        .await
-        .unwrap_or_else(|| panic!("case {case:?}: a two-way route must reply"));
+    let replied = exchanged_reply(case, &mut basic, r#"{"action":"reply","n":1}"#).await;
     assert!(
         replied.contains("MESSAGE"),
         "case {case:?}: the two-way route must answer its own event, got {replied:?}"
@@ -543,9 +543,7 @@ async fn each_stage_publishes_the_counters_its_own_traffic_produced() {
     let mut detailed: ClientSocket = handshake_at(case, &api.authority, "/detailed")
         .await
         .unwrap_or_else(|status| panic!("case {case:?}: the handshake must complete, got {status}"));
-    let replied = exchange(case, &mut detailed, r#"{"action":"reply","n":2}"#)
-        .await
-        .unwrap_or_else(|| panic!("case {case:?}: a two-way route must reply"));
+    let replied = exchanged_reply(case, &mut detailed, r#"{"action":"reply","n":2}"#).await;
     let event: Value = serde_json::from_str(&replied)
         .unwrap_or_else(|error| panic!("case {case:?}: expected the event back, got {error}"));
     let connection_id = event
@@ -553,9 +551,7 @@ async fn each_stage_publishes_the_counters_its_own_traffic_produced() {
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("case {case:?}: the reply must carry the connection id"))
         .to_string();
-    let failed = exchange(case, &mut detailed, r#"{"action":"boom"}"#)
-        .await
-        .unwrap_or_else(|| panic!("case {case:?}: a failing route is answered by the gateway"));
+    let failed = exchanged_reply(case, &mut detailed, r#"{"action":"boom"}"#).await;
     assert!(
         failed.contains("Internal server error"),
         "case {case:?}: a route that produced no reply is answered with the gateway's own \
@@ -666,9 +662,7 @@ async fn a_refused_call_is_metered_as_the_class_it_was_refused_with() {
     let mut socket: ClientSocket = handshake_at(case, &unrouted.authority, "/bare")
         .await
         .unwrap_or_else(|status| panic!("case {case:?}: the handshake must complete, got {status}"));
-    let answered = exchange(case, &mut socket, r#"{"action":"nowhere"}"#)
-        .await
-        .unwrap_or_else(|| panic!("case {case:?}: the gateway must answer an unrouted frame"));
+    let answered = exchanged_reply(case, &mut socket, r#"{"action":"nowhere"}"#).await;
     assert!(
         answered.contains("Forbidden"),
         "case {case:?}: a message the api routes nowhere is answered with the gateway's \

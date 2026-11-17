@@ -30,11 +30,14 @@
 //! the `wss` address the core opened for it. That endpoint's own rule is
 //! `api_endpoint_scheme`'s; this suite only holds it fixed.
 
-use serde_json::json;
+use std::time::{Duration, Instant};
+
+use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::api_lifecycle::{as_str, call_at_host, emulator};
-use crate::websocket_handshake_data_plane::{send, Answer};
+use crate::http_api_backend_dispatch::{emulator_with_lambda, given_function, lambda_integration};
+use crate::websocket_handshake_data_plane::{send, send_with_body, Answer};
 
 /// The status an `HTTP_PROXY` route answers: the upstream is a URI the CALLER can reach, so
 /// the caller is sent there — `307`, with the integration's own `IntegrationUri` in
@@ -529,6 +532,191 @@ async fn a_websocket_api_still_announces_the_socket_its_data_plane_was_opened_on
             port.parse::<u16>().is_ok_and(|port| port > 0),
             "case {:?}: the socket's port is the one it landed on, got {announced:?}",
             row.case
+        );
+    }
+}
+
+/// The route the lifecycle rows below deploy, and the path within the stage that matches it.
+const VISITOR_ROUTE_KEY: &str = "POST /visitors";
+const VISITOR_PATH: &str = "/visitors";
+
+/// The handler those rows front. It answers a document it COMPUTES from the event the gateway
+/// handed it — what the client posted, the route key that matched, the method, and the source
+/// address the gateway reported for the call — so what the client reads back at the announced
+/// address is a function's own work and not a value this emulator filled in.
+const VISITOR_HANDLER: &str = "import json\n\
+     def lambda_handler(event, context):\n\
+     \x20   posted = json.loads(event.get(\"body\") or \"{}\")\n\
+     \x20   http = event[\"requestContext\"][\"http\"]\n\
+     \x20   seen = {\"visitor\": posted.get(\"visitor\"), \"routeKey\": event[\"routeKey\"], \
+     \"method\": http[\"method\"], \"sourceIp\": http[\"sourceIp\"]}\n\
+     \x20   return {\"statusCode\": 200, \"headers\": {\"content-type\": \"application/json\"}, \
+     \"body\": json.dumps(seen)}\n";
+
+/// The status the gateway answers while the function a route fronts has produced no response
+/// yet — which a loaded host can do transiently while that function's runtime is starting — and
+/// how long a row keeps posting for the function's own answer, looking this often. Generous,
+/// and bounding no behaviour the row asserts on.
+const INTEGRATION_FAULT: u16 = 500;
+const ANSWER_WAIT: Duration = Duration::from_secs(120);
+const LOOK_INTERVAL: Duration = Duration::from_millis(100);
+
+/// POST `posted` to the announced address until the FUNCTION answered it, or [`ANSWER_WAIT`]
+/// passes: the wait is for that answer — a condition — and nothing here asserts on the clock.
+/// An address nothing claims, or any other status, fails the row at once.
+async fn answered_by_the_function(
+    emulator: &MultiServiceRouter,
+    row: &Row,
+    authority: &str,
+    path: &str,
+    posted: &Value,
+) -> Answer {
+    let deadline = Instant::now() + ANSWER_WAIT;
+    loop {
+        let answer = send_with_body(
+            emulator,
+            authority,
+            "POST",
+            path,
+            &[("content-type", "application/json")],
+            serde_json::to_vec(posted).expect("the posted document serializes"),
+        )
+        .await;
+        assert_ne!(
+            answer.error_type.as_deref(),
+            Some(UNKNOWN_SERVICE),
+            "case {:?}: the announced address must be one this emulator claims, but \
+             {authority}{path} is claimed by no service: {}",
+            row.case,
+            answer.summary()
+        );
+        if answer.status == 200 {
+            return answer;
+        }
+        assert!(
+            answer.status == INTEGRATION_FAULT && Instant::now() < deadline,
+            "case {:?}: {authority}{path} must be answered by the function the route fronts, \
+             got {}",
+            row.case,
+            answer.summary()
+        );
+        tokio::time::sleep(LOOK_INTERVAL).await;
+    }
+}
+
+/// The address an api announces is the one a SERVERLESS client drives the api at: a client that
+/// read `ApiEndpoint` and posted to the route reaches the function that route fronts, and reads
+/// back what that function returned.
+///
+/// The rows are the same ones above: the announced address is the only thing that differs
+/// between a client configured with this emulator's endpoint and one that resolves AWS's own
+/// hosts, and both must serve.
+#[tokio::test]
+async fn the_announced_address_serves_a_lambda_backed_route_with_the_functions_own_answer() {
+    for (index, row) in rows().into_iter().enumerate() {
+        // One emulator per row, with AWS Lambda beside this service on the same engine: the
+        // route's answer belongs to a function that lives there.
+        let (emulator, engine) = emulator_with_lambda();
+        let function = given_function(
+            &emulator,
+            &engine,
+            row.case,
+            "announced-address-visitor",
+            VISITOR_HANDLER,
+        )
+        .await;
+
+        let (status, created) = call_at_host(
+            &emulator,
+            row.host,
+            row.region,
+            "POST",
+            "/v2/apis",
+            Some(json!({
+                "name": format!("announced-address-visitor-{index}"),
+                "protocolType": "HTTP"
+            })),
+        )
+        .await;
+        assert_eq!(
+            status, 201,
+            "case {:?}: CreateApi must answer 201, got {status} {created}",
+            row.case
+        );
+        let api_id = as_str(&created, "apiId");
+        let (authority, base_path) = assert_announced(
+            &row,
+            "CreateApi",
+            &api_id,
+            &as_str(&created, "apiEndpoint"),
+        );
+
+        let (status, integration) = call_at_host(
+            &emulator,
+            row.host,
+            row.region,
+            "POST",
+            &format!("/v2/apis/{api_id}/integrations"),
+            Some(lambda_integration(&function, "2.0")),
+        )
+        .await;
+        assert_eq!(
+            status, 201,
+            "case {:?}: CreateIntegration must answer 201, got {status} {integration}",
+            row.case
+        );
+        let integration_id = as_str(&integration, "integrationId");
+        let (status, route) = call_at_host(
+            &emulator,
+            row.host,
+            row.region,
+            "POST",
+            &format!("/v2/apis/{api_id}/routes"),
+            Some(json!({
+                "routeKey": VISITOR_ROUTE_KEY,
+                "target": format!("integrations/{integration_id}")
+            })),
+        )
+        .await;
+        assert_eq!(
+            status, 201,
+            "case {:?}: CreateRoute must answer 201, got {status} {route}",
+            row.case
+        );
+        create_default_stage(&emulator, &row, &api_id).await;
+
+        let visitor = format!("visitor-{index}");
+        let posted = json!({ "visitor": visitor });
+        let answer = answered_by_the_function(
+            &emulator,
+            &row,
+            &authority,
+            &format!("{base_path}{VISITOR_PATH}"),
+            &posted,
+        )
+        .await;
+        for (what, member, expected) in [
+            ("what the client posted", "visitor", json!(visitor)),
+            ("the route that matched", "routeKey", json!(VISITOR_ROUTE_KEY)),
+            ("the method it arrived with", "method", json!("POST")),
+        ] {
+            assert_eq!(
+                answer.body.get(member).cloned().unwrap_or(Value::Null),
+                expected,
+                "case {:?}: expected {what} at {member} to be {expected}, got {}",
+                row.case,
+                answer.summary()
+            );
+        }
+        assert!(
+            answer
+                .body
+                .get("sourceIp")
+                .and_then(Value::as_str)
+                .is_some_and(|address| !address.trim().is_empty()),
+            "case {:?}: the event must carry the source address of the call, got {}",
+            row.case,
+            answer.summary()
         );
     }
 }
