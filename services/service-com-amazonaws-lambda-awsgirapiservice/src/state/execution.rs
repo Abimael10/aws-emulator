@@ -756,16 +756,47 @@ pub async fn run_invocation(
     // out of the SAME budget the deployment package was: what one invocation holds is
     // bounded across its mounts rather than per archive. A layer this emulator holds no
     // readable archive for mounts nothing, exactly as a deployment package it holds no
-    // bytes for imports nothing.
-    if engine == Engine::Node {
-        for archive in &invocation.layer_zips {
-            if let Ok(entries) =
-                package::javascript_modules_within(Some(archive.as_slice()), &mut read_budget)
-            {
-                modules.extend(entries.into_iter().map(|entry| package::PackageModule {
-                    path: format!("{}{}", node::LAYER_ID_PREFIX, entry.path),
-                    source: entry.source,
-                }));
+    // bytes for imports nothing. Each engine mounts the entries IT can read, as the
+    // deployment package's were: a layer's content is the caller's files, whichever
+    // language the function is written in.
+    for archive in &invocation.layer_zips {
+        match engine {
+            Engine::Node => {
+                if let Ok(entries) =
+                    package::javascript_modules_within(Some(archive.as_slice()), &mut read_budget)
+                {
+                    modules.extend(entries.into_iter().map(|entry| package::PackageModule {
+                        path: format!("{}{}", node::LAYER_ID_PREFIX, entry.path),
+                        source: entry.source,
+                    }));
+                }
+            }
+            // A Python layer mounts both halves of its content for the same reason the
+            // deployment package does: the modules its import roots put on the path, and
+            // the files its packages ship beside them, which the standard library's own
+            // resource reading answers from.
+            Engine::Python => {
+                if let Ok(entries) =
+                    package::python_modules_within(Some(archive.as_slice()), &mut read_budget)
+                {
+                    modules.extend(entries.into_iter().map(|entry| package::PackageModule {
+                        path: format!("{}{}", python::LAYER_ID_PREFIX, entry.path),
+                        source: entry.source,
+                    }));
+                }
+                if let Ok(entries) =
+                    package::python_resources_within(Some(archive.as_slice()), &mut read_budget)
+                {
+                    modules.extend(entries.into_iter().map(|entry| package::PackageModule {
+                        path: format!(
+                            "{}{}{}",
+                            python::LAYER_ID_PREFIX,
+                            python::RESOURCE_ID_PREFIX,
+                            entry.path
+                        ),
+                        source: entry.source,
+                    }));
+                }
             }
         }
     }

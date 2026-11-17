@@ -103,9 +103,10 @@ mod urllib3;
 
 /// The modules this runtime puts on a Python handler's import path, as the SDK it ships.
 ///
-/// Resolved AFTER the deployment package's own entries, so a package that ships its own
-/// `boto3` wins — which is the order a real runtime resolves them in, where the package
-/// directory precedes the runtime's own site-packages.
+/// Resolved AFTER the deployment package's own entries and after the content the function's
+/// LAYERS mount, so a package — or a layer — that ships its own `boto3` wins: that is the
+/// order a real runtime resolves them in, where the task root and the layer root's own
+/// directories precede the runtime's.
 #[must_use]
 pub fn runtime_modules() -> Vec<PackageModule> {
     [

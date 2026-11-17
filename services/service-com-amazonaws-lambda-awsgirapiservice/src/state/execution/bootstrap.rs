@@ -23,9 +23,9 @@
 //! host's own interpreter surface stays as small as a string in and a string out:
 //!
 //! * `__lambda_input` — a JSON document the host hands to the first call below: the
-//!   handler name, the package's modules and its own data files, the modules the RUNTIME
-//!   supplies beside them (the AWS SDK), the event and the environment the invocation runs
-//!   with.
+//!   handler name, the package's modules and its own data files, the content the function's
+//!   LAYERS mount, the modules the RUNTIME supplies beside them (the AWS SDK), the event and
+//!   the environment the invocation runs with.
 //! * `__lambda_prepare` — the INIT phase: it installs this runtime, imports the handler's
 //!   module and resolves its entry point, answering the empty string when the environment
 //!   is ready and an error document for an initialization that failed. None of that is the
@@ -276,19 +276,36 @@ def _configured_log_format(environment):
     return (environment or {}).get("AWS_LAMBDA_LOG_FORMAT") or ""
 
 
-class _PackageLoader:
-    """Imports one module from the deployment package held in memory."""
+# The MOUNTS a module one run imports can come from, and the DIRECTORY each of them is
+# mounted at: the deployment package at the task root, the content of the function's layers
+# under the layer root, and the modules the runtime itself supplies under its own
+# directories. Which mount a module came from is what its `__file__` states — its path under
+# that mount — because a `sys.path` entry is a directory and a module is the file of it that
+# the entry resolved to.
+_TASK_ROOT = "/var/task"
+_LAYER_ROOT = "/opt"
+_RUNTIME_ROOT = "/var/runtime"
 
-    def __init__(self, path, sources):
+
+class _PackageLoader:
+    """Imports one module of ONE mount of the execution environment, held in memory.
+
+    `root` is the directory that mount is mounted at, so the file the module reports — and
+    the file a frame of it names — is its own path under the directory it was resolved
+    from, exactly as it is on a real runtime.
+    """
+
+    def __init__(self, path, sources, root):
         self._path = path
         self._sources = sources
+        self._root = root
 
     def create_module(self, spec):
         return None
 
     def exec_module(self, module):
         source = self._sources[self._path]
-        filename = "/var/task/" + self._path
+        filename = self._root + "/" + self._path
         module.__dict__["__file__"] = filename
         code = compile(source, filename, "exec")
         exec(code, module.__dict__)
@@ -305,10 +322,10 @@ class _PackageLoader:
         A package's data file is held beside its modules (`_RESOURCE_PREFIX`), so the
         resources of a package are the held entries under its own directory, and those of
         a module are the ones beside it — which is the directory each of them is at under
-        the task root.
+        the mount the module was resolved from.
         """
         directory = self._path.rpartition("/")[0]
-        return _PackageResources(self._sources, directory)
+        return _PackageResources(self._sources, directory, self._root)
 
 
 # The prefix the host keys a DATA entry of the deployment package under, which is where the
@@ -330,20 +347,22 @@ def _entry_path(held):
 
 
 class _PackageFile:
-    """One PATH inside the deployment package, as the standard library's own resource
-    reading traverses one.
+    """One PATH inside one mount of the execution environment, as the standard library's own
+    resource reading traverses one.
 
     The entries are the ones the host read out of the archive, so a file this answers for
-    is one the package really holds and one it does not hold reads as absent. Nothing here
-    opens a host file: a file's text is the text the archive carried.
+    is one the mount really holds and one it does not hold reads as absent. Nothing here
+    opens a host file: a file's text is the text the archive carried. The path it NAMES is
+    its path under the directory the mount is mounted at (`root`).
     """
 
-    def __init__(self, sources, path):
+    def __init__(self, sources, path, root):
         self._sources = sources
         self._path = path
+        self._root = root
 
     def __repr__(self):
-        return "<PackageFile %r>" % ("/var/task/" + self._path,)
+        return "<PackageFile %r>" % (self._root + "/" + self._path,)
 
     @property
     def name(self):
@@ -384,7 +403,7 @@ class _PackageFile:
             for part in str(name).split("/"):
                 if part:
                     path = path + "/" + part if path else part
-        return _PackageFile(self._sources, path)
+        return _PackageFile(self._sources, path, self._root)
 
     def __truediv__(self, name):
         return self.joinpath(name)
@@ -392,7 +411,7 @@ class _PackageFile:
     def _bytes(self):
         held = self._held()
         if held is None:
-            raise FileNotFoundError("/var/task/" + self._path)
+            raise FileNotFoundError(self._root + "/" + self._path)
         return self._sources[held].encode("utf-8")
 
     def open(self, mode="r", encoding=None, errors=None, newline=None):
@@ -410,19 +429,19 @@ class _PackageFile:
 
 
 class _PackageResources:
-    """The FILES of one module of the deployment package, as the import system asks the
-    loader for them.
+    """The FILES of one module of one mount, as the import system asks the loader for them.
 
     It answers both ways the standard library asks: `files()` for the traversable the
     current resource reading walks, and the older by-name calls beside it.
     """
 
-    def __init__(self, sources, directory):
+    def __init__(self, sources, directory, root):
         self._sources = sources
         self._directory = directory
+        self._root = root
 
     def files(self):
-        return _PackageFile(self._sources, self._directory)
+        return _PackageFile(self._sources, self._directory, self._root)
 
     def open_resource(self, resource):
         return self.files().joinpath(resource).open("rb")
@@ -430,7 +449,7 @@ class _PackageResources:
     def resource_path(self, resource):
         # A file of this runtime is held in memory, so it is at no path of the host a
         # caller could open for itself.
-        raise FileNotFoundError("/var/task/" + self._directory)
+        raise FileNotFoundError(self._root + "/" + self._directory)
 
     def is_resource(self, path):
         return self.files().joinpath(path).is_file()
@@ -440,26 +459,80 @@ class _PackageResources:
 
 
 class _PackageFinder:
-    """Resolves a module name against the deployment package's own entries.
+    """Resolves a module name against the entries of ONE mount, whose own directory is
+    `root`.
 
-    Installed ahead of every other finder, so the handler's own modules win over a
-    standard-library module of the same name, exactly as the package directory does on
-    the real runtime's `sys.path`.
+    The deployment package's mount is installed ahead of every other finder, so the
+    handler's own modules win over a standard-library module of the same name, exactly as
+    the package directory does on the real runtime's `sys.path`; a mount the RUNTIME
+    supplies is installed behind the ones above it, in the order that same path lists the
+    directories.
 
     `spec_from_loader` is handed in rather than imported here: this runs INSIDE the
     import machinery, so an import of its own would re-enter the machinery.
     """
 
-    def __init__(self, sources, spec_from_loader):
+    def __init__(self, sources, spec_from_loader, root):
         self._sources = sources
         self._spec_from_loader = spec_from_loader
+        self._root = root
 
     def find_spec(self, name, path=None, target=None):
         key = name.replace(".", "/")
         for candidate, is_package in ((key + "/__init__.py", True), (key + ".py", False)):
             if candidate in self._sources:
-                loader = _PackageLoader(candidate, self._sources)
+                loader = _PackageLoader(candidate, self._sources, self._root)
                 return self._spec_from_loader(name, loader, is_package=is_package)
+        return None
+
+
+def _layer_import_roots(library):
+    """The DIRECTORIES of the layer root a python runtime puts on its import path, in the
+    order `sys.path` lists them.
+
+    A layer's content is extracted under the layer root, and two of its directories are
+    import path entries for a python runtime: the site-packages directory of the runtime's
+    OWN version, then the version-independent one beside it. The version is the one the
+    runtime's own library directory is named for (`_runtime_library`), so a site-packages
+    directory named for another version is on no path at all and a package shipped only
+    there is not importable.
+    """
+
+    version = library.rpartition("/")[2]
+    roots = []
+    if version:
+        roots.append("python/lib/" + version + "/site-packages")
+    roots.append("python")
+    return roots
+
+
+class _LayerFinder:
+    """Resolves a module name against the content the function's LAYERS mount.
+
+    The entries are keyed by their own path under the layer root, because that is where a
+    layer's content is extracted to, and only the directories of that root which are import
+    path entries (`roots`) resolve a module at all — an entry of the layer outside them is
+    content of the layer and no module of the run.
+
+    Installed behind the deployment package's own mount and ahead of every mount the
+    RUNTIME supplies, which is where those directories sit on a real runtime's `sys.path`:
+    a layer that ships its own copy of a package the runtime bundles shadows the runtime's,
+    and only the function's own package wins over a layer's.
+    """
+
+    def __init__(self, sources, roots, spec_from_loader):
+        self._sources = sources
+        self._roots = roots
+        self._spec_from_loader = spec_from_loader
+
+    def find_spec(self, name, path=None, target=None):
+        key = name.replace(".", "/")
+        for root in self._roots:
+            for tail, is_package in ((key + "/__init__.py", True), (key + ".py", False)):
+                candidate = root + "/" + tail
+                if candidate in self._sources:
+                    loader = _PackageLoader(candidate, self._sources, _LAYER_ROOT)
+                    return self._spec_from_loader(name, loader, is_package=is_package)
         return None
 
 
@@ -605,25 +678,46 @@ def _prepare(request, library):
     handler's own `Timeout` starts running.
     """
     sources = request["modules"]
-    sys.meta_path.insert(0, _PackageFinder(sources, importlib.util.spec_from_loader))
-    # The modules of the STANDARD LIBRARY this runtime supplies itself — the socket
-    # interface a Python program expects of its operating system, and the HTTP client built
-    # on one — are resolved ahead of the frozen standard library and behind the deployment
-    # package, which is where a runtime's own standard library sits: these ARE this
-    # runtime's `socket` and `http.client`, and a package shipping its own still wins.
+    # The MOUNTS a module is resolved from, in the order a real runtime's `sys.path` lists
+    # their directories: the deployment package at the task root first, so the handler's own
+    # modules win over everything; then the content the function's LAYERS mount under the
+    # layer root; then the modules of the STANDARD LIBRARY this runtime supplies itself — the
+    # socket interface a Python program expects of its operating system, and the HTTP client
+    # built on one — which are resolved ahead of the frozen standard library and behind the
+    # two above, so a package or a layer shipping its own copy of one of them wins.
+    mounts = [_PackageFinder(sources, importlib.util.spec_from_loader, _TASK_ROOT)]
+    layer_sources = request.get("layerModules") or {}
+    if layer_sources:
+        mounts.append(
+            _LayerFinder(
+                layer_sources,
+                _layer_import_roots(library),
+                importlib.util.spec_from_loader,
+            )
+        )
     runtime_stdlib = request.get("runtimeStdlib") or {}
     if runtime_stdlib:
-        sys.meta_path.insert(
-            1, _PackageFinder(runtime_stdlib, importlib.util.spec_from_loader)
+        mounts.append(
+            _PackageFinder(
+                runtime_stdlib,
+                importlib.util.spec_from_loader,
+                library or _RUNTIME_ROOT,
+            )
         )
-    # The modules the RUNTIME supplies — the AWS SDK a managed runtime ships — are
-    # resolved AFTER the deployment package's own entries and after the standard library,
-    # so a package shipping its own copy of one of them wins, exactly as the package
-    # directory precedes the runtime's site-packages on a real runtime's `sys.path`.
+    for index, finder in enumerate(mounts):
+        sys.meta_path.insert(index, finder)
+    # The modules the RUNTIME supplies — the AWS SDK a managed runtime ships, which it keeps
+    # in a directory of its own rather than in the function's — are resolved AFTER the
+    # deployment package's own entries, after the layers' content and after the standard
+    # library, so a package or a layer shipping its own copy of one of them wins, exactly as
+    # the task root and the layer root precede the runtime's directories on a real runtime's
+    # `sys.path`.
     runtime_sources = request.get("runtimeModules") or {}
     if runtime_sources:
         sys.meta_path.append(
-            _PackageFinder(runtime_sources, importlib.util.spec_from_loader)
+            _PackageFinder(
+                runtime_sources, importlib.util.spec_from_loader, _RUNTIME_ROOT
+            )
         )
     time.sleep = _bounded_sleep
     # Before the handler's module is imported, which is where a module-level record is

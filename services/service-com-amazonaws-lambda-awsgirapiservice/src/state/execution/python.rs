@@ -132,6 +132,17 @@ const HOST_MODULE: &str = "_lambda_host";
 /// the runtime's loader answers from the same held entries.
 pub const RESOURCE_ID_PREFIX: &str = "resource:";
 
+/// The prefix an entry of one of the function's LAYERS is keyed under among the entries the
+/// run is handed.
+///
+/// A layer's content is mounted at the LAYER ROOT rather than at the task root, so its
+/// entries are keyed apart from the deployment package's and resolved from their own mount
+/// ([`super::bootstrap`]): what follows this prefix is the entry's own path inside the layer
+/// archive, which is its path under the layer root. A DATA entry of a layer carries
+/// [`RESOURCE_ID_PREFIX`] after this one, exactly as a data entry of the deployment package
+/// carries it, so no module name resolves to one.
+pub const LAYER_ID_PREFIX: &str = "layer:";
+
 /// Every native module this interpreter registers, out of the engine's own two pools.
 ///
 /// This list IS the containment of the native surface: a name absent from it is dropped
@@ -1359,16 +1370,20 @@ fn read_completion(answered: &str, response_bytes: usize) -> Completion {
 
 /// The JSON document the runtime source is handed.
 fn runtime_input(request: &Run<'_>) -> Result<String, String> {
-    let modules: ::serde_json::Map<String, ::serde_json::Value> = request
-        .modules
-        .iter()
-        .map(|module| {
-            (
-                module.path.clone(),
-                ::serde_json::Value::String(module.source.clone()),
-            )
-        })
-        .collect();
+    // The entries of the deployment package and the entries the function's LAYERS mount are
+    // two MOUNTS of the execution environment, so they are handed over apart: each is
+    // resolved from its own root and reports its own path ([`super::bootstrap`]).
+    let mut modules = ::serde_json::Map::new();
+    let mut layer_modules = ::serde_json::Map::new();
+    for module in request.modules {
+        let source = ::serde_json::Value::String(module.source.clone());
+        match module.path.strip_prefix(LAYER_ID_PREFIX) {
+            // A later layer's entry wins over an earlier one's, which is what mounting one
+            // layer's content over another's at the same root leaves.
+            Some(path) => layer_modules.insert(path.to_string(), source),
+            None => modules.insert(module.path.clone(), source),
+        };
+    }
     let environment: ::serde_json::Map<String, ::serde_json::Value> = request
         .environment
         .iter()
@@ -1382,6 +1397,7 @@ fn runtime_input(request: &Run<'_>) -> Result<String, String> {
     let document = ::serde_json::json!({
         "handler": request.handler,
         "modules": modules,
+        "layerModules": layer_modules,
         "runtimeModules": runtime_modules(),
         "runtimeStdlib": runtime_stdlib(),
         "environment": environment,
@@ -1423,9 +1439,9 @@ fn invocation_input(request: &Run<'_>) -> Result<String, String> {
 }
 
 /// The modules this RUNTIME supplies on the handler's import path, beside the deployment
-/// package's own: the AWS SDK a managed `python3.x` runtime ships
-/// ([`super::aws_sdk_guest`]), and the durable-execution programming model it ships beside it
-/// ([`super::durable_sdk_guest`]).
+/// package's own and the content the function's layers mount: the AWS SDK a managed
+/// `python3.x` runtime ships ([`super::aws_sdk_guest`]), and the durable-execution
+/// programming model it ships beside it ([`super::durable_sdk_guest`]).
 fn runtime_modules() -> ::serde_json::Map<String, ::serde_json::Value> {
     super::aws_sdk_guest::runtime_modules()
         .into_iter()
@@ -1440,8 +1456,8 @@ fn runtime_modules() -> ::serde_json::Map<String, ::serde_json::Value> {
 /// interface the standard library's own `selectors` is built out of
 /// ([`super::guest_select`]), and the signal and child-process interfaces beside them
 /// ([`super::guest_signal`], [`super::guest_process`]). Resolved before the frozen standard
-/// library and after the deployment package's own entries, which is where a runtime's own
-/// standard library sits.
+/// library and after the deployment package's own entries and the content the function's
+/// layers mount, which is where a runtime's own standard library sits.
 fn runtime_stdlib() -> ::serde_json::Map<String, ::serde_json::Value> {
     super::guest_http::runtime_stdlib_modules()
         .into_iter()
