@@ -173,7 +173,7 @@ const EXPECTED: &[Expected] = &[
         disk_size_in_gb: 40,
         transfer_per_month_in_gb: 2_048,
         power: 500,
-        price: 16.0,
+        price: 14.0,
     },
     Expected {
         bundle_id: "xlarge_win_3_0",
@@ -185,7 +185,7 @@ const EXPECTED: &[Expected] = &[
         disk_size_in_gb: 320,
         transfer_per_month_in_gb: 6_144,
         power: 4_000,
-        price: 166.0,
+        price: 140.0,
     },
 ];
 

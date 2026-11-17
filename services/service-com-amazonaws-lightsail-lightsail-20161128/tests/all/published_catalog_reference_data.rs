@@ -7,8 +7,8 @@
 //! the entry the service publishes and each column the value the service
 //! publishes for it — the whole plan table including the sizes offered on one
 //! platform only, the images a caller can select including the application images
-//! named after the product they install, the catalog generation's own version
-//! date, the whole geography sentence of a Region, and the price list's own
+//! named after the product they install, each image's own software
+//! version, the whole geography sentence of a Region, and the price list's own
 //! figures — rather than a value the emulator derived from a neighbouring row, a
 //! name or a doubling rule.
 //!
@@ -139,7 +139,7 @@ const PLAN_TABLE: &[PlanRow] = &[
         power: 500,
         linux_price: 7.0,
         windows: Some(WindowsColumn {
-            price: 16.0,
+            price: 14.0,
             disk_size_in_gb: 40,
             power: 500,
         }),
@@ -153,7 +153,7 @@ const PLAN_TABLE: &[PlanRow] = &[
         power: 1_000,
         linux_price: 12.0,
         windows: Some(WindowsColumn {
-            price: 26.0,
+            price: 22.0,
             disk_size_in_gb: 60,
             power: 1_000,
         }),
@@ -167,7 +167,7 @@ const PLAN_TABLE: &[PlanRow] = &[
         power: 2_000,
         linux_price: 24.0,
         windows: Some(WindowsColumn {
-            price: 46.0,
+            price: 44.0,
             disk_size_in_gb: 80,
             power: 2_000,
         }),
@@ -181,7 +181,7 @@ const PLAN_TABLE: &[PlanRow] = &[
         power: 3_000,
         linux_price: 44.0,
         windows: Some(WindowsColumn {
-            price: 86.0,
+            price: 74.0,
             disk_size_in_gb: 160,
             power: 3_000,
         }),
@@ -195,7 +195,7 @@ const PLAN_TABLE: &[PlanRow] = &[
         power: 4_000,
         linux_price: 84.0,
         windows: Some(WindowsColumn {
-            price: 166.0,
+            price: 140.0,
             disk_size_in_gb: 320,
             power: 4_000,
         }),
@@ -209,7 +209,7 @@ const PLAN_TABLE: &[PlanRow] = &[
         power: 5_000,
         linux_price: 164.0,
         windows: Some(WindowsColumn {
-            price: 326.0,
+            price: 260.0,
             disk_size_in_gb: 640,
             power: 5_000,
         }),
@@ -223,7 +223,7 @@ const PLAN_TABLE: &[PlanRow] = &[
         power: 6_000,
         linux_price: 384.0,
         windows: Some(WindowsColumn {
-            price: 646.0,
+            price: 500.0,
             disk_size_in_gb: 1_280,
             power: 6_000,
         }),
@@ -608,27 +608,27 @@ async fn the_windows_sql_server_image_is_published_and_can_be_created_from() {
     );
 }
 
-/// Whether `version` is a catalog version: the `YYYY.MM.DD` publication date of a
-/// catalog generation.
-fn is_catalog_version(version: &str) -> bool {
+/// Whether `version` is a published software version: a dotted numeric release
+/// string, the form `Blueprint$version` carries.
+fn is_published_version(version: &str) -> bool {
     let parts: Vec<&str> = version.split('.').collect();
-    parts.len() == 3
-        && parts[0].len() == 4
+    !parts.is_empty()
         && parts
             .iter()
             .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
 }
 
-/// `Blueprint$version` is the CATALOG generation's date, so it is one value across
-/// the whole listing — an image's own software release is not what it carries.
+/// `Blueprint$version` is the release of the software an entry's image installs,
+/// so it is the ENTRY's own — the listing carries more than one — and the version
+/// an entry reports does not depend on which images the request asked for.
 ///
 /// The rows are the two listings the request can ask for: the active images and
-/// every published image, which must agree on the generation.
+/// every published image, which must agree on each image's version.
 #[tokio::test]
-async fn every_published_image_carries_the_catalog_generations_version() {
+async fn every_published_image_carries_the_version_of_its_own_software() {
     let emulator = Emulator::new();
 
-    let mut generations: Vec<String> = Vec::new();
+    let mut by_listing: Vec<Vec<(String, String)>> = Vec::new();
     for request in [json!({}), json!({"includeInactive": true})] {
         let case = request.to_string();
         let blueprints = listing(&emulator, "GetBlueprints", "blueprints", request).await;
@@ -636,27 +636,40 @@ async fn every_published_image_carries_the_catalog_generations_version() {
             !blueprints.is_empty(),
             "case {case}: expected the catalog to report images"
         );
+        let mut reported: Vec<(String, String)> = Vec::new();
         for blueprint in &blueprints {
             let id = text(blueprint, "blueprintId");
             let version = text(blueprint, "version");
             assert!(
-                is_catalog_version(&version),
-                "case {case}: expected {id} to carry the generation's YYYY.MM.DD date, \
+                is_published_version(&version),
+                "case {case}: expected {id} to carry the published release of its software, \
                  got {version:?}"
             );
-            assert_eq!(
-                version,
-                text(&blueprints[0], "version"),
-                "case {case}: expected one version across the generation, got {id} at {version:?}"
-            );
+            reported.push((id, version));
         }
-        generations.push(text(&blueprints[0], "version"));
+        let distinct: std::collections::BTreeSet<&String> =
+            reported.iter().map(|(_, version)| version).collect();
+        assert!(
+            distinct.len() > 1,
+            "case {case}: version is each image's own release, so the listing carries more \
+             than one, got {distinct:?}"
+        );
+        by_listing.push(reported);
     }
-    assert_eq!(
-        generations[0], generations[1],
-        "case both listings: the generation does not depend on which images are asked for, \
-         got {generations:?}"
-    );
+
+    // The same image reports the same version in either listing: the version is
+    // the image's, not the request's.
+    for (id, version) in &by_listing[0] {
+        let both = by_listing[1]
+            .iter()
+            .find(|(other, _)| other == id)
+            .map(|(_, version)| version.clone());
+        assert_eq!(
+            both.as_ref(),
+            Some(version),
+            "case {id}: expected the same version in both listings, got {both:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

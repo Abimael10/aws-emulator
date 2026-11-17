@@ -89,9 +89,13 @@ pub struct BundleSpec {
 /// shared with the Linux/Unix plan of it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WindowsPlan {
-    /// `Bundle$price` of the Windows plan of this size: more than the
-    /// Linux/Unix plan of the same size, which is the operating-system licence
-    /// the plan carries.
+    /// `Bundle$price` of the Windows plan of this size: the price in US dollars
+    /// the plan table's WINDOWS column publishes for the size, which is more
+    /// than its Linux/Unix row's because the plan carries an operating-system
+    /// licence — and is that column's OWN figure rather than the Linux/Unix
+    /// price plus a markup, since the two columns are priced independently (the
+    /// 4 GB Windows plan and the 8 GB Linux/Unix plan are published at the same
+    /// monthly price).
     pub price_usd_per_month: f32,
     /// `Bundle$diskSizeInGb` of the Windows plan of this size — the plan table's
     /// own SSD figure for the Windows column, which is not always its
@@ -125,6 +129,13 @@ pub struct WindowsPlan {
 /// [`BundleSpec::windows`]); the sizes it does cover carry that column's own
 /// price, SSD size and power ([`WindowsPlan`]).
 ///
+/// The two price columns are PUBLISHED independently of each other: the Windows
+/// column's monthly prices are the figures the table lists for the Windows plans
+/// ($9.50, $14, $22, $44 and $74 for the plans up to 8 GB of RAM, and the larger
+/// plans' own figures above them), never the Linux/Unix price of the size plus a
+/// licence markup — the 4 GB Windows plan and the 8 GB Linux/Unix plan are
+/// published at the same monthly price, which no per-size markup produces.
+///
 /// Lightsail has retired none of these sizes, so every entry is active.
 pub const BUNDLE_SPECS: &[BundleSpec] = &[
     BundleSpec {
@@ -154,7 +165,7 @@ pub const BUNDLE_SPECS: &[BundleSpec] = &[
         power: 500,
         price_usd_per_month: 7.0,
         windows: Some(WindowsPlan {
-            price_usd_per_month: 16.0,
+            price_usd_per_month: 14.0,
             disk_size_in_gb: 40,
             power: 500,
         }),
@@ -170,7 +181,7 @@ pub const BUNDLE_SPECS: &[BundleSpec] = &[
         power: 1_000,
         price_usd_per_month: 12.0,
         windows: Some(WindowsPlan {
-            price_usd_per_month: 26.0,
+            price_usd_per_month: 22.0,
             disk_size_in_gb: 60,
             power: 1_000,
         }),
@@ -186,7 +197,7 @@ pub const BUNDLE_SPECS: &[BundleSpec] = &[
         power: 2_000,
         price_usd_per_month: 24.0,
         windows: Some(WindowsPlan {
-            price_usd_per_month: 46.0,
+            price_usd_per_month: 44.0,
             disk_size_in_gb: 80,
             power: 2_000,
         }),
@@ -202,7 +213,7 @@ pub const BUNDLE_SPECS: &[BundleSpec] = &[
         power: 3_000,
         price_usd_per_month: 44.0,
         windows: Some(WindowsPlan {
-            price_usd_per_month: 86.0,
+            price_usd_per_month: 74.0,
             disk_size_in_gb: 160,
             power: 3_000,
         }),
@@ -218,7 +229,7 @@ pub const BUNDLE_SPECS: &[BundleSpec] = &[
         power: 4_000,
         price_usd_per_month: 84.0,
         windows: Some(WindowsPlan {
-            price_usd_per_month: 166.0,
+            price_usd_per_month: 140.0,
             disk_size_in_gb: 320,
             power: 4_000,
         }),
@@ -234,7 +245,7 @@ pub const BUNDLE_SPECS: &[BundleSpec] = &[
         power: 5_000,
         price_usd_per_month: 164.0,
         windows: Some(WindowsPlan {
-            price_usd_per_month: 326.0,
+            price_usd_per_month: 260.0,
             disk_size_in_gb: 640,
             power: 5_000,
         }),
@@ -250,7 +261,7 @@ pub const BUNDLE_SPECS: &[BundleSpec] = &[
         power: 6_000,
         price_usd_per_month: 384.0,
         windows: Some(WindowsPlan {
-            price_usd_per_month: 646.0,
+            price_usd_per_month: 500.0,
             disk_size_in_gb: 1_280,
             power: 6_000,
         }),

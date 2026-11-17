@@ -15,9 +15,9 @@
 //!   id's words spell it, the product's name where the catalog names the image
 //!   after the product it installs — the same name `Instance$blueprintName`
 //!   reports, so an instance created from the blueprint carries it too), `group`
-//!   is the family name the catalog publishes for the entry, `version` is the
-//!   publication date of the catalog generation and is therefore one and the same
-//!   on every entry, `platform` is `WINDOWS` for exactly the Windows images and
+//!   is the family name the catalog publishes for the entry's release, `version`
+//!   is the release of the software the entry's image installs and is therefore
+//!   the entry's own, `platform` is `WINDOWS` for exactly the Windows images and
 //!   `LINUX_UNIX` otherwise, `minPower` is the power of the smallest plan the
 //!   image runs on (the floor the entry publishes, else its platform's: the
 //!   `micro` plan's for a Windows image, 0 — "the blueprint runs on all instance
@@ -68,10 +68,11 @@ const BLUEPRINT_TYPES: &[&str] = &["os", "app"];
 /// (`smithy_query(query="shape",shape="InstancePlatform")`).
 const PLATFORMS: &[&str] = &["LINUX_UNIX", "WINDOWS"];
 
-/// Where a published blueprint's `productUrl` leads: the AWS Marketplace product
-/// view the image's listing is served at. Written out here rather than read off
-/// the crate, so the host and path form are pinned by this suite.
-const MARKETPLACE_PRODUCT_VIEW_PREFIX: &str = "https://aws.amazon.com/marketplace/pp/prodview-";
+/// Where a published blueprint's `productUrl` leads: the AWS site, which serves
+/// both the Marketplace listing an image is offered through and the product page
+/// AWS keeps for an operating system of its own. Written out here rather than
+/// read off the crate, so the host is pinned by this suite.
+const AWS_PRODUCT_PAGE_PREFIX: &str = "https://aws.amazon.com/";
 
 /// Where a published blueprint's `licenseUrl` leads: the end-user licence
 /// agreement AWS serves for the image.
@@ -97,9 +98,10 @@ struct Expected {
     /// `Blueprint$minPower`: the power of the smallest instance plan the image
     /// runs on.
     min_power: i64,
-    /// Whether the catalog publishes this image's vendor product page, and
-    /// whether it publishes the licence terms the vendor sets for it — which the
-    /// recorded Windows entries carry both of.
+    /// Whether the catalog publishes an AWS page describing this image, and
+    /// whether it publishes the end-user licence agreement AWS serves for it —
+    /// which every image the catalog offers carries, a recorded Amazon Linux
+    /// entry included.
     publishes_product_url: bool,
     publishes_license_url: bool,
 }
@@ -142,56 +144,56 @@ const EXPECTED: &[Expected] = &[
         blueprint_id: "amazon_linux_2023",
         blueprint_type: "os",
         name: "Amazon Linux 2023",
-        group: "amazon-linux",
+        group: "amazon_linux_2023",
         platform: "LINUX_UNIX",
         is_active: true,
         min_power: 0,
         publishes_product_url: true,
-        publishes_license_url: false,
+        publishes_license_url: true,
     },
     Expected {
         blueprint_id: "centos_stream_9",
         blueprint_type: "os",
         name: "Centos Stream 9",
-        group: "centos-stream",
+        group: "centos_stream_9",
         platform: "LINUX_UNIX",
         is_active: true,
         min_power: 0,
         publishes_product_url: true,
-        publishes_license_url: false,
+        publishes_license_url: true,
     },
     Expected {
         blueprint_id: "ubuntu_22_04",
         blueprint_type: "os",
         name: "Ubuntu 22 04",
-        group: "ubuntu",
+        group: "ubuntu_22_04",
         platform: "LINUX_UNIX",
         is_active: true,
         min_power: 0,
         publishes_product_url: true,
-        publishes_license_url: false,
+        publishes_license_url: true,
     },
     Expected {
         blueprint_id: "ubuntu_18_04",
         blueprint_type: "os",
         name: "Ubuntu 18 04",
-        group: "ubuntu",
+        group: "ubuntu_18_04",
         platform: "LINUX_UNIX",
         is_active: false,
         min_power: 0,
         publishes_product_url: true,
-        publishes_license_url: false,
+        publishes_license_url: true,
     },
     Expected {
         blueprint_id: "debian_10",
         blueprint_type: "os",
         name: "Debian 10",
-        group: "debian",
+        group: "debian_10",
         platform: "LINUX_UNIX",
         is_active: false,
         min_power: 0,
         publishes_product_url: true,
-        publishes_license_url: false,
+        publishes_license_url: true,
     },
     Expected {
         blueprint_id: "windows_server_2019",
@@ -274,16 +276,17 @@ fn micro_power() -> i64 {
     )
 }
 
-/// Whether `version` is a catalog version: the `YYYY.MM.DD` publication date of
-/// a catalog generation, which is what `Blueprint$version` carries (its own
-/// example, `2016.03.0`, is that dotted numeric form).
-fn is_catalog_version(version: &str) -> bool {
+/// Whether `version` is a published software version: a dotted numeric release
+/// string, which is the form `Blueprint$version` carries (its own example,
+/// `2016.03.0`, is that form) — the release of the operating system, application
+/// or stack the image installs, or the date of the build the catalog publishes
+/// the image by.
+fn is_published_version(version: &str) -> bool {
     let components: Vec<&str> = version.split('.').collect();
-    components.len() == 3
+    !components.is_empty()
         && components
             .iter()
             .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
-        && components[0].len() == 4
 }
 
 /// The friendly name of a blueprint the catalog names after its id: the id's
@@ -441,19 +444,13 @@ async fn every_reported_blueprint_derives_its_members_from_its_catalog_entry() {
             !member(blueprint, "group").is_empty(),
             "case {case:?}: group must name the entry's published family, got {blueprint:?}"
         );
-        // `version` is the CATALOG generation's publication date, so every entry
-        // of one listing carries the same one — it does not restate the image's
-        // own release.
+        // `version` is the release of the software THIS image installs, so it is
+        // the entry's own: an image of a named release reports that release
+        // rather than one figure shared by the listing.
         let version = member(blueprint, "version");
         assert!(
-            is_catalog_version(&version),
-            "case {case:?}: version must be the catalog generation's YYYY.MM.DD date, \
-             got {blueprint:?}"
-        );
-        assert_eq!(
-            version,
-            member(&blueprints[0], "version"),
-            "case {case:?}: every entry of a catalog generation carries one version, \
+            is_published_version(&version),
+            "case {case:?}: version must be the published release of the image's software, \
              got {blueprint:?}"
         );
 
@@ -537,7 +534,7 @@ async fn every_reported_blueprint_derives_its_members_from_its_catalog_entry() {
             "case {case:?}: expected the published versionCode, got {blueprint:?}"
         );
         for (link, prefix) in [
-            ("productUrl", MARKETPLACE_PRODUCT_VIEW_PREFIX),
+            ("productUrl", AWS_PRODUCT_PAGE_PREFIX),
             ("licenseUrl", LICENSE_AGREEMENT_PREFIX),
         ] {
             if let Some(url) = blueprint[link].as_str() {
@@ -907,7 +904,8 @@ const SYNTHETIC: &[state::BlueprintSpec] = &[
         blueprint_type: state::BLUEPRINT_TYPE_OS,
         is_active: true,
         description: "A synthetic operating-system image, for the slice and paging rules.",
-        product_view: "",
+        version: "1.0",
+        product_page: "",
         license_agreement: "",
     },
     state::BlueprintSpec {
@@ -918,7 +916,8 @@ const SYNTHETIC: &[state::BlueprintSpec] = &[
         blueprint_type: state::BLUEPRINT_TYPE_OS,
         is_active: false,
         description: "A synthetic retired operating-system image.",
-        product_view: "",
+        version: "2.0",
+        product_page: "",
         license_agreement: "",
     },
     state::BlueprintSpec {
@@ -930,7 +929,8 @@ const SYNTHETIC: &[state::BlueprintSpec] = &[
         is_active: true,
         description: "A synthetic application image that publishes its own name, power floor, \
                       listing and licence agreement.",
-        product_view: "prodview-synthetic1",
+        version: "4.0",
+        product_page: "marketplace/pp/prodview-synthetic1",
         license_agreement: "synthetic-product/synthetic-agreement.txt",
     },
     state::BlueprintSpec {
@@ -941,7 +941,8 @@ const SYNTHETIC: &[state::BlueprintSpec] = &[
         blueprint_type: state::BLUEPRINT_TYPE_OS,
         is_active: true,
         description: "A synthetic Windows operating-system image.",
-        product_view: "",
+        version: "2030.01.01",
+        product_page: "",
         license_agreement: "",
     },
     state::BlueprintSpec {
@@ -952,7 +953,8 @@ const SYNTHETIC: &[state::BlueprintSpec] = &[
         blueprint_type: state::BLUEPRINT_TYPE_APP,
         is_active: false,
         description: "A synthetic retired application image.",
-        product_view: "",
+        version: "3.0",
+        product_page: "",
         license_agreement: "",
     },
 ];

@@ -143,15 +143,16 @@ const WINDOWS_IMAGES: &[WindowsImage] = &[
 /// power.
 const WINDOWS_MIN_POWER: i64 = 500;
 
-/// `Blueprint$version` of every entry of the published catalog: the publication
-/// date of the catalog generation the images belong to, in `YYYY.MM.DD` form.
+/// `Blueprint$version` of the images this catalog publishes by BUILD DATE: the
+/// date the build was published, in `YYYY.MM.DD` form.
 ///
-/// SOURCE: the recorded `GetBlueprints` answer, which reports this one version
-/// across entries of different upstream releases — a Windows Server 2025
-/// operating-system image and a SQL Server 2022 application image carry the same
-/// one — so the member pins the catalog generation rather than the image's own
-/// software release.
-const CATALOG_VERSION: &str = "2026.09.17";
+/// SOURCE: the recorded `GetBlueprints` answer, which reports this one version on
+/// a Windows Server 2025 operating-system image and on a SQL Server 2022
+/// application image — the Windows family and the preinstalled stacks are
+/// rebuilt as a set and published by that build's date. An operating system whose
+/// own release the catalog names carries that release instead, so this is the
+/// version of SOME entries and not of the whole listing.
+const IMAGE_BUILD_VERSION: &str = "2026.09.17";
 
 #[tokio::test]
 async fn the_blueprint_catalog_opens_with_the_windows_images_it_publishes() {
@@ -236,16 +237,31 @@ async fn the_blueprint_catalog_opens_with_the_windows_images_it_publishes() {
         }
     }
 
-    // `version` is the catalog GENERATION's publication date, so every entry of
-    // the listing carries it — whatever release its own software is at.
-    for blueprint in &blueprints {
-        let case = text(blueprint, "blueprintId");
+    // `version` is the release of the software an entry's image installs, so the
+    // Windows block — published by build date — carries that date, while the
+    // listing as a whole carries more than one version.
+    for want in WINDOWS_IMAGES {
+        let case = want.blueprint_id;
+        let reported = blueprints
+            .iter()
+            .find(|blueprint| text(blueprint, "blueprintId") == case)
+            .unwrap_or_else(|| panic!("case {case}: expected the catalog to publish it"));
         assert_eq!(
-            blueprint["version"].as_str(),
-            Some(CATALOG_VERSION),
-            "case {case}: expected the catalog generation's version, got {blueprint:?}"
+            reported["version"].as_str(),
+            Some(IMAGE_BUILD_VERSION),
+            "case {case}: expected the build date the Windows images are published by, got \
+             {reported:?}"
         );
     }
+    let versions: BTreeSet<String> = blueprints
+        .iter()
+        .map(|blueprint| text(blueprint, "version"))
+        .collect();
+    assert!(
+        versions.len() > 1,
+        "case the whole catalog: version is the release of each image's own software, so the \
+         listing carries more than one, got {versions:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -304,7 +320,7 @@ const PLANS: &[Plan] = &[
         power: 500,
         linux_price: 7.0,
         windows: Some(WindowsColumn {
-            price: 16.0,
+            price: 14.0,
             power: 500,
         }),
     },
@@ -315,7 +331,7 @@ const PLANS: &[Plan] = &[
         power: 1_000,
         linux_price: 12.0,
         windows: Some(WindowsColumn {
-            price: 26.0,
+            price: 22.0,
             power: 1_000,
         }),
     },
@@ -326,7 +342,7 @@ const PLANS: &[Plan] = &[
         power: 2_000,
         linux_price: 24.0,
         windows: Some(WindowsColumn {
-            price: 46.0,
+            price: 44.0,
             power: 2_000,
         }),
     },
@@ -337,7 +353,7 @@ const PLANS: &[Plan] = &[
         power: 3_000,
         linux_price: 44.0,
         windows: Some(WindowsColumn {
-            price: 86.0,
+            price: 74.0,
             power: 3_000,
         }),
     },
@@ -348,7 +364,7 @@ const PLANS: &[Plan] = &[
         power: 4_000,
         linux_price: 84.0,
         windows: Some(WindowsColumn {
-            price: 166.0,
+            price: 140.0,
             power: 4_000,
         }),
     },
@@ -359,7 +375,7 @@ const PLANS: &[Plan] = &[
         power: 5_000,
         linux_price: 164.0,
         windows: Some(WindowsColumn {
-            price: 326.0,
+            price: 260.0,
             power: 5_000,
         }),
     },
@@ -370,7 +386,7 @@ const PLANS: &[Plan] = &[
         power: 6_000,
         linux_price: 384.0,
         windows: Some(WindowsColumn {
-            price: 646.0,
+            price: 500.0,
             power: 6_000,
         }),
     },
