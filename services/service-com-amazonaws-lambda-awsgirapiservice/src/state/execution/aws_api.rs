@@ -982,6 +982,30 @@ pub const APIS: &[Api] = &[
         protocol: Protocol::RestJson(&IOT),
         answer_model: Some(&IOT_ANSWERS),
     },
+    // `services/service-com-amazonaws-transfer-transferservice/smithy-model/
+    // com-amazonaws-transfer-transferservice.json`: awsJson1_1, sigv4Name `transfer`,
+    // endpointPrefix `transfer`, sdkId `Transfer`, service shape `TransferService`.
+    //
+    // A MANAGED WORKFLOW's custom step is one of the places AWS documents a function calling
+    // the service that invoked it: the step hands its Lambda target an execution id, a workflow
+    // id and a callback token, and "you must include those with their callback as well as
+    // providing a status" (`SendWorkflowStepState`) — so a target that cannot reach this service
+    // can never report its outcome, and the execution that is waiting on it never finishes.
+    // Reading the file the step acts on and the server, user or workflow the event names
+    // (`DescribeServer`, `DescribeUser`, `DescribeExecution`, `ListExecutions`) is the rest of
+    // what such a handler does.
+    Api {
+        sdk_token: "transfer",
+        signing_name: "transfer",
+        endpoint_prefix: "transfer",
+        model: Some(TRANSFER_MODEL),
+        protocol: Protocol::AwsJson {
+            target_prefix: "TransferService",
+            json_version: "1.1",
+            query_compatible: false,
+        },
+        answer_model: Some(&TRANSFER),
+    },
 ];
 
 /// Whether `named` and `asked` name the ONE service.
@@ -1167,6 +1191,10 @@ pub(super) const IOT_MODEL: &str = include_str!(
     "../../../../service-com-amazonaws-iot-awsiotservice/smithy-model/\
      com-amazonaws-iot-awsiotservice.json"
 );
+pub(super) const TRANSFER_MODEL: &str = include_str!(
+    "../../../../service-com-amazonaws-transfer-transferservice/smithy-model/\
+     com-amazonaws-transfer-transferservice.json"
+);
 /// THIS service's own model, read the same way as every other entry's: a call a handler makes
 /// to Lambda is bound by the model this crate is generated from, so the surface a running
 /// function reaches is the surface this emulator serves.
@@ -1320,6 +1348,10 @@ static COGNITO_IDP: super::blob_members::ServiceModel = super::blob_members::Ser
 };
 static IOT_ANSWERS: super::blob_members::ServiceModel = super::blob_members::ServiceModel {
     source: IOT_MODEL,
+    plan: ::std::sync::OnceLock::new(),
+};
+static TRANSFER: super::blob_members::ServiceModel = super::blob_members::ServiceModel {
+    source: TRANSFER_MODEL,
     plan: ::std::sync::OnceLock::new(),
 };
 
