@@ -18,7 +18,10 @@
 //! foreign account (another account, one differing in a single digit, the
 //! largest the pattern admits, text that is no account id at all, and ids too
 //! short and too long for it), both places the account travels (the header and
-//! the host prefix), and resources that exist beside names that do not.
+//! the host prefix), every authority that prefix sits ahead of (the public
+//! endpoint, a loopback address with and without a port, and a named host —
+//! a client prepends the prefix to whatever endpoint it resolved), and resources
+//! that exist beside names that do not.
 
 use crate::access_point_lifecycle::{
     assert_foreign_account_refused, Emulator, Reply, ACCOUNT, FOREIGN_ACCOUNT_STATUS,
@@ -200,10 +203,28 @@ async fn send_from(
         Some(account) => format!("{account}.s3-control.{REGION}.amazonaws.com"),
         None => format!("s3-control.{REGION}.amazonaws.com"),
     };
+    send_to(emulator, &host, header_account, method, uri, "").await
+}
+
+/// Send one request to `authority` — the host it states it was sent to — naming
+/// `header_account` in the header every operation binds its `AccountId` to.
+///
+/// The one request builder of this suite: the rows above vary the account, and
+/// the rows below the AUTHORITY the prefix sits ahead of, which is the whole
+/// difference between the public endpoint and an endpoint a client is configured
+/// with.
+async fn send_to(
+    emulator: &Emulator,
+    authority: &str,
+    header_account: Option<&str>,
+    method: &str,
+    uri: &str,
+    body: &str,
+) -> Reply {
     let mut request = ::http::Request::builder()
         .method(method)
         .uri(uri)
-        .header("host", host)
+        .header("host", authority)
         .header(
             "authorization",
             format!(
@@ -219,7 +240,7 @@ async fn send_from(
         .router
         .dispatch(
             request
-                .body(::bytes::Bytes::new())
+                .body(::bytes::Bytes::from(body.to_owned()))
                 .expect("build the request"),
         )
         .await;
@@ -237,6 +258,42 @@ async fn send_from(
             .collect(),
         body: String::from_utf8(response.body().to_vec()).expect("a UTF-8 response body"),
     }
+}
+
+/// The foreign accounts above that the `AccountId` pattern (`^\d{12}$`) admits.
+///
+/// A host prefix ahead of an authority this service does not publish is the
+/// account only when it is shaped the way that host label is — that shape is the
+/// only thing telling a prefixed account from the first label of the host itself
+/// — while a label ahead of the service's own endpoint is the account whatever
+/// it reads as, which the row table below pins separately.
+fn foreign_accounts_the_pattern_admits() -> Vec<(&'static str, String)> {
+    foreign_accounts()
+        .into_iter()
+        .filter(|(_, account)| {
+            account.len() == 12 && account.bytes().all(|byte| byte.is_ascii_digit())
+        })
+        .collect()
+}
+
+/// Every authority a client reaches this service at, each as the host it builds
+/// for `account`: the public endpoint, a loopback address with and without a
+/// port, and a named host. A client prepends the modelled `{AccountId}.` prefix
+/// to whatever endpoint it resolved, so the account travels the same way in all
+/// four.
+fn prefixed_authorities(account: &str) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "the public endpoint",
+            format!("{account}.s3-control.{REGION}.amazonaws.com"),
+        ),
+        (
+            "a loopback authority with a port",
+            format!("{account}.127.0.0.1:9297"),
+        ),
+        ("a loopback authority", format!("{account}.127.0.0.1")),
+        ("a named host", format!("{account}.emulator.test:9297")),
+    ]
 }
 
 /// Assert `reply` is the authorization refusal, naming `account` in the member a
@@ -551,4 +608,172 @@ fn every_operation_of_this_service_names_its_account_in_the_header_the_gate_read
         "expected this service's model to bind an account to its endpoint, checked {checked} \
          operations"
     );
+}
+
+#[tokio::test]
+async fn a_foreign_account_in_the_host_prefix_is_refused_at_every_authority() {
+    let name = "present-ap";
+    let emulator = emulator_holding(name).await;
+    let uri = format!("/v20180820/accesspoint/{name}");
+
+    // The header names the caller's OWN account throughout, so the prefix is the
+    // only thing that makes each request one for another account's control
+    // plane — and it is read wherever the service is reached, not only at the
+    // public endpoint.
+    for (account_case, account) in foreign_accounts_the_pattern_admits() {
+        for (authority_case, authority) in prefixed_authorities(&account) {
+            let case = format!("{account_case} in the prefix of {authority_case}");
+            let reply = send_to(&emulator, &authority, Some(ACCOUNT), "GET", &uri, "").await;
+            assert_denied(&case, &account, &reply);
+            assert!(
+                reply.text("Bucket").is_none(),
+                "case {case:?}: expected nothing of the access point beside the refusal, got \
+                 body {}",
+                reply.body
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_callers_own_account_in_the_host_prefix_is_served_at_every_authority() {
+    let name = "present-ap";
+    let emulator = emulator_holding(name).await;
+    let uri = format!("/v20180820/accesspoint/{name}");
+
+    // The same prefix naming the caller's own account, and the bare authorities
+    // that carry no prefix at all: every one of them is served.
+    let mut served = prefixed_authorities(ACCOUNT);
+    served.push(("a bare loopback authority", "127.0.0.1:9297".to_string()));
+    served.push((
+        "a bare named host",
+        format!("s3-control.{REGION}.amazonaws.com"),
+    ));
+    for (authority_case, authority) in served {
+        let reply = send_to(&emulator, &authority, Some(ACCOUNT), "GET", &uri, "").await;
+        assert_eq!(
+            (reply.status, reply.text("Name")),
+            (200, Some(name.to_string())),
+            "case {authority_case:?}: expected the caller's own account to be served, got {} \
+             with body {}",
+            reply.status,
+            reply.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_host_prefix_is_authorized_ahead_of_every_operation_and_of_the_resource() {
+    let present = "present-ap";
+    let absent = "absent-ap";
+    let emulator = emulator_holding(present).await;
+    // The authority a client configured with this emulator's own endpoint builds:
+    // the modelled prefix, naming an account the caller holds no credentials for,
+    // ahead of the address the service answers on.
+    let authority = format!("{OTHER_ACCOUNT}.127.0.0.1:9297");
+
+    // Reads and writes, a name that exists beside one that does not, across the
+    // surfaces of the service: one refusal, stated identically, and nothing of
+    // the caller's own control plane touched.
+    let mut stated = Vec::new();
+    for call in calls(present).into_iter().chain(calls(absent)) {
+        let reply = send_to(
+            &emulator,
+            &authority,
+            Some(ACCOUNT),
+            call.method,
+            &request_uri(&call),
+            &call.body,
+        )
+        .await;
+        assert_denied(call.operation, OTHER_ACCOUNT, &reply);
+        stated.push((
+            call.operation,
+            (
+                reply.status,
+                reply.code(),
+                reply.text("Message"),
+                reply.text("AccountId"),
+            ),
+        ));
+    }
+    let (first_case, first) = stated[0].clone();
+    for (case, refusal) in &stated {
+        assert_eq!(
+            refusal, &first,
+            "case {case:?}: expected the same refusal as {first_case:?}, got {refusal:?}"
+        );
+    }
+
+    let read = emulator
+        .call("GET", &format!("/v20180820/accesspoint/{present}"), ACCOUNT, "")
+        .await;
+    assert_eq!(
+        (read.status, read.text("Name")),
+        (200, Some(present.to_string())),
+        "expected the refused calls to leave the access point alone, got body {}",
+        read.body
+    );
+    let absent_read = emulator
+        .call("GET", &format!("/v20180820/accesspoint/{absent}"), ACCOUNT, "")
+        .await;
+    assert_ne!(
+        absent_read.status, 200,
+        "expected the refused create to have created nothing, got body {}",
+        absent_read.body
+    );
+}
+
+#[tokio::test]
+async fn a_leading_label_that_is_no_account_prefix_is_part_of_the_host() {
+    let name = "present-ap";
+    let emulator = emulator_holding(name).await;
+    let uri = format!("/v20180820/accesspoint/{name}");
+
+    // A label ahead of this service's own endpoint is the account whatever text
+    // it carries, so an account that cannot be authorized is an authorization
+    // failure rather than a shape violation; the leading label of an authority
+    // the service does not recognize is the account only when it is shaped the
+    // way the `AccountId` host label is (`^\d{12}$`) — otherwise it is part of
+    // the host, and the header names the account.
+    for (case, authority, denied) in [
+        (
+            "text that is no account, ahead of the service endpoint",
+            format!("notanaccountid.s3-control.{REGION}.amazonaws.com"),
+            Some("notanaccountid"),
+        ),
+        (
+            "an id one digit short of the pattern, ahead of the service endpoint",
+            format!("12345678901.s3-control.{REGION}.amazonaws.com"),
+            Some("12345678901"),
+        ),
+        (
+            "a named host whose leading label is no account",
+            "emulator.test:9297".to_string(),
+            None,
+        ),
+        (
+            "a host whose leading label is one digit short of the pattern",
+            "12345678901.emulator.test:9297".to_string(),
+            None,
+        ),
+        (
+            "a host whose leading label is one digit past the pattern",
+            "1234567890123.emulator.test:9297".to_string(),
+            None,
+        ),
+    ] {
+        let reply = send_to(&emulator, &authority, Some(ACCOUNT), "GET", &uri, "").await;
+        match denied {
+            Some(account) => assert_denied(case, account, &reply),
+            None => assert_eq!(
+                (reply.status, reply.text("Name")),
+                (200, Some(name.to_string())),
+                "case {case:?}: expected the account the header names to be served, got {} with \
+                 body {}",
+                reply.status,
+                reply.body
+            ),
+        }
+    }
 }

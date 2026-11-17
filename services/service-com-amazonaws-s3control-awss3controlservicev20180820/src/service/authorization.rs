@@ -43,9 +43,18 @@ const HOST_HEADER: &str = "host";
 /// The label this service's own endpoint begins with
 /// (`smithy_query(query="service_info")`: `awsService.endpointPrefix` =
 /// `s3-control`). The host prefix the account travels in sits immediately ahead
-/// of it, so a label before THIS one is an account and a label before anything
-/// else is not.
+/// of it, so a label before THIS one is an account whatever it reads as.
 const ENDPOINT_PREFIX: &str = "s3-control";
+
+/// How many digits the account's own host label carries
+/// (`smithy_query(query="shape", shape="AccountId")`: `@pattern ^\d{12}$`).
+///
+/// A client builds the host it sends to by prepending `{AccountId}.` to
+/// WHATEVER endpoint authority it resolved, not only to the public
+/// `s3-control.<region>.amazonaws.com` one, so the leading label of an authority
+/// this service does not recognize is still the account when it is shaped the
+/// way that host label is.
+const ACCOUNT_ID_DIGITS: usize = 12;
 
 /// The account this emulator's caller is authorized for: the single account
 /// every emulated service presents, and the one every ARN it emits carries.
@@ -66,14 +75,27 @@ fn uri_authority(uri: &str) -> Option<String> {
 }
 
 /// The account the host prefix of `authority` names, or `None` for an authority
-/// that carries no host prefix — the emulator's own host, and the service
-/// endpoint addressed without one alike.
+/// that carries no host prefix — the service endpoint addressed without one, and
+/// the bare authority an emulated endpoint is reached at alike.
+///
+/// Two authorities carry the prefix, because the host is built by prepending
+/// `{AccountId}.` to the endpoint the client resolved: the public endpoint, whose
+/// remainder begins with [`ENDPOINT_PREFIX`], where the label ahead of it is the
+/// account whatever text it carries; and any OTHER authority this service is
+/// reached at, where the leading label is the account when it is shaped the way
+/// the account's own host label is ([`ACCOUNT_ID_DIGITS`]) — the only thing that
+/// tells a prefixed account from the first label of the host itself.
 fn host_prefix_account(authority: &str) -> Option<&str> {
     let (label, rest) = authority.split_once('.')?;
-    if label.is_empty() || !rest.starts_with(ENDPOINT_PREFIX) {
+    if label.is_empty() {
         return None;
     }
-    Some(label)
+    if rest.starts_with(ENDPOINT_PREFIX) {
+        return Some(label);
+    }
+    let account_shaped =
+        label.len() == ACCOUNT_ID_DIGITS && label.bytes().all(|byte| byte.is_ascii_digit());
+    account_shaped.then_some(label)
 }
 
 /// Every account `req` names: the one its `x-amz-account-id` header carries —
@@ -134,7 +156,7 @@ mod tests {
 
     #[test]
     fn every_account_a_request_names_is_read_from_its_header_and_its_host_prefix() {
-        let cases: [Row; 9] = [
+        let cases: [Row; 13] = [
             (
                 "the header alone",
                 "/v20180820/accesspoint",
@@ -188,6 +210,47 @@ mod tests {
                 "/v20180820/accesspoint",
                 vec![(HOST_HEADER, "127.0.0.1:9297")],
                 vec![],
+            ),
+            (
+                // The host a client builds against an endpoint of its own: the
+                // same `{AccountId}.` prefix, ahead of the authority this
+                // service is reached at rather than the public endpoint.
+                "a host prefix ahead of a loopback authority",
+                "/v20180820/accesspoint",
+                vec![
+                    (HOST_HEADER, "888888888888.127.0.0.1:9297"),
+                    (ACCOUNT_ID_HEADER, "888888888888"),
+                ],
+                vec!["888888888888", "888888888888"],
+            ),
+            (
+                "a host prefix ahead of a loopback authority, naming another \
+                 account than the header",
+                "/v20180820/accesspoint",
+                vec![
+                    (HOST_HEADER, "999999999999.127.0.0.1:9297"),
+                    (ACCOUNT_ID_HEADER, "000000000001"),
+                ],
+                vec!["000000000001", "999999999999"],
+            ),
+            (
+                "an absolute-form URI carrying the host prefix ahead of a named \
+                 authority",
+                "https://121212121212.emulator.test:9297/v20180820/accesspoint",
+                vec![],
+                vec!["121212121212"],
+            ),
+            (
+                // A leading label that is not shaped the way the account's own
+                // host label is, ahead of an authority this service does not
+                // recognize, is part of the host rather than a prefix.
+                "a named host whose leading label is no account",
+                "/v20180820/accesspoint",
+                vec![
+                    (HOST_HEADER, "emulator.test:9297"),
+                    (ACCOUNT_ID_HEADER, "131313131313"),
+                ],
+                vec!["131313131313"],
             ),
             (
                 // A query member carrying an S3 URI: the `://` in it is not an
