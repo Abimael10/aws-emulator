@@ -73,6 +73,26 @@ pub const APPSYNC_FIELD_NAME_PROPERTY: &str = "FieldName";
 /// derived from the same name are different digits ([`derived_digits`]).
 const APPSYNC_API_ID_SALT: &str = "appsync/api-id";
 
+/// What a GraphQL SCHEMA's identifier is the API's id followed by: AppSync addresses the
+/// schema by its API alone, so what identifies the resource is that API's id with the type's
+/// own resource segment appended — this fixed text, the id coming from the declaration.
+pub const APPSYNC_GRAPHQL_SCHEMA_ID_SUFFIX: &str = "GraphQLSchema";
+
+/// The identifier the schema of the API `api_id` publishes, which is what that resource's
+/// `Ref` returns and what the stack records as its physical id.
+pub fn appsync_schema_identifier(api_id: &str) -> String {
+    format!("{api_id}{APPSYNC_GRAPHQL_SCHEMA_ID_SUFFIX}")
+}
+
+/// The API id one of those identifiers was built on, or the identifier itself where it does
+/// not carry the suffix — the identifier of a schema this emulator recorded before the
+/// composite one was published.
+pub fn appsync_schema_api_id(identifier: &str) -> &str {
+    identifier
+        .strip_suffix(APPSYNC_GRAPHQL_SCHEMA_ID_SUFFIX)
+        .unwrap_or(identifier)
+}
+
 /// How many characters an AppSync GraphQL API id carries: the ids that service mints are a
 /// fixed-length run of lower-case alphanumerics, and a stand-in of the same length is what a
 /// declaration reads until the create answers the real one.
@@ -123,9 +143,13 @@ pub(super) fn appsync_return_values(
         }
         // The schema of one API. AppSync holds one schema per API and addresses it by that
         // API alone (`StartSchemaCreation`/`GetIntrospectionSchema` take an `apiId` and
-        // nothing else), so what identifies the resource is the API it belongs to, and it
+        // nothing else), so what identifies the resource is the API it belongs to — that id
+        // with the type's own segment appended ([`appsync_schema_identifier`]) — and it
         // publishes no attribute of its own.
-        APPSYNC_GRAPHQL_SCHEMA => (declared_api_id(properties, scope, budget), attributes),
+        APPSYNC_GRAPHQL_SCHEMA => (
+            appsync_schema_identifier(&declared_api_id(properties, scope, budget)),
+            attributes,
+        ),
         // A data source: `Ref` returns its ARN, and `Fn::GetAtt` reads that ARN and the name
         // it was created under.
         APPSYNC_DATA_SOURCE => {
@@ -179,9 +203,11 @@ pub(super) fn appsync_return_values(
             attributes.insert("Name".to_string(), name.to_string());
             (arn, attributes)
         }
-        // An API key: the key AppSync generated is both the resource's identifier and the
-        // value a caller presents in `x-api-key`, so `ApiKey` and `ApiKeyId` are that one
-        // value, and the ARN is built on it under the API that holds it.
+        // An API key: the key AppSync generated is both the value a caller presents in
+        // `x-api-key` and the key's own id, so `ApiKey` and `ApiKeyId` are that one value,
+        // while what IDENTIFIES the resource is the ARN built on it under the API that holds
+        // it — which is what `Ref` returns, so the key itself is never published as the
+        // resource's physical id.
         APPSYNC_API_KEY => {
             let key_id = stand_in_api_id(name);
             let arn = child_arn(
@@ -193,8 +219,8 @@ pub(super) fn appsync_return_values(
             );
             attributes.insert("ApiKey".to_string(), key_id.clone());
             attributes.insert("ApiKeyId".to_string(), key_id.clone());
-            attributes.insert("Arn".to_string(), arn);
-            (key_id, attributes)
+            attributes.insert("Arn".to_string(), arn.clone());
+            (arn, attributes)
         }
         // An Event API: `Ref` returns the `Api` ID, and `Fn::GetAtt` reads that id, the ARN
         // AppSync built on it and the two DNS records the API is SERVED at — one per endpoint,

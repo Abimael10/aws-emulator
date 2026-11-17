@@ -151,6 +151,14 @@ pub const CODE_UNIT: &str = "code.js";
 /// the response reports as it stands after the run.
 pub const STASH_MEMBER: &str = "stash";
 
+/// The member of a context that carries the arguments the field's selection was made with,
+/// and the SHORT name the same map is read under: an APPSYNC_JS `ctx` carries one arguments
+/// map, reachable by either name, which is how a resolver's own context is built
+/// (`crate::service::graphql_api`).
+pub const ARGUMENTS_MEMBER: &str = "arguments";
+/// See [`ARGUMENTS_MEMBER`].
+pub const ARGUMENTS_SHORT_MEMBER: &str = "args";
+
 /// One fault found in the code itself, as a `CodeError` reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodeFault {

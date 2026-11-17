@@ -278,6 +278,20 @@ impl GraphqlApiRecord {
         Ok(schema.into_bytes())
     }
 
+    /// This API's type system as introspection's `__Schema`, for the DATA plane's own
+    /// `__schema` field (`crate::service::graphql_api::introspection`), or `None` for an
+    /// API that holds no type system — there is nothing to introspect then, which is what
+    /// the call above refuses such an API with.
+    ///
+    /// The same rendering the call answers with, so the two cannot disagree about one API.
+    pub fn introspection_schema_document(&self, include_directives: bool) -> Option<Value> {
+        if self.types.is_empty() {
+            return None;
+        }
+        let declarations = schema_declarations(self.schema_document.as_deref().unwrap_or(""));
+        Some(self.schema_json(&declarations, include_directives))
+    }
+
     /// This API's schema as GraphQL SDL: the `schema` definition the created document
     /// binds its root operation types with (where it writes one — GraphQL lets a schema
     /// whose roots carry the default names omit it), the directives it defines, and every
@@ -324,6 +338,17 @@ impl GraphqlApiRecord {
         declarations: &SchemaDeclarations,
         include_directives: bool,
     ) -> String {
+        let schema = self.schema_json(declarations, include_directives);
+        serde_json::to_string_pretty(&json!({"data": {"__schema": schema}})).unwrap_or_default()
+    }
+
+    /// The `__Schema` itself, which both that document and the data plane's own `__schema`
+    /// field report ([`Self::introspection_schema_document`]).
+    fn schema_json(
+        &self,
+        declarations: &SchemaDeclarations,
+        include_directives: bool,
+    ) -> Value {
         let mut types: Vec<Value> = self
             .types_in_creation_order()
             .map(|record| record.introspection(&self.types))
@@ -351,7 +376,7 @@ impl GraphqlApiRecord {
                 members.insert("directives".to_string(), Value::Array(directives));
             }
         }
-        serde_json::to_string_pretty(&json!({"data": {"__schema": schema}})).unwrap_or_default()
+        schema
     }
 
     /// The types this API holds, in the order they were created.

@@ -44,6 +44,20 @@
 //!   (`POST /v1/apis/{apiId}/functions`);
 //! * `AWS::AppSync::ApiKey` is `CreateApiKey` (`POST /v1/apis/{apiId}/apikeys`).
 //!
+//! A CHANGED declaration rides that type's own update call, bound to the URI that addresses
+//! the resource itself — `UpdateGraphqlApi`, `UpdateDataSource`, `UpdateResolver`,
+//! `UpdateFunction` and `UpdateApiKey` — and a changed schema rides `StartSchemaCreation`
+//! again, which is the call AppSync publishes for installing one ([`update`]).
+//!
+//! ## What identifies each resource
+//!
+//! Each is the handle every later call on the resource takes, and the value that type's `Ref`
+//! returns: the API's own ARN, a data source's, a resolver's and a function's ARN, the ARN of
+//! an API key under the API that holds it — never the key AppSync generated, which is what a
+//! caller PRESENTS — and, for a schema, the API's id with the type's own segment appended
+//! (`crate::state::template::appsync_schema_identifier`), AppSync holding one schema per API
+//! and addressing it by that API alone.
+//!
 //! ## The properties
 //!
 //! Every property these types publish is a member of the owning create under the SAME name
@@ -75,9 +89,10 @@ use serde_json::{Map, Value};
 use super::{applicable_tags, call_rest_json, percent_encoded, Created, Readiness, Refusal, Removal};
 use crate::state::provisioner::{attribute_text, lower_camel_members, tags_as_map, tags_of};
 use crate::state::template::{
-    APPSYNC_API_ID_PROPERTY, APPSYNC_API_KEY, APPSYNC_ARN_NAMESPACE, APPSYNC_DATA_SOURCE,
-    APPSYNC_FIELD_NAME_PROPERTY, APPSYNC_FUNCTION_CONFIGURATION, APPSYNC_GRAPHQL_API,
-    APPSYNC_GRAPHQL_SCHEMA, APPSYNC_RESOLVER, APPSYNC_TYPE_NAME_PROPERTY,
+    appsync_schema_api_id, appsync_schema_identifier, APPSYNC_API_ID_PROPERTY, APPSYNC_API_KEY,
+    APPSYNC_ARN_NAMESPACE, APPSYNC_DATA_SOURCE, APPSYNC_FIELD_NAME_PROPERTY,
+    APPSYNC_FUNCTION_CONFIGURATION, APPSYNC_GRAPHQL_API, APPSYNC_GRAPHQL_SCHEMA, APPSYNC_RESOLVER,
+    APPSYNC_TYPE_NAME_PROPERTY,
 };
 use crate::state::StoredResource;
 
@@ -197,6 +212,23 @@ const GRAPHQL_API_MEMBERS: &[&str] = &[
     "Visibility",
 ];
 
+/// The properties of an API that travel as `UpdateGraphqlApi`'s own members: the create's,
+/// minus the two that call models no member for — the KIND of API and where it is reachable
+/// from, which are fixed when AppSync makes it, so a declaration restating either asks for a
+/// different API (`crate::state::template::replacement_properties` names them) and such a
+/// change never reaches the update at all.
+const GRAPHQL_API_UPDATE_MEMBERS: &[&str] = &[
+    "AdditionalAuthenticationProviders",
+    "EnhancedMetricsConfig",
+    "IntrospectionConfig",
+    "LambdaAuthorizerConfig",
+    "LogConfig",
+    "MergedApiExecutionRoleArn",
+    "OpenIDConnectConfig",
+    "OwnerContact",
+    "UserPoolConfig",
+];
+
 /// The members of an API AppSync models as a NUMBER rather than as text (`QueryDepthLimit`
 /// `@range(min: 0, max: 75)` and `ResolverCountLimit` `@range(min: 0, max: 10000)`), so a
 /// declaration that writes one as the text a parameter reference resolves to is sent as the
@@ -276,6 +308,21 @@ const RESOLVER_MEMBERS: &[&str] = &[
     "Code",
     "DataSourceName",
     APPSYNC_FIELD_NAME_PROPERTY,
+    "Kind",
+    "MetricsConfig",
+    "PipelineConfig",
+    "RequestMappingTemplate",
+    "ResponseMappingTemplate",
+    "Runtime",
+    "SyncConfig",
+];
+
+/// The properties of a resolver that travel as `UpdateResolver`'s own members: the create's,
+/// minus the FIELD name — which that call takes as a URI label rather than in its body.
+const RESOLVER_UPDATE_MEMBERS: &[&str] = &[
+    "CachingConfig",
+    "Code",
+    "DataSourceName",
     "Kind",
     "MetricsConfig",
     "PipelineConfig",
@@ -470,7 +517,8 @@ const REALTIME_ENDPOINT: &str = "REALTIME";
 /// "Adds a new schema to your GraphQL API. This operation is asynchronous" — the call answers
 /// the schema `PROCESSING`, so the resource's creation is held open until that service reports
 /// the creation finished ([`readiness`]). AppSync holds one schema per API and addresses it by
-/// that API alone, so the API's id is this resource's identity.
+/// that API alone, so what identifies this resource is that API's id with the type's own
+/// segment appended ([`appsync_schema_identifier`]).
 async fn start_schema_creation(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -492,7 +540,7 @@ async fn start_schema_creation(
     )
     .await?;
     Ok(Created {
-        physical_resource_id: Some(api_id),
+        physical_resource_id: Some(appsync_schema_identifier(&api_id)),
         attributes: BTreeMap::new(),
     })
 }
@@ -622,8 +670,9 @@ async fn create_function(
 /// caller presenting the key the stack published is really admitted by that API.
 ///
 /// AppSync GENERATES the key: `CreateApiKey` takes a description and an expiry and answers the
-/// `apiKey.id` it made, which is both the resource's identifier and the value a caller sends in
-/// `x-api-key`.
+/// `apiKey.id` it made, which is both the key's own id and the value a caller sends in
+/// `x-api-key`. What IDENTIFIES the resource is the ARN built on that id under the API that
+/// holds it, which is what this type's `Ref` returns.
 async fn create_api_key(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -631,15 +680,7 @@ async fn create_api_key(
 ) -> Result<Created, Refusal> {
     let properties = &resource.properties;
     let api_id = required(resource, properties, APPSYNC_API_ID_PROPERTY)?;
-    if stated(properties, API_KEY_ID).is_some() {
-        return Err(Refusal {
-            code: NOT_IMPLEMENTED.to_string(),
-            message: format!(
-                "AppSync generates an API key's own identifier, so this emulator does not create \
-                 a {APPSYNC_API_KEY} under the {API_KEY_ID} property a declaration states"
-            ),
-        });
-    }
+    refuse_declared_key_id(properties)?;
     let mut request = Map::new();
     carry(&mut request, properties, &["Description"])?;
     carry_numbers(&mut request, properties, resource, &[API_KEY_EXPIRES])?;
@@ -658,17 +699,37 @@ async fn create_api_key(
     attributes.insert(API_KEY_ID.to_string(), key_id.clone());
     // An API key is addressed under the API that holds it, as `DeleteApiKey`'s own URI
     // (`/v1/apis/{apiId}/apikeys/{id}`) addresses it, so its ARN is that path.
-    attributes.insert(
-        "Arn".to_string(),
-        ::emulator_server::emulator_arn(
-            APPSYNC_ARN_NAMESPACE,
-            region,
-            &format!("apis/{api_id}/apikeys/{key_id}"),
-        ),
-    );
+    let arn = key_arn(region, &api_id, &key_id);
+    attributes.insert("Arn".to_string(), arn.clone());
     Ok(Created {
-        physical_resource_id: Some(key_id),
+        physical_resource_id: Some(arn),
         attributes,
+    })
+}
+
+/// The ARN of one API key, built on the API that holds it and the key's own id — the path
+/// `DeleteApiKey`'s own URI (`/v1/apis/{apiId}/apikeys/{id}`) addresses the key at.
+fn key_arn(region: &str, api_id: &str, key_id: &str) -> String {
+    ::emulator_server::emulator_arn(
+        APPSYNC_ARN_NAMESPACE,
+        region,
+        &format!("apis/{api_id}/apikeys/{key_id}"),
+    )
+}
+
+/// The refusal for a declaration that states the key's own identifier: AppSync GENERATES a
+/// key, so neither its create nor its update takes one, and a declaration naming one asks for
+/// a key this emulator cannot make.
+fn refuse_declared_key_id(properties: &Value) -> Result<(), Refusal> {
+    if stated(properties, API_KEY_ID).is_none() {
+        return Ok(());
+    }
+    Err(Refusal {
+        code: NOT_IMPLEMENTED.to_string(),
+        message: format!(
+            "AppSync generates an API key's own identifier, so this emulator does not create a \
+             {APPSYNC_API_KEY} under the {API_KEY_ID} property a declaration states"
+        ),
     })
 }
 
@@ -693,7 +754,7 @@ pub(super) async fn readiness(
         ctx,
         region,
         "GET",
-        &schema_creation_uri(physical_resource_id),
+        &schema_creation_uri(appsync_schema_api_id(physical_resource_id)),
         None,
     )
     .await?;
@@ -733,16 +794,20 @@ pub(super) fn removal() -> Removal {
     Removal::Gone
 }
 
-/// Apply a CHANGED declaration to the resource the stack already has.
+/// Apply a CHANGED declaration to the resource the stack already has, through the call AppSync
+/// publishes for changing one.
 ///
-/// A schema is the one of these resources whose change AppSync applies through the SAME call
-/// that created it — `StartSchemaCreation` "adds a new schema to your GraphQL API", and the
-/// document a declaration states is the whole type system — so a changed definition is
-/// installed by starting that creation again on the API the resource already names.
+/// Each type has exactly one: `UpdateGraphqlApi`, `UpdateDataSource`, `UpdateResolver`,
+/// `UpdateFunction` and `UpdateApiKey`, each bound to the URI that addresses the resource
+/// itself, and each taking the same members its create takes minus the ones the URI binds. A
+/// SCHEMA is the one whose change AppSync applies through the call that created it —
+/// `StartSchemaCreation` "adds a new schema to your GraphQL API", and the document a
+/// declaration states is the whole type system — so a changed definition is installed by
+/// starting that creation again on the API the resource already names.
 ///
-/// For the other five, `Ok(None)`: AppSync changes them through its own update calls, which no
-/// arm here makes yet, so such a deployment reports the change as NOT applied rather than as a
-/// success that dropped the caller's change.
+/// `Ok(None)` is a declaration that restates a value the resource's IDENTITY is built from
+/// ([`identity_moved`]): that asks for a different resource, which the deployment replaces
+/// rather than changing in place.
 pub(super) async fn update(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -750,17 +815,117 @@ pub(super) async fn update(
     resource: &StoredResource,
     declared: &Value,
 ) -> Result<Option<Created>, Refusal> {
-    if kind != Kind::GraphqlSchema {
-        return Ok(None);
-    }
-    refuse_unapplied_properties(declared, resource, GRAPHQL_SCHEMA_PROPERTIES)?;
+    refuse_unapplied_properties(declared, resource, properties_of(kind))?;
     refuse_unfetched_documents(declared, resource)?;
-    // The API the schema belongs to is the resource's own identity: a declaration that moves
-    // the schema to another API is a different resource, which the deployment replaces rather
-    // than changing in place.
-    if stated_text(declared, APPSYNC_API_ID_PROPERTY) != resource.physical_resource_id {
+    if identity_moved(kind, resource, declared) {
         return Ok(None);
     }
+    match kind {
+        Kind::GraphqlApi => update_graphql_api(ctx, region, resource, declared).await,
+        Kind::GraphqlSchema => install_schema(ctx, region, resource, declared).await,
+        Kind::DataSource => update_data_source(ctx, region, resource, declared).await,
+        Kind::Resolver => update_resolver(ctx, region, resource, declared).await,
+        Kind::FunctionConfiguration => update_function(ctx, region, resource, declared).await,
+        Kind::ApiKey => update_api_key(ctx, region, resource, declared).await,
+    }
+    .map(Some)
+}
+
+/// Whether a declaration states one of the values the resource's identity is built from
+/// differently from the resource the stack has: the API every child lives under, the NAME a
+/// data source is addressed by, and the type and field a resolver is attached to. None of
+/// those is a member of the owning update call — each is a URI label of it — so a declaration
+/// restating one asks for a different resource
+/// (`crate::state::template::replacing_properties` is the one reading of that, and what makes
+/// the deployment replace such a resource before it reaches here).
+fn identity_moved(kind: Kind, resource: &StoredResource, declared: &Value) -> bool {
+    let held = &resource.properties;
+    // A schema's identity is the API it belongs to, which is what its physical id carries.
+    if kind == Kind::GraphqlSchema {
+        return stated_text(declared, APPSYNC_API_ID_PROPERTY)
+            != appsync_schema_api_id(&resource.physical_resource_id);
+    }
+    let bound: &[&str] = match kind {
+        Kind::GraphqlApi => &[],
+        Kind::DataSource => &[APPSYNC_API_ID_PROPERTY, NAME],
+        Kind::Resolver => &[
+            APPSYNC_API_ID_PROPERTY,
+            APPSYNC_TYPE_NAME_PROPERTY,
+            APPSYNC_FIELD_NAME_PROPERTY,
+        ],
+        Kind::FunctionConfiguration | Kind::ApiKey => &[APPSYNC_API_ID_PROPERTY],
+        Kind::GraphqlSchema => &[],
+    };
+    bound
+        .iter()
+        .any(|property| stated_text(declared, property) != stated_text(held, property))
+}
+
+/// Apply a changed declaration of the API itself, through `UpdateGraphqlApi` — which takes the
+/// API's whole configuration (its `name` and `authenticationType` are both required members),
+/// so a changed declaration is applied by putting it, and the variables it holds by the one
+/// call AppSync publishes for them.
+async fn update_graphql_api(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+) -> Result<Created, Refusal> {
+    let api_id = api_id_of(resource)?;
+    let mut request = Map::new();
+    request.insert(
+        "name".to_string(),
+        Value::String(required(resource, declared, NAME)?),
+    );
+    request.insert(
+        "authenticationType".to_string(),
+        Value::String(required(resource, declared, AUTHENTICATION_TYPE)?),
+    );
+    carry(&mut request, declared, GRAPHQL_API_UPDATE_MEMBERS)?;
+    carry_numbers(&mut request, declared, resource, GRAPHQL_API_NUMBERS)?;
+    carry_flags(&mut request, declared, resource, GRAPHQL_API_FLAGS)?;
+    let answered = call_appsync(
+        ctx,
+        region,
+        "POST",
+        &api_uri(&api_id),
+        Some(&Value::Object(request)),
+    )
+    .await?;
+    let api = answered.get("graphqlApi").cloned().unwrap_or(Value::Null);
+    let arn = minted(&api, "arn", "UpdateGraphqlApi")?;
+    // The variables an API holds are written by a call of their own, so a change to them is
+    // applied to the API this update just changed rather than dropped. That call takes the
+    // WHOLE map, so a declaration that no longer states any is applied by putting an empty
+    // one — and an API neither revision states variables for is left alone.
+    let stated_now = stated(declared, ENVIRONMENT_VARIABLES);
+    if stated_now.is_some() || stated(&resource.properties, ENVIRONMENT_VARIABLES).is_some() {
+        let variables = stated_now.unwrap_or_else(|| Value::Object(Map::new()));
+        let request = serde_json::json!({ "environmentVariables": variables });
+        call_appsync(
+            ctx,
+            region,
+            "PUT",
+            &format!("{}/environmentVariables", api_uri(&api_id)),
+            Some(&request),
+        )
+        .await?;
+    }
+    Ok(Created {
+        physical_resource_id: Some(arn.clone()),
+        attributes: api_attributes(&api, &api_id, &arn),
+    })
+}
+
+/// Install the schema a changed `AWS::AppSync::GraphQLSchema` declares, on the API the resource
+/// already names — the same asynchronous creation its own create starts, so the resource is
+/// held open until AppSync reports it installed ([`readiness`]).
+async fn install_schema(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+) -> Result<Created, Refusal> {
     let definition = required(resource, declared, DEFINITION)?;
     let request = serde_json::json!({
         "definition": ::aws_smithy_types::base64::encode(definition.as_bytes()),
@@ -769,11 +934,163 @@ pub(super) async fn update(
         ctx,
         region,
         "POST",
-        &schema_creation_uri(&resource.physical_resource_id),
+        &schema_creation_uri(appsync_schema_api_id(&resource.physical_resource_id)),
         Some(&request),
     )
     .await?;
-    Ok(Some(Created::attributes(BTreeMap::new())))
+    Ok(Created::attributes(BTreeMap::new()))
+}
+
+/// Apply a changed declaration of a data source, through `UpdateDataSource` — which addresses
+/// the data source by the API and the name it was created under and takes the rest of what its
+/// create takes.
+async fn update_data_source(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+) -> Result<Created, Refusal> {
+    let name = required(resource, declared, NAME)?;
+    let mut request = Map::new();
+    carry(&mut request, declared, DATA_SOURCE_MEMBERS)?;
+    carry_renamed(&mut request, declared, DYNAMODB_CONFIG, DYNAMODB_CONFIG_MEMBER)?;
+    let answered = call_appsync(
+        ctx,
+        region,
+        "POST",
+        &format!(
+            "{}/datasources/{}",
+            api_uri(&api_id_of(resource)?),
+            percent_encoded(&name)
+        ),
+        Some(&Value::Object(request)),
+    )
+    .await?;
+    let data_source = answered.get("dataSource").cloned().unwrap_or(Value::Null);
+    let arn = minted(&data_source, "dataSourceArn", "UpdateDataSource")?;
+    let mut attributes = BTreeMap::new();
+    attributes.insert("DataSourceArn".to_string(), arn.clone());
+    attributes.insert("Name".to_string(), name);
+    Ok(Created {
+        physical_resource_id: Some(arn),
+        attributes,
+    })
+}
+
+/// Apply a changed declaration of a resolver, through `UpdateResolver` — which addresses the
+/// resolver by the API, the type and the field it is attached to and takes the rest of what its
+/// create takes.
+async fn update_resolver(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+) -> Result<Created, Refusal> {
+    let type_name = required(resource, declared, APPSYNC_TYPE_NAME_PROPERTY)?;
+    let field_name = required(resource, declared, APPSYNC_FIELD_NAME_PROPERTY)?;
+    let mut request = Map::new();
+    carry(&mut request, declared, RESOLVER_UPDATE_MEMBERS)?;
+    carry_numbers(&mut request, declared, resource, BATCH_SIZE_NUMBERS)?;
+    let answered = call_appsync(
+        ctx,
+        region,
+        "POST",
+        &format!(
+            "{}/resolvers/{}",
+            type_uri(&api_id_of(resource)?, &type_name),
+            percent_encoded(&field_name)
+        ),
+        Some(&Value::Object(request)),
+    )
+    .await?;
+    let resolver = answered.get("resolver").cloned().unwrap_or(Value::Null);
+    let arn = minted(&resolver, "resolverArn", "UpdateResolver")?;
+    let mut attributes = BTreeMap::new();
+    attributes.insert("FieldName".to_string(), field_name);
+    attributes.insert("ResolverArn".to_string(), arn.clone());
+    attributes.insert("TypeName".to_string(), type_name);
+    Ok(Created {
+        physical_resource_id: Some(arn),
+        attributes,
+    })
+}
+
+/// Apply a changed declaration of a pipeline function, through `UpdateFunction` — which
+/// addresses the function by the API and the `functionId` AppSync minted and takes a new name
+/// beside the rest of what its create takes, so a renamed function is the SAME function under
+/// another name.
+async fn update_function(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+) -> Result<Created, Refusal> {
+    let name = required(resource, declared, NAME)?;
+    let mut request = Map::new();
+    request.insert("name".to_string(), Value::String(name.clone()));
+    carry(&mut request, declared, FUNCTION_MEMBERS)?;
+    carry_numbers(&mut request, declared, resource, BATCH_SIZE_NUMBERS)?;
+    let answered = call_appsync(
+        ctx,
+        region,
+        "POST",
+        &function_uri(resource)?,
+        Some(&Value::Object(request)),
+    )
+    .await?;
+    let function = answered
+        .get("functionConfiguration")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let arn = minted(&function, "functionArn", "UpdateFunction")?;
+    let function_id = minted(&function, "functionId", "UpdateFunction")?;
+    let mut attributes = BTreeMap::new();
+    attributes.insert(
+        "DataSourceName".to_string(),
+        stated_text(declared, "DataSourceName"),
+    );
+    attributes.insert("FunctionArn".to_string(), arn.clone());
+    attributes.insert("FunctionId".to_string(), function_id);
+    attributes.insert("Name".to_string(), name);
+    Ok(Created {
+        physical_resource_id: Some(arn),
+        attributes,
+    })
+}
+
+/// Apply a changed declaration of an API key, through `UpdateApiKey` — which addresses the key
+/// by the API and the key's own id and takes the description and the expiry, the two members a
+/// declaration states beside them. The key itself is NOT reissued: it is the value AppSync
+/// generated, which this call leaves as it is.
+async fn update_api_key(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+) -> Result<Created, Refusal> {
+    refuse_declared_key_id(declared)?;
+    let mut request = Map::new();
+    carry(&mut request, declared, &["Description"])?;
+    carry_numbers(&mut request, declared, resource, &[API_KEY_EXPIRES])?;
+    let answered = call_appsync(
+        ctx,
+        region,
+        "POST",
+        &api_key_uri(resource)?,
+        Some(&Value::Object(request)),
+    )
+    .await?;
+    let key = answered.get("apiKey").cloned().unwrap_or(Value::Null);
+    let key_id = minted(&key, "id", "UpdateApiKey")?;
+    let arn = key_arn(region, &api_id_of(resource)?, &key_id);
+    let mut attributes = BTreeMap::new();
+    attributes.insert("ApiKey".to_string(), key_id.clone());
+    attributes.insert(API_KEY_ID.to_string(), key_id);
+    attributes.insert("Arn".to_string(), arn.clone());
+    Ok(Created {
+        physical_resource_id: Some(arn),
+        attributes,
+    })
 }
 
 /// Delete the resource a stack created, addressed exactly as its own read is.
@@ -926,13 +1243,42 @@ fn addressed(kind: Kind, resource: &StoredResource) -> Result<Option<String>, Re
         ),
         Kind::Resolver => resolver_uri(resource)?,
         Kind::FunctionConfiguration => function_uri(resource)?,
-        Kind::ApiKey => format!(
-            "{}/apikeys/{}",
-            api_uri(&api_id_of(resource)?),
-            percent_encoded(&resource.physical_resource_id)
-        ),
+        Kind::ApiKey => api_key_uri(resource)?,
     };
     Ok(Some(uri))
+}
+
+/// The URI that addresses one API key, as `UpdateApiKey` and `DeleteApiKey` bind it: the API
+/// that holds the key, and the key's own id — which is the attribute the create recorded, the
+/// resource's physical id being the ARN built on it.
+fn api_key_uri(resource: &StoredResource) -> Result<String, Refusal> {
+    let key_id = resource
+        .attributes
+        .get(API_KEY_ID)
+        .filter(|id| !id.is_empty())
+        .cloned()
+        .unwrap_or_else(|| last_segment(&resource.physical_resource_id).to_string());
+    if key_id.is_empty() {
+        return Err(Refusal {
+            code: MISSING_PROPERTY.to_string(),
+            message: format!(
+                "the {} this stack created carries no {API_KEY_ID}, so AppSync cannot be asked \
+                 about it",
+                resource.resource_type
+            ),
+        });
+    }
+    Ok(format!(
+        "{}/apikeys/{}",
+        api_uri(&api_id_of(resource)?),
+        percent_encoded(&key_id)
+    ))
+}
+
+/// The last `/`-separated segment of an identifier, which is the key id an API key's ARN ends
+/// in.
+fn last_segment(identifier: &str) -> &str {
+    identifier.rsplit('/').next().unwrap_or(identifier)
 }
 
 /// The API id one of these resources belongs to: the one its declaration names, and for the

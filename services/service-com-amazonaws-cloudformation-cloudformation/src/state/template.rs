@@ -2854,6 +2854,29 @@ pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
         crate::state::provisioning::appsync_domain_names::APPSYNC_DOMAIN_NAME => {
             &["CertificateArn"]
         }
+        // Every child of an AppSync GraphQL API lives UNDER the API its `ApiId` names: that id
+        // is the first URI label of every call on the child — the create included — and that
+        // service publishes no call that moves one to another API, so a declaration restating
+        // it asks for a DIFFERENT resource. A RESOLVER is attached to one field of one type,
+        // which `UpdateResolver` addresses it by and takes no new value for, so restating
+        // either asks for a different resolver too. (A data source's NAME is in that same
+        // position through [`name_is_create_only`]: `UpdateDataSource` addresses a data source
+        // BY its name and takes no new one.)
+        APPSYNC_GRAPHQL_SCHEMA
+        | APPSYNC_DATA_SOURCE
+        | APPSYNC_FUNCTION_CONFIGURATION
+        | APPSYNC_API_KEY => &[APPSYNC_API_ID_PROPERTY],
+        APPSYNC_RESOLVER => &[
+            APPSYNC_API_ID_PROPERTY,
+            APPSYNC_TYPE_NAME_PROPERTY,
+            APPSYNC_FIELD_NAME_PROPERTY,
+        ],
+        // A GraphQL API is of the KIND it was created as and is reachable from where its
+        // create said: `apiType` and `visibility` are members of `CreateGraphqlApi` and of no
+        // member of `UpdateGraphqlApi`, so a declaration restating either asks for a different
+        // API. (Its NAME is not one of them: that update takes a new one — see
+        // [`name_is_create_only`].)
+        APPSYNC_GRAPHQL_API => &["ApiType", "Visibility"],
         // An AppConfig environment and configuration profile belong to the application their
         // `ApplicationId` names, and a profile reads its configuration from the source its
         // `LocationUri` and `Type` fix: each is a member of that type's create and of no
@@ -3105,6 +3128,14 @@ pub fn name_is_create_only(resource_type: &str) -> bool {
             | AMPLIFYUIBUILDER_COMPONENT
             | AMPLIFYUIBUILDER_FORM
             | AMPLIFYUIBUILDER_THEME
+            // An AppSync GraphQL API and a pipeline function of one are two more:
+            // `UpdateGraphqlApi` takes an `apiId` together with a new required `name`, and
+            // `UpdateFunction` a `functionId` together with a new required `name` — each
+            // resource being identified by the id AppSync minted for it. Renaming one is a
+            // modification of it, not a recreation. (A DATA SOURCE is not: `UpdateDataSource`
+            // addresses it BY its name, so the name is part of its identity.)
+            | APPSYNC_GRAPHQL_API
+            | APPSYNC_FUNCTION_CONFIGURATION
             // A BACKUP GATEWAY hypervisor is in that same position: `UpdateHypervisor` takes
             // the `HypervisorArn` that service minted together with a new `Name`, so renaming
             // one is a modification of it rather than a recreation.

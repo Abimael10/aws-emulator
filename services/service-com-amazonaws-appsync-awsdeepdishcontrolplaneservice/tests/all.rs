@@ -81,6 +81,8 @@ mod environment_variables;
 mod error_contract;
 #[path = "all/evaluate_code.rs"]
 mod evaluate_code;
+#[path = "all/evaluate_code_context_arguments.rs"]
+mod evaluate_code_context_arguments;
 #[path = "all/event_api.rs"]
 mod event_api;
 #[path = "all/event_api_authorization_gate.rs"]
@@ -115,6 +117,8 @@ mod graphql_api_create_rules;
 mod graphql_api_environment_variables_authorization;
 #[path = "all/graphql_api_field_logging.rs"]
 mod graphql_api_field_logging;
+#[path = "all/graphql_api_introspection_fields.rs"]
+mod graphql_api_introspection_fields;
 #[path = "all/graphql_api_lifecycle.rs"]
 mod graphql_api_lifecycle;
 #[path = "all/graphql_api_mapping_template_resolvers.rs"]

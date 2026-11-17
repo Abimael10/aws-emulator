@@ -170,11 +170,32 @@ const ERRORS_MEMBER: &str = "errors";
 /// descent is bounded in host code rather than by what the document asks for.
 const MAX_SELECTION_DEPTH: usize = 16;
 
-/// How many resolvers one request may run.
+/// How many fields one request may run a resolver for, and how many ENGINE RUNS those fields
+/// may make between them.
 ///
-/// An emulator resource guard, NOT an AWS quota, for the same reason as the depth: each run
-/// is a fresh engine, so the number of them one request can ask for is bounded here.
+/// Emulator resource guards, NOT AWS quotas: each run is a fresh engine with its own bounds,
+/// and one field's resolver expands into a run per step of it — the before step, each function
+/// of a pipeline and the after step — so the number of runs a request can ask for is the
+/// PRODUCT of the fields it selects and the steps each one carries. Both factors are counted
+/// down here rather than either alone, and a field that meets the second bound is reported as
+/// the field that met it rather than being run.
 const MAX_RESOLVER_RUNS: usize = 64;
+const MAX_ENGINE_RUNS: usize = 256;
+
+/// How long ALL the APPSYNC_JS evaluations of ONE request may be STARTED over, between them.
+///
+/// The same guard the mapping templates of one request share ([`MAX_TEMPLATE_RUNTIME`]), for
+/// the same reason: every evaluation is handed to a blocking worker with a budget of its own,
+/// so what one request can occupy is bounded by this span rather than by the sum of the
+/// budgets of the runs it asks for. A field whose step would start past it is reported as the
+/// field that met the bound.
+const MAX_ENGINE_RUNTIME: ::std::time::Duration = ::std::time::Duration::from_secs(10);
+
+/// How many steps of a `PIPELINE` resolver one field may run: "Functions per pipeline
+/// resolver" is 10 in AWS AppSync's own service quotas, so a stored resolver naming more
+/// steps than this is one no AppSync pipeline has, and the field is reported as the field that
+/// met the bound rather than run with the steps that fit.
+const MAX_PIPELINE_STEPS: usize = 10;
 
 /// How many fields one selection set may select, for the same reason.
 const MAX_SELECTED_FIELDS: usize = 64;
@@ -214,6 +235,31 @@ const MAX_ARGUMENT_BYTES: usize = 4 * 1024 * 1024;
 /// not, and why a document past this is refused before anything is built.
 const MAX_SELECTED_NODES: usize = 1_024;
 
+/// How many bytes of INTROSPECTION answer one request may be given, every introspection
+/// field of it together.
+///
+/// An emulator resource guard of the same kind as [`MAX_ARGUMENT_BYTES`], and the one that
+/// bounds the AMPLIFICATION rather than one answer: `__schema` answers the API's whole type
+/// system, whose size is the schema the owner installed, and how many introspection fields a
+/// document selects is the REQUEST's to choose ([`MAX_SELECTED_FIELDS`] per level,
+/// [`MAX_SELECTED_NODES`] in all) — so the PRODUCT of the two is counted down from here
+/// rather than either factor alone. A field whose answer no longer fits resolves to `null`
+/// and is reported as the field that met the bound.
+const MAX_INTROSPECTED_BYTES: usize = 4 * 1024 * 1024;
+
+/// How many bytes of ANSWER one request may be built, every field of every level together.
+///
+/// An emulator resource guard of the same kind as the three above, and the one that bounds
+/// what the result HOLDS: a response key is the selection's own alias, so one field may be
+/// selected many times in a selection set, and each selection is answered by a value of its
+/// own — a member of the value its parent resolved to, an element of a list, or a projection
+/// of one — so the bytes a result accumulates are the request's to choose along both the
+/// width and the depth of its selection tree. Every value a field resolves to is counted down
+/// from here as it is placed in the result ([`Execution::affordable_answer`]), the projected
+/// values of an introspection answer among them, and the field that exhausts it resolves to
+/// `null` and is reported as the field that met the bound.
+const MAX_ANSWER_BYTES: usize = 32 * 1024 * 1024;
+
 /// How long ALL the mapping templates of ONE request may run, between them: the evaluations
 /// of one request share this, so a request selecting many template-defined fields cannot
 /// hold a thread for the sum of their own budgets.
@@ -252,16 +298,21 @@ pub async fn execute(context: &PlaneContext, request: &GraphqlRequest) -> Answer
         Err(refusal) => return Answer::refused(refusal),
     };
     // The type the operation's fields belong to: the type the API's schema binds as that
-    // operation's root, which is what says WHICH resolvers the selection addresses.
-    let Some(root_type) = context
+    // operation's root, which is what says WHICH resolvers the selection addresses — beside
+    // the QUERY root, which is the type the introspection system's own two root fields are
+    // fields of ([`Execution::introspected`]).
+    let Some((root_type, query_root)) = context
         .state
         .lock()
         .graphql_apis
         .get(&context.api_id)
-        .map(|api| match kind {
-            OperationKind::Query => api.query_root_type(),
-            OperationKind::Mutation => api.mutation_root_type(),
-            OperationKind::Subscription => api.subscription_root_type(),
+        .map(|api| {
+            let root_type = match kind {
+                OperationKind::Query => api.query_root_type(),
+                OperationKind::Mutation => api.mutation_root_type(),
+                OperationKind::Subscription => api.subscription_root_type(),
+            };
+            (root_type, api.query_root_type())
         })
     else {
         return Answer::refused(crate::state::API_NOT_FOUND_MESSAGE.to_string());
@@ -272,7 +323,12 @@ pub async fn execute(context: &PlaneContext, request: &GraphqlRequest) -> Answer
     let mut execution = Execution {
         context,
         request,
+        query_root,
+        introspected: None,
+        introspected_bytes: MAX_INTROSPECTED_BYTES,
+        answer_bytes: MAX_ANSWER_BYTES,
         runs: 0,
+        engine_runs: 0,
         errors: Vec::new(),
         started: ::std::time::Instant::now(),
         traced: super::field_logs::captures_field_logs(&context.state.lock(), &context.api_id),
@@ -281,6 +337,7 @@ pub async fn execute(context: &PlaneContext, request: &GraphqlRequest) -> Answer
         steps: Vec::new(),
         appended: Vec::new(),
         template_deadline: ::std::time::Instant::now() + MAX_TEMPLATE_RUNTIME,
+        engine_deadline: ::std::time::Instant::now() + MAX_ENGINE_RUNTIME,
     };
     let data = execution
         .resolve_fields(&root_type, &Json::Null, &fields, Vec::new(), 0)
@@ -356,8 +413,22 @@ fn read_operation(request: &GraphqlRequest) -> Result<(OperationKind, Vec<Select
 struct Execution<'a> {
     context: &'a PlaneContext,
     request: &'a GraphqlRequest,
+    /// The type the API's schema binds as its QUERY root, which is the type the introspection
+    /// system's own `__schema` and `__type` are fields of.
+    query_root: String,
+    /// The API's type system as introspection reports it, rendered at most ONCE per request
+    /// ([`Execution::introspection_document`]) — `None` until a selected field needs it.
+    introspected: Option<Json>,
+    /// How many more bytes of INTROSPECTION answer this request may be given, which
+    /// [`MAX_INTROSPECTED_BYTES`] starts at.
+    introspected_bytes: usize,
+    /// How many more bytes of ANSWER it may be built, which [`MAX_ANSWER_BYTES`] starts at.
+    answer_bytes: usize,
     /// How many resolvers this request has run, which [`MAX_RESOLVER_RUNS`] bounds.
     runs: usize,
+    /// How many ENGINE RUNS its fields have made between them, which [`MAX_ENGINE_RUNS`]
+    /// bounds.
+    engine_runs: usize,
     /// The errors of the fields that did not resolve, in the order they were resolved.
     errors: Vec<Json>,
     /// When this execution began, which every field's own offset is measured from.
@@ -381,6 +452,9 @@ struct Execution<'a> {
     /// each evaluation is given what is left of it, so the PRODUCT of the fields a request
     /// selects and the templates each one runs is bounded, not just each run.
     template_deadline: ::std::time::Instant,
+    /// The same for its APPSYNC_JS evaluations: no step of a resolver is STARTED past it
+    /// ([`MAX_ENGINE_RUNTIME`]).
+    engine_deadline: ::std::time::Instant,
 }
 
 impl Execution<'_> {
@@ -405,6 +479,9 @@ impl Execution<'_> {
                 let value = self
                     .resolve_field(type_name, source, field, &field_path, depth)
                     .await;
+                // What the RESULT holds is counted down in host code, for the reason
+                // [`MAX_ANSWER_BYTES`] records: every value placed in it passes here.
+                let value = self.affordable_answer(value, &field_path);
                 resolved.insert(field.key.clone(), value);
             }
             Json::Object(resolved)
@@ -439,6 +516,27 @@ impl Execution<'_> {
         {
             self.fault(unauthorized_field(path, type_name, &field.name));
             return Json::Null;
+        }
+        // The fields GraphQL's INTROSPECTION SYSTEM adds to every schema are answered from
+        // the API's own type system, before any resolver is looked for: no resolver can be
+        // attached to one, because each belongs to no type the schema declares
+        // ([`super::introspection`]).
+        if let Some((introspected_type, value)) = self.introspected(type_name, field) {
+            // What the introspection answers of ONE request may hold is counted down in host
+            // code, for the reason [`MAX_INTROSPECTED_BYTES`] records.
+            if !self.affordable_introspection(&value) {
+                self.fault(field_error(
+                    path,
+                    &format!("{TOO_MUCH_INTROSPECTION} {MAX_INTROSPECTED_BYTES} bytes."),
+                ));
+                return Json::Null;
+            }
+            if field.selections.is_empty() || value.is_null() {
+                return value;
+            }
+            return self
+                .projected(introspected_type, value, field, path, depth)
+                .await;
         }
         let plan = self.plan(type_name, &field.name);
         let resolver_arn = plan.as_ref().and_then(|plan| plan.arn.clone());
@@ -591,10 +689,115 @@ impl Execution<'_> {
         })
     }
 
+    /// What one of GraphQL's introspection fields answers for this field, as `(the
+    /// introspection type the value is of, the value)`, or `None` for a field that is none
+    /// of them.
+    ///
+    /// `__typename` is available on every object and names the type the selection is on;
+    /// `__schema` and `__type(name:)` are fields of the QUERY ROOT and report the type system
+    /// itself, so they are answered only where the selection is on that root. All three are
+    /// read off the one type-system snapshot this request renders
+    /// ([`Self::introspection_document`]).
+    fn introspected(
+        &mut self,
+        type_name: &str,
+        field: &SelectedField,
+    ) -> Option<(&'static str, Json)> {
+        use super::introspection;
+        match field.name.as_str() {
+            introspection::TYPENAME_FIELD => {
+                let named = introspection::type_name(self.introspection_document(), type_name);
+                Some(("", named))
+            }
+            introspection::SCHEMA_FIELD if type_name == self.query_root => Some((
+                introspection::SCHEMA_TYPE,
+                self.introspection_document().clone(),
+            )),
+            introspection::TYPE_FIELD if type_name == self.query_root => {
+                let name = field
+                    .arguments
+                    .get(introspection::TYPE_NAME_ARGUMENT)
+                    .and_then(Json::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let reported = introspection::named_type(self.introspection_document(), &name);
+                Some((introspection::TYPE_TYPE, reported))
+            }
+            _ => None,
+        }
+    }
+
+    /// `value` where this request's result may still hold it, and `null` where it may not —
+    /// spending what it holds, and reporting the field that met the bound.
+    ///
+    /// Weighed as the bytes the value CARRIES, through the same serializer that writes the
+    /// response, so what is counted is what the result holds. Every value the execution
+    /// places in the result is weighed here, at every level, because what a nested selection
+    /// accumulates is as much the request's choice as the width of one level is.
+    fn affordable_answer(&mut self, value: Json, path: &[Json]) -> Json {
+        let weight = ::serde_json::to_string(&value)
+            .map(|serialized| serialized.len())
+            .unwrap_or(usize::MAX);
+        if weight > self.answer_bytes {
+            self.fault(field_error(
+                path,
+                &format!("{TOO_MUCH_ANSWER} {MAX_ANSWER_BYTES} bytes."),
+            ));
+            return Json::Null;
+        }
+        self.answer_bytes -= weight;
+        value
+    }
+
+    /// Whether the introspection answer `value` fits in what this request may still be given,
+    /// spending it if so.
+    ///
+    /// Weighed as the bytes the answer CARRIES — the length of the value's own serialized
+    /// form, through the same serializer that writes the response — so what is counted is
+    /// what the request would be given. A value that cannot be serialized at all is one this
+    /// request is not given either.
+    fn affordable_introspection(&mut self, value: &Json) -> bool {
+        let Ok(serialized) = ::serde_json::to_string(value) else {
+            return false;
+        };
+        let weight = serialized.len();
+        if weight > self.introspected_bytes {
+            return false;
+        }
+        self.introspected_bytes -= weight;
+        true
+    }
+
+    /// The API's type system as introspection reports it, rendered at most ONCE per request:
+    /// one GraphQL request is executed against one schema, so a document selecting many
+    /// introspection fields reads one snapshot of it rather than rendering it per field.
+    ///
+    /// `Json::Null` for an API that holds no type system, and for one this service no longer
+    /// holds at all.
+    fn introspection_document(&mut self) -> &Json {
+        if self.introspected.is_none() {
+            let rendered = {
+                let store = self.context.state.lock();
+                store
+                    .graphql_apis
+                    .get(&self.context.api_id)
+                    .map(super::introspection::schema)
+                    .unwrap_or(Json::Null)
+            };
+            self.introspected = Some(rendered);
+        }
+        self.introspected.get_or_insert(Json::Null)
+    }
+
     /// The name of the type `field_name` of `type_name` resolves to, or the empty name when
     /// the API's schema declares none — a field whose type is unknown addresses no
     /// resolver, so its sub-selection is taken from the value it resolved to.
     fn field_type_name(&self, type_name: &str, field_name: &str) -> String {
+        // A field of one of the INTROSPECTION system's own types resolves to the type that
+        // system declares for it, which the API's schema declares nothing about.
+        if let Some(named) = super::introspection::field_type(type_name, field_name) {
+            return named.to_string();
+        }
         let store = self.context.state.lock();
         store
             .graphql_apis
@@ -658,17 +861,18 @@ impl Execution<'_> {
             };
             return self.run_step(&step, &base, &mut stash, &Json::Null).await;
         }
+        // A pipeline runs a step per function it names, and no pipeline of this service runs
+        // more of them than AppSync holds one ([`MAX_PIPELINE_STEPS`]).
+        if plan.functions.len() > MAX_PIPELINE_STEPS {
+            return Err(format!("{TOO_MANY_STEPS} {MAX_PIPELINE_STEPS}.").into());
+        }
         // The pipeline's BEFORE step: what it produces is the `ctx.prev.result` the first
         // function is handed.
         let mut previous = match (&plan.code, &plan.templates) {
             (Some(code), _) => {
-                returned(
-                    code,
-                    REQUEST_FUNCTION,
-                    &step_context(&base, &stash, &Json::Null, None),
-                    &mut stash,
-                )
-                .await?
+                let context = step_context(&base, &stash, &Json::Null, None);
+                self.evaluated(code, REQUEST_FUNCTION, &context, &mut stash)
+                    .await?
             }
             (None, Some(templates)) => match &templates.request {
                 Some(template) => {
@@ -691,13 +895,11 @@ impl Execution<'_> {
         }
         // And its AFTER step, over what the last function produced.
         match (&plan.code, &plan.templates) {
-            (Some(code), _) => Ok(returned(
-                code,
-                RESPONSE_FUNCTION,
-                &step_context(&base, &stash, &previous, Some(&previous)),
-                &mut stash,
-            )
-            .await?),
+            (Some(code), _) => {
+                let context = step_context(&base, &stash, &previous, Some(&previous));
+                self.evaluated(code, RESPONSE_FUNCTION, &context, &mut stash)
+                    .await
+            }
             (None, Some(templates)) => match &templates.response {
                 Some(template) => {
                     let context = step_context(&base, &stash, &previous, Some(&previous));
@@ -733,24 +935,45 @@ impl Execution<'_> {
             };
         };
         let recorded = self.recorded_step(&step.name);
-        let requested = returned(
-            code,
-            REQUEST_FUNCTION,
-            &step_context(base, stash, &Json::Null, Some(previous)),
-            stash,
-        )
-        .await?;
+        let context = step_context(base, stash, &Json::Null, Some(previous));
+        let requested = self
+            .evaluated(code, REQUEST_FUNCTION, &context, stash)
+            .await?;
         self.record_request(recorded, &requested);
         let result = self.data_source_result(step, &requested)?;
-        let answered = returned(
-            code,
-            RESPONSE_FUNCTION,
-            &step_context(base, stash, &result, Some(previous)),
-            stash,
-        )
-        .await?;
+        let context = step_context(base, stash, &result, Some(previous));
+        let answered = self
+            .evaluated(code, RESPONSE_FUNCTION, &context, stash)
+            .await?;
         self.record_response(recorded, &answered);
         Ok(answered)
+    }
+
+    /// ONE APPSYNC_JS evaluation of this request, charged against what the request may run
+    /// ([`MAX_ENGINE_RUNS`]) and started only inside the span its evaluations share
+    /// ([`MAX_ENGINE_RUNTIME`]).
+    ///
+    /// Every evaluation of a resolver's code goes through here, so one request's runs are
+    /// counted in one place however many steps its fields expand into.
+    async fn evaluated(
+        &mut self,
+        code: &str,
+        function: &str,
+        context: &Json,
+        stash: &mut Json,
+    ) -> Result<Json, Failure> {
+        if self.engine_runs >= MAX_ENGINE_RUNS {
+            return Err(format!("{TOO_MANY_ENGINE_RUNS} {MAX_ENGINE_RUNS}.").into());
+        }
+        if ::std::time::Instant::now() >= self.engine_deadline {
+            return Err(format!(
+                "{EVALUATIONS_TOOK_TOO_LONG} {:?}.",
+                MAX_ENGINE_RUNTIME
+            )
+            .into());
+        }
+        self.engine_runs = self.engine_runs.saturating_add(1);
+        Ok(returned(code, function, context, stash).await?)
     }
 
     /// Run ONE step that is defined by MAPPING TEMPLATES: evaluate the request template to
@@ -1101,6 +1324,10 @@ fn step_data_source(api: &GraphqlApiRecord, name: Option<&str>) -> Option<StepDa
 ///
 /// A function the API no longer holds contributes a step with no definition, which is
 /// reported as a step that could not run rather than skipped: the pipeline names it.
+///
+/// At most one step past [`MAX_PIPELINE_STEPS`] is built, so a stored pipeline naming more of
+/// them than any AppSync pipeline holds costs nothing to read and is reported as the bound it
+/// met ([`Execution::run`]) rather than run with the steps that fit.
 fn pipeline_steps(api: &GraphqlApiRecord, resolver: &ResolverRecord) -> Vec<PipelineStep> {
     resolver
         .pipeline_config
@@ -1108,6 +1335,7 @@ fn pipeline_steps(api: &GraphqlApiRecord, resolver: &ResolverRecord) -> Vec<Pipe
         .and_then(|pipeline| pipeline.functions.clone())
         .unwrap_or_default()
         .iter()
+        .take(MAX_PIPELINE_STEPS.saturating_add(1))
         .map(|function_id| match api.functions.get(function_id) {
             Some(function) => PipelineStep {
                 name: function.name.clone(),
@@ -1617,8 +1845,14 @@ const TOO_MANY_FIELDS: &str = "A selection set carries at most";
 const TOO_MANY_NODES: &str = "One request selects at most";
 const CYCLIC_FRAGMENT: &str = "This document spreads a fragment into itself:";
 const TOO_MANY_RUNS: &str = "One request runs at most";
+const TOO_MANY_ENGINE_RUNS: &str = "One request's fields run the APPSYNC_JS runtime at most";
+const TOO_MANY_STEPS: &str = "A pipeline resolver of this endpoint runs at most";
+const EVALUATIONS_TOOK_TOO_LONG: &str =
+    "This request's resolvers ran for longer than this endpoint evaluates them in:";
 const TOO_MANY_ERRORS: &str = "This request's result reports at most";
 const TOO_MUCH_ARGUMENT: &str = "One request's selected arguments hold at most";
+const TOO_MUCH_INTROSPECTION: &str = "One request's introspection answers hold at most";
+const TOO_MUCH_ANSWER: &str = "One request's result holds at most";
 const NO_DEFINITION: &str = "This field's resolver carries no definition to run.";
 const TEMPLATES_TOOK_TOO_LONG: &str =
     "This request's mapping templates ran for longer than this endpoint evaluates them in:";

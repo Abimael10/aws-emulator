@@ -100,7 +100,8 @@ use super::types::*;
 pub mod appsync_js;
 
 use appsync_js::{
-    CodeFault, Evaluation, Outcome, DEFAULT_FUNCTION, EVALUATED_FUNCTIONS, STASH_MEMBER,
+    CodeFault, Evaluation, Outcome, ARGUMENTS_MEMBER, ARGUMENTS_SHORT_MEMBER, DEFAULT_FUNCTION,
+    EVALUATED_FUNCTIONS, STASH_MEMBER,
 };
 
 /// The only `runtimeVersion` the APPSYNC_JS runtime has: "The `version` of the runtime to
@@ -203,7 +204,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // invocation": a context that is not a map carries no member the code could read,
         // so it is refused before anything runs.
         let context = match ::serde_json::from_str::<::serde_json::Value>(&input.context) {
-            Ok(context) if context.is_object() => with_stash(context),
+            Ok(context) if context.is_object() => resolver_context(context),
             _ => return Err(invalid_member("context")),
         };
 
@@ -211,14 +212,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// `context` with a stash on it, so the evaluated code can write to `ctx.stash` the way a
-/// resolver does: "A single stash object lives through a single resolver run", and the
-/// response reports it as the run left it. A context that already carries one keeps it.
-fn with_stash(mut context: ::serde_json::Value) -> ::serde_json::Value {
+/// The context the evaluated code is RUN with: the one the request states, with the members
+/// a resolver's own `ctx` carries that are not values a caller states.
+///
+/// Two of them:
+///
+/// * the STASH, so the code can write to `ctx.stash` the way a resolver does — "A single
+///   stash object lives through a single resolver run", and the response reports it as the
+///   run left it;
+/// * the arguments map under BOTH names it is read by. The map a field's selection carries
+///   is one value with two names in an APPSYNC_JS `ctx`, so code reading either name reads
+///   the arguments the request stated, whichever name it stated them under.
+///
+/// A context that already states a member keeps the value it states; only a name it leaves
+/// out is filled in.
+fn resolver_context(mut context: ::serde_json::Value) -> ::serde_json::Value {
     if let Some(members) = context.as_object_mut() {
         members
             .entry(STASH_MEMBER)
             .or_insert_with(|| ::serde_json::Value::Object(::serde_json::Map::new()));
+        for (name, alias) in [
+            (ARGUMENTS_MEMBER, ARGUMENTS_SHORT_MEMBER),
+            (ARGUMENTS_SHORT_MEMBER, ARGUMENTS_MEMBER),
+        ] {
+            if let Some(arguments) = members.get(name).cloned() {
+                members.entry(alias).or_insert(arguments);
+            }
+        }
     }
     context
 }
