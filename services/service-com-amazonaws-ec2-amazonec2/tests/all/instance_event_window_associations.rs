@@ -42,7 +42,7 @@ use service_com_amazonaws_ec2_amazonec2 as ec2;
 use ec2::state::{
     availability_zones_in_region, DEFAULT_INSTANCE_TYPE, INSTANCE_EVENT_WINDOW_STATE_ACTIVE,
     INSTANCE_EVENT_WINDOW_STATE_ASSOCIATING, INSTANCE_EVENT_WINDOW_STATE_DISASSOCIATING,
-    INVALID_INSTANCE_EVENT_WINDOW_ID_MALFORMED, INVALID_INSTANCE_EVENT_WINDOW_ID_NOT_FOUND,
+    INVALID_INSTANCE_EVENT_WINDOW_ID_DOT_NOT_FOUND, INVALID_INSTANCE_EVENT_WINDOW_ID_MALFORMED,
     INVALID_HOST_ID_NOT_FOUND, MAX_EVENT_WINDOW_TARGET_TAGS, MAX_TAG_KEY_CHARS, TRANSITION_DELAY,
 };
 use smithy_server_runtime::MultiServiceRouter;
@@ -583,7 +583,7 @@ async fn a_refused_change_carries_ec2s_code_and_writes_nothing() {
             case: "an event window id the account holds no window for".to_string(),
             action: "AssociateInstanceEventWindow",
             params: change_params(UNKNOWN_WINDOW, &held),
-            code: INVALID_INSTANCE_EVENT_WINDOW_ID_NOT_FOUND,
+            code: INVALID_INSTANCE_EVENT_WINDOW_ID_DOT_NOT_FOUND,
             window: tagged.clone(),
             held: Some(held.clone()),
         },

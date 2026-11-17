@@ -144,7 +144,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             instance_event_window_payload_bytes, one_event_window_target_kind_required,
             require_event_window_target_capacity, require_event_window_target_id_count,
             require_known_instance, require_one_event_window_target_kind, require_service_state,
-            unresolvable_host_id, unresolvable_instance_event_window_id,
+            unresolvable_addressed_instance_event_window_id, unresolvable_host_id,
             validate_event_window_target_tags, with_target_ids, with_target_tags,
             EventWindowTargetKind, INSTANCE_EVENT_WINDOW_STATE_ASSOCIATING, MAX_STORED_BYTES,
             TRANSITION_DELAY,
@@ -180,7 +180,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let record = store
             .instance_event_windows
             .get(window_id)
-            .ok_or_else(|| unresolvable_instance_event_window_id(window_id))?;
+            .ok_or_else(|| unresolvable_addressed_instance_event_window_id(window_id))?;
         let held = record.view.association_target.clone().unwrap_or_default();
 
         // "Only one type of target ... can be associated with an event window" is a rule

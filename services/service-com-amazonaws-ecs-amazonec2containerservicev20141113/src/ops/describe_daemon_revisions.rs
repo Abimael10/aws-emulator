@@ -7,14 +7,14 @@
 //! the rollout that captured it was deploying — never what the daemon happens to run now.
 //! "Daemon revisions are immutable": nothing rewrites one.
 //!
-//! A daemon-revision ARN carries the cluster whose daemon the revision belongs to
+//! A daemon-revision ARN carries the daemon whose history the revision belongs to
 //! (`daemon-revision/<cluster>/<daemon>/<id>`), so what an entry can identify is settled
 //! before anything is looked up: an entry that is not shaped like such an ARN, and one whose
-//! cluster this account holds no record of, could name no revision of this account at all,
+//! daemon this account holds no record of, could name no revision of this account at all,
 //! and both are refused as the invalid revision ARN they are
-//! (`InvalidParameterException`). An ARN that COULD name a revision of this account and names
-//! none is a `MISSING` failure of its own entry rather than a refusal that would lose the
-//! revisions the request did resolve.
+//! (`InvalidParameterException`). An ARN under a daemon this account DOES hold that names no
+//! stored revision is a `MISSING` failure of its own entry rather than a refusal that would
+//! lose the revisions the request did resolve.
 //!
 //! ## Shape of an operation
 //!
@@ -186,7 +186,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Each entry is "the ARN of the daemon revision" and nothing else, so what it can
         // identify is settled before any revision is looked up: a value that is not shaped
         // like a revision's ARN ([`crate::state::is_daemon_revision_arn`]), and one whose
-        // cluster this account holds no record of, could name no revision of this account at
+        // daemon this account holds no record of, could name no revision of this account at
         // all, and both are refused as the unusable ARN the member was given rather than
         // reported as a revision that happens to be missing or as the cluster the ARN
         // carries. The `failures` channel answers for an ARN that COULD name a revision of
@@ -211,7 +211,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = state.lock();
         guard.advance_clock(::std::time::SystemTime::now());
 
-        if guard.names_a_missing_cluster(
+        // An entry whose DAEMON this account holds no record of — a cluster it never
+        // created, or a cluster that holds no such daemon — could name no revision of this
+        // account either, so it earns the same refusal as an entry of the wrong shape.
+        if guard.names_an_unheld_daemon(
             input.daemon_revision_arns.iter().map(String::as_str),
             crate::state::DAEMON_REVISION_RESOURCE_TYPE,
         ) {

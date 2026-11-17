@@ -6,14 +6,14 @@
 //! of them adds up to per capacity provider, and the state of the failure detectors its own
 //! deployment configuration turned on.
 //!
-//! A daemon-deployment ARN carries the cluster whose daemon the rollout belongs to
+//! A daemon-deployment ARN carries the daemon whose rollout it is
 //! (`daemon-deployment/<cluster>/<daemon>/<id>`), so what an entry can identify is settled
 //! before anything is looked up: an entry that is not shaped like such an ARN, and one
-//! whose cluster this account holds no record of, could name no rollout of this account at
+//! whose daemon this account holds no record of, could name no rollout of this account at
 //! all, and both are refused as the unusable parameter the member was given
-//! (`InvalidParameterException`). An ARN that COULD name a rollout of this account and names
-//! none is a `MISSING` failure of its own entry rather than a refusal that would lose the
-//! deployments the request did resolve.
+//! (`InvalidParameterException`). An ARN under a daemon this account DOES hold that names no
+//! stored rollout is a `MISSING` failure of its own entry rather than a refusal that would
+//! lose the deployments the request did resolve.
 //!
 //! ## Shape of an operation
 //!
@@ -215,11 +215,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = state.lock();
         guard.advance_clock(now);
 
-        // An entry whose CLUSTER this account holds no record of could name no rollout of
-        // this account either, so it is the same unusable ARN and earns the same refusal;
-        // the `failures` channel answers for an ARN that COULD name a rollout of this
-        // account and names none.
-        if guard.names_a_missing_cluster(
+        // An entry whose DAEMON this account holds no record of could name no rollout of
+        // this account either — a cluster that was never created, or a cluster that holds no
+        // such daemon — so it is the same unusable ARN and earns the same refusal; the
+        // `failures` channel answers for an entry under a daemon this account DOES hold
+        // whose id resolves to no rollout.
+        if guard.names_an_unheld_daemon(
             input.daemon_deployment_arns.iter().map(String::as_str),
             crate::state::DAEMON_DEPLOYMENT_RESOURCE_TYPE,
         ) {

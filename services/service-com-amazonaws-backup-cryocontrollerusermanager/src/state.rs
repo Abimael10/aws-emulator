@@ -3901,6 +3901,31 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
         vault_account_id.is_none_or(|account| account == ::engine::emulator_account_id())
     }
 
+    /// The SAME account-scoping decision on its own, for a call that has ANOTHER
+    /// resource to judge besides the vault it addresses: `Ok(())` when
+    /// `vault_account_id` is this account's or absent, and the refusal otherwise.
+    ///
+    /// `BackupVaultAccountId` is the documented cross-account path: the member states
+    /// WHOSE vault the call is about, so a request naming another account's is a
+    /// request to act in that account — which only that account can grant — and AWS
+    /// Backup refuses it in the one fixed sentence it refuses an invisible vault with
+    /// ([`Self::visible_vault`]), which quotes nothing of the request.
+    ///
+    /// It needs no vault and no store, which is why it can be taken FIRST: a call the
+    /// caller may not make in that account at all is answered about the account it
+    /// addressed, ahead of every other resource the request names
+    /// ([`super::authorized_recovery_point`]) and ahead of any lookup. A reader with
+    /// nothing else to judge takes the same decision inside [`Self::visible_vault`],
+    /// from the same predicate ([`Self::is_own_account`]), so the two cannot drift.
+    pub fn authorized_vault_account(
+        vault_account_id: Option<&str>,
+    ) -> Result<(), crate::scaffolded::AccessDeniedException> {
+        if Self::is_own_account(vault_account_id) {
+            return Ok(());
+        }
+        Err(crate::scaffolded::AccessDeniedException::insufficient_privileges())
+    }
+
     /// Materialise the transition the clock has already made due, for ONE job.
     ///
     /// This is the ONLY write a reporting operation performs: a job whose

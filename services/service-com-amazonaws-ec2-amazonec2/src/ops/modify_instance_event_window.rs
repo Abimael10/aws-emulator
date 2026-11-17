@@ -155,8 +155,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::state::{
             event_window_schedule_named, event_window_with_change,
             instance_event_window_limit_exceeded, instance_event_window_payload_bytes,
-            missing_parameter, require_service_state, unresolvable_instance_event_window_id,
-            InstanceEventWindowChange, MAX_STORED_BYTES,
+            missing_parameter, require_service_state,
+            unresolvable_addressed_instance_event_window_id, InstanceEventWindowChange,
+            MAX_STORED_BYTES,
         };
 
         // `ctx` carries request metadata only; this operation reads none of it — an event
@@ -204,11 +205,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An id this account holds no event window for has nothing to modify, and one that
         // is not an event window id at all is answered as malformed — the ordering every
         // resource of this service keeps
-        // ([`crate::state::unresolvable_instance_event_window_id`]).
+        // ([`crate::state::unresolvable_addressed_instance_event_window_id`]).
         let record = store
             .instance_event_windows
             .get(window_id)
-            .ok_or_else(|| unresolvable_instance_event_window_id(window_id))?;
+            .ok_or_else(|| unresolvable_addressed_instance_event_window_id(window_id))?;
 
         // A name, a cron expression and a list of time ranges are caller-chosen bytes the
         // store keeps for as long as the window does, and this call REPLACES them, so the

@@ -141,7 +141,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::state::{
             event_window_association_target, require_event_window_target_id_count,
             require_event_window_targets_named, require_service_state,
-            unresolvable_instance_event_window_id, validate_event_window_target_tags,
+            unresolvable_addressed_instance_event_window_id, validate_event_window_target_tags,
             without_target_ids, without_target_tags, INSTANCE_EVENT_WINDOW_STATE_DISASSOCIATING,
             TRANSITION_DELAY,
         };
@@ -176,7 +176,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let record = store
             .instance_event_windows
             .get(window_id)
-            .ok_or_else(|| unresolvable_instance_event_window_id(window_id))?;
+            .ok_or_else(|| unresolvable_addressed_instance_event_window_id(window_id))?;
         let held = record.view.association_target.clone().unwrap_or_default();
 
         // "Disassociates one or more targets from an event window": what is left is what the

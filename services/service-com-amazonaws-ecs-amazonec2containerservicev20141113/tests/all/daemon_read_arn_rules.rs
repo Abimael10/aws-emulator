@@ -13,11 +13,12 @@
 //!   daemon of any account;
 //! * a read whose required member is a LIST OF RESOURCE ARNS refuses an entry that could
 //!   identify no resource of this account — one that is not shaped like that resource's ARN,
-//!   and one whose cluster this account holds no record of — as the invalid parameter it is
+//!   and one whose DAEMON this account holds no record of (a cluster it never created, or a
+//!   cluster that holds no such daemon) — as the invalid parameter it is
 //!   (`InvalidParameterException`, with the sentence the member's own read words), and keeps
-//!   the `failures` channel for an entry that COULD name one and names none;
+//!   the `failures` channel for an entry under a daemon it DOES hold;
 //! * the ID in the last segment of such an ARN is MINTED by the service, so how it is spelled
-//!   is no part of what makes the ARN an identifier: an entry of that shape under a cluster
+//!   is no part of what makes the ARN an identifier: an entry of that shape under a daemon
 //!   this account holds is read as the resource it names whatever its id looks like, and an
 //!   id this store holds nothing under is one `MISSING` failure of its own entry;
 //! * a daemon write resolves the resources its own PARAMETERS name — the daemon task
@@ -280,13 +281,14 @@ async fn a_daemon_read_refuses_an_arn_that_could_identify_no_resource_of_this_ac
     for (operation, member, resource_type, expected) in ARN_LIST_READS {
         // The rows differ along WHAT about the ARN makes it name nothing: its not being an
         // ARN, its partition/vendor fields, its resource type, how many segments its
-        // resource path carries, the character set of the names in it, and the cluster it
-        // carries. How the ID is spelled is NOT one of them: the service mints it, so it is
-        // read as the identifier it is whatever it looks like
+        // resource path carries, the character set of the names in it, and the daemon it
+        // sits under — the cluster that was never created, and the daemon a cluster that WAS
+        // created does not hold. How the ID is spelled is NOT one of them: the service mints
+        // it, so it is read as the identifier it is whatever it looks like
         // ([`a_daemon_read_reads_an_id_it_holds_nothing_under_however_it_is_spelled`]). The
         // last row pairs an unusable entry with a usable one, so the refusal is of the
         // REQUEST and not of one entry's own report.
-        let rows: [(&str, Value); 11] = [
+        let rows: [(&str, Value); 12] = [
             ("a value that is no ARN at all", json!(["not-an-arn"])),
             (
                 "an ARN of another service",
@@ -349,6 +351,15 @@ async fn a_daemon_read_refuses_an_arn_that_could_identify_no_resource_of_this_ac
                     resource_type,
                     "daemon-nowhere",
                     "agents",
+                    &sequence_id(1)
+                )]),
+            ),
+            (
+                "a daemon the cluster this account holds does not hold",
+                json!([below_daemon(
+                    resource_type,
+                    CLUSTER,
+                    "nosuchdaemon",
                     &sequence_id(1)
                 )]),
             ),
@@ -695,5 +706,126 @@ async fn a_daemon_read_reads_an_id_it_holds_nothing_under_however_it_is_spelled(
                 "case {case:?}: expected the entry echoed as MISSING, got {body}"
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn a_daemon_read_refuses_an_entry_under_a_daemon_this_account_does_not_hold() {
+    let router = service();
+    const CLUSTER: &str = "daemon-unheld-daemons";
+    // A second cluster of this account that holds no daemon at all, so a row can differ
+    // along the DAEMON while the cluster it names is one this account created.
+    const EMPTY_CLUSTER: &str = "daemon-unheld-empty";
+    const CASE: &str = "setup";
+    create_cluster(&router, CLUSTER, CASE).await;
+    create_cluster(&router, EMPTY_CLUSTER, CASE).await;
+    let provider = managed_provider(&router, CLUSTER, "mi-unheld", CASE).await;
+    let definition = daemon_definition(&router, "daemonunhelddaemons", CASE).await;
+    let (deployment, revision) =
+        minted_daemon_arns(&router, CLUSTER, &provider, &definition, CASE).await;
+
+    for (operation, member, resource_type, expected) in ARN_LIST_READS {
+        // The ARNs this service MINTED for the daemon it holds, so every row below is
+        // answered against a store that does hold such resources.
+        let held = if resource_type == "daemon-deployment" {
+            deployment.clone()
+        } else {
+            revision.clone()
+        };
+        let reported = if resource_type == "daemon-deployment" {
+            ("daemonDeployments", "daemonDeploymentArn")
+        } else {
+            ("daemonRevisions", "daemonRevisionArn")
+        };
+
+        // The rows differ along WHY this account holds no such daemon: the cluster was
+        // never created, the cluster exists but holds no daemon, the cluster holds a
+        // daemon under another name, and the name it holds is a PREFIX of the name the
+        // entry carries. A `daemon-deployment`/`daemon-revision` exists only as part of a
+        // daemon's history, so when the daemon is not there no id under it can name one.
+        let rows: [(&str, String); 4] = [
+            (
+                "a cluster this account never created",
+                below_daemon(resource_type, "daemon-nowhere", "agents", &sequence_id(1)),
+            ),
+            (
+                "a cluster of this account that holds no daemon",
+                below_daemon(resource_type, EMPTY_CLUSTER, "agents", &sequence_id(1)),
+            ),
+            (
+                "a daemon this cluster does not hold",
+                below_daemon(resource_type, CLUSTER, "nosuchdaemon", &sequence_id(1)),
+            ),
+            (
+                "a daemon name the held daemon's name is a prefix of",
+                below_daemon(resource_type, CLUSTER, "agents-2", &sequence_id(1)),
+            ),
+        ];
+        for (row, entry) in rows {
+            let case = format!("{operation} given an entry under {row}");
+            let (code, message) =
+                refusal(&router, operation, json!({ member: [entry.clone()] }), &case).await;
+            assert_eq!(
+                (code.as_str(), message.as_str()),
+                (INVALID_PARAMETER, expected),
+                "case {case:?}: expected the sentence this read words for an unusable \
+                 {member} entry, got {code:?} with {message:?}"
+            );
+
+            // The same entry BESIDE the one that resolves: the refusal is of the REQUEST,
+            // so a usable entry does not turn it into a per-entry failure.
+            let case = format!("{case}, beside a usable entry");
+            let (code, message) = refusal(
+                &router,
+                operation,
+                json!({ member: [held.clone(), entry] }),
+                &case,
+            )
+            .await;
+            assert_eq!(
+                (code.as_str(), message.as_str()),
+                (INVALID_PARAMETER, expected),
+                "case {case:?}: expected the whole request to be refused, got {code:?} with \
+                 {message:?}"
+            );
+        }
+
+        // The other half of the rule: under a daemon this account DOES hold, an id the
+        // store holds nothing under is the per-entry `MISSING` failure at HTTP 200 —
+        // whatever that id looks like, here the nil uuid.
+        let unheld = below_daemon(
+            resource_type,
+            CLUSTER,
+            "agents",
+            "00000000-0000-0000-0000-000000000000",
+        );
+        let case = format!("{operation} given an unheld id under the daemon this account holds");
+        let body = ok(
+            &router,
+            operation,
+            json!({ member: [held.clone(), unheld.clone()] }),
+            &case,
+        )
+        .await;
+        assert_eq!(
+            list(&body, reported.0, &case)
+                .iter()
+                .map(|entry| string(entry, reported.1, &case))
+                .collect::<Vec<String>>(),
+            vec![held.clone()],
+            "case {case:?}: expected the resource the minted ARN names to still be reported, \
+             got {body}"
+        );
+        assert_eq!(
+            list(&body, "failures", &case)
+                .iter()
+                .map(|failure| (
+                    string(failure, "arn", &case),
+                    string(failure, "reason", &case)
+                ))
+                .collect::<Vec<(String, String)>>(),
+            vec![(unheld, "MISSING".to_string())],
+            "case {case:?}: expected the unheld id echoed as MISSING, got {body}"
+        );
     }
 }

@@ -27,7 +27,7 @@
 //! week), each published bound and one past it — so no row is the specification.
 
 use service_com_amazonaws_ec2_amazonec2::state::{
-    INVALID_INSTANCE_EVENT_WINDOW_ID_MALFORMED, INVALID_INSTANCE_EVENT_WINDOW_ID_NOT_FOUND,
+    INVALID_INSTANCE_EVENT_WINDOW_ID_DOT_NOT_FOUND, INVALID_INSTANCE_EVENT_WINDOW_ID_MALFORMED,
     MAX_EVENT_WINDOW_CRON_BYTES, MAX_EVENT_WINDOW_TIME_RANGES, MIN_EVENT_WINDOW_RANGE_HOURS,
     MIN_EVENT_WINDOW_TOTAL_HOURS,
 };
@@ -494,7 +494,7 @@ fn refusals() -> Vec<RefusalRow> {
             "an id the account holds no window for",
             Names::AnUnknownWindow,
             vec![p("Name", "renamed")],
-            INVALID_INSTANCE_EVENT_WINDOW_ID_NOT_FOUND,
+            INVALID_INSTANCE_EVENT_WINDOW_ID_DOT_NOT_FOUND,
         ),
         (
             "a value that is no event window id",

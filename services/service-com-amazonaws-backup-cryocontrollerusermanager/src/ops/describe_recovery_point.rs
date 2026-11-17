@@ -7,14 +7,20 @@
 //! ([`crate::state::ComAmazonawsBackupCryocontrollerusermanagerState::recovery_point_view`]),
 //! so this read and the vault's listing can never disagree about the same point.
 //!
-//! Four steps, in the order AWS Backup applies them:
+//! Five steps, in the order AWS Backup applies them:
 //!
 //! * a `RecoveryPointArn` that is not an ARN is a bad parameter value, not an
 //!   absent resource ([`crate::state::rejected_arn`]);
-//! * the authorization decision on the point the request names is taken before
-//!   anything is resolved ([`crate::state::authorized_recovery_point`]), so an
-//!   ARN of another account is refused `AccessDeniedException` (HTTP 403) rather
-//!   than disclosing whether that account holds it;
+//! * the ACCOUNT the read scopes itself to is decided next
+//!   ([`crate::state::ComAmazonawsBackupCryocontrollerusermanagerState::authorized_vault_account`]):
+//!   a request that addresses another account's vault with `BackupVaultAccountId`
+//!   asks to act in that account, so it is refused for lack of privileges — in the
+//!   service's own fixed sentence, which quotes nothing of the request — before
+//!   anything else it names is judged;
+//! * then the authorization decision on the point the request names
+//!   ([`crate::state::authorized_recovery_point`]), so an ARN of another account is
+//!   refused `AccessDeniedException` (HTTP 403) rather than disclosing whether that
+//!   account holds it;
 //! * the named vault is resolved by the step every vault-scoped read shares
 //!   ([`crate::state::ComAmazonawsBackupCryocontrollerusermanagerState::visible_vault`]),
 //!   which decides access before existence, so a vault the caller cannot see is
@@ -275,7 +281,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // The authorization decision on the recovery point this read reports,
+        // The ACCOUNT this read scopes itself to is decided first: a request that
+        // addresses another account's vault with `BackupVaultAccountId` asks to act
+        // in that account, which only that account could grant, so it is refused in
+        // the service's own fixed sentence before anything else the request names is
+        // judged. The decision lives beside the vault resolution that takes it again
+        // for a reader with nothing else to judge
+        // (`state::ComAmazonawsBackupCryocontrollerusermanagerState::authorized_vault_account`).
+        crate::state::ComAmazonawsBackupCryocontrollerusermanagerState::authorized_vault_account(
+            input.backup_vault_account_id.as_deref(),
+        )?;
+
+        // Then the authorization decision on the recovery point this read reports,
         // taken BEFORE anything is resolved: an ARN of another account is
         // refused for lack of privileges, so no read can disclose whether
         // another account holds the point it names. The refusal names the

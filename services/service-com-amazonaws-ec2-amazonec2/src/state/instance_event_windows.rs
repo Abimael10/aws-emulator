@@ -96,16 +96,30 @@ pub const MAX_INSTANCE_EVENT_WINDOWS: usize = 200;
 /// quota code takes ([`VOLUME_LIMIT_EXCEEDED`], [`LAUNCH_TEMPLATE_LIMIT_EXCEEDED`]).
 pub const INSTANCE_EVENT_WINDOW_LIMIT_EXCEEDED: &str = "InstanceEventWindowLimitExceeded";
 
-/// EC2's code for a request that named an event window id the account holds no window for.
+/// EC2's code for a DESCRIBE that could not resolve one of the event window ids it was
+/// given.
 ///
 /// ONE WORD, with neither the dot the rest of this service's `Invalid<Kind>Id.NotFound`
-/// codes carry nor the lower-case `Id` of the resource's own prefix: the event-window family
-/// spells this code `InvalidInstanceEventWindowIDNotFound`, which is what its recorded
-/// refusals answer — a caller catching the code by name sees it from every operation of the
-/// family, the describe included. The `.Malformed` half keeps the dotted spelling
-/// ([`INVALID_INSTANCE_EVENT_WINDOW_ID_MALFORMED`]), each half being recorded on its own.
+/// codes carry nor the lower-case `Id` of the resource's own prefix: the describe of this
+/// family spells this code `InvalidInstanceEventWindowIDNotFound`, which is what its
+/// recorded refusals answer, and the same one word reaches a caller that named an absent
+/// window in a tag request. An operation ADDRESSED TO ONE window answers the dotted
+/// spelling instead ([`INVALID_INSTANCE_EVENT_WINDOW_ID_DOT_NOT_FOUND`]), each half being
+/// recorded on its own, and the `.Malformed` code keeps the dotted spelling throughout
+/// ([`INVALID_INSTANCE_EVENT_WINDOW_ID_MALFORMED`]).
 pub const INVALID_INSTANCE_EVENT_WINDOW_ID_NOT_FOUND: &str =
     "InvalidInstanceEventWindowIDNotFound";
+
+/// EC2's code for a request that ADDRESSES ONE event window — by the single
+/// `InstanceEventWindowId` member the associate, the disassociate, the modify and the
+/// delete all take — and names an id the account holds no window for.
+///
+/// The dotted `Invalid<Resource>Id.NotFound` form every other resource of this service
+/// answers, which is what the recorded refusals of those operations carry; only the
+/// describe's bulk id resolution answers the one-word spelling
+/// ([`INVALID_INSTANCE_EVENT_WINDOW_ID_NOT_FOUND`]).
+pub const INVALID_INSTANCE_EVENT_WINDOW_ID_DOT_NOT_FOUND: &str =
+    "InvalidInstanceEventWindowId.NotFound";
 
 /// EC2's code for a request that named something that is not an event window id at all.
 pub const INVALID_INSTANCE_EVENT_WINDOW_ID_MALFORMED: &str =
@@ -642,9 +656,10 @@ pub fn instance_event_window_id_is_well_formed(id: &str) -> bool {
     prefixed_id_is_well_formed(INSTANCE_EVENT_WINDOW_ID_PREFIX, id)
 }
 
-/// Refuse a request that named an event window id the account holds no such window for:
+/// Refuse a DESCRIBE that named event window ids the account holds no such windows for:
 /// HTTP 400 [`INVALID_INSTANCE_EVENT_WINDOW_ID_NOT_FOUND`], in the sentence EC2 words for
-/// this family — `Invalid Instance Event Window IDs [<the ids it could not resolve>].`
+/// this family's bulk id resolution — `Invalid Instance Event Window IDs [<the ids it could
+/// not resolve>].`
 ///
 /// The refusal is made over the ids the REQUEST supplied, which is why the sentence carries a
 /// BRACKETED list: a describe that names several windows reports every one it could not
@@ -662,36 +677,72 @@ pub fn invalid_instance_event_window_id_not_found<E>(
     )
 }
 
-/// The SAME code for the SAME class, in the wording the operations that act on ONE window
-/// answer: `Invalid Instance Event Window ID <the id sent>.` — singular, and naming the id
-/// without the brackets a LIST of them is reported in.
+/// Refuse a request ADDRESSED TO ONE event window the account does not hold: HTTP 400
+/// [`INVALID_INSTANCE_EVENT_WINDOW_ID_DOT_NOT_FOUND`], in the sentence EC2 words for a
+/// resource it cannot resolve — `The instance-event-window ID '<the id sent>' does not
+/// exist`.
 ///
-/// Which of the two an operation answers follows from what it was asked: a describe resolves a
-/// LIST of ids and reports the ones it could not resolve as a list, while a delete acts on one
-/// window and names that one. Both are recorded, each by its own caller.
+/// Fixed text around the one variable part, the id the REQUEST carried, bounded the way
+/// every echoed caller-chosen value of this crate is ([`echoed_resource_id`]) and named in
+/// SINGLE quotes, with no trailing period — the template of this service's `does not exist`
+/// refusals.
+///
+/// Which of the two an operation answers follows from what it was asked: an operation
+/// addressed to ONE window names that window, while a describe resolves a LIST of ids and
+/// reports the ones it could not resolve as a list
+/// ([`invalid_instance_event_window_id_not_found`]). Both are recorded, each by its own
+/// caller.
 pub fn invalid_instance_event_window_id<E>(instance_event_window_id: &str) -> Scaffolded<E> {
     Scaffolded::service_error(
-        INVALID_INSTANCE_EVENT_WINDOW_ID_NOT_FOUND,
+        INVALID_INSTANCE_EVENT_WINDOW_ID_DOT_NOT_FOUND,
         400,
         format!(
-            "Invalid Instance Event Window ID {}.",
+            "The instance-event-window ID '{}' does not exist",
             echoed_resource_id(instance_event_window_id)
         ),
     )
 }
 
-/// Refuse an event window id this service cannot resolve: a malformed one is answered as
+/// Refuse a value that is no event window id at all: HTTP 400
+/// [`INVALID_INSTANCE_EVENT_WINDOW_ID_MALFORMED`], in this crate's ONE wording of an
+/// unreadable resource id ([`invalid_id_message`]).
+///
+/// The answer is the same whoever asked — the id is unreadable, so neither the describe's
+/// bulk resolution nor an operation addressed to one window reports a resource for it — which
+/// is why both resolutions below answer it from here rather than each writing it out.
+pub fn malformed_instance_event_window_id<E>(instance_event_window_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_INSTANCE_EVENT_WINDOW_ID_MALFORMED,
+        400,
+        invalid_id_message(instance_event_window_id),
+    )
+}
+
+/// Refuse an event window id a DESCRIBE cannot resolve: a malformed one is answered as
 /// malformed and a well-formed one as not found — the ordering [`unresolvable_host_id`] and
 /// [`require_known_volume`] keep.
 pub fn unresolvable_instance_event_window_id<E>(instance_event_window_id: &str) -> Scaffolded<E> {
     if instance_event_window_id_is_well_formed(instance_event_window_id) {
         return invalid_instance_event_window_id_not_found(instance_event_window_id);
     }
-    Scaffolded::service_error(
-        INVALID_INSTANCE_EVENT_WINDOW_ID_MALFORMED,
-        400,
-        invalid_id_message(instance_event_window_id),
-    )
+    malformed_instance_event_window_id(instance_event_window_id)
+}
+
+/// The same two-step resolution for a request ADDRESSED TO ONE event window: a value that is
+/// no event window id is answered as malformed, and a well-formed id the account holds no
+/// window for earns that operation's own not-found refusal
+/// ([`invalid_instance_event_window_id`]).
+///
+/// The malformed half is the SAME answer the describe gives, from the one place that words it
+/// ([`malformed_instance_event_window_id`]); only the not-found half differs, because only it
+/// reports a resource.
+pub fn unresolvable_addressed_instance_event_window_id<E>(
+    instance_event_window_id: &str,
+) -> Scaffolded<E> {
+    if instance_event_window_id_is_well_formed(instance_event_window_id) {
+        return invalid_instance_event_window_id(instance_event_window_id);
+    }
+    malformed_instance_event_window_id(instance_event_window_id)
 }
 
 /// Refuse a create that would take the store past [`MAX_INSTANCE_EVENT_WINDOWS`] or its

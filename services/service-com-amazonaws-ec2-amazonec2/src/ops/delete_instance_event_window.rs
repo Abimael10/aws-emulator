@@ -17,9 +17,9 @@
 //!
 //! The refusals: a request carrying no id is `MissingParameter`; a value that is no event
 //! window id at all is `InvalidInstanceEventWindowId.Malformed` before anything is looked up;
-//! an id the account holds no window for is the family's own
-//! `InvalidInstanceEventWindowIDNotFound`; and a `DryRun` request that would have succeeded is
-//! `DryRunOperation`.
+//! an id the account holds no window for is `InvalidInstanceEventWindowId.NotFound`, the code
+//! every operation addressed to ONE window answers; and a `DryRun` request that would have
+//! succeeded is `DryRunOperation`.
 //!
 //! ## Shape of an operation
 //!
@@ -164,7 +164,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A value that is not an event window id at all is refused BEFORE the lookup, the
         // order every resource of this service keeps.
         if !state::instance_event_window_id_is_well_formed(&input.instance_event_window_id) {
-            return Err(state::unresolvable_instance_event_window_id(
+            return Err(state::unresolvable_addressed_instance_event_window_id(
                 &input.instance_event_window_id,
             ));
         }
@@ -184,13 +184,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // anybody called, so those moves are applied before this call reads it.
         store.materialize_due_transitions();
 
-        // An id this account holds no event window for has nothing to delete. The code is the
-        // event-window family's own — `InvalidInstanceEventWindowIDNotFound`, written as one
-        // word, where the rest of this service answers the dotted
-        // `Invalid<Resource>Id.NotFound` form — and the sentence is the one the operations
-        // that act on ONE window answer, naming that id
-        // ([`crate::state::invalid_instance_event_window_id`]) where a describe reports the
-        // list of ids it could not resolve.
+        // An id this account holds no event window for has nothing to delete. The code and
+        // the sentence are the ones the operations ADDRESSED TO ONE window answer —
+        // the dotted `InvalidInstanceEventWindowId.NotFound` and the sentence naming that id
+        // ([`crate::state::invalid_instance_event_window_id`]) — where a describe resolves a
+        // LIST of ids and reports the ones it could not resolve as a list under the
+        // family's one-word code.
         let Some(record) = store
             .instance_event_windows
             .get(&input.instance_event_window_id)

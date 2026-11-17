@@ -31,7 +31,9 @@ use service_com_amazonaws_ec2_amazonec2::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::ec2_query::{call, element, elements, error_code, filters, indexed, unescaped};
+use super::ec2_query::{
+    call, element, elements, error_code, error_message, filters, indexed, unescaped,
+};
 
 /// The Region every call here is signed for. An event window carries no ARN and no zone, so
 /// nothing in these assertions is derived from it — it is only the scope the ec2Query
@@ -1083,9 +1085,14 @@ async fn delete(router: &MultiServiceRouter, params: &[(String, String)]) -> (u1
     call(router, REGION, "DeleteInstanceEventWindow", params).await
 }
 
-/// The code the event-window family answers for an id the account holds no window for: ONE
-/// word, where the rest of this service answers the dotted `Invalid<Resource>Id.NotFound`.
+/// The code the event-window DESCRIBE answers for an id the account holds no window for:
+/// ONE word, where the rest of this service answers the dotted `Invalid<Resource>Id.NotFound`.
 const WINDOW_NOT_FOUND: &str = "InvalidInstanceEventWindowIDNotFound";
+
+/// The code an operation ADDRESSED TO ONE window — the delete among them — answers for an id
+/// the account holds no window for: the dotted form, which is what those operations' recorded
+/// refusals carry.
+const ADDRESSED_WINDOW_NOT_FOUND: &str = "InvalidInstanceEventWindowId.NotFound";
 
 /// RULE 5: "deletes the specified event window" — the delete reports the `deleting` state of
 /// the window it took away, that window is gone for every later caller (the describe by id
@@ -1156,7 +1163,7 @@ async fn deleting_a_window_takes_exactly_it_out_of_the_store() {
         let (status, body) = delete(&router, &[p("InstanceEventWindowId", doomed.clone())]).await;
         assert_eq!(
             (status, error_code(&body).as_str()),
-            (400, WINDOW_NOT_FOUND),
+            (400, ADDRESSED_WINDOW_NOT_FOUND),
             "case {case:?}: a second delete must be refused, got {status} with body {body}"
         );
         assert_eq!(
@@ -1247,6 +1254,229 @@ async fn a_window_that_carries_targets_is_deleted_only_with_the_force_flag() {
         assert!(
             described_ids(&router, case, &[]).await.is_empty(),
             "case {case:?}: the forced delete must take the window away"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RULE 6: an `InstanceEventWindowId` this service cannot resolve is answered in the form the
+// operation's own answer takes — the dotted not-found code and its singular sentence for an
+// operation ADDRESSED TO ONE window, the family's one-word code and bracketed list for the
+// DESCRIBE, which resolves a list of ids, and the malformed refusal for a value that is no
+// event window id at all, on every one of them
+// ---------------------------------------------------------------------------
+
+/// The code every event-window operation answers a value that is no event window id at all.
+const WINDOW_ID_MALFORMED: &str = "InvalidInstanceEventWindowId.Malformed";
+
+/// The sentence an operation addressed to ONE window words for `id`: fixed text around the id
+/// the request carried, in single quotes and with no trailing period.
+fn does_not_exist(id: &str) -> String {
+    format!("The instance-event-window ID '{id}' does not exist")
+}
+
+/// The sentence the DESCRIBE words for the ids it could not resolve: the bracketed list.
+fn ids_not_found(id: &str) -> String {
+    format!("Invalid Instance Event Window IDs [{id}].")
+}
+
+/// Well-formed event window ids this emulator never issued, each differing in the id form EC2
+/// resource ids take and in its digits.
+fn unresolvable_ids() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("the long seventeen-digit form", "iew-0123456789abcdef0"),
+        ("the short eight-digit form", "iew-0a1b2c3d"),
+        ("another long id", "iew-00000000000000999"),
+    ]
+}
+
+/// Values that are no event window id at all.
+fn malformed_ids() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("a word", "not-an-event-window"),
+        ("the prefix alone", "iew-"),
+        ("too few digits", "iew-0a1b2c"),
+        ("another resource's id", "i-0123456789abcdef0"),
+    ]
+}
+
+/// One operation addressed to a SINGLE event window: its name and the parameters that address
+/// `window_id` through it.
+///
+/// From the model (`smithy_query(query="operation",
+/// operation="AssociateInstanceEventWindow,DisassociateInstanceEventWindow,
+/// ModifyInstanceEventWindow,DeleteInstanceEventWindow")`): each takes the one
+/// `InstanceEventWindowId` member, the two association calls beside an `AssociationTarget` and
+/// the modify beside what it would change. `DescribeInstanceEventWindows` is the family's only
+/// read of a LIST of ids, so it is not one of these.
+struct Addressed {
+    operation: &'static str,
+    params: fn(&str) -> Params,
+}
+
+/// The four of them.
+fn addressed_operations() -> Vec<Addressed> {
+    vec![
+        Addressed {
+            operation: "AssociateInstanceEventWindow",
+            params: |id| {
+                vec![
+                    p("InstanceEventWindowId", id),
+                    p("AssociationTarget.InstanceTag.1.Key", "Owner"),
+                    p("AssociationTarget.InstanceTag.1.Value", "platform"),
+                ]
+            },
+        },
+        Addressed {
+            operation: "DisassociateInstanceEventWindow",
+            params: |id| {
+                vec![
+                    p("InstanceEventWindowId", id),
+                    p("AssociationTarget.InstanceTag.1.Key", "Owner"),
+                    p("AssociationTarget.InstanceTag.1.Value", "platform"),
+                ]
+            },
+        },
+        Addressed {
+            operation: "ModifyInstanceEventWindow",
+            params: |id| vec![p("InstanceEventWindowId", id), p("Name", "renamed")],
+        },
+        Addressed {
+            operation: "DeleteInstanceEventWindow",
+            params: |id| vec![p("InstanceEventWindowId", id)],
+        },
+    ]
+}
+
+/// Address `id` through `operation`.
+async fn address(router: &MultiServiceRouter, operation: &Addressed, id: &str) -> (u16, String) {
+    call(router, REGION, operation.operation, &(operation.params)(id)).await
+}
+
+/// One window this account holds, so a refusal below is about the id the request named and not
+/// about an empty store.
+async fn seed_one_window(router: &MultiServiceRouter, case: &str) -> String {
+    create_window(
+        router,
+        case,
+        &[p("Name", case), p("CronExpression", "* 0-4 * * 1")],
+    )
+    .await
+}
+
+/// RULE 6: every operation addressed to ONE window answers an id the account holds no window
+/// for with the dotted not-found code and the sentence naming that id.
+#[tokio::test]
+async fn an_operation_addressed_to_one_window_reports_an_unheld_id_as_not_found() {
+    let router = emulator();
+    let _held = seed_one_window(&router, "addressed-not-found").await;
+
+    for operation in addressed_operations() {
+        for (case, id) in unresolvable_ids() {
+            let (status, body) = address(&router, &operation, id).await;
+            assert_eq!(
+                (
+                    status,
+                    error_code(&body).as_str(),
+                    error_message(&body).as_str()
+                ),
+                (
+                    400,
+                    ADDRESSED_WINDOW_NOT_FOUND,
+                    does_not_exist(id).as_str()
+                ),
+                "case {case:?} on {}: expected the not-found refusal naming {id}, got {status} \
+                 with body {body}",
+                operation.operation
+            );
+        }
+    }
+
+    // The control: the window the account holds is still addressable through every one of
+    // them, so what the rows above assert is the id and not the operation. Each control runs
+    // against its own store, so none of them is answered by what the one before it left.
+    for operation in addressed_operations() {
+        let router = emulator();
+        let held = seed_one_window(&router, "addressed-control").await;
+        let (status, body) = address(&router, &operation, &held).await;
+        assert_eq!(
+            status, 200,
+            "case the window this account holds on {}: expected it to be addressable, got \
+             {status} with body {body}",
+            operation.operation
+        );
+    }
+}
+
+/// RULE 6, the other half: the describe resolves a LIST, so it reports the ids it could not
+/// resolve as a list, under this family's one-word code — a different answer from the one every
+/// operation addressed to a single window gives, so a client can tell them apart.
+#[tokio::test]
+async fn the_describe_reports_the_ids_it_could_not_resolve_as_a_list() {
+    assert_ne!(
+        ADDRESSED_WINDOW_NOT_FOUND, WINDOW_NOT_FOUND,
+        "the addressed and the bulk not-found codes must differ"
+    );
+    let router = emulator();
+    let held = seed_one_window(&router, "describe-not-found").await;
+
+    for (case, id) in unresolvable_ids() {
+        let (status, body) = describe(&router, &[p("InstanceEventWindowId.1", id)]).await;
+        assert_eq!(
+            (
+                status,
+                error_code(&body).as_str(),
+                error_message(&body).as_str()
+            ),
+            (400, WINDOW_NOT_FOUND, ids_not_found(id).as_str()),
+            "case {case:?}: expected the describe's bulk refusal, got {status} with body {body}"
+        );
+        // ... and the operations addressed to ONE window word the SAME id differently.
+        for operation in addressed_operations() {
+            let (_, addressed) = address(&router, &operation, id).await;
+            assert_ne!(
+                error_message(&addressed),
+                error_message(&body),
+                "case {case:?} on {}: the addressed and the bulk refusal must word the same id \
+                 differently, got {addressed}",
+                operation.operation
+            );
+        }
+    }
+
+    // The control: the id the account holds is still described.
+    let (status, body) = describe(&router, &[p("InstanceEventWindowId.1", held)]).await;
+    assert_eq!(
+        status, 200,
+        "case the window this account holds: expected the describe to report it, got {status} \
+         with body {body}"
+    );
+}
+
+/// RULE 6, third part: a value that is no event window id at all is MALFORMED rather than
+/// absent, on the describe and on every operation addressed to one window.
+#[tokio::test]
+async fn a_value_that_is_no_event_window_id_is_malformed_everywhere() {
+    let router = emulator();
+    let _held = seed_one_window(&router, "malformed-ids").await;
+
+    for (case, id) in malformed_ids() {
+        for operation in addressed_operations() {
+            let (status, body) = address(&router, &operation, id).await;
+            assert_eq!(
+                (status, error_code(&body).as_str()),
+                (400, WINDOW_ID_MALFORMED),
+                "case {case:?} on {}: expected the malformed refusal, got {status} with body \
+                 {body}",
+                operation.operation
+            );
+        }
+        let (status, body) = describe(&router, &[p("InstanceEventWindowId.1", id)]).await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, WINDOW_ID_MALFORMED),
+            "case {case:?} on DescribeInstanceEventWindows: expected the malformed refusal, got \
+             {status} with body {body}"
         );
     }
 }

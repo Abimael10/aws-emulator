@@ -57,11 +57,9 @@ const GHOST_ID: &str = "11111111-2222-4333-8444-555555555555-1";
 const NO_CLUSTER_TYPE_MESSAGE: &str =
     "You must specify a cluster type, either provisioned or serverless.";
 
-/// What MSK answers a create that names BOTH cluster types: its own sentence for a
-/// body that asks for two at once, which says only one may be named and points at
-/// neither member.
-const BOTH_CLUSTER_TYPES_MESSAGE: &str =
-    "You can specify only one cluster type, either provisioned or serverless.";
+/// What MSK answers a create that names BOTH cluster types: the fixed sentence it
+/// words for a body-level rejection, which names no member at all.
+const INVALID_REQUEST_BODY_MESSAGE: &str = "Invalid request body";
 
 /// What MSK answers a request whose `CurrentVersion` is not a version token at all.
 const INVALID_CURRENT_VERSION_MESSAGE: &str = "Invalid parameter currentVersion.";
@@ -266,18 +264,18 @@ async fn a_provisioned_create_refuses_a_version_the_catalog_does_not_publish() {
 }
 
 /// RULE: `CreateClusterV2` names exactly ONE cluster type, and the two ways of
-/// getting that wrong are two DIFFERENT refusals — a missing cluster type is
-/// answered with the sentence that says one is required, while naming both kinds is
-/// answered with the one that says only one may be given, and both blame the
-/// `clusterType` parameter rather than either alternative member — so a client can
-/// tell the two input errors apart. Neither registers anything.
+/// getting that wrong are two DIFFERENT refusals — a missing cluster type blames the
+/// `clusterType` parameter with the sentence that says one is required, while naming
+/// both kinds is refused as the unreadable BODY it is, with MSK's fixed body-level
+/// sentence and no `invalidParameter` — so a client can tell the two input errors
+/// apart. Neither registers anything.
 #[tokio::test]
 async fn the_two_cluster_type_refusals_are_distinct() {
     let emulator = Emulator::new();
 
     // The two messages are not variants of one sentence.
     assert_ne!(
-        NO_CLUSTER_TYPE_MESSAGE, BOTH_CLUSTER_TYPES_MESSAGE,
+        NO_CLUSTER_TYPE_MESSAGE, INVALID_REQUEST_BODY_MESSAGE,
         "the two cluster-type refusals must carry different sentences"
     );
 
@@ -314,7 +312,7 @@ async fn the_two_cluster_type_refusals_are_distinct() {
         body["provisioned"]["numberOfBrokerNodes"] = json!(brokers);
         body["serverless"] = v2_serverless_body(&name, *configurations)["serverless"].clone();
         let reply = emulator.create_cluster_v2(body).await;
-        assert_refusal(&reply, case, "clusterType", BOTH_CLUSTER_TYPES_MESSAGE);
+        assert_body_refusal(&reply, case);
     }
 
     let listed = listed_names(&emulator).await;
@@ -341,6 +339,91 @@ async fn the_two_cluster_type_refusals_are_distinct() {
             reply.status, reply.body
         );
     }
+}
+
+/// RULE: a create naming BOTH cluster types is a BODY-level rejection — MSK's one fixed
+/// sentence and no `invalidParameter` — whatever the two blocks say and whatever else the
+/// body carries, because the decision is taken on the body rather than on a member a caller
+/// could repair on its own.
+///
+/// The rows differ along what the rest of the request says: the cluster name, the tags, the
+/// broker software and instance type the provisioned block names, how many brokers and VPC
+/// configurations each block carries, and whether the provisioned block would itself have
+/// been refused (an unsupported `KafkaVersion`) — none of which MSK looks at, so each row
+/// reads the same.
+#[tokio::test]
+async fn naming_both_cluster_types_is_refused_as_the_body_it_is() {
+    let emulator = Emulator::new();
+
+    // (case, the cluster name, the tags, the version and instance type, brokers, configs)
+    let rows: Vec<(&str, &str, Value, &str, &str, u64, usize)> = vec![
+        (
+            "a minimal body of each kind",
+            "both-minimal",
+            json!(null),
+            "3.6.0",
+            "kafka.m5.large",
+            1,
+            1,
+        ),
+        (
+            "a tagged create",
+            "both-tagged",
+            json!({ "team": "data" }),
+            "3.6.0",
+            "kafka.m5.large",
+            3,
+            2,
+        ),
+        (
+            "another broker software and instance type",
+            "both-other-software",
+            json!({}),
+            "3.9.x",
+            "kafka.m7g.large",
+            6,
+            3,
+        ),
+        (
+            "a provisioned block that would itself have been refused",
+            "both-bad-version",
+            json!(null),
+            "0.0.0-not-a-version",
+            "kafka.m5.large",
+            2,
+            1,
+        ),
+    ];
+
+    for (case, name, tags, version, instance_type, brokers, configurations) in rows {
+        let mut body = v2_provisioned_body(name, version, instance_type);
+        body["provisioned"]["numberOfBrokerNodes"] = json!(brokers);
+        body["serverless"] = v2_serverless_body(name, configurations)["serverless"].clone();
+        if !tags.is_null() {
+            body["tags"] = tags;
+        }
+        let reply = emulator.create_cluster_v2(body).await;
+        assert_body_refusal(&reply, case);
+    }
+
+    // The refusal registers nothing: neither block was read as a create.
+    let listed = listed_names(&emulator).await;
+    assert!(
+        listed.is_empty(),
+        "a refused create must register no cluster, got {listed:?}"
+    );
+
+    // ... and the refusal for naming NEITHER kind is still the parameter-level one, so the
+    // two input errors stay distinct.
+    let reply = emulator
+        .create_cluster_v2(json!({ "clusterName": "neither-kind" }))
+        .await;
+    assert_refusal(
+        &reply,
+        "a create naming neither cluster type",
+        "clusterType",
+        NO_CLUSTER_TYPE_MESSAGE,
+    );
 }
 
 /// `CreateReplicator` for a replicator spanning the two Amazon MSK clusters
@@ -842,6 +925,25 @@ fn assert_refusal(reply: &Reply, case: &str, parameter: &str, message: &str) {
         reply.at("/invalidParameter").as_str(),
         Some(parameter),
         "case {case}: expected the refusal to name {parameter} at fault, got {}",
+        reply.body
+    );
+}
+
+/// The BODY-level refusal: HTTP 400 `BadRequestException` carrying MSK's fixed
+/// sentence for a body it will not read, and NO `invalidParameter` — the decision is
+/// about the body as a whole, so no member is named.
+fn assert_body_refusal(reply: &Reply, case: &str) {
+    assert_eq!(
+        (reply.status, reply.error_code(), reply.error_message()),
+        (400, "BadRequestException", INVALID_REQUEST_BODY_MESSAGE),
+        "case {case}: expected a 400 BadRequestException {INVALID_REQUEST_BODY_MESSAGE:?}, got \
+         {} {}",
+        reply.status,
+        reply.body
+    );
+    assert!(
+        reply.at("/invalidParameter").is_null(),
+        "case {case}: expected a body-level refusal to name no member, got {}",
         reply.body
     );
 }
