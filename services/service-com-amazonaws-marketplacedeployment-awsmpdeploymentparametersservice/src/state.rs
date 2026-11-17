@@ -725,20 +725,40 @@ impl ComAmazonawsMarketplacedeploymentAwsmpdeploymentparametersserviceState {
             .contains_key(&(catalog.to_string(), agreement_id.to_string()))
     }
 
+    /// Whether this account holds `product_id` in `catalog` at all — whether ANY
+    /// agreement it holds there covers that product.
+    ///
+    /// This is the resource the request's URI PATH addresses: `catalog` and
+    /// `productId` are the operation's two `@httpLabel` members
+    /// (`POST /catalogs/{catalog}/products/{productId}/deployment-parameters`,
+    /// `smithy_query(query="operation",operation="PutDeploymentParameter")`),
+    /// resolved on their own, independently of which agreement a particular
+    /// request's body names.
+    pub fn holds_product(&self, catalog: &str, product_id: &str) -> bool {
+        self.agreements
+            .iter()
+            .any(|((held_catalog, _), agreement)| {
+                held_catalog == catalog && agreement.covers(product_id)
+            })
+    }
+
     /// Which segment of the target `(catalog, productId, agreementId)` this
     /// account does not hold, or `None` when the whole target resolves.
     ///
-    /// ONE order, for every request: the resource the operation is TARGETED BY is
-    /// resolved first and the resource that target has to cover second, so
-    /// `agreementId` is the segment reported whenever this account holds no
-    /// agreement of that id in the catalog — the case a request naming neither a
-    /// held agreement nor a held product falls in — and `productId` only once the
-    /// agreement itself resolves and does not cover the product the URI
-    /// addresses. The operation "creates or updates a deployment parameter and is
-    /// targeted by `catalog` and `agreementId`"
-    /// (`smithy_query(query="doc",shape="PutDeploymentParameter")`), and
-    /// `agreementId` is the one target segment its response reports back, while
-    /// `productId` is the resource its URI path addresses (the `@httpLabel`).
+    /// ONE order, for every request: the resource the request's URI PATH
+    /// addresses is resolved FIRST and the member its BODY carries second. The
+    /// path addresses the product inside the catalog (`catalog` and `productId`
+    /// are the two `@httpLabel` members of
+    /// `POST /catalogs/{catalog}/products/{productId}/deployment-parameters`)
+    /// while `agreementId` is a body member, so `productId` is the segment
+    /// reported whenever no agreement this account holds in the catalog covers
+    /// that product — the case a request naming neither a held product nor a held
+    /// agreement falls in — and `agreementId` only once the product itself
+    /// resolves and the agreement the body names is not one that covers it.
+    ///
+    /// Nothing else about a request bears on the segment reported: the order is
+    /// the same whatever else the body carries (tags, an idempotency token, an
+    /// expiry).
     ///
     /// The returned name is the member as [`target_not_found`] states it.
     pub fn unresolved_target(
@@ -750,10 +770,10 @@ impl ComAmazonawsMarketplacedeploymentAwsmpdeploymentparametersserviceState {
         if self.holds_target(catalog, product_id, agreement_id) {
             return None;
         }
-        Some(if self.holds_agreement(catalog, agreement_id) {
-            "ProductId"
-        } else {
+        Some(if self.holds_product(catalog, product_id) {
             "AgreementId"
+        } else {
+            "ProductId"
         })
     }
 

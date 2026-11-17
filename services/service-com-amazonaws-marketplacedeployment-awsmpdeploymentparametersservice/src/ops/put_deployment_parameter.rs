@@ -73,8 +73,8 @@
 //! RESOLVES and never one the write establishes: a request whose
 //! (catalog, productId, agreementId) the store does not hold is the modelled
 //! `ResourceNotFoundException` (HTTP 404) naming the segment that did not resolve
-//! — the resource the write is TARGETED BY (`agreementId`) before the product it
-//! has to cover
+//! — the resource the request's URI PATH addresses (`productId` inside `catalog`)
+//! before the agreement its BODY names
 //! ([`crate::state::ComAmazonawsMarketplacedeploymentAwsmpdeploymentparametersserviceState::unresolved_target`]),
 //! with nothing written. The targets themselves get into the store out of band of
 //! any request, from the fixture set a fresh store holds
@@ -484,8 +484,10 @@ impl Plan {
 ///    product or an agreement. So the target is a precondition this operation
 ///    RESOLVES: a request whose triple the store does not hold is the modelled
 ///    `ResourceNotFoundException` (HTTP 404), blamed on the segment that did not
-///    resolve — the resource the write is TARGETED BY (`agreementId`) first, then
-///    the product it has to cover — and nothing is written for it.
+///    resolve — the resource the request's URI PATH addresses (`productId` inside
+///    `catalog`) first, then the agreement its BODY names
+///    (`crate::state::ComAmazonawsMarketplacedeploymentAwsmpdeploymentparametersserviceState::unresolved_target`
+///    owns that order) — and nothing is written for it.
 ///
 ///    The modelled input constraints (every `@pattern`, every `@length`) are
 ///    already refused with `ValidationException` (HTTP 400) by the centralized

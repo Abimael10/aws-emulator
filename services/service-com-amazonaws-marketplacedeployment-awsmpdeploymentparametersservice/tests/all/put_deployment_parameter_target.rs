@@ -9,8 +9,8 @@
 //! against the agreements the account holds before it mints or updates anything:
 //! a triple the store holds is the create-or-update the operation documents, and
 //! a triple it does not hold is the modelled `ResourceNotFoundException`
-//! (HTTP 404) naming the segment that did not resolve — the resource the write is
-//! targeted by before the product it has to cover (the
+//! (HTTP 404) naming the segment that did not resolve — the product the request's
+//! URI path addresses before the agreement its body names (the
 //! `unresolved_target_precedence` suite owns that precedence) — with nothing
 //! written and no token consumed.
 //!
@@ -191,7 +191,7 @@ async fn a_put_is_404_until_its_target_is_held_and_is_served_once_it_is() {
             let (status, answer) = put(&router, CATALOG, row.product_id, &body).await;
             assert_target_not_found(
                 &format!("{case} with {shape}"),
-                "AgreementId",
+                "ProductId",
                 status,
                 &answer,
             );
@@ -259,7 +259,7 @@ async fn a_put_is_404_until_its_target_is_held_and_is_served_once_it_is() {
 }
 
 #[tokio::test]
-async fn the_refusal_names_the_agreement_before_the_product() {
+async fn the_refusal_names_the_product_before_the_agreement() {
     let (router, engine) = emulator();
     // Two agreements over overlapping products, so each row below differs from a
     // held target in exactly one segment and the suite can tell the two blames
@@ -269,28 +269,16 @@ async fn the_refusal_names_the_agreement_before_the_product() {
     provision(&engine, CATALOG, "agmt-two", &["prod-shared"]);
 
     // (case, productId, agreementId, the member the refusal must name). The
-    // agreement the write is targeted by is resolved first, so an agreement the
-    // catalog does not hold is blamed on `AgreementId`, whatever the product is;
-    // otherwise the agreement resolves and the product it does not cover is what
-    // the refusal names.
+    // product the request's URI path addresses is resolved first, so a product no
+    // agreement of the catalog covers is blamed on `ProductId`, whatever the
+    // agreement is; otherwise the product resolves and the agreement that does not
+    // cover it is what the refusal names.
     let rows: Vec<(&str, &str, &str, &str)> = vec![
         (
             "neither identifier is held",
             "prod-unknown",
             "agmt-unknown",
-            "AgreementId",
-        ),
-        (
-            "a covered product, under an agreement that does not exist",
-            "prod-one",
-            "agmt-unknown",
-            "AgreementId",
-        ),
-        (
-            "an agreement differing from a held one only in case",
-            "prod-one",
-            "AGMT-ONE",
-            "AgreementId",
+            "ProductId",
         ),
         (
             "a product nothing covers, under a held agreement",
@@ -305,10 +293,22 @@ async fn the_refusal_names_the_agreement_before_the_product() {
             "ProductId",
         ),
         (
+            "a covered product, under an agreement that does not exist",
+            "prod-one",
+            "agmt-unknown",
+            "AgreementId",
+        ),
+        (
+            "an agreement differing from a held one only in case",
+            "prod-one",
+            "AGMT-ONE",
+            "AgreementId",
+        ),
+        (
             "a covered product, under a held agreement covering other products",
             "prod-one",
             "agmt-two",
-            "ProductId",
+            "AgreementId",
         ),
     ];
 
@@ -527,7 +527,7 @@ async fn a_write_refused_for_its_target_consumes_no_idempotency_token() {
     // Refused because nothing holds its target, so the write never happens and the
     // token is never bound to one.
     let (status, answer) = put(&router, CATALOG, "prod-later", &body).await;
-    assert_target_not_found("the token's first attempt", "AgreementId", status, &answer);
+    assert_target_not_found("the token's first attempt", "ProductId", status, &answer);
     let stored = stored_parameters(&engine);
     assert_eq!(
         stored, 0,
@@ -637,7 +637,7 @@ async fn the_target_ledger_is_bounded_and_refuses_a_target_past_its_ceiling() {
     let (status, answer) = put(&router, CATALOG, &last_product, &body(&last_agreement)).await;
     assert_target_not_found(
         "a write against a target the ledger refused",
-        "AgreementId",
+        "ProductId",
         status,
         &answer,
     );
