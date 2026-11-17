@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateMaintenanceWindowTarget
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateMaintenanceWindowTarget`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Modify a target already registered with a maintenance window — the edit half of this
+//! service's maintenance-window target slice. This is the ONLY file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateMaintenanceWindowTarget::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! It writes the one store `RegisterTargetWithMaintenanceWindow` minted the target into and
+//! `DescribeMaintenanceWindowTargets` reports it out of
+//! ([`crate::state::maintenance_window_targets`]), so what this update persists is what a
+//! later read reports. Nothing about the target's identity moves: no input member carries the
+//! id, the window or the resource type, so the update edits the labels and the criteria
+//! alone, under the id the register minted.
+//!
+//! A target is addressed through its window, so BOTH ids are resolved against the Region's
+//! records: a window this endpoint holds none of, and a target that is no target of the
+//! window named, are each refused `DoesNotExistException` and nothing is written.
+//!
+//! "If a parameter is null, then the corresponding field isn't modified", and under `Replace`
+//! "optional fields that aren't specified are set to null" while the members the register
+//! requires are required here too — the one reading of an omitted member every update of this
+//! service holds to ([`crate::state::replacing_update`]).
 //!
 //! ## Shape of an operation
 //!
@@ -98,6 +108,21 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::replacing_update::{
+    replace_requires_member_message, updated_member, updated_optional_member,
+};
+
+/// The member a replacing update must carry, in the spelling this service's refusals name a
+/// member in — its modelled name with a lowercase first letter.
+///
+/// "If True, then all fields that are required by the RegisterTargetWithMaintenanceWindow
+/// operation are also required for this API request": of the members this update carries,
+/// `Targets` is the one that register requires. The register's other required members —
+/// `WindowId` and `ResourceType` — are not among them: `WindowId` is required here anyway and
+/// no input member of this update carries the resource type at all, so a replacing update
+/// leaves the type the register persisted alone.
+const REPLACE_REQUIRED_MEMBER: &str = "targets";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -167,18 +192,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateMaintenanceWindowTarget` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateMaintenanceWindowTargetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Both ids' presence, length and pattern, the `Targets` list's length and every
+        // other member's length and pattern are MODELLED constraints, so the centralized
+        // walk has already refused anything outside them: what is resolved here is which
+        // target the update edits.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateMaintenanceWindowTargetErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the maintenance window store is unavailable".to_string()),
+            })
+        })?;
+
+        // A replacing update that leaves out a member the register requires is missing a
+        // member it was required to carry — decided before anything is read, so such a
+        // request cannot touch the target.
+        let replace = input.replace.unwrap_or(false);
+        if replace && input.targets.is_none() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                replace_requires_member_message(REPLACE_REQUIRED_MEMBER),
+            ));
+        }
+
+        // A window and its targets live in the Region the endpoint names, which is the
+        // signed credential scope's — so both ids are resolved against that Region's
+        // records.
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        if store
+            .maintenance_window(&region, &input.window_id)
+            .is_none()
+        {
+            return Err(
+                UpdateMaintenanceWindowTargetErrorModeled::DoesNotExistException(
+                    DoesNotExistException {
+                        message: Some(
+                            crate::state::maintenance_windows::maintenance_window_not_found_message(
+                                &input.window_id,
+                            ),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+        let held = store
+            .maintenance_window_target(&region, &input.window_id, &input.window_target_id)
+            .cloned();
+        let Some(mut record) = held else {
+            return Err(
+                UpdateMaintenanceWindowTargetErrorModeled::DoesNotExistException(
+                    DoesNotExistException {
+                        message: Some(
+                            crate::state::maintenance_window_targets::target_not_found_message(
+                                &input.window_id,
+                                &input.window_target_id,
+                            ),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Every member the request supplied is applied to the target the store holds, and
+        // every member it left out keeps the value that target holds — unless the update
+        // replaces the target, where a member left out is cleared to what a register that
+        // named it nothing would have persisted. The criteria are a list the register always
+        // states, so the nothing a register can carry for them is the empty list the
+        // modelled length admits.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateMaintenanceWindowTarget"))
+        // What the update does NOT touch is the target's identity — its minted id, its
+        // window, its Region, its resource type and the idempotency token its register
+        // carried — nor when that register ran, which is the order a listing of the window's
+        // targets walks them in.
+        record.targets = updated_member(input.targets, record.targets, Vec::new(), replace);
+        record.owner_information =
+            updated_optional_member(input.owner_information, record.owner_information, replace);
+        record.name = updated_optional_member(input.name, record.name, replace);
+        record.description = updated_optional_member(input.description, record.description, replace);
+
+        // "The updated targets", "the updated owner", "the updated name", "the updated
+        // description": what the update persisted, which is what a later read of this target
+        // reports. A label the target now carries nothing for is reported as nothing at all,
+        // the way a read of a target whose register named none of them does.
+        let output = UpdateMaintenanceWindowTargetOutput {
+            window_id: Some(record.window_id.clone()),
+            window_target_id: Some(record.window_target_id.clone()),
+            targets: Some(record.targets.clone()),
+            owner_information: record.owner_information.clone(),
+            name: record.name.clone(),
+            description: record.description.clone(),
+        };
+        store.insert_maintenance_window_target(record);
+        Ok(output)
     }
 }

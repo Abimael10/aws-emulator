@@ -365,6 +365,10 @@ pub mod maintenance_windows;
 /// a describe and a deregister address one.
 pub mod maintenance_window_targets;
 
+/// What an update that takes a `Replace` flag leaves behind: the one reading of an omitted
+/// member every such operation of this service holds to.
+pub mod replacing_update;
+
 /// The account-level settings the Systems Manager service teams provision, which
 /// `GetServiceSetting` reports and `UpdateServiceSetting`/`ResetServiceSetting` modify.
 pub mod service_settings;

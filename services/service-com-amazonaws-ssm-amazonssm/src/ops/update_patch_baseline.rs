@@ -180,29 +180,10 @@ impl From<UpdatePatchBaselineErrorModeled> for UpdatePatchBaselineError {
     }
 }
 
-/// What one member of the updated baseline carries.
-///
-/// "Fields not specified in the request are left unchanged", so a member the request
-/// supplied is taken as given and a member it left out keeps `stored`. Under `Replace`,
-/// "optional fields that aren't specified are set to null", so a member the request left
-/// out carries `cleared` instead — the value a create that named that member nothing would
-/// have persisted, which is how a read reports a member nothing ever set.
-fn updated_member<T>(supplied: Option<T>, stored: T, cleared: T, replace: bool) -> T {
-    match supplied {
-        Some(value) => value,
-        None if replace => cleared,
-        None => stored,
-    }
-}
-
-/// [`updated_member`] for a member a read reports only when a write set it.
-///
-/// Such a member's own type is already the optional one, so the request supplies it exactly
-/// when it carries a value: a request that leaves it out leaves the stored value alone, and
-/// a replacing update clears it to the nothing a create that named it carried.
-fn updated_optional_member<T>(supplied: Option<T>, stored: Option<T>, replace: bool) -> Option<T> {
-    updated_member(supplied.map(Some), stored, None, replace)
-}
+// What one member of the updated baseline carries: the one reading of an omitted member
+// every update of this service that takes a `Replace` flag holds to
+// (`crate::state::replacing_update`).
+use crate::state::replacing_update::{updated_member, updated_optional_member};
 
 /// The `UpdatePatchBaseline` operation.
 ///

@@ -190,17 +190,7 @@ const REPLACE_REQUIRED_MEMBER: &str = "name";
 /// states over a member that must not be null, in the envelope this service's refusals
 /// carry, neither of which is spelled here.
 pub fn replace_requires_name_message() -> String {
-    let clause = format!(
-        "Value null at '{REPLACE_REQUIRED_MEMBER}' failed to satisfy constraint: {}",
-        ::service_common::validation_message::requirement(
-            ::aws_smithy_schema_server::constraints::ViolationKind::MissingRequiredMember
-        )
-    );
-    // The envelope answers `None` only for NO clause at all, and there is exactly one here,
-    // so the fallback is unreachable; it keeps the clause itself rather than panicking on an
-    // envelope that could not be worded.
-    ::service_common::validation_message::envelope_over(std::slice::from_ref(&clause))
-        .unwrap_or(clause)
+    super::replacing_update::replace_requires_member_message(REPLACE_REQUIRED_MEMBER)
 }
 
 // ---------------------------------------------------------------------------
