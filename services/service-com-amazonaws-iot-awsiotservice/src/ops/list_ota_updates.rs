@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListOTAUpdates
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListOTAUpdates`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListOTAUpdates::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! One page of the account's OTA updates
+//! (`crate::state::ComAmazonawsIotAwsiotserviceState::ota_updates`), in `otaUpdateId`
+//! order, narrowed by the request's `otaUpdateStatus`: every entry is built from the
+//! record `CreateOTAUpdate` persisted, so what this reports and what `GetOTAUpdate`
+//! reads are one value, and an update `DeleteOTAUpdate` removed is listed by neither.
+//!
+//! `maxResults` bounds the page and `nextToken` resumes it: the token is opaque, carries
+//! the listing's own filter, and a token issued for another filter is refused with the
+//! modelled `InvalidRequestException` rather than silently resuming a different listing.
+//!
+//! The only write a listing makes is the one the clock already owed: an update created
+//! in [`crate::state::NEW_OTA_UPDATE_STATUS`] whose completion came due is materialised
+//! here exactly as [`crate::state::RegisteredOtaUpdate::settle`] materialises it for
+//! `GetOTAUpdate`, so the status this reports (and the status the request filters on) is
+//! the one the update holds at the instant of the call.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +155,149 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListOTAUpdates` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListOTAUpdatesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListOTAUpdates"))
+        let _ = ctx;
+
+        // The continuation token is resolved BEFORE the store is reached: a token that
+        // is not one this listing issued is refused whatever the store holds.
+        let scope = input.ota_update_status.clone().unwrap_or_default();
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => Some(decode_next_token(token, &scope)?),
+            None => None,
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListOTAUpdatesErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some("the IoT emulator has no state store attached".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `maxResults` is "The maximum number of results to return at one time", modelled
+        // `range 1..250` and refused outside it before this handler runs, so a request
+        // that names it asks for at least one update and one that does not asks for every
+        // update that matches. The clamp is defensive rather than load-bearing.
+        let page_size = input
+            .max_results
+            .map_or(usize::MAX, |max| max.clamp(1, 250) as usize);
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The completions the clock already owed at `now`, each due whether or not this
+        // call happened: materialised before the walk, so the status an update is
+        // reported in and the status the filter selects on are the same one.
+        for update in store.ota_updates.values_mut() {
+            update.settle(now);
+        }
+        let mut page: Vec<OTAUpdateSummary> = store
+            .ota_updates
+            .values()
+            // The store is keyed by `otaUpdateId`, so iteration is already id order and
+            // "the updates whose id sorts after the last one emitted" is a well-defined
+            // resume point even if that update has since been deleted.
+            .filter(|update| {
+                resume_after
+                    .as_deref()
+                    .is_none_or(|cursor| update.ota_update_id.as_str() > cursor)
+            })
+            // `otaUpdateStatus` is "The OTA update job status": an update matches only
+            // while it holds that status.
+            .filter(|update| {
+                input
+                    .ota_update_status
+                    .as_deref()
+                    .is_none_or(|wanted| update.status == wanted)
+            })
+            // One update beyond the page: its presence is what says the listing is
+            // truncated, and nothing more than that is read.
+            .take(page_size.saturating_add(1))
+            .map(ota_update_summary)
+            .collect();
+        let truncated = page.len() > page_size;
+        page.truncate(page_size);
+
+        // `nextToken` is "A token to use to get the next set of results", so it is issued
+        // only while there is a next set.
+        let next_token = if truncated {
+            page.last()
+                .and_then(|last| last.ota_update_id.as_deref())
+                .map(|last_id| encode_next_token(&scope, last_id))
+        } else {
+            None
+        };
+
+        Ok(ListOTAUpdatesOutput {
+            // `OTAUpdatesSummary` carries no length constraint, so an account with no
+            // matching update answers with an EMPTY list rather than an absent member:
+            // "nothing matches" is an answer, not a missing one.
+            ota_updates: Some(page),
+            next_token,
+        })
     }
+}
+
+/// One stored update as the modelled `OTAUpdateSummary` a listing carries.
+///
+/// `OTAUpdateSummary` is "An OTA update summary" of three members: the id, the ARN and
+/// "The date when the OTA update was created", each read off the record the create
+/// persisted, so a summary and the `OTAUpdateInfo` `GetOTAUpdate` reports can never
+/// disagree.
+fn ota_update_summary(update: &crate::state::RegisteredOtaUpdate) -> OTAUpdateSummary {
+    OTAUpdateSummary {
+        ota_update_id: Some(update.ota_update_id.clone()),
+        ota_update_arn: Some(update.ota_update_arn.clone()),
+        creation_date: Some(::aws_smithy_types::DateTime::from(update.creation_date)),
+    }
+}
+
+/// The character that separates a token's scope from the id it resumes after. A control
+/// character, so it is outside `OTAUpdateId`'s pattern (`^[a-zA-Z0-9_-]+$`) and outside
+/// every `OTAUpdateStatus` value, and the split is unambiguous.
+const TOKEN_SEPARATOR: char = '\u{1f}';
+
+/// The opaque `nextToken` that resumes `scope`'s listing after the update named
+/// `last_id`.
+///
+/// Hex-encoded so the token is opaque to the caller whatever the id and the filter
+/// contain. The encoding carries no integrity protection and claims none: a caller that
+/// reverses it can name any resume point of the listing it is already reading, which
+/// selects a page of that same listing and nothing else.
+fn encode_next_token(scope: &str, last_id: &str) -> String {
+    ::hex::encode(format!("{scope}{TOKEN_SEPARATOR}{last_id}"))
+}
+
+/// The `otaUpdateId` a `nextToken` resumes after, or `InvalidRequestException` (HTTP 400,
+/// "The request is not valid") when the token is not one [`encode_next_token`] issued for
+/// THIS listing.
+///
+/// Every step is fallible on purpose: the token is caller-supplied, so nothing read out
+/// of it may panic the handler. A token issued for another status filter is refused
+/// rather than silently restarting a different listing from the middle.
+fn decode_next_token(token: &str, scope: &str) -> Result<String, ListOTAUpdatesError> {
+    let invalid = || -> ListOTAUpdatesError {
+        ListOTAUpdatesErrorModeled::InvalidRequestException(InvalidRequestException {
+            message: Some("nextToken is not a continuation token of this listing".to_string()),
+        })
+        .into()
+    };
+    let bytes = ::hex::decode(token).map_err(|_| invalid())?;
+    let decoded = String::from_utf8(bytes).map_err(|_| invalid())?;
+    let (token_scope, resume_after) = decoded.split_once(TOKEN_SEPARATOR).ok_or_else(invalid)?;
+    // A resume point outside `OTAUpdateId` could name no update in the store, so a token
+    // carrying one was not issued by this listing.
+    if token_scope != scope || !is_modeled_ota_update_id(resume_after) {
+        return Err(invalid());
+    }
+    Ok(resume_after.to_string())
+}
+
+/// Whether `candidate` is a value of the modelled `OTAUpdateId`: `len 1..128`, pattern
+/// `^[a-zA-Z0-9_-]+$` (`smithy_query(query="shape",shape="OTAUpdateSummary")`), and so
+/// could name an update this account holds.
+fn is_modeled_ota_update_id(candidate: &str) -> bool {
+    (1..=128).contains(&candidate.len())
+        && candidate
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
 }
