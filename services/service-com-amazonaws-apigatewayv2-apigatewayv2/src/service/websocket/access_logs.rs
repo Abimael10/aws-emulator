@@ -216,7 +216,10 @@ mod tests {
             connection_id: "L0SM9cOFyjUCIhA=".to_string(),
             region: "us-east-1".to_string(),
             connected_at: SystemTime::UNIX_EPOCH + Duration::from_millis(1_793_000_000_000),
-            headers: [("Host".to_string(), "127.0.0.1:34567".to_string())]
+            headers: [(
+                "Host".to_string(),
+                vec!["127.0.0.1:34567".to_string()],
+            )]
                 .into_iter()
                 .collect(),
             query_parameters: BTreeMap::new(),

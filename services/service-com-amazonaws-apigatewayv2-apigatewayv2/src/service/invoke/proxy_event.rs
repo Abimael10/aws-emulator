@@ -27,7 +27,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ::base64::Engine as _;
 use serde_json::{json, Map, Value};
 
-use super::super::data_plane::path_segments;
+use super::super::data_plane::{joined_field, joined_fields, path_segments, FieldValues};
 
 /// The header a client carries its cookies in (RFC 6265 §5.4), which a `2.0` event lifts
 /// out of the header map into its own list: "cookies — an array of the cookies the request
@@ -37,11 +37,6 @@ const COOKIE_HEADER: &str = "cookie";
 /// How a `2.0` event's `Cookie` header is split into the list: cookie pairs are separated
 /// by `; ` (RFC 6265 §4.2.1).
 const COOKIE_SEPARATOR: char = ';';
-
-/// How a header or query parameter that appeared more than once is carried in a
-/// SINGLE-valued map: one comma-separated value (RFC 9110 §5.3), the form API Gateway
-/// documents for a `2.0` event's `headers` and `queryStringParameters`.
-const MULTI_VALUE_SEPARATOR: &str = ",";
 
 /// The protocol an event reports the request arrived over. The transport the emulator's
 /// front door serves is HTTP/1.1, and the event reports what carried the request rather
@@ -94,11 +89,12 @@ pub struct ProxyRequest {
     /// The query string as it arrived, with no leading `?`; empty for a request carrying
     /// none.
     pub raw_query_string: String,
-    /// Every header, by lowercased name, in the order a `BTreeMap` keeps them; a header
-    /// that appeared more than once is one comma-joined value.
-    pub headers: BTreeMap<String, String>,
-    /// Every query parameter, by name, likewise comma-joined when repeated.
-    pub query_parameters: BTreeMap<String, String>,
+    /// Every header, by lowercased name, with ONE ENTRY PER FIELD LINE the request carried
+    /// ([`FieldValues`]): the occurrences the multi-valued maps of a `1.0` event report,
+    /// and which the single-valued maps report joined.
+    pub headers: FieldValues,
+    /// Every query parameter, by name, likewise one entry per occurrence in the query.
+    pub query_parameters: FieldValues,
     /// The request's body as it arrived.
     pub body: Vec<u8>,
     /// The matched route's `RouteKey`.
@@ -116,10 +112,16 @@ pub struct ProxyRequest {
 }
 
 impl ProxyRequest {
+    /// The ONE value the request states for the header `name` — its field lines joined
+    /// (`super::super::data_plane::joined_field`) — or `None` for a header it carried none
+    /// of. The name is the lowercased one the map is keyed by.
+    pub fn header(&self, name: &str) -> Option<String> {
+        joined_field(&self.headers, name)
+    }
+
     /// The cookies the request carried, as a `2.0` event's own list.
     fn cookies(&self) -> Vec<String> {
-        self.headers
-            .get(COOKIE_HEADER)
+        self.header(COOKIE_HEADER)
             .map(|value| {
                 value
                     .split(COOKIE_SEPARATOR)
@@ -134,17 +136,17 @@ impl ProxyRequest {
     /// The header map a `2.0` event carries: every header except the one the cookies were
     /// lifted out of, which that format reports in `cookies` instead.
     fn headers_without_cookies(&self) -> Map<String, Value> {
-        self.headers
-            .iter()
+        joined_fields(&self.headers)
+            .into_iter()
             .filter(|(name, _)| name.as_str() != COOKIE_HEADER)
-            .map(|(name, value)| (name.clone(), Value::String(value.clone())))
+            .map(|(name, value)| (name, Value::String(value)))
             .collect()
     }
 
     /// The caller's address, as the event reports it.
     fn source_ip(&self) -> String {
-        self.headers
-            .get(FORWARDED_FOR_HEADER)
+        self.header(FORWARDED_FOR_HEADER)
+            .as_deref()
             .and_then(|value| value.split(',').next())
             .map(str::trim)
             .filter(|address| !address.is_empty())
@@ -154,7 +156,7 @@ impl ProxyRequest {
 
     /// The `userAgent` the event reports, or `None` for a request naming none.
     fn user_agent(&self) -> Option<String> {
-        self.headers.get("user-agent").cloned()
+        self.header("user-agent")
     }
 
     /// The body as the event carries it, with the flag that says how it is encoded.
@@ -312,7 +314,7 @@ pub fn event_2_0(request: &ProxyRequest, invocation: &Invocation) -> Value {
     if !request.query_parameters.is_empty() {
         event.insert(
             "queryStringParameters".to_string(),
-            json!(request.query_parameters),
+            json!(joined_fields(&request.query_parameters)),
         );
     }
     event.insert(
@@ -433,8 +435,8 @@ pub fn event_1_0(request: &ProxyRequest, invocation: &Invocation) -> Value {
         "httpMethod": request.method,
         "headers": single_valued(&request.headers),
         "multiValueHeaders": multi_valued(&request.headers),
-        "queryStringParameters": optional_map(&request.query_parameters),
-        "multiValueQueryStringParameters": optional_multi_map(&request.query_parameters),
+        "queryStringParameters": optional_fields(&request.query_parameters),
+        "multiValueQueryStringParameters": optional_multi_fields(&request.query_parameters),
         "requestContext": request_context_1_0(request, invocation, &resource),
         "pathParameters": optional_map(&path_parameters),
         "stageVariables": optional_map(&request.stage_variables),
@@ -562,28 +564,21 @@ pub fn authorizer_event(
     event
 }
 
-/// A single-valued JSON map of `values`, always present (a `1.0` event's `headers`).
-pub(crate) fn single_valued(values: &BTreeMap<String, String>) -> Value {
-    json!(values)
+/// A single-valued JSON map of `values`, always present (a `1.0` event's `headers`): each
+/// name against its occurrences joined (`super::super::data_plane::joined_fields`).
+pub(crate) fn single_valued(values: &FieldValues) -> Value {
+    json!(joined_fields(values))
 }
 
-/// The multi-valued form of `values`: each name against the list its comma-joined value
-/// splits into, which is how a `1.0` event reports a header that appeared more than once.
-pub(crate) fn multi_valued(values: &BTreeMap<String, String>) -> Value {
-    let multi: BTreeMap<String, Vec<String>> = values
-        .iter()
-        .map(|(name, value)| {
-            (
-                name.clone(),
-                value
-                    .split(MULTI_VALUE_SEPARATOR)
-                    .map(str::trim)
-                    .map(str::to_string)
-                    .collect(),
-            )
-        })
-        .collect();
-    json!(multi)
+/// The multi-valued form of `values`: each name against the list of values the request
+/// carried for it, ONE PER OCCURRENCE, which is how a `1.0` event reports a header or a
+/// query parameter that appeared more than once.
+///
+/// The list is what arrived and is never re-derived from the joined form: a field sent ONCE
+/// whose value itself contains a comma (`Accept: text/plain,text/html`, `?p=a,b`) is one
+/// value here, exactly as the sender stated it, while a field sent twice is two.
+pub(crate) fn multi_valued(values: &FieldValues) -> Value {
+    json!(values)
 }
 
 /// `values` as a JSON map, or JSON null for an empty one: a `1.0` event reports an absent
@@ -595,8 +590,16 @@ pub(crate) fn optional_map(values: &BTreeMap<String, String>) -> Value {
     json!(values)
 }
 
-/// [`optional_map`] in the multi-valued form.
-pub(crate) fn optional_multi_map(values: &BTreeMap<String, String>) -> Value {
+/// [`optional_map`] over the occurrences of a field, in the single-valued form.
+pub(crate) fn optional_fields(values: &FieldValues) -> Value {
+    if values.is_empty() {
+        return Value::Null;
+    }
+    single_valued(values)
+}
+
+/// [`optional_fields`] in the multi-valued form.
+pub(crate) fn optional_multi_fields(values: &FieldValues) -> Value {
     if values.is_empty() {
         return Value::Null;
     }
@@ -688,7 +691,8 @@ mod tests {
     use super::*;
 
     /// A request against `GET /orders/{id}` of a named stage, carrying two cookies, a
-    /// repeated header and a query string.
+    /// header whose ONE field line holds a comma, a header sent TWICE, and a query string
+    /// with a repeated name.
     fn request() -> ProxyRequest {
         ProxyRequest {
             method: "GET".to_string(),
@@ -696,13 +700,17 @@ mod tests {
             route_path: "/orders/7".to_string(),
             raw_query_string: "a=1&a=2&b=3".to_string(),
             headers: BTreeMap::from([
-                ("cookie".to_string(), "one=1; two=2".to_string()),
-                ("accept".to_string(), "text/plain,text/html".to_string()),
-                ("user-agent".to_string(), "curl".to_string()),
+                ("cookie".to_string(), vec!["one=1; two=2".to_string()]),
+                ("accept".to_string(), vec!["text/plain,text/html".to_string()]),
+                (
+                    "x-probe".to_string(),
+                    vec!["first".to_string(), "second".to_string()],
+                ),
+                ("user-agent".to_string(), vec!["curl".to_string()]),
             ]),
             query_parameters: BTreeMap::from([
-                ("a".to_string(), "1,2".to_string()),
-                ("b".to_string(), "3".to_string()),
+                ("a".to_string(), vec!["1".to_string(), "2".to_string()]),
+                ("b".to_string(), vec!["3".to_string()]),
             ]),
             body: b"hello".to_vec(),
             route_key: "GET /orders/{id}".to_string(),
@@ -776,7 +784,7 @@ mod tests {
     #[test]
     fn a_1_0_event_reports_both_the_single_and_the_multi_valued_maps() {
         let event = event_1_0(&request(), &invocation());
-        let cases: [(&str, &str, Value); 6] = [
+        let cases: [(&str, &str, Value); 9] = [
             ("the format version", "/version", json!("1.0")),
             ("the method on the event itself", "/httpMethod", json!("GET")),
             ("the key's path as the resource", "/resource", json!("/orders/{id}")),
@@ -786,14 +794,29 @@ mod tests {
                 json!("text/plain,text/html"),
             ),
             (
-                "the multi-valued header map",
+                "a field line that itself holds a comma is ONE value",
                 "/multiValueHeaders/accept",
-                json!(["text/plain", "text/html"]),
+                json!(["text/plain,text/html"]),
+            ),
+            (
+                "a header sent twice is two values",
+                "/multiValueHeaders/x-probe",
+                json!(["first", "second"]),
+            ),
+            (
+                "a header sent twice is comma-joined in the single-valued map",
+                "/headers/x-probe",
+                json!("first,second"),
             ),
             (
                 "the multi-valued query map",
                 "/multiValueQueryStringParameters/a",
                 json!(["1", "2"]),
+            ),
+            (
+                "the single-valued query map comma-joins the occurrences",
+                "/queryStringParameters/a",
+                json!("1,2"),
             ),
         ];
         for (case, pointer, expected) in cases {

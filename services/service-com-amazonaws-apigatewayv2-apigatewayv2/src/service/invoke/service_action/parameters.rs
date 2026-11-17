@@ -295,12 +295,11 @@ impl Sources<'_> {
         match source {
             // A header is named case-insensitively (RFC 9110 §5.1), and the request's headers
             // are held under their lowercased names.
-            HEADER_SOURCE => self
-                .request
-                .headers
-                .get(&rest?.to_ascii_lowercase())
-                .cloned(),
-            QUERY_STRING_SOURCE => self.request.query_parameters.get(rest?).cloned(),
+            HEADER_SOURCE => self.request.header(&rest?.to_ascii_lowercase()),
+            QUERY_STRING_SOURCE => crate::service::data_plane::joined_field(
+                &self.request.query_parameters,
+                rest?,
+            ),
             PATH_SOURCE => match rest {
                 None => Some(self.request.route_path.clone()),
                 Some(name) => self.path_parameters().get(name).cloned(),
@@ -466,14 +465,20 @@ mod tests {
             route_path: "/orders/7".to_string(),
             raw_query_string: "kind=retail&tag=a&tag=b".to_string(),
             headers: [
-                ("content-type".to_string(), "application/json".to_string()),
-                ("x-source".to_string(), "app.orders".to_string()),
+                (
+                    "content-type".to_string(),
+                    vec!["application/json".to_string()],
+                ),
+                ("x-source".to_string(), vec!["app.orders".to_string()]),
             ]
             .into_iter()
             .collect(),
             query_parameters: [
-                ("kind".to_string(), "retail".to_string()),
-                ("tag".to_string(), "a,b".to_string()),
+                ("kind".to_string(), vec!["retail".to_string()]),
+                (
+                    "tag".to_string(),
+                    vec!["a".to_string(), "b".to_string()],
+                ),
             ]
             .into_iter()
             .collect(),

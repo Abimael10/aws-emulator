@@ -98,10 +98,11 @@ pub struct Connection {
     pub region: String,
     /// When the connection was established.
     pub connected_at: SystemTime,
-    /// The opening handshake's headers, under the names the client sent them with.
-    pub headers: BTreeMap<String, String>,
-    /// The opening handshake's query parameters, a repeated name comma-joined.
-    pub query_parameters: BTreeMap<String, String>,
+    /// The opening handshake's headers, under the names the client sent them with, with ONE
+    /// ENTRY PER FIELD LINE it carried (`super::super::data_plane::FieldValues`).
+    pub headers: crate::service::data_plane::FieldValues,
+    /// The opening handshake's query parameters, one entry per occurrence in the query.
+    pub query_parameters: crate::service::data_plane::FieldValues,
     /// The serving stage's variables.
     pub stage_variables: BTreeMap<String, String>,
     /// The `context` the connection request's authorizer returned, carried into every later
@@ -117,14 +118,13 @@ impl Connection {
     /// handshake's own `Host`, and the api's `execute-api` host for a client that sent none.
     pub fn domain_name(&self) -> String {
         field(&self.headers, HOST_HEADER)
-            .map(str::trim)
+            .map(|host| host.trim().to_string())
             .filter(|host| !host.is_empty())
-            .map(str::to_string)
             .unwrap_or_else(|| crate::state::execute_api_host(&self.api_id, &self.region))
     }
 
     /// What the client named itself as, which the event reports under `identity`.
-    pub fn user_agent(&self) -> Option<&str> {
+    pub fn user_agent(&self) -> Option<String> {
         field(&self.headers, USER_AGENT_HEADER)
     }
 
@@ -142,13 +142,14 @@ impl Connection {
     }
 }
 
-/// The value `headers` carries for the field `name`, compared case-insensitively the way a
-/// field name is (RFC 9110 §5.1) — because the map is keyed by the spelling the client used.
-pub fn field<'h>(headers: &'h BTreeMap<String, String>, name: &str) -> Option<&'h str> {
+/// The value `headers` carries for the field `name` — its field lines joined, which is how
+/// one value of a repeated field reads (RFC 9110 §5.3) — compared case-insensitively the way
+/// a field name is (§5.1), because the map is keyed by the spelling the client used.
+pub fn field(headers: &crate::service::data_plane::FieldValues, name: &str) -> Option<String> {
     headers
         .iter()
         .find(|(field, _)| field.eq_ignore_ascii_case(name))
-        .map(|(_, value)| value.as_str())
+        .map(|(_, value)| value.join(crate::service::data_plane::FIELD_LIST_SEPARATOR))
 }
 
 /// Which call of a connection an event is about.
@@ -214,11 +215,11 @@ pub fn event_of(
     if matches!(call, Call::Connect) {
         event.insert(
             "queryStringParameters".to_string(),
-            proxy_event::optional_map(&connection.query_parameters),
+            proxy_event::optional_fields(&connection.query_parameters),
         );
         event.insert(
             "multiValueQueryStringParameters".to_string(),
-            proxy_event::optional_multi_map(&connection.query_parameters),
+            proxy_event::optional_multi_fields(&connection.query_parameters),
         );
     }
     if call.carries_the_handshake() {
@@ -373,10 +374,16 @@ mod tests {
             region: "eu-west-1".to_string(),
             connected_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(1_700_000),
             headers: BTreeMap::from([
-                ("host".to_string(), "sockets.example.test".to_string()),
-                ("user-agent".to_string(), "suite".to_string()),
+                (
+                    "host".to_string(),
+                    vec!["sockets.example.test".to_string()],
+                ),
+                ("user-agent".to_string(), vec!["suite".to_string()]),
             ]),
-            query_parameters: BTreeMap::from([("token".to_string(), "t0ken".to_string())]),
+            query_parameters: BTreeMap::from([(
+                "token".to_string(),
+                vec!["t0ken".to_string()],
+            )]),
             stage_variables: BTreeMap::from([("tenant".to_string(), "acme".to_string())]),
             authorizer_context,
             authorizer_principal,

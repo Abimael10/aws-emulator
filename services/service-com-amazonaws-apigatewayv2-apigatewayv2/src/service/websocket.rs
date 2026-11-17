@@ -602,12 +602,8 @@ pub async fn serve_with_transport<Eng: Send + Sync + 'static>(
                 connection_id,
                 region: resolved.api.region.clone(),
                 connected_at: ::std::time::SystemTime::now(),
-                headers: req
-                    .headers()
-                    .iter()
-                    .map(|(name, value)| (name.to_string(), value.to_string()))
-                    .collect(),
-                query_parameters: super::data_plane::joined_query_parameters(req.uri()),
+                headers: super::data_plane::header_field_values(req.headers().iter()),
+                query_parameters: super::data_plane::query_parameter_values(req.uri()),
                 stage_variables: stage.stage_variables.clone(),
                 authorizer_context: None,
                 authorizer_principal: None,

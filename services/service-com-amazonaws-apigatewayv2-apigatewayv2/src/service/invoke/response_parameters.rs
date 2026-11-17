@@ -234,8 +234,11 @@ mod tests {
             raw_path: "/prod/orders".to_string(),
             route_path: "/orders".to_string(),
             raw_query_string: "page=2".to_string(),
-            headers: BTreeMap::from([("x-sent".to_string(), "by-the-client".to_string())]),
-            query_parameters: BTreeMap::from([("page".to_string(), "2".to_string())]),
+            headers: BTreeMap::from([(
+                "x-sent".to_string(),
+                vec!["by-the-client".to_string()],
+            )]),
+            query_parameters: BTreeMap::from([("page".to_string(), vec!["2".to_string()])]),
             body: br#"{"wanted":"gold"}"#.to_vec(),
             route_key: "GET /orders".to_string(),
             api_id: "abc123".to_string(),

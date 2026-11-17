@@ -345,11 +345,11 @@ struct Offer {
     method: String,
     /// The request target as written: the path, and any query string after it.
     target: String,
-    /// Every header field, under the name the client sent it with; a field that appeared
-    /// more than once is one comma-separated value (RFC 9110 §5.3). The spelling is KEPT
+    /// Every header field, under the name the client sent it with, with ONE ENTRY PER FIELD
+    /// LINE it carried (`super::super::data_plane::FieldValues`). The spelling is KEPT
     /// because it is what the event reports (`super::event`), and every lookup here is
     /// case-insensitive instead.
-    headers: BTreeMap<String, String>,
+    headers: crate::service::data_plane::FieldValues,
 }
 
 impl Offer {
@@ -365,23 +365,20 @@ impl Offer {
         }
         let target = request.path?.to_string();
         let method = request.method?.to_string();
-        let mut headers: BTreeMap<String, String> = BTreeMap::new();
+        let mut headers: crate::service::data_plane::FieldValues = BTreeMap::new();
         for field in request.headers.iter() {
             let Ok(value) = std::str::from_utf8(field.value) else {
                 continue;
             };
-            // A field the client repeated is one comma-separated value, under the spelling
-            // it first used.
+            // A field the client repeated keeps BOTH of its values, under the spelling it
+            // first used: the field lines are what the request carried.
             match headers
                 .iter_mut()
                 .find(|(name, _)| name.eq_ignore_ascii_case(field.name))
             {
-                Some((_, held)) => {
-                    held.push(',');
-                    held.push_str(value.trim());
-                }
+                Some((_, held)) => held.push(value.trim().to_string()),
                 None => {
-                    headers.insert(field.name.to_string(), value.trim().to_string());
+                    headers.insert(field.name.to_string(), vec![value.trim().to_string()]);
                 }
             }
         }
@@ -397,13 +394,17 @@ impl Offer {
     /// service endpoint cannot disagree about what a handshake is. Everything else on this
     /// socket is an ordinary HTTP request ([`super::endpoint_http`]).
     fn is_opening_handshake(&self) -> bool {
+        let host = self.header(::http::header::HOST.as_str()).unwrap_or_default();
+        let connection = self.header("connection");
+        let upgrade = self.header("upgrade");
+        let key = self.header(super::SEC_WEBSOCKET_KEY);
         super::Handshake::of_fields(
             &self.method,
-            event::field(&self.headers, ::http::header::HOST.as_str()).unwrap_or_default(),
+            &host,
             self.path(),
-            event::field(&self.headers, "connection"),
-            event::field(&self.headers, "upgrade"),
-            event::field(&self.headers, super::SEC_WEBSOCKET_KEY),
+            connection.as_deref(),
+            upgrade.as_deref(),
+            key.as_deref(),
         )
         .is_opening()
     }
@@ -411,7 +412,7 @@ impl Offer {
     /// The value this handshake carries for the header `name`, read case-insensitively as a
     /// header name is.
     fn header(&self, name: &str) -> Option<String> {
-        event::field(&self.headers, name).map(str::to_string)
+        event::field(&self.headers, name)
     }
 
     /// The path the handshake addressed, with its query string removed.
@@ -866,7 +867,7 @@ fn offered(
             region: api.region.clone(),
             connected_at: SystemTime::now(),
             headers: offer.headers.clone(),
-            query_parameters: super::super::data_plane::joined_query_parameters(&offer.target),
+            query_parameters: super::super::data_plane::query_parameter_values(&offer.target),
             stage_variables: stage.stage_variables.clone(),
             // Filled in by the authorizer's own decision, when a route names one.
             authorizer_context: None,
@@ -968,7 +969,7 @@ async fn carry_frames<S>(
             // What the client named itself as in its own handshake, and NOTHING for a client
             // that named nothing: the registry reports the member only where the handshake
             // carried one, so no value is invented for a field the client never sent.
-            user_agent: connection.user_agent().map(str::to_string),
+            user_agent: connection.user_agent(),
         },
         SystemTime::now(),
         endpoint,

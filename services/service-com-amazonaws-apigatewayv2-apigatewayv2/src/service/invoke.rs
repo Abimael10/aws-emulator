@@ -193,10 +193,10 @@ use smithy_server_runtime::{http, OperationContext};
 
 use super::data_plane::{
     addresses_connections, api_id_of_host, authority_of, first_segment, forbidden, header_of,
-    identity_source_value, joined_query_parameters, json_response, not_found, path_of,
-    path_segments, presents_identity_source, query_of, query_parameters, service_named_by_host,
-    split_first_segment, EXECUTE_API_LABEL, LOCAL_ENDPOINT_PREFIX, UNAUTHORIZED_MESSAGE,
-    UNAUTHORIZED_STATUS, UNPLACEABLE_STATUS,
+    identity_source_value, json_response, not_found, path_of, path_segments,
+    presents_identity_source, query_of, query_parameter_values, query_parameters,
+    service_named_by_host, split_first_segment, FieldValues, EXECUTE_API_LABEL,
+    LOCAL_ENDPOINT_PREFIX, UNAUTHORIZED_MESSAGE, UNAUTHORIZED_STATUS, UNPLACEABLE_STATUS,
 };
 use super::jwt;
 use crate::state::{
@@ -1776,7 +1776,7 @@ fn dispatch(
             route_path: route_path.to_string(),
             raw_query_string: query_of(req.uri()).unwrap_or_default().to_string(),
             headers: backend_headers(req),
-            query_parameters: joined_query_parameters(req.uri()),
+            query_parameters: query_parameter_values(req.uri()),
             body: req
                 .body()
                 .bytes()
@@ -1826,21 +1826,11 @@ fn route_throttle(stage: &Stage, route_key: &str) -> Option<crate::state::route_
     )
 }
 
-/// Every header of the request, by lowercased name, with a header that appeared more than
-/// once joined into the one comma-separated value a field list is (RFC 9110 §5.3).
-fn request_headers(req: &RtRequest) -> BTreeMap<String, String> {
-    let mut headers: BTreeMap<String, String> = BTreeMap::new();
-    for (name, value) in req.headers().iter() {
-        let name = name.to_ascii_lowercase();
-        headers
-            .entry(name)
-            .and_modify(|held| {
-                held.push(',');
-                held.push_str(value);
-            })
-            .or_insert_with(|| value.to_string());
-    }
-    headers
+/// Every header of the request, by lowercased name, with ONE ENTRY PER FIELD LINE it
+/// carried — the reading [`super::data_plane::header_field_values`] owns, so this plane and
+/// the WebSocket one state a repeated field the same way.
+fn request_headers(req: &RtRequest) -> FieldValues {
+    super::data_plane::header_field_values(req.headers().iter())
 }
 
 /// The request as the BACKEND sees it: every header the client sent ([`request_headers`]),
@@ -1854,15 +1844,20 @@ fn request_headers(req: &RtRequest) -> BTreeMap<String, String> {
 /// is the node closest to the client"). A request carrying no chain gets one holding that
 /// address alone. Every other header the client sent — `Via` among them — is relayed exactly
 /// as it arrived.
-fn backend_headers(req: &RtRequest) -> BTreeMap<String, String> {
+fn backend_headers(req: &RtRequest) -> FieldValues {
     let mut headers = request_headers(req);
-    let chain = match headers.get(FORWARDED_FOR_HEADER).map(String::as_str) {
-        Some(claimed) if !claimed.trim().is_empty() => {
-            format!("{claimed}{FORWARDED_FOR_SEPARATOR}{}", observed_peer())
-        }
-        _ => observed_peer().to_string(),
+    let claimed = headers
+        .get(FORWARDED_FOR_HEADER)
+        .map(|held| held.join(FORWARDED_FOR_SEPARATOR))
+        .unwrap_or_default();
+    let chain = if claimed.trim().is_empty() {
+        observed_peer().to_string()
+    } else {
+        format!("{claimed}{FORWARDED_FOR_SEPARATOR}{}", observed_peer())
     };
-    headers.insert(FORWARDED_FOR_HEADER.to_string(), chain);
+    // The chain is ONE field line, whichever number of them the client sent: the hop
+    // appends to the chain rather than beside it.
+    headers.insert(FORWARDED_FOR_HEADER.to_string(), vec![chain]);
     headers
 }
 

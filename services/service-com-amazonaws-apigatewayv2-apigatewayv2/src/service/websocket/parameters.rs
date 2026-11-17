@@ -101,10 +101,12 @@ pub fn mapped(connection: &Connection, request_parameters: &BTreeMap<String, Str
                 mapped
                     .headers
                     .retain(|field, _| !field.eq_ignore_ascii_case(name));
-                mapped.headers.insert(name.to_string(), resolved);
+                mapped.headers.insert(name.to_string(), vec![resolved]);
             }
             MappedInto::QueryString => {
-                mapped.query_parameters.insert(name.to_string(), resolved);
+                mapped
+                    .query_parameters
+                    .insert(name.to_string(), vec![resolved]);
             }
             // A WebSocket call has no path template behind its stage, so there is no path
             // parameter of the integration request for the event to report.
@@ -142,10 +144,10 @@ fn source_value(connection: &Connection, value: &str) -> Option<String> {
         return Some(literal.to_string());
     }
     if let Some(name) = source_name(value, &HEADER_SOURCE_PREFIXES) {
-        return field(&connection.headers, name).map(str::to_string);
+        return field(&connection.headers, name);
     }
     if let Some(name) = source_name(value, &QUERY_SOURCE_PREFIXES) {
-        return connection.query_parameters.get(name).cloned();
+        return crate::service::data_plane::joined_field(&connection.query_parameters, name);
     }
     None
 }
@@ -195,10 +197,13 @@ mod tests {
             region: "eu-west-1".to_string(),
             connected_at: SystemTime::UNIX_EPOCH,
             headers: BTreeMap::from([
-                ("X-Client-Trace".to_string(), "trace-7".to_string()),
-                ("User-Agent".to_string(), "suite".to_string()),
+                ("X-Client-Trace".to_string(), vec!["trace-7".to_string()]),
+                ("User-Agent".to_string(), vec!["suite".to_string()]),
             ]),
-            query_parameters: BTreeMap::from([("token".to_string(), "t-9".to_string())]),
+            query_parameters: BTreeMap::from([(
+                "token".to_string(),
+                vec!["t-9".to_string()],
+            )]),
             stage_variables: BTreeMap::new(),
             authorizer_context: None,
             authorizer_principal: None,
@@ -316,20 +321,21 @@ mod tests {
         for (name, expected) in cases {
             let actual = field(&mapped.headers, name);
             assert_eq!(
-                actual, *expected,
+                actual.as_deref(),
+                *expected,
                 "case {name:?}: expected the header {expected:?}, got {actual:?}"
             );
         }
-        let passed = mapped.query_parameters.get("passed").map(String::as_str);
+        let passed = crate::service::data_plane::joined_field(&mapped.query_parameters, "passed");
         assert_eq!(
-            passed,
+            passed.as_deref(),
             Some("t-9"),
             "case {:?}: expected the mapped query parameter, got {passed:?}",
             "integration.request.querystring.passed"
         );
-        let sent = mapped.query_parameters.get("token").map(String::as_str);
+        let sent = crate::service::data_plane::joined_field(&mapped.query_parameters, "token");
         assert_eq!(
-            sent,
+            sent.as_deref(),
             Some("t-9"),
             "case {:?}: the handshake's own query parameter travels on, got {sent:?}",
             "token"
@@ -352,7 +358,7 @@ mod tests {
             );
             let actual = field(&mapped.headers, "x-client-trace");
             assert_eq!(
-                actual,
+                actual.as_deref(),
                 Some("overwritten"),
                 "case {name:?}: expected the mapped value to replace what the client sent, \
                  got {actual:?}"

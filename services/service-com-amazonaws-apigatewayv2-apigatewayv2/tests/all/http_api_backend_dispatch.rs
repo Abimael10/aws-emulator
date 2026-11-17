@@ -16,6 +16,15 @@
 //! function RAN and returned, which is why AWS Lambda is mounted beside this service on one
 //! engine — an `AWS_PROXY` route's answer belongs to a function that lives in that service.
 //!
+//! One table states a rule of its own about the EVENT, beside the rule above:
+//!
+//! > The maps a proxy event states the request's header fields and query parameters in are
+//! > read by OCCURRENCE: the multi-valued maps (`multiValueHeaders`,
+//! > `multiValueQueryStringParameters`) carry one entry per field line, and per parameter
+//! > occurrence, the request really carried, and the single-valued maps beside them carry
+//! > those occurrences joined by a comma (RFC 9110 §5.3) — so a field sent ONCE whose value
+//! > itself holds a comma stays one value, and only a field sent more than once is several.
+//!
 //! The suites that already pin the steps BEFORE the integration (the claim, the three
 //! addressings, stage resolution, the deployment gate, route matching, the authorization
 //! gate, the CORS decoration and the payload quota) are not restated here:
@@ -1398,6 +1407,153 @@ async fn an_http_proxy_route_sends_the_caller_to_the_endpoint_it_names() {
                     answer.summary()
                 );
             }
+        }
+    }
+}
+
+/// The header fields every occurrence row is read off: one field line holding the separator,
+/// one holding it with the optional whitespace a field list admits (RFC 9110 §5.6.1), and one
+/// field the client sends TWICE — which is the only thing that makes a field several values.
+const OCCURRENCE_FIELDS: &[(&str, &str)] = &[
+    ("x-one-value", "alpha,beta"),
+    ("x-spaced-value", "alpha, beta"),
+    ("x-repeated", "first"),
+    ("x-repeated", "second"),
+];
+
+/// The query string beside them, with the same three shapes: a parameter sent once whose
+/// single value holds the separator (percent-encoded, so the comma is part of the value), a
+/// parameter sent twice, and one sent once.
+const OCCURRENCE_QUERY: &str = "?p=a%2Cb&q=1&q=2&single=s";
+
+#[tokio::test]
+async fn an_events_multi_valued_maps_report_one_entry_per_occurrence_of_a_field() {
+    // Rows differ along the payload format version, because each format states the request's
+    // fields in its own maps: `1.0` carries both the single-valued and the multi-valued map
+    // of headers and of query parameters, while `2.0` carries only the single-valued ones.
+    let cases: [(&str, &str); 2] = [
+        ("the 1.0 event's maps", "1.0"),
+        ("the 2.0 event's maps", "2.0"),
+    ];
+    for (case, payload_format) in cases {
+        let (emulator, engine) = emulator_with_lambda();
+        let function = given_function(&emulator, &engine, case, "echo-function", ECHO_EVENT).await;
+        let (_api_id, host) = given_api(
+            &emulator,
+            case,
+            lambda_integration(&function, payload_format),
+            "GET /orders",
+            json!({ "stageName": "$default", "autoDeploy": true }),
+        )
+        .await;
+        let answer = send(
+            &emulator,
+            &host,
+            "GET",
+            &format!("/orders{OCCURRENCE_QUERY}"),
+            OCCURRENCE_FIELDS,
+        )
+        .await;
+        assert_eq!(
+            answer.status,
+            200,
+            "case {case:?}: expected the function's 200, got {}",
+            answer.summary()
+        );
+        let event: Value = serde_json::from_str(&answer.text).unwrap_or(Value::Null);
+        // Each row is one member of the event and the value these occurrences owe it: a
+        // field sent once is ONE value whatever its value holds, a field sent twice is two,
+        // and the single-valued maps are those occurrences comma-joined.
+        let members: Vec<(&str, &str, Value)> = if payload_format == "1.0" {
+            vec![
+                (
+                    "a header sent once whose value holds the separator",
+                    "/multiValueHeaders/x-one-value",
+                    json!(["alpha,beta"]),
+                ),
+                (
+                    "a header sent once whose value holds the separator and a space",
+                    "/multiValueHeaders/x-spaced-value",
+                    json!(["alpha, beta"]),
+                ),
+                (
+                    "a header sent twice",
+                    "/multiValueHeaders/x-repeated",
+                    json!(["first", "second"]),
+                ),
+                (
+                    "that header in the single-valued map",
+                    "/headers/x-repeated",
+                    json!("first,second"),
+                ),
+                (
+                    "the one-value header in the single-valued map",
+                    "/headers/x-one-value",
+                    json!("alpha,beta"),
+                ),
+                (
+                    "a query parameter sent once whose value holds the separator",
+                    "/multiValueQueryStringParameters/p",
+                    json!(["a,b"]),
+                ),
+                (
+                    "a query parameter sent twice",
+                    "/multiValueQueryStringParameters/q",
+                    json!(["1", "2"]),
+                ),
+                (
+                    "a query parameter sent once",
+                    "/multiValueQueryStringParameters/single",
+                    json!(["s"]),
+                ),
+                (
+                    "that repeated parameter in the single-valued map",
+                    "/queryStringParameters/q",
+                    json!("1,2"),
+                ),
+                (
+                    "the one-value parameter in the single-valued map",
+                    "/queryStringParameters/p",
+                    json!("a,b"),
+                ),
+            ]
+        } else {
+            vec![
+                (
+                    "a header sent once whose value holds the separator",
+                    "/headers/x-one-value",
+                    json!("alpha,beta"),
+                ),
+                (
+                    "a header sent twice, comma-joined",
+                    "/headers/x-repeated",
+                    json!("first,second"),
+                ),
+                (
+                    "a query parameter sent once whose value holds the separator",
+                    "/queryStringParameters/p",
+                    json!("a,b"),
+                ),
+                (
+                    "a query parameter sent twice, comma-joined",
+                    "/queryStringParameters/q",
+                    json!("1,2"),
+                ),
+                (
+                    "a query parameter sent once",
+                    "/queryStringParameters/single",
+                    json!("s"),
+                ),
+            ]
+        };
+        for (member, pointer, expected) in members {
+            let actual = event.pointer(pointer).cloned().unwrap_or(Value::Null);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected {member} at {pointer} to be {expected}, got {actual} \
+                 in {}",
+                answer.text
+            );
         }
     }
 }

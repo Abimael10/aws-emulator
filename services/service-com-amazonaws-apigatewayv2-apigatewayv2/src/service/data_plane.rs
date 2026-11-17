@@ -273,6 +273,27 @@ pub fn header_of<'h>(headers: &'h http::HeaderMap, name: &str) -> Option<&'h str
     headers.get(name).and_then(|value| value.to_str().ok())
 }
 
+/// Every header field a request carried, by LOWERCASED name, with ONE ENTRY PER FIELD LINE
+/// ([`FieldValues`]) in the order the lines arrived.
+///
+/// A field name is case-insensitive (RFC 9110 §5.1), so the lowercased name is the one key
+/// a lookup can be made under; a field the sender REPEATED keeps both of its values here
+/// rather than one of them, because the two field lines are what the request carried and
+/// what a multi-valued event member reports.
+pub fn header_field_values<'h, Fields>(fields: Fields) -> FieldValues
+where
+    Fields: IntoIterator<Item = (&'h str, &'h str)>,
+{
+    let mut headers: FieldValues = BTreeMap::new();
+    for (name, value) in fields {
+        headers
+            .entry(name.to_ascii_lowercase())
+            .or_default()
+            .push(value.to_string());
+    }
+    headers
+}
+
 /// The first label of `host` when `host` is an `execute-api` endpoint: the api id.
 ///
 /// The shape is `{api-id}.execute-api.{region}.amazonaws.com` — a first label, then the
@@ -408,28 +429,63 @@ pub fn query_parameters(uri: &str) -> BTreeMap<String, String> {
     parameters
 }
 
-/// The query parameters of a request URI with a name the query REPEATS keeping every one of
-/// its values, joined into the one comma-separated value a field list is (RFC 9110 §5.3).
+/// Every value a request carried for one FIELD — a header field or a query-string
+/// parameter — by name, with ONE ENTRY PER OCCURRENCE in the request, in the order they
+/// arrived.
 ///
-/// That is the form a proxy event's `queryStringParameters` states them in — "the query
-/// string parameters, with a repeated parameter's values comma-separated" — so the event
-/// reports a repeated parameter as the list it was sent as rather than as whichever value a
-/// reader met first. The same decoder as [`query_parameters`] reads the grammar, so the two
-/// readings cannot disagree about what a pair says.
-pub fn joined_query_parameters(uri: &str) -> BTreeMap<String, String> {
-    let mut parameters: BTreeMap<String, String> = BTreeMap::new();
+/// This is the occurrence-level reading every event member about the request is rendered
+/// from: the multi-valued maps a proxy event carries report exactly these entries, and the
+/// single-valued maps beside them report them joined ([`joined_fields`]). Holding the
+/// occurrences — rather than one joined string to be taken apart again — is what keeps a
+/// value that CONTAINS the separator one value: `?p=a,b` was sent once and is one value,
+/// while `?p=a&p=b` was sent twice and is two, and no reading of the joined form can tell
+/// those apart.
+pub type FieldValues = BTreeMap<String, Vec<String>>;
+
+/// The separator that carries several values of one field as a single value, and the one a
+/// joined value is read as naming several: "a recipient MAY combine multiple field lines
+/// within the same field section into one field line … by appending each subsequent field
+/// line value … separated by a comma" (RFC 9110 §5.3).
+pub const FIELD_LIST_SEPARATOR: &str = ",";
+
+/// `values` with each name against ONE value: its occurrences joined by
+/// [`FIELD_LIST_SEPARATOR`].
+///
+/// That is the form the single-valued maps of a proxy event state a field in — a `1.0`
+/// event's `headers` and `queryStringParameters`, and a `2.0` event's, where a header or a
+/// query parameter the request carried more than once is reported as one comma-separated
+/// value. Derived from [`FieldValues`] rather than built beside it, so the single-valued and
+/// the multi-valued rendering of one request cannot disagree.
+pub fn joined_fields(values: &FieldValues) -> BTreeMap<String, String> {
+    values
+        .iter()
+        .map(|(name, held)| (name.clone(), held.join(FIELD_LIST_SEPARATOR)))
+        .collect()
+}
+
+/// The value `values` state for the field `name`: its occurrences joined
+/// ([`joined_fields`]), or `None` for a field the request carried none of.
+pub fn joined_field(values: &FieldValues, name: &str) -> Option<String> {
+    values
+        .get(name)
+        .map(|held| held.join(FIELD_LIST_SEPARATOR))
+}
+
+/// The query parameters of a request URI, with EVERY value a repeated name was given, in
+/// the order the query carried them.
+///
+/// The same decoder as [`query_parameters`] reads the grammar, so the two readings cannot
+/// disagree about what a pair says; this one keeps the occurrences
+/// ([`FieldValues`]) instead of the first value alone, because a proxy event reports a
+/// repeated parameter as the list it was sent as.
+pub fn query_parameter_values(uri: &str) -> FieldValues {
+    let mut parameters: FieldValues = BTreeMap::new();
     let Some(query) = query_of(uri) else {
         return parameters;
     };
     for (name, value) in ::aws_smithy_schema_server::query::parse_form_urlencoded(query.as_bytes())
     {
-        parameters
-            .entry(name)
-            .and_modify(|held| {
-                held.push(',');
-                held.push_str(&value);
-            })
-            .or_insert(value);
+        parameters.entry(name).or_default().push(value);
     }
     parameters
 }
