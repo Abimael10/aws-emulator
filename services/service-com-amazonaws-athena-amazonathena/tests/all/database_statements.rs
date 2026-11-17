@@ -470,17 +470,19 @@ async fn show_databases_reports_the_catalog_s_own_databases() {
     }
 
     // (case, the statement, the names it must report). The rows differ along the spelling
-    // of the statement and whether it narrows its answer.
+    // of the statement and whether it narrows its answer. An unnarrowed listing carries
+    // `default` beside the created names: that database is the Data Catalog's own, carried
+    // for every account without a create.
     let cases: Vec<(&str, &str, Vec<&str>)> = vec![
         (
             "every database the catalog holds",
             "SHOW DATABASES",
-            vec!["other_gamma", "show_alpha", "show_beta"],
+            vec!["default", "other_gamma", "show_alpha", "show_beta"],
         ),
         (
             "the Presto spelling of the same statement",
             "SHOW SCHEMAS",
-            vec!["other_gamma", "show_alpha", "show_beta"],
+            vec!["default", "other_gamma", "show_alpha", "show_beta"],
         ),
         (
             "narrowed by a SQL pattern",

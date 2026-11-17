@@ -254,7 +254,9 @@ async fn a_name_supplied_as_null_or_empty_is_the_catalogs_own_input_error() {
         .collect();
     assert_eq!(
         held,
-        vec!["input_refusals_db"],
+        // The database the Data Catalog carries is listed beside the created one; no
+        // refused write added a third.
+        vec!["default", "input_refusals_db"],
         "a refused create must store nothing, got {databases}"
     );
     let tables = ok(

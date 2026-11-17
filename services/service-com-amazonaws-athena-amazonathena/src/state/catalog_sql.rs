@@ -30,6 +30,8 @@
 pub mod data;
 /// The statements the Data Catalog performs.
 pub mod ddl;
+/// Why an unregistered relation fails on the relation: the database the catalog carries.
+mod default_database;
 /// What Athena says about text its query grammar cannot read as a statement.
 pub mod grammar;
 /// The `CREATE DATABASE` clauses Hive's DDL grammar takes beyond the general parser.

@@ -24,6 +24,11 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::wire::{call, emulator, error_code, ok, ACCOUNT_ID};
 
+/// The database every account's Data Catalog HOLDS from the moment it exists, which no
+/// `CreateDatabase` wrote: it is listed beside the created ones
+/// (`service_com_amazonaws_glue_awsglue::state::CATALOG_DEFAULT_DATABASE`).
+const CARRIED_DATABASE: &str = "default";
+
 /// Create one database from the `DatabaseInput` the row describes.
 async fn given_database(router: &MultiServiceRouter, input: &Value) {
     ok(router, "CreateDatabase", &json!({ "DatabaseInput": input })).await;
@@ -205,10 +210,12 @@ async fn every_listed_database_is_the_single_read_projection() {
         }
     }
 
+    // The created databases, beside the `default` one every Data Catalog holds from the
+    // moment it exists.
     assert_eq!(
         listed.len(),
-        rows.len(),
-        "every stored database must be listed, got {:?}",
+        rows.len() + 1,
+        "every stored database must be listed beside the one the catalog carries, got {:?}",
         listed_names(&json!({ "DatabaseList": listed.clone() }))
     );
 }
@@ -231,10 +238,14 @@ async fn every_stored_database_is_listed_in_name_order_and_paged() {
     for (case, stored, page_size) in rows {
         let router = emulator();
         // Created out of name order, so the listing's own order is what is asserted.
-        let expected: Vec<String> = (0..*stored).map(|index| format!("db_{index:02}")).collect();
+        let mut expected: Vec<String> =
+            (0..*stored).map(|index| format!("db_{index:02}")).collect();
         for name in expected.iter().rev() {
             given_database(&router, &json!({ "Name": name })).await;
         }
+        // The database the catalog HOLDS from the start is listed with them, in the same
+        // name order: `default` sorts after every `db_NN`.
+        expected.push(CARRIED_DATABASE.to_string());
 
         let mut request = json!({});
         if let Some(size) = page_size {
@@ -265,11 +276,12 @@ async fn the_last_page_of_a_listing_carries_no_next_token() {
         given_database(&router, &json!({ "Name": format!("db_{index:02}") })).await;
     }
 
-    // (case, the page size, whether that page is the last one)
+    // (case, the page size, whether that page is the last one). The listing holds FOUR
+    // databases: the three created above and the `default` one the catalog carries.
     let rows: &[(&str, i32, bool)] = &[
         ("a page that stops short of the end continues", 1, false),
-        ("a page that stops one short of the end continues", 2, false),
-        ("a page that reaches the end stops", 3, true),
+        ("a page that stops one short of the end continues", 3, false),
+        ("a page that reaches the end stops", 4, true),
         ("a page past the end stops", 10, true),
     ];
     for (case, size, is_last) in rows {
@@ -336,10 +348,19 @@ async fn attributes_to_get_narrows_each_element_to_the_members_it_names() {
             .clone();
         assert_eq!(
             listed_names(&page),
-            vec!["linked_db".to_string(), "plain_db".to_string()],
+            vec![
+                CARRIED_DATABASE.to_string(),
+                "linked_db".to_string(),
+                "plain_db".to_string(),
+            ],
             "case {case:?}: a projection narrows each element, not the listing, got {elements:?}"
         );
-        for (element, expected) in elements.iter().zip([linked_members, plain_members]) {
+        // In listed order: the carried database, which is no resource link, then the
+        // linked one, then the plain one.
+        for (element, expected) in elements
+            .iter()
+            .zip([plain_members, linked_members, plain_members])
+        {
             let expected: Vec<String> = {
                 let mut names: Vec<String> = expected
                     .iter()
@@ -411,16 +432,28 @@ async fn resource_share_type_selects_which_share_is_listed() {
     // (case, ResourceShareType, the names expected). A stored database is federated
     // exactly when it carries a `FederatedDatabase`; none is foreign, because this store
     // holds one account's catalog and nothing in it was shared from another account.
+    // The database the catalog holds from the start is in neither share: it carries no
+    // `FederatedDatabase`, so only the unnarrowed listings report it.
     let rows: Vec<(&str, Option<&str>, Vec<&str>)> = vec![
         (
             "no share type named",
             None,
-            vec!["another_federated_db", "federated_db", "local_db"],
+            vec![
+                "another_federated_db",
+                CARRIED_DATABASE,
+                "federated_db",
+                "local_db",
+            ],
         ),
         (
             "ALL",
             Some("ALL"),
-            vec!["another_federated_db", "federated_db", "local_db"],
+            vec![
+                "another_federated_db",
+                CARRIED_DATABASE,
+                "federated_db",
+                "local_db",
+            ],
         ),
         (
             "FEDERATED",
@@ -467,20 +500,20 @@ async fn resource_share_type_selects_which_share_is_listed() {
 }
 
 #[tokio::test]
-async fn a_catalog_with_no_databases_lists_none_and_another_accounts_is_refused() {
+async fn a_catalog_nothing_wrote_into_lists_the_one_it_carries_and_another_accounts_is_refused() {
     let router = emulator();
 
-    // This account's catalog, before anything wrote a database into it: an empty listing,
-    // not a miss.
+    // This account's catalog, before anything wrote a database into it: the one database
+    // it came with and nothing else, which is a listing and not a miss.
     let page = ok(&router, "GetDatabases", &json!({})).await;
     assert_eq!(
-        page["DatabaseList"],
-        json!([]),
-        "a catalog holding no databases lists none, got {page}"
+        listed_names(&page),
+        vec![CARRIED_DATABASE.to_string()],
+        "a catalog nothing wrote into lists the one it came with, got {page}"
     );
     assert!(
         page.get("NextToken").and_then(Value::as_str).is_none(),
-        "an empty listing is the last page, got {page}"
+        "a listing that fits one page is the last page, got {page}"
     );
 
     // The same request against the catalog of another account, which is reachable only
@@ -534,10 +567,14 @@ async fn max_results_is_served_at_its_published_bounds_and_refused_past_them() {
 #[tokio::test]
 async fn a_continuation_token_resumes_strictly_after_the_name_it_names() {
     let router = emulator();
-    let names: Vec<String> = (0..6).map(|index| format!("page_db_{index}")).collect();
-    for name in &names {
+    let created: Vec<String> = (0..6).map(|index| format!("page_db_{index}")).collect();
+    for name in &created {
         given_database(&router, &json!({ "Name": name })).await;
     }
+    // The whole listing in name order: the database the catalog HOLDS from the start
+    // sorts before every created name.
+    let mut names = vec![CARRIED_DATABASE.to_string()];
+    names.extend(created);
 
     // Each row walks the same listing at a different page size and asserts the pages
     // concatenate to the whole listing exactly once, with no name served twice.

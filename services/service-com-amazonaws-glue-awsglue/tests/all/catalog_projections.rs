@@ -793,19 +793,27 @@ async fn a_projected_database_listing_reports_every_entrys_catalog_identity() {
             read["Database"]["DatabaseId"].clone(),
         ));
     }
+    // The database the Data Catalog CARRIES is listed with them and carries the same
+    // catalog-written members, so the page is read against it too.
+    let carried = ok(&router, "GetDatabase", &json!({ "Name": "default" })).await;
+    expected_ids.push((
+        "default".to_string(),
+        carried["Database"]["DatabaseId"].clone(),
+    ));
 
-    // (case, the request, how many entries the page holds)
+    // (case, the request, how many entries the page holds: the two created databases and
+    // the one the catalog carries, unless `MaxResults` narrows the page)
     let cases: Vec<(&str, Value, usize)> = vec![
-        ("NAME alone", json!({ "AttributesToGet": [ "NAME" ] }), 2),
+        ("NAME alone", json!({ "AttributesToGet": [ "NAME" ] }), 3),
         (
             "NAME and TARGET_DATABASE",
             json!({ "AttributesToGet": [ "NAME", "TARGET_DATABASE" ] }),
-            2,
+            3,
         ),
         (
             "TARGET_DATABASE and NAME, the other order",
             json!({ "AttributesToGet": [ "TARGET_DATABASE", "NAME" ] }),
-            2,
+            3,
         ),
         (
             "NAME over a page narrowed by MaxResults",

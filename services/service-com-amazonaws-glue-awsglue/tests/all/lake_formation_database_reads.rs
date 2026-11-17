@@ -49,6 +49,12 @@ const TABLE: &str = "usage_events";
 /// another.
 const OTHER_DATABASE: &str = "warehouse";
 
+/// The database a Data Catalog comes with
+/// (`service_com_amazonaws_glue_awsglue::state::CATALOG_DEFAULT_DATABASE`). It carries the
+/// creation-time grant every database gets, and no row revokes it, so it is listed
+/// throughout.
+const CATALOG_DATABASE: &str = "default";
+
 /// The role the reader of these rows assumes.
 const READER_ROLE: &str = "reader";
 
@@ -664,7 +670,11 @@ async fn the_listing_omits_a_database_the_caller_may_not_describe() {
     );
     assert_eq!(
         names(&page),
-        vec![DATABASE.to_string(), OTHER_DATABASE.to_string()],
+        vec![
+            CATALOG_DATABASE.to_string(),
+            DATABASE.to_string(),
+            OTHER_DATABASE.to_string(),
+        ],
         "case {case:?}: both databases carry their creation-time grant, got {page}"
     );
 
@@ -683,8 +693,8 @@ async fn the_listing_omits_a_database_the_caller_may_not_describe() {
     );
     assert_eq!(
         names(&page),
-        vec![OTHER_DATABASE.to_string()],
-        "case {case:?}: expected only the database still granted, got {page}"
+        vec![CATALOG_DATABASE.to_string(), OTHER_DATABASE.to_string()],
+        "case {case:?}: expected only the databases still granted, got {page}"
     );
 
     grant(
@@ -708,7 +718,11 @@ async fn the_listing_omits_a_database_the_caller_may_not_describe() {
     );
     assert_eq!(
         names(&page),
-        vec![DATABASE.to_string(), OTHER_DATABASE.to_string()],
+        vec![
+            CATALOG_DATABASE.to_string(),
+            DATABASE.to_string(),
+            OTHER_DATABASE.to_string(),
+        ],
         "case {case:?}: the granted database must be listed again, got {page}"
     );
 }

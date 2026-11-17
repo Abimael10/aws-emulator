@@ -1009,8 +1009,10 @@ pub(super) fn id_draw(sequence: u64, index: usize) -> u64 {
 /// Per-service state for com-amazonaws-glue-awsglue. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsGlueAwsglueState {
-    /// Every Data Catalog this emulator holds, keyed by `CatalogId`.
-    pub catalogs: HashMap<String, Catalog>,
+    /// Every Data Catalog this emulator holds, keyed by `CatalogId` — the account's own
+    /// holding the [`CATALOG_DEFAULT_DATABASE`] database a Data Catalog HAS from the
+    /// moment the store exists ([`Catalogs`]).
+    pub catalogs: Catalogs,
     /// The instant the Data Catalogs of this store carry their DEFAULT migration status
     /// from ([`CatalogStatusStamp`]): the instant a status read reports as
     /// `CatalogImportStatus$ImportTime` for a catalog no `ImportCatalogToGlue` has

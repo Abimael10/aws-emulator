@@ -1181,17 +1181,19 @@ async fn show_databases_lists_the_catalog_databases() {
         start(&router, "setup", "show_ddl_one", sql).await;
     }
 
-    // (case, the statement, the names it must list)
+    // (case, the statement, the names it must list). An unnarrowed listing carries
+    // `default` beside the created names: that database is the Data Catalog's own, carried
+    // for every account without a create.
     let cases: Vec<(&str, &str, Vec<&str>)> = vec![
         (
             "every database the catalog holds",
             "SHOW DATABASES",
-            vec!["show_api_db", "show_ddl_one", "show_ddl_two"],
+            vec!["default", "show_api_db", "show_ddl_one", "show_ddl_two"],
         ),
         (
             "the same listing under the SCHEMAS spelling",
             "SHOW SCHEMAS",
-            vec!["show_api_db", "show_ddl_one", "show_ddl_two"],
+            vec!["default", "show_api_db", "show_ddl_one", "show_ddl_two"],
         ),
         (
             "a listing narrowed by a pattern",

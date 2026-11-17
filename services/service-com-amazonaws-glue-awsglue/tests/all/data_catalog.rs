@@ -1480,10 +1480,11 @@ fn seed(engine: &Arc<engine::InMemoryEngine>, databases: usize, tables_each: usi
 /// tables store-wide.
 #[tokio::test]
 async fn a_create_past_a_capacity_ceiling_is_refused() {
-    // Databases per catalog.
+    // Databases per catalog. The catalog already holds the one database a Data Catalog
+    // comes with, so the seed fills the rest of its room up to one short of the ceiling.
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let router = emulator_on(engine.clone());
-    seed(&engine, MAX_DATABASES_PER_CATALOG - 1, 0);
+    seed(&engine, MAX_DATABASES_PER_CATALOG - 2, 0);
 
     ok(&router, "CreateDatabase", &database_body("last_db")).await;
     let (status, body) = call(&router, "CreateDatabase", &database_body("one_too_many")).await;

@@ -815,8 +815,9 @@ async fn a_create_past_the_catalog_ceiling_is_refused() {
     let router = emulator_on(engine.clone());
 
     // Reaching the ceiling over the wire would exercise the transport rather than the
-    // bound.
-    let seeded: Vec<String> = (0..MAX_CATALOGS - 1)
+    // bound. One container is there already — the account's own Data Catalog — so the
+    // seeds fill the rest of the room up to one short of the ceiling.
+    let seeded: Vec<String> = (0..MAX_CATALOGS - 2)
         .map(|index| format!("{ACCOUNT_ID}:seeded-{index}"))
         .collect();
     {

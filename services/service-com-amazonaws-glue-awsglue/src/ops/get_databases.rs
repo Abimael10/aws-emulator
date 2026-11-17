@@ -432,7 +432,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let (database_list, next_token, encryptions) = {
             let store = state.lock();
             // A catalog this account holds but nothing has written a database into yet
-            // holds none, which is an empty listing and not a miss.
+            // holds only the one its Data Catalog came with, which is a listing and not a
+            // miss.
             let matching: Vec<&crate::state::DatabaseEntry> = store
                 .catalogs
                 .get(&catalog_id)

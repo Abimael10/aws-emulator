@@ -19,8 +19,28 @@ use smithy_server_runtime::MultiServiceRouter;
 /// An emulator with Lake Formation and Glue over ONE shared engine, reached exactly as
 /// the production router reaches it: `MultiServiceRouter::dispatch` of a buffered HTTP
 /// request.
+///
+/// Its Data Catalog starts holding NO database. A Data Catalog comes with its own
+/// `default` database (`service_com_amazonaws_glue_awsglue::state::CATALOG_DEFAULT_DATABASE`),
+/// and that database carries the same creation-time grant every database carries — which is
+/// the Glue crate's own suite to assert (`tests/all/lake_formation_database_reads.rs`
+/// there lists it). Every row HERE is about the grants of the entities the row itself
+/// creates, so that one record is taken out of the account's catalog, which is otherwise
+/// left exactly as the service serves it: carrying its grant through every expectation
+/// below would add nothing any row measures.
 pub fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    {
+        let state = engine
+            .state::<service_com_amazonaws_glue_awsglue::state::ComAmazonawsGlueAwsglueState>();
+        let mut store = state.lock();
+        let catalog_id = service_com_amazonaws_glue_awsglue::state::resolve_catalog_id(None);
+        if let Some(catalog) = store.catalogs.get_mut(&catalog_id) {
+            catalog
+                .databases
+                .remove(service_com_amazonaws_glue_awsglue::state::CATALOG_DEFAULT_DATABASE);
+        }
+    }
     let mut router = MultiServiceRouter::new();
     router.register_service(
         service_com_amazonaws_lakeformation_awslakeformation::EmulatedService::new(Arc::clone(

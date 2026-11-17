@@ -1280,10 +1280,12 @@ pub fn data_catalog_type_error(catalog_type: &str) -> Option<String> {
 /// name it without this registry holding a [`WorkGroupRecord`] for it.
 pub const DEFAULT_WORK_GROUP: &str = "primary";
 
-/// The database a query runs in when its `QueryExecutionContext` names none. The Glue
-/// Data Catalog's own default database carries this name, so a query that qualifies
-/// nothing runs where an unqualified name resolves.
-pub const DEFAULT_QUERY_DATABASE: &str = "default";
+/// The database a query runs in when its `QueryExecutionContext` names none: the database
+/// the Glue Data Catalog itself holds for every account
+/// ([`glue_state::CATALOG_DEFAULT_DATABASE`]), so a query that qualifies nothing runs
+/// where an unqualified name resolves, and the name is taken from the catalog rather than
+/// spelled a second time here.
+pub const DEFAULT_QUERY_DATABASE: &str = glue_state::CATALOG_DEFAULT_DATABASE;
 
 /// The `QueryExecutionState` of a query that has been submitted and is waiting for
 /// resources. `QueryExecutionStatus$State` documents it: "QUEUED indicates that the

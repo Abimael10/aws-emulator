@@ -76,6 +76,64 @@ impl Catalog {
     }
 }
 
+/// The name of the database an account's Data Catalog HAS: a Data Catalog holds a
+/// `default` database that no `CreateDatabase` wrote — it is part of what a Data Catalog
+/// is, and it is where a query layer resolves a name that qualifies no database (Athena's
+/// `QueryExecutionContext$Database` "if none is specified" case).
+pub const CATALOG_DEFAULT_DATABASE: &str = "default";
+
+/// The Data Catalogs this store holds, keyed by `CatalogId` — the account's own already
+/// holding its [`CATALOG_DEFAULT_DATABASE`] database.
+///
+/// That database is part of the store's INITIAL state rather than something a request
+/// brings into existence: a Data Catalog HAS it, so it is written when the store is
+/// materialised — the way the store's own migration stamp takes its instant then
+/// ([`CatalogStatusStamp`]) — and by no operation afterwards, so no read has to write
+/// anything to answer for it and every reader sees the same record. It is a stored
+/// [`DatabaseEntry`] like any other database's, which is what keeps one catalog ONE
+/// record: the reads report it, a `CreateTable` may write a table into it, a delete
+/// removes it, and it occupies one of the catalog's database slots
+/// ([`Catalog::can_store_database`]) — no path has to know that this database came from
+/// anywhere else.
+#[derive(Debug)]
+pub struct Catalogs(HashMap<String, Catalog>);
+
+impl Default for Catalogs {
+    fn default() -> Self {
+        let catalog_id = resolve_catalog_id(None);
+        let entry = DatabaseEntry::from_input(
+            &DatabaseInput {
+                name: CATALOG_DEFAULT_DATABASE.to_string(),
+                ..DatabaseInput::default()
+            },
+            &catalog_id,
+            None,
+            SystemTime::now(),
+        );
+        let catalog = Catalog {
+            databases: HashMap::from([(fold_name(CATALOG_DEFAULT_DATABASE), entry)]),
+            ..Catalog::default()
+        };
+        Self(HashMap::from([(catalog_id, catalog)]))
+    }
+}
+
+/// The map itself, so every reader and writer of the catalogs reaches it exactly as it did
+/// when the field was the map: this type adds the store's initial content, not an API.
+impl ::std::ops::Deref for Catalogs {
+    type Target = HashMap<String, Catalog>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl ::std::ops::DerefMut for Catalogs {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
 /// `CatalogImportStatus$ImportedBy` of a Data Catalog: the service's own marker, reported
 /// in place of "the name of the person who initiated the migration" because the migration
 /// status of a Data Catalog this service serves is one the SERVICE set — no request it

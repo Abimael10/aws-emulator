@@ -72,6 +72,9 @@ fn seed_catalogs(
 #[test]
 fn the_catalog_container_count_is_bounded() {
     let mut store = ComAmazonawsGlueAwsglueState::default();
+    // This row measures the store's own container ceiling, so it starts from no container
+    // at all rather than from the account's own Data Catalog the store comes with.
+    store.catalogs.clear();
 
     let admitted = seed_catalogs(&mut store, MAX_CATALOGS, 0);
     assert_eq!(
@@ -111,6 +114,9 @@ fn the_catalog_container_count_is_bounded() {
 #[test]
 fn the_stored_database_count_is_bounded_across_catalogs() {
     let mut store = ComAmazonawsGlueAwsglueState::default();
+    // As above: the ceiling is what this row measures, so the databases below are the only
+    // ones the store holds.
+    store.catalogs.clear();
 
     // Spread the records over several containers: the point of the bound is that a
     // per-catalog ceiling multiplied by a container count is not itself a bound.
