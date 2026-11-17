@@ -481,7 +481,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // here, so a tenant is created holding none.
             invalidations: std::collections::BTreeMap::new(),
         };
-        let distribution_tenant = stored.to_distribution_tenant();
+        let distribution_tenant = store.distribution_tenant_document(&stored);
         store.distribution_tenants.insert(id, stored);
 
         Ok(CreateDistributionTenantOutput {

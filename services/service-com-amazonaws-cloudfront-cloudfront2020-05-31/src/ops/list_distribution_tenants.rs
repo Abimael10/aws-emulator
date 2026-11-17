@@ -285,7 +285,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 more_remain = true;
                 break;
             }
-            tenants.push(stored.to_summary());
+            tenants.push(store.distribution_tenant_summary(stored));
         }
 
         Ok(ListDistributionTenantsOutput {

@@ -469,7 +469,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             enabled: input.enabled,
             managed_certificate_request: input.managed_certificate_request,
         };
-        let Some(tenant) = store.apply_distribution_tenant_update(&input.id, update, now) else {
+        let Some(tenant) = store
+            .apply_distribution_tenant_update(&input.id, update, now)
+            .cloned()
+        else {
             return Err(UpdateDistributionTenantErrorModeled::EntityNotFound(
                 crate::state::distribution_tenant_not_found(),
             )
@@ -479,7 +482,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(UpdateDistributionTenantOutput {
             // "The distribution tenant that you're updating" — read from the record just
             // written, so the answer and every later read are the same document.
-            distribution_tenant: Some(tenant.to_distribution_tenant()),
+            distribution_tenant: Some(store.distribution_tenant_document(&tenant)),
             // "The current version of the distribution tenant": the token this mutation just
             // minted, so the version from before it no longer satisfies an `If-Match`.
             e_tag: Some(tenant.etag.clone()),

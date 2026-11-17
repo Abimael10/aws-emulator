@@ -106,7 +106,8 @@ use crate::ops::types::{
     S3OriginConfig, SessionStickinessConfig, Signer, StreamingDistribution,
     StreamingDistributionConfig,
     StreamingDistributionSummary, StreamingLoggingConfig, StringSchemaConfig, Tag, Tags,
-    TrafficConfig, TrustedKeyGroups, TrustedSigners, ValidationTokenDetail, ViewerCertificate,
+    TrafficConfig, TenantConfig, TrustedKeyGroups, TrustedSigners, ValidationTokenDetail,
+    ViewerCertificate,
     WebAclCustomization,
 };
 
@@ -614,14 +615,18 @@ pub const MAX_GEO_RESTRICTION_LOCATIONS: usize = 26 * 26;
 pub const MAX_DISTRIBUTION_TENANTS: usize = 10_000;
 
 /// `DomainResult$Status` — "Whether the domain is active or inactive" — for a domain a
-/// distribution tenant is SERVED at: viewers asking for it are routed to the tenant.
+/// distribution tenant is SERVED at: a viewer asking for it reaches the tenant, which takes
+/// both a certificate the domain can be served over and a DNS record that sends the viewer
+/// to the tenant's routing endpoint
+/// ([`ComAmazonawsCloudfrontCloudfront20200531State::domain_is_active`]).
 pub const DOMAIN_STATUS_ACTIVE: &str = "active";
 
 /// `DomainResult$Status` for a domain the tenant holds but is NOT served at yet: the
-/// CloudFront managed certificate requested for it is still waiting to be validated, so
-/// CloudFront cannot serve the domain and a viewer asking for it is routed nowhere
-/// ([`StoredDistributionTenant::domain_pending_validation`]). The validation is what moves
-/// it to [`DOMAIN_STATUS_ACTIVE`].
+/// CloudFront managed certificate requested for it is still waiting to be validated
+/// ([`StoredDistributionTenant::domain_pending_validation`]), or no DNS record points the
+/// domain at the routing endpoint the tenant's viewers are routed through — either way a
+/// viewer asking for it reaches nothing. This is what a domain a tenant was just created
+/// with reads, since neither condition is met by writing the association down.
 pub const DOMAIN_STATUS_INACTIVE: &str = "inactive";
 
 /// The `CustomizationActionType` a distribution tenant's web ACL customization carries when
@@ -1231,10 +1236,19 @@ pub const DEFAULT_MAX_TTL: i64 = 31_536_000;
 /// ("Customizing error responses").
 pub const DEFAULT_ERROR_CACHING_MIN_TTL: i64 = 300;
 
-/// `ViewerCertificate$SSLSupportMethod` reported for a distribution served on CloudFront's
-/// own certificate: such a distribution "accepts HTTPS connections from all viewers
-/// including those that don't support SNI", which is what `vip` names.
-pub const SSL_SUPPORT_METHOD_VIP: &str = "vip";
+/// `ViewerCertificate$SSLSupportMethod` the service supplies for a configuration that
+/// named none.
+///
+/// `sni-only` is "the distribution accepts HTTPS connections from only viewers that support
+/// server name indication (SNI). This is recommended. Most browsers and clients support
+/// SNI." The alternative the enum admits for a certificate CloudFront serves, `vip`, is the
+/// dedicated-IP method — "not recommended, and results in additional monthly charges from
+/// CloudFront" — and `static-ip` is "not [to be specified] unless your distribution has
+/// been enabled for this feature by the CloudFront team": a method that costs more, or that
+/// has to be enabled for the account, is never one a configuration is given without asking
+/// for it, so the recommended method is what the service supplies and a request naming
+/// another gets exactly the one it named.
+pub const SSL_SUPPORT_METHOD_SNI_ONLY: &str = "sni-only";
 
 /// `ViewerCertificate$MinimumProtocolVersion` reported for a distribution served on
 /// CloudFront's own certificate: "If the distribution uses the CloudFront domain name such
@@ -1983,7 +1997,7 @@ pub struct StoredDistributionTenant {
     pub distribution_id: String,
     /// The domains associated with this tenant, in the order the create listed them. Each
     /// is reported as a `DomainResult` under the status it is served at
-    /// ([`Self::to_domain_results`]).
+    /// ([`ComAmazonawsCloudfrontCloudfront20200531State::domain_is_active`]).
     pub domains: Vec<String>,
     /// `DistributionTenant$ConnectionGroupId` — the connection group the tenant's viewers
     /// are routed through: the one the create named, or the account's default one.
@@ -2070,13 +2084,19 @@ impl StoredDistributionTenant {
         })
     }
 
-    /// Whether a viewer asking for `domain` is routed to this tenant: the tenant holds the
-    /// domain AND the domain is not still waiting for a managed certificate
-    /// ([`Self::domain_pending_validation`]).
+    /// Whether a request arriving for `domain` is routed to this tenant: the tenant holds
+    /// the domain AND the domain is not still waiting for a managed certificate
+    /// ([`Self::domain_pending_validation`]), which is the certificate CloudFront would have
+    /// to complete the TLS handshake with.
     ///
     /// This is also what makes the tenant's claim on the domain an ENFORCED one
     /// ([`ComAmazonawsCloudfrontCloudfront20200531State::domain_in_use`]): a domain nothing
     /// routes yet is a domain no route collides with.
+    ///
+    /// Being routable is NOT the whole of being reachable: a viewer only arrives at
+    /// CloudFront at all once DNS sends it there, which is the second half of what the
+    /// domain's reported status answers
+    /// ([`ComAmazonawsCloudfrontCloudfront20200531State::domain_is_active`]).
     pub fn serves_domain(&self, domain: &str) -> bool {
         self.holds_domain(domain) && !self.domain_pending_validation(domain)
     }
@@ -2090,24 +2110,22 @@ impl StoredDistributionTenant {
     /// holds, in the order they were associated, each with the status it is SERVED under.
     ///
     /// `DomainResult$Status` is "whether the domain is active or inactive", which is a
-    /// property of the domain's own reachability rather than of the tenant: a domain a
-    /// viewer is routed to ([`Self::serves_domain`]) reads [`DOMAIN_STATUS_ACTIVE`], and one
-    /// that routes nowhere yet — a domain whose CloudFront managed certificate is still
-    /// waiting to be validated, so CloudFront cannot serve it — reads
-    /// [`DOMAIN_STATUS_INACTIVE`] until the validation makes it serve. The same predicate
-    /// decides the tenant's claim on the domain
-    /// ([`ComAmazonawsCloudfrontCloudfront20200531State::domain_in_use`]), so what a tenant
-    /// reports about a domain and what the domain routes to cannot disagree.
+    /// property of the domain's own reachability rather than of the tenant, so `is_active`
+    /// is the one answer to it
+    /// ([`ComAmazonawsCloudfrontCloudfront20200531State::domain_is_active`]): it is decided
+    /// against the store, since whether a viewer reaches the tenant at a domain depends on
+    /// DNS records and on the connection group the tenant is routed through, neither of
+    /// which this record holds.
     ///
     /// ONE mapping, so the full document and a listing's summary cannot drift apart about a
     /// tenant's domains.
-    fn to_domain_results(&self) -> Vec<DomainResult> {
+    fn to_domain_results(&self, is_active: impl Fn(&str) -> bool) -> Vec<DomainResult> {
         self.domains
             .iter()
             .map(|domain| DomainResult {
                 domain: domain.clone(),
                 status: Some(
-                    if self.serves_domain(domain) {
+                    if is_active(domain) {
                         DOMAIN_STATUS_ACTIVE
                     } else {
                         DOMAIN_STATUS_INACTIVE
@@ -2119,14 +2137,15 @@ impl StoredDistributionTenant {
     }
 
     /// The `DistributionTenant` projection every distribution tenant operation returns,
-    /// read from the one stored record.
-    pub fn to_distribution_tenant(&self) -> DistributionTenant {
+    /// read from the one stored record and the `domains` the store reports for it
+    /// ([`ComAmazonawsCloudfrontCloudfront20200531State::distribution_tenant_document`]).
+    fn to_distribution_tenant(&self, domains: Vec<DomainResult>) -> DistributionTenant {
         DistributionTenant {
             id: Some(self.id.clone()),
             distribution_id: Some(self.distribution_id.clone()),
             name: Some(self.name.clone()),
             arn: Some(self.arn.clone()),
-            domains: Some(self.to_domain_results()),
+            domains: Some(domains),
             tags: Some(self.to_tags()),
             customizations: self.customizations.clone(),
             // A tenant that was created with no parameter values carries none, rather
@@ -2151,13 +2170,13 @@ impl StoredDistributionTenant {
     /// other member is the same value under the same name. A summary carries no
     /// `Parameters`, so the parameter values a tenant holds are reached through a read of
     /// the tenant itself.
-    pub fn to_summary(&self) -> DistributionTenantSummary {
+    fn to_summary(&self, domains: Vec<DomainResult>) -> DistributionTenantSummary {
         DistributionTenantSummary {
             id: self.id.clone(),
             distribution_id: self.distribution_id.clone(),
             name: self.name.clone(),
             arn: self.arn.clone(),
-            domains: self.to_domain_results(),
+            domains,
             connection_group_id: Some(self.connection_group_id.clone()),
             customizations: self.customizations.clone(),
             created_time: ::aws_smithy_types::DateTime::from(self.created_time),
@@ -2242,6 +2261,22 @@ pub struct DistributionTenantUpdate {
     /// `ManagedCertificateRequest` — the CloudFront managed ACM certificate the update asks
     /// for, which MINTS one over the domains the tenant holds after the update.
     pub managed_certificate_request: Option<ManagedCertificateRequest>,
+}
+
+/// The `TenantConfig` a distribution's stored configuration retains.
+///
+/// `TenantConfig$ParameterDefinitions` is "the parameters that you specify for a
+/// distribution tenant", so a list carrying no entry specifies none: it is retained as
+/// absent rather than as an empty element, the same rule the empty `Items` of a listing
+/// follows. The element itself is retained as the request stated it — it is the member that
+/// "only supports multi-tenant distributions", so dropping it would change what the
+/// configuration says about its own tenancy. ONE rule for every write that stores a
+/// distribution's configuration.
+pub(crate) fn retained_tenant_config(mut tenant_config: TenantConfig) -> TenantConfig {
+    tenant_config.parameter_definitions = tenant_config
+        .parameter_definitions
+        .filter(|definitions| !definitions.is_empty());
+    tenant_config
 }
 
 /// The customization set a tenant's record retains, or `None` when the set names nothing at

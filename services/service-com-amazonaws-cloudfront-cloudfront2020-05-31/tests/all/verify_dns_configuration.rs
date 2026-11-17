@@ -28,6 +28,14 @@
 //! Beside them: an `Identifier` no tenant carries is `EntityNotFound`, and the verification
 //! is a REPORT — it changes nothing a later caller sees.
 //!
+//! The third rule is the one the DNS configuration decides for the tenant itself: a domain
+//! is reported `active` only once a viewer asking for it reaches the tenant — the domain
+//! resolves to the routing endpoint of the connection group the tenant is routed through AND
+//! the certificate it would be served over has been issued — and `inactive` until then. The
+//! association alone does neither, so a domain a create has just associated is `inactive`,
+//! and every path that serializes a tenant (the create, a read, a listing's summary, an
+//! update) reports the one status.
+//!
 //! The rows differ along everything the rules generalise over: which endpoint the domain
 //! resolves to (the tenant's own connection group, another connection group, a
 //! distribution's own edge domain, nothing at all), whether the name is one the tenant
@@ -39,18 +47,23 @@
 
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
     DISTRIBUTION_TENANT_ID_PREFIX, DNS_CONFIGURATION_INVALID, DNS_CONFIGURATION_UNKNOWN,
-    DNS_CONFIGURATION_VALID, MAX_DOMAINS_PER_TENANT, MAX_DOMAIN_LABEL_LEN,
+    DNS_CONFIGURATION_VALID, DOMAIN_STATUS_ACTIVE, DOMAIN_STATUS_INACTIVE,
+    MAX_DOMAINS_PER_TENANT, MAX_DOMAIN_LABEL_LEN,
 };
 use smithy_server_runtime::MultiServiceRouter;
+use std::time::Instant;
 
 use crate::connection_groups::create_connection_group;
 use crate::distribution_lifecycle::{
-    call, config, create_distribution, emulator, Answer, Node, API_VERSION,
+    call, config, create_distribution, emulator, Answer, Node, API_VERSION, POLL_INTERVAL,
+    READY_DEADLINE,
 };
 use crate::distribution_tenant_lifecycle::{
-    create_distribution_tenant, encode_label, escape, longest_domain,
+    create_distribution_tenant, domains_of, encode_label, escape, longest_domain,
     managed_certificate_request, multi_tenant_distribution,
 };
+use crate::distribution_tenant_update::{update_tenant, update_xml};
+use crate::distribution_tenants_list::{list_body, list_tenants, summaries};
 use crate::response_headers_policy_lifecycle::text;
 
 /// The message CloudFront answers a `Domain` the named distribution tenant does not hold
@@ -183,14 +196,15 @@ async fn connection_group(router: &MultiServiceRouter, name: &str) -> (String, S
 }
 
 /// Create a distribution tenant called `name` under `distribution_id`, routed through
-/// `connection_group_id` and holding `domains`. Answers its minted `(Id, Arn)`.
-async fn distribution_tenant(
+/// `connection_group_id` and holding `domains`. Answers the CREATE's own answer, which is
+/// the first of the four payloads that serialize a tenant.
+async fn created_distribution_tenant(
     router: &MultiServiceRouter,
     distribution_id: &str,
     name: &str,
     domains: &[&str],
     connection_group_id: &str,
-) -> (String, String) {
+) -> Answer {
     assert!(
         domains.len() <= MAX_DOMAINS_PER_TENANT,
         "case {name}: a tenant holds at most {MAX_DOMAINS_PER_TENANT} domains, got {}",
@@ -220,10 +234,30 @@ async fn distribution_tenant(
         "case {name}: expected the tenant to be created, got {} with {}",
         created.status, created.raw
     );
-    let tenant = created
+    created
+}
+
+/// The `DistributionTenant` document one of the tenant payloads carries.
+fn tenant_document<'a>(answer: &'a Answer, case: &str) -> &'a Node {
+    answer
         .root()
         .descendant("DistributionTenant")
-        .unwrap_or_else(|| panic!("case {name}: the create carries no DistributionTenant"));
+        .unwrap_or_else(|| panic!("case {case}: the answer carries no DistributionTenant"))
+}
+
+/// Create a distribution tenant called `name` under `distribution_id`, routed through
+/// `connection_group_id` and holding `domains`. Answers its minted `(Id, Arn)`.
+async fn distribution_tenant(
+    router: &MultiServiceRouter,
+    distribution_id: &str,
+    name: &str,
+    domains: &[&str],
+    connection_group_id: &str,
+) -> (String, String) {
+    let created =
+        created_distribution_tenant(router, distribution_id, name, domains, connection_group_id)
+            .await;
+    let tenant = tenant_document(&created, name);
     (
         text(tenant, "Id", name, "the created tenant", &created.raw),
         text(tenant, "Arn", name, "the created tenant", &created.raw),
@@ -616,4 +650,169 @@ async fn an_identifier_no_tenant_carries_is_not_found() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The status the DNS configuration decides
+// ---------------------------------------------------------------------------
+
+/// Look again until the tenant `identifier` reports `domain` [`DOMAIN_STATUS_ACTIVE`], or
+/// [`READY_DEADLINE`] passes, which fails the case. Answers the read that saw it.
+///
+/// The CONDITION is what is waited for, never a span of the host's clock: the certificate's
+/// issuance is the transition the clock owes the record, and the read is what materialises
+/// it.
+async fn awaited_active_domain(
+    router: &MultiServiceRouter,
+    identifier: &str,
+    domain: &str,
+) -> Answer {
+    let deadline = Instant::now() + READY_DEADLINE;
+    loop {
+        let read = get_distribution_tenant(router, identifier).await;
+        let active = domains_of(read.root())
+            .into_iter()
+            .any(|(held, status)| held == domain && status == DOMAIN_STATUS_ACTIVE);
+        if active {
+            return read;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the domain {domain} never became {DOMAIN_STATUS_ACTIVE}, last answer {}",
+            read.raw
+        );
+        ::tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// The `DistributionTenantSummary` the unfiltered listing reports for the tenant `id`.
+fn listed_summary<'a>(answer: &'a Answer, id: &str) -> &'a Node {
+    summaries(answer)
+        .into_iter()
+        .find(|summary| summary.text_at("Id") == Some(id))
+        .unwrap_or_else(|| panic!("the listing carries no summary for {id}: {}", answer.raw))
+}
+
+/// A tenant's domain is `active` only once a viewer asking for it reaches the tenant: the
+/// domain has to resolve to the routing endpoint of the connection group the tenant is
+/// routed through, and the certificate it is served over has to have been issued. So the
+/// domains a create has just associated are all `inactive` — the association is a claim on
+/// the name, not a route to it — and once the issuance the clock owes is due exactly the
+/// domain that points at the tenant's own routing endpoint reads `active`, while a domain
+/// pointing at another CloudFront endpoint and a domain in a zone this service holds no
+/// record for stay `inactive`.
+///
+/// The rows differ along what each domain resolves to (the tenant's own connection group,
+/// another connection group, a distribution's own edge domain, nothing at all), the case the
+/// name is written in, and its length; the four serialization paths — the create, the read,
+/// a listing's summary and an update — are each asserted to report the one status.
+#[tokio::test]
+async fn a_tenant_domain_is_active_only_once_it_points_at_the_tenants_routing_endpoint() {
+    let router = emulator();
+    let distribution_id = multi_tenant_distribution(&router, "ref-domain-status").await;
+    let (own_group, own_endpoint) = connection_group(&router, "domain-status-own").await;
+    let (other_group, other_endpoint) = connection_group(&router, "domain-status-other").await;
+    let distribution_domain = distribution_domain_name(&router, "ref-domain-status-std").await;
+    let longest = longest_domain();
+    // The row whose DNS points at the tenant's own routing endpoint, written in a case the
+    // record does not hold it in: DNS names are case-insensitive, so the comparison is too.
+    let own_endpoint_mixed = own_endpoint.to_ascii_uppercase();
+
+    let held: Vec<String> = vec![
+        own_endpoint_mixed.clone(),
+        other_endpoint.clone(),
+        distribution_domain.clone(),
+        "shop.example.com".to_string(),
+        longest.clone(),
+    ];
+    let created = created_distribution_tenant(
+        &router,
+        &distribution_id,
+        "domain-status-tenant",
+        &held.iter().map(String::as_str).collect::<Vec<&str>>(),
+        &own_group,
+    )
+    .await;
+    // A second tenant on the OTHER group, so the endpoint the first tenant's domains are
+    // compared against is its own group's rather than whichever group the store holds.
+    distribution_tenant(
+        &router,
+        &distribution_id,
+        "domain-status-neighbour",
+        &["neighbour.example.com"],
+        &other_group,
+    )
+    .await;
+
+    // The create's own answer: the certificate it asked for is not issued yet, so NO domain
+    // is served yet — not even the one whose DNS already points at the tenant.
+    let document = tenant_document(&created, "the create");
+    let tenant_id = text(document, "Id", "the create", "the created tenant", &created.raw);
+    let staged = domains_of(document);
+    let all_inactive: Vec<(String, String)> = held
+        .iter()
+        .map(|domain| (domain.clone(), DOMAIN_STATUS_INACTIVE.to_string()))
+        .collect();
+    assert_eq!(
+        staged, all_inactive,
+        "case CreateDistributionTenant: expected the domains {all_inactive:?}, got {staged:?} \
+         in {}",
+        created.raw
+    );
+
+    // Once the issuance the clock owes is due, the DNS record decides each domain.
+    let read = awaited_active_domain(&router, &tenant_id, &own_endpoint_mixed).await;
+    let expected: Vec<(String, String)> = held
+        .iter()
+        .map(|domain| {
+            let status = if domain.eq_ignore_ascii_case(&own_endpoint) {
+                DOMAIN_STATUS_ACTIVE
+            } else {
+                DOMAIN_STATUS_INACTIVE
+            };
+            (domain.clone(), status.to_string())
+        })
+        .collect();
+    let reported = domains_of(read.root());
+    assert_eq!(
+        reported, expected,
+        "case GetDistributionTenant: expected the domains {expected:?}, got {reported:?} in {}",
+        read.raw
+    );
+
+    // The listing's summary answers from the same record, so it reports the same statuses.
+    let listed = list_tenants(&router, &list_body(None, None, None)).await;
+    assert_eq!(
+        listed.status, 200,
+        "expected the listing to succeed, got {} with {}",
+        listed.status, listed.raw
+    );
+    let summary = domains_of(listed_summary(&listed, &tenant_id));
+    assert_eq!(
+        summary, expected,
+        "case ListDistributionTenants: expected the domains {expected:?}, got {summary:?} in {}",
+        listed.raw
+    );
+
+    // And so does an update's answer: a mutation that restates nothing about the domains
+    // neither takes the active one away nor promotes any of the others.
+    let updated = update_tenant(
+        &router,
+        &tenant_id,
+        &update_xml("<Enabled>true</Enabled>"),
+        Some(read.header("etag")),
+    )
+    .await;
+    assert_eq!(
+        updated.status, 200,
+        "expected the update to be accepted, got {} with {}",
+        updated.status, updated.raw
+    );
+    let after_update = domains_of(tenant_document(&updated, "the update"));
+    assert_eq!(
+        after_update, expected,
+        "case UpdateDistributionTenant: expected the domains {expected:?}, got {after_update:?} \
+         in {}",
+        updated.raw
+    );
 }

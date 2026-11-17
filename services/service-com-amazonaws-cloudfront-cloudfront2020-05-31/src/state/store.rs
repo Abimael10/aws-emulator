@@ -341,6 +341,87 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
             })
     }
 
+    /// Whether the DNS record this service can read for `domain` points at
+    /// `routing_endpoint`.
+    ///
+    /// "This API operation checks whether your domain name points to the correct routing
+    /// endpoint of the connection group": the comparison is between the endpoint the name
+    /// resolves to ([`Self::resolved_cloudfront_endpoint`]) and the endpoint the resource is
+    /// served through, as DNS names are compared. A name this service holds no record for,
+    /// and a resource with no routing endpoint to compare against, are both answered `false`
+    /// — nothing says the name points there.
+    ///
+    /// ONE comparison, so the DNS configuration a verification reports and the status a
+    /// tenant's domain is reported under cannot disagree about one name.
+    pub fn domain_points_at_routing_endpoint(
+        &self,
+        domain: &str,
+        routing_endpoint: Option<&str>,
+    ) -> bool {
+        match (routing_endpoint, self.resolved_cloudfront_endpoint(domain)) {
+            (Some(endpoint), Some(resolved)) => same_domain(&resolved, endpoint),
+            _ => false,
+        }
+    }
+
+    /// Whether `tenant`'s `domain` is ACTIVE: whether a viewer asking for it reaches the
+    /// tenant.
+    ///
+    /// `DomainResult$Status` is "whether the domain is active or inactive", and a viewer
+    /// reaches a distribution tenant at one of its domains only when BOTH halves of the path
+    /// to it are in place:
+    ///
+    /// * the domain resolves to the routing endpoint of the connection group the tenant is
+    ///   routed through ([`Self::domain_points_at_routing_endpoint`]) — until the DNS record
+    ///   points there, the viewer never arrives at CloudFront at all, which is exactly the
+    ///   configuration `VerifyDnsConfiguration` exists to troubleshoot;
+    /// * and the domain is served over a certificate that has been issued, so the handshake
+    ///   for that name completes ([`StoredDistributionTenant::serves_domain`]).
+    ///
+    /// Neither follows from writing the association down, so a domain a create or an update
+    /// has just associated is [`DOMAIN_STATUS_INACTIVE`]: the association is a claim on the
+    /// name, and the name becomes active once it is validated and served. The DNS half is
+    /// read from this service's own DNS view, which holds records only for the names
+    /// CloudFront MINTS ([`Self::resolved_cloudfront_endpoint`]) — a name in a customer's
+    /// zone is published by DNS this emulator neither runs nor reaches, so a tenant's domain
+    /// stays inactive until it is pointed at a CloudFront endpoint this service answers for.
+    pub fn domain_is_active(&self, tenant: &StoredDistributionTenant, domain: &str) -> bool {
+        let routing_endpoint = self
+            .connection_group(&tenant.connection_group_id)
+            .map(|group| group.routing_endpoint.as_str());
+        tenant.serves_domain(domain)
+            && self.domain_points_at_routing_endpoint(domain, routing_endpoint)
+    }
+
+    /// The `DomainResult` list every projection of `tenant` reports, each domain under the
+    /// status it is served at ([`Self::domain_is_active`]).
+    pub fn distribution_tenant_domains(
+        &self,
+        tenant: &StoredDistributionTenant,
+    ) -> Vec<DomainResult> {
+        tenant.to_domain_results(|domain| self.domain_is_active(tenant, domain))
+    }
+
+    /// The `DistributionTenant` document every operation that answers with one whole tenant
+    /// returns, read from the stored record and this store's view of its domains.
+    pub fn distribution_tenant_document(
+        &self,
+        tenant: &StoredDistributionTenant,
+    ) -> DistributionTenant {
+        tenant.to_distribution_tenant(self.distribution_tenant_domains(tenant))
+    }
+
+    /// The `DistributionTenantSummary` every LISTING of distribution tenants reports, built
+    /// from the same record and the same domain view
+    /// [`Self::distribution_tenant_document`] reads, so a listing and a single-tenant read
+    /// can never disagree about one tenant.
+    pub fn distribution_tenant_summary(
+        &self,
+        tenant: &StoredDistributionTenant,
+    ) -> DistributionTenantSummary {
+        tenant.to_summary(self.distribution_tenant_domains(tenant))
+    }
+
     /// Every domain association this store holds that conflicts with the domain
     /// `requested`, as the `DomainConflict` each is reported as.
     ///
@@ -406,7 +487,8 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
     /// this emulator can resolve: a name in a CUSTOMER's zone (the domain of a
     /// distribution tenant, an alias of a distribution) is published by the customer's own
     /// DNS, which this emulator neither runs nor reaches — so it holds no record for one,
-    /// exactly as [`DOMAIN_STATUS_ACTIVE`] says of the association it does hold.
+    /// which is why a tenant's domain in such a zone stays
+    /// [`DOMAIN_STATUS_INACTIVE`] ([`Self::domain_is_active`]).
     ///
     /// [`MULTI_TENANT_DOMAIN_NAME`] is excluded: it is the fixed placeholder a
     /// multi-tenant distribution reports in place of an edge domain, not a name that

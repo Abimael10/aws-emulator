@@ -35,11 +35,13 @@ use crate::distribution_lifecycle::{
     create_distribution, emulator, get_distribution, update_distribution, Answer, Node,
     API_VERSION,
 };
+use service_com_amazonaws_cloudfront_cloudfront2020_05_31::ops::types::S_S_L_SUPPORT_METHOD_VALUES;
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
     DEFAULT_CONNECTION_ATTEMPTS, DEFAULT_CONNECTION_TIMEOUT, DEFAULT_DEFAULT_TTL,
     DEFAULT_ERROR_CACHING_MIN_TTL, DEFAULT_HTTP_VERSION, DEFAULT_MAX_TTL, DEFAULT_MIN_TTL,
     DEFAULT_ORIGIN_KEEPALIVE_TIMEOUT, DEFAULT_ORIGIN_READ_TIMEOUT, DEFAULT_PRICE_CLASS,
-    MAX_CACHE_BEHAVIORS, MAX_TRUSTED_KEY_GROUPS, MAX_TRUSTED_SIGNERS, SERVICE_ENDPOINT,
+    MAX_CACHE_BEHAVIORS, MAX_TRUSTED_KEY_GROUPS, MAX_TRUSTED_SIGNERS,
+    MINIMUM_PROTOCOL_VERSION_DEFAULT_CERTIFICATE, SERVICE_ENDPOINT, SSL_SUPPORT_METHOD_SNI_ONLY,
 };
 
 /// A SigV4 credential scope naming this service's signing name, which routes a request
@@ -113,8 +115,14 @@ fn distribution_level_defaults() -> Vec<(String, String)> {
         at("Logging/Prefix", ""),
         at("PriceClass", DEFAULT_PRICE_CLASS),
         at("ViewerCertificate/CloudFrontDefaultCertificate", "true"),
-        at("ViewerCertificate/SSLSupportMethod", "vip"),
-        at("ViewerCertificate/MinimumProtocolVersion", "TLSv1"),
+        // The method the service supplies is the recommended SNI-only one; the
+        // dedicated-IP method bills for dedicated addresses, so no configuration is given
+        // it without asking for it.
+        at(
+            "ViewerCertificate/SSLSupportMethod",
+            SSL_SUPPORT_METHOD_SNI_ONLY,
+        ),
+        at("ViewerCertificate/MinimumProtocolVersion", MINIMUM_PROTOCOL_VERSION_DEFAULT_CERTIFICATE),
         at("ViewerCertificate/CertificateSource", "cloudfront"),
         at("Restrictions/GeoRestriction/RestrictionType", "none"),
         at("Restrictions/GeoRestriction/Quantity", "0"),
@@ -753,6 +761,280 @@ async fn every_payload_reports_the_resolved_configuration() {
             &reread.raw,
         );
         assert_active_sets(&row, reread.root(), "GetDistribution after the update");
+    }
+}
+
+/// One row of the certificate-and-tenancy table: a configuration, the two
+/// `ViewerCertificate` members the service decides for it, and the `TenantConfig` the
+/// resolved configuration reports.
+struct TenancyRow {
+    case: &'static str,
+    /// The members this row adds after `Enabled`.
+    extra: String,
+    /// The `SSLSupportMethod` the resolved configuration reports.
+    ssl_support_method: String,
+    /// The `MinimumProtocolVersion` the resolved configuration reports.
+    minimum_protocol_version: String,
+    /// Whether the resolved configuration carries a `TenantConfig` element at all.
+    tenant_config: bool,
+    /// The parameter names `TenantConfig$ParameterDefinitions` reports, or `None` when the
+    /// resolved configuration carries no `ParameterDefinitions` element.
+    parameter_definitions: Option<Vec<&'static str>>,
+}
+
+/// A `ViewerCertificate` served on CloudFront's own certificate, naming whichever of the
+/// method and the security policy the row names.
+fn default_certificate(method: Option<&str>, policy: Option<&str>) -> String {
+    let method = method
+        .map(|method| format!("<SSLSupportMethod>{method}</SSLSupportMethod>"))
+        .unwrap_or_default();
+    let policy = policy
+        .map(|policy| format!("<MinimumProtocolVersion>{policy}</MinimumProtocolVersion>"))
+        .unwrap_or_default();
+    format!(
+        "<ViewerCertificate><CloudFrontDefaultCertificate>true\
+         </CloudFrontDefaultCertificate>{method}{policy}</ViewerCertificate>"
+    )
+}
+
+/// A `TenantConfig` declaring one definition per name in `names` — a `ParameterDefinitions`
+/// declaring NOTHING when `names` is empty. `ParameterDefinitions`' member carries no
+/// `xmlName` (`smithy_query(query="shape",shape="ParameterDefinitions")`), so each entry
+/// travels in the restXml default `<member>` element.
+fn tenant_config(names: &[&str]) -> String {
+    let mut out = String::from("<TenantConfig><ParameterDefinitions>");
+    for name in names {
+        out.push_str(&format!(
+            "<member><Name>{name}</Name><Definition><StringSchema>\
+             <Required>false</Required></StringSchema></Definition></member>"
+        ));
+    }
+    out.push_str("</ParameterDefinitions></TenantConfig>");
+    out
+}
+
+/// The security policy a declared one is overridden by, and the one a configuration that
+/// declared none is served under.
+const DECLARED_POLICY: &str = "TLSv1.2_2021";
+
+/// `ConnectionMode` `tenant-only` — the member that selects a multi-tenant distribution.
+const TENANT_ONLY: &str = "<ConnectionMode>tenant-only</ConnectionMode>";
+
+/// The rows the certificate-and-tenancy rule is asserted over.
+fn tenancy_rows() -> Vec<TenancyRow> {
+    // The method column spans every value the model's own catalog admits
+    // (`ops::types::S_S_L_SUPPORT_METHOD_VALUES`, the values
+    // `smithy_query(query="shape",shape="SSLSupportMethod")` reports), each named
+    // explicitly, beside the two ways of naming none.
+    let standard = |case: &'static str, extra: String, method: &str, policy: &str| TenancyRow {
+        case,
+        extra,
+        ssl_support_method: method.to_string(),
+        minimum_protocol_version: policy.to_string(),
+        tenant_config: false,
+        parameter_definitions: None,
+    };
+    let mut rows = vec![
+        standard(
+            "no ViewerCertificate at all",
+            String::new(),
+            SSL_SUPPORT_METHOD_SNI_ONLY,
+            MINIMUM_PROTOCOL_VERSION_DEFAULT_CERTIFICATE,
+        ),
+        standard(
+            "CloudFront's own certificate, neither member named",
+            default_certificate(None, None),
+            SSL_SUPPORT_METHOD_SNI_ONLY,
+            MINIMUM_PROTOCOL_VERSION_DEFAULT_CERTIFICATE,
+        ),
+        standard(
+            "a standard distribution declaring a security policy, which is overridden",
+            default_certificate(None, Some(DECLARED_POLICY)),
+            SSL_SUPPORT_METHOD_SNI_ONLY,
+            MINIMUM_PROTOCOL_VERSION_DEFAULT_CERTIFICATE,
+        ),
+    ];
+    for method in S_S_L_SUPPORT_METHOD_VALUES {
+        rows.push(standard(
+            "a method the request names",
+            default_certificate(Some(method), None),
+            method,
+            MINIMUM_PROTOCOL_VERSION_DEFAULT_CERTIFICATE,
+        ));
+    }
+    // The tenancy column: a multi-tenant configuration has no CloudFront domain name of its
+    // own, so a security policy it DECLARED is the one it keeps, while one it declared none
+    // of is served under the same automatic policy a standard distribution is. Its
+    // `TenantConfig` is reported as the request stated it, and a `ParameterDefinitions`
+    // carrying no entry declares no parameter, so no payload reports that element.
+    rows.push(TenancyRow {
+        case: "a TenantConfig declaring two parameters",
+        extra: format!("{TENANT_ONLY}{}", tenant_config(&["stage", "region-label"])),
+        ssl_support_method: SSL_SUPPORT_METHOD_SNI_ONLY.to_string(),
+        minimum_protocol_version: MINIMUM_PROTOCOL_VERSION_DEFAULT_CERTIFICATE.to_string(),
+        tenant_config: true,
+        parameter_definitions: Some(vec!["stage", "region-label"]),
+    });
+    rows.push(TenancyRow {
+        case: "a multi-tenant distribution declaring a security policy, which it keeps",
+        extra: format!(
+            "{}{TENANT_ONLY}{}",
+            default_certificate(None, Some(DECLARED_POLICY)),
+            tenant_config(&["stage"])
+        ),
+        ssl_support_method: SSL_SUPPORT_METHOD_SNI_ONLY.to_string(),
+        minimum_protocol_version: DECLARED_POLICY.to_string(),
+        tenant_config: true,
+        parameter_definitions: Some(vec!["stage"]),
+    });
+    rows.push(TenancyRow {
+        case: "a TenantConfig with an empty ParameterDefinitions",
+        extra: format!("{TENANT_ONLY}{}", tenant_config(&[])),
+        ssl_support_method: SSL_SUPPORT_METHOD_SNI_ONLY.to_string(),
+        minimum_protocol_version: MINIMUM_PROTOCOL_VERSION_DEFAULT_CERTIFICATE.to_string(),
+        tenant_config: true,
+        parameter_definitions: None,
+    });
+    rows.push(TenancyRow {
+        case: "a TenantConfig carrying no ParameterDefinitions",
+        extra: format!("{TENANT_ONLY}<TenantConfig></TenantConfig>"),
+        ssl_support_method: SSL_SUPPORT_METHOD_SNI_ONLY.to_string(),
+        minimum_protocol_version: MINIMUM_PROTOCOL_VERSION_DEFAULT_CERTIFICATE.to_string(),
+        tenant_config: true,
+        parameter_definitions: None,
+    });
+    rows.push(TenancyRow {
+        case: "a multi-tenant configuration with no TenantConfig",
+        extra: TENANT_ONLY.to_string(),
+        ssl_support_method: SSL_SUPPORT_METHOD_SNI_ONLY.to_string(),
+        minimum_protocol_version: MINIMUM_PROTOCOL_VERSION_DEFAULT_CERTIFICATE.to_string(),
+        tenant_config: false,
+        parameter_definitions: None,
+    });
+    rows
+}
+
+/// Assert one `DistributionConfig` reports this row's certificate members and its
+/// `TenantConfig`.
+fn assert_tenancy(row: &TenancyRow, config: &Node, context: &str, raw: &str) {
+    let case = row.case;
+    for (path, expected) in [
+        (
+            "ViewerCertificate/SSLSupportMethod",
+            row.ssl_support_method.as_str(),
+        ),
+        (
+            "ViewerCertificate/MinimumProtocolVersion",
+            row.minimum_protocol_version.as_str(),
+        ),
+    ] {
+        let actual = config.text_at(path);
+        assert_eq!(
+            actual,
+            Some(expected),
+            "case {case} ({context}): expected {path} {expected:?}, got {actual:?} in {raw}"
+        );
+    }
+    assert_eq!(
+        config.at("TenantConfig").is_some(),
+        row.tenant_config,
+        "case {case} ({context}): expected TenantConfig present={}, got the opposite in {raw}",
+        row.tenant_config
+    );
+    match &row.parameter_definitions {
+        None => assert!(
+            config.at("TenantConfig/ParameterDefinitions").is_none(),
+            "case {case} ({context}): expected no ParameterDefinitions element, got one in {raw}"
+        ),
+        Some(names) => {
+            let declared: Vec<String> = config
+                .at("TenantConfig/ParameterDefinitions")
+                .map(|list| {
+                    list.children
+                        .iter()
+                        .map(|entry| entry.text_at("Name").unwrap_or_default().to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            assert_eq!(
+                declared, *names,
+                "case {case} ({context}): expected the parameter definitions {names:?}, got \
+                 {declared:?} in {raw}"
+            );
+        }
+    }
+}
+
+/// The certificate a configuration is served over and the tenant configuration it declares
+/// are the ones the REQUEST described: a configuration naming no `SSLSupportMethod` is
+/// served over the recommended SNI-only method — never the dedicated-IP one, which costs
+/// more — one naming a method gets exactly that method back, the security policy is the
+/// automatic one for CloudFront's own certificate unless the distribution has no CloudFront
+/// domain name of its own to override it, and a `ParameterDefinitions` declaring no
+/// parameter is reported by no payload. Asserted on the create answer, on the read, and on
+/// the answer to an update that submits the same configuration, so none of the three paths
+/// invents a member of its own.
+#[tokio::test]
+async fn the_certificate_and_the_tenant_config_are_the_ones_the_request_described() {
+    let router = emulator();
+    for (index, row) in tenancy_rows().into_iter().enumerate() {
+        let case = row.case;
+        let config = config_xml(
+            &format!("tenancy-{index}"),
+            &format!(
+                "{MINIMAL_CUSTOM_ORIGIN}{}<Comment>tenancy</Comment><Enabled>true</Enabled>{}",
+                minimal_behavior(""),
+                row.extra
+            ),
+        );
+
+        let created = create_distribution(&router, &config).await;
+        assert_eq!(
+            created.status, 201,
+            "case {case}: expected the create to be accepted, got {} ({})",
+            created.status, created.raw
+        );
+        let id = created.root().text_at("Id").unwrap_or_default().to_string();
+        let etag = created.header("etag").to_string();
+        assert_tenancy(
+            &row,
+            config_of(&created, case, "CreateDistribution"),
+            "CreateDistribution",
+            &created.raw,
+        );
+
+        let read = get_distribution(&router, &id).await;
+        assert_tenancy(
+            &row,
+            config_of(&read, case, "GetDistribution"),
+            "GetDistribution",
+            &read.raw,
+        );
+
+        // The configuration the read reports is one an update admits back unchanged, so
+        // what the create resolved survives a read-modify-write round trip. An update
+        // submits the configuration WHOLE, so a STANDARD distribution's update states the
+        // price class the create resolved — a multi-tenant one has no price class at all.
+        let submitted = if row.extra.contains("tenant-only") {
+            config.clone()
+        } else {
+            config.replace(
+                "<Enabled>",
+                &format!("<PriceClass>{DEFAULT_PRICE_CLASS}</PriceClass><Enabled>"),
+            )
+        };
+        let updated = update_distribution(&router, &id, &submitted, Some(&etag)).await;
+        assert_eq!(
+            updated.status, 200,
+            "case {case}: expected the update to be accepted, got {} ({})",
+            updated.status, updated.raw
+        );
+        assert_tenancy(
+            &row,
+            config_of(&updated, case, "UpdateDistribution"),
+            "UpdateDistribution",
+            &updated.raw,
+        );
     }
 }
 

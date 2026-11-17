@@ -150,7 +150,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(GetDistributionTenantOutput {
             // "The distribution tenant that you retrieved" — the stored record, never the
             // request being served.
-            distribution_tenant: Some(stored.to_distribution_tenant()),
+            distribution_tenant: Some(store.distribution_tenant_document(stored)),
             // "The current version of the distribution tenant" — the token the last
             // mutation handed back, which is what an `If-Match` is checked against.
             e_tag: Some(stored.etag.clone()),

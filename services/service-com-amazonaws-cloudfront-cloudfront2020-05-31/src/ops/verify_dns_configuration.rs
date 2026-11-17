@@ -149,17 +149,23 @@ fn domain_not_associated() -> VerifyDnsConfigurationError {
 }
 
 /// The `DnsConfiguration` reported for `domain`, given the `routing_endpoint` of the
-/// connection group the distribution tenant is routed through and the endpoint `domain`
-/// resolves to.
+/// connection group the distribution tenant is routed through.
+///
+/// The record `domain` resolves to and whether it points at that routing endpoint are both
+/// read from the store
+/// ([`crate::state::ComAmazonawsCloudfrontCloudfront20200531State::domain_points_at_routing_endpoint`]
+/// is the one place that comparison is made, which is also what a tenant's domain being
+/// ACTIVE requires), so the two cannot disagree about one name.
 ///
 /// The one place the three statuses are decided, so the `Domain`-scoped call and the
-/// whole-tenant call cannot disagree about one domain.
+/// whole-tenant call cannot disagree about one domain either.
 fn dns_configuration(
+    store: &crate::state::ComAmazonawsCloudfrontCloudfront20200531State,
     domain: &str,
     routing_endpoint: Option<&str>,
-    resolved: Option<&str>,
 ) -> DnsConfiguration {
-    let (status, reason) = match (routing_endpoint, resolved) {
+    let resolved = store.resolved_cloudfront_endpoint(domain);
+    let (status, reason) = match (routing_endpoint, resolved.as_deref()) {
         // Nothing to compare against: the verification was not made, rather than made
         // and failed.
         (None, _) => (
@@ -169,13 +175,17 @@ fn dns_configuration(
                  the DNS configuration of {domain} could not be verified."
             ),
         ),
-        (Some(endpoint), Some(resolved)) if crate::state::same_domain(resolved, endpoint) => (
-            crate::state::DNS_CONFIGURATION_VALID,
-            format!(
-                "{domain} points to {endpoint}, the routing endpoint of the connection group of \
-                 this distribution tenant."
-            ),
-        ),
+        (Some(endpoint), Some(_))
+            if store.domain_points_at_routing_endpoint(domain, routing_endpoint) =>
+        {
+            (
+                crate::state::DNS_CONFIGURATION_VALID,
+                format!(
+                    "{domain} points to {endpoint}, the routing endpoint of the connection group \
+                     of this distribution tenant."
+                ),
+            )
+        }
         (Some(endpoint), Some(resolved)) => (
             crate::state::DNS_CONFIGURATION_INVALID,
             format!(
@@ -280,10 +290,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let dns_configuration_list: Vec<DnsConfiguration> = domains
             .iter()
-            .map(|domain| {
-                let resolved = store.resolved_cloudfront_endpoint(domain);
-                dns_configuration(domain, routing_endpoint.as_deref(), resolved.as_deref())
-            })
+            .map(|domain| dns_configuration(&store, domain, routing_endpoint.as_deref()))
             .collect();
 
         Ok(VerifyDnsConfigurationOutput {

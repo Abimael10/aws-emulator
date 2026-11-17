@@ -40,7 +40,7 @@
 //! a client takes.
 
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
-    CUSTOMIZATION_ACTION_OVERRIDE, DOMAIN_STATUS_ACTIVE, DOMAIN_STATUS_INACTIVE,
+    CUSTOMIZATION_ACTION_OVERRIDE, DOMAIN_STATUS_INACTIVE,
     INVALID_DOMAIN_NAME_MESSAGE,
     INVALID_IF_MATCH_VERSION_MESSAGE, MAX_DOMAINS_PER_TENANT, MAX_PARAMETERS_PER_TENANT,
     STATUS_DEPLOYED, STATUS_IN_PROGRESS, VALIDATION_TOKEN_HOST_CLOUDFRONT,
@@ -497,14 +497,11 @@ impl Row {
         let domains = self
             .stated_domains(tenant, slug)
             .unwrap_or_else(|| vec![tenant.domain.clone()]);
-        // `DomainResult$Status` is about what the domain SERVES: a domain this row freshly
-        // names asks CloudFront to validate it, so it serves nothing until that certificate
-        // is issued and reads `inactive`, while the domain the tenant already holds — bound
-        // under a certificate the create's own wait has had issued — reads `active`.
-        let domain_status = match self.domains {
-            Domains::Fresh(_) => DOMAIN_STATUS_INACTIVE,
-            Domains::Held | Domains::Unstated => DOMAIN_STATUS_ACTIVE,
-        };
+        // `DomainResult$Status` is about what the domain SERVES: every domain in this suite
+        // is a name in a customer's own zone, which this service holds no DNS record for, so
+        // no viewer asking for one reaches the tenant and each reads `inactive` — the one
+        // whose claim this row freshly states and the one the tenant already held alike.
+        let domain_status = DOMAIN_STATUS_INACTIVE;
         Facts {
             // Submitted by no member of the update, so untouched by every row.
             name: tenant.facts.name.clone(),

@@ -97,23 +97,26 @@ pub(super) fn resolve_logging(logging: Option<LoggingConfig>) -> LoggingConfig {
 ///
 /// A configuration that names no certificate of its own is served on CloudFront's own
 /// certificate: "If the distribution doesn't use `Aliases` ... set
-/// `CloudFrontDefaultCertificate` to `true` and leave all other fields empty." Under that
-/// certificate the distribution accepts HTTPS from every viewer, SNI or not
-/// ([`SSL_SUPPORT_METHOD_VIP`]). The deprecated `Certificate` and `CertificateSource`
-/// members report which certificate is in use and where it is kept, so they follow from the
-/// certificate the configuration chose.
+/// `CloudFrontDefaultCertificate` to `true` and leave all other fields empty." The method
+/// viewers connect over is then the recommended one
+/// ([`SSL_SUPPORT_METHOD_SNI_ONLY`]) — a configuration is never given the dedicated-IP
+/// method it did not ask for, which bills for dedicated addresses. The deprecated
+/// `Certificate` and `CertificateSource` members report which certificate is in use and
+/// where it is kept, so they follow from the certificate the configuration chose.
 ///
-/// `MinimumProtocolVersion` is the one member the service OVERRIDES rather than supplies,
-/// and it overrides it for exactly one kind of distribution: "If the distribution uses the
+/// `MinimumProtocolVersion` is both SUPPLIED and OVERRIDDEN, and the certificate decides
+/// which: under CloudFront's own certificate the security policy is the automatic
+/// [`MINIMUM_PROTOCOL_VERSION_DEFAULT_CERTIFICATE`] — "If the distribution uses the
 /// CloudFront domain name such as `d111111abcdef8.cloudfront.net` (you set
 /// `CloudFrontDefaultCertificate` to `true`), CloudFront automatically sets the security
-/// policy to `TLSv1` regardless of the value that you set here." Both halves of that
-/// condition have to hold, so `serves_own_domain` carries the first: a distribution that is
-/// served on a CloudFront domain name of its own, under the default certificate, reports
-/// [`MINIMUM_PROTOCOL_VERSION_DEFAULT_CERTIFICATE`], and every other configuration — one
-/// naming a custom certificate, and a multi-tenant one, which has no CloudFront domain name
-/// at all and whose viewers reach it through a connection group — keeps the security policy
-/// it declared, which is what a later read of it answers.
+/// policy to `TLSv1` regardless of the value that you set here." A configuration that
+/// DECLARED a policy keeps it unless both halves of that sentence hold, so
+/// `serves_own_domain` carries the first: a distribution served on a CloudFront domain name
+/// of its own has its declared policy overridden, while a multi-tenant one, which has no
+/// CloudFront domain name at all and whose viewers reach it through a connection group,
+/// keeps what it declared. One that declared nothing is served under the automatic policy
+/// either way — the member is never left unset, since the distribution is served over a
+/// security policy whether or not the request named one.
 pub(super) fn resolve_viewer_certificate(
     certificate: Option<ViewerCertificate>,
     serves_own_domain: bool,
@@ -129,9 +132,9 @@ pub(super) fn resolve_viewer_certificate(
         resolved.ssl_support_method = Some(
             resolved
                 .ssl_support_method
-                .unwrap_or_else(|| SSL_SUPPORT_METHOD_VIP.to_string()),
+                .unwrap_or_else(|| SSL_SUPPORT_METHOD_SNI_ONLY.to_string()),
         );
-        if serves_own_domain {
+        if serves_own_domain || resolved.minimum_protocol_version.is_none() {
             resolved.minimum_protocol_version =
                 Some(MINIMUM_PROTOCOL_VERSION_DEFAULT_CERTIFICATE.to_string());
         }
@@ -4067,6 +4070,13 @@ pub(super) fn render_token(value: u64, len: usize) -> String {
 /// supplies a default for, which is what makes the configuration a read reports one a later
 /// update admits back unchanged.
 pub fn resolve_distribution_config(mut config: DistributionConfig) -> DistributionConfig {
+    // `TenantConfig$ParameterDefinitions` is "the parameters that you specify for a
+    // distribution tenant", and a list carrying no entry specifies none: it is retained as
+    // ABSENT rather than as an empty element, the same way a listing that selects nothing
+    // reports no `Items`. The `TenantConfig` element itself is the one the request stated,
+    // so the configuration a read reports is the one the request described
+    // ([`retained_tenant_config`]).
+    config.tenant_config = config.tenant_config.map(retained_tenant_config);
     // Which KIND of distribution the configuration describes decides which members the
     // service supplies at all: a member documented as supported only on a standard
     // distribution is no member of a multi-tenant one, which states none of them
