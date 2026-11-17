@@ -444,6 +444,146 @@ impl ComAmazonawsRoute53profilesRoute53profilesState {
             None => {}
         }
     }
+
+    /// Whether the store holds a resource whose ARN is `arn`.
+    ///
+    /// A tag operation addresses the resource by its ARN, so this is the lookup
+    /// each of them resolves that ARN through: a Profile and a Profile association
+    /// are the resources this service mints an ARN for, and their records keep it.
+    pub fn holds_tagged_resource(&self, arn: &str) -> bool {
+        self.profiles.values().any(|profile| profile.arn == arn)
+            || self
+                .profile_associations
+                .values()
+                .any(|association| association.arn == arn)
+    }
+
+    /// The tags `arn` carries, as the modelled `TagMap` the wire reports: empty for
+    /// a resource nothing has tagged.
+    pub fn tags_of(&self, arn: &str) -> HashMap<String, String> {
+        self.tags
+            .get(arn)
+            .map(|tags| {
+                tags.iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Add `requested` to the tags of `arn`, which is an upsert keyed on the tag
+    /// key: a key the resource already carries takes the requested value, and a key
+    /// new to the resource is added. Keys are compared exactly, as tag keys are
+    /// case-sensitive.
+    ///
+    /// Answers `false`, leaving the stored tags EXACTLY as they were, when the
+    /// result would carry more than [`MAX_TAGS_PER_RESOURCE`] tags.
+    ///
+    /// An entry is added only for a resource the store holds, and
+    /// [`MAX_TAGGED_RESOURCES`] is the two resource stores' caps together, so the
+    /// map cannot outgrow that ceiling through this path.
+    pub fn merge_tags(&mut self, arn: &str, requested: &HashMap<String, String>) -> bool {
+        let held = self.tags.get(arn);
+        let added = requested
+            .keys()
+            .filter(|key| held.is_none_or(|tags| !tags.contains_key(*key)))
+            .count();
+        if held.map_or(0, BTreeMap::len) + added > MAX_TAGS_PER_RESOURCE {
+            return false;
+        }
+        // A request that names no tag leaves no entry behind, so a resource nobody
+        // has tagged still has none at all.
+        if requested.is_empty() {
+            return true;
+        }
+        let stored = self.tags.entry(arn.to_string()).or_default();
+        for (key, value) in requested {
+            stored.insert(key.clone(), value.clone());
+        }
+        true
+    }
+
+    /// Drop every tag of `arn` whose key is named in `keys`, leaving the rest.
+    ///
+    /// Idempotent: a key the resource does not carry removes nothing, so removing
+    /// the same keys twice leaves the same tags. A resource left carrying none has
+    /// no entry at all, exactly like one that was never tagged.
+    pub fn remove_tags(&mut self, arn: &str, keys: &[String]) {
+        let Some(stored) = self.tags.get_mut(arn) else {
+            return;
+        };
+        stored.retain(|key, _| !keys.contains(key));
+        if stored.is_empty() {
+            self.tags.remove(arn);
+        }
+    }
+}
+
+/// The most tags one resource carries.
+///
+/// The modelled `TagMap` is `length 0..200` — it is both the map `TagResource`
+/// takes and the map `ListTagsForResource` reports — so 200 tags is the most one
+/// call can hand over and the most a resource can report back. A write that would
+/// take a resource past it is refused and the stored tags are left as they were.
+pub const MAX_TAGS_PER_RESOURCE: usize = 200;
+
+/// The resources of this service that carry tags, as the resource-type segment of
+/// the resource's ARN with the `ResourceType` an error about it reports.
+///
+/// A Profile and a Profile association are the resources this service mints an ARN
+/// for ([`profile_arn`], [`profile_association_arn`]), so they are the resources a
+/// tag operation's `ResourceArn` can name; a Profile *resource* association is
+/// addressed by its own id and has no ARN, so no tag hangs off one.
+const TAGGABLE_ARN_SEGMENTS: [(&str, &str); 2] = [
+    (PROFILE_RESOURCE, PROFILE_RESOURCE_TYPE),
+    (PROFILE_ASSOCIATION_RESOURCE, PROFILE_ASSOCIATION_RESOURCE_TYPE),
+];
+
+/// The resource a tag operation's `ResourceArn` names: the `ResourceType` an error
+/// about it reports, and the id the ARN names it by (the segment after the `/` in
+/// `arn:<partition>:<service>:<region>:<account>:<type>/<id>`).
+///
+/// `None` for anything else — an ARN of another service, one this service mints no
+/// resource of that type for, or a string that is no ARN at all — so a tag
+/// operation refuses such a value as an invalid ARN rather than reporting a
+/// resource that could never exist as merely absent.
+pub fn tagged_resource_of_arn(resource_arn: &str) -> Option<(&'static str, &str)> {
+    let mut fields = resource_arn.split(':');
+    if fields.next()? != "arn" {
+        return None;
+    }
+    // partition, then the service that owns the resource.
+    let _partition = fields.next()?;
+    if fields.next()? != ARN_NAMESPACE {
+        return None;
+    }
+    // region, account, then the resource itself.
+    let _region = fields.next()?;
+    let _account = fields.next()?;
+    let (segment, resource_id) = fields.next()?.split_once('/')?;
+    if resource_id.is_empty() {
+        return None;
+    }
+    TAGGABLE_ARN_SEGMENTS
+        .iter()
+        .find(|(name, _)| *name == segment)
+        .map(|(_, resource_type)| (*resource_type, resource_id))
+}
+
+/// `ValidationException` refusing a tag write that would take one resource past
+/// [`MAX_TAGS_PER_RESOURCE`] tags.
+///
+/// `TagResource` models no limit error, so the refusal is the `ValidationException`
+/// it does model. The sentence states the limit the modelled `TagMap` fixes and
+/// nothing from the request, so the rejected tags are not echoed back: the status
+/// (400) and the error shape are what the contract fixes, and the wording is an
+/// example.
+pub fn tag_limit_exceeded() -> crate::ops::types::ValidationException {
+    crate::ops::types::ValidationException {
+        message: Some(format!(
+            "A resource can have at most {MAX_TAGS_PER_RESOURCE} tags."
+        )),
+    }
 }
 
 /// The ARN of a Profile in `region`.
@@ -737,8 +877,10 @@ pub fn profile_resource_association_not_found(
     resource_not_found(association_id, PROFILE_RESOURCE_ASSOCIATION_RESOURCE_TYPE)
 }
 
-/// `ValidationException` for a `ResourceArn` naming a resource a Profile cannot
-/// hold. The ARN is echoed from the request, which is all that varies.
+/// `ValidationException` for a `ResourceArn` this service cannot read as naming a
+/// resource of the kind the operation addresses — one a Profile cannot hold, or one
+/// that is no taggable resource of this service ([`tagged_resource_of_arn`]). The
+/// ARN is echoed from the request, which is all that varies.
 pub fn invalid_resource_arn(resource_arn: &str) -> crate::ops::types::ValidationException {
     crate::ops::types::ValidationException {
         message: Some(format!(

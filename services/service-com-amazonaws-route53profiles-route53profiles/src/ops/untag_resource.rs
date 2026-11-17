@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: drops the tags whose keys the request names from the resource the
+//! `ResourceArn` names, leaving the rest, so `ListTagsForResource` stops reporting
+//! them. Idempotent: a key the resource does not carry removes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -83,11 +77,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-route53profiles-route53
 // here — hence the `UntagResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.route53profiles#UntagResource")]
+// `InternalServiceErrorException` is widened in through `extra_errors`: the SERVICE
+// models it (`AssociateResourceToProfile` declares it) but this operation does not
+// list it, and it is the only server-side failure this handler can hit — the service
+// mounted on an engine that holds no store for it.
+#[smithy_macros::operation_error(
+    "com.amazonaws.route53profiles#UntagResource",
+    extra_errors = ["InternalServiceErrorException"]
+)]
 #[derive(Debug)]
 pub enum UntagResourceErrorModeled {
     AccessDeniedException(AccessDeniedException),
     ConflictException(ConflictException),
+    InternalServiceErrorException(InternalServiceErrorException),
     ResourceNotFoundException(ResourceNotFoundException),
     ThrottlingException(ThrottlingException),
     ValidationException(ValidationException),
@@ -144,18 +146,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        // The ARN the request carries already says which account and region the
+        // resource belongs to, so nothing is read off the request metadata.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UntagResourceErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {
+                    message: Some(crate::state::NO_STORE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // An ARN that names no taggable resource kind of this service is not a value
+        // the service holds tags for at all, so it is refused as an invalid ARN rather
+        // than reported as an absent resource.
+        let Some((resource_type, resource_id)) =
+            crate::state::tagged_resource_of_arn(&input.resource_arn)
+        else {
+            return Err(UntagResourceErrorModeled::ValidationException(
+                crate::state::invalid_resource_arn(&input.resource_arn),
+            )
+            .into());
+        };
+
+        // "Removes one or more tags from a SPECIFIED resource": the keys are removed
+        // from the resource the ARN names, so an ARN this store holds no resource
+        // under is reported as missing instead of being accepted as a no-op.
+        let mut store = state.lock();
+        if !store.holds_tagged_resource(&input.resource_arn) {
+            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(resource_id, resource_type),
+            )
+            .into());
+        }
+        store.remove_tags(&input.resource_arn, &input.tag_keys);
+
+        // The operation models no output member: the success is what says the keys are
+        // off the resource, and `ListTagsForResource` reports what is left.
+        Ok(UntagResourceOutput {})
     }
 }

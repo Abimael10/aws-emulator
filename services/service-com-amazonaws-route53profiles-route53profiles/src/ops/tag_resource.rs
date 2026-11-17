@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: writes the requested tags onto the resource the `ResourceArn` names,
+//! as an upsert keyed on the tag key, so `ListTagsForResource` reports them back. An
+//! ARN this service holds no resource under is reported as missing, and a request the
+//! service refuses persists nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -81,10 +76,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-route53profiles-route53
 // here — hence the `TagResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.route53profiles#TagResource")]
+// `InternalServiceErrorException` is widened in through `extra_errors`: the SERVICE
+// models it (`AssociateResourceToProfile` declares it) but this operation does not
+// list it, and it is the only server-side failure this handler can hit — the service
+// mounted on an engine that holds no store for it.
+#[smithy_macros::operation_error(
+    "com.amazonaws.route53profiles#TagResource",
+    extra_errors = ["InternalServiceErrorException"]
+)]
 #[derive(Debug)]
 pub enum TagResourceErrorModeled {
     AccessDeniedException(AccessDeniedException),
+    InternalServiceErrorException(InternalServiceErrorException),
     ResourceNotFoundException(ResourceNotFoundException),
     ThrottlingException(ThrottlingException),
     ValidationException(ValidationException),
@@ -141,18 +144,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // The ARN the request carries already says which account and region the
+        // resource belongs to, so nothing is read off the request metadata.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {
+                    message: Some(crate::state::NO_STORE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // An ARN that names no taggable resource kind of this service is not a value
+        // the service can tag at all, whatever the store holds, so it is refused as an
+        // invalid ARN rather than reported as an absent resource.
+        let Some((resource_type, resource_id)) =
+            crate::state::tagged_resource_of_arn(&input.resource_arn)
+        else {
+            return Err(TagResourceErrorModeled::ValidationException(
+                crate::state::invalid_resource_arn(&input.resource_arn),
+            )
+            .into());
+        };
+
+        // "Adds one or more tags to a SPECIFIED resource": the tags are written onto
+        // the resource the ARN names, so an ARN this store holds no resource under is
+        // reported as missing instead of being accepted and then dropped.
+        let mut store = state.lock();
+        if !store.holds_tagged_resource(&input.resource_arn) {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(resource_id, resource_type),
+            )
+            .into());
+        }
+
+        // A write that would take the resource past the modelled ceiling is refused
+        // and the stored tags are left exactly as they were: a refused write persists
+        // nothing, not even the tags of the request that would have fitted.
+        if !store.merge_tags(&input.resource_arn, &input.tags) {
+            return Err(TagResourceErrorModeled::ValidationException(
+                crate::state::tag_limit_exceeded(),
+            )
+            .into());
+        }
+
+        // The operation models no output member: the success is what says the tags are
+        // on the resource, and `ListTagsForResource` reports them.
+        Ok(TagResourceOutput {})
     }
 }

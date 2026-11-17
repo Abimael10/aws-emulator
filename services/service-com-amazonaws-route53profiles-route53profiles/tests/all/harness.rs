@@ -267,4 +267,63 @@ impl Emulator {
         )
         .await
     }
+
+    /// `ListTagsForResource`: `GET /tags/{ResourceArn}`.
+    pub(crate) async fn list_tags(&self, resource_arn: &str) -> Reply {
+        self.call("GET", &format!("/tags/{}", path_label(resource_arn)), None)
+            .await
+    }
+
+    /// `TagResource`: `POST /tags/{ResourceArn}` with the `Tags` map in the body.
+    pub(crate) async fn tag_resource(&self, resource_arn: &str, tags: Value) -> Reply {
+        self.call(
+            "POST",
+            &format!("/tags/{}", path_label(resource_arn)),
+            Some(json!({ "Tags": tags })),
+        )
+        .await
+    }
+
+    /// `UntagResource`: `DELETE /tags/{ResourceArn}` with `TagKeys` bound to the
+    /// repeated `tagKeys` query parameter.
+    pub(crate) async fn untag_resource(&self, resource_arn: &str, tag_keys: &[&str]) -> Reply {
+        let query: Vec<String> = tag_keys
+            .iter()
+            .map(|key| format!("tagKeys={}", query_value(key)))
+            .collect();
+        self.call(
+            "DELETE",
+            &format!("/tags/{}?{}", path_label(resource_arn), query.join("&")),
+            None,
+        )
+        .await
+    }
+}
+
+/// The characters RFC 3986 calls unreserved: never percent-encoded by an SDK, and
+/// the only ones left alone by [`path_label`] and [`query_value`].
+fn is_unreserved(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~')
+}
+
+/// A value bound to a non-greedy `@httpLabel`, as one path segment: every character
+/// outside the unreserved set is percent-encoded, the `/` inside an ARN included —
+/// exactly what an SDK sends, so the label is one segment rather than several.
+fn path_label(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| {
+            if is_unreserved(byte) {
+                (byte as char).to_string()
+            } else {
+                format!("%{byte:02X}")
+            }
+        })
+        .collect()
+}
+
+/// A value bound to an `@httpQuery` member, percent-encoded the same way: a tag key
+/// may carry any of the characters a query string gives its own meaning.
+fn query_value(value: &str) -> String {
+    path_label(value)
 }

@@ -28,11 +28,20 @@
 //! * `DeleteProfile` refuses with `ConflictException` while the Profile still has
 //!   associations, and otherwise removes it and reports it `DELETING`;
 //! * an id that names nothing is `ResourceNotFoundException`, and a `MaxResults`
-//!   outside the modelled range is refused.
+//!   outside the modelled range is refused;
+//! * the tag slice holds one key-to-value set per resource, addressed by that
+//!   resource's ARN: `TagResource` upserts the keys it names, `UntagResource` removes
+//!   exactly the keys it names, and `ListTagsForResource` reports what is held — for
+//!   every resource kind of this service that has an ARN, over tag sets spanning the
+//!   modelled `TagKey` / `TagValue` bounds, and up to the modelled ceiling of 200 tags
+//!   per resource;
+//! * every tag operation refuses an ARN this service holds no resource under with
+//!   `ResourceNotFoundException`, and one that names no taggable resource of this
+//!   service with `ValidationException`, persisting nothing either way.
 
 use std::collections::BTreeSet;
 
-use serde_json::json;
+use serde_json::{json, Value};
 
 use super::harness::{Emulator, ACCOUNT_ID};
 
@@ -829,4 +838,491 @@ async fn list_profile_associations_narrows_by_filter_and_pages_every_record_once
             );
         }
     }
+}
+
+/// The region the shared harness signs for, used to build the ARNs below.
+const REGION: &str = "us-east-1";
+
+/// One tag set as the modelled `TagMap` the wire carries: a JSON object of key to
+/// value (`smithy_query(query="shape",shape="TagMap")`).
+fn tag_map(tags: &[(String, String)]) -> Value {
+    Value::Object(
+        tags.iter()
+            .map(|(key, value)| (key.clone(), Value::String(value.clone())))
+            .collect(),
+    )
+}
+
+/// The tag sets the slice has to round-trip, as `(case, tags)`.
+///
+/// The rows differ along what the rule generalises over — how many tags a write
+/// carries, and the forms a key and a value take: `TagKey` is `length 1..128` and
+/// `TagValue` `length 0..256` (`smithy_query(query="shape",shape="TagMap")`), so
+/// both published bounds of each appear, as do characters a path or a query string
+/// gives its own meaning and characters outside ASCII, since neither member
+/// constrains its alphabet.
+fn tag_cases() -> Vec<(&'static str, Vec<(String, String)>)> {
+    vec![
+        ("one", vec![("env".to_string(), "test".to_string())]),
+        (
+            "several",
+            vec![
+                ("env".to_string(), "test".to_string()),
+                ("team".to_string(), "net".to_string()),
+                ("owner".to_string(), "dns".to_string()),
+            ],
+        ),
+        (
+            "modelled-bounds",
+            vec![
+                ("k".to_string(), String::new()),
+                ("K".repeat(128), "v".repeat(256)),
+            ],
+        ),
+        (
+            "punctuation-and-non-ascii",
+            vec![
+                ("a/b c".to_string(), "x=y&z?#".to_string()),
+                ("clé".to_string(), "日本語".to_string()),
+            ],
+        ),
+    ]
+}
+
+/// Every resource kind of this service a tag operation can address, as
+/// `(kind, ResourceArn)`, each created fresh and carrying no tags.
+///
+/// A Profile reports its own `Arn`. The `ProfileAssociation` shape reports no `Arn`
+/// member, so an association's ARN is built here the way the service's IAM resource
+/// type `profile-association` spells it —
+/// `arn:aws:route53profiles:<region>:<account>:profile-association/<Id>`.
+async fn taggable_arns(em: &Emulator, label: &str) -> Vec<(&'static str, String)> {
+    let profile = em.create_named(&format!("{label}-profile")).await;
+    assert_eq!(
+        profile.status, 200,
+        "setup {label}: CreateProfile expected 200, got {} / {:?}",
+        profile.status, profile.body
+    );
+    let profile_id = profile.nested_string("Profile", "Id");
+    let association = em
+        .associate(&profile_id, &format!("vpc-{label}"), &format!("{label}-assoc"))
+        .await;
+    assert_eq!(
+        association.status, 200,
+        "setup {label}: AssociateProfile expected 200, got {} / {:?}",
+        association.status, association.body
+    );
+    let association_id = association.nested_string("ProfileAssociation", "Id");
+    vec![
+        ("profile", profile.nested_string("Profile", "Arn")),
+        (
+            "profile-association",
+            format!(
+                "arn:aws:route53profiles:{REGION}:{ACCOUNT_ID}:profile-association/{association_id}"
+            ),
+        ),
+    ]
+}
+
+/// The `Tags` map `ListTagsForResource` reports for `resource_arn`, asserting the
+/// call succeeded.
+async fn reported_tags(em: &Emulator, case: &str, resource_arn: &str) -> Value {
+    let listed = em.list_tags(resource_arn).await;
+    assert_eq!(
+        listed.status, 200,
+        "case {case}: ListTagsForResource expected 200, got {} / {:?}",
+        listed.status, listed.body
+    );
+    listed.member("Tags").clone()
+}
+
+#[tokio::test]
+async fn the_tag_slice_round_trips_every_tag_set_for_every_taggable_resource() {
+    let em = Emulator::new();
+
+    for (kind, arn) in taggable_arns(&em, "round-trip").await {
+        // A resource nobody has tagged reports an empty map rather than a refusal.
+        assert_eq!(
+            reported_tags(&em, kind, &arn).await,
+            json!({}),
+            "case kind={kind}: a resource carrying no tags must report none"
+        );
+
+        for (name, tags) in tag_cases() {
+            let case = format!("kind={kind} tags={name}");
+
+            let tagged = em.tag_resource(&arn, tag_map(&tags)).await;
+            assert_eq!(
+                tagged.status, 204,
+                "case {case}: TagResource expected 204, got {} / {:?}",
+                tagged.status, tagged.body
+            );
+            assert_eq!(
+                reported_tags(&em, &case, &arn).await,
+                tag_map(&tags),
+                "case {case}: every tag written must be reported back"
+            );
+
+            // A key the resource already carries takes the value of the later write,
+            // and the keys the write does not name are left alone.
+            let (first_key, _) = tags[0].clone();
+            let upserted = em
+                .tag_resource(
+                    &arn,
+                    tag_map(&[(first_key.clone(), "rewritten".to_string())]),
+                )
+                .await;
+            assert_eq!(
+                upserted.status, 204,
+                "case {case}: a repeated key expected 204, got {} / {:?}",
+                upserted.status, upserted.body
+            );
+            let mut expected = tags.clone();
+            expected[0].1 = "rewritten".to_string();
+            assert_eq!(
+                reported_tags(&em, &case, &arn).await,
+                tag_map(&expected),
+                "case {case}: a repeated key must take the new value and leave the others"
+            );
+
+            // Untagging removes exactly the keys named: a key the resource does not
+            // carry removes nothing, and repeating the call changes nothing more.
+            let remaining: Vec<(String, String)> = expected[1..].to_vec();
+            for round in 0..2 {
+                let untagged = em
+                    .untag_resource(&arn, &[first_key.as_str(), "never-written"])
+                    .await;
+                assert_eq!(
+                    untagged.status, 204,
+                    "case {case} round={round}: UntagResource expected 204, got {} / {:?}",
+                    untagged.status, untagged.body
+                );
+                assert_eq!(
+                    reported_tags(&em, &case, &arn).await,
+                    tag_map(&remaining),
+                    "case {case} round={round}: untagging must remove exactly the keys named"
+                );
+            }
+
+            // With every key removed the resource reports nothing at all, exactly
+            // like one that was never tagged — so the next row starts clean.
+            // `TagKeys` is a required query binding, so a call naming no key is not
+            // a request this operation serves and none is made.
+            let rest: Vec<&str> = remaining.iter().map(|(key, _)| key.as_str()).collect();
+            if !rest.is_empty() {
+                let cleared = em.untag_resource(&arn, &rest).await;
+                assert_eq!(
+                    cleared.status, 204,
+                    "case {case}: clearing the rest expected 204, got {} / {:?}",
+                    cleared.status, cleared.body
+                );
+            }
+            assert_eq!(
+                reported_tags(&em, &case, &arn).await,
+                json!({}),
+                "case {case}: a resource whose last tag was removed must report none"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn every_tag_operation_refuses_an_arn_that_names_no_resource_of_this_service() {
+    let em = Emulator::new();
+
+    // One tagged Profile that every refusal below is checked against: a refused
+    // request must leave its tags exactly as they were.
+    let held = em.create_named("tag-refusals").await;
+    let held_arn = held.nested_string("Profile", "Arn");
+    let held_tags = vec![("keep".to_string(), "me".to_string())];
+    assert_eq!(
+        em.tag_resource(&held_arn, tag_map(&held_tags)).await.status,
+        204,
+        "setup: tagging the held Profile must succeed"
+    );
+
+    // A Profile that was deleted takes its tags with it, so its ARN names nothing.
+    let gone = em.create_named("tag-deleted").await;
+    let gone_arn = gone.nested_string("Profile", "Arn");
+    let gone_id = gone.nested_string("Profile", "Id");
+    assert_eq!(
+        em.tag_resource(&gone_arn, tag_map(&held_tags)).await.status,
+        204,
+        "setup: tagging the Profile to delete must succeed"
+    );
+    assert_eq!(
+        em.delete_profile(&gone_id).await.status,
+        200,
+        "setup: DeleteProfile must succeed"
+    );
+
+    // An ARN naming a resource kind this service tags, whose id it holds nothing
+    // for: the resource is absent, so every tag operation reports it missing and
+    // names the id from the request.
+    let absent: Vec<(String, String)> = vec![
+        (
+            format!("arn:aws:route53profiles:{REGION}:{ACCOUNT_ID}:profile/rp-0123456789abcdef"),
+            "rp-0123456789abcdef".to_string(),
+        ),
+        (
+            format!(
+                "arn:aws:route53profiles:{REGION}:{ACCOUNT_ID}:profile-association/rpassoc-fedcba9876543210"
+            ),
+            "rpassoc-fedcba9876543210".to_string(),
+        ),
+        // Another region and another partition name no resource this store holds
+        // either, however well-formed they are.
+        (
+            format!("arn:aws-cn:route53profiles:cn-north-1:{ACCOUNT_ID}:profile/rp-1111111111111111"),
+            "rp-1111111111111111".to_string(),
+        ),
+        (gone_arn.clone(), gone_id.clone()),
+    ];
+    for (resource_arn, resource_id) in absent {
+        for reply in [
+            em.list_tags(&resource_arn).await,
+            em.tag_resource(&resource_arn, tag_map(&held_tags)).await,
+            em.untag_resource(&resource_arn, &["keep"]).await,
+        ] {
+            let case = format!("arn={resource_arn}");
+            assert_eq!(
+                reply.status, 400,
+                "case {case}: expected 400, got {} / {:?}",
+                reply.status, reply.body
+            );
+            assert_eq!(
+                reply.error.as_deref(),
+                Some("ResourceNotFoundException"),
+                "case {case}: unexpected error code, got {:?}",
+                reply.body
+            );
+            assert_eq!(
+                reply.message(),
+                format!("[RSLVR-05007] Can't find the resource with ID \"{resource_id}\"."),
+                "case {case}: unexpected refusal message"
+            );
+        }
+    }
+
+    // A value this service cannot read as naming a taggable resource of its own is
+    // refused as an invalid ARN, whatever the store holds: a string that is no ARN,
+    // another service's resource, and a resource kind this service does not tag.
+    let invalid: Vec<String> = vec![
+        "not-an-arn".to_string(),
+        "arn:aws:s3:::a-bucket".to_string(),
+        format!(
+            "arn:aws:route53resolver:{REGION}:{ACCOUNT_ID}:resolver-rule/rslvr-rr-1111111111111111"
+        ),
+        format!(
+            "arn:aws:route53profiles:{REGION}:{ACCOUNT_ID}:profile-resource-association/rpr-1111111111111111"
+        ),
+        // A resource type with no id after it names no resource.
+        format!("arn:aws:route53profiles:{REGION}:{ACCOUNT_ID}:profile/"),
+        format!("arn:aws:route53profiles:{REGION}:{ACCOUNT_ID}:profile"),
+    ];
+    for resource_arn in invalid {
+        for reply in [
+            em.list_tags(&resource_arn).await,
+            em.tag_resource(&resource_arn, tag_map(&held_tags)).await,
+            em.untag_resource(&resource_arn, &["keep"]).await,
+        ] {
+            let case = format!("arn={resource_arn}");
+            assert_eq!(
+                reply.status, 400,
+                "case {case}: expected 400, got {} / {:?}",
+                reply.status, reply.body
+            );
+            assert_eq!(
+                reply.error.as_deref(),
+                Some("ValidationException"),
+                "case {case}: unexpected error code, got {:?}",
+                reply.body
+            );
+            assert_eq!(
+                reply.message(),
+                format!(
+                    "[RSLVR-05022] The ARN in your request isn't valid:\"{resource_arn}\". \
+                     Provide a valid ARN."
+                ),
+                "case {case}: unexpected refusal message"
+            );
+        }
+    }
+
+    // Not one refused request touched the resource that does exist.
+    assert_eq!(
+        reported_tags(&em, "held", &held_arn).await,
+        tag_map(&held_tags),
+        "a refused tag operation must leave every stored tag as it was"
+    );
+}
+
+#[tokio::test]
+async fn tags_given_when_a_resource_is_created_are_reported_and_extended() {
+    let em = Emulator::new();
+
+    // `CreateProfile` and `AssociateProfile` both take a `Tags` list, and the tag
+    // slice reports what they stored against the resource they created.
+    let created = em
+        .create_profile(json!({
+            "Name": "seeded-profile",
+            "ClientToken": "tok-seeded-profile",
+            "Tags": [{ "Key": "env", "Value": "test" }, { "Key": "team", "Value": "net" }],
+        }))
+        .await;
+    assert_eq!(
+        created.status, 200,
+        "CreateProfile expected 200, got {} / {:?}",
+        created.status, created.body
+    );
+    let profile_id = created.nested_string("Profile", "Id");
+    let profile_arn = created.nested_string("Profile", "Arn");
+    assert_eq!(
+        reported_tags(&em, "created-profile", &profile_arn).await,
+        json!({ "env": "test", "team": "net" }),
+        "the tags CreateProfile stored must be reported back"
+    );
+
+    let association = em
+        .call(
+            "POST",
+            "/profileassociation",
+            Some(json!({
+                "ProfileId": profile_id,
+                "ResourceId": "vpc-seeded",
+                "Name": "seeded-assoc",
+                "Tags": [{ "Key": "owner", "Value": "dns" }],
+            })),
+        )
+        .await;
+    assert_eq!(
+        association.status, 200,
+        "AssociateProfile expected 200, got {} / {:?}",
+        association.status, association.body
+    );
+    let association_arn = format!(
+        "arn:aws:route53profiles:{REGION}:{ACCOUNT_ID}:profile-association/{}",
+        association.nested_string("ProfileAssociation", "Id")
+    );
+    assert_eq!(
+        reported_tags(&em, "created-association", &association_arn).await,
+        json!({ "owner": "dns" }),
+        "the tags AssociateProfile stored must be reported back"
+    );
+
+    // `TagResource` extends what the create stored rather than replacing it.
+    for (resource_arn, expected) in [
+        (
+            profile_arn.clone(),
+            json!({ "env": "test", "team": "core", "cost": "42" }),
+        ),
+        (
+            association_arn.clone(),
+            json!({ "owner": "dns", "team": "core", "cost": "42" }),
+        ),
+    ] {
+        let case = format!("arn={resource_arn}");
+        let tagged = em
+            .tag_resource(&resource_arn, json!({ "team": "core", "cost": "42" }))
+            .await;
+        assert_eq!(
+            tagged.status, 204,
+            "case {case}: TagResource expected 204, got {} / {:?}",
+            tagged.status, tagged.body
+        );
+        assert_eq!(
+            reported_tags(&em, &case, &resource_arn).await,
+            expected,
+            "case {case}: a tag write must add to the tags the create stored"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_write_past_the_modelled_tag_ceiling_is_refused_and_changes_nothing() {
+    let em = Emulator::new();
+    let bulk = em.create_named("bulk-tags").await;
+    let bulk_arn = bulk.nested_string("Profile", "Arn");
+
+    // `TagMap` is `length 0..200`, so 200 tags is the most a resource can carry and
+    // the most one request can hand over: a write at exactly the published maximum
+    // is accepted.
+    let full: Vec<(String, String)> = (0..200)
+        .map(|index| (format!("key-{index:03}"), format!("value-{index}")))
+        .collect();
+    let filled = em.tag_resource(&bulk_arn, tag_map(&full)).await;
+    assert_eq!(
+        filled.status, 204,
+        "case full: a write of 200 tags expected 204, got {} / {:?}",
+        filled.status, filled.body
+    );
+    assert_eq!(
+        reported_tags(&em, "full", &bulk_arn).await,
+        tag_map(&full),
+        "case full: every tag of a write at the maximum must be reported back"
+    );
+
+    // One more KEY would be the 201st, so the write is refused and the stored tags
+    // are left exactly as they were.
+    let over = em
+        .tag_resource(&bulk_arn, json!({ "key-200": "one-too-many" }))
+        .await;
+    assert_eq!(
+        over.status, 400,
+        "case over: expected 400, got {} / {:?}",
+        over.status, over.body
+    );
+    assert_eq!(
+        over.error.as_deref(),
+        Some("ValidationException"),
+        "case over: unexpected error code, got {:?}",
+        over.body
+    );
+    assert_eq!(
+        over.message(),
+        "A resource can have at most 200 tags.",
+        "case over: unexpected refusal message"
+    );
+    assert_eq!(
+        reported_tags(&em, "over", &bulk_arn).await,
+        tag_map(&full),
+        "case over: a refused write must persist nothing"
+    );
+
+    // A key the resource already carries is no new tag, so it is still an upsert at
+    // the ceiling.
+    let at_ceiling = em
+        .tag_resource(&bulk_arn, json!({ "key-000": "rewritten" }))
+        .await;
+    assert_eq!(
+        at_ceiling.status, 204,
+        "case ceiling: rewriting a held key expected 204, got {} / {:?}",
+        at_ceiling.status, at_ceiling.body
+    );
+    let mut rewritten = full.clone();
+    rewritten[0].1 = "rewritten".to_string();
+    assert_eq!(
+        reported_tags(&em, "ceiling", &bulk_arn).await,
+        tag_map(&rewritten),
+        "case ceiling: a held key must take the new value even with the map full"
+    );
+
+    // And one request past the modelled map length is refused on a resource that
+    // carries nothing at all, so the ceiling is the resource's, not the request's.
+    let empty = em.create_named("bulk-tags-empty").await;
+    let empty_arn = empty.nested_string("Profile", "Arn");
+    let too_many: Vec<(String, String)> = (0..201)
+        .map(|index| (format!("key-{index:03}"), format!("value-{index}")))
+        .collect();
+    let refused = em.tag_resource(&empty_arn, tag_map(&too_many)).await;
+    assert_eq!(
+        refused.status, 400,
+        "case too-many: expected 400, got {} / {:?}",
+        refused.status, refused.body
+    );
+    assert_eq!(
+        reported_tags(&em, "too-many", &empty_arn).await,
+        json!({}),
+        "case too-many: a refused write must persist nothing"
+    );
 }
