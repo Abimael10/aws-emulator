@@ -52,3 +52,40 @@ The pipe name, queue URLs/ARNs, role ARN, message ids, MD5s, host, port and time
 6. SendMessage to the source twice: body {"kind":"unwanted","marker":"suppressed"} and body {"kind":"wanted","marker":"control"}, each with MessageAttributes {"probe": {"DataType": "String", "StringValue": "attr-bad"/"attr-good"}}.
 7. Poll ReceiveMessage on the TARGET queue. Observe that no message ever arrives (and that ReceiveMessage on the SOURCE still shows the two messages, i.e. the pipe never consumed them), so the wait runs to the harness cap.
 8. After fixing, re-replay pipes__sqs.pipe-filter-criteria-non-matching-not-delivered and confirm the matching record arrives as the SQS record envelope with the source message's messageId/md5OfBody/md5OfMessageAttributes and eventSourceARN == the source queue ARN, while the non-matching record never reaches the target and is consumed from the source.
+
+## Resolution note
+
+The behaviour this report names is served, and it is now pinned where a client sees it. Driving the
+sequence of "Steps to Reproduce" exactly — source queue with `VisibilityTimeout=60`, a role trusting
+`pipes.amazonaws.com` carrying only `sqs:ReceiveMessage`/`DeleteMessage`/`GetQueueAttributes` on the
+source and `sqs:SendMessage` on the target, `CreatePipe` with
+`FilterCriteria={"Filters":[{"Pattern":"{\"body\": {\"kind\": [\"wanted\"]}}"}]}` and
+`SqsQueueParameters={"BatchSize":10}` and no `TargetParameters` at all, one non-matching send
+followed by one matching send — the pipe reaches `RUNNING`, consumes both records and delivers the
+matching one about a tenth of a second after it was sent, as the record envelope with exactly
+`{attributes, awsRegion, body, eventSource, eventSourceARN, md5OfBody, md5OfMessageAttributes,
+messageAttributes, messageId, receiptHandle}`: `body` the source body verbatim, `messageId` /
+`md5OfBody` / `md5OfMessageAttributes` the values the source `SendMessage` reported, `eventSource`
+`aws:sqs`, `eventSourceARN` the SOURCE queue, `awsRegion` the request's Region, `messageAttributes`
+lowercase-keyed, `attributes` exactly the four with `ApproximateReceiveCount` `"1"`, and no message
+attributes on the delivery itself; the non-matching record never reaches the target and neither
+record is left on the source. That holds both in process and on the emulator a client STARTS (the
+built binary, request authentication on, SigV4 over TLS), in us-east-1 and in us-west-2, with the
+role's statements naming their resources as a string or as a list, under long-polling receives, and
+again for records sent after the pipe had already moved a batch.
+
+The suite `core/router/tests/all/pipes_filtered_sqs_delivery.rs` drives that over the wire with
+pipes, Amazon SQS and IAM on one engine, over a table whose rows differ in which record of a batch
+the pattern admits, how many are admitted, the batch size they are polled under, how many patterns
+are ORed, whether an admitted record carries message attributes, and whether the pipe was created
+explicitly RUNNING; its second test sends a wave only after the first has been moved.
+
+What is NOT verified green is this report's own replay key (`_collect#31|Timeout`): replaying the
+recorded unit still ends in the harness's "Check timed out after 60.0s" inside the check's collect
+step, with no call answering an error and nothing in the emulator's log. The delivery this key blames
+does happen — the narrative above ("no record is ever observed at the target and the source messages
+are never consumed") is inference from that timeout, and the started-emulator run refutes it — so the
+residual timeout is in the check's own waiting (the suppression half of such a check needs an idle
+window) rather than in this cause. The sibling report
+`20261103T175414Z-pipes-updatepipe-re-installing-filtercriteria-on-a-running.md` records the same
+caveat for the same check family. A later reader should not take the key as verified.
