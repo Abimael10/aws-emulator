@@ -265,7 +265,7 @@ const NEXT_TOKEN_MEMBER: &str = "NextToken";
 fn invalid_parameter(member: &str, message: &str) -> ListAttacksError {
     ListAttacksErrorModeled::InvalidParameterException(InvalidParameterException {
         message: Some(message.to_string()),
-        reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+        reason: Some(crate::state::VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string()),
         fields: Some(vec![ValidationExceptionField {
             name: member.to_string(),
             message: message.to_string(),

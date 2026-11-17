@@ -194,19 +194,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The group's own fields are judged first, so a request that could not describe
         // a group under ANY account is refused as the malformed request it is rather
         // than as a missing subscription.
-        if !guard.protection_group_fields_accepted(
+        let faults = guard.protection_group_field_faults(
             &input.pattern,
             input.resource_type.as_deref(),
             &members,
-        ) {
-            return Err(CreateProtectionGroupErrorModeled::InvalidParameterException(
-                InvalidParameterException {
-                    message: Some(crate::state::PROTECTION_GROUP_FIELDS_MESSAGE.to_string()),
-                    reason: None,
-                    fields: None,
-                },
-            )
-            .into());
+        );
+        if !faults.is_empty() {
+            return Err(invalid_parameter(&faults));
         }
 
         // A protection group groups what a Shield Advanced subscription protects, so
@@ -300,4 +294,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(CreateProtectionGroupOutput {})
     }
+}
+
+/// The modelled `InvalidParameterException` (HTTP 400) this operation refuses a
+/// `Pattern`/`ResourceType`/`Members` combination with.
+///
+/// The top-level sentence states that the group's input fields are wrong, and the
+/// structured members say WHICH: `reason` classifies the refusal as a per-field one and
+/// `fields` carries one entry per input member at fault, naming it and why it failed —
+/// which is where a client reads the diagnosis it can act on.
+fn invalid_parameter(
+    faults: &[crate::state::ProtectionGroupFieldFault],
+) -> CreateProtectionGroupError {
+    CreateProtectionGroupErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(crate::state::PROTECTION_GROUP_FIELDS_MESSAGE.to_string()),
+        reason: Some(crate::state::VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string()),
+        fields: Some(
+            faults
+                .iter()
+                .map(|fault| ValidationExceptionField {
+                    name: fault.name.to_string(),
+                    message: fault.message.to_string(),
+                })
+                .collect(),
+        ),
+    })
+    .into()
 }

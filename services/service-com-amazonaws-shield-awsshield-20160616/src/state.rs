@@ -93,6 +93,43 @@ pub const PROTECTION_GROUP_NOT_FOUND_MESSAGE: &str =
 pub const PROTECTION_GROUP_FIELDS_MESSAGE: &str =
     "One or more protection group input fields are incorrect.";
 
+/// The `ValidationExceptionReason` an `InvalidParameterException` carries when what the
+/// request got wrong is a particular input member, as against the model's only other
+/// value for the member (`OTHER`), which says nothing about where the trouble is. A
+/// client branches on it to tell a per-field refusal from any other invalid parameter.
+pub const VALIDATION_REASON_FIELD_VALIDATION_FAILED: &str = "FIELD_VALIDATION_FAILED";
+
+/// The `ValidationExceptionField$name` of `CreateProtectionGroupRequest$ResourceType`:
+/// a refusal names the member in the spelling the model gives it.
+pub const PROTECTION_GROUP_RESOURCE_TYPE_FIELD: &str = "ResourceType";
+
+/// The `ValidationExceptionField$name` of `CreateProtectionGroupRequest$Members`. See
+/// [`PROTECTION_GROUP_RESOURCE_TYPE_FIELD`].
+pub const PROTECTION_GROUP_MEMBERS_FIELD: &str = "Members";
+
+/// The `ValidationExceptionField$message` for a member the request set that the group's
+/// `Pattern` does not admit — the member's own documented rule read from the side that
+/// forbids it ("you must not set it for any other `Pattern` setting"). Fixed text: the
+/// entry's `name` is what localizes it, so the sentence names no member and carries no
+/// value from the request.
+pub const PROTECTION_GROUP_FIELD_UNEXPECTED_MESSAGE: &str =
+    "This field should not be defined for this pattern";
+
+/// The `ValidationExceptionField$message` for a member the group's `Pattern` requires
+/// that the request left unset — the same documented rule read from the side that asks
+/// for it ("You must set this when you set `Pattern` to ..."), and the mirror of
+/// [`PROTECTION_GROUP_FIELD_UNEXPECTED_MESSAGE`].
+pub const PROTECTION_GROUP_FIELD_MISSING_MESSAGE: &str =
+    "This field should be defined for this pattern";
+
+/// The `ValidationExceptionField$message` for a `Members` list that names a resource the
+/// account does not protect. A protection group groups *protected* resources, so a
+/// member that is not one of them is a value this member cannot carry. CHOSEN wording,
+/// like the other fixed refusal sentences of this service: it names no ARN from the
+/// request.
+pub const PROTECTION_GROUP_MEMBER_UNPROTECTED_MESSAGE: &str =
+    "This field should name only resources that this account protects";
+
 /// How this service states that a `ResourceARN` names no Shield resource it holds.
 pub const INVALID_RESOURCE_MESSAGE: &str = "The referenced resource is invalid.";
 
@@ -483,6 +520,22 @@ impl ProtectionGroupEntry {
     }
 }
 
+/// One input member of a protection group that a request got wrong, and why: exactly
+/// what an `InvalidParameterException` reports as a `ValidationExceptionField`, so the
+/// per-field diagnosis travels in the modelled members rather than only in the
+/// top-level sentence.
+///
+/// Both halves are fixed text: the member name in its modelled spelling and the
+/// sentence describing why that member failed validation, so no value from the request
+/// reaches the refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProtectionGroupFieldFault {
+    /// The input member at fault, spelled as the request shape declares it.
+    pub name: &'static str,
+    /// Why that member failed validation.
+    pub message: &'static str,
+}
+
 /// One DDoS attack Shield detected against a resource of the account, as this emulator
 /// persists it.
 ///
@@ -845,8 +898,9 @@ impl ComAmazonawsShieldAwsshield20160616State {
             .collect()
     }
 
-    /// Whether a protection group's `Pattern`, `ResourceType` and `Members` are a
-    /// combination this service accepts.
+    /// Which of a protection group's `Pattern`, `ResourceType` and `Members` this
+    /// service cannot accept as the request spelled them, and why — one entry per input
+    /// member at fault, empty when the combination is one this service accepts.
     ///
     /// The three members constrain each other, in their own documented words.
     /// `Members`: "You must set this when you set `Pattern` to `ARBITRARY` and you must
@@ -856,20 +910,52 @@ impl ComAmazonawsShieldAwsshield20160616State {
     /// and a protection group groups *protected* resources, so each named member must be
     /// a resource the account protects. An empty list is not a set one: a group whose
     /// membership is spelled out explicitly has at least one member.
-    pub fn protection_group_fields_accepted(
+    ///
+    /// Each fault is reported against the member the rule belongs to, so the refusal
+    /// localizes itself; the order is the order the request shape declares the members
+    /// in (`ResourceType` before `Members`), so a request that got both wrong is
+    /// reported the same way every time.
+    pub fn protection_group_field_faults(
         &self,
         pattern: &str,
         resource_type: Option<&str>,
         members: &[String],
-    ) -> bool {
+    ) -> Vec<ProtectionGroupFieldFault> {
         let wants_members = pattern == PROTECTION_GROUP_PATTERN_ARBITRARY;
         let wants_resource_type = pattern == PROTECTION_GROUP_PATTERN_BY_RESOURCE_TYPE;
-        if members.is_empty() == wants_members || resource_type.is_some() != wants_resource_type {
-            return false;
+        let mut faults = Vec::new();
+
+        if resource_type.is_some() != wants_resource_type {
+            faults.push(ProtectionGroupFieldFault {
+                name: PROTECTION_GROUP_RESOURCE_TYPE_FIELD,
+                message: if wants_resource_type {
+                    PROTECTION_GROUP_FIELD_MISSING_MESSAGE
+                } else {
+                    PROTECTION_GROUP_FIELD_UNEXPECTED_MESSAGE
+                },
+            });
         }
-        members
+
+        if members.is_empty() == wants_members {
+            faults.push(ProtectionGroupFieldFault {
+                name: PROTECTION_GROUP_MEMBERS_FIELD,
+                message: if wants_members {
+                    PROTECTION_GROUP_FIELD_MISSING_MESSAGE
+                } else {
+                    PROTECTION_GROUP_FIELD_UNEXPECTED_MESSAGE
+                },
+            });
+        } else if members
             .iter()
-            .all(|member| self.protection_by_resource_arn(member).is_some())
+            .any(|member| self.protection_by_resource_arn(member).is_none())
+        {
+            faults.push(ProtectionGroupFieldFault {
+                name: PROTECTION_GROUP_MEMBERS_FIELD,
+                message: PROTECTION_GROUP_MEMBER_UNPROTECTED_MESSAGE,
+            });
+        }
+
+        faults
     }
 
     /// Which taggable resource of this service an ARN names, or `None` when the account

@@ -237,7 +237,7 @@ const NO_ADDRESS_MESSAGE: &str =
 fn invalid_parameter(message: &str) -> DescribeProtectionError {
     DescribeProtectionErrorModeled::InvalidParameterException(InvalidParameterException {
         message: Some(message.to_string()),
-        reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+        reason: Some(crate::state::VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string()),
         fields: Some(vec![
             ValidationExceptionField {
                 name: PROTECTION_ID_PARAMETER.to_string(),

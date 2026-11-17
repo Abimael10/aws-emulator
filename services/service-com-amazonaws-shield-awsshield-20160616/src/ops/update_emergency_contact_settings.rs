@@ -195,13 +195,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 UpdateEmergencyContactSettingsErrorModeled::InvalidParameterException(
                     InvalidParameterException {
-                        message: Some(
-                            "The emergency contact list must include at least one phone number \
-                             while proactive engagement is enabled."
-                                .to_string(),
+                        message: Some(MISSING_PHONE_NUMBER_MESSAGE.to_string()),
+                        // The refusal is about one input member, so it says so and names
+                        // it: a client reads the structured members to localize the fault.
+                        reason: Some(
+                            crate::state::VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
                         ),
-                        reason: None,
-                        fields: None,
+                        fields: Some(vec![ValidationExceptionField {
+                            name: EMERGENCY_CONTACT_LIST_MEMBER.to_string(),
+                            message: MISSING_PHONE_NUMBER_MESSAGE.to_string(),
+                        }]),
                     },
                 )
                 .into(),
@@ -215,3 +218,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(UpdateEmergencyContactSettingsOutput {})
     }
 }
+
+/// The input member a refused contact list arrived on, spelled as the request shape
+/// declares it.
+const EMERGENCY_CONTACT_LIST_MEMBER: &str = "EmergencyContactList";
+
+/// How this service states that the submitted contact list leaves the Shield Response
+/// Team no number to call while proactive engagement is enabled. Fixed text: it carries
+/// no contact from the request.
+const MISSING_PHONE_NUMBER_MESSAGE: &str = "The emergency contact list must include at least \
+     one phone number while proactive engagement is enabled.";

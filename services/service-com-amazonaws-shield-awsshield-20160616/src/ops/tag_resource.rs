@@ -171,14 +171,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut merged = tags.clone();
         crate::state::merge_tags(&mut merged, &input.tags);
         if merged.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            let message = format!(
+                "The resource cannot carry more than {} tags.",
+                crate::state::MAX_TAGS_PER_RESOURCE
+            );
             return Err(TagResourceErrorModeled::InvalidParameterException(
                 InvalidParameterException {
-                    message: Some(format!(
-                        "The resource cannot carry more than {} tags.",
-                        crate::state::MAX_TAGS_PER_RESOURCE
-                    )),
-                    reason: None,
-                    fields: None,
+                    message: Some(message.clone()),
+                    // The refusal is about one input member, so it says so and names it:
+                    // a client reads the structured members to localize the fault.
+                    reason: Some(
+                        crate::state::VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
+                    ),
+                    fields: Some(vec![ValidationExceptionField {
+                        name: TAGS_MEMBER.to_string(),
+                        message,
+                    }]),
                 },
             )
             .into());
@@ -188,3 +196,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(TagResourceOutput {})
     }
 }
+
+/// The input member a refused tag count arrived on, spelled as the request shape
+/// declares it.
+const TAGS_MEMBER: &str = "Tags";
