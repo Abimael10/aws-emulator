@@ -36,6 +36,13 @@ const DELETE_SERVICE: &str = "/v2/delete-service";
 const CREATE_INPUT_SOURCE: &str = "/v2/create-input-source";
 const DELETE_INPUT_SOURCE: &str = "/v2/delete-input-source";
 const LIST_INPUT_SOURCES: &str = "/v2/list-input-sources";
+/// The routes of the children that DO go with a deleted service, and of the service read
+/// itself, so one suite can assert what the delete takes and what it leaves.
+const CREATE_SERVICE_FUNCTION: &str = "/v2/create-service-function";
+const CREATE_ASSERTION: &str = "/v2/create-assertion";
+const GET_SERVICE: &str = "/v2/get-service";
+const LIST_SERVICE_FUNCTIONS: &str = "/v2/list-functions";
+const LIST_ASSERTIONS: &str = "/v2/list-assertions";
 
 /// A SigV4 `Authorization` header whose credential scope names this service's signing
 /// name (`resiliencehub`) and the Region ARNs are minted in. Signature verification is off
@@ -823,7 +830,8 @@ async fn unknown_identifiers_are_refused_and_sources_are_per_service() {
         "the refused deletes must leave the stored source in place: {body:?}"
     );
 
-    // Deleting the service cascades: there is no service left to list its sources under.
+    // Deleting the service does NOT take its input sources: they outlive it and stay
+    // addressable through the very same ARN (see `input_sources_outlive_their_service`).
     let (status, body) = call(
         &router,
         "POST",
@@ -837,8 +845,9 @@ async fn unknown_identifiers_are_refused_and_sources_are_per_service() {
     );
     let (status, body) = list_sources(&router, &format!("serviceArn={service_arn}")).await;
     assert_eq!(
-        status, 404,
-        "expected HTTP 404 listing a deleted service's input sources, got {status} {body:?}"
+        listed("the deleted service's surviving sources", status, &body).len(),
+        1,
+        "the source created before the delete must still be listed, got {body:?}"
     );
 
     // A service recreated under the deleted one's name starts with no input sources, so
@@ -849,4 +858,321 @@ async fn unknown_identifiers_are_refused_and_sources_are_per_service() {
         listed("a recreated service", status, &body).is_empty(),
         "a freshly created service holds no input sources, got {body:?}"
     );
+}
+
+/// The id segment of an ARN: everything after the fifth `:`, which is what a
+/// `ResourceNotFoundException` naming that resource reports and words its message with.
+fn arn_resource_id(arn: &str) -> &str {
+    arn.splitn(6, ':').nth(5).unwrap_or(arn)
+}
+
+/// Assert `uri` is refused with the `ResourceNotFoundException` a `serviceArn` naming no
+/// stored service answers with, naming `service_id` the way that refusal words it.
+async fn assert_service_gone(
+    router: &MultiServiceRouter,
+    case: &str,
+    reader: &str,
+    uri: &str,
+    service_id: &str,
+) {
+    let (status, body) = call(router, "GET", uri, None).await;
+    assert_eq!(
+        status, 404,
+        "case {case:?}: expected HTTP 404 from {reader} on the deleted service, got {status} \
+         {body:?}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "ResourceNotFoundException",
+        "case {case:?}: expected ResourceNotFoundException from {reader}, got {body:?}"
+    );
+    assert_eq!(
+        body["message"],
+        json!(format!("Service not found: {service_id}")),
+        "case {case:?}: {reader} must name the service it could not find, got {body:?}"
+    );
+}
+
+/// `DeleteService` takes the children the service record owns, but NOT its input sources:
+/// an input source outlives the service it was created for and stays listable and
+/// deletable through that same `serviceArn`.
+///
+/// The rows differ in how many input sources the service holds when it is deleted, which
+/// `ResourceConfiguration` members those sources carry, and which of the children that DO
+/// go with the service (a service function, an assertion) it also holds.
+#[tokio::test]
+async fn input_sources_outlive_their_service() {
+    let rows = configuration_rows();
+    for (case, count, with_function, with_assertion) in [
+        ("one source, beside a function and an assertion", 1usize, true, true),
+        ("two sources of different configuration members", 2, true, false),
+        ("every configuration member the table spans", rows.len(), false, true),
+    ] {
+        let router = emulator();
+        let service_arn = create_service(&router, "InputSourceSurvival").await;
+        let service_id = arn_resource_id(&service_arn).to_string();
+
+        if with_function {
+            let (status, body) = call(
+                &router,
+                "POST",
+                CREATE_SERVICE_FUNCTION,
+                Some(json!({
+                    "serviceArn": service_arn,
+                    "name": "checkout flow",
+                    "criticality": "PRIMARY",
+                })),
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected HTTP 200 from CreateServiceFunction, got {status} \
+                 {body:?}"
+            );
+        }
+        if with_assertion {
+            let (status, body) = call(
+                &router,
+                "POST",
+                CREATE_ASSERTION,
+                Some(json!({
+                    "serviceArn": service_arn,
+                    "text": "Service must survive an AZ outage.",
+                })),
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected HTTP 200 from CreateAssertion, got {status} {body:?}"
+            );
+        }
+
+        let created: Vec<(Row, String)> = {
+            let mut created = Vec::new();
+            for row in rows.iter().take(count) {
+                let (status, body) = create_source(&router, row.body(&service_arn)).await;
+                let id = minted_id(row.case, &service_arn, status, &body);
+                created.push((row.clone(), id));
+            }
+            created
+        };
+
+        let (status, body) = list_sources(&router, &format!("serviceArn={service_arn}")).await;
+        assert_eq!(
+            listed(case, status, &body).len(),
+            count,
+            "case {case:?}: the live service must list every source created for it, got {body:?}"
+        );
+
+        let (status, body) = call(
+            &router,
+            "POST",
+            DELETE_SERVICE,
+            Some(json!({"serviceArn": service_arn})),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from DeleteService, got {status} {body:?}"
+        );
+
+        // The service and the children its record owns are gone with it, each refused by
+        // the one wording a `serviceArn` naming no stored service answers with.
+        for (reader, uri) in [
+            ("GetService", format!("{GET_SERVICE}?serviceArn={service_arn}")),
+            (
+                "ListServiceFunctions",
+                format!("{LIST_SERVICE_FUNCTIONS}?serviceArn={service_arn}"),
+            ),
+            (
+                "ListAssertions",
+                format!("{LIST_ASSERTIONS}?serviceArn={service_arn}"),
+            ),
+        ] {
+            assert_service_gone(&router, case, reader, &uri, &service_id).await;
+        }
+
+        // The input sources did not go with it: every one is still listed through the dead
+        // ARN, still projected from what the create stored.
+        let (status, body) = list_sources(&router, &format!("serviceArn={service_arn}")).await;
+        let summaries = listed(case, status, &body);
+        assert_eq!(
+            summaries.len(),
+            count,
+            "case {case:?}: a deleted service's input sources must still be listed, got {body:?}"
+        );
+        for (row, id) in &created {
+            row.assert_summary(&summary_of(case, &summaries, id));
+        }
+
+        // The listing's `type` filter reads the same surviving sources.
+        for (row, id) in &created {
+            let (status, body) = list_sources(
+                &router,
+                &format!("serviceArn={service_arn}&type={}", row.expected_type),
+            )
+            .await;
+            let filtered = listed(case, status, &body);
+            assert!(
+                filtered
+                    .iter()
+                    .any(|summary| summary["inputSourceId"] == json!(id)),
+                "case {case:?}: the {} filter must still reach the surviving source {id}, got \
+                 {body:?}",
+                row.expected_type
+            );
+        }
+
+        // No source can be CREATED for a service that is gone: a create needs a live parent.
+        let (status, body) = create_source(&router, rows[0].body(&service_arn)).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: expected HTTP 404 from CreateInputSource on the deleted service, \
+             got {status} {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ResourceNotFoundException",
+            "case {case:?}: expected ResourceNotFoundException from CreateInputSource, got \
+             {body:?}"
+        );
+
+        // And each surviving source is still DELETABLE through the dead ARN: the delete
+        // answers 200 and the listing it leaves no longer carries that id.
+        let mut remaining = count;
+        for (row, id) in &created {
+            let (status, body) = delete_source(&router, &service_arn, id).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}/{:?}: expected HTTP 200 deleting a surviving source, got \
+                 {status} {body:?}",
+                row.case
+            );
+            assert_eq!(
+                body["inputSourceId"],
+                json!(id),
+                "case {case:?}/{:?}: the delete must answer the source it removed, got {body:?}",
+                row.case
+            );
+            remaining -= 1;
+            let (status, body) =
+                list_sources(&router, &format!("serviceArn={service_arn}")).await;
+            let left = listed(case, status, &body);
+            assert_eq!(
+                left.len(),
+                remaining,
+                "case {case:?}/{:?}: the listing must lose exactly the deleted source, got \
+                 {body:?}",
+                row.case
+            );
+            assert!(
+                !left
+                    .iter()
+                    .any(|summary| summary["inputSourceId"] == json!(id)),
+                "case {case:?}/{:?}: {id} was deleted, so it must not be listed, got {body:?}",
+                row.case
+            );
+
+            // Repeating the delete does not report a second success.
+            let (status, body) = delete_source(&router, &service_arn, id).await;
+            assert_eq!(
+                status, 404,
+                "case {case:?}/{:?}: expected HTTP 404 repeating the delete, got {status} \
+                 {body:?}",
+                row.case
+            );
+            assert_eq!(
+                error_code(&body),
+                "ResourceNotFoundException",
+                "case {case:?}/{:?}: expected ResourceNotFoundException, got {body:?}",
+                row.case
+            );
+        }
+
+        // With the last one deleted the ARN still answers the listing — with nothing in it.
+        let (status, body) = list_sources(&router, &format!("serviceArn={service_arn}")).await;
+        assert!(
+            listed(case, status, &body).is_empty(),
+            "case {case:?}: every surviving source was deleted, so the listing is empty, got \
+             {body:?}"
+        );
+    }
+}
+
+/// A `serviceArn` that never had an input source keeps the refusal: nothing survives a
+/// service that held none, so the listing and the delete are both 404 once it is gone.
+#[tokio::test]
+async fn an_arn_that_never_had_input_sources_is_still_refused() {
+    let router = emulator();
+    for (case, name) in [
+        ("a service with a function but no input source", "NoSourcesButAFunction"),
+        ("a service with no children at all", "NoChildrenAtAll"),
+    ] {
+        let service_arn = create_service(&router, name).await;
+        if case.contains("function") {
+            let (status, body) = call(
+                &router,
+                "POST",
+                CREATE_SERVICE_FUNCTION,
+                Some(json!({
+                    "serviceArn": service_arn,
+                    "name": "checkout flow",
+                    "criticality": "PRIMARY",
+                })),
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected HTTP 200 from CreateServiceFunction, got {status} \
+                 {body:?}"
+            );
+        }
+
+        // While the service lives, the listing is an empty page rather than a refusal.
+        let (status, body) = list_sources(&router, &format!("serviceArn={service_arn}")).await;
+        assert!(
+            listed(case, status, &body).is_empty(),
+            "case {case:?}: a live service with no input sources lists none, got {body:?}"
+        );
+
+        let (status, body) = call(
+            &router,
+            "POST",
+            DELETE_SERVICE,
+            Some(json!({"serviceArn": service_arn})),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from DeleteService, got {status} {body:?}"
+        );
+
+        let (status, body) = list_sources(&router, &format!("serviceArn={service_arn}")).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: nothing survives a service that had no input sources, so the \
+             listing is refused, got {status} {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ResourceNotFoundException",
+            "case {case:?}: expected ResourceNotFoundException, got {body:?}"
+        );
+        assert_eq!(
+            body["message"],
+            json!(format!("Service not found: {}", arn_resource_id(&service_arn))),
+            "case {case:?}: the refusal must name the service it could not find, got {body:?}"
+        );
+
+        let (status, body) = delete_source(&router, &service_arn, "no-such-input-source").await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: expected HTTP 404 from DeleteInputSource, got {status} {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ResourceNotFoundException",
+            "case {case:?}: expected ResourceNotFoundException, got {body:?}"
+        );
+    }
 }

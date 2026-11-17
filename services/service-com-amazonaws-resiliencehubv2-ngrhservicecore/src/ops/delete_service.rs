@@ -2,7 +2,8 @@
 
 //! @op DeleteService
 //! Removes a stored service and echoes its ARN — after the record is gone, so a later
-//! `GetService` is a 404. This is the ONLY file to touch for this operation.
+//! `GetService` is a 404. The input sources created for the service outlive it and stay
+//! addressable through its ARN. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -159,12 +160,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         // The name is free again, and no `clientToken` may replay into a service that no
-        // longer exists. The service's functions went with the record: they are stored
-        // inside it, so deleting a service cascades to the child resources it holds.
+        // longer exists. The service's functions and assertions went with the record: they
+        // are stored inside it, so deleting a service cascades to the child resources it
+        // holds. Its INPUT SOURCES do not: they outlive the service they were created for,
+        // so the collection held for this ARN stays in the store, only marked orphaned, and
+        // `ListInputSources` and `DeleteInputSource` keep resolving this ARN.
         store.service_names.remove(&record.name);
         store
             .idempotency
             .retain(|_, arn| arn != &record.service_arn);
+        store.orphan_input_sources(&record.service_arn);
 
         Ok(DeleteServiceOutput {
             service_arn: record.service_arn,

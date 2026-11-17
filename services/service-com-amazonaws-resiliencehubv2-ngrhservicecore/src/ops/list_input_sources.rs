@@ -3,7 +3,8 @@
 //! @op ListInputSources
 //! Lists input sources for a service, in creation order, one page at a time, optionally
 //! narrowed to one `InputSourceType`. Every summary is projected from a stored
-//! [`crate::state::InputSourceRecord`].
+//! [`crate::state::InputSourceRecord`]. The `serviceArn` resolves whether or not its
+//! service still exists, because an input source outlives the service it was created for.
 //!
 //! ## Shape of an operation
 //!
@@ -210,10 +211,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // Input sources live inside their service's record, so a `serviceArn` naming no
-        // service is a 404 — not an empty list, which would claim the service exists and
-        // has no input sources.
-        let Some(service) = store.services.get(&input.service_arn) else {
+        // Input sources OUTLIVE the service they were created for, so the listing resolves
+        // the sources held for this `serviceArn` rather than the service: an ARN whose
+        // service is gone but whose sources remain is served, and only an ARN with neither
+        // a stored service nor surviving sources is a 404 — not an empty list, which would
+        // claim the ARN has a scope and nothing in it.
+        if !store.input_sources_addressable(&input.service_arn) {
             return Err(ListInputSourcesErrorModeled::ResourceNotFoundException(
                 crate::state::resource_not_found(
                     crate::state::SERVICE_RESOURCE_TYPE,
@@ -221,15 +224,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             )
             .into());
-        };
+        }
 
         // `type` narrows the listing to the sources of that type — the type each stored
         // configuration names — and a request that omits it asks for all of them. A
         // modelled enum, so the boundary has already refused anything outside
         // `INPUT_SOURCE_TYPE_VALUES`.
         let wanted_type = input.r#type.as_deref();
-        let matched: Vec<&crate::state::InputSourceRecord> = service
-            .input_sources_in_creation_order()
+        let matched: Vec<&crate::state::InputSourceRecord> = store
+            .input_sources_for(&input.service_arn)
+            .map(|sources| sources.in_creation_order())
+            .unwrap_or_default()
             .into_iter()
             .filter(|source| source.sequence >= resume_from.unwrap_or(0))
             .filter(|source| wanted_type.is_none_or(|wanted| wanted == source.source_type()))

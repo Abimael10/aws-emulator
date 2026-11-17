@@ -9,11 +9,16 @@
 //!
 //! A service's child resources are stored INSIDE its record — see
 //! [`ServiceRecord::service_functions`] for the `ServiceFunction` lifecycle
-//! (`CreateServiceFunction`, `ListServiceFunctions`), [`ServiceRecord::assertions`] for
-//! the `Assertion` one (`CreateAssertion`, `ListAssertions`, see [`assertions`]) and
-//! [`ServiceRecord::input_sources`] for the `InputSource` one (`CreateInputSource`,
-//! `ListInputSources`, `DeleteInputSource`, see [`input_sources`]) — so deleting a service
-//! cascades to them and no lookup can reach a child whose parent is gone.
+//! (`CreateServiceFunction`, `ListServiceFunctions`) and [`ServiceRecord::assertions`] for
+//! the `Assertion` one (`CreateAssertion`, `ListAssertions`, see [`assertions`]) — so
+//! deleting a service cascades to them and no lookup can reach a child whose parent is
+//! gone.
+//!
+//! Input sources are the exception: an input source OUTLIVES the service it was created
+//! for, so [`Self::input_sources`] holds one collection per `serviceArn` beside the
+//! service records rather than inside one (`CreateInputSource`, `ListInputSources`,
+//! `DeleteInputSource`, see [`input_sources`]), and a read or a delete addressed to the
+//! ARN of a deleted service still resolves.
 //!
 //! Every response those operations return is projected from a record here —
 //! [`ServiceRecord::to_service`] for the full `Service` shape and
@@ -52,9 +57,10 @@ pub use assertions::{
 };
 pub use conflicts::{name_already_exists_message, two_requests_one_token_message};
 pub use input_sources::{
-    mint_input_source_id, InputSourceRecord, INPUT_SOURCE_TYPE_CFN_STACK,
+    mint_input_source_id, InputSourceCollection, InputSourceRecord, INPUT_SOURCE_TYPE_CFN_STACK,
     INPUT_SOURCE_TYPE_DESIGN_FILE, INPUT_SOURCE_TYPE_EKS, INPUT_SOURCE_TYPE_TAGS,
     INPUT_SOURCE_TYPE_TERRAFORM, MAX_INPUT_SOURCES_PER_SERVICE,
+    MAX_ORPHANED_INPUT_SOURCE_SERVICES,
 };
 pub use invoker_role::{invoker_role_rejection, unassumable_message, SERVICE_PRINCIPAL};
 pub use not_found::{
@@ -274,17 +280,6 @@ pub struct ServiceRecord {
     /// `@idempotencyToken` returns the function the first call created instead of creating
     /// a second one. Scoped to the parent service for the same reason as above.
     pub service_function_idempotency: BTreeMap<String, String>,
-    /// The input sources created for this service, keyed by `inputSourceId`. See
-    /// [`input_sources`].
-    ///
-    /// An input source exists only FOR a service (`CreateInputSource` is "Creates an
-    /// input source for a service"), so it is stored inside the parent record the way a
-    /// service function is: removing the service removes its input sources with it.
-    pub input_sources: BTreeMap<String, InputSourceRecord>,
-    /// `clientToken` -> `inputSourceId`, so a replayed `CreateInputSource`
-    /// `@idempotencyToken` returns the input source the first call created instead of
-    /// creating a second one. Scoped to the parent service for the same reason as above.
-    pub input_source_idempotency: BTreeMap<String, String>,
     /// The resilience assertions created on this service, keyed by `assertionId`. See
     /// [`assertions`] — held inside the parent record for the same reason
     /// [`Self::service_functions`] is.
@@ -491,6 +486,13 @@ pub struct ComAmazonawsResiliencehubv2NgrhservicecoreState {
     /// `clientToken` -> `serviceArn`, so a replayed `@idempotencyToken` returns the
     /// service the first call created instead of creating a second one.
     pub idempotency: BTreeMap<String, String>,
+    /// The input sources created for each `serviceArn`, keyed by that ARN. See
+    /// [`input_sources`].
+    ///
+    /// Held HERE rather than inside the service record because an input source outlives
+    /// the service it was created for: `DeleteService` leaves the collection in place (as
+    /// an orphan) so `ListInputSources` and `DeleteInputSource` keep resolving the ARN.
+    pub input_sources: BTreeMap<String, InputSourceCollection>,
     /// Every created resilience policy, keyed by its ARN. See [`policies`].
     pub policies: BTreeMap<String, PolicyRecord>,
     /// `name` -> `policyArn`, so `CreatePolicy` can refuse a duplicate name with

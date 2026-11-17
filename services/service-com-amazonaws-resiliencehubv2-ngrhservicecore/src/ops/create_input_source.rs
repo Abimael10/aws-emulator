@@ -164,20 +164,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // An input source is created FOR a service, so the parent must exist before
         // anything is stored: a `serviceArn` naming no service is a 404, not a source with
-        // no parent. Every refusal below reads the service, so nothing is minted or
-        // consumed until the call is known to be a create.
-        let Some(service) = store.services.get(&service_arn) else {
+        // no parent. The sources themselves live beside the service records, keyed by this
+        // ARN, so they survive the service — but only a live service can be created for.
+        if !store.services.contains_key(&service_arn) {
             return Err(service_not_found(&service_arn).into());
-        };
+        }
+        let held = store.input_sources_for(&service_arn);
 
         // `clientToken` is an @idempotencyToken: a repeat of the same call returns the
         // input source the first one created rather than creating a second one.
         if let Some(replayed) = input
             .client_token
             .as_deref()
-            .and_then(|token| service.input_source_idempotency.get(token))
+            .and_then(|token| held.and_then(|sources| sources.idempotency.get(token)))
             .cloned()
-            .filter(|id| service.input_sources.contains_key(id))
+            .filter(|id| held.is_some_and(|sources| sources.sources.contains_key(id)))
         {
             return Ok(CreateInputSourceOutput {
                 service_arn,
@@ -185,8 +186,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
 
-        // The store is BOUNDED before it is written: every create grows the parent
-        // service's record by one entry carrying caller-supplied payload, so a caller that
+        // The store is BOUNDED before it is written: every create grows this ARN's
+        // collection by one entry carrying caller-supplied payload, so a caller that
         // repeats this call would otherwise grow the process's memory without limit. At
         // the ceiling the create is refused with the quota error this operation models.
         // The idempotency index is capped by the SAME ceiling here rather than assumed to
@@ -194,9 +195,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `DeleteInputSource` drops the tokens that named the source it removed, so the
         // index cannot outgrow the sources — and if it ever did, the create is refused
         // rather than growing it further.
-        if service.input_sources.len() >= crate::state::MAX_INPUT_SOURCES_PER_SERVICE
-            || service.input_source_idempotency.len()
-                >= crate::state::MAX_INPUT_SOURCES_PER_SERVICE
+        let (stored_sources, stored_tokens) = held.map_or((0, 0), |sources| {
+            (sources.sources.len(), sources.idempotency.len())
+        });
+        if stored_sources >= crate::state::MAX_INPUT_SOURCES_PER_SERVICE
+            || stored_tokens >= crate::state::MAX_INPUT_SOURCES_PER_SERVICE
         {
             return Err(
                 CreateInputSourceErrorModeled::ServiceQuotaExceededException(
@@ -226,18 +229,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_at: now,
             sequence,
         };
-        // Re-reached mutably now that the counter has been read: the store has been held
-        // under this one lock throughout, so the service is still there, and a store that
-        // somehow lost it answers the same 404 rather than panicking.
-        let Some(service) = store.services.get_mut(&service_arn) else {
-            return Err(service_not_found(&service_arn).into());
-        };
+        // The collection for this ARN, opened empty if this is its first input source.
+        let sources = store.input_sources_entry(&service_arn);
         if let Some(token) = input.client_token {
-            service
-                .input_source_idempotency
-                .insert(token, input_source_id.clone());
+            sources.idempotency.insert(token, input_source_id.clone());
         }
-        service.input_sources.insert(input_source_id.clone(), record);
+        sources.sources.insert(input_source_id.clone(), record);
 
         Ok(CreateInputSourceOutput {
             service_arn,

@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteInputSource
-//! Deletes an input source: the stored record is REMOVED from the service it was created
-//! for, so the listing that reads that service stops serving it.
+//! Deletes an input source: the stored record is REMOVED from the sources held for the
+//! `serviceArn` it was created for, so the listing that reads that ARN stops serving it.
+//! The ARN resolves whether or not its service still exists, because an input source
+//! outlives the service it was created for.
 //!
 //! ## Shape of an operation
 //!
@@ -152,9 +154,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut store = state.lock();
 
-        // An input source lives inside its service's record, so the parent is resolved
-        // first: a `serviceArn` naming no service is a 404, not a delete of nothing.
-        let Some(service) = store.services.get_mut(&input.service_arn) else {
+        // An input source OUTLIVES the service it was created for, so the delete resolves
+        // the sources held for this `serviceArn` rather than the service: a `serviceArn`
+        // with neither a stored service nor surviving sources is a 404, not a delete of
+        // nothing.
+        if !store.input_sources_addressable(&input.service_arn) {
             return Err(DeleteInputSourceErrorModeled::ResourceNotFoundException(
                 crate::state::resource_not_found(
                     crate::state::SERVICE_RESOURCE_TYPE,
@@ -162,23 +166,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             )
             .into());
-        };
+        }
 
         // One identifier names ONE input source, whatever configuration it carries, so a
         // delete removes exactly that source and leaves every other one — including one
         // created from identical configuration — in place. An identifier that names no
         // source there is a 404: repeating a delete does not report a second success.
-        let Some(removed) = service.input_sources.remove(&input.input_source_id) else {
+        //
+        // No `clientToken` may replay into an input source that no longer exists, so the
+        // tokens that named it go with it — the same pruning `DeleteServiceFunction`
+        // performs.
+        let removed = store
+            .input_sources_for_mut(&input.service_arn)
+            .and_then(|sources| {
+                let removed = sources.sources.remove(&input.input_source_id)?;
+                sources
+                    .idempotency
+                    .retain(|_, id| id != &removed.input_source_id);
+                Some(removed)
+            });
+        let Some(removed) = removed else {
             return Err(DeleteInputSourceErrorModeled::ResourceNotFoundException(
                 crate::state::input_source_not_found(&input.input_source_id),
             )
             .into());
         };
-        // No `clientToken` may replay into an input source that no longer exists, so the
-        // tokens that named it go with it — the same pruning `DeleteServiceFunction` performs.
-        service
-            .input_source_idempotency
-            .retain(|_, id| id != &removed.input_source_id);
 
         Ok(DeleteInputSourceOutput {
             service_arn: input.service_arn,

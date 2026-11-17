@@ -3,10 +3,19 @@
 //! The `InputSource` side of this service's store.
 //!
 //! An input source is created "for a service" (`CreateInputSource`'s own documentation)
-//! and listed per `serviceArn`, so one [`InputSourceRecord`] per created source lives
-//! INSIDE the service it was created for ([`super::ServiceRecord::input_sources`]), the
-//! same shape the `ServiceFunction` side of this store uses: deleting the service removes
-//! its input sources with it, and no lookup can reach a source whose service is gone.
+//! and listed per `serviceArn`, but it OUTLIVES that service: one
+//! [`InputSourceCollection`] per `serviceArn` lives in the store beside the service
+//! records ([`super::ComAmazonawsResiliencehubv2NgrhservicecoreState::input_sources`])
+//! rather than inside one, so deleting the service leaves its input sources addressable —
+//! and deletable — through the very same ARN. That is what separates them from the
+//! `ServiceFunction` and `Assertion` sides of this store, which are owned by the service
+//! record and go with it.
+//!
+//! A collection whose service has been deleted is ORPHANED
+//! ([`InputSourceCollection::orphaned_at`]): it still answers reads and deletes, but no
+//! create can add to it, because a create resolves a live service first. The store keeps
+//! at most [`MAX_ORPHANED_INPUT_SOURCE_SERVICES`] of them, dropping the longest-orphaned
+//! first, so the collections cannot grow without limit as services come and go.
 //!
 //! What a record holds is the `ResourceConfiguration` the create supplied, unchanged. That
 //! union carries EXACTLY ONE member ("Resource configuration for an input source. Provide
@@ -20,11 +29,12 @@
 //! Every `InputSourceSummary` this crate returns is projected from a record here through
 //! [`InputSourceRecord::to_summary`], so a listing cannot drift from what a create stored.
 
+use std::collections::BTreeMap;
 use std::time::SystemTime;
 
 use crate::ops::types::{InputSourceSummary, ResourceConfiguration};
 
-use super::{to_date_time, ServiceRecord};
+use super::{to_date_time, ComAmazonawsResiliencehubv2NgrhservicecoreState};
 
 /// `InputSourceType` for a source discovered from `resourceTags` ("The resource tags for
 /// tag-based resource discovery"). One of `INPUT_SOURCE_TYPE_VALUES`.
@@ -55,12 +65,24 @@ pub const INPUT_SOURCE_TYPE_DESIGN_FILE: &str = "DESIGN_FILE";
 /// token returns the stored source instead of inserting a second one.
 pub const MAX_INPUT_SOURCES_PER_SERVICE: usize = super::MAX_SERVICE_FUNCTIONS_PER_SERVICE;
 
+/// The ceiling on how many input-source collections whose service has been deleted the
+/// store retains, so a caller repeating create-service / create-input-source /
+/// delete-service cannot grow the process's memory without limit through the sources that
+/// survive each delete.
+///
+/// CHOSEN, not documented: the model publishes no quota over input sources that outlive
+/// their service, so this mirrors the ceiling the `Service` side of this store uses
+/// ([`super::MAX_SERVICES`]) — as many orphaned collections as there are services the
+/// store will hold at once. Past it the LONGEST-orphaned collection is dropped, never one
+/// whose service still exists, so the ARNs a caller is working with keep their sources.
+pub const MAX_ORPHANED_INPUT_SOURCE_SERVICES: usize = super::MAX_SERVICES;
+
 /// One created input source, and the sole source of every `InputSourceSummary` body this
 /// crate returns.
 #[derive(Debug, Clone)]
 pub struct InputSourceRecord {
     /// The minted `inputSourceId`; also this record's key in
-    /// [`super::ServiceRecord::input_sources`].
+    /// [`InputSourceCollection::sources`].
     pub input_source_id: String,
     /// The resource configuration this source discovers from, exactly as the create
     /// supplied it.
@@ -126,13 +148,99 @@ impl InputSourceRecord {
     }
 }
 
-impl ServiceRecord {
-    /// This service's input sources in creation order — what `ListInputSources`
-    /// enumerates before it filters and projects them.
-    pub fn input_sources_in_creation_order(&self) -> Vec<&InputSourceRecord> {
-        let mut sources: Vec<&InputSourceRecord> = self.input_sources.values().collect();
+/// The input sources created for ONE `serviceArn`, and the `clientToken` index over them.
+///
+/// Keyed in the store by that `serviceArn` rather than held inside the service record, so
+/// the collection survives `DeleteService` and the reads and deletes addressed to the ARN
+/// keep resolving.
+#[derive(Debug, Clone, Default)]
+pub struct InputSourceCollection {
+    /// The input sources created for this `serviceArn`, keyed by `inputSourceId`.
+    pub sources: BTreeMap<String, InputSourceRecord>,
+    /// `clientToken` -> `inputSourceId`, so a replayed `CreateInputSource`
+    /// `@idempotencyToken` returns the input source the first call created instead of
+    /// creating a second one. Scoped to the `serviceArn` the create named.
+    pub idempotency: BTreeMap<String, String>,
+    /// The store position at which this collection's service was deleted, and `None` while
+    /// that service still exists. It orders the orphans for
+    /// [`MAX_ORPHANED_INPUT_SOURCE_SERVICES`], so the longest-orphaned collection is the
+    /// one dropped at the ceiling.
+    pub orphaned_at: Option<u64>,
+}
+
+impl InputSourceCollection {
+    /// These input sources in creation order — what `ListInputSources` enumerates before
+    /// it filters and projects them.
+    pub fn in_creation_order(&self) -> Vec<&InputSourceRecord> {
+        let mut sources: Vec<&InputSourceRecord> = self.sources.values().collect();
         sources.sort_by_key(|source| source.sequence);
         sources
+    }
+}
+
+impl ComAmazonawsResiliencehubv2NgrhservicecoreState {
+    /// Whether `service_arn` is an ARN this store can answer an input-source read or delete
+    /// for: either the service is still stored, or input sources created for it survive it.
+    /// An ARN that has neither is what a `ResourceNotFoundException` names.
+    pub fn input_sources_addressable(&self, service_arn: &str) -> bool {
+        self.services.contains_key(service_arn) || self.input_sources.contains_key(service_arn)
+    }
+
+    /// The input sources held for `service_arn`, whether or not its service still exists.
+    pub fn input_sources_for(&self, service_arn: &str) -> Option<&InputSourceCollection> {
+        self.input_sources.get(service_arn)
+    }
+
+    /// The input sources held for `service_arn`, mutably.
+    pub fn input_sources_for_mut(
+        &mut self,
+        service_arn: &str,
+    ) -> Option<&mut InputSourceCollection> {
+        self.input_sources.get_mut(service_arn)
+    }
+
+    /// The collection a create stores into, opened empty the first time `service_arn` gets
+    /// an input source. Only a create reaches this, and a create resolves a live service
+    /// first, so no collection is ever opened for an ARN that names no service.
+    pub fn input_sources_entry(&mut self, service_arn: &str) -> &mut InputSourceCollection {
+        self.input_sources.entry(service_arn.to_string()).or_default()
+    }
+
+    /// Record that `service_arn`'s service has been deleted while its input sources remain.
+    ///
+    /// The sources are NOT touched: they outlive the service, so the collection only takes
+    /// its orphan position, and the store then drops the longest-orphaned collections past
+    /// [`MAX_ORPHANED_INPUT_SOURCE_SERVICES`]. An ARN that never had an input source keeps
+    /// no collection at all, so a later read of it is still refused.
+    pub fn orphan_input_sources(&mut self, service_arn: &str) {
+        if !self.input_sources.contains_key(service_arn) {
+            return;
+        }
+        let position = self.next_sequence();
+        if let Some(collection) = self.input_sources.get_mut(service_arn) {
+            collection.orphaned_at = Some(position);
+        }
+        self.prune_orphaned_input_sources();
+    }
+
+    /// Drop the longest-orphaned input-source collections while more of them are retained
+    /// than [`MAX_ORPHANED_INPUT_SOURCE_SERVICES`] allows.
+    fn prune_orphaned_input_sources(&mut self) {
+        let mut orphans: Vec<(u64, String)> = self
+            .input_sources
+            .iter()
+            .filter_map(|(arn, collection)| {
+                collection.orphaned_at.map(|position| (position, arn.clone()))
+            })
+            .collect();
+        if orphans.len() <= MAX_ORPHANED_INPUT_SOURCE_SERVICES {
+            return;
+        }
+        orphans.sort_by_key(|(position, _)| *position);
+        let excess = orphans.len() - MAX_ORPHANED_INPUT_SOURCE_SERVICES;
+        for (_, arn) in orphans.into_iter().take(excess) {
+            self.input_sources.remove(&arn);
+        }
     }
 }
 
