@@ -14,6 +14,10 @@ pub use verifications::*;
 mod brand_profile_attributes;
 pub use brand_profile_attributes::*;
 
+/// Which resource a `resourceArn` names, and the tags that resource carries.
+mod tags;
+pub use tags::*;
+
 /// The service's own ARN namespace / sigv4 signing name, as the Smithy model's
 /// `aws.api#service` trait declares it (`arnNamespace`/`endpointPrefix`
 /// `end-user-messaging`).
@@ -45,7 +49,8 @@ pub struct BrandProfile {
     pub deletion_protection_enabled: bool,
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
-    /// `tags` as supplied at create time; the tagging operations are scaffolded.
+    /// The tags this profile carries, in the order they were written: those supplied
+    /// at create time, as `ListTagsForResource` reports them.
     pub tags: Vec<(String, String)>,
     /// The profile's attributes, keyed by `attributeName`: the default template of
     /// [`default_brand_profile_attributes`] as created, plus whatever the attribute
@@ -81,7 +86,8 @@ pub struct NotifyCodeConfigurationRecord {
     pub deletion_protection_enabled: bool,
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
-    /// `tags` as supplied at create time; the tagging operations are scaffolded.
+    /// The tags this configuration carries, in the order they were written: those
+    /// supplied at create time, as `ListTagsForResource` reports them.
     pub tags: Vec<(String, String)>,
     /// The `clientToken` of the request that minted this record, when it carried
     /// one. Kept on the record rather than in a map beside it, so the token lives

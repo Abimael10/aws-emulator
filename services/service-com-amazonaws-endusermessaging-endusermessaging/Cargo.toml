@@ -31,9 +31,11 @@ rand = "0.9"
 # magic-number signature, which is what `mediaContentType` reports: the request
 # carries the bytes alone and declares no type for them.
 infer = "0.22"
-# `service-common` carries `data_plane_addressing`: the reserved path namespace every
-# emulated data plane is addressed under, so the attribute-media plane claims no path
-# another plane or control route could.
+# `service-common` carries the workspace's one ARN parse (`arn`), which reads a
+# caller-supplied `resourceArn`'s vendor, Region and resource type, and
+# `data_plane_addressing`: the reserved path namespace every emulated data plane is
+# addressed under, so the attribute-media plane claims no path another plane or
+# control route could.
 service-common = { path = "../common" }
 
 [build-dependencies]

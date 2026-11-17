@@ -247,7 +247,11 @@ fn accepted_names() -> Vec<String> {
 /// `brandProfileId` is a non-greedy `@httpLabel` in this route, so a client sends
 /// any `/` the identifier contains percent-encoded rather than as a segment
 /// separator; an identifier that is a full ARN carries one.
-fn path_label(value: &str) -> String {
+///
+/// `pub(crate)` because the suites of this crate's one test target share it: every
+/// non-greedy `@httpLabel` this service binds (`brandProfileId`, `resourceArn`) is
+/// sent this way, so the encoding is written once.
+pub(crate) fn path_label(value: &str) -> String {
     value.replace('/', "%2F")
 }
 

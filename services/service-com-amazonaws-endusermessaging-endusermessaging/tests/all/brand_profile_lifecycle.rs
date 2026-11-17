@@ -23,7 +23,16 @@
 //!   while deletion protection is on;
 //! * an id that names nothing is `ResourceNotFoundException` (404), and a value
 //!   outside a modelled constraint is `ValidationException` (400);
-//! * a repeated `clientToken` reports the first profile instead of creating another.
+//! * a repeated `clientToken` reports the first profile instead of creating another;
+//! * `ListTagsForResource` reports the tags stored on the resource its `resourceArn`
+//!   names — for every tag set a create may carry, and for every taggable resource
+//!   type of this service;
+//! * a `resourceArn` that is not the ARN of a resource of this service's own
+//!   namespace — not an ARN at all, or one of another vendor — and one scoped to
+//!   another Region, are `ValidationException` (400), and an ARN of this service and
+//!   Region that names no stored resource — a resource type this service does not
+//!   hold, an unknown identifier, a deleted resource — is `ResourceNotFoundException`
+//!   (404).
 
 use std::sync::Arc;
 
@@ -193,6 +202,66 @@ impl Emulator {
         )
         .await
     }
+
+    async fn create_notify_code_configuration(&self, body: Value) -> Reply {
+        self.call("POST", "/v1/notify-code-configurations", Some(body))
+            .await
+    }
+
+    /// `ListTagsForResource`. `resourceArn` is a NON-greedy `@httpLabel`, so the ARN
+    /// travels percent-encoded as one path segment, the way an SDK client sends it.
+    async fn list_tags(&self, resource_arn: &str) -> Reply {
+        self.call(
+            "GET",
+            &format!(
+                "/v1/tags/{}",
+                crate::brand_profile_default_attributes::path_label(resource_arn)
+            ),
+            None,
+        )
+        .await
+    }
+}
+
+/// The `tags` a reply reports, as a sorted list of pairs: the API states no order for
+/// the list, so every assertion below is on the SET of pairs it carries.
+fn reported_tags(reply: &Reply) -> Vec<(String, String)> {
+    let listed = reply
+        .member("tags")
+        .as_array()
+        .unwrap_or_else(|| panic!("tags is not a list in {:?}", reply.body))
+        .iter()
+        .map(|tag| {
+            (
+                tag["key"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("a tag has no key in {:?}", reply.body))
+                    .to_string(),
+                tag["value"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("a tag has no value in {:?}", reply.body))
+                    .to_string(),
+            )
+        });
+    let mut pairs: Vec<(String, String)> = listed.collect();
+    pairs.sort();
+    pairs
+}
+
+/// A tag set as the wire carries it on a create.
+fn tag_body(tags: &[(String, String)]) -> Value {
+    Value::Array(
+        tags.iter()
+            .map(|(key, value)| json!({ "key": key, "value": value }))
+            .collect(),
+    )
+}
+
+/// `tags` sorted into the order [`reported_tags`] returns, so the two compare.
+fn sorted(tags: &[(String, String)]) -> Vec<(String, String)> {
+    let mut pairs = tags.to_vec();
+    pairs.sort();
+    pairs
 }
 
 /// The names in this table are the classes `BrandProfileName`'s modelled
@@ -900,6 +969,347 @@ async fn the_store_is_bounded_and_refuses_a_create_past_its_ceiling() {
         "a create must succeed once a slot is free, got {} / {:?}",
         after.status, after.body
     );
+}
+
+/// Each row is a tag set a create may carry, spanning what the modelled `TagList` and
+/// `Tag` accept (`smithy_query(query="shape",shape="TagList,Tag")`: `TagList`
+/// `@length(0..50)`, `Tag$key` `@length(1..128)`, `Tag$value` `@length(0..256)`): no
+/// tags at all, one pair, several, a pair whose value is the empty string the value's
+/// lower bound allows, a key and a value at exactly their maximum lengths, and a list
+/// at its own maximum length.
+fn tag_sets() -> Vec<(&'static str, Vec<(String, String)>)> {
+    vec![
+        ("no tags", Vec::new()),
+        ("one pair", vec![("env".to_string(), "prod".to_string())]),
+        (
+            "several pairs",
+            vec![
+                ("env".to_string(), "prod".to_string()),
+                ("team".to_string(), "messaging".to_string()),
+                ("cost-center".to_string(), "42".to_string()),
+            ],
+        ),
+        (
+            "an empty value",
+            vec![("env".to_string(), String::new())],
+        ),
+        (
+            "a key and a value at their maximum length",
+            vec![("k".repeat(128), "v".repeat(256))],
+        ),
+        (
+            "a list at its maximum length",
+            (0..50)
+                .map(|index| (format!("key-{index}"), format!("value-{index}")))
+                .collect(),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn a_brand_profiles_tags_are_reported_for_its_own_arn() {
+    for (case, tags) in tag_sets() {
+        let em = Emulator::new();
+        // A second, differently tagged profile stands beside each row, so a reply
+        // that reported the store's tags rather than this resource's would fail.
+        let other = em
+            .create(json!({
+                "brandProfileName": "other-profile",
+                "tags": [{ "key": "owner", "value": "other" }],
+            }))
+            .await;
+        let created = em
+            .create(json!({
+                "brandProfileName": "tagged-profile",
+                "tags": tag_body(&tags),
+            }))
+            .await;
+        assert_eq!(
+            created.status, 200,
+            "case {case}: the create must succeed, got {} / {:?}",
+            created.status, created.body
+        );
+        let arn = created.string("brandProfileArn");
+
+        let listed = em.list_tags(&arn).await;
+        assert_eq!(
+            listed.status, 200,
+            "case {case}: ListTagsForResource must report the created profile's tags, \
+             got {} / {:?}",
+            listed.status, listed.body
+        );
+        assert_eq!(
+            reported_tags(&listed),
+            sorted(&tags),
+            "case {case}: unexpected tags for {arn}, got {:?}",
+            listed.body
+        );
+
+        let neighbour = em.list_tags(&other.string("brandProfileArn")).await;
+        assert_eq!(
+            reported_tags(&neighbour),
+            vec![("owner".to_string(), "other".to_string())],
+            "case {case}: a resource reports only its own tags, got {:?}",
+            neighbour.body
+        );
+
+        // A read changes nothing a later caller sees: the same ARN reports the same
+        // tags, and the resource itself is untouched.
+        let again = em.list_tags(&arn).await;
+        assert_eq!(
+            reported_tags(&again),
+            sorted(&tags),
+            "case {case}: a second read must report the same tags, got {:?}",
+            again.body
+        );
+        let fetched = em.get(&arn).await;
+        assert_eq!(
+            fetched.number("updatedAt"),
+            created.number("updatedAt"),
+            "case {case}: reading tags must not move the resource's updatedAt, got {:?}",
+            fetched.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_notify_code_configurations_tags_are_reported_for_its_own_arn() {
+    // The rule is about the resource an ARN names, not about one resource type, so
+    // every taggable resource of this service answers it; the notify code
+    // configuration is the other one that carries `tags` at create time.
+    for (case, tags) in tag_sets() {
+        let em = Emulator::new();
+        let created = em
+            .create_notify_code_configuration(json!({
+                "notifyCodeConfigurationName": "tagged-configuration",
+                "tags": tag_body(&tags),
+            }))
+            .await;
+        assert_eq!(
+            created.status, 200,
+            "case {case}: the create must succeed, got {} / {:?}",
+            created.status, created.body
+        );
+        let arn = created.member("notifyCodeConfiguration")["notifyCodeConfigurationArn"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case}: the create reported no ARN, got {:?}",
+                    created.body
+                )
+            })
+            .to_string();
+
+        let listed = em.list_tags(&arn).await;
+        assert_eq!(
+            listed.status, 200,
+            "case {case}: ListTagsForResource must report the configuration's tags, got \
+             {} / {:?}",
+            listed.status, listed.body
+        );
+        assert_eq!(
+            reported_tags(&listed),
+            sorted(&tags),
+            "case {case}: unexpected tags for {arn}, got {:?}",
+            listed.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_arn_this_request_cannot_reach_is_refused_as_invalid() {
+    // Every row is a real AWS region name; the rule is that a resourceArn names a
+    // resource in the Region the request was made in, whichever Region that is.
+    let regions = ["us-east-1", "eu-west-1", "ap-southeast-2", "us-gov-west-1"];
+    for request_region in regions {
+        let em = Emulator::in_region(request_region);
+        let created = em
+            .create(json!({
+                "brandProfileName": "regional-profile",
+                "tags": [{ "key": "env", "value": "prod" }],
+            }))
+            .await;
+        let arn = created.string("brandProfileArn");
+
+        // Its own Region reaches it.
+        let listed = em.list_tags(&arn).await;
+        assert_eq!(
+            listed.status, 200,
+            "case {request_region}: the resource's own ARN must be reachable, got {} / {:?}",
+            listed.status, listed.body
+        );
+
+        for other_region in regions.iter().filter(|region| **region != request_region) {
+            let foreign = arn.replace(request_region, other_region);
+            let case = format!("request={request_region} arn={foreign}");
+            let refused = em.list_tags(&foreign).await;
+            assert_eq!(
+                refused.status, 400,
+                "case {case}: an ARN from another Region is a ValidationException (400), \
+                 got {} / {:?}",
+                refused.status, refused.body
+            );
+            assert_eq!(
+                refused.error.as_deref(),
+                Some("ValidationException"),
+                "case {case}: unexpected error code, got {:?}",
+                refused.error
+            );
+            assert_eq!(
+                refused.member("fieldList")[0]["path"],
+                json!("/resourceArn"),
+                "case {case}: the refusal must name the member it refused, got {:?}",
+                refused.body
+            );
+        }
+    }
+
+    // Each row is a value the modelled `^arn:[A-Za-z0-9_:/-]+$` pattern and
+    // `@length(20..256)` accept, and that still cannot name a resource of this
+    // service's namespace: too few of an ARN's six fields, an empty partition, an
+    // empty resource, and a well-formed in-Region ARN of ANOTHER vendor — which
+    // names nothing here however complete it is.
+    let em = Emulator::new();
+    for not_a_resource_arn in [
+        "arn:aws-this-is-not-an-arn".to_string(),
+        format!("arn:aws:{SIGNING_NAME}"),
+        format!("arn:aws:{SIGNING_NAME}:us-east-1:{ACCOUNT_ID}"),
+        format!("arn::{SIGNING_NAME}:us-east-1:{ACCOUNT_ID}:brand-profile/bp-1"),
+        format!("arn:aws:{SIGNING_NAME}:us-east-1:{ACCOUNT_ID}:"),
+        format!("arn:aws:s3:us-east-1:{ACCOUNT_ID}:bucket/some-bucket"),
+        format!("arn:aws:sqs:us-east-1:{ACCOUNT_ID}:some-queue"),
+    ] {
+        let refused = em.list_tags(&not_a_resource_arn).await;
+        assert_eq!(
+            refused.status, 400,
+            "case {not_a_resource_arn}: a value that names no resource of this service is a \
+             ValidationException (400), got {} / {:?}",
+            refused.status, refused.body
+        );
+        assert_eq!(
+            refused.error.as_deref(),
+            Some("ValidationException"),
+            "case {not_a_resource_arn}: unexpected error code, got {:?}",
+            refused.error
+        );
+        assert_eq!(
+            refused.member("fieldList")[0]["path"],
+            json!("/resourceArn"),
+            "case {not_a_resource_arn}: the refusal must name the member it refused, got {:?}",
+            refused.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_arn_naming_no_stored_resource_is_not_found() {
+    let em = Emulator::new();
+    let created = em
+        .create(json!({
+            "brandProfileName": "to-be-deleted",
+            "tags": [{ "key": "env", "value": "prod" }],
+        }))
+        .await;
+    let arn = created.string("brandProfileArn");
+    let id = created.string("brandProfileId");
+
+    // The tags of a live resource are reachable; the rows below are the ARNs that
+    // reach nothing. Each is (case, ARN, the resourceType the refusal reports — the
+    // ARN's own resource-type segment, the resourceId it reports — the identifier
+    // that segment names).
+    assert_eq!(
+        em.list_tags(&arn).await.status,
+        200,
+        "the live profile's tags must be reachable before it is deleted"
+    );
+    assert_eq!(
+        em.delete(&id).await.status,
+        200,
+        "deleting the profile must succeed"
+    );
+
+    let unknown_profile =
+        format!("arn:aws:{SIGNING_NAME}:us-east-1:{ACCOUNT_ID}:brand-profile/bp-00000000000000000");
+    let unknown_configuration = format!(
+        "arn:aws:{SIGNING_NAME}:us-east-1:{ACCOUNT_ID}:notify-code-configuration/ncc-0000000000"
+    );
+    // A resource type this service's ARNs name but this store does not hold, and the
+    // id of a resource of ANOTHER type: the ARN as a whole is what names a resource.
+    let wrong_type = format!("arn:aws:{SIGNING_NAME}:us-east-1:{ACCOUNT_ID}:phone-number/pn-1234");
+    let type_of_another_resource =
+        format!("arn:aws:{SIGNING_NAME}:us-east-1:{ACCOUNT_ID}:notify-code-configuration/{id}");
+    let another_account = format!("arn:aws:{SIGNING_NAME}:us-east-1:000000000000:brand-profile/{id}");
+
+    let cases: Vec<(&str, &str, &str, &str)> = vec![
+        ("a deleted profile", arn.as_str(), "brand-profile", id.as_str()),
+        (
+            "an unknown profile id",
+            &unknown_profile,
+            "brand-profile",
+            "bp-00000000000000000",
+        ),
+        (
+            "an unknown configuration id",
+            &unknown_configuration,
+            "notify-code-configuration",
+            "ncc-0000000000",
+        ),
+        (
+            "a resource type nothing is stored for",
+            &wrong_type,
+            "phone-number",
+            "pn-1234",
+        ),
+        (
+            "an id under another resource type",
+            &type_of_another_resource,
+            "notify-code-configuration",
+            id.as_str(),
+        ),
+        (
+            "another account",
+            &another_account,
+            "brand-profile",
+            id.as_str(),
+        ),
+    ];
+
+    for (case, resource_arn, resource_type, resource_id) in cases {
+        let refused = em.list_tags(resource_arn).await;
+        assert_eq!(
+            refused.status, 404,
+            "case {case} ({resource_arn}): an ARN naming no stored resource is \
+             ResourceNotFoundException (404), got {} / {:?}",
+            refused.status, refused.body
+        );
+        assert_eq!(
+            refused.error.as_deref(),
+            Some("ResourceNotFoundException"),
+            "case {case}: unexpected error code, got {:?}",
+            refused.error
+        );
+        assert_eq!(
+            refused.member("resourceId"),
+            &json!(resource_id),
+            "case {case}: the refusal must report the identifier the ARN names, got {:?}",
+            refused.body
+        );
+        assert_eq!(
+            refused.member("resourceType"),
+            &json!(resource_type),
+            "case {case}: the refusal must report the ARN's resource type, got {:?}",
+            refused.body
+        );
+        assert_eq!(
+            refused.string("message"),
+            format!(
+                "Resource not found - ResourceType=\"{resource_type}\" \
+                 ResourceId=\"{resource_id}\""
+            ),
+            "case {case}: unexpected refusal message, got {:?}",
+            refused.body
+        );
+    }
 }
 
 #[tokio::test]
