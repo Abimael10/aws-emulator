@@ -538,7 +538,7 @@ async fn describe_images_refuses_the_same_identifiers_and_names_them() {
             format!("imageId {{imageDigest:'{absent_digest}', imageTag:'{UNSET_MEMBER}'}}"),
         ),
         (
-            // The tag DID resolve, to another stored image, so nothing cleared it.
+            // Both members resolve, to DIFFERENT stored images.
             "a stored digest with a tag on another image",
             json!({"imageDigest": docker_digest.clone(), "imageTag": "oci"}),
             format!("imageId {{imageDigest:'{docker_digest}', imageTag:'oci'}}"),

@@ -42,7 +42,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::image_storage_class_identification::given_tagged_image;
 use crate::wire::{
-    call, call_in_region, emulator, given_layer, layer_digest, ok, refused, REGION, REGISTRY_ID,
+    at, call, call_in_region, emulator, given_layer, layer_digest, ok, refused, REGION, REGISTRY_ID,
 };
 
 /// The error code ECR states a refused parameter with.
@@ -436,6 +436,164 @@ async fn an_image_refusal_states_the_identifier_the_request_sent() {
             )
             .await;
         }
+    }
+}
+
+/// The same rule holds for an identifier that STOPPED resolving: a repository that did
+/// hold the image refuses the identifier the request sends, so the echo is the request's
+/// entry and not something the repository's history left behind.
+///
+/// Driven end to end through the operations that change what resolves: `PutImage` pushes a
+/// manifest under two tags, `BatchDeleteImage` frees one tag and then the manifest itself,
+/// and each lookup in between is crossed with every operation that resolves an identifier
+/// ([`image_lookups`]), because the rule belongs to the resolution rather than to one
+/// operation. The rows differ along how the identifier stopped resolving (a freed tag, a
+/// deleted digest, a tag whose digest went away) and along which members the request
+/// carries.
+#[tokio::test]
+async fn an_identifier_that_stopped_resolving_is_still_echoed_as_sent() {
+    // A manifest this suite pushes; its digest is whatever the registry computed over
+    // these bytes, read back from the push rather than written out here.
+    const MANIFEST: &str = r#"{"schemaVersion":2,"mediaType":"application/vnd.docker.distribution.manifest.v2+json","config":{},"layers":[]}"#;
+
+    let router = emulator();
+    let repository = "resolution-history";
+    given_repository(&router, "the repository that held the image", repository).await;
+
+    let pushed = ok(
+        &router,
+        "the first tag",
+        "PutImage",
+        &json!({
+            "repositoryName": repository,
+            "imageManifest": MANIFEST,
+            "imageTag": "v1",
+        }),
+    )
+    .await;
+    let digest = pushed["image"]["imageId"]["imageDigest"]
+        .as_str()
+        .unwrap_or_else(|| panic!("PutImage must report the digest it stored, got {pushed:?}"))
+        .to_string();
+    ok(
+        &router,
+        "a second tag on the same manifest",
+        "PutImage",
+        &json!({
+            "repositoryName": repository,
+            "imageManifest": MANIFEST,
+            "imageTag": "v2",
+        }),
+    )
+    .await;
+
+    // Both tags resolve while the manifest is stored.
+    for tag in ["v1", "v2"] {
+        let described = ok(
+            &router,
+            tag,
+            "DescribeImages",
+            &json!({"repositoryName": repository, "imageIds": [{"imageTag": tag}]}),
+        )
+        .await;
+        assert_eq!(
+            at(&described, "/imageDetails/0/imageDigest"),
+            json!(digest),
+            "case {tag:?}: the pushed tag must resolve to the stored manifest, got {described:?}"
+        );
+    }
+
+    // Freeing ONE tag leaves the manifest, and the other tag, in place.
+    ok(
+        &router,
+        "freeing the first tag",
+        "BatchDeleteImage",
+        &json!({"repositoryName": repository, "imageIds": [{"imageTag": "v1"}]}),
+    )
+    .await;
+
+    // (case, the identifier the request sends, the digest echoed, the tag echoed)
+    let freed: Vec<(&str, Value, &str, &str)> = vec![
+        (
+            "the tag the delete freed",
+            json!({"imageTag": "v1"}),
+            UNSET_MEMBER,
+            "v1",
+        ),
+        (
+            "the freed tag beside the digest that still exists",
+            json!({"imageDigest": digest.clone(), "imageTag": "v1"}),
+            digest.as_str(),
+            "v1",
+        ),
+    ];
+    for (case, id, echoed_digest, echoed_tag) in freed {
+        assert_every_lookup_echoes(&router, case, repository, &id, echoed_digest, echoed_tag)
+            .await;
+    }
+
+    // Deleting the manifest itself takes its remaining tag with it, and every way of
+    // addressing it is echoed as the request wrote it.
+    ok(
+        &router,
+        "deleting the manifest",
+        "BatchDeleteImage",
+        &json!({"repositoryName": repository, "imageIds": [{"imageDigest": digest.clone()}]}),
+    )
+    .await;
+
+    let gone: Vec<(&str, Value, &str, &str)> = vec![
+        (
+            "the deleted digest",
+            json!({"imageDigest": digest.clone()}),
+            digest.as_str(),
+            UNSET_MEMBER,
+        ),
+        (
+            "the tag the deleted manifest carried",
+            json!({"imageTag": "v2"}),
+            UNSET_MEMBER,
+            "v2",
+        ),
+        (
+            "the deleted digest and its tag together",
+            json!({"imageDigest": digest.clone(), "imageTag": "v2"}),
+            digest.as_str(),
+            "v2",
+        ),
+    ];
+    for (case, id, echoed_digest, echoed_tag) in gone {
+        assert_every_lookup_echoes(&router, case, repository, &id, echoed_digest, echoed_tag)
+            .await;
+    }
+}
+
+/// Assert that every operation resolving an identifier refuses `id` by echoing exactly
+/// `echoed_digest` and `echoed_tag`, in the sentence a resource missing inside a repository
+/// is reported in.
+async fn assert_every_lookup_echoes(
+    router: &MultiServiceRouter,
+    case: &str,
+    repository: &str,
+    id: &Value,
+    echoed_digest: &str,
+    echoed_tag: &str,
+) {
+    let expected = not_within_sentence(
+        &format!("image with imageId {{imageDigest:'{echoed_digest}', imageTag:'{echoed_tag}'}}"),
+        repository,
+    );
+    for (operation, request) in image_lookups(repository, id) {
+        let case = format!("{case} on {operation}");
+        assert_refusal(
+            router,
+            &case,
+            operation,
+            &request,
+            "ImageNotFoundException",
+            &expected,
+        )
+        .await;
     }
 }
 
