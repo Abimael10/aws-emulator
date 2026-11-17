@@ -80,7 +80,12 @@
 //!   users against, the statuses the clock owes it and the address this
 //!   emulator publishes for its page, so `CreateConsentPortal`,
 //!   `GetConsentPortal`, `ListConsentPortals`, `UpdateConsentPortal` and
-//!   `DeleteConsentPortal` answer from one store.
+//!   `DeleteConsentPortal` answer from one store;
+//! * the online evaluation configuration (`/online-evaluation-configs/`): one
+//!   [`OnlineEvaluationConfigRecord`] per `onlineEvaluationConfigId`, holding
+//!   the whole configuration `CreateOnlineEvaluationConfig` persisted, whether
+//!   its evaluation is running and the status the clock owes it, so
+//!   `GetOnlineEvaluationConfig` reports exactly that.
 //!
 //! Helpers the handlers share (the region a request was signed for, the
 //! canonical ARNs, id minting, the clock-owed status transition, the response
@@ -2029,6 +2034,12 @@ mod listings;
 /// Re-exported, so a handler names `crate::state::…` for it exactly as it does
 /// for the resources beside it.
 pub mod consent_portals;
+/// The online evaluation configuration this account holds: the record
+/// `CreateOnlineEvaluationConfig` persists, the ARN it is reported by, whether its
+/// evaluation is running and the status the clock owes it. Re-exported, so a
+/// handler names `crate::state::…` for it exactly as it does for the resources
+/// beside it.
+pub mod online_evaluation_configs;
 pub use api_key_credential_providers::*;
 pub use capacity_providers::*;
 pub use consent_portals::*;
@@ -2038,6 +2049,7 @@ pub use gateway_rules::*;
 pub use gateway_target_synchronization::*;
 pub use listings::*;
 pub use oauth2_credential_providers::*;
+pub use online_evaluation_configs::*;
 pub use memory_strategies::*;
 pub use payment_credential_providers::*;
 pub use payment_managers::*;
@@ -3369,6 +3381,8 @@ impl ConfigurationBundleRecord {
 /// name index),
 /// [`MAX_CONSENT_PORTALS`] the consent portals (and with them their 1:1 name
 /// index),
+/// [`MAX_ONLINE_EVALUATION_CONFIGS`] the online evaluation configurations (and
+/// with them their 1:1 name index),
 /// [`MAX_RATE_LIMITS_PER_GATEWAY`](gateway_rate_limits::MAX_RATE_LIMITS_PER_GATEWAY)
 /// the rate limits one gateway holds,
 /// [`MAX_POLICY_ENGINES`](policies::MAX_POLICY_ENGINES) the policy engines and
@@ -3698,6 +3712,24 @@ pub struct ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState
     /// Manager secret (see [`oauth2_credential_providers`]), and the record holds
     /// the ARN of that secret rather than the credential.
     pub oauth2_credential_providers: BTreeMap<String, Oauth2CredentialProviderRecord>,
+    /// Every online evaluation configuration of this account, keyed by
+    /// `onlineEvaluationConfigId` — the identifier every online-evaluation-config
+    /// route addresses it by. The key order is the deterministic list order a
+    /// configuration listing pages over.
+    pub online_evaluation_configs: BTreeMap<String, OnlineEvaluationConfigRecord>,
+    /// `onlineEvaluationConfigName` -> `onlineEvaluationConfigId`, so a duplicate
+    /// name at create time is a `ConflictException` ("Must be unique within your
+    /// account"). One entry per stored configuration.
+    pub online_evaluation_config_names: BTreeMap<String, String>,
+    /// `<operation>/<clientToken>` -> the online evaluation configuration that
+    /// token first produced, so a replayed `CreateOnlineEvaluationConfig` answers
+    /// with its first result instead of minting a second configuration. Separate
+    /// from the maps above because the record is validated against a different
+    /// store; the key carries the operation for the same reason as there.
+    online_evaluation_config_idempotency: BTreeMap<String, String>,
+    /// The keys of [`Self::online_evaluation_config_idempotency`] in the order they
+    /// were first recorded, so the oldest record is the one evicted at the ceiling.
+    online_evaluation_config_idempotency_order: VecDeque<String>,
     /// Bumped on every mint, so two runtimes created in the same instant with
     /// the same name still get distinct ids.
     mint_counter: u64,

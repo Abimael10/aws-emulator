@@ -61,6 +61,9 @@ html-escape = "0.2"
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Declares one `mod` per `tests/all/<name>.rs`, so a suite file is the only thing a
+# new test adds.
+automod = { workspace = true }
 # Mounted beside this service in the code-artifact suite, so the object a create
 # resolves is one the emulator's object storage really holds.
 service-com-amazonaws-s3-amazons3 = { workspace = true }
