@@ -11,17 +11,19 @@
 //!
 //! The rules under test, each asserted over a TABLE rather than one recorded call:
 //!
-//! * a data-access toggle records the transition it starts and the clock settles it: a
-//!   disable moves the directory out of `Enabled` into the transient `Disabling`, and
-//!   `Disabled` falls due one transition span later — over a table of directories
+//! * a data-access toggle is applied by the call that makes it: a disable moves the
+//!   directory out of `Enabled` into `Disabled`, which is what the FIRST read after it
+//!   reports, and the status stays there as the clock passes a transition span because
+//!   nothing later moves it — over a table of directories
 //!   differing in type (Simple AD / Managed Microsoft AD), size, edition and network
 //!   type, with an enabled directory in the same store left alone as the control, so a
 //!   status that is not per-directory cannot pass;
 //! * the toggle round-trips: a directory whose access has been withdrawn can be enabled
-//!   again, and enabling and disabling in turn keeps reporting the status the store
-//!   holds;
+//!   again straight away, and enabling and disabling in turn keeps reporting the status
+//!   the store holds;
 //! * a disable is refused when the directory is already in the state it asks for
-//!   (`DirectoryInDesiredStateException`) — while `Disabling`, once `Disabled`, and on a
+//!   (`DirectoryInDesiredStateException`) — from the instant an earlier disable answered,
+//!   a transition span later, and on a
 //!   directory nothing ever enabled — while an enabled directory in the same store still
 //!   accepts one;
 //! * a disable needs a directory that is in service: one still being built by the
@@ -38,7 +40,8 @@ use service_com_amazonaws_directoryservice_directoryservice_20150416::ops::types
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::directory_lifecycle::{
-    call, create_directory, minimal_create, ok, refused, service, string, PASSWORD, PAST_ONE_SPAN,
+    await_in_service, call, create_directory, minimal_create, ok, refused, service, string,
+    PASSWORD,
 };
 use crate::microsoft_ad::{create_microsoft_ad, minimal_microsoft_ad};
 
@@ -47,10 +50,7 @@ use crate::microsoft_ad::{create_microsoft_ad, minimal_microsoft_ad};
 /// catalog the crate generates from the model as [`DATA_ACCESS_STATUS_VALUES`].
 const DISABLED: &str = "Disabled";
 
-/// The status a directory carries between the disable and the transition it owes.
-const DISABLING: &str = "Disabling";
-
-/// The status a directory carries once an enable's transition has fallen due.
+/// The status a directory carries from the instant an enable answers.
 const ENABLED: &str = "Enabled";
 
 /// Well-formed `DirectoryId`s no directory is ever created under, as `(id, class)`.
@@ -166,9 +166,9 @@ fn rows() -> Vec<DisableCase> {
     ]
 }
 
-/// Create every row, let the stage transition its create owes fall due, enable data
-/// access on all of them and let that transition fall due too, so every directory in the
-/// store starts the case below `Enabled`.
+/// Create every row, let the stage transition its create owes fall due and enable data
+/// access on all of them, so every directory in the store starts the case below
+/// `Enabled`.
 async fn store_with_enabled_directories(
     router: &MultiServiceRouter,
     rows: &[DisableCase],
@@ -177,17 +177,16 @@ async fn store_with_enabled_directories(
     for (index, row) in rows.iter().enumerate() {
         ids.push((index, create(router, row).await));
     }
-    tokio::time::sleep(PAST_ONE_SPAN).await;
     for (index, id) in &ids {
+        await_in_service(router, id, rows[*index].case).await;
         toggle(router, "EnableDirectoryDataAccess", id, rows[*index].case).await;
     }
-    tokio::time::sleep(PAST_ONE_SPAN).await;
     for (index, id) in &ids {
         let case = rows[*index].case;
         let status = data_access_status(router, id, case).await;
         assert_eq!(
             status, ENABLED,
-            "case {case:?}: the enable settles on {ENABLED} before the disable is \
+            "case {case:?}: the enable is in effect before the disable is \
              exercised, got {status:?}"
         );
     }
@@ -195,7 +194,7 @@ async fn store_with_enabled_directories(
 }
 
 #[tokio::test]
-async fn a_disable_records_the_transition_the_clock_then_settles() {
+async fn a_disable_is_applied_by_the_call_and_the_clock_leaves_it_there() {
     let router = service();
     let rows = rows();
     let ids = store_with_enabled_directories(&router, &rows).await;
@@ -206,12 +205,12 @@ async fn a_disable_records_the_transition_the_clock_then_settles() {
         }
     }
 
-    // The instant after the disable the transition it owes is still outstanding, so the
-    // transient status is observable — and the control directory is untouched.
+    // The instant after the disable the directory already reports the withdrawal — and the
+    // control directory is untouched.
     for (index, id) in &ids {
         let case = rows[*index].case;
         let expected = if rows[*index].disabled {
-            DISABLING
+            DISABLED
         } else {
             ENABLED
         };
@@ -223,11 +222,8 @@ async fn a_disable_records_the_transition_the_clock_then_settles() {
         );
     }
 
-    // The clock settles the transition the disable owed; nothing else did.
-    tokio::time::sleep(PAST_ONE_SPAN).await;
-
     // Two reads in a row, because a report is not a mutation: the second must answer
-    // exactly what the first did.
+    // exactly what the first did, with every other row's reads in between.
     for pass in ["the first read", "the repeated read"] {
         for (index, id) in &ids {
             let case = rows[*index].case;
@@ -239,21 +235,20 @@ async fn a_disable_records_the_transition_the_clock_then_settles() {
             let status = data_access_status(&router, id, case).await;
             assert_eq!(
                 status, expected,
-                "case {case:?}: one transition span after the disable, on {pass}, the \
-                 directory reports {expected}, got {status:?}"
+                "case {case:?}: on {pass} after the disable, the directory still reports \
+                 {expected}, got {status:?}"
             );
         }
     }
 
-    // And the toggle round-trips: a withdrawn directory is enabled again, which is only
-    // possible because the disable left it in the settled `Disabled` state.
+    // And the toggle round-trips: a withdrawn directory is enabled again straight away,
+    // which is only possible because the disable left it in the settled `Disabled` state.
     for (index, id) in &ids {
         if !rows[*index].disabled {
             continue;
         }
         let case = rows[*index].case;
         toggle(&router, "EnableDirectoryDataAccess", id, case).await;
-        tokio::time::sleep(PAST_ONE_SPAN).await;
         let status = data_access_status(&router, id, case).await;
         assert_eq!(
             status, ENABLED,
@@ -274,9 +269,8 @@ async fn a_disable_is_refused_when_the_directory_is_already_in_that_state() {
         }
     }
 
-    // A second disable while the first transition is still outstanding asks for the state
-    // the directory is already moving to, while the control directory — still `Enabled` —
-    // accepts one.
+    // A second disable asks for the state the first one already put the directory in,
+    // while the control directory — still `Enabled` — accepts one.
     for (index, id) in &ids {
         let case = rows[*index].case;
         if rows[*index].disabled {
@@ -292,21 +286,20 @@ async fn a_disable_is_refused_when_the_directory_is_already_in_that_state() {
             toggle(&router, "DisableDirectoryDataAccess", id, case).await;
             let status = data_access_status(&router, id, case).await;
             assert_eq!(
-                status, DISABLING,
+                status, DISABLED,
                 "case {case:?}: the control directory withdraws like any other, got \
                  {status:?}"
             );
         }
     }
 
-    // Once the transition has fallen due the directory IS in the state the disable asks
-    // for, so the refusal holds for the settled status too.
-    tokio::time::sleep(PAST_ONE_SPAN).await;
+    // And every row is still in the state the disable put it in, so the refusal holds on a
+    // further attempt too — including for the control directory this round withdrew.
     for (index, id) in &ids {
         let status = data_access_status(&router, id, rows[*index].case).await;
         assert_eq!(
             status, DISABLED,
-            "case {:?}: the withdrawal settles on {DISABLED}, got {status:?}",
+            "case {:?}: the withdrawal stands at {DISABLED}, got {status:?}",
             rows[*index].case
         );
         refused(
@@ -336,7 +329,7 @@ async fn a_disable_is_refused_when_the_directory_is_already_in_that_state() {
         },
     ] {
         let id = create(&router, &row).await;
-        tokio::time::sleep(PAST_ONE_SPAN).await;
+        await_in_service(&router, &id, row.case).await;
         let status = data_access_status(&router, &id, row.case).await;
         assert_eq!(
             status, DISABLED,
@@ -391,16 +384,16 @@ async fn a_disable_needs_a_directory_that_is_in_service() {
         ids.push((row, id));
     }
 
-    // The refusal was about the stage, so the very same directory takes the call once the
-    // transition the create owed has fallen due and its access has been enabled.
-    tokio::time::sleep(PAST_ONE_SPAN).await;
+    // The refusal was about the stage, so the very same directory takes the call once its
+    // build has finished — which the case looks for — and its access has been enabled, which
+    // needs no wait of its own.
     for (row, id) in &ids {
+        await_in_service(&router, id, row.case).await;
         toggle(&router, "EnableDirectoryDataAccess", id, row.case).await;
-        tokio::time::sleep(PAST_ONE_SPAN).await;
         toggle(&router, "DisableDirectoryDataAccess", id, row.case).await;
         let status = data_access_status(&router, id, row.case).await;
         assert_eq!(
-            status, DISABLING,
+            status, DISABLED,
             "case {:?}: the disable is admitted once the directory is in service, got \
              {status:?}",
             row.case
@@ -420,7 +413,7 @@ async fn a_disable_resolves_the_directory_in_the_store() {
         "the stored directory",
     )
     .await;
-    tokio::time::sleep(PAST_ONE_SPAN).await;
+    await_in_service(&router, &stored, "the stored directory").await;
     toggle(
         &router,
         "EnableDirectoryDataAccess",
@@ -428,7 +421,6 @@ async fn a_disable_resolves_the_directory_in_the_store() {
         "the stored directory",
     )
     .await;
-    tokio::time::sleep(PAST_ONE_SPAN).await;
 
     for (absent, class) in ABSENT_DIRECTORY_IDS {
         refused(
@@ -484,7 +476,7 @@ async fn a_disable_resolves_the_directory_in_the_store() {
     .await;
     let status = data_access_status(&router, &stored, "the stored directory").await;
     assert_eq!(
-        status, DISABLING,
+        status, DISABLED,
         "case {:?}: the stored directory withdraws and reports back, got {status:?}",
         "the stored directory"
     );

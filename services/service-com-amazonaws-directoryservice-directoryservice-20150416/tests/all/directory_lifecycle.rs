@@ -260,6 +260,32 @@ pub(crate) async fn describe_one(
     found[0].clone()
 }
 
+/// How many times a case looks again for a directory's build to finish, and how long it
+/// leaves between looks: a generous bound on a stage that never settles rather than a wait
+/// for a known duration, so no case's outcome depends on how fast the host runs.
+pub(crate) const BUILD_LOOK_ATTEMPTS: usize = 240;
+pub(crate) const BUILD_LOOK_AGAIN: Duration = Duration::from_millis(250);
+
+/// Look again until `DescribeDirectories` reports `directory_id` in [`STAGE_ACTIVE`].
+///
+/// The stage chain a create owes IS a clock-owed transition — a create answers while the
+/// directory's servers are still coming up — so a case that needs a directory in service
+/// polls for THAT CONDITION instead of waiting a fixed time for it.
+pub(crate) async fn await_in_service(router: &MultiServiceRouter, directory_id: &str, case: &str) {
+    for _ in 0..BUILD_LOOK_ATTEMPTS {
+        if describe_one(router, directory_id, case).await["Stage"] == json!(STAGE_ACTIVE) {
+            return;
+        }
+        tokio::time::sleep(BUILD_LOOK_AGAIN).await;
+    }
+    let described = describe_one(router, directory_id, case).await;
+    panic!(
+        "case {case:?}: expected {directory_id} to reach Stage {STAGE_ACTIVE}, it stayed at \
+         {:?}",
+        described["Stage"]
+    );
+}
+
 /// The `Tags` of a `ListTagsForResource` answer, as a key -> value map.
 pub(crate) fn tag_map(body: &Value, case: &str) -> BTreeMap<String, String> {
     body["Tags"]

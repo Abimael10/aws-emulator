@@ -3,8 +3,7 @@
 //! @op DescribeDirectoryDataAccess
 //!
 //! Reports the `DataAccessStatus` stored for a directory — the one
-//! `EnableDirectoryDataAccess` records, settled by the clock through
-//! [`crate::state::ComAmazonawsDirectoryserviceDirectoryservice20150416State::advance_clock`]
+//! `EnableDirectoryDataAccess` or `DisableDirectoryDataAccess` last applied to it
 //! — and nothing else: a directory nothing has enabled reports
 //! [`crate::state::DATA_ACCESS_DISABLED`] rather than an absent member, because that is
 //! the status the store holds for it.

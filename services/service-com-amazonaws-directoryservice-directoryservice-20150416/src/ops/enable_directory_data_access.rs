@@ -2,17 +2,18 @@
 
 //! @op EnableDirectoryDataAccess
 //!
-//! Opens a stored directory to the Directory Service Data API, by recording the
-//! `DataAccessStatus` transition the enable starts: the directory leaves
-//! [`crate::state::DATA_ACCESS_DISABLED`] for the transient
-//! [`crate::state::DATA_ACCESS_ENABLING`], and the clock — not a later call — settles it
-//! on [`crate::state::DATA_ACCESS_ENABLED`] once [`crate::state::TRANSITION_SPAN`] has
-//! elapsed. `DescribeDirectoryDataAccess` is what reports that status.
+//! Opens a stored directory to the Directory Service Data API, by switching the directory's
+//! `DataAccessStatus` from [`crate::state::DATA_ACCESS_DISABLED`] to
+//! [`crate::state::DATA_ACCESS_ENABLED`]. The switch is a setting of the directory this
+//! service already holds rather than infrastructure to build — this operation's result is
+//! modelled with no members at all, so it reports no status a caller could be told to wait
+//! out — so the call itself applies it and `DescribeDirectoryDataAccess` reports the settled
+//! status from here on.
 //!
 //! That status is also the GATE the Directory Service DATA plane answers behind, and that
 //! plane cannot read this service's store, so the change is recorded in the one record both
-//! planes share (`service_common::ad_directories`) with the same due instant: the Data API
-//! starts answering for the directory exactly when this status settles on
+//! planes share (`service_common::ad_directories`) as effective at the same instant: the
+//! Data API starts answering for the directory exactly when this status reads
 //! [`crate::state::DATA_ACCESS_ENABLED`], and `DisableDirectoryDataAccess` is the mirrored
 //! toggle that closes it again.
 //!
@@ -21,7 +22,7 @@
 //! id no directory is stored under is refused with `DirectoryDoesNotExistException`, a
 //! directory that is not in service (still being built by the transition its create
 //! owes, or otherwise outside `Active`) with `DirectoryUnavailableException`, and one
-//! whose data access is already enabled — or already on its way there — with
+//! whose data access is already enabled with
 //! `DirectoryInDesiredStateException`, the error whose own documentation reads "The
 //! directory is already updated to desired update type settings".
 //!
@@ -208,14 +209,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // A directory already enabled — or already on its way there under the
-        // transition an earlier enable started — is in the state this request asks for,
-        // so the enable is refused rather than silently restarting that transition. The
-        // diagnostic is this service's shared sentence for a toggle whose directory is
-        // already in the desired state.
-        if directory.data_access_status == crate::state::DATA_ACCESS_ENABLED
-            || directory.data_access_status == crate::state::DATA_ACCESS_ENABLING
-        {
+        // A directory already enabled is in the state this request asks for, so the enable
+        // is refused rather than written again. The diagnostic is this service's shared
+        // sentence for a toggle whose directory is already in the desired state.
+        if directory.data_access_status == crate::state::DATA_ACCESS_ENABLED {
             return Err(
                 EnableDirectoryDataAccessErrorModeled::DirectoryInDesiredStateException(
                     crate::state::refusal(crate::state::directory_in_desired_state(
@@ -226,22 +223,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // Data access is not in service the instant this call answers: the move to
-        // `Enabled` is owed by the clock, like a create's stage transition.
-        let due_at = now + crate::state::TRANSITION_SPAN;
-        directory.data_access_status = crate::state::DATA_ACCESS_ENABLING.to_string();
-        directory.data_access_due_at = Some(due_at);
+        // The switch this toggle moves is the directory's own setting — nothing is built
+        // for it, which is why the operation reports nothing back — so the call applies it
+        // instead of leaving a transition for the clock: the next read reports `Enabled`.
+        directory.data_access_status = crate::state::DATA_ACCESS_ENABLED.to_string();
 
         // The Directory Service DATA plane cannot read this store, and this toggle is the
         // only thing that makes it answer for the directory at all, so the change goes into
-        // the one record both planes share, with the SAME instant it falls due at here —
-        // the data API is in service exactly when this status settles on `Enabled`. Taken
+        // the one record both planes share, effective at the SAME instant it is applied here
+        // — the data API is in service exactly while this status reads `Enabled`. Taken
         // while this service's own store is held, which is the lock order that record
         // declares.
         if let Some(inventory) = crate::state::ad_directory_inventory(&*self.engine) {
             inventory
                 .lock()
-                .enable_data_access(&input.directory_id, now, due_at);
+                .enable_data_access(&input.directory_id, now, now);
         }
 
         Ok(EnableDirectoryDataAccessOutput {})

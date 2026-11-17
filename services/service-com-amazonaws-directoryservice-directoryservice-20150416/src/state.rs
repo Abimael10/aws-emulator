@@ -20,7 +20,7 @@
 //!   (and a removed one leaving the store), a
 //!   trust leaving `Creating` or `Verifying` (and a torn-down one settling on `Deleted`
 //!   and then leaving the store), an
-//!   assessment leaving `IN_PROGRESS`, a directory's data access leaving `Enabling`, a
+//!   assessment leaving `IN_PROGRESS`, a
 //!   directory's LDAP security leaving `Enabling`, a
 //!   registered certificate leaving `Registering`, an organization directory share
 //!   leaving `Sharing` (and an unshared one leaving the store), a schema extension
@@ -708,30 +708,22 @@ pub const MAX_SCHEMA_EXTENSIONS_PER_DIRECTORY: usize = 100;
 /// API for: the `Disabled` value of the modelled `DataAccessStatus` enum
 /// (`smithy_query(query="shape", shape="DataAccessStatus")` answers
 /// `["Disabled", "Disabling", "Enabled", "Enabling", "Failed"]`), and the status
-/// `DescribeDirectoryDataAccess` therefore reports for every freshly created directory.
+/// `DescribeDirectoryDataAccess` therefore reports for every freshly created directory
+/// and for every directory `DisableDirectoryDataAccess` has withdrawn.
 pub const DATA_ACCESS_DISABLED: &str = "Disabled";
 
-/// The `DataAccessStatus` a directory carries between `EnableDirectoryDataAccess` and
-/// [`TRANSITION_SPAN`]: the modelled enum's `Enabling` value.
+/// The `DataAccessStatus` of a directory `EnableDirectoryDataAccess` has opened to the
+/// Data API: the modelled enum's `Enabled` value.
 ///
-/// The enable answers before data access is in service — the enum carries both the
-/// transient `Enabling` and the settled `Enabled` — so the move to
-/// [`DATA_ACCESS_ENABLED`] is owed by the clock, on the same span a create's stage
-/// transition uses.
-pub const DATA_ACCESS_ENABLING: &str = "Enabling";
-
-/// The `DataAccessStatus` a directory reaches once the enable's [`TRANSITION_SPAN`] has
-/// elapsed: the modelled enum's `Enabled` value.
+/// Either toggle is applied to the directory BY THE CALL, not owed to the clock: what it
+/// moves is a switch on the directory record this service already holds — neither
+/// operation reports a status back (both results are modelled with no members at all) and
+/// neither has anything built for it — so the status the next read reports, and the gate
+/// the Data API answers behind, is the settled one from the instant the toggle answers. A
+/// directory still being BUILT is the other matter: that stage chain IS what the clock
+/// owes (see [`STAGE_CREATING`]), and a toggle is refused from it with
+/// `DirectoryUnavailableException`.
 pub const DATA_ACCESS_ENABLED: &str = "Enabled";
-
-/// The `DataAccessStatus` a directory carries between `DisableDirectoryDataAccess` and
-/// [`TRANSITION_SPAN`]: the modelled enum's `Disabling` value.
-///
-/// The disable answers before data access has actually been withdrawn — the enum carries
-/// both the transient `Disabling` and the settled [`DATA_ACCESS_DISABLED`] — so the move
-/// back to [`DATA_ACCESS_DISABLED`] is owed by the clock, on the same span the enable's
-/// transition uses.
-pub const DATA_ACCESS_DISABLING: &str = "Disabling";
 
 /// The `CertificateState` a certificate carries between `RegisterCertificate` and
 /// [`TRANSITION_SPAN`]: the first value of the modelled `CertificateState` enum
@@ -2349,11 +2341,10 @@ pub struct Directory {
     /// API, as `DescribeDirectoryDataAccess` reports it: one of the modelled
     /// `DataAccessStatus` values, [`DATA_ACCESS_DISABLED`] until
     /// `EnableDirectoryDataAccess` records otherwise and again once
-    /// `DisableDirectoryDataAccess` has withdrawn it.
+    /// `DisableDirectoryDataAccess` has withdrawn it. Each toggle writes the settled value
+    /// it asks for (see [`DATA_ACCESS_ENABLED`]), so no transition is left outstanding on
+    /// it for the clock to settle.
     pub data_access_status: String,
-    /// When the data-access status transition an enable or a disable owes falls due;
-    /// `None` once there is none left to make. See [`TRANSITION_SPAN`].
-    pub data_access_due_at: Option<SystemTime>,
     /// The certificate-authority enrollment policy `EnableCAEnrollmentPolicy` recorded for
     /// this directory, if any; `DescribeCAEnrollmentPolicy` reports it and
     /// `DisableCAEnrollmentPolicy` is what withdraws it. A directory holds at most one (see
@@ -3764,22 +3755,6 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
                 route.status != IP_ROUTE_STATUS_REMOVING
                     || route.status_due_at.is_some_and(|due| now < due)
             });
-            // The data-access transitions the toggles owe: the transient `Enabling`
-            // `EnableDirectoryDataAccess` records settles on `Enabled`, and the
-            // transient `Disabling` `DisableDirectoryDataAccess` records settles back on
-            // `Disabled`. Either way the directory keeps a `DataAccessStatus`, so
-            // neither transition removes anything from the store.
-            if let Some(due) = directory.data_access_due_at {
-                if now >= due {
-                    if directory.data_access_status == DATA_ACCESS_ENABLING {
-                        directory.data_access_status = DATA_ACCESS_ENABLED.to_string();
-                        directory.data_access_due_at = None;
-                    } else if directory.data_access_status == DATA_ACCESS_DISABLING {
-                        directory.data_access_status = DATA_ACCESS_DISABLED.to_string();
-                        directory.data_access_due_at = None;
-                    }
-                }
-            }
             // The transitions the CA enrollment policy toggles owe: the transient
             // activation `EnableCAEnrollmentPolicy` records settles on `Success` and the
             // transient deactivation `DisableCAEnrollmentPolicy` records settles on

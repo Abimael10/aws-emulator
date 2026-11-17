@@ -12,15 +12,17 @@
 //! The rules under test, each asserted over a TABLE rather than one recorded call:
 //!
 //! * a directory's data access is reported from the store: `Disabled` until an enable
-//!   records otherwise, the transient `Enabling` while the transition that enable owes
-//!   is outstanding, and `Enabled` once the clock has settled it one transition span
-//!   later — over a table of directories differing in type (Simple AD / Managed
-//!   Microsoft AD), size, edition and network type, with an untouched directory in the
+//!   records otherwise, and `Enabled` from the instant the enable answers — the toggle
+//!   switches a setting of the directory the service already holds, so the FIRST read
+//!   after it reports the settled value and the status stays there as the clock passes a
+//!   transition span, because nothing later moves it — over a table of directories
+//!   differing in type (Simple AD / Managed Microsoft AD), size, edition and network
+//!   type, with an untouched directory in the
 //!   same store as the control, so a status that is not per-directory cannot pass, and
 //!   every reported value checked against the catalog the crate generates from the
 //!   model;
 //! * an enable is refused when the directory is already in the state it asks for
-//!   (`DirectoryInDesiredStateException`), both while `Enabling` and once `Enabled`,
+//!   (`DirectoryInDesiredStateException`), from the instant the first enable answered,
 //!   while the control directory in the same store still accepts one;
 //! * an enable needs a directory that is in service: one still being built by the
 //!   transition its create owes is refused with `DirectoryUnavailableException`, and the
@@ -37,7 +39,8 @@ use service_com_amazonaws_directoryservice_directoryservice_20150416::ops::types
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::directory_lifecycle::{
-    call, create_directory, minimal_create, ok, refused, service, string, PASSWORD, PAST_ONE_SPAN,
+    await_in_service, call, create_directory, minimal_create, ok, refused, service, string,
+    PASSWORD,
 };
 use crate::microsoft_ad::{create_microsoft_ad, minimal_microsoft_ad};
 
@@ -46,10 +49,8 @@ use crate::microsoft_ad::{create_microsoft_ad, minimal_microsoft_ad};
 /// model as [`DATA_ACCESS_STATUS_VALUES`].
 const DISABLED: &str = "Disabled";
 
-/// The status a directory carries between the enable and the transition it owes.
-const ENABLING: &str = "Enabling";
-
-/// The status a directory carries once that transition has fallen due.
+/// The status a directory carries from the instant its enable answers: the toggle is
+/// applied by the call, so this is what the next read reports.
 const ENABLED: &str = "Enabled";
 
 /// Well-formed `DirectoryId`s no directory is ever created under, as `(id, class)`.
@@ -176,9 +177,11 @@ async fn data_access_status_is_reported_from_the_store_for_each_directory() {
         );
     }
 
-    // The stage transition each create owes falls due, so the directories are in
-    // service and an enable is admitted.
-    tokio::time::sleep(PAST_ONE_SPAN).await;
+    // Each create's stage chain is looked for until it has finished, so the directories are
+    // in service and an enable is admitted.
+    for (row, id) in &ids {
+        await_in_service(&router, id, row.case).await;
+    }
 
     for (row, id) in &ids {
         if !row.enabled {
@@ -200,11 +203,11 @@ async fn data_access_status_is_reported_from_the_store_for_each_directory() {
         );
     }
 
-    // The instant after the enable the transition it owes is still outstanding, so the
-    // transient status is observable — and the control directory is untouched.
+    // The instant after the enable the directory already reports the status the enable
+    // asked for — and the control directory is untouched.
     for (row, id) in &ids {
         let status = data_access_status(&router, id, row.case).await;
-        let expected = if row.enabled { ENABLING } else { DISABLED };
+        let expected = if row.enabled { ENABLED } else { DISABLED };
         assert_eq!(
             status, expected,
             "case {:?}: straight after the enable the directory reports {expected}, got \
@@ -213,8 +216,7 @@ async fn data_access_status_is_reported_from_the_store_for_each_directory() {
         );
     }
 
-    // A second enable while the first transition is still outstanding asks for the
-    // state the directory is already moving to.
+    // A second enable asks for the state the first one already put the directory in.
     for (row, id) in &ids {
         if !row.enabled {
             continue;
@@ -229,15 +231,14 @@ async fn data_access_status_is_reported_from_the_store_for_each_directory() {
         .await;
     }
 
-    // The clock settles the transition the enable owed; nothing else did.
-    tokio::time::sleep(PAST_ONE_SPAN).await;
-
+    // The refused second enable changed nothing, and neither does any other call the store
+    // takes meanwhile: every directory is exactly where its own enable left it.
     for (row, id) in &ids {
         let status = data_access_status(&router, id, row.case).await;
         let expected = if row.enabled { ENABLED } else { DISABLED };
         assert_eq!(
             status, expected,
-            "case {:?}: one transition span after the enable the directory reports \
+            "case {:?}: after the refused second enable the directory still reports \
              {expected}, got {status:?}",
             row.case
         );
@@ -277,7 +278,7 @@ async fn data_access_status_is_reported_from_the_store_for_each_directory() {
             .await;
             let status = data_access_status(&router, id, row.case).await;
             assert_eq!(
-                status, ENABLING,
+                status, ENABLED,
                 "case {:?}: the control directory enables like any other, got \
                  {status:?}",
                 row.case
@@ -328,10 +329,10 @@ async fn an_enable_needs_a_directory_that_is_in_service() {
         ids.push((row, id));
     }
 
-    // The refusal was about the stage, so the very same call is admitted once the
-    // transition the create owed has fallen due.
-    tokio::time::sleep(PAST_ONE_SPAN).await;
+    // The refusal was about the stage, so the very same call is admitted once each create's
+    // build has finished, which the case looks for rather than waits out.
     for (row, id) in &ids {
+        await_in_service(&router, id, row.case).await;
         ok(
             &router,
             "EnableDirectoryDataAccess",
@@ -341,7 +342,7 @@ async fn an_enable_needs_a_directory_that_is_in_service() {
         .await;
         let status = data_access_status(&router, id, row.case).await;
         assert_eq!(
-            status, ENABLING,
+            status, ENABLED,
             "case {:?}: the enable is admitted once the directory is in service, got \
              {status:?}",
             row.case
@@ -361,7 +362,7 @@ async fn both_operations_resolve_the_directory_in_the_store() {
         "the stored directory",
     )
     .await;
-    tokio::time::sleep(PAST_ONE_SPAN).await;
+    await_in_service(&router, &stored, "the stored directory").await;
 
     for (absent, class) in ABSENT_DIRECTORY_IDS {
         for operation in ["EnableDirectoryDataAccess", "DescribeDirectoryDataAccess"] {
@@ -419,7 +420,7 @@ async fn both_operations_resolve_the_directory_in_the_store() {
     .await;
     let status = data_access_status(&router, &stored, "the stored directory").await;
     assert_eq!(
-        status, ENABLING,
+        status, ENABLED,
         "case {:?}: the stored directory enables and reports back, got {status:?}",
         "the stored directory"
     );

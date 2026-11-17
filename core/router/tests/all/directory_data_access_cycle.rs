@@ -10,7 +10,9 @@
 //! record the control plane writes.
 //!
 //! The rule this suite pins, in BOTH directions: `ds-data` answers for a directory exactly
-//! while the control plane reports its `DataAccessStatus` as `Enabled`, and every call
+//! while the control plane reports its `DataAccessStatus` as `Enabled`, and each toggle
+//! moves that status in the call that makes it, so the two planes agree on the very next
+//! request. Every call
 //! against a directory whose feature is out of service is refused with
 //! `AccessDeniedException`, HTTP 403, `Reason` `DATA_DISABLED` and one fixed sentence —
 //! identically for an object read, a write and an inventory listing, because what is refused
@@ -41,13 +43,11 @@ const DATA_DISABLED: &str = "DATA_DISABLED";
 const DATA_DISABLED_MESSAGE: &str = "DS Data feature is not enabled on this directory. \
      This feature must first be enabled by calling the EnableDirectoryDataAccess API.";
 
-/// The `DataAccessStatus` values this suite polls for, from the modelled enum
+/// The `DataAccessStatus` values this suite reads, from the modelled enum
 /// (`smithy_query(query="shape", shape="DataAccessStatus")` — `Disabled`, `Disabling`,
 /// `Enabled`, `Enabling`, `Failed`).
 const DISABLED: &str = "Disabled";
-const DISABLING: &str = "Disabling";
 const ENABLED: &str = "Enabled";
-const ENABLING: &str = "Enabling";
 
 /// The `DirectoryStage` an in-service directory reports throughout
 /// (`smithy_query(query="shape", shape="DirectoryStage")` carries it).
@@ -103,18 +103,14 @@ async fn await_stage(emulator: &Emulator, directory: &str, stage_wanted: &str) {
     );
 }
 
-/// Poll until the control plane reports `status_wanted` for `directory`'s data access, as a
-/// client waiting for the enable or the disable to settle does.
-async fn await_data_access(emulator: &Emulator, directory: &str, status_wanted: &str) {
-    for _ in 0..POLL_ATTEMPTS {
-        if data_access_status(emulator, directory).await == status_wanted {
-            return;
-        }
-        tokio::time::sleep(PAST_ONE_SPAN / 4).await;
-    }
-    panic!(
-        "case waiting for DataAccessStatus {status_wanted}: it stayed at {:?}",
-        data_access_status(emulator, directory).await
+/// Assert the control plane reports `status_wanted` for `directory`'s data access, which it
+/// does from the instant the toggle that asked for it answered.
+async fn assert_data_access(emulator: &Emulator, directory: &str, status_wanted: &str) {
+    let reported = data_access_status(emulator, directory).await;
+    assert_eq!(
+        reported, status_wanted,
+        "case the status after the toggle: expected DataAccessStatus {status_wanted}, got \
+         {reported:?}"
     );
 }
 
@@ -247,7 +243,7 @@ async fn disabling_data_access_closes_the_data_plane_without_losing_the_director
     assert_data_disabled("ListUsers before any enable", &before_any_enable);
 
     toggle(&emulator, "EnableDirectoryDataAccess", &directory).await;
-    await_data_access(&emulator, &directory, ENABLED).await;
+    assert_data_access(&emulator, &directory, ENABLED).await;
 
     // The objects that exist before the disable.
     let created_user = emulator
@@ -307,11 +303,11 @@ async fn disabling_data_access_closes_the_data_plane_without_losing_the_director
         )
         .await;
 
-    // The disable answers before the directory has left the Data API: the control plane
-    // reports the transient status and the data plane is still serving, so the two planes
-    // agree at every instant.
+    // The disable takes the directory out of the Data API in the call that makes it: the
+    // control plane reports the withdrawal and the data plane is shut from the next request
+    // on, so the two planes agree at every instant.
     toggle(&emulator, "DisableDirectoryDataAccess", &directory).await;
-    await_data_access(&emulator, &directory, DISABLED).await;
+    assert_data_access(&emulator, &directory, DISABLED).await;
 
     // A read, a write and an inventory listing: the identical refusal, because the gate is
     // on the directory.
@@ -360,7 +356,7 @@ async fn disabling_data_access_closes_the_data_plane_without_losing_the_director
     );
 
     toggle(&emulator, "EnableDirectoryDataAccess", &directory).await;
-    await_data_access(&emulator, &directory, ENABLED).await;
+    assert_data_access(&emulator, &directory, ENABLED).await;
 
     // The same AD objects: the SIDs Active Directory minted cannot be re-derived, so a
     // cycle that lost the objects would answer with different ones.
@@ -431,9 +427,10 @@ async fn disabling_data_access_closes_the_data_plane_without_losing_the_director
     );
 }
 
-/// The transient legs of the switch, which only the two planes together can show: an enable
-/// answers before the data plane opens and a disable answers before it closes, and the data
-/// plane's answer matches the status the control plane reports at the same instant.
+/// The two planes at the instant each toggle answers, which only the two together can show:
+/// the switch is applied by the call, so the status the control plane reports and what the
+/// data plane serves change over the same call — with no instant in between at which the two
+/// disagree.
 #[tokio::test]
 async fn the_data_plane_follows_the_status_the_control_plane_reports() {
     let emulator = Emulator::new();
@@ -446,50 +443,44 @@ async fn the_data_plane_follows_the_status_the_control_plane_reports() {
     let directory = created.text("DirectoryId");
     await_stage(&emulator, &directory, ACTIVE).await;
 
-    // Straight after the enable the transition it owes is still outstanding, so the control
-    // plane reports the transient status and the data plane is not open yet.
+    // Straight after the enable — the next request, nothing waited out — the control plane
+    // reports `Enabled` and the data plane serves.
     toggle(&emulator, "EnableDirectoryDataAccess", &directory).await;
-    let while_enabling = emulator
+    let straight_after_enable = emulator
         .data_plane("/Users/ListUsers", &directory, json!({}))
         .await;
+    assert_data_access(&emulator, &directory, ENABLED).await;
     assert_eq!(
-        data_access_status(&emulator, &directory).await,
-        ENABLING,
-        "case straight after the enable: expected DataAccessStatus {ENABLING}"
+        straight_after_enable.status, 200,
+        "case straight after the enable: expected the listing to be served, got {} with {:?}",
+        straight_after_enable.status, straight_after_enable.body
     );
-    assert_data_disabled("ListUsers while the enable is outstanding", &while_enabling);
 
-    await_data_access(&emulator, &directory, ENABLED).await;
+    // Read both planes again, with the status read of the other plane in between: neither
+    // has moved on its own, because the toggle left nothing for the clock to settle.
     let served = emulator
         .data_plane("/Users/ListUsers", &directory, json!({}))
         .await;
+    assert_data_access(&emulator, &directory, ENABLED).await;
     assert_eq!(
         served.status, 200,
-        "case once the enable has settled: expected the listing to be served, got {} with {:?}",
+        "case the second read after the enable: expected the listing to be served, got {} \
+         with {:?}",
         served.status, served.body
     );
 
-    // Straight after the disable the directory has not left the Data API yet, so the data
-    // plane still answers — exactly as the control plane's transient status says.
+    // And straight after the disable the directory has left the Data API, exactly as the
+    // status the control plane reports says.
     toggle(&emulator, "DisableDirectoryDataAccess", &directory).await;
-    let while_disabling = emulator
+    let straight_after_disable = emulator
         .data_plane("/Users/ListUsers", &directory, json!({}))
         .await;
-    assert_eq!(
-        data_access_status(&emulator, &directory).await,
-        DISABLING,
-        "case straight after the disable: expected DataAccessStatus {DISABLING}"
-    );
-    assert_eq!(
-        while_disabling.status, 200,
-        "case while the disable is outstanding: expected the listing to still be served, got \
-         {} with {:?}",
-        while_disabling.status, while_disabling.body
-    );
+    assert_data_access(&emulator, &directory, DISABLED).await;
+    assert_data_disabled("ListUsers straight after the disable", &straight_after_disable);
 
-    await_data_access(&emulator, &directory, DISABLED).await;
     let shut = emulator
         .data_plane("/Users/ListUsers", &directory, json!({}))
         .await;
-    assert_data_disabled("ListUsers once the disable has settled", &shut);
+    assert_data_access(&emulator, &directory, DISABLED).await;
+    assert_data_disabled("ListUsers on the second read after the disable", &shut);
 }

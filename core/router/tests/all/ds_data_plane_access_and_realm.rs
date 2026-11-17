@@ -33,9 +33,7 @@
 
 use serde_json::json;
 
-use crate::directory_data_plane_authorization::{
-    create_microsoft_ad, Answer, Emulator, PAST_ONE_SPAN,
-};
+use crate::directory_data_plane_authorization::{create_microsoft_ad, Answer, Emulator};
 
 /// A directory administrator password the directory's own policy accepts: between 8 and 64
 /// characters, drawn from at least three of Active Directory's four character classes.
@@ -51,6 +49,43 @@ const DATA_DISABLED: &str = "DATA_DISABLED";
 const DATA_ACCESS_NOT_ENABLED: &str =
     "DS Data feature is not enabled on this directory. This feature must first be enabled \
      by calling the EnableDirectoryDataAccess API.";
+
+/// The `DirectoryStage` a directory whose build has finished reports, which is the one state
+/// the DS Data switch is admitted from.
+const ACTIVE: &str = "Active";
+
+/// How long these rows give a create's build chain before calling it wedged, and how often
+/// they look again: a generous bound on a stage that never settles rather than a wait for a
+/// duration, so nothing here depends on how fast the host runs.
+const BUILD_ATTEMPTS: usize = 240;
+const LOOK_AGAIN: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// The `DirectoryStage` the control plane reports for `directory`.
+async fn stage(emulator: &Emulator, directory: &str) -> String {
+    let described = emulator
+        .control_plane("DescribeDirectories", json!({"DirectoryIds": [directory]}))
+        .await;
+    described.body["DirectoryDescriptions"][0]["Stage"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Look again until the directory's build has finished, which is the transition the clock
+/// owes here: a create answers while its servers are still coming up, and the switch below
+/// needs a directory that is in service.
+async fn await_in_service(emulator: &Emulator, directory: &str, case: &str) {
+    for _ in 0..BUILD_ATTEMPTS {
+        if stage(emulator, directory).await == ACTIVE {
+            return;
+        }
+        tokio::time::sleep(LOOK_AGAIN).await;
+    }
+    panic!(
+        "case {case:?}: the directory never reached Stage {ACTIVE}, it stayed in {:?}",
+        stage(emulator, directory).await
+    );
+}
 
 /// A Managed Microsoft AD directory of domain `name`, in service, with its DS Data feature
 /// turned on — the two control-plane calls every row below depends on. `short_name` is the
@@ -72,9 +107,10 @@ async fn directory_serving_its_data_plane(
     );
     let directory_id = created.text("DirectoryId");
 
-    // The switch needs a directory that is in service, and it is accepted rather than
-    // completed inside the call, so each transition is waited out in turn.
-    tokio::time::sleep(PAST_ONE_SPAN).await;
+    // The switch needs a directory that is in service, so the stage chain the create owes is
+    // looked for rather than waited out; the switch itself takes effect in the call that
+    // makes it.
+    await_in_service(emulator, &directory_id, name).await;
     let enabled = emulator
         .control_plane(
             "EnableDirectoryDataAccess",
@@ -86,7 +122,6 @@ async fn directory_serving_its_data_plane(
         "EnableDirectoryDataAccess on {name:?} must be accepted, got {} with {:?}",
         enabled.status, enabled.body
     );
-    tokio::time::sleep(PAST_ONE_SPAN).await;
     directory_id
 }
 
@@ -333,7 +368,7 @@ async fn the_feature_the_realm_is_answered_under_is_the_control_planes_to_switch
         .control_plane("CreateMicrosoftAD", create_microsoft_ad(realm))
         .await;
     let directory_id = created.text("DirectoryId");
-    tokio::time::sleep(PAST_ONE_SPAN).await;
+    await_in_service(&emulator, &directory_id, realm).await;
 
     // Nothing has enabled the feature for this directory, so every call against it is
     // refused — the writes as well as the reads, which is what makes the switch an
@@ -348,8 +383,8 @@ async fn the_feature_the_realm_is_answered_under_is_the_control_planes_to_switch
         assert_data_disabled(&format!("{route} before the feature is enabled"), &answer);
     }
 
-    // The enable answers before the feature is in service, so the data plane is still
-    // closed until the transition it owes falls due.
+    // The enable is applied by the call that makes it, so the data plane is open to the
+    // very next request: no transition stands between the switch and the feature.
     let enabled = emulator
         .control_plane(
             "EnableDirectoryDataAccess",
@@ -361,11 +396,14 @@ async fn the_feature_the_realm_is_answered_under_is_the_control_planes_to_switch
         "EnableDirectoryDataAccess must be accepted, got {} with {:?}",
         enabled.status, enabled.body
     );
-    let while_enabling = emulator
+    let straight_after = emulator
         .data_plane("/Users/ListUsers", &directory_id, json!({}))
         .await;
-    assert_data_disabled("while the enable is under way", &while_enabling);
-    tokio::time::sleep(PAST_ONE_SPAN).await;
+    assert_eq!(
+        straight_after.status, 200,
+        "expected the listing straight after the enable to be served, got {} with {:?}",
+        straight_after.status, straight_after.body
+    );
 
     let served = emulator
         .data_plane(
@@ -380,7 +418,7 @@ async fn the_feature_the_realm_is_answered_under_is_the_control_planes_to_switch
         served.status, served.body
     );
 
-    // And the control plane's switch closes the data plane again, on its own transition.
+    // And the control plane's switch closes the data plane again, just as immediately.
     let withdrawn = emulator
         .control_plane(
             "DisableDirectoryDataAccess",
@@ -392,7 +430,6 @@ async fn the_feature_the_realm_is_answered_under_is_the_control_planes_to_switch
         "DisableDirectoryDataAccess must be accepted, got {} with {:?}",
         withdrawn.status, withdrawn.body
     );
-    tokio::time::sleep(PAST_ONE_SPAN).await;
     let after = emulator
         .data_plane(
             "/Users/DescribeUser",

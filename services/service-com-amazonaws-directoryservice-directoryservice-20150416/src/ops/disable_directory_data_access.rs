@@ -2,18 +2,18 @@
 
 //! @op DisableDirectoryDataAccess
 //!
-//! Withdraws a stored directory from the Directory Service Data API, by recording the
-//! `DataAccessStatus` transition the disable starts: the directory leaves
-//! [`crate::state::DATA_ACCESS_ENABLED`] for the transient
-//! [`crate::state::DATA_ACCESS_DISABLING`], and the clock — not a later call — settles it
-//! on [`crate::state::DATA_ACCESS_DISABLED`] once [`crate::state::TRANSITION_SPAN`] has
-//! elapsed. `DescribeDirectoryDataAccess` is what reports that status, and
-//! `EnableDirectoryDataAccess` is the mirrored toggle.
+//! Withdraws a stored directory from the Directory Service Data API, by switching the
+//! directory's `DataAccessStatus` from [`crate::state::DATA_ACCESS_ENABLED`] back to
+//! [`crate::state::DATA_ACCESS_DISABLED`]. The switch is a setting of the directory this
+//! service already holds rather than infrastructure to tear down — this operation's result
+//! is modelled with no members at all, so it reports no status a caller could be told to
+//! wait out — so the call itself applies it and `DescribeDirectoryDataAccess` reports the
+//! settled status from here on; `EnableDirectoryDataAccess` is the mirrored toggle.
 //!
 //! That status is also the GATE the Directory Service DATA plane answers behind, and that
 //! plane cannot read this service's store, so the change is recorded in the one record both
-//! planes share (`service_common::ad_directories`) with the same due instant: the Data API
-//! stops answering for the directory exactly when this status settles on
+//! planes share (`service_common::ad_directories`) as effective at the same instant: the
+//! Data API stops answering for the directory exactly when this status reads
 //! [`crate::state::DATA_ACCESS_DISABLED`].
 //!
 //! The modelled `DirectoryId` pattern is refused by the framework's boundary validator
@@ -21,8 +21,8 @@
 //! id no directory is stored under is refused with `DirectoryDoesNotExistException`, a
 //! directory that is not in service (still being built by the transition its create
 //! owes, or otherwise outside `Active`) with `DirectoryUnavailableException`, and one
-//! whose data access is already disabled — or already on its way there — with
-//! `DirectoryInDesiredStateException`, the error whose own documentation reads "The
+//! whose data access is already disabled with `DirectoryInDesiredStateException`, the
+//! error whose own documentation reads "The
 //! directory is already updated to desired update type settings".
 //!
 //! The Smithy model restricts this operation to no `DirectoryType`, so none is refused
@@ -209,15 +209,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // A directory already disabled — including one nothing ever enabled — or already
-        // on its way there under the transition an earlier disable started is in the
-        // state this request asks for, so the disable is refused rather than silently
-        // restarting that transition. The diagnostic is this service's shared sentence for
-        // a toggle whose directory is already in the desired state, so an enable and a
-        // disable state this refusal identically.
-        if directory.data_access_status == crate::state::DATA_ACCESS_DISABLED
-            || directory.data_access_status == crate::state::DATA_ACCESS_DISABLING
-        {
+        // A directory already disabled — including one nothing ever enabled — is in the
+        // state this request asks for, so the disable is refused rather than written again.
+        // The diagnostic is this service's shared sentence for a toggle whose directory is
+        // already in the desired state, so an enable and a disable state this refusal
+        // identically.
+        if directory.data_access_status == crate::state::DATA_ACCESS_DISABLED {
             return Err(
                 DisableDirectoryDataAccessErrorModeled::DirectoryInDesiredStateException(
                     crate::state::refusal(crate::state::directory_in_desired_state(
@@ -228,23 +225,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // Data access is still in service the instant this call answers: the move back to
-        // `Disabled` is owed by the clock, on the same span the enable's transition uses.
-        let due_at = now + crate::state::TRANSITION_SPAN;
-        directory.data_access_status = crate::state::DATA_ACCESS_DISABLING.to_string();
-        directory.data_access_due_at = Some(due_at);
+        // The switch this toggle moves is the directory's own setting — nothing is torn
+        // down for it, which is why the operation reports nothing back — so the call applies
+        // it instead of leaving a transition for the clock: the next read reports
+        // `Disabled`.
+        directory.data_access_status = crate::state::DATA_ACCESS_DISABLED.to_string();
 
         // The Directory Service DATA plane answers for a directory only while the toggle in
         // the record both planes share has its data access on, so withdrawing the directory
-        // from the Data API means recording the change there too, with the SAME instant it
-        // falls due at here: the data API stops answering exactly when this status settles
-        // on `Disabled`, and serves nothing for the directory again until another enable.
+        // from the Data API means recording the change there too, effective at the SAME
+        // instant it is applied here: the data API stops answering exactly when this status
+        // reads `Disabled`, and serves nothing for the directory again until another enable.
         // Taken while this service's own store is held, which is the lock order that record
         // declares.
         if let Some(inventory) = crate::state::ad_directory_inventory(&*self.engine) {
             inventory
                 .lock()
-                .disable_data_access(&input.directory_id, now, due_at);
+                .disable_data_access(&input.directory_id, now, now);
         }
 
         Ok(DisableDirectoryDataAccessOutput {})

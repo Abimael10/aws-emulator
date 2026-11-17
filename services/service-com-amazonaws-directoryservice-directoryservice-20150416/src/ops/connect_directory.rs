@@ -428,7 +428,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `EnableDirectoryDataAccess` is what opens a directory to the Directory
             // Service Data API; a fresh one is closed to it.
             data_access_status: crate::state::DATA_ACCESS_DISABLED.to_string(),
-            data_access_due_at: None,
             // `EnableCAEnrollmentPolicy` is what enrolls a directory's clients with a
             // Private CA connector; a fresh one holds no such policy.
             ca_enrollment_policy: None,
