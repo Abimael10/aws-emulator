@@ -80,6 +80,14 @@ pub(crate) struct Principal {
 /// (`crate::identity_policy_authorization`), so one router stands for both.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
+    /// The ONE shared engine the three services are mounted on.
+    ///
+    /// Held because one state a case needs cannot be reached by any request: a
+    /// service-specific credential whose `ExpirationDate` has already passed, which no
+    /// create can mint (an age is counted forward from the create). The suite about the HTTP
+    /// ingestion endpoints seeds that one instant here and asserts everything else over the
+    /// wire.
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
@@ -101,10 +109,16 @@ impl Emulator {
         );
         router.register_service(
             service_com_amazonaws_sts_awssecuritytokenservicev20110615::EmulatedService::new(
-                engine,
+                Arc::clone(&engine),
             ),
         );
-        Self { router }
+        Self { router, engine }
+    }
+
+    /// The ONE shared engine the mounted services read and write — see [`Emulator::engine`]'s
+    /// field documentation for the one thing a case reaches it for.
+    pub(crate) fn engine(&self) -> &Arc<engine::InMemoryEngine> {
+        &self.engine
     }
 
     /// One call to this service, signed for [`REGION`] with `access_key_id` in the credential
@@ -203,12 +217,35 @@ impl Emulator {
         );
         text
     }
+
+    /// One RAW exchange with whatever this router mounts: the status and the body bytes
+    /// exactly as the answering service wrote them.
+    ///
+    /// Every other call here builds the request — a signed `awsJson1_1` call to this
+    /// service, or an `awsQuery` call to IAM or STS. A request to one of this service's
+    /// HTTP ingestion endpoints is neither: it is an unsigned `POST` to a path of its own
+    /// carrying a bearer credential, so the suite about those endpoints
+    /// (`crate::http_ingestion_endpoints`) builds the request itself and exchanges it
+    /// through here, over the same router and the same shared engine the calls above use.
+    pub(crate) async fn answered(
+        &self,
+        request: http::Request<bytes::Bytes>,
+    ) -> (u16, bytes::Bytes) {
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        (status, response.into_body())
+    }
 }
 
 /// Percent-encode one `application/x-www-form-urlencoded` component, leaving only RFC 3986's
 /// unreserved characters literal — so a policy document's braces and quotes survive the round
 /// trip.
-fn form_encode(value: &str) -> String {
+///
+/// `pub(crate)` because the same encoding is what a client escapes a log group name in a
+/// QUERY string with, which the suite about the HTTP ingestion endpoints
+/// (`crate::http_ingestion_endpoints`) needs: one reading of it in this target rather than a
+/// copy per suite.
+pub(crate) fn form_encode(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {

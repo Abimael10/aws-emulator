@@ -309,11 +309,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The record leaves the account: the deleted credential is gone from the
         // listing, stops counting against the per-service quota the create takes, and
-        // can no longer be reset or have its status moved. The id and the secret were
+        // can no longer be reset or have its status moved. Its secret's verifier goes with
+        // it, so the bearer credential it authenticated authenticates nothing from now on.
+        // The id and the secret were
         // never kept in the emulator's own credential store (the create removes the
         // minted record again), so there is nothing else to release.
         let removed = store
             .service_specific_credentials
+            .remove(&input.service_specific_credential_id);
+        store
+            .service_specific_credential_secrets
             .remove(&input.service_specific_credential_id);
         let service_name = removed
             .map(|credential| credential.service_name)

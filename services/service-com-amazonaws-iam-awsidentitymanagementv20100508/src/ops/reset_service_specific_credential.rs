@@ -328,6 +328,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
+        // What the account holds of the fresh secret: its verifier, which is what lets the
+        // issuing service authenticate a bearer credential a client presents later, and
+        // which REPLACES the one the superseded secret was held under — "resetting the
+        // password immediately invalidates the previous password". It is taken from the
+        // minted secret itself, before that secret is moved into the member the credential's
+        // form reports it in.
+        let held = store.hold_password(&password);
+        store
+            .service_specific_credential_secrets
+            .insert(credential.service_specific_credential_id.clone(), held);
+
         // Which member carries the fresh secret is the FORM the credential was minted
         // in, which the stored record itself records: a user-name-and-password
         // credential carries a `ServiceUserName`, while a long-term API key carries the

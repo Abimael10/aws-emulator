@@ -325,6 +325,11 @@ pub mod identity_authorization;
 /// on the role that driver acts as.
 pub mod log_stream_creation;
 
+/// The HTTP INGESTION endpoints: what a client addresses them at, what a request's body
+/// carries, and what one answers. The seam that serves them is
+/// `crate::service::http_ingestion`.
+pub mod http_ingestion;
+
 /// Per-service state for com-amazonaws-cloudwatchlogs-logs-20140328. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCloudwatchlogsLogs20140328State {

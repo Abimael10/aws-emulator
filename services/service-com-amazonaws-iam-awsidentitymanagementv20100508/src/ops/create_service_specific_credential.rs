@@ -294,6 +294,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
+        // What the account holds of the SECRET half: its verifier, which is what lets the
+        // issuing service authenticate a bearer credential a client presents later
+        // (`service_specific_credential_for_secret`). It is taken from the minted secret
+        // itself, before that secret is moved into the member the form reports it in; the
+        // secret is reported in this response and kept nowhere, exactly as a console
+        // password is not.
+        let held = store.hold_password(&secret);
+
         // Which members carry the credential is the FORM the service issues: a user
         // name and a password, or a long-term API key's public alias and its secret. The
         // HANDLE is the one convention either form reports
@@ -329,8 +337,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             service_name: service.service_name.to_string(),
         };
         store
+            .service_specific_credential_secrets
+            .insert(credential_id.clone(), held);
+        store
             .service_specific_credentials
-            .insert(credential_id, stored.clone());
+            .insert(credential_id.clone(), stored.clone());
+
+        // The account minted a credential: an audit record of the write, naming the
+        // credential by the id the account reports it under and never the secret it issued,
+        // as every other write on these credentials records itself.
+        ::tracing::info!(
+            audit = true,
+            operation = "CreateServiceSpecificCredential",
+            outcome = "created",
+            caller_akid = %::engine::extract_akid(&ctx.parts().headers),
+            user_key = %user_key,
+            service_specific_credential_id = %credential_id,
+            service_name = %stored.service_name,
+            "a service-specific credential was created"
+        );
 
         Ok(CreateServiceSpecificCredentialOutput {
             service_specific_credential: Some(ServiceSpecificCredential {

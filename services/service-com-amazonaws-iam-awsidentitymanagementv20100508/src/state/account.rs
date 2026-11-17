@@ -569,6 +569,20 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// be recovered later"
     /// (`CreateServiceSpecificCredential$ServiceSpecificCredential`).
     pub service_specific_credentials: BTreeMap<String, ServiceSpecificCredentialMetadata>,
+    /// What the account keeps of each service-specific credential's SECRET half, keyed by
+    /// the same `ServiceSpecificCredentialId` [`Self::service_specific_credentials`] is:
+    /// the [`PasswordVerifier`] of that secret, never the secret.
+    ///
+    /// It exists because a long-term API key is presented BACK to the issuing service as a
+    /// bearer credential — `ServiceSpecificCredential$ServiceCredentialSecret` is "the
+    /// generated password for the service-specific credential" a client authenticates with
+    /// — so the account has to be able to answer whether a secret a later request presents
+    /// is one it issued ([`Self::service_specific_credential_for_secret`]). A verifier
+    /// answers exactly that and nothing else: the create response "is the only time that
+    /// the password for this credential set is available", so the secret itself is kept
+    /// nowhere, exactly as a console password is not
+    /// ([`Self::hold_password`]).
+    pub service_specific_credential_secrets: BTreeMap<String, PasswordVerifier>,
     /// The persisted customer managed policies, keyed by [`name_key`] of the
     /// policy name, for the same reason users and roles are: the model's
     /// `CreatePolicy$PolicyName` documentation says "IAM user, group, role, and
@@ -941,6 +955,7 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
             ssh_public_keys: BTreeMap::new(),
             login_profiles: BTreeMap::new(),
             service_specific_credentials: BTreeMap::new(),
+            service_specific_credential_secrets: BTreeMap::new(),
             policies: BTreeMap::new(),
             instance_profiles: BTreeMap::new(),
             role_attached_policies: BTreeMap::new(),
@@ -1532,6 +1547,47 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
                 credential.status = CREDENTIAL_STATUS_EXPIRED.to_string();
             }
         }
+    }
+
+    /// The ACTIVE service-specific credential of `service_name` whose secret half is
+    /// `secret`, or `None` when the account issued no such credential.
+    ///
+    /// This is the question the issuing service asks of a bearer credential a client
+    /// presents to it: a long-term API key is "the generated password for the
+    /// service-specific credential", so a request carrying one speaks for the IAM user the
+    /// credential was created for, and for no other. Only an `Active` credential answers —
+    /// `ServiceSpecificCredential$Status` documents `Active` as "the key is valid for API
+    /// calls" — so a credential a caller made `Inactive` authenticates nothing, and neither
+    /// does one whose `ExpirationDate` is at or before `now_secs`: that expiry is owed by the
+    /// CLOCK ([`Self::expire_service_specific_credentials`] materialises it on the account's
+    /// own reads), so it is applied here whether or not any IAM call has run since it fell
+    /// due.
+    ///
+    /// A READ: asking changes nothing a later caller sees — the status field is left as it
+    /// stands and the due expiry is applied to the answer alone. The service name compares
+    /// case-folded, because a service principal is a DNS name.
+    pub fn service_specific_credential_for_secret(
+        &self,
+        service_name: &str,
+        secret: &str,
+        now_secs: i64,
+    ) -> Option<&ServiceSpecificCredentialMetadata> {
+        self.service_specific_credentials
+            .iter()
+            .filter(|(_, credential)| {
+                let expired = credential
+                    .expiration_date
+                    .is_some_and(|expires_at| expires_at.secs() <= now_secs);
+                credential.service_name.eq_ignore_ascii_case(service_name)
+                    && credential.status == CREDENTIAL_STATUS_ACTIVE
+                    && !expired
+            })
+            .find(|(credential_id, _)| {
+                self.service_specific_credential_secrets
+                    .get(*credential_id)
+                    .is_some_and(|held| held.verifies(secret))
+            })
+            .map(|(_, credential)| credential)
     }
 
     /// How many sets of service-specific credentials the user keyed by `user_key`

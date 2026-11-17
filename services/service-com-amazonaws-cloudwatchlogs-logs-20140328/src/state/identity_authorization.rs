@@ -122,8 +122,49 @@ pub fn refusal<Eng: Send + Sync + 'static>(
     operation: &str,
     resource: &str,
 ) -> Option<String> {
+    decided(&caller(engine, ctx), operation, resource)
+}
+
+/// `Some(message)` when IAM does not allow `logs:<operation>` on `resource` for the IAM
+/// identity `identity_arn`, and `None` when it does — the same decision [`refusal`] takes,
+/// for a request whose principal is named by something other than a SigV4 credential scope.
+///
+/// A request to one of this service's HTTP ingestion endpoints is such a request: it
+/// presents a long-term API key the account issued to an IAM USER
+/// (`crate::service::http_ingestion`), so the principal is that user rather than whatever
+/// an access key id would resolve to, and what it may do is still the user's own
+/// identity-based policies. Everything past resolving the principal is shared with
+/// [`refusal`], so the two cannot decide the same `(action, resource)` differently.
+///
+/// Asked with NO store guard held, and before the request writes anything.
+#[must_use]
+pub fn refusal_for_identity<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    identity_arn: &str,
+    operation: &str,
+    resource: &str,
+) -> Option<String> {
+    let mut caller = Caller {
+        arn: identity_arn.to_string(),
+        ..Caller::default()
+    };
+    if let Some(iam) = iam_store::service_state(engine) {
+        let store = iam.lock();
+        caller.read_policies_of(&store, identity_arn);
+    }
+    decided(&caller, operation, resource)
+}
+
+/// IAM's decision about `logs:<operation>` on `resource` for `caller`, as the sentence a
+/// refusal carries, or `None` where it is allowed.
+///
+/// IAM's order: an explicit `Deny` in a document that CAN be read refuses the request
+/// whatever else the principal carries; otherwise a grant is needed, which a caller this
+/// gate does not bound has by definition (see the module docs); and a grant is capped by the
+/// permissions boundary, since "a permissions boundary sets the maximum permissions that an
+/// identity-based policy can grant" (IAM, permissions boundaries).
+fn decided(caller: &Caller, operation: &str, resource: &str) -> Option<String> {
     let action = action_for(operation);
-    let caller = caller(engine, ctx);
     // An identity-based document states no `Principal` element, so the decision rests on
     // the action and the resource the request addressed.
     let request = iam::Request::new(&action, resource, &[]);

@@ -180,6 +180,10 @@ pub mod identity_authorization;
 /// request a response answers").
 pub mod stated_request_id;
 
+/// The HTTP ingestion endpoints: a bearer-token-authenticated POST of log records, which
+/// this service's model binds no operation for.
+pub mod http_ingestion;
+
 /// The operations the generated routing table cannot serve: each one's output member
 /// targets a `@streaming` union (`StartLiveTail$responseStream`,
 /// `GetLogObject$fieldStream`), so the generated shim declines the request and
@@ -660,6 +664,9 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// `@streaming` union, so the generated shim in the entry's routing table declines the
     /// request.
     get_log_object: Dispatch<Eng>,
+    /// The HTTP INGESTION endpoints, which no routing table of the model names: a POST of
+    /// log records authenticated by a bearer credential rather than by a SigV4 signature.
+    http_ingestion: http_ingestion::HttpIngestion<Eng>,
 }
 
 /// One dispatch this service hands the router: whatever serves the request, behind the IAM
@@ -694,6 +701,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             get_log_object: authorized(Box::new(EventStreamRoute(
                 crate::ops::get_log_object::GetLogObject::new(Arc::clone(&engine)),
             ))),
+            http_ingestion: http_ingestion::HttpIngestion::new(Arc::clone(&engine)),
         }
     }
 }
@@ -713,10 +721,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // Claim a request whose resolved route key is this service's signing
         // name. Edit this for anything the model does not express — a signing
         // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
+        if let Some(key) = smithy_server_runtime::resolve_route_key(parts) {
+            if key == self.entry.identity().signing_name() {
+                return true;
+            }
         }
+        // And the HTTP INGESTION endpoints, which this service's model binds no operation
+        // for: such a request carries a bearer credential rather than a SigV4 one and
+        // addresses a path of its own, so the front door can resolve no target service for
+        // it (`crate::service::http_ingestion`).
+        http_ingestion::claims_parts(parts)
     }
 
     fn override_operation(
@@ -730,6 +744,11 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // itself is NOT overridden: the key is resolved by the model's own protocol, and a
         // request the table cannot serve is declined here so the framework's routing-error
         // path stays exactly as it was.
+        // The HTTP INGESTION endpoints first: such a request names no modelled operation
+        // at all, and the endpoint owns the whole request-to-response step.
+        if http_ingestion::claims_request(req) {
+            return Some(&self.http_ingestion as &dyn ErasedOperation);
+        }
         let operation = self.definition().protocol().routing_key(req).ok()?;
         self.definition().routing_table().get(operation)?;
         // The exceptions are the event-stream operations, whose generated shims in that

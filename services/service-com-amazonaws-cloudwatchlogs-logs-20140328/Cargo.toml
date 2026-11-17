@@ -22,7 +22,10 @@ aws-smithy-types = { workspace = true }
 tokio = { workspace = true, features = ["time"] }
 bytes = { workspace = true }
 http = { workspace = true }
-serde_json = { workspace = true }
+# `preserve_order`: a record an HTTP ingestion endpoint takes in is stored as the document
+# it arrived as (`src/state/http_ingestion.rs`), so the member order a client wrote it in is
+# part of what a reader gets back rather than re-sorted by the reader of the body.
+serde_json = { workspace = true, features = ["preserve_order"] }
 tracing = { workspace = true }
 # Opaque pagination tokens: the cursor payload is hex-encoded so a client only
 # round-trips it.
@@ -105,6 +108,9 @@ aws-sdk-ec2 = { version = "1", default-features = false }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# `automod` declares one module per `tests/all/<name>.rs` from `tests/all/main.rs`, so a
+# new suite is a new file and needs no declaration.
+automod = { workspace = true }
 sha2 = { workspace = true }
 # Decodes one `application/vnd.amazon.eventstream` frame, so the live-tail suite reads
 # `StartLiveTail`'s response the way an SDK's event-stream decoder does.
@@ -129,6 +135,11 @@ service-com-amazonaws-s3-amazons3 = { workspace = true }
 # about creating one mounts CloudTrail beside this service on the same engine and creates,
 # and deletes, the source through it.
 service-com-amazonaws-cloudtrail-cloudtrail-20131101 = { workspace = true }
+# The IAM user and the CloudWatch Logs API key an HTTP ingestion endpoint authenticates are
+# IAM's own records, so the suite about those endpoints mounts IAM beside this service on the
+# same engine and creates both through IAM's OWN API. Already a dependency of `src/`; an
+# integration test reaches it only through this list.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 # A subscription filter's LAMBDA destination is authorised by the function's own resource
 # policy, so the suite about that gate mounts AWS Lambda beside this service on the same engine
 # and writes the permission through Lambda's OWN `AddPermission`.
