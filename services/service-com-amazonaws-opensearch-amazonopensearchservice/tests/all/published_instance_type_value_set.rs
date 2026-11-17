@@ -44,13 +44,15 @@ const OFFERED_VERSION: &str = "OpenSearch_2.19";
 /// (`crate::state::published_instance_types`, which `ListInstanceTypeDetails` serves and
 /// [`super::current_generation_instance_types`] tables), sampled one size per family —
 /// including families the report that asked for this listing did not cite.
-const BEYOND_THE_SNAPSHOT: [&str; 6] = [
+const BEYOND_THE_SNAPSHOT: [&str; 8] = [
     "c7i.xlarge.search",
     "m7i.2xlarge.search",
     "c8g.16xlarge.search",
     "r8gd.medium.search",
     "oi2.4xlarge.search",
     "om2.8xlarge.search",
+    "i7i.8xlarge.search",
+    "i8g.24xlarge.search",
 ];
 
 /// `DescribeInstanceTypeLimits`:

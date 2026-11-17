@@ -590,6 +590,36 @@ pub(super) const INSTANCE_TYPE_CATALOG: &[CatalogFamily] = &[
         releases: OfferedReleases::SinceOpenSearch(GRAVITON4_SINCE_OPENSEARCH),
     },
     CatalogFamily {
+        family: "i8g",
+        instance_types: &[
+            "i8g.large.search",
+            "i8g.xlarge.search",
+            "i8g.2xlarge.search",
+            "i8g.4xlarge.search",
+            "i8g.8xlarge.search",
+            "i8g.12xlarge.search",
+            "i8g.16xlarge.search",
+            "i8g.24xlarge.search",
+        ],
+        roles: ROLES_DATA_AND_MASTER,
+        releases: OfferedReleases::SinceOpenSearch(GRAVITON4_SINCE_OPENSEARCH),
+    },
+    CatalogFamily {
+        family: "i7i",
+        instance_types: &[
+            "i7i.large.search",
+            "i7i.xlarge.search",
+            "i7i.2xlarge.search",
+            "i7i.4xlarge.search",
+            "i7i.8xlarge.search",
+            "i7i.12xlarge.search",
+            "i7i.16xlarge.search",
+            "i7i.24xlarge.search",
+        ],
+        roles: ROLES_DATA_AND_MASTER,
+        releases: OfferedReleases::SinceOpenSearch(SEVENTH_GENERATION_INTEL_SINCE_OPENSEARCH),
+    },
+    CatalogFamily {
         family: "im4gn",
         instance_types: &[
             "im4gn.large.search",
@@ -959,8 +989,8 @@ pub const LIMIT_DATA_NODES_WITHOUT_MASTER: &str = "MaximumNumberOfDataNodesWitho
 /// The instance families whose data sits on storage built into the instance rather than
 /// on an attached volume, so the only storage type they publish is
 /// [`STORAGE_TYPE_INSTANCE`].
-pub(super) const INSTANCE_STORAGE_FAMILIES: [&str; 9] = [
-    "d2", "i2", "i3", "i8ge", "im4gn", "r3", "r6gd", "r7gd", "r8gd",
+pub(super) const INSTANCE_STORAGE_FAMILIES: [&str; 11] = [
+    "d2", "i2", "i3", "i7i", "i8g", "i8ge", "im4gn", "r3", "r6gd", "r7gd", "r8gd",
 ];
 
 /// The smallest EBS volume, in GiB, every sub-type publishes — the floor a volume size

@@ -13,10 +13,13 @@
 //! The ARN is checked against the expression this service validates an application ARN
 //! against ([`APPLICATION_ARN_PATTERN`]) and then RESOLVED against the applications this
 //! account holds: the setting designates one of them, so an ARN no application of this
-//! account is addressed by is the modelled missing-resource refusal
-//! ([`crate::state::application_arn_not_found`]) and the setting in effect is left exactly
-//! as it was — a value outside the expression is refused before that, as the constraint
-//! report every other value outside its member's expression is refused with.
+//! account is addressed by is the modelled missing-resource refusal and the setting in
+//! effect is left exactly as it was — stated as the EMPTY-COLLECTION condition
+//! ([`crate::state::no_applications_for_account`]) when the account holds no application
+//! at all, and as the miss of that ARN ([`crate::state::application_arn_not_found`]) when
+//! it holds applications the ARN addresses none of. A value outside the expression is
+//! refused before that, as the constraint report every other value outside its member's
+//! expression is refused with.
 //!
 //! Either way the answer reports the application the call acted on: the ARN the request
 //! named.
@@ -192,15 +195,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // setting designates an APPLICATION, so the ARN is resolved against the ones this
         // account holds and an ARN that addresses none is the modelled missing-resource
         // refusal — answered on the status this service answers that shape on
-        // (`crate::scaffolded::RESOURCE_NOT_FOUND_STATUS`). Nothing is written for such a
-        // request, so the default in effect is the one an independent
+        // (`crate::scaffolded::RESOURCE_NOT_FOUND_STATUS`). An account holding NO
+        // application at all is the empty-collection condition rather than a miss among
+        // the ones it holds, so that is what the refusal states
+        // ([`crate::state::no_applications_for_account`]); only where there are
+        // applications to miss among does it name the ARN that missed. Nothing is written
+        // for such a request, so the default in effect is the one an independent
         // `GetDefaultApplicationSetting` still reports.
         if store.application_of_arn(&input.application_arn).is_none() {
+            let refusal = if store.applications.is_empty() {
+                crate::state::no_applications_for_account()
+            } else {
+                crate::state::application_arn_not_found(&input.application_arn)
+            };
             return Err(
-                PutDefaultApplicationSettingErrorModeled::ResourceNotFoundException(
-                    crate::state::application_arn_not_found(&input.application_arn),
-                )
-                .into(),
+                PutDefaultApplicationSettingErrorModeled::ResourceNotFoundException(refusal).into(),
             );
         }
 

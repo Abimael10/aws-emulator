@@ -100,3 +100,52 @@ Smithy cited: ListInstanceTypeDetails (GET /2021-01-01/opensearch/instanceTypeDe
 5. Cause 4: replay esdef-create-domain-gp3-server-defaults, step task#2 — DescribeDomain on the created domain; assert DomainStatus.Endpoint is a DNS hostname containing no ':' port and no '/' path segment.
 6. Cause 5: replay opensearch-application-error-paths, step task#2 — PutDefaultApplicationSetting with an applicationArn for an account that holds no applications; assert HTTP 404 with message 'No applications found for account ID: <caller account id>'.
 7. Each step should pass against the recorded response.
+
+## Resolution
+
+Cause 5 is FIXED. A lookup that resolves a value against a collection of the account
+states the EMPTY-COLLECTION condition when that collection is empty — the account the
+lookup was scoped to, and nothing of the request — and states the per-value miss only
+where there are values to miss among. `PutDefaultApplicationSetting`'s not-found branch
+now decides between the two off the applications the account holds
+(`state::no_applications_for_account`), so a write made while the account holds none is
+refused with the account-scoped statement and the same write, once one application
+exists, is refused naming the ARN. The whole
+`opensearch-application-error-paths` fixture replays clean. Held by
+`tests/all/default_application_setting.rs`.
+
+Cause 4's `Endpoint` half is FIXED (the replay key reports `fixed`): the domain publishes
+a DNS hostname, with no port and no path. Its `ServiceSoftwareOptions.CurrentVersion`
+half is DECLINED, as the report itself states — the release label is a drifting AWS value
+and is not claimed as a requirement; the emitted label has the published form and is
+stable across reads.
+
+Causes 1, 2 and 3: the catalog's MEMBERSHIP advanced. The listing for a release is the
+catalog the service publishes for it, so it carries every instance family the service's
+own accepted-value list reports; `INSTANCE_TYPE_CATALOG` now also publishes the two
+dense-storage current generations that list names and the table still omitted — the
+Graviton4 `i8g` and the seventh-generation Intel `i7i` families, 16 instance types — each
+with the roles a storage-optimized instance serves, the release its generation is offered
+from and its built-in storage kind. Every family named anywhere in this report's recorded
+evidence is now published, and `DescribeInstanceTypeLimits`' enum-value-set clause renders
+that same catalog, so the two cannot disagree. Held by
+`tests/all/current_generation_instance_types.rs` and
+`tests/all/published_instance_type_value_set.rs`.
+
+Still DECLINED, as in 20261101T032039Z and 20261030T001859Z: the ORDER the set is stated
+in, which is what the two replay keys still report. `InstanceTypeDetailsList` is a bare
+list with no ordering trait and no documented order, and the recorded orders differ
+between recordings of the SAME operation — one leads with `m7i.2xlarge.search` and places
+`c8g.12xlarge.search`, `oi2.8xlarge.search`, `r7i.12xlarge.search` at 2, 3, 4, another has
+`r7i.12xlarge.search` at 3 and `c8g.8xlarge.search` at 4, a third leads with
+`r5.large.search` and a fourth with `r4.2xlarge.search`; the bracketed set inside the
+refusal message is listed in a different order again. It is neither the modelled value
+set's order nor a sort of family, generation, size or name, so it is the per-run iteration
+order of the service's own collection rather than published content, and writing those
+positions in would be a memorised prefix rather than a rule.
+
+Also still declined: `AvailabilityZones` on an entry of a request that did not ask for
+zones. The member is modelled optional and the schema serializer writes a member only
+when it is present (`vendor/smithy-macros/src/lib.rs`), so the emulator cannot emit an
+explicit `null` without a change to the read-only framework; the zones are reported
+exactly when `retrieveAZs` asks for them.

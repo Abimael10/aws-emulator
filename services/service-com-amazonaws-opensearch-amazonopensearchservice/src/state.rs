@@ -1606,6 +1606,24 @@ pub fn application_arn_not_found(arn: &str) -> ResourceNotFoundException {
     }
 }
 
+/// The `ResourceNotFoundException` payload for a lookup made on the account's
+/// APPLICATIONS while the account holds none at all.
+///
+/// A lookup that resolves a value against a collection of the account reports the
+/// EMPTY-COLLECTION condition when the collection is empty: the account holds no
+/// application for any value to address, so what the caller is told is that the account
+/// has none — naming the account the lookup was scoped to — rather than that one value
+/// among the ones it holds could not be resolved. There is nothing of the request in
+/// this statement, because no value of the request decided it.
+pub fn no_applications_for_account() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            "No applications found for account ID: {}",
+            ::engine::emulator_account_id()
+        )),
+    }
+}
+
 /// The same refusal, naming the account the id was resolved in
 /// ([`application_not_found_for_account_message`]).
 pub fn application_not_found_for_account(id: &str) -> ResourceNotFoundException {

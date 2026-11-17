@@ -26,6 +26,10 @@
 //!   live default is left untouched — over a table of ARNs differing in partition,
 //!   Region, account and resource form, including each published length bound and the ARN
 //!   of an application that has been taken away;
+//! * the same write made while the account holds NO application at all is refused with
+//!   the empty-collection statement instead — the account the lookup was scoped to, and
+//!   nothing of the request — over the same table of ARNs, each then shown to fall back
+//!   to the per-ARN miss once the account holds one application;
 //! * a value outside the expression the service validates an application ARN against,
 //!   and one past each published length bound, are refused with `ValidationException`
 //!   and leave the stored setting untouched — the first stated as the constraint
@@ -409,6 +413,74 @@ async fn an_arn_naming_no_application_of_this_account_is_refused_and_the_default
         "case the held application: expected the setting to designate it, got {:?}",
         read.body
     );
+}
+
+#[tokio::test]
+async fn an_account_holding_no_applications_is_refused_with_the_account_scoped_statement() {
+    let account = ::engine::emulator_account_id();
+    let expected = format!("No applications found for account ID: {account}");
+
+    // The rows are the same well-formed ARNs as above — differing in partition, Region,
+    // account, resource form and length, including each published length bound — so what
+    // differs between this test and the one above is only WHETHER THE ACCOUNT HOLDS
+    // APPLICATIONS, which is the condition the statement is about. A fresh emulator per
+    // row keeps the account empty for every one of them.
+    for arn in arns_naming_no_application() {
+        let case = format!("empty account, PutDefaultApplicationSetting({}..)", label(&arn));
+        let emulator = Emulator::new();
+
+        for set_as_default in [true, false] {
+            let answer = put(&emulator, &arn, set_as_default).await;
+            assert_eq!(
+                answer.status,
+                RECORDED_NOT_FOUND_STATUS,
+                "case {case} with setAsDefault={set_as_default}: expected \
+                 {RECORDED_NOT_FOUND_STATUS}, got {} with {:?}",
+                answer.status,
+                answer.body
+            );
+            assert_eq!(
+                error_code(&answer),
+                "ResourceNotFoundException",
+                "case {case} with setAsDefault={set_as_default}: expected \
+                 ResourceNotFoundException, got {:?}",
+                answer.body
+            );
+            let stated = message(&answer, &case);
+            assert_eq!(
+                stated, expected,
+                "case {case} with setAsDefault={set_as_default}: expected {expected:?}, got \
+                 {stated:?}"
+            );
+            // The condition is the account's, not the request's, so no value of the
+            // request is in the statement.
+            assert!(
+                !stated.contains(arn.as_str()),
+                "case {case} with setAsDefault={set_as_default}: the statement names the \
+                 account, not the ARN, got {stated:?}"
+            );
+        }
+
+        // Nothing was written, so the setting is still unset.
+        let read = get(&emulator).await;
+        assert_eq!(
+            read.status, RECORDED_NOT_FOUND_STATUS,
+            "case {case}: a refused write must store nothing, got {} with {:?}",
+            read.status, read.body
+        );
+
+        // Once the account HOLDS an application, the very same ARN misses among the ones
+        // it holds, so the refusal is the per-ARN one: the collection's emptiness is what
+        // decides which condition is reported.
+        created_application(&emulator, "default-setting-first").await;
+        let answer = put(&emulator, &arn, true).await;
+        let stated = message(&answer, &case);
+        assert_eq!(
+            stated,
+            format!("Application not found for ARN: {arn}"),
+            "case {case} with one application held: expected the per-ARN miss, got {stated:?}"
+        );
+    }
 }
 
 #[tokio::test]

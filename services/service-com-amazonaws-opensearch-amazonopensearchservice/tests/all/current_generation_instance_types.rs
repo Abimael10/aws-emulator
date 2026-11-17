@@ -23,7 +23,8 @@
 //! reports — the value set its refusal of an unknown `instanceType` enumerates, which
 //! is the service's record of what it accepts and carries the seventh-generation Intel,
 //! Graviton3, Graviton4, dense-storage and second-generation OpenSearch-optimized
-//! families the checked-in enum does not list. The sizes each family is published in
+//! families the checked-in enum does not list, the Intel and Graviton4 dense-storage
+//! families (`i7i`, `i8g` beside `i8ge`) included. The sizes each family is published in
 //! are the service's published ladder for it, as [`ListInstanceTypeDetails`] reports
 //! them; this suite reads them back from the answer rather than restating them.
 
@@ -49,7 +50,7 @@ const DATA_ONLY: &[&str] = &["data"];
 /// table spans the size ladder as well as the families: the instance type, a release
 /// that offers it, the release before its family's prerequisite, and the roles an
 /// instance of the family serves.
-const CURRENT_GENERATION: [(&str, &str, &str, &[&str]); 13] = [
+const CURRENT_GENERATION: [(&str, &str, &str, &[&str]); 15] = [
     // The seventh-generation Intel families, offered for the OpenSearch engine alone.
     ("c7i.xlarge.search", "OpenSearch_2.13", "OpenSearch_2.11", DATA_MASTER_COORDINATOR),
     ("m7i.2xlarge.search", "OpenSearch_2.13", "OpenSearch_2.11", DATA_MASTER_COORDINATOR),
@@ -60,6 +61,9 @@ const CURRENT_GENERATION: [(&str, &str, &str, &[&str]); 13] = [
     ("r8g.large.search", "OpenSearch_2.15", "OpenSearch_2.13", DATA_MASTER_COORDINATOR),
     ("r8gd.medium.search", "OpenSearch_2.15", "OpenSearch_2.13", DATA_MASTER_COORDINATOR),
     ("i8ge.18xlarge.search", "OpenSearch_2.15", "OpenSearch_2.13", DATA_AND_MASTER),
+    ("i8g.4xlarge.search", "OpenSearch_2.15", "OpenSearch_2.13", DATA_AND_MASTER),
+    // The seventh-generation Intel dense-storage family.
+    ("i7i.12xlarge.search", "OpenSearch_2.13", "OpenSearch_2.11", DATA_AND_MASTER),
     // The Graviton families offered from the Graviton prerequisite onwards, so from an
     // Elasticsearch release and on every OpenSearch one.
     ("im4gn.8xlarge.search", "Elasticsearch_7.9", "Elasticsearch_7.8", DATA_AND_MASTER),
