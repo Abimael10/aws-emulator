@@ -17,7 +17,10 @@
 //! * an operation has ONE account default: a provider claiming one another provider
 //!   holds is refused `InvalidRequestException` (400) with nothing created, and the
 //!   claim is free again as soon as the provider holding it is deleted;
-//! * a name the account holds no provider under is `ResourceNotFoundException` (404).
+//! * a name the account holds no provider under is `ResourceNotFoundException` (404);
+//! * a name the account already holds a provider under is
+//!   `ResourceAlreadyExistsException` (409), worded with this family's own already-exists
+//!   sentence, and the stored provider is left as it was.
 
 use std::sync::Arc;
 
@@ -34,6 +37,9 @@ const REGION: &str = "us-west-1";
 /// The function a provider calls: its form is the caller's, so one well-formed ARN is
 /// used throughout.
 const PROVIDER_FUNCTION: &str = "arn:aws:lambda:us-west-1:000000000000:function:issuer";
+/// A second well-formed function ARN: a create refused for a taken name must not replace
+/// the stored provider's function with this one.
+const REPLACEMENT_FUNCTION: &str = "arn:aws:lambda:us-west-1:000000000000:function:other-issuer";
 
 /// One emulator: the shared engine plus a router with this service mounted.
 struct Emulator {
@@ -209,6 +215,77 @@ async fn a_created_certificate_provider_is_read_back_member_for_member() {
                 "case {name}: expected the delete to answer 200"
             );
         }
+    }
+}
+
+/// RULE: a create under a name the account already holds a certificate provider under is
+/// refused with this family's already-exists sentence — the name BRACKETED and the
+/// collision scoped to the account — and the provider that holds the name is left exactly
+/// as it was.
+#[tokio::test]
+async fn a_taken_certificate_provider_name_is_refused_with_this_familys_sentence() {
+    let operation = CERTIFICATE_PROVIDER_OPERATIONS
+        .first()
+        .expect("the model declares at least one certificate provider operation");
+    // The rows span the form `CertificateProviderName` admits
+    // (`smithy_query(query="operation",operation="CreateCertificateProvider")`: len 1..128,
+    // pattern `^[\w=,@-]+$`): a plain name, one using every character class the pattern
+    // allows, the shortest legal one, and the longest.
+    let longest = "p".repeat(128);
+    for name in ["issuer", "issuer_2-A=,@", "a", longest.as_str()] {
+        // Each row gets its own account: a provider claims an operation's account default,
+        // and an account holds one provider per operation.
+        let emulator = Emulator::new();
+        let created = emulator
+            .create_provider(name, &Emulator::claim(&[operation]))
+            .await;
+        assert_eq!(
+            created.status,
+            200,
+            "case {name}: expected the first create to answer 200, got {} body {}",
+            created.status,
+            created.text()
+        );
+
+        // The second create asks for a DIFFERENT function, so a create that overwrote the
+        // record instead of refusing would show up in the read below.
+        let duplicate = emulator
+            .create_provider(
+                name,
+                &json!({
+                    "lambdaFunctionArn": REPLACEMENT_FUNCTION,
+                    "accountDefaultForOperations": [operation],
+                }),
+            )
+            .await;
+        assert_eq!(
+            duplicate.status,
+            409,
+            "case {name}: expected 409 for a name already taken, got {} body {}",
+            duplicate.status,
+            duplicate.text()
+        );
+        assert_eq!(
+            duplicate.error_code(),
+            "ResourceAlreadyExistsException",
+            "case {name}: expected ResourceAlreadyExistsException, got {}",
+            duplicate.text()
+        );
+        assert_eq!(
+            duplicate.error_message(),
+            format!("Certificate provider [{name}] already exists for this account"),
+            "case {name}: expected this family's already-exists sentence, got {}",
+            duplicate.text()
+        );
+
+        let read = emulator.describe_provider(name).await;
+        let described = read.json();
+        assert_eq!(
+            described["lambdaFunctionArn"],
+            json!(PROVIDER_FUNCTION),
+            "case {name}: the refused create must leave the stored provider as it was, got \
+             {described}"
+        );
     }
 }
 

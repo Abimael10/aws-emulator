@@ -219,7 +219,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // The name is the provider's identity, so a name already taken is a conflict:
-        // `ResourceAlreadyExistsException` (HTTP 409).
+        // `ResourceAlreadyExistsException` (HTTP 409), worded with this family's own
+        // already-exists sentence
+        // ([`crate::state::existing_certificate_provider_message`]) rather than one
+        // phrased here, so the collision reads the same wherever it is refused.
         if let Some(existing) = store
             .certificate_providers
             .get(&input.certificate_provider_name)
@@ -227,9 +230,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateCertificateProviderErrorModeled::ResourceAlreadyExistsException(
                     ResourceAlreadyExistsException {
-                        message: Some(format!(
-                            "Certificate provider {} already exists",
-                            existing.certificate_provider_name
+                        message: Some(crate::state::existing_certificate_provider_message(
+                            &existing.certificate_provider_name,
                         )),
                         resource_id: Some(existing.certificate_provider_name.clone()),
                         resource_arn: Some(existing.certificate_provider_arn.clone()),

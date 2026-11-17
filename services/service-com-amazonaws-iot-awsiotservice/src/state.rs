@@ -3235,9 +3235,10 @@ pub use not_found::{
 // reaches them as `crate::state::<name>`.
 pub mod already_exists;
 pub use already_exists::{
-    existing_command_message, existing_job_message, existing_package_message,
-    existing_policy_message, existing_role_alias_message, existing_thing_group_message,
-    existing_thing_message, existing_thing_type_message, existing_topic_rule_message,
+    existing_certificate_provider_message, existing_command_message, existing_job_message,
+    existing_package_message, existing_policy_message, existing_role_alias_message,
+    existing_thing_group_message, existing_thing_message, existing_thing_type_message,
+    existing_topic_rule_message,
 };
 
 // What an AWS-MANAGED JOB TEMPLATE is — the published catalog `ListManagedJobTemplates`

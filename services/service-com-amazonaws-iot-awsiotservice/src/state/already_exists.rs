@@ -19,6 +19,9 @@
 //!   `current account`, with the family noun in TWO capitalised words.
 //! * The TOPIC RULE family single-quotes the name and scopes the collision to the
 //!   account: `Topic Rule '<name>' already exists for account`.
+//! * The CERTIFICATE PROVIDER family BRACKETS the name and scopes the collision to the
+//!   account: `Certificate provider [<name>] already exists for this account`
+//!   ([`existing_certificate_provider_message`]).
 //! * The SOFTWARE PACKAGE family does not report an existing resource at all: it reports
 //!   a duplicate REQUEST, as a conditional-check failure
 //!   ([`existing_package_message`]).
@@ -112,6 +115,17 @@ pub fn existing_thing_type_message(thing_type_name: &str) -> String {
 /// holds: the name SINGLE-QUOTED, and the collision scoped to the account.
 pub fn existing_topic_rule_message(rule_name: &str) -> String {
     format!("Topic Rule '{rule_name}' already exists for account")
+}
+
+/// How this service refuses a `CreateCertificateProvider` under a name the account already
+/// holds a certificate provider under.
+///
+/// This family BRACKETS the name the request carried — the way every certificate-provider
+/// refusal states a name it reports back
+/// ([`super::missing_certificate_provider_message`]) — and scopes the collision to the
+/// account, since a provider is an account-wide record rather than a regional one.
+pub fn existing_certificate_provider_message(certificate_provider_name: &str) -> String {
+    format!("Certificate provider [{certificate_provider_name}] already exists for this account")
 }
 
 /// How this service refuses a `CreatePackage` under a name the catalog already holds.
