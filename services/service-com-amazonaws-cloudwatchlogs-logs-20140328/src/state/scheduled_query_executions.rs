@@ -41,7 +41,10 @@
 //! * an Amazon S3 destination is "the Amazon S3 URI where query results are delivered": the
 //!   results are written there as an object of the object store, over the in-process callback
 //!   the way every other hop of this service to a sibling service is made, so nothing opens a
-//!   socket or leaves the host.
+//!   socket or leaves the host. One settled run writes ONE object, keyed under the URI's own
+//!   prefix by the query the results belong to and the run's `queryId`, holding the run's result
+//!   rows as the JSON document a consumer of a published result set parses
+//!   ([`results_object_key`], [`results_json`]).
 //!
 //! WHAT BOUNDS IT: one history read materialises at most [`MAX_CATCHUP_INSTANTS`] schedule
 //! instants, keeps at most [`MAX_TRIGGER_HISTORY_RECORDS`] of them per query and carries out at
@@ -555,7 +558,11 @@ pub async fn settle<Eng: Send + Sync + 'static>(
             continue;
         };
         let execution = super::insights::run(prepared).await;
-        let results = results_csv(&execution);
+        // Each destination is handed the rows in the encoding IT takes: a lookup table holds the
+        // CSV body its own operations read ([`super::parse_table_body`]), and an Amazon S3
+        // destination the JSON document a consumer of a published result set parses.
+        let table_body = results_csv(&execution);
+        let object_body = results_json(&execution);
 
         let deliveries = {
             let mut store = state.lock();
@@ -570,7 +577,8 @@ pub async fn settle<Eng: Send + Sync + 'static>(
                 identifier,
                 &query_id,
                 execution.failed.as_deref(),
-                results.as_deref(),
+                table_body.as_deref(),
+                &object_body,
                 region,
             )
         };
@@ -605,13 +613,15 @@ pub async fn settle<Eng: Send + Sync + 'static>(
 /// execution still owes.
 ///
 /// `failed` is why the run could not run at all, for a query string this service cannot
-/// execute, and `results` the rows it produced as the CSV a destination is handed.
+/// execute; `table_body` the rows it produced as the CSV a lookup table holds, and
+/// `object_body` the same rows as the JSON document an Amazon S3 destination is handed.
 fn record_run(
     store: &mut State,
     identifier: &str,
     query_id: &str,
     failed: Option<&str>,
-    results: Option<&str>,
+    table_body: Option<&str>,
+    object_body: &str,
     region: &str,
 ) -> Vec<S3Delivery> {
     let Some(configuration) = store
@@ -628,7 +638,7 @@ fn record_run(
         .and_then(|configuration| configuration.lookup_table_configuration.as_ref())
         .map(|table| match failed {
             Some(reason) => DeliveryOutcome::failed(reason.to_string()),
-            None => refresh_lookup_table(store, table, results, region),
+            None => refresh_lookup_table(store, table, table_body, region),
         });
 
     if let Some(execution) = store
@@ -661,13 +671,11 @@ fn record_run(
     else {
         return Vec::new();
     };
-    // What this run OWES the object store: an object holding its rows, or nothing at all —
-    // a run that could not run delivered nothing and says why, and one that produced no rows
-    // has no rows to write, which is a processing that completed over nothing.
-    let owed = match (failed, results) {
-        (Some(reason), _) => Err(DeliveryOutcome::failed(reason.to_string())),
-        (None, None) => Err(DeliveryOutcome::complete(None)),
-        (None, Some(body)) => match s3_uri_parts(&s3.destination_identifier) {
+    // What this run OWES the object store: the one object holding the result set it produced —
+    // a run that could not run at all delivered nothing and says why instead.
+    let owed = match failed {
+        Some(reason) => Err(DeliveryOutcome::failed(reason.to_string())),
+        None => match s3_uri_parts(&s3.destination_identifier) {
             Some((bucket, prefix)) => {
                 let name = store
                     .scheduled_query(identifier)
@@ -677,7 +685,7 @@ fn record_run(
                     uri: s3.destination_identifier.clone(),
                     bucket,
                     key: results_object_key(&prefix, &name, query_id),
-                    body: body.to_string(),
+                    body: object_body.to_string(),
                 })
             }
             // A destination that is no Amazon S3 URI addresses no bucket, so there is nowhere
@@ -712,7 +720,7 @@ struct S3Delivery {
     bucket: String,
     /// The key the results are written under.
     key: String,
-    /// The results, as the CSV a destination is handed.
+    /// The results, as the JSON document the destination is handed.
     body: String,
 }
 
@@ -728,14 +736,16 @@ fn s3_uri_parts(uri: &str) -> Option<(String, String)> {
 }
 
 /// The key one run's results are written under: the prefix the destination URI names, then the
-/// scheduled query the results belong to and the id of the run that produced them — so one
-/// prefix holds the results of several queries and of several runs without collision.
+/// scheduled query the results belong to and the id of the run that produced them, with the
+/// suffix of the JSON document the object holds — so one prefix holds the results of several
+/// queries and of several runs without collision, and a consumer that knows the run's `queryId`
+/// knows the key without listing anything.
 fn results_object_key(prefix: &str, name: &str, query_id: &str) -> String {
     let prefix = prefix.trim_end_matches('/');
     if prefix.is_empty() {
-        format!("{name}/{query_id}.csv")
+        format!("{name}/{query_id}.json")
     } else {
-        format!("{prefix}/{name}/{query_id}.csv")
+        format!("{prefix}/{name}/{query_id}.json")
     }
 }
 
@@ -869,16 +879,48 @@ fn refresh_lookup_table(
     DeliveryOutcome::complete(Some(arn))
 }
 
-/// One run's results as the CSV a destination is handed: a header row naming the fields the
-/// first row carries, then one row per result in the order the query ordered them.
+/// The fields of one result row a DESTINATION is handed: the ones the query PROJECTED.
+///
+/// `@ptr` is not among them: "the fields you specify in your query are returned, along with a
+/// @ptr field, which is the identifier for the log record. You can use the value of @ptr in a
+/// GetLogRecord operation to get the full log record" (`GetQueryResults`) — that pointer is the
+/// handle the interactive read hands a caller for fetching the whole record, not a field of the
+/// result set a delivery carries.
+fn delivered_fields(row: &[(String, String)]) -> impl Iterator<Item = &(String, String)> {
+    row.iter()
+        .filter(|(field, _)| field != super::insights::FIELD_PTR)
+}
+
+/// One run's results as the JSON document the run's Amazon S3 destination is handed: an array
+/// holding one object per result row, each carrying exactly the fields that row projected, in
+/// the order the query ordered the rows.
+///
+/// A run that produced no rows delivers the empty array: the run settled, and the object it owes
+/// its destination holds the result set it produced, which holds nothing.
+fn results_json(execution: &super::insights::Execution) -> String {
+    let rows: Vec<::serde_json::Value> = execution
+        .rows
+        .iter()
+        .map(|row| {
+            ::serde_json::Value::Object(
+                delivered_fields(row)
+                    .map(|(field, value)| {
+                        (field.clone(), ::serde_json::Value::String(value.clone()))
+                    })
+                    .collect(),
+            )
+        })
+        .collect();
+    ::serde_json::Value::Array(rows).to_string()
+}
+
+/// One run's results as the CSV a lookup-table destination holds: a header row naming the fields
+/// the first row carries, then one row per result in the order the query ordered them.
 ///
 /// `None` for a run that produced no rows: there is no header row to name, so there is nothing
 /// to deliver.
 fn results_csv(execution: &super::insights::Execution) -> Option<String> {
-    let fields: Vec<String> = execution
-        .rows
-        .first()?
-        .iter()
+    let fields: Vec<String> = delivered_fields(execution.rows.first()?)
         .map(|(field, _)| field.clone())
         .collect();
     let mut writer = ::csv::Writer::from_writer(Vec::new());

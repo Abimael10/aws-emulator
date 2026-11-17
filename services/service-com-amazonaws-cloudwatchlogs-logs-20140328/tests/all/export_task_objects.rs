@@ -171,7 +171,7 @@ impl Emulator {
     }
 
     /// The bytes `bucket` holds at `key`, read through `GetObject`.
-    async fn object(&self, case: &str, bucket: &str, key: &str) -> Vec<u8> {
+    pub(crate) async fn object(&self, case: &str, bucket: &str, key: &str) -> Vec<u8> {
         let (status, body) = self.s3("GET", &format!("/{bucket}/{key}"), b"").await;
         assert_eq!(
             status,
