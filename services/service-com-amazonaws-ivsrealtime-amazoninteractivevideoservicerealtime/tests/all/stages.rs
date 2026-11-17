@@ -1884,6 +1884,284 @@ async fn a_participant_token_reports_a_collection_member_only_when_it_holds_entr
 }
 
 // ---------------------------------------------------------------------------
+// The lifetime every minted token states
+// ---------------------------------------------------------------------------
+
+/// The published bounds of the lifetime member, from
+/// `smithy_query(query="shape",shape="ParticipantTokenDurationMinutes")` —
+/// `@range(min 1, max 20160)`. Its documented default is [`DEFAULT_DURATION`] above.
+const MIN_DURATION: i64 = 1;
+const MAX_DURATION: i64 = 20160;
+
+/// The modelled maximum of `ParticipantTokenConfigurations`
+/// (`smithy_query(query="operation",operation="CreateStage")` — `@length(min 0, max 12)`).
+const MAX_TOKEN_CONFIGURATIONS: usize = 12;
+
+/// How far a token's `expirationTime` may sit outside the window the two clock readings
+/// around the call bracket it in.
+///
+/// The service mints the token at some instant between the reading this suite takes before
+/// the call and the one it takes after it, so `expirationTime` must land between those two
+/// instants plus the lifetime the token states, however long the host stalls in between.
+/// All this covers is the sub-second truncation at each end of that window.
+const EXPIRY_ROUNDING_SLACK_SECONDS: i64 = 2;
+
+/// One row of the effective-lifetime table: the case, the `duration` the configuration
+/// asks for (`None` where it asks for none) and the lifetime the minted token must state.
+type DurationRow = (&'static str, Option<i64>, i64);
+
+/// The lifetimes this suite spans — exactly the modelled maximum number of
+/// configurations, so one request exercises the whole list bound. The rows differ along
+/// what the rule generalises over: a configuration that sizes nothing, both published
+/// bounds, a step inside each bound, the documented default asked for explicitly, a step
+/// either side of it, and middling values.
+fn duration_rows() -> Vec<DurationRow> {
+    let rows: Vec<DurationRow> = vec![
+        ("no duration at all", None, DEFAULT_DURATION),
+        ("the published minimum", Some(MIN_DURATION), MIN_DURATION),
+        ("a step inside the minimum", Some(MIN_DURATION + 1), MIN_DURATION + 1),
+        ("an hour", Some(60), 60),
+        ("a middling lifetime", Some(90), 90),
+        (
+            "a step under the documented default",
+            Some(DEFAULT_DURATION - 1),
+            DEFAULT_DURATION - 1,
+        ),
+        (
+            "the documented default, asked for explicitly",
+            Some(DEFAULT_DURATION),
+            DEFAULT_DURATION,
+        ),
+        (
+            "a step over the documented default",
+            Some(DEFAULT_DURATION + 1),
+            DEFAULT_DURATION + 1,
+        ),
+        ("a day", Some(1440), 1440),
+        ("a week", Some(10080), 10080),
+        ("a step inside the maximum", Some(MAX_DURATION - 1), MAX_DURATION - 1),
+        ("the published maximum", Some(MAX_DURATION), MAX_DURATION),
+    ];
+    assert_eq!(
+        rows.len(),
+        MAX_TOKEN_CONFIGURATIONS,
+        "the table spans the whole modelled list bound of {MAX_TOKEN_CONFIGURATIONS} \
+         configurations, got {} rows",
+        rows.len()
+    );
+    rows
+}
+
+/// One `participantTokenConfigurations` entry for a row, identified by the `userId` the
+/// token carries back so each token is matched to the configuration it came from.
+fn sized_configuration(index: usize, duration: Option<i64>) -> Value {
+    let mut configuration = json!({ "userId": format!("sized-{index}") });
+    if let Some(duration) = duration {
+        configuration["duration"] = json!(duration);
+    }
+    configuration
+}
+
+/// Every token `CreateStage` mints states the EFFECTIVE lifetime it was issued for: the
+/// `duration` its own configuration asked for, or the lifetime the model documents on the
+/// reported member where the configuration asked for none — on every entry of the list, up
+/// to the modelled maximum of twelve, in the order the configurations were sent, and with
+/// `expirationTime` that many minutes out.
+#[tokio::test]
+async fn create_stage_states_the_effective_lifetime_of_every_token_it_mints() {
+    let emulator = Emulator::new();
+    let rows = duration_rows();
+    let configurations: Vec<Value> = rows
+        .iter()
+        .enumerate()
+        .map(|(index, (_, requested, _))| sized_configuration(index, *requested))
+        .collect();
+
+    let issued_before = now_secs();
+    let (status, response) = emulator
+        .call(
+            "CreateStage",
+            &json!({
+                "name": "sized-tokens",
+                "participantTokenConfigurations": configurations,
+            }),
+        )
+        .await;
+    let issued_after = now_secs();
+    assert_eq!(status, 200, "CreateStage: expected 200, got {response}");
+    let tokens = response["participantTokens"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        tokens.len(),
+        rows.len(),
+        "expected one token per configuration ({}), got {response}",
+        rows.len()
+    );
+
+    for (index, (case, requested, effective)) in rows.iter().enumerate() {
+        let token = &tokens[index];
+        // Each token belongs to its own configuration, so the lifetimes below are read off
+        // the right one.
+        assert_eq!(
+            token["userId"],
+            json!(format!("sized-{index}")),
+            "case {case:?}: expected the token of configuration {index}, got {token}"
+        );
+        assert_eq!(
+            token.get("duration").and_then(Value::as_i64),
+            Some(*effective),
+            "case {case:?}: expected the effective duration {effective} for a \
+             configuration asking for {requested:?}, got {token}"
+        );
+        assert!(
+            (MIN_DURATION..=MAX_DURATION).contains(effective),
+            "case {case:?}: expected a duration inside the published range \
+             {MIN_DURATION}..={MAX_DURATION}, got {effective}"
+        );
+        // The lifetime it states is the one its expiry was computed from, so a client can
+        // validate the one against the other. The token was minted between the two clock
+        // readings around the call, so its expiry must land between them plus the lifetime
+        // it states: that brackets the derivation exactly, however long the host stalled
+        // during the call, and still separates lifetimes a minute apart.
+        let expiry = timestamp_secs(&token["expirationTime"]);
+        let window = (issued_before + effective * 60 - EXPIRY_ROUNDING_SLACK_SECONDS)
+            ..=(issued_after + effective * 60 + EXPIRY_ROUNDING_SLACK_SECONDS);
+        assert!(
+            window.contains(&expiry),
+            "case {case:?}: expected an expirationTime {effective} minutes past the \
+             instant the token was minted (inside {window:?}), got {expiry} in {token}"
+        );
+    }
+
+    // The create that minted them is backed by a stage a later reader sees.
+    let arn = response["stage"]["arn"].as_str().unwrap_or_default();
+    let (status, read) = emulator.call("GetStage", &json!({ "arn": arn })).await;
+    assert_eq!(status, 200, "GetStage {arn}: got {status} {read}");
+    assert_eq!(
+        read["stage"]["arn"],
+        json!(arn),
+        "expected GetStage to read back the created stage, got {read}"
+    );
+}
+
+/// A configuration that sizes a token OUTSIDE the published range is refused as a
+/// validation failure naming that entry's own `duration`, and the refused request creates
+/// no stage; a configuration on either published bound is accepted wherever it sits in the
+/// list.
+#[tokio::test]
+async fn create_stage_holds_every_configuration_to_the_published_duration_range() {
+    let emulator = Emulator::new();
+
+    // Rows differ along the value (each bound, one step past each bound, far past one) and
+    // along the POSITION the offending configuration sits at, so the refusal is exercised
+    // beyond the first entry.
+    let refused: Vec<(&str, i64, usize)> = vec![
+        ("one step below the minimum", MIN_DURATION - 1, 1),
+        ("far below the minimum", -5, 2),
+        ("one step above the maximum", MAX_DURATION + 1, 1),
+        (
+            "far above the maximum, at the last entry",
+            100_000,
+            MAX_TOKEN_CONFIGURATIONS,
+        ),
+    ];
+    for (case, duration, position) in refused {
+        let configurations: Vec<Value> = (1..=position)
+            .map(|entry| {
+                sized_configuration(entry, (entry == position).then_some(duration))
+            })
+            .collect();
+        let (status, response) = emulator
+            .call(
+                "CreateStage",
+                &json!({ "participantTokenConfigurations": configurations }),
+            )
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?} (duration {duration} at entry {position}): expected 400, got \
+             {status} {response}"
+        );
+        assert_eq!(
+            error_code(&response),
+            "ValidationException",
+            "case {case:?}: got {response}"
+        );
+        let message = response["message"].as_str().unwrap_or_default();
+        // The whole sentence, as this service words a constraint refusal (recorded:
+        // "CreateParticipantToken.duration is required to have a maximum value of
+        // 20160.0, found 20161.0"): the operation, the dotted path of the OFFENDING list
+        // entry's own member, the bound it violated and the value it carried — so a
+        // message naming another entry or another bound fails the case.
+        let bound = if duration < MIN_DURATION {
+            format!("minimum value of {MIN_DURATION}.0")
+        } else {
+            format!("maximum value of {MAX_DURATION}.0")
+        };
+        let expected = format!(
+            "CreateStage.participantTokenConfigurations.{position}.member.duration is \
+             required to have a {bound}, found {duration}.0"
+        );
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected the refusal {expected:?}, got {message:?}"
+        );
+    }
+
+    // Nothing the refusals asked for was persisted: a refused create leaves no stage.
+    let (status, listed) = emulator.call("ListStages", &json!({})).await;
+    assert_eq!(status, 200, "ListStages: got {status} {listed}");
+    let stages = listed["stages"].as_array().cloned().unwrap_or_default();
+    assert!(
+        stages.is_empty(),
+        "expected a refused CreateStage to leave no stage behind, got {listed}"
+    );
+
+    // Both published bounds are accepted, at a position other than the first.
+    for bound in [MIN_DURATION, MAX_DURATION] {
+        let configurations = vec![
+            sized_configuration(1, None),
+            sized_configuration(2, Some(bound)),
+        ];
+        let (status, response) = emulator
+            .call(
+                "CreateStage",
+                &json!({ "participantTokenConfigurations": configurations }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "bound {bound}: expected the published bound to be accepted, got {status} \
+             {response}"
+        );
+        let tokens = response["participantTokens"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            tokens.len(),
+            2,
+            "bound {bound}: expected one token per configuration, got {response}"
+        );
+        assert_eq!(
+            tokens[0].get("duration").and_then(Value::as_i64),
+            Some(DEFAULT_DURATION),
+            "bound {bound}: expected the unsized configuration's token to state the \
+             documented default, got {}",
+            tokens[0]
+        );
+        assert_eq!(
+            tokens[1].get("duration").and_then(Value::as_i64),
+            Some(bound),
+            "bound {bound}: expected the sized configuration's token to state it, got {}",
+            tokens[1]
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Request claiming
 // ---------------------------------------------------------------------------
 
