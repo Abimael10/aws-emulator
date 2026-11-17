@@ -511,8 +511,12 @@ async fn a_read_resolves_an_association_by_the_id_its_create_minted() {
         ("another Region's view of an id", OTHER_REGION, second_id),
     ];
     for (case, region, association_id) in rows {
-        let (status, parsed) =
-            describe_in_region(&router, region, &json!({"AssociationId": association_id})).await;
+        let (status, parsed) = describe_in_region(
+            &router,
+            region,
+            &json!({"AssociationId": association_id.clone()}),
+        )
+        .await;
         assert_eq!(
             (status, error_code(&parsed).as_str()),
             (400, "AssociationDoesNotExist"),
@@ -521,8 +525,9 @@ async fn a_read_resolves_an_association_by_the_id_its_create_minted() {
         );
         assert_eq!(
             error_message(&parsed),
-            associations::ASSOCIATION_DOES_NOT_EXIST,
-            "case {case:?}: expected the modelled refusal sentence, got {parsed:?}"
+            associations::association_does_not_exist(&association_id),
+            "case {case:?}: expected the refusal to name the association asked about, got \
+             {parsed:?}"
         );
     }
 

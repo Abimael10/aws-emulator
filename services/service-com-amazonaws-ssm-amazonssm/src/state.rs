@@ -246,6 +246,10 @@ pub mod associations;
 /// that creates one and the one that creates a batch of them.
 pub mod association_create;
 
+/// The executions of a State Manager association: what the runs an association has had
+/// report, and what the nodes one of those runs reached report.
+pub mod association_executions;
+
 /// The resource policies attached to this account's Systems Manager resources, and the
 /// hash that keeps two writers from overwriting each other's.
 pub mod resource_policies;

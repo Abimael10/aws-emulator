@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAssociationExecutions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAssociationExecutions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAssociationExecutions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Views all executions for a specific association ID": the executions of an association
+//! are the runs State Manager has dispatched it in — the run a create started and every one
+//! `StartAssociationsOnce` started since — so this read reports what those dispatches
+//! persisted ([`crate::state::association_executions`]) and writes nothing. An id that names
+//! no association of the Region the request was signed for is `AssociationDoesNotExist`, and
+//! a run that reached no registered node is an execution all the same, one that reports no
+//! result because it has no target to report one.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +150,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAssociationExecutions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAssociationExecutionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAssociationExecutions"))
+        // `AssociationId`'s presence and pattern, `MaxResults`' range, the filter list's
+        // length and each filter's required key, value and type are MODELLED constraints the
+        // centralized walk has already refused anything outside of. What is read here is
+        // which association the id resolves to, which of its executions the filters admit
+        // and where the page starts.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeAssociationExecutionsErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the association store is unavailable".to_string()),
+            })
+        })?;
+
+        let filters = input.filters.clone().unwrap_or_default();
+        // A filter that names no attribute of an execution, or an operator the attribute it
+        // names does not accept, narrows this report by nothing, so it is refused rather
+        // than served as if it had been applied.
+        for filter in &filters {
+            if let Some(rejection) = association_executions::execution_filter_rejection(
+                &filter.key,
+                &filter.value,
+                &filter.r#type,
+            ) {
+                return Err(crate::scaffolded::Scaffolded::validation(rejection));
+            }
+        }
+
+        let page_size = associations::association_page_size(input.max_results)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let store = state.lock();
+
+        // The specified association doesn't exist (`AssociationDoesNotExist`): an
+        // association is reachable through the Region it was created in, by the id that
+        // create minted, and the refusal NAMES the id that resolved to none.
+        let Some(association) = store.association(&region, &input.association_id) else {
+            return Err(
+                DescribeAssociationExecutionsErrorModeled::AssociationDoesNotExist(
+                    AssociationDoesNotExist {
+                        message: Some(associations::association_does_not_exist(
+                            &input.association_id,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Two filters narrow together: an execution is reported only when every filter the
+        // request carries admits it.
+        let admitted: Vec<&associations::AssociationRunRecord> = association
+            .reported_executions()
+            .into_iter()
+            .filter(|run| {
+                filters.iter().all(|filter| {
+                    run.matches_execution_filter(&filter.key, &filter.value, &filter.r#type, now)
+                })
+            })
+            .collect();
+
+        // The token this operation hands out is the id of the execution the next page starts
+        // at, so a token naming no execution this association still holds was not one of
+        // ours.
+        let start = match crate::state::non_empty(input.next_token.as_deref()) {
+            None => 0,
+            Some(token) => admitted
+                .iter()
+                .position(|run| run.execution_id == token)
+                .ok_or_else(|| {
+                    DescribeAssociationExecutionsError::from(
+                        DescribeAssociationExecutionsErrorModeled::InvalidNextToken(
+                            InvalidNextToken {
+                                message: Some(crate::state::INVALID_NEXT_TOKEN.to_string()),
+                            },
+                        ),
+                    )
+                })?,
+        };
+
+        let page: Vec<AssociationExecution> = admitted
+            .iter()
+            .skip(start)
+            .take(page_size)
+            .map(|run| run.to_association_execution(association, now))
+            .collect();
+        // The page is full and an execution is still waiting: the caller is handed the id it
+        // resumes at, so the next request continues where this one stopped.
+        let next_token = admitted
+            .get(start + page.len())
+            .map(|run| run.execution_id.clone());
+
+        Ok(DescribeAssociationExecutionsOutput {
+            association_executions: Some(page),
+            next_token,
+        })
     }
 }
+
+// The association slice of this service's store: the records a create wrote and the page
+// size an association read serves, and the executions those records hold — what each one
+// reports and the one reading of an execution filter.
+use crate::state::{association_executions, associations};

@@ -182,9 +182,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let store = state.lock();
 
-        let does_not_exist = || {
+        // The refusal NAMES the association the request asked about
+        // ([`crate::state::associations::association_does_not_exist`]); a request that
+        // addressed the association by the document and the node a create paired carried no
+        // id to name, so it is refused with the sentence that names none.
+        let does_not_exist = |association_id: Option<&str>| {
             DescribeAssociationErrorModeled::AssociationDoesNotExist(AssociationDoesNotExist {
-                message: Some(crate::state::associations::ASSOCIATION_DOES_NOT_EXIST.to_string()),
+                message: Some(association_id.map_or_else(
+                    || crate::state::associations::ASSOCIATION_DOES_NOT_EXIST.to_string(),
+                    crate::state::associations::association_does_not_exist,
+                )),
             })
         };
         // An association id names ONE association; the document name and the node id of a
@@ -195,13 +202,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let name = non_empty(input.name.as_deref());
         let instance_id = non_empty(input.instance_id.as_deref());
         let held = match (association_id, name, instance_id) {
-            (Some(id), _, _) => store.association(&region, id).ok_or_else(does_not_exist)?,
+            (Some(id), _, _) => store
+                .association(&region, id)
+                .ok_or_else(|| does_not_exist(Some(id)))?,
             // The pairing form: the association of that document on that node. The node ids
             // an association TARGETS are criteria resolved when it is dispatched rather than
             // an identity it is held under, so only the node a create named resolves here.
             (None, Some(name), Some(instance_id)) => store
                 .association_of_node(&region, name, instance_id)
-                .ok_or_else(does_not_exist)?,
+                .ok_or_else(|| does_not_exist(None))?,
             (None, _, _) => {
                 return Err(crate::scaffolded::Scaffolded::validation(
                     "Either AssociationId or both Name and InstanceId must be specified",

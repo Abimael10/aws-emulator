@@ -95,7 +95,7 @@ fn dispatched_nodes(engine: &Arc<engine::InMemoryEngine>, association_id: &str) 
         .associations
         .values()
         .find(|held| held.association_id == association_id)
-        .and_then(|held| held.last_run.as_ref())
+        .and_then(|held| held.last_run())
         .map(|run| run.nodes.clone())
         .unwrap_or_default()
 }
@@ -107,7 +107,7 @@ fn age_runs(engine: &Arc<engine::InMemoryEngine>) {
     let state = engine.state::<ComAmazonawsSsmAmazonssmState>();
     let mut store = state.lock();
     for held in store.associations.values_mut() {
-        if let Some(run) = held.last_run.as_mut() {
+        if let Some(run) = held.last_run_mut() {
             run.started_at -= associations::ASSOCIATION_EXECUTION_DELAY + Duration::from_secs(1);
         }
     }

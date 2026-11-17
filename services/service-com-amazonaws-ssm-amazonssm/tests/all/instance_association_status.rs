@@ -190,8 +190,7 @@ fn finish_run(engine: &Arc<engine::InMemoryEngine>, association_id: &str) {
         .association_mut(REGION, association_id)
         .expect("the create persisted the association");
     let run = record
-        .last_run
-        .as_mut()
+        .last_run_mut()
         .expect("the create dispatched a run");
     run.started_at -= associations::ASSOCIATION_EXECUTION_DELAY + Duration::from_secs(1);
 }
@@ -971,10 +970,9 @@ fn stored_runs(engine: &Arc<engine::InMemoryEngine>) -> Vec<(String, Option<Syst
         .map(|record| {
             (
                 record.association_id.clone(),
-                record.last_run.as_ref().map(|run| run.started_at),
+                record.last_run().map(|run| run.started_at),
                 record
-                    .last_run
-                    .as_ref()
+                    .last_run()
                     .map(|run| run.nodes.clone())
                     .unwrap_or_default(),
             )

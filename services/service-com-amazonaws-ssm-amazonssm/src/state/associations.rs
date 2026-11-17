@@ -20,13 +20,20 @@
 //!
 //! An association RUNS against the managed nodes its targets select: State Manager applies
 //! it as soon as it is created, and `StartAssociationsOnce` applies it again on demand.
-//! What a run is here is [`AssociationRunRecord`] — the instant it started and the nodes it
-//! was dispatched to, resolved from the node store at that instant — and its result is
-//! derived from that stored instant ([`ASSOCIATION_EXECUTION_DELAY`]) rather than written
-//! by a read, so two callers see the same thing whether or not either of them called. An
-//! association whose targets select NO registered node has nothing to dispatch to, so it
-//! reports no execution at all and stays `Pending`, which is what an association targeting
-//! an instance that never became a managed node reports in the real service too.
+//! What a run is here is [`AssociationRunRecord`] — the id it is reported by, the version it
+//! ran, the instant it started and the nodes it was dispatched to, resolved from the node
+//! store at that instant — and its result is derived from that stored instant
+//! ([`ASSOCIATION_EXECUTION_DELAY`]) rather than written by a read, so two callers see the
+//! same thing whether or not either of them called. An association whose targets select NO
+//! registered node has no node to report a result, so it reports none and stays `Pending`,
+//! which is what an association targeting an instance that never became a managed node
+//! reports in the real service too.
+//!
+//! An association keeps the runs it has had, oldest first ([`AssociationRecord::executions`]),
+//! because every one of them is an EXECUTION of it: "Views all executions for a specific
+//! association ID" (`DescribeAssociationExecutions`), so dispatching the association again
+//! adds an execution rather than rewriting the one before it. What those executions report is
+//! [`super::association_executions`].
 //!
 //! A create is owed its move off `Creating` ([`ASSOCIATION_CREATION_DELAY`]) the same way.
 
@@ -104,6 +111,17 @@ pub const MAX_ASSOCIATIONS_PER_REGION: usize = 2_000;
 /// space and the store could grow without bound.
 pub const MAX_ASSOCIATIONS_TOTAL: usize = 2 * MAX_ASSOCIATIONS_PER_REGION;
 
+/// How many runs of ONE association this store keeps, newest last
+/// ([`AssociationRecord::executions`]).
+///
+/// Emulator resource guard, NOT a published AWS quota: an association can be dispatched
+/// again as often as a caller asks, and the store is held in memory for as long as the
+/// process runs — so without a ceiling the executions of one association would grow without
+/// bound. A dispatch past it drops the association's OLDEST execution rather than being
+/// refused, because dispatching an association is not something the service refuses for
+/// having run it before.
+pub const MAX_ASSOCIATION_EXECUTIONS: usize = 100;
+
 /// How many versions ONE association keeps: "You have reached the maximum number versions
 /// allowed for an association. Each association has a limit of 1,000 versions"
 /// (`AssociationVersionLimitExceeded`). An update past it is refused with that error rather
@@ -150,8 +168,21 @@ pub const INVALID_SCHEDULE: &str =
 /// and TargetMaps can't be specified together" (`CreateAssociationRequest$TargetMaps`).
 pub const TARGETS_AND_TARGET_MAPS: &str = "Both Targets and TargetMaps can't be specified together";
 
-/// How this service states an association an id names none of. `AssociationDoesNotExist`'s
-/// own documentation is "The specified association doesn't exist."
+/// How this service states that an id names no association of the endpoint a READ of one was
+/// asked through: `AssociationDoesNotExist` NAMES the association the request asked about —
+/// "Association <AssociationId> does not exist." — where the fixed text is
+/// "Association … does not exist." and the variable part is the id the request carried, so a
+/// caller reading the refusal can tell which association is gone.
+///
+/// THE ONE wording of that refusal for the reads that resolve an association by the id their
+/// request carries: `DescribeAssociation` and the two reads of an association's executions.
+pub fn association_does_not_exist(association_id: &str) -> String {
+    format!("Association {association_id} does not exist.")
+}
+
+/// The same refusal where no id is there to name, and where the operation answers the error's
+/// own documented sentence: a read addressed by the document and the node a create paired,
+/// which carries no association id, and the operations that DISPATCH or change an association.
 pub const ASSOCIATION_DOES_NOT_EXIST: &str = "The specified association doesn't exist.";
 
 /// How this service states an `AssociationVersion` the association does not hold.
@@ -353,9 +384,11 @@ pub struct AssociationRecord {
     /// The tag set the association carries, written by its create and by the tag
     /// operations (`super::tagging`).
     pub tags: BTreeMap<String, String>,
-    /// The most recent run of this association, or `None` for one that has never been
-    /// dispatched to a node — see [`AssociationRunRecord`].
-    pub last_run: Option<AssociationRunRecord>,
+    /// Every run this association has had, oldest first and EMPTY for one that has never
+    /// been dispatched — see [`AssociationRunRecord`]. Each one is an execution of the
+    /// association ([`super::association_executions`]); the last is its most recent
+    /// ([`AssociationRecord::last_run`]).
+    pub executions: Vec<AssociationRunRecord>,
 }
 
 /// One run of an association: when State Manager dispatched it, and to which managed nodes.
@@ -366,6 +399,13 @@ pub struct AssociationRecord {
 /// written by anything: it has finished once [`ASSOCIATION_EXECUTION_DELAY`] has passed.
 #[derive(Debug, Clone)]
 pub struct AssociationRunRecord {
+    /// "The execution ID for the association" (`AssociationExecution$ExecutionId`), minted
+    /// once when the run is dispatched and held with it, so every read of this execution
+    /// reports the one id and no two executions share one.
+    pub execution_id: String,
+    /// The number of the association version this run applied: the version in force when it
+    /// was dispatched, which is what `AssociationExecution$AssociationVersion` reports.
+    pub association_version: u64,
     /// When the run was dispatched.
     pub started_at: SystemTime,
     /// The ids of the managed nodes it was dispatched to, in ascending node-id order. EMPTY
@@ -384,6 +424,31 @@ impl AssociationRunRecord {
     /// dispatched to none has no node to report a result.
     pub fn has_finished(&self, now: SystemTime) -> bool {
         !self.nodes.is_empty() && now >= self.finished_at()
+    }
+
+    /// The status this run reports as of `now`: a run that has finished applied the document
+    /// on every node it was dispatched to, which is `Success`; until then no execution of it
+    /// has reported a result, which is `Pending`.
+    ///
+    /// THE ONE reading of a run's status across this service, so the association's own
+    /// reads, its per-node status reports and its executions cannot disagree about how far
+    /// one run has got.
+    pub fn status(&self, now: SystemTime) -> &'static str {
+        if self.has_finished(now) {
+            ASSOCIATION_STATUS_SUCCESS
+        } else {
+            ASSOCIATION_STATUS_PENDING
+        }
+    }
+
+    /// The detail of that status: the result a finished run finished with, and the work
+    /// still being gone through on its nodes until then.
+    pub fn detailed_status(&self, now: SystemTime) -> &'static str {
+        if self.has_finished(now) {
+            ASSOCIATION_DETAILED_STATUS_SUCCESS
+        } else {
+            ASSOCIATION_DETAILED_STATUS_IN_PROGRESS
+        }
     }
 }
 
@@ -407,7 +472,7 @@ impl AssociationRecord {
             created_at,
             versions: vec![version],
             tags,
-            last_run: None,
+            executions: Vec::new(),
         }
     }
 
@@ -415,13 +480,36 @@ impl AssociationRecord {
     /// is what a create and a `StartAssociationsOnce` do: "Runs an association immediately
     /// and only one time" (`StartAssociationsOnce`).
     ///
-    /// The run REPLACES whatever this association last ran: an association reports its most
-    /// recent execution, so starting one again is what makes the next report that run's.
+    /// The run is APPENDED to the runs this association has had: each one is an execution of
+    /// it, so dispatching it again adds an execution rather than rewriting the one before it,
+    /// and the association's own reads report the one it ran LAST
+    /// ([`AssociationRecord::last_run`]). The id the execution is reported by is minted here,
+    /// once, and the version it ran is the one in force at the dispatch.
     pub fn start_run(&mut self, nodes: Vec<String>, now: SystemTime) {
-        self.last_run = Some(AssociationRunRecord {
+        self.executions.push(AssociationRunRecord {
+            execution_id: super::new_uuid(),
+            association_version: self.latest_version(),
             started_at: now,
             nodes,
         });
+        // The oldest executions go once the association holds the most this store keeps of
+        // one ([`MAX_ASSOCIATION_EXECUTIONS`]), so a scheduled association cannot grow the
+        // store without bound.
+        if self.executions.len() > MAX_ASSOCIATION_EXECUTIONS {
+            let over = self.executions.len() - MAX_ASSOCIATION_EXECUTIONS;
+            self.executions.drain(..over);
+        }
+    }
+
+    /// The most recent run of this association, or `None` for one that has never been
+    /// dispatched: the run every read of the association itself reports.
+    pub fn last_run(&self) -> Option<&AssociationRunRecord> {
+        self.executions.last()
+    }
+
+    /// The same run, to move the instant it was dispatched at.
+    pub fn last_run_mut(&mut self) -> Option<&mut AssociationRunRecord> {
+        self.executions.last_mut()
     }
 
     /// Whether State Manager runs this association on the CALL that applied the version it
@@ -441,7 +529,7 @@ impl AssociationRecord {
     /// The run of this association that had finished by `now`, or `None` when it has never
     /// been dispatched to a node or its latest run is still in progress.
     pub fn finished_run(&self, now: SystemTime) -> Option<&AssociationRunRecord> {
-        self.last_run.as_ref().filter(|run| run.has_finished(now))
+        self.last_run().filter(|run| run.has_finished(now))
     }
 
     /// The version this association holds last, which is what a read that names none
@@ -519,8 +607,7 @@ impl AssociationRecord {
         }
         let creating = now < self.created_at + ASSOCIATION_CREATION_DELAY;
         let dispatched = self
-            .last_run
-            .as_ref()
+            .last_run()
             .is_some_and(|run| !run.nodes.is_empty());
         let detailed_status = if creating {
             Some(ASSOCIATION_DETAILED_STATUS_CREATING.to_string())
@@ -721,8 +808,7 @@ impl AssociationRecord {
     /// ([`AssociationRunRecord`]), so a node registered after the dispatch is not one this
     /// run reached.
     pub fn run_on_node(&self, instance_id: &str) -> Option<&AssociationRunRecord> {
-        self.last_run
-            .as_ref()
+        self.last_run()
             .filter(|run| run.nodes.iter().any(|node| node == instance_id))
     }
 
@@ -751,7 +837,6 @@ impl AssociationRecord {
     ) -> InstanceAssociationStatusInfo {
         let version = self.latest();
         let run = self.run_on_node(instance_id);
-        let finished = run.is_some_and(|run| run.has_finished(now));
         InstanceAssociationStatusInfo {
             association_id: Some(self.association_id.clone()),
             name: Some(self.name.clone()),
@@ -759,21 +844,14 @@ impl AssociationRecord {
             association_version: Some(self.latest_version().to_string()),
             instance_id: Some(instance_id.to_string()),
             execution_date: run.map(|run| ::aws_smithy_types::DateTime::from(run.started_at)),
+            // A node no run has reached reports the status of an association nothing has
+            // run, and a run that reached it reports how far that run has got
+            // ([`AssociationRunRecord::status`]).
             status: Some(
-                if finished {
-                    ASSOCIATION_STATUS_SUCCESS
-                } else {
-                    ASSOCIATION_STATUS_PENDING
-                }
-                .to_string(),
+                run.map_or(ASSOCIATION_STATUS_PENDING, |run| run.status(now))
+                    .to_string(),
             ),
-            detailed_status: run.map(|_| {
-                if finished {
-                    ASSOCIATION_DETAILED_STATUS_SUCCESS.to_string()
-                } else {
-                    ASSOCIATION_DETAILED_STATUS_IN_PROGRESS.to_string()
-                }
-            }),
+            detailed_status: run.map(|run| run.detailed_status(now).to_string()),
             execution_summary: None,
             error_code: None,
             output_url: None,
