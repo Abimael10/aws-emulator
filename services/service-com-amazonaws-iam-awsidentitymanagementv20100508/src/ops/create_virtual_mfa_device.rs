@@ -249,15 +249,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The path and the name together identify the device, so a create for a pair the
         // account already holds a device under is a conflict rather than a second device.
-        // Every word of the refusal is fixed: what it reports is that the account already
-        // holds a device at that path and name, which the request itself names.
+        // The refusal is IAM's own sentence for that class
+        // ([`crate::state::VIRTUAL_MFA_DEVICE_ALREADY_EXISTS`]): entirely fixed text, which
+        // interpolates neither the name nor the path the request named.
         if store.virtual_mfa_devices.contains_key(&serial_number) {
             return Err(
                 CreateVirtualMFADeviceErrorModeled::EntityAlreadyExistsException(
                     EntityAlreadyExistsException {
                         message: Some(
-                            "MFADevice entity at the same path and name already exists."
-                                .to_string(),
+                            crate::state::VIRTUAL_MFA_DEVICE_ALREADY_EXISTS.to_string(),
                         ),
                     },
                 )

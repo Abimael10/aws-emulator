@@ -9,8 +9,9 @@
 //! a device provisioned with that seed emits ([`virtual_mfa_device_answers`],
 //! [`virtual_mfa_device_answers_in_sequence`], [`virtual_mfa_device_resync_step`]), the
 //! sentences every operation on a device refuses one with
-//! ([`INVALID_AUTHENTICATION_CODE`], [`mfa_device_not_found_message`],
-//! [`mfa_device_not_found_for_user_message`], [`mfa_device_already_enabled_message`]) and the
+//! ([`INVALID_AUTHENTICATION_CODE`], [`VIRTUAL_MFA_DEVICE_ALREADY_EXISTS`],
+//! [`mfa_device_not_found_message`], [`mfa_device_not_found_for_user_message`],
+//! [`mfa_device_already_enabled_message`]) and the
 //! report every reader of a device makes
 //! ([`ComAmazonawsIamAwsidentitymanagementv20100508State::virtual_mfa_device_report`]).
 
@@ -317,6 +318,16 @@ const PASS_CODE_RESYNC_DRIFT_STEPS: u64 = 4;
 /// Entirely fixed text: it quotes neither code back and names neither the device nor the
 /// user, because what it reports is that the codes were not the device's.
 pub const INVALID_AUTHENTICATION_CODE: &str = "Authentication code for device is not valid.";
+
+/// How IAM refuses a create for a path and name the account ALREADY holds a virtual MFA
+/// device under — the `EntityAlreadyExistsException` of `CreateVirtualMFADevice`.
+///
+/// Entirely fixed text: the sentence names the KIND of entity the account already holds and
+/// interpolates neither the device's name nor its path, unlike the sentences of the
+/// entity-already-exists family whose kind publishes a name clause
+/// ([`mfa_device_already_enabled_message`] is one of those). A refused request already
+/// carries the pair it named, so the refusal quotes nothing of it back.
+pub const VIRTUAL_MFA_DEVICE_ALREADY_EXISTS: &str = "MFA device already exists.";
 
 /// How IAM refuses a `SerialNumber` the account holds NO MFA device under: the fixed text
 /// `MFA Device with serial number ` … ` does not exist.` carrying the serial the request

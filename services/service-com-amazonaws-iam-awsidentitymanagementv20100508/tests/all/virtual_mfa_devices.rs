@@ -33,6 +33,15 @@ const BASE32_SEED_CHARACTERS: usize = 32;
 /// signature"), which is what says the `QRCodePNG` member carries a PNG image.
 const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
 
+/// IAM's whole refusal for a create naming a path and name the account already holds a
+/// virtual MFA device under, written out here rather than read from the implementation's
+/// constant: what these suites pin is the SENTENCE IAM answers, so a reworded constant has
+/// to fail here rather than agree with itself.
+///
+/// Entirely fixed text — the kind of entity the account already holds, with neither the
+/// device's name nor its path in it.
+const DEVICE_ALREADY_EXISTS: &str = "MFA device already exists.";
+
 /// One device a row provisions: the path it is created under, the name it is spelled with,
 /// and the tags it carries.
 pub(crate) struct Provisioned {
@@ -380,9 +389,10 @@ async fn a_second_create_at_one_path_and_name_is_a_conflict() {
         );
         assert_eq!(
             element(&body, "Message"),
-            "MFADevice entity at the same path and name already exists.",
-            "case {:?}: expected IAM's wording for a device that already exists: {body}",
-            row.case
+            DEVICE_ALREADY_EXISTS,
+            "case {:?}: expected {DEVICE_ALREADY_EXISTS:?}, got {:?}: {body}",
+            row.case,
+            element(&body, "Message")
         );
 
         // The same NAME under another path is another device, so the account then holds
@@ -480,3 +490,169 @@ async fn attached_tags_are_the_devices_and_a_reserved_key_creates_nothing() {
         );
     }
 }
+
+/// The duplicate refusal's text is IAM's one FIXED sentence for the device kind: whatever
+/// path the held device sits under, whatever its name is spelled with and whatever either
+/// create carries, the whole message is the same and quotes nothing of the request back.
+///
+/// The rows are the table above — path, name alphabet and tag count all vary — and each
+/// repeat carries a DIFFERENT tag set from the create that was accepted, so a message built
+/// out of the request would have to differ somewhere across them.
+#[tokio::test]
+async fn the_duplicate_refusal_is_one_fixed_sentence_whatever_the_request_named() {
+    for row in PROVISIONED {
+        let router = router();
+        provision(&router, row).await;
+
+        let repeat = Provisioned {
+            case: row.case,
+            path: row.path,
+            name: row.name,
+            // Tags where the accepted create carried none and none where it carried some.
+            tags: if row.tags.is_empty() {
+                &[("attempted", "again")]
+            } else {
+                &[]
+            },
+        };
+        let params = repeat.params();
+        let (status, body) = call(&router, "CreateVirtualMFADevice", &borrowed(&params)).await;
+        assert_eq!(
+            status, 409,
+            "case {:?}: expected HTTP 409 from the second create, got {status}: {body}",
+            row.case
+        );
+        assert_eq!(
+            error_code(&body),
+            "EntityAlreadyExists",
+            "case {:?}: expected EntityAlreadyExists, got {:?}: {body}",
+            row.case,
+            error_code(&body)
+        );
+        let message = element(&body, "Message");
+        assert_eq!(
+            message, DEVICE_ALREADY_EXISTS,
+            "case {:?}: expected {DEVICE_ALREADY_EXISTS:?}, got {message:?}",
+            row.case
+        );
+        for quoted in [Some(row.name), row.path, repeat.tags.first().map(|(key, _)| *key)] {
+            let Some(quoted) = quoted else { continue };
+            assert!(
+                !message.contains(quoted),
+                "case {:?}: expected a sentence carrying nothing of the request, \
+                 but {message:?} carries {quoted:?}",
+                row.case
+            );
+        }
+    }
+}
+
+/// One kind of entity a duplicate create addresses: the create that is refused twice over
+/// and the whole sentence IAM answers the second one with.
+struct Kind {
+    /// The case this row stands for, named in every assertion it makes.
+    case: &'static str,
+    /// The create operation the row calls twice.
+    action: &'static str,
+    /// That create's form parameters.
+    params: Vec<(String, String)>,
+    /// IAM's whole sentence for a duplicate of this kind.
+    expected: String,
+}
+
+/// The RULE one level up from the device: a create for an entity the account already holds
+/// is refused `EntityAlreadyExists` (HTTP 409) with the sentence IAM publishes for THAT
+/// KIND — the identifier the kind is held under where that kind's sentence carries such a
+/// clause, and nothing of the request where it does not, which is the virtual MFA device's
+/// case.
+///
+/// The rows span the create families this service serves: the entities held by name (user,
+/// group, role, instance profile), the managed policy whose sentence words the collision
+/// its own way, and the device whose sentence is entirely fixed. The expected text is
+/// written out here, not read from the implementation.
+#[tokio::test]
+async fn each_kinds_duplicate_create_carries_that_kinds_sentence() {
+    // A policy document with a single statement — the form `CreatePolicy`'s own modelled
+    // example carries — and a trust policy of the same shape, which a role create needs.
+    const POLICY_DOCUMENT: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"*"}]}"#;
+    const TRUST_POLICY: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}"#;
+
+    let owned = |name: &str, value: &str| (name.to_string(), value.to_string());
+    let rows = vec![
+        Kind {
+            case: "a user",
+            action: "CreateUser",
+            params: vec![owned("UserName", "duplicate-user")],
+            expected: "User with name duplicate-user already exists.".to_string(),
+        },
+        Kind {
+            case: "a group",
+            action: "CreateGroup",
+            params: vec![owned("GroupName", "duplicate-group")],
+            expected: "Group with name duplicate-group already exists.".to_string(),
+        },
+        Kind {
+            case: "a role",
+            action: "CreateRole",
+            params: vec![
+                owned("RoleName", "duplicate-role"),
+                owned("AssumeRolePolicyDocument", TRUST_POLICY),
+            ],
+            expected: "Role with name duplicate-role already exists.".to_string(),
+        },
+        Kind {
+            case: "an instance profile",
+            action: "CreateInstanceProfile",
+            params: vec![owned("InstanceProfileName", "duplicate-profile")],
+            expected: "Instance Profile duplicate-profile already exists.".to_string(),
+        },
+        Kind {
+            case: "a managed policy",
+            action: "CreatePolicy",
+            params: vec![
+                owned("PolicyName", "duplicate-policy"),
+                owned("PolicyDocument", POLICY_DOCUMENT),
+            ],
+            expected: "A policy called duplicate-policy already exists. Duplicate names are \
+                       not allowed."
+                .to_string(),
+        },
+        Kind {
+            case: "a virtual MFA device",
+            action: "CreateVirtualMFADevice",
+            params: vec![owned("VirtualMFADeviceName", "duplicate-device")],
+            expected: DEVICE_ALREADY_EXISTS.to_string(),
+        },
+    ];
+
+    let router = router();
+    for row in &rows {
+        let (status, body) = call(&router, row.action, &borrowed(&row.params)).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: expected HTTP 200 from the first create, got {status}: {body}",
+            row.case
+        );
+
+        let (status, body) = call(&router, row.action, &borrowed(&row.params)).await;
+        assert_eq!(
+            status, 409,
+            "case {:?}: expected HTTP 409 from the second create, got {status}: {body}",
+            row.case
+        );
+        assert_eq!(
+            error_code(&body),
+            "EntityAlreadyExists",
+            "case {:?}: expected EntityAlreadyExists, got {:?}: {body}",
+            row.case,
+            error_code(&body)
+        );
+        let message = element(&body, "Message");
+        assert_eq!(
+            message, row.expected,
+            "case {:?}: expected {:?}, got {message:?}",
+            row.case, row.expected
+        );
+    }
+}
+
