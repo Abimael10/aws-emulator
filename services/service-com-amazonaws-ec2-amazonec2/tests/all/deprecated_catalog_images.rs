@@ -98,9 +98,10 @@ fn days_ago(case: &str, timestamp: &str) -> f64 {
 async fn every_deprecated_catalog_image_is_deprecated_and_of_a_realistic_age() {
     let (router, _engine) = super::ec2_query::emulator();
 
+    let now = std::time::SystemTime::now();
     let deprecated: Vec<ec2::state::ImageSpec> = ec2::state::published_image_specs()
         .into_iter()
-        .filter(|spec| spec.deprecation_time.is_some())
+        .filter(|spec| ec2::state::image_spec_is_deprecated(spec, now))
         .collect();
     assert!(
         !deprecated.is_empty(),
@@ -214,9 +215,17 @@ async fn a_name_filtered_read_hides_the_deprecated_builds_unless_asked_for() {
                 params.push(super::wire::param("IncludeDeprecated", "true"));
             }
             let reported = described(&case, &router, &params).await;
+            // A reported image is DEPRECATED when the time it reports has passed: a build of
+            // a family still in support reports a deprecation time that is still ahead, and
+            // is reported whether or not the request asks for deprecated images.
             let deprecated: Vec<&Image> = reported
                 .iter()
-                .filter(|image| image.deprecation_time.is_some())
+                .filter(|image| {
+                    image
+                        .deprecation_time
+                        .as_deref()
+                        .is_some_and(|at| days_ago(&case, at) > 0.0)
+                })
                 .collect();
             assert_eq!(
                 !deprecated.is_empty(),

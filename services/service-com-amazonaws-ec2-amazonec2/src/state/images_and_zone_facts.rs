@@ -1147,6 +1147,19 @@ pub fn image_is_deprecated(image: &Image, now: SystemTime) -> bool {
         .is_some_and(|at| iso8601_is_before(at, &reference))
 }
 
+/// Is the image `spec` describes deprecated as of `now`?
+///
+/// The SAME reading as [`image_is_deprecated`], over the spec a writer stores rather than the
+/// stored image, so a catalog row and the image stored from it cannot disagree about whether
+/// it is deprecated: a row carrying no deprecation time is never deprecated, and one whose
+/// time is still ahead is not deprecated yet.
+pub fn image_spec_is_deprecated(spec: &ImageSpec, now: SystemTime) -> bool {
+    let reference = iso8601_utc(now);
+    spec.deprecation_time
+        .as_deref()
+        .is_some_and(|at| iso8601_is_before(at, &reference))
+}
+
 /// A stored ISO 8601 UTC timestamp STRING as the modelled timestamp type, or `None` when
 /// there is no string or its rendering does not read as an instant.
 ///
@@ -1620,6 +1633,16 @@ impl ComAmazonawsEc2Amazonec2State {
         // from the snapshot minted above, with none at all for an image whose root device is
         // the instance store, which restores none.
         let mut block_device_mappings = spec.block_device_mappings.take().unwrap_or_else(|| {
+            // "The number of I/O operations per second (IOPS)" and "the throughput that the
+            // volume supports" (`EbsBlockDevice$Iops`, `$Throughput`) the root volume this
+            // mapping restores is created with: the figures the ONE volume type AWS documents
+            // a default for provisions without being asked — "gp3: 3,000 (default)" and the
+            // bottom of the gp3 throughput range — and none at all for a type whose IOPS are
+            // provisioned per volume or follow its size, which is how a LAUNCHED root volume
+            // reads the same mapping
+            // ([`ComAmazonawsEc2Amazonec2State::launched_root_volume`]), so the AMI and the
+            // volume restored from it cannot report the performance differently.
+            let provisions_throughput = spec.root_volume_type == THROUGHPUT_VOLUME_TYPE;
             derived_root_snapshot_id
                 .map(|snapshot_id| BlockDeviceMapping {
                     ebs: Some(EbsBlockDevice {
@@ -1630,9 +1653,9 @@ impl ComAmazonawsEc2Amazonec2State {
                         // The snapshot was minted for this image by the line above and
                         // nothing asked for it to be encrypted.
                         encrypted: Some(false),
-                        iops: None,
+                        iops: provisions_throughput.then_some(DEFAULT_GP3_IOPS),
                         kms_key_id: None,
-                        throughput: None,
+                        throughput: provisions_throughput.then_some(DEFAULT_GP3_THROUGHPUT),
                         outpost_arn: None,
                         availability_zone: None,
                         volume_initialization_rate: None,
@@ -2087,6 +2110,41 @@ pub(super) const AL2_NEWER_BUILD_DAYS_AGO: u64 = 390;
 
 /// The seconds in a day, for the catalog's relative build dates.
 pub(super) const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
+
+/// How long after the catalog is seeded the standard support of a family that is still
+/// supported ends — the instant every build of such a family carries as its
+/// `DeprecationTime`.
+///
+/// Amazon publishes an AMI with the date it is to be deprecated on ("the date and time to
+/// deprecate the AMI", `Image$DeprecationTime`): a build of a family still in support carries
+/// a date that is still AHEAD, so the image is reported without `IncludeDeprecated`, while a
+/// build of a family whose support has ended carries one that has passed
+/// ([`AL2_SUPPORT_ENDED_DAYS_AGO`]).
+///
+/// CHOSEN, and relative rather than a calendar date, for the same reason that one is: a fixed
+/// date would silently deprecate the catalog's current builds once this emulator's clock
+/// passed it.
+pub(super) const SUPPORTED_FAMILY_SUPPORT_ENDS_IN_DAYS: u64 = 600;
+
+/// The instant the standard support of a still-supported family ends
+/// ([`SUPPORTED_FAMILY_SUPPORT_ENDS_IN_DAYS`]), as the ISO 8601 UTC rendering an image
+/// reports it in.
+pub(super) fn supported_family_deprecation_time() -> String {
+    iso8601_utc(rolling_catalog_date_ahead(
+        SUPPORTED_FAMILY_SUPPORT_ENDS_IN_DAYS,
+    ))
+}
+
+/// The instant `days_ahead` days after now, truncated to the start of that UTC day — the
+/// forward-looking half of [`rolling_catalog_date`], and stable for the same reason.
+pub(super) fn rolling_catalog_date_ahead(days_ahead: u64) -> SystemTime {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .saturating_add(days_ahead.saturating_mul(SECONDS_PER_DAY));
+    UNIX_EPOCH + Duration::from_secs(seconds - seconds % SECONDS_PER_DAY)
+}
 
 /// The instant `days_ago` days before now, truncated to the start of that UTC day.
 ///

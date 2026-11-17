@@ -570,3 +570,357 @@ async fn adapter_boot_and_core_facts_are_published_per_type() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Two more compute optimized families: one Intel, one Graviton
+// ---------------------------------------------------------------------------
+
+/// The published facts of one size of a compute optimized family.
+///
+/// Each figure is the one AWS publishes for that ONE type: the four EBS figures and the
+/// attachment limit come from "Amazon EBS optimized instance types" and "Instance volume
+/// limits", the network performance from the family's own specification page, and the core
+/// counts from the published list of the counts a type can be configured with.
+#[derive(Debug, Clone)]
+struct ComputeRow {
+    /// `c6i.8xlarge` and the like.
+    instance_type: &'static str,
+    /// (sustained Mbps, sustained IOPS, Mbps it reaches, IOPS it reaches).
+    ebs: (i64, i64, i64, i64),
+    /// How many Amazon EBS volumes the type can hold attached.
+    ebs_attachments: i64,
+    /// Its network performance, as the published table writes it.
+    network_performance: &'static str,
+    /// Its processor's sustained frequency, in GHz.
+    sustained_ghz: f64,
+    /// Whether a configurable number of ENA queues is offered, as the enum spells it.
+    flexible_ena_queues: &'static str,
+    /// Whether ENA Express is offered.
+    ena_srd: bool,
+    /// The Elastic Fabric Adapters it is offered, zero where it is offered none.
+    efa_interfaces: i64,
+    /// The core counts a caller may configure.
+    valid_cores: Vec<i64>,
+}
+
+/// The rows of the two families, in size order within each.
+fn compute_rows() -> Vec<ComputeRow> {
+    let evens_to = |cores: i64| (1..=cores / 2).map(|step| step * 2).collect::<Vec<i64>>();
+    let every_count_to = |cores: i64| (1..=cores).collect::<Vec<i64>>();
+    vec![
+        // C6i: the smallest size, the first size whose cores go up in twos, the size at which
+        // the bandwidth stops bursting, a middle size, the largest virtualized size and the
+        // bare metal one.
+        ComputeRow {
+            instance_type: "c6i.large",
+            ebs: (650, 3_600, 10_000, 40_000),
+            ebs_attachments: 27,
+            network_performance: "Up to 12.5 Gigabit",
+            sustained_ghz: 3.5,
+            flexible_ena_queues: "supported",
+            ena_srd: false,
+            efa_interfaces: 0,
+            valid_cores: vec![1],
+        },
+        ComputeRow {
+            instance_type: "c6i.2xlarge",
+            ebs: (2_500, 12_000, 10_000, 40_000),
+            ebs_attachments: 27,
+            network_performance: "Up to 12.5 Gigabit",
+            sustained_ghz: 3.5,
+            flexible_ena_queues: "supported",
+            ena_srd: false,
+            efa_interfaces: 0,
+            valid_cores: vec![2, 4],
+        },
+        ComputeRow {
+            instance_type: "c6i.8xlarge",
+            ebs: (10_000, 40_000, 10_000, 40_000),
+            ebs_attachments: 27,
+            network_performance: "12.5 Gigabit",
+            sustained_ghz: 3.5,
+            flexible_ena_queues: "supported",
+            ena_srd: true,
+            efa_interfaces: 0,
+            valid_cores: evens_to(16),
+        },
+        ComputeRow {
+            instance_type: "c6i.16xlarge",
+            ebs: (20_000, 80_000, 20_000, 80_000),
+            ebs_attachments: 27,
+            network_performance: "25 Gigabit",
+            sustained_ghz: 3.5,
+            flexible_ena_queues: "supported",
+            ena_srd: true,
+            efa_interfaces: 0,
+            valid_cores: evens_to(32),
+        },
+        ComputeRow {
+            instance_type: "c6i.32xlarge",
+            ebs: (40_000, 160_000, 40_000, 160_000),
+            ebs_attachments: 27,
+            network_performance: "50 Gigabit",
+            sustained_ghz: 3.5,
+            flexible_ena_queues: "supported",
+            ena_srd: true,
+            efa_interfaces: 1,
+            valid_cores: evens_to(64),
+        },
+        ComputeRow {
+            instance_type: "c6i.metal",
+            ebs: (40_000, 160_000, 40_000, 160_000),
+            ebs_attachments: 31,
+            network_performance: "50 Gigabit",
+            sustained_ghz: 3.5,
+            flexible_ena_queues: "unsupported",
+            ena_srd: true,
+            efa_interfaces: 1,
+            valid_cores: every_count_to(64),
+        },
+        // C7g: the smallest size of the Graviton3 ladder, a size below the one that stops
+        // bursting, that size itself, the largest virtualized size and the bare metal one.
+        ComputeRow {
+            instance_type: "c7g.medium",
+            ebs: (315, 2_500, 10_000, 40_000),
+            ebs_attachments: 27,
+            network_performance: "Up to 12.5 Gigabit",
+            sustained_ghz: 2.6,
+            flexible_ena_queues: "unsupported",
+            ena_srd: false,
+            efa_interfaces: 0,
+            valid_cores: vec![1],
+        },
+        ComputeRow {
+            instance_type: "c7g.xlarge",
+            ebs: (1_250, 6_000, 10_000, 40_000),
+            ebs_attachments: 27,
+            network_performance: "Up to 12.5 Gigabit",
+            sustained_ghz: 2.6,
+            flexible_ena_queues: "unsupported",
+            ena_srd: false,
+            efa_interfaces: 0,
+            valid_cores: every_count_to(4),
+        },
+        ComputeRow {
+            instance_type: "c7g.8xlarge",
+            ebs: (10_000, 40_000, 10_000, 40_000),
+            ebs_attachments: 27,
+            network_performance: "15 Gigabit",
+            sustained_ghz: 2.6,
+            flexible_ena_queues: "unsupported",
+            ena_srd: false,
+            efa_interfaces: 0,
+            valid_cores: every_count_to(32),
+        },
+        ComputeRow {
+            instance_type: "c7g.16xlarge",
+            ebs: (20_000, 80_000, 20_000, 80_000),
+            ebs_attachments: 27,
+            network_performance: "30 Gigabit",
+            sustained_ghz: 2.6,
+            flexible_ena_queues: "unsupported",
+            ena_srd: true,
+            efa_interfaces: 1,
+            valid_cores: every_count_to(64),
+        },
+        ComputeRow {
+            instance_type: "c7g.metal",
+            ebs: (20_000, 80_000, 20_000, 80_000),
+            ebs_attachments: 31,
+            network_performance: "30 Gigabit",
+            sustained_ghz: 2.6,
+            flexible_ena_queues: "unsupported",
+            ena_srd: true,
+            efa_interfaces: 1,
+            valid_cores: every_count_to(64),
+        },
+    ]
+}
+
+/// Rule: every member AWS publishes per instance type is served from that type's own row —
+/// here over two more compute optimized families, one Intel and one Graviton.
+#[tokio::test]
+async fn the_two_compute_families_serve_their_published_ebs_network_and_core_facts() {
+    let (router, _engine) = super::ec2_query::emulator();
+
+    for row in compute_rows() {
+        let case = row.instance_type;
+        let body = described(case, &router, row.instance_type).await;
+        let ebs_info = required(case, &body, "ebsInfo");
+        let performance = required(case, &ebs_info, "ebsOptimizedInfo");
+        let (baseline_mbps, baseline_iops, maximum_mbps, maximum_iops) = row.ebs;
+        for (name, expected) in [
+            ("baselineBandwidthInMbps", baseline_mbps),
+            ("baselineIops", baseline_iops),
+            ("maximumBandwidthInMbps", maximum_mbps),
+            ("maximumIops", maximum_iops),
+        ] {
+            let reported = number(case, &performance, name) as i64;
+            assert_eq!(
+                reported, expected,
+                "case {case:?}: expected {name} {expected}, got {reported}"
+            );
+        }
+        // The throughput members are the bandwidth ones in the other unit, which is exactly
+        // how the published table's Mbps and MB/s columns relate.
+        for (name, bandwidth) in [
+            ("baselineThroughputInMBps", baseline_mbps),
+            ("maximumThroughputInMBps", maximum_mbps),
+        ] {
+            let expected = bandwidth as f64 / MEGABITS_PER_MEGABYTE;
+            let reported = number(case, &performance, name);
+            assert!(
+                (reported - expected).abs() < 0.001,
+                "case {case:?}: expected {name} {expected}, got {reported} \
+                 ({:?} on the wire)",
+                required(case, &performance, name)
+            );
+        }
+        let reported = number(case, &ebs_info, "maximumEbsAttachments") as i64;
+        assert_eq!(
+            reported, row.ebs_attachments,
+            "case {case:?}: expected maximumEbsAttachments {}, got {reported}",
+            row.ebs_attachments
+        );
+
+        let network_info = required(case, &body, "networkInfo");
+        let reported = required(case, &network_info, "networkPerformance");
+        assert_eq!(
+            reported, row.network_performance,
+            "case {case:?}: expected networkPerformance {:?}, got {reported:?}",
+            row.network_performance
+        );
+        let processor_info = required(case, &body, "processorInfo");
+        let reported = number(case, &processor_info, "sustainedClockSpeedInGhz");
+        assert!(
+            (reported - row.sustained_ghz).abs() < 0.001,
+            "case {case:?}: expected sustainedClockSpeedInGhz {}, got {reported}",
+            row.sustained_ghz
+        );
+
+        let v_cpu_info = required(case, &body, "vCpuInfo");
+        let reported: Vec<i64> = list(case, &v_cpu_info, "validCores")
+            .iter()
+            .map(|count| {
+                count.parse().unwrap_or_else(|_| {
+                    panic!("case {case:?}: a core count must be a number, got {count:?}")
+                })
+            })
+            .collect();
+        assert_eq!(
+            reported, row.valid_cores,
+            "case {case:?}: expected validCores {:?}, got {reported:?}",
+            row.valid_cores
+        );
+    }
+}
+
+/// Rule: the adapter capabilities of those two families are published per type as well — a
+/// configurable ENA queue count, ENA Express and the Elastic Fabric Adapter each reported for
+/// the sizes that are offered it and against the sizes that are not.
+#[tokio::test]
+async fn the_two_compute_families_serve_their_published_adapter_capabilities() {
+    let (router, _engine) = super::ec2_query::emulator();
+
+    for row in compute_rows() {
+        let case = row.instance_type;
+        let body = described(case, &router, row.instance_type).await;
+        let network_info = required(case, &body, "networkInfo");
+        for (name, expected) in [
+            ("flexibleEnaQueuesSupport", row.flexible_ena_queues.to_string()),
+            ("enaSrdSupported", row.ena_srd.to_string()),
+            ("efaSupported", (row.efa_interfaces > 0).to_string()),
+            // One physical network card on every size of both families, and the first card is
+            // the default.
+            ("maximumNetworkCards", "1".to_string()),
+            ("defaultNetworkCardIndex", "0".to_string()),
+        ] {
+            let reported = required(case, &network_info, name);
+            assert_eq!(
+                reported, expected,
+                "case {case:?}: expected {name} {expected:?}, got {reported:?}"
+            );
+        }
+        let efa_info = element(&network_info, "efaInfo");
+        if row.efa_interfaces > 0 {
+            let efa_info = efa_info.unwrap_or_else(|| {
+                panic!("case {case:?}: a type offered the adapter describes it, got {body}")
+            });
+            let reported = number(case, &efa_info, "maximumEfaInterfaces") as i64;
+            assert_eq!(
+                reported, row.efa_interfaces,
+                "case {case:?}: expected maximumEfaInterfaces {}, got {reported}",
+                row.efa_interfaces
+            );
+        } else {
+            assert!(
+                efa_info.is_none(),
+                "case {case:?}: a type offered no Elastic Fabric Adapter describes none, got \
+                 {efa_info:?}"
+            );
+        }
+        // Neither hardware generation carries a local PTP hardware clock, and both are
+        // offered reboot migration — the bare metal sizes too, the move to another host
+        // being the host's to make rather than the hypervisor's they have none of.
+        for (name, expected) in [
+            ("phcSupport", "unsupported"),
+            ("rebootMigrationSupport", "supported"),
+        ] {
+            let reported = required(case, &body, name);
+            assert_eq!(
+                reported, expected,
+                "case {case:?}: expected {name} {expected:?}, got {reported:?}"
+            );
+        }
+    }
+
+    // The Graviton3 family takes no interface attachment from a secondary network, so no
+    // address at all is available on one, while the Intel family reports the support alone —
+    // two answers one flag over the family cannot give.
+    for (instance_type, secondary_addresses) in [
+        ("c7g.medium", Some("0")),
+        ("c7g.metal", Some("0")),
+        ("c6i.large", None),
+        ("c6i.metal", None),
+    ] {
+        let case = instance_type;
+        let body = described(case, &router, instance_type).await;
+        let network_info = required(case, &body, "networkInfo");
+        let reported = required(case, &network_info, "secondaryNetworkSupported");
+        assert_eq!(
+            reported, "false",
+            "case {case:?}: expected secondaryNetworkSupported false, got {reported:?}"
+        );
+        let addresses = element(&network_info, "ipv4AddressesPerSecondaryInterface");
+        assert_eq!(
+            addresses.as_deref(),
+            secondary_addresses,
+            "case {case:?}: expected ipv4AddressesPerSecondaryInterface \
+             {secondary_addresses:?}, got {addresses:?}"
+        );
+    }
+
+    // Two families at ONE size agree on neither their EBS figures nor their network
+    // performance, so neither follows from the size in the name.
+    let left = described("c6i.large", &router, "c6i.large").await;
+    let right = described("c7g.large", &router, "c7g.large").await;
+    let baseline = |body: &str, case: &str| -> i64 {
+        let ebs_info = required(case, body, "ebsInfo");
+        let performance = required(case, &ebs_info, "ebsOptimizedInfo");
+        number(case, &performance, "baselineBandwidthInMbps") as i64
+    };
+    assert_ne!(
+        baseline(&left, "c6i.large"),
+        baseline(&right, "c7g.large"),
+        "two families of one size publish different sustained EBS bandwidth"
+    );
+    let left = described("c6i.16xlarge", &router, "c6i.16xlarge").await;
+    let right = described("c7g.16xlarge", &router, "c7g.16xlarge").await;
+    let left_network = required("c6i.16xlarge", &left, "networkInfo");
+    let right_network = required("c7g.16xlarge", &right, "networkInfo");
+    assert_ne!(
+        required("c6i.16xlarge", &left_network, "networkPerformance"),
+        required("c7g.16xlarge", &right_network, "networkPerformance"),
+        "two families of one size publish different network performance"
+    );
+}

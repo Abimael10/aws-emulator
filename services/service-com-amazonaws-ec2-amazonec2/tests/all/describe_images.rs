@@ -255,11 +255,14 @@ fn catalog_names() -> Vec<String> {
 
 /// The catalog images a request that asks for nothing extra must report: every published
 /// image whose deprecation time has not passed (the ones that have need
-/// `IncludeDeprecated`).
+/// `IncludeDeprecated`), read through the crate's one reading of that question
+/// (`image_spec_is_deprecated`) — a build of a family still in support carries a deprecation
+/// time that is still AHEAD, so it is reported without the flag.
 fn undeprecated_catalog_names() -> Vec<String> {
+    let now = std::time::SystemTime::now();
     published_image_specs()
         .into_iter()
-        .filter(|spec| spec.deprecation_time.is_none())
+        .filter(|spec| !ec2::state::image_spec_is_deprecated(spec, now))
         .map(|spec| spec.name)
         .collect()
 }
@@ -271,9 +274,10 @@ fn undeprecated_catalog_names() -> Vec<String> {
 /// always holds — and their published names carry that build date.
 static DEPRECATED_CATALOG_NAMES: std::sync::LazyLock<Vec<String>> =
     std::sync::LazyLock::new(|| {
+        let now = std::time::SystemTime::now();
         published_image_specs()
             .into_iter()
-            .filter(|spec| spec.deprecation_time.is_some())
+            .filter(|spec| ec2::state::image_spec_is_deprecated(spec, now))
             .map(|spec| spec.name)
             .collect()
     });
@@ -1630,4 +1634,148 @@ async fn dry_run_reports_the_permitted_outcome_without_describing() {
         !reported.is_empty(),
         "DryRun=false: expected the ordinary report, got {reported:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// What an AMI reports about the volume it restores, and when it is deprecated
+// ---------------------------------------------------------------------------
+
+/// The `<ebs>` block of the first block device mapping `body` reports.
+fn root_ebs(case: &str, body: &str) -> String {
+    let mapping = super::ec2_query::element(body, "blockDeviceMapping").unwrap_or_else(|| {
+        panic!("case {case:?}: the image must report its block device mappings, got {body}")
+    });
+    super::ec2_query::element(&mapping, "ebs").unwrap_or_else(|| {
+        panic!("case {case:?}: the root mapping restores an Amazon EBS volume, got {mapping}")
+    })
+}
+
+/// Rule: an AMI's Amazon EBS block device mapping reports the performance the volume it
+/// restores is created with — the figures the ONE volume type AWS documents a default for
+/// provisions without being asked, and none for a type whose IOPS are provisioned per volume
+/// or follow its size.
+#[tokio::test]
+async fn an_ami_reports_the_performance_the_root_volume_it_restores_is_created_with() {
+    let (router, engine) = super::ec2_query::emulator();
+
+    // Rows: the root volume type, which is what the rule generalises over — the type with a
+    // documented default, the two types the published catalog's older families carry, and a
+    // type whose IOPS are provisioned per volume.
+    let rows = [
+        ("gp3", Some(("3000", "125"))),
+        ("gp2", None),
+        ("standard", None),
+        ("io2", None),
+    ];
+
+    for (volume_type, performance) in rows {
+        let case = format!("a root volume of type {volume_type}");
+        let image_id = engine.state::<Ec2State>().lock().insert_image(ImageSpec {
+            name: format!("app-root-volume-{volume_type}"),
+            root_volume_type: volume_type.to_string(),
+            ..ImageSpec::default()
+        });
+        let (status, body) = describe(&router, &indexed("ImageId", &[image_id.as_str()])).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200, got {status} with body {body}"
+        );
+        let ebs = root_ebs(&case, &body);
+        let reported = super::ec2_query::element(&ebs, "volumeType");
+        assert_eq!(
+            reported.as_deref(),
+            Some(volume_type),
+            "case {case:?}: the mapping restores a volume of that type, got {reported:?}"
+        );
+        let reported = (
+            super::ec2_query::element(&ebs, "iops"),
+            super::ec2_query::element(&ebs, "throughput"),
+        );
+        match performance {
+            Some((iops, throughput)) => assert_eq!(
+                (reported.0.as_deref(), reported.1.as_deref()),
+                (Some(iops), Some(throughput)),
+                "case {case:?}: expected the documented default of {iops} IOPS and \
+                 {throughput} MB/s, got {reported:?}"
+            ),
+            None => assert_eq!(
+                (reported.0.as_deref(), reported.1.as_deref()),
+                (None, None),
+                "case {case:?}: a type with no documented default reports neither figure, \
+                 got {reported:?}"
+            ),
+        }
+    }
+}
+
+/// Rule: a build of a published family still in standard support reports the deprecation time
+/// of that support — an instant still ahead, so the build is reported without
+/// `IncludeDeprecated` — beside the IMDS support and the root volume performance a client
+/// chooses an AMI on.
+#[tokio::test]
+async fn a_published_build_of_a_supported_family_reports_when_it_is_deprecated() {
+    let (router, engine) = super::ec2_query::emulator();
+    seed(&engine);
+    let now = std::time::SystemTime::now();
+
+    // Rows: every published build whose family is still in support — read off the catalog
+    // rather than written out, so a family the catalog gains later is covered too.
+    let supported: Vec<ImageSpec> = published_image_specs()
+        .into_iter()
+        .filter(|spec| !ec2::state::image_spec_is_deprecated(spec, now))
+        .filter(|spec| spec.deprecation_time.is_some())
+        .collect();
+    assert!(
+        !supported.is_empty(),
+        "the catalog must publish a build of a family that is still in support"
+    );
+
+    for spec in &supported {
+        let case = spec.name.clone();
+        let (status, body) = describe(&router, &filters(&[("name", &[case.as_str()])])).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200, got {status} with body {body}"
+        );
+        let reported = elements(&body, "name");
+        assert_eq!(
+            reported,
+            vec![case.clone()],
+            "case {case:?}: a build whose deprecation time is still ahead is reported \
+             without IncludeDeprecated, got {reported:?}"
+        );
+        let deprecation_time = super::ec2_query::element(&body, "deprecationTime")
+            .unwrap_or_else(|| panic!("case {case:?}: the build reports when, got {body}"));
+        let at = super::ec2_query::as_timestamp(&deprecation_time).unwrap_or_else(|| {
+            panic!("case {case:?}: a deprecation time reads as an instant, got {deprecation_time:?}")
+        });
+        let seconds_now = now
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is after the epoch")
+            .as_secs_f64();
+        assert!(
+            at > seconds_now,
+            "case {case:?}: the support of a family still in support ends ahead of now, got \
+             {deprecation_time:?}"
+        );
+        // The members a client picks an AMI by: IMDSv2 is required by these families, and the
+        // root volume it restores reports the performance it is created with.
+        let reported = super::ec2_query::element(&body, "imdsSupport");
+        assert_eq!(
+            reported.as_deref(),
+            Some("v2.0"),
+            "case {case:?}: the family requires IMDSv2, got {reported:?}"
+        );
+        let ebs = root_ebs(&case, &body);
+        let reported = (
+            super::ec2_query::element(&ebs, "iops"),
+            super::ec2_query::element(&ebs, "throughput"),
+        );
+        assert_eq!(
+            (reported.0.as_deref(), reported.1.as_deref()),
+            (Some("3000"), Some("125")),
+            "case {case:?}: the published build's root volume reports the documented gp3 \
+             default, got {reported:?}"
+        );
+    }
 }

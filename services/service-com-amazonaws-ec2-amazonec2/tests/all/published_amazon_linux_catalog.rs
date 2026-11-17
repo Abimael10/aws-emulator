@@ -297,11 +297,26 @@ async fn every_published_variant_resolves_to_a_launchable_available_image() {
                     &image.architecture, architecture,
                     "case {case:?}: the pattern names that architecture, got {image:?}"
                 );
-                assert_eq!(
-                    image.deprecation_time, None,
-                    "case {case:?}: a request that does not ask for deprecated images gets \
-                     none, got {image:?}"
-                );
+                // A request that does not ask for deprecated images gets none: a reported
+                // image either carries no deprecation time at all or carries one that has not
+                // been reached yet, which is what a build of a family still in support does.
+                if let Some(at) = image.deprecation_time.as_deref() {
+                    let deprecates_at = as_timestamp(at).unwrap_or_else(|| {
+                        panic!(
+                            "case {case:?}: a deprecation time must read as an instant, got \
+                             {image:?}"
+                        )
+                    });
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .expect("the clock is after the epoch")
+                        .as_secs_f64();
+                    assert!(
+                        deprecates_at > now,
+                        "case {case:?}: a request that does not ask for deprecated images gets \
+                         none, so any deprecation time it reports is still ahead, got {image:?}"
+                    );
+                }
                 assert!(
                     as_timestamp(&image.creation_date).is_some(),
                     "case {case:?}: the creation date a caller sorts on must be an instant, got \

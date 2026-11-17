@@ -60,13 +60,15 @@ async fn both_ways_of_naming_the_amazon_owner_report_the_whole_published_catalog
     });
 
     // The catalog's own current, Amazon-published builds, read off the store's catalog rather
-    // than written out here.
+    // than written out here. A build whose deprecation time is still ahead is a current one:
+    // only a build whose time has PASSED needs `IncludeDeprecated` to be reported.
+    let now = std::time::SystemTime::now();
     let mut published: Vec<String> = ec2::state::published_image_specs()
         .into_iter()
         .filter(|spec| {
             spec.owner_alias.as_deref() == Some(AMAZON)
                 && spec.state == AVAILABLE
-                && spec.deprecation_time.is_none()
+                && !ec2::state::image_spec_is_deprecated(spec, now)
         })
         .map(|spec| spec.name)
         .collect();

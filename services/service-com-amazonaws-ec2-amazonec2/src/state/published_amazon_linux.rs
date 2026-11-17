@@ -384,6 +384,11 @@ fn kernel_named_specs(
                     boot_mode: Some(hvm_boot_mode(architecture, true)),
                     // These families require IMDSv2.
                     imds_support: Some(IMDS_SUPPORT_V2.to_string()),
+                    // Amazon publishes the date an AMI is to be deprecated on. These families
+                    // are still in standard support, so every build of them carries the
+                    // instant that support ends, which is still ahead — the contrast with the
+                    // builds of a family whose support has already ended.
+                    deprecation_time: Some(super::images_and_zone_facts::supported_family_deprecation_time()),
                     public_ssm_parameter_name: Some(alias(&format!(
                         "{family}-ami{minimal_name}-kernel-{kernel}-{architecture}"
                     ))),
