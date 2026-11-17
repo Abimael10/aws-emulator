@@ -262,6 +262,19 @@ async fn every_other_absent_required_member_keeps_the_walks_clause() {
             json!({}),
             "tableName",
         ),
+        // A member the MODEL leaves optional while the create itself requires it: a table
+        // is declared with a primary key, and `CreateTable$KeySchema` carries a `@length`
+        // minimum rather than `@required`
+        // (`smithy_query(query="operation", operation="CreateTable")`). The absence is
+        // found by the service's own request code and stated as the SAME clause, so a
+        // client reads one sentence for a member it left out whichever code found it.
+        (
+            "a table create with no key schema",
+            "CreateTable",
+            json!({"TableName": "Declared",
+                   "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}]}),
+            "keySchema",
+        ),
     ];
 
     for (case, operation, request, path) in rows {
@@ -277,6 +290,29 @@ async fn every_other_absent_required_member_keeps_the_walks_clause() {
              {code} with {stated:?}"
         );
     }
+
+    // The CONTROL for the member the service's own code requires: a list the request DID
+    // carry is not an absent member, so what it earns is the bound it broke rather than the
+    // absent-member clause — the `@length` minimum the model declares on it.
+    let (code, stated) = refusal(
+        &router,
+        "a table create whose key schema is an empty list",
+        "CreateTable",
+        json!({"TableName": "Declared", "KeySchema": [],
+               "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}]}),
+    )
+    .await;
+    assert_eq!(
+        code, "ValidationException",
+        "case \"an empty key schema\": expected the constraint class, got {code} with {stated:?}"
+    );
+    assert!(
+        stated.contains("at 'keySchema' failed to satisfy constraint: Member must have length \
+                         greater than or equal to 1")
+            && !stated.contains("must not be null"),
+        "case \"an empty key schema\": expected the length clause over 'keySchema' rather than \
+         the absent-member clause, got {stated:?}"
+    );
 }
 
 // ===========================================================================

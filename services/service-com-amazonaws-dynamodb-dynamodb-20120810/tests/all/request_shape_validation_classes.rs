@@ -42,6 +42,17 @@
 //! that states one identifier twice asks for an item in which one key carries two values
 //! and is refused naming the repeated identifier(s). The rows span the ways two items
 //! collapse onto one identifier, and the controls span the lists that do not.
+//!
+//! RULE 5 — the class boundary IN FRONT of all four: a body value whose JSON class the
+//! modelled type of its member cannot be read from never becomes a value, so it fails
+//! DESERIALIZATION rather than a rule — answered as the protocol's own
+//! `com.amazon.coral.service#SerializationException` with the reason under the capitalized
+//! `Message` member, and nothing of the request read or applied — while a value that WAS
+//! read and then broke a declared bound keeps the `ValidationException` the rules above are
+//! refused with. The rows span the operation, the member, the modelled type of that member,
+//! the class the request sent there and the DEPTH the value stands at (a top-level member, a
+//! member of a nested structure, an element of a list, a value of a map); the controls are
+//! the values that do read.
 
 use serde_json::{json, Value};
 
@@ -967,3 +978,291 @@ async fn a_select_clause_that_repeats_an_identifier_is_refused() {
         "case \"a star projection\": expected the one matching item, got {everything}"
     );
 }
+
+// ===========================================================================
+// RULE 5. A value that could not be READ is a different class from one that
+//         was read and then broke a rule
+// ===========================================================================
+
+/// The error class a body this service could not read into the modelled input is refused
+/// with, as the wire spells it: the absolute id of the protocol's own error shape, which is
+/// what an SDK branches a non-retryable marshalling failure on.
+const SERIALIZATION_EXCEPTION: &str = "com.amazon.coral.service#SerializationException";
+
+/// What the refusal states where the member's modelled type holds other values (a list, a
+/// map, a structure) and the body carried something else there, or where a member modelled
+/// as a single value carried a collection.
+const UNEXPECTED_FIELD_TYPE: &str = "Unexpected field type";
+
+/// The one assertion both halves of the class boundary are read through: the status, the
+/// error class as the wire spells it, and which body member carries the prose.
+///
+/// A serialization refusal states its sentence under the capitalized `Message` and carries
+/// no lowercase `message`; a constraint refusal is the other way round, which is what a tool
+/// extracting an error reason off one slot or the other depends on.
+fn refused_as(case: &str, status: u16, body: &Value, class: &str, sentence: &str) {
+    let answered = body.get("__type").and_then(Value::as_str).unwrap_or_default();
+    assert_eq!(
+        (status, answered),
+        (400, class),
+        "case {case:?}: expected 400 {class}, got {status} with {body}"
+    );
+    let capital = body.get("Message").and_then(Value::as_str);
+    let lower = body.get("message").and_then(Value::as_str);
+    let (stated, empty, slot) = if class == SERIALIZATION_EXCEPTION {
+        (capital, lower, "Message")
+    } else {
+        (lower, capital, "message")
+    };
+    assert_eq!(
+        stated,
+        Some(sentence),
+        "case {case:?}: expected ${slot} {sentence:?}, got {body}"
+    );
+    assert_eq!(
+        empty, None,
+        "case {case:?}: this class states its prose under ${slot} alone, got {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_value_that_could_not_be_read_is_refused_as_a_serialization_failure() {
+    let router = emulator();
+
+    // The ARN rows address a real table, so nothing about the class boundary depends on
+    // whether the resource exists — and a refusal that never looked it up cannot tell.
+    create_active_table(&router, "Tagged", &[("pk", "HASH", "S")]).await;
+    let tagged = describe_when_active(&router, "an ARN to address", "Tagged").await["TableArn"]
+        .as_str()
+        .expect("the table reports its ARN")
+        .to_string();
+
+    // (case, operation, the body, the sentence the refusal states)
+    //
+    // The modelled type of each member named here comes from
+    // `smithy_query(query="operation", operation="<the operation>")`: `TableName` targets
+    // `TableArn` (string) on every table operation, `ExclusiveStartTableName` targets
+    // `TableName` (string), `Limit` targets `ListTablesInputLimit` (integer),
+    // `ResourceArn` targets `ResourceArnString` (string), `Tags` targets `TagList` (list),
+    // `TagKeys` targets `TagKeyList` (list), `Key`/`ExpressionAttributeNames` are maps,
+    // `KeySchema` is a list, `ProvisionedThroughput` a structure and `ConsistentRead` a
+    // boolean.
+    let rows: Vec<(&str, &str, Value, String)> = vec![
+        (
+            "a number where a table name is a string, on the create",
+            "CreateTable",
+            json!({"TableName": 42,
+                   "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                   "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}]}),
+            "NUMBER_VALUE cannot be converted to String".to_string(),
+        ),
+        (
+            "a number where a table name is a string, on the update",
+            "UpdateTable",
+            json!({"TableName": 7}),
+            "NUMBER_VALUE cannot be converted to String".to_string(),
+        ),
+        (
+            "a number where a start key is a string, on the list",
+            "ListTables",
+            json!({"ExclusiveStartTableName": 1}),
+            "NUMBER_VALUE cannot be converted to String".to_string(),
+        ),
+        (
+            "a number where a resource ARN is a string, on the tag read",
+            "ListTagsOfResource",
+            json!({"ResourceArn": 1}),
+            "NUMBER_VALUE cannot be converted to String".to_string(),
+        ),
+        (
+            "a number where a resource ARN is a string, on the tag write",
+            "TagResource",
+            json!({"ResourceArn": 1, "Tags": [{"Key": "k", "Value": "v"}]}),
+            "NUMBER_VALUE cannot be converted to String".to_string(),
+        ),
+        (
+            "a flag where a table name is a string",
+            "DescribeTable",
+            json!({"TableName": true}),
+            "BOOLEAN_VALUE cannot be converted to String".to_string(),
+        ),
+        (
+            "text where a page size is an integer",
+            "ListTables",
+            json!({"Limit": "10"}),
+            "STRING_VALUE cannot be converted to Integer".to_string(),
+        ),
+        (
+            "text where a read mode is a boolean",
+            "Scan",
+            json!({"TableName": "Tagged", "ConsistentRead": "true"}),
+            "STRING_VALUE cannot be converted to Boolean".to_string(),
+        ),
+        (
+            "text where a tag set is a list",
+            "TagResource",
+            json!({"ResourceArn": tagged.clone(), "Tags": "k=v"}),
+            UNEXPECTED_FIELD_TYPE.to_string(),
+        ),
+        (
+            "a number where a tag set is a list",
+            "TagResource",
+            json!({"ResourceArn": tagged.clone(), "Tags": 1}),
+            UNEXPECTED_FIELD_TYPE.to_string(),
+        ),
+        (
+            "text where a tag key set is a list",
+            "UntagResource",
+            json!({"ResourceArn": tagged.clone(), "TagKeys": "k"}),
+            UNEXPECTED_FIELD_TYPE.to_string(),
+        ),
+        (
+            "a flag where a key schema is a list",
+            "CreateTable",
+            json!({"TableName": "Later", "KeySchema": false}),
+            UNEXPECTED_FIELD_TYPE.to_string(),
+        ),
+        (
+            "a number where a throughput is a structure",
+            "CreateTable",
+            json!({"TableName": "Later",
+                   "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                   "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                   "ProvisionedThroughput": 5}),
+            UNEXPECTED_FIELD_TYPE.to_string(),
+        ),
+        (
+            "text where an item key is a map",
+            "GetItem",
+            json!({"TableName": "Tagged", "Key": "pk"}),
+            UNEXPECTED_FIELD_TYPE.to_string(),
+        ),
+        (
+            "a list where a table name is a string",
+            "DeleteTable",
+            json!({"TableName": ["Tagged"]}),
+            UNEXPECTED_FIELD_TYPE.to_string(),
+        ),
+        (
+            "an object where a table name is a string",
+            "DescribeTable",
+            json!({"TableName": {"Name": "Tagged"}}),
+            UNEXPECTED_FIELD_TYPE.to_string(),
+        ),
+        (
+            // Nested inside a structure: the codec's own descent reaches it, so the depth
+            // of the value makes no difference to the class of the refusal.
+            "text where a nested capacity is a long",
+            "CreateTable",
+            json!({"TableName": "Later",
+                   "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                   "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                   "ProvisionedThroughput": {"ReadCapacityUnits": "5",
+                                             "WriteCapacityUnits": 5}}),
+            "STRING_VALUE cannot be converted to Long".to_string(),
+        ),
+        (
+            "a number where a nested key attribute name is a string",
+            "CreateTable",
+            json!({"TableName": "Later",
+                   "KeySchema": [{"AttributeName": 1, "KeyType": "HASH"}],
+                   "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}]}),
+            "NUMBER_VALUE cannot be converted to String".to_string(),
+        ),
+        (
+            "a number where a tag's key is a string, inside the list",
+            "TagResource",
+            json!({"ResourceArn": tagged.clone(), "Tags": [{"Key": 1, "Value": "v"}]}),
+            "NUMBER_VALUE cannot be converted to String".to_string(),
+        ),
+        (
+            "a scalar where a tag set's element is a structure",
+            "TagResource",
+            json!({"ResourceArn": tagged.clone(), "Tags": ["k=v"]}),
+            UNEXPECTED_FIELD_TYPE.to_string(),
+        ),
+        (
+            "a number where a tag key set's element is a string",
+            "UntagResource",
+            json!({"ResourceArn": tagged.clone(), "TagKeys": [1]}),
+            "NUMBER_VALUE cannot be converted to String".to_string(),
+        ),
+        (
+            "a number where an attribute's substituted name is a string, inside the map",
+            "GetItem",
+            json!({"TableName": "Tagged", "Key": {"pk": {"S": "a"}},
+                   "ProjectionExpression": "#p", "ExpressionAttributeNames": {"#p": 1}}),
+            "NUMBER_VALUE cannot be converted to String".to_string(),
+        ),
+    ];
+
+    for (case, operation, body, sentence) in rows {
+        let (status, answered) = call(&router, operation, body).await;
+        refused_as(
+            case,
+            status,
+            &answered,
+            SERIALIZATION_EXCEPTION,
+            &sentence,
+        );
+    }
+
+    // Nothing of a refused request was read, so nothing of it was applied: the creates
+    // above addressed no table that exists afterwards, and the tag write that named a real
+    // resource left its tag set alone.
+    let listed = ok(&router, "ListTables", json!({})).await;
+    assert_eq!(
+        listed["TableNames"],
+        json!(["Tagged"]),
+        "case \"after the refusals\": expected only the table the suite made, got {listed}"
+    );
+    let tags = ok(
+        &router,
+        "ListTagsOfResource",
+        json!({"ResourceArn": tagged.clone()}),
+    )
+    .await;
+    assert_eq!(
+        tags["Tags"].as_array().map(Vec::len).unwrap_or(0),
+        0,
+        "case \"after the refusals\": a refused tag write applied nothing, got {tags}"
+    );
+
+    // The CONTROL, on the other side of the boundary: every one of these values READS into
+    // its member, so what refuses them is the rule it then breaks — the constraint class,
+    // with its prose in the lowercase slot — and the ones that break no rule are served.
+    for (case, operation, body, sentence) in [
+        (
+            "a page size below its range",
+            "ListTables",
+            json!({"Limit": 0}),
+            "1 validation error detected: Value '0' at 'limit' failed to satisfy constraint: \
+             Member must have value greater than or equal to 1",
+        ),
+        (
+            "a start key shorter than a table name may be",
+            "ListTables",
+            json!({"ExclusiveStartTableName": "ab"}),
+            "1 validation error detected: Value 'ab' at 'exclusiveStartTableName' failed to \
+             satisfy constraint: Member must have length greater than or equal to 3",
+        ),
+    ] {
+        let (status, answered) = call(&router, operation, body).await;
+        refused_as(case, status, &answered, "ValidationException", sentence);
+    }
+    for (case, operation, body) in [
+        ("a page size inside its range", "ListTables", json!({"Limit": 10})),
+        (
+            "a tag set that is a list of tags",
+            "TagResource",
+            json!({"ResourceArn": tagged, "Tags": [{"Key": "k", "Value": "v"}]}),
+        ),
+    ] {
+        let (status, answered) = call(&router, operation, body).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the request to be served, got {status} with {answered}"
+        );
+    }
+}
+

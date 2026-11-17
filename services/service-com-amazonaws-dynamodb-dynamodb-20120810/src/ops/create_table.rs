@@ -336,6 +336,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => crate::state::ResourcePolicySlot::default(),
         };
 
+        // A request that carries NO key schema at all states no primary key, which the
+        // create requires: the member is absent rather than wrong, so what it earns is the
+        // validating walk's own absent-member clause over it
+        // ([`crate::state::absent_member_message`]) rather than a sentence about the schema
+        // it did declare — the refusal every member a request leaves out is stated with.
+        if input.key_schema.is_none() {
+            return Err(lift(crate::state::RequestError::Validation(
+                crate::state::absent_member_message(crate::state::KEY_SCHEMA_MEMBER_PATH),
+            )));
+        }
         let key_schema = validated_key_schema(&declared).map_err(lift)?;
         // The stream the table publishes to, when the request enables one: its view
         // type is resolved before anything is stored, so a specification that cannot

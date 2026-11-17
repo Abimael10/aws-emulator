@@ -20,3 +20,24 @@
 pub fn missing_parameter_message(member: &str) -> String {
     format!("The parameter '{member}' is required but was not present in the request")
 }
+
+/// The member path the key schema of a table declaration is reported under, as the
+/// validating walk spells it (lowerCamel).
+pub const KEY_SCHEMA_MEMBER_PATH: &str = "keySchema";
+
+/// The other way the same absence is stated: the validating WALK's own clause for a member
+/// the request carries no value for, inside the `<N> validation error(s) detected: `
+/// envelope that counts it.
+///
+/// A member the MODEL marks `@required` earns this clause from that walk, before any handler
+/// runs; a member the model leaves optional while the service's own request code requires it
+/// is found absent by that code instead, and the ones observed to be stated this way rather
+/// than with the sentence above are worded here so the two readings of the same absence
+/// cannot drift apart. The clause states `Value null` — the absence itself — and names the
+/// member by the path that walk reports, which is the path a client reads out of the message.
+pub fn absent_member_message(path: &str) -> String {
+    format!(
+        "1 validation error detected: Value null at '{path}' failed to satisfy constraint: \
+         Member must not be null"
+    )
+}

@@ -63,6 +63,15 @@
 //! and the refusal is worded by [`region_refusal`] at the one layer every request this
 //! service serves passes through ([`OperationScopedClauseForm`]).
 //!
+//! ## Reading the request before validating it
+//!
+//! A request's body is READ into the modelled input before any rule about its values is
+//! checked, and a value whose JSON class its member cannot be read from fails that reading
+//! rather than a rule: it is the protocol's own marshalling failure, a different error class
+//! from a constraint violation and worded in a different body member. That layer lives in
+//! [`request_layer`] and runs at the same point the Region gate does, ahead of every
+//! operation ([`OperationScopedClauseForm`]).
+//!
 //! ## What every response reports about itself
 //!
 //! Two things every response of this service carries, whichever layer produced it, are
@@ -155,6 +164,11 @@ mod request_latency_metrics;
 /// The input constraints this service checks ITSELF — the ones the model declares no trait
 /// for — read off the request body so their clauses join the walk's in one refusal.
 mod request_constraints;
+
+/// The layer BEFORE every constraint: a body value whose JSON class the member it is bound
+/// to cannot be read from, which is a marshalling failure rather than a constraint
+/// violation and is answered as a different error class.
+pub mod request_layer;
 
 /// This front door's AUDIT leg: every control-plane call it serves is a management event of
 /// this service, recorded in the account's event history where CloudTrail reads it.
@@ -675,10 +689,12 @@ fn served_service_checked_clauses() -> Vec<String> {
 /// operation's clause form ([`clause_form`]) in scope for the whole run, and names the
 /// request in the response's header (see "Naming the request a response answers").
 ///
-/// It adds nothing else: the request, the service and the context are handed to the
-/// modelled operation unchanged, so deserialization, validation, the handler and the
-/// response are the framework's and the operation's own. The routing table holds only
-/// generated operations, so the inner lookup can never resolve back to this type.
+/// It adds two things to that: the endpoint's own gates ahead of every operation — the
+/// Region gate and the deserialization layer ([`request_layer`]) — and the reporting every
+/// response of this service carries. Past them the request, the service and the context are
+/// handed to the modelled operation unchanged, so validation, the handler and the response
+/// are the framework's and the operation's own. The routing table holds only generated
+/// operations, so the inner lookup can never resolve back to this type.
 struct OperationScopedClauseForm<Eng: Send + Sync + 'static> {
     /// The SAME shared engine the generated entry threads into every operation, so the
     /// throughput each request charged is published into the one CloudWatch store this
@@ -717,6 +733,24 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for OperationScopedClauseForm<E
             let Some((operation, op)) = routed else {
                 return reported(front_door::unknown_operation_response(req));
             };
+            // DESERIALIZATION precedes every later layer: a value whose JSON class the
+            // modelled member it is bound to cannot be read from never becomes a value at
+            // all, so the request is refused as the PROTOCOL's own marshalling failure
+            // before the operation's validating walk reaches a constraint and before its
+            // handler reads or writes anything. The framework would otherwise render that
+            // codec failure in the constraint-violation envelope, which is a different
+            // error class, under a different member name, and a different remediation for
+            // the caller ([`request_layer`]). The cost is deliberate: a request's body is
+            // read twice, once here and once by the dispatch that follows.
+            let unreadable = {
+                let protocol = svc.definition().wire_protocol(req);
+                request_layer::coercion_refusal::<Eng>(operation, protocol.protocol(), req)
+            };
+            if let Some(message) = unreadable {
+                if let Some(refusal) = request_layer::serialization_refusal(svc, req, &message) {
+                    return front_door::announced(req, reported(refusal));
+                }
+            }
             // What serving this request TAKES is measured around the operation's own run,
             // which is the elapsed time its latency series reports
             // ([`request_latency_metrics`]).
