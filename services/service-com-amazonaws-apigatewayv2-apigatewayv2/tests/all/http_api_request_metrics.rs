@@ -16,7 +16,10 @@
 //! > are dimensioned by `ApiId` and by `ApiId` with `Stage`, and a route whose serving stage
 //! > sets `DetailedMetricsEnabled` gets the same observations again under its own `Method` and
 //! > `Resource` dimensions — a stage that asks for nothing publishes the stage-level series and
-//! > no route's.
+//! > no route's. Beside those counters, the stage publishes one `IntegrationLatency` sample per
+//! > request whose route's BACKEND ANSWERED the invocation the gateway relayed to it, and none
+//! > for a request answered without a backend's answer — so that series' `SampleCount` is how
+//! > many invocations a backend answered rather than how many requests the stage served.
 //!
 //! Only a cross-service suite can pin this: the api, its stage and its route settings are this
 //! service's, the answer a route is served with belongs to a function AWS Lambda holds and
@@ -39,7 +42,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::http_api_backend_dispatch::{given_api, given_function, lambda_integration, ECHO_EVENT};
+use crate::http_api_backend_dispatch::{
+    control, given_api, given_function, lambda_integration, ECHO_EVENT,
+};
 use crate::websocket_handshake_data_plane::{send, Answer};
 
 /// The Region every request below is signed for.
@@ -54,6 +59,7 @@ const CLIENT_ERRORS: &str = "4xx";
 const SERVER_ERRORS: &str = "5xx";
 const LATENCY: &str = "Latency";
 const DATA_PROCESSED: &str = "DataProcessed";
+const INTEGRATION_LATENCY: &str = "IntegrationLatency";
 
 /// The dimensions those series are identified by.
 const API_ID: &str = "ApiId";
@@ -136,6 +142,27 @@ async fn total(
     metric: &str,
     dimensions: &[(&str, String)],
 ) -> Option<f64> {
+    aggregated(router, metric, dimensions, "Sum").await
+}
+
+/// How many OBSERVATIONS the series holds in the window: its `SampleCount`, added up the same
+/// way, which for a measurement is the number of things measured.
+async fn samples(
+    router: &MultiServiceRouter,
+    metric: &str,
+    dimensions: &[(&str, String)],
+) -> Option<f64> {
+    aggregated(router, metric, dimensions, "SampleCount").await
+}
+
+/// The `statistic` of every datapoint the series `metric`/`dimensions` holds in the window,
+/// added up over the periods the window covers.
+async fn aggregated(
+    router: &MultiServiceRouter,
+    metric: &str,
+    dimensions: &[(&str, String)],
+    statistic: &str,
+) -> Option<f64> {
     let now = now_secs();
     let (status, body) = monitoring(
         router,
@@ -150,7 +177,7 @@ async fn total(
             "StartTime": now - WINDOW_SECONDS,
             "EndTime": now + AHEAD_SECONDS,
             "Period": PERIOD_SECONDS,
-            "Statistics": ["Sum"],
+            "Statistics": [statistic],
         }),
     )
     .await;
@@ -163,7 +190,12 @@ async fn total(
             .map(|points| {
                 points
                     .iter()
-                    .map(|point| point.get("Sum").and_then(Value::as_f64).unwrap_or_default())
+                    .map(|point| {
+                        point
+                            .get(statistic)
+                            .and_then(Value::as_f64)
+                            .unwrap_or_default()
+                    })
                     .sum()
             })
             .unwrap_or_default(),
@@ -244,6 +276,11 @@ struct Row {
     detailed: Detailed,
     /// The status each request to the row's own route path, in order, is answered with.
     statuses: &'static [u16],
+    /// How many of those requests' invocations the route's BACKEND ANSWERED, which is what the
+    /// stage has an `IntegrationLatency` sample for: a request the stage refused before the
+    /// backend was reached has none, and a function that ran and raised answered the
+    /// invocation with Lambda's error document, so it has one.
+    backend_answers: f64,
     /// Paths within the same stage that NO route of the api matches. Each is requested once,
     /// is answered by the gateway itself, and is counted in none of the stage's series.
     unrouted_paths: &'static [&'static str],
@@ -281,6 +318,7 @@ fn rows() -> Vec<Row> {
             throttle: None,
             detailed: Detailed::Off,
             statuses: &[200],
+            backend_answers: 1.0,
             unrouted_paths: &[],
             route_series: None,
         },
@@ -294,6 +332,7 @@ fn rows() -> Vec<Row> {
             throttle: None,
             detailed: Detailed::Off,
             statuses: &[200, 200, 200],
+            backend_answers: 3.0,
             unrouted_paths: &[],
             route_series: None,
         },
@@ -308,6 +347,7 @@ fn rows() -> Vec<Row> {
             throttle: None,
             detailed: Detailed::Off,
             statuses: &[],
+            backend_answers: 0.0,
             unrouted_paths: &["/nothing-here", "/nothing/here/either", "/served/deeper"],
             route_series: None,
         },
@@ -322,6 +362,7 @@ fn rows() -> Vec<Row> {
             throttle: None,
             detailed: Detailed::Off,
             statuses: &[200, 200, 200, 200],
+            backend_answers: 4.0,
             unrouted_paths: &["/nothing-here", "/also-nothing"],
             route_series: None,
         },
@@ -335,6 +376,7 @@ fn rows() -> Vec<Row> {
             throttle: Some((0.0, 1)),
             detailed: Detailed::Off,
             statuses: &[200, 429, 429, 429],
+            backend_answers: 1.0,
             unrouted_paths: &[],
             route_series: None,
         },
@@ -348,6 +390,7 @@ fn rows() -> Vec<Row> {
             throttle: None,
             detailed: Detailed::Off,
             statuses: &[500],
+            backend_answers: 1.0,
             unrouted_paths: &[],
             route_series: None,
         },
@@ -361,6 +404,7 @@ fn rows() -> Vec<Row> {
             throttle: None,
             detailed: Detailed::OnTheRoute,
             statuses: &[200, 200],
+            backend_answers: 2.0,
             unrouted_paths: &[],
             route_series: Some(("GET", "/served")),
         },
@@ -375,6 +419,7 @@ fn rows() -> Vec<Row> {
             throttle: None,
             detailed: Detailed::OnTheRoute,
             statuses: &[200, 200],
+            backend_answers: 2.0,
             unrouted_paths: &["/nothing-here"],
             route_series: Some(("GET", "/served")),
         },
@@ -389,6 +434,7 @@ fn rows() -> Vec<Row> {
             throttle: None,
             detailed: Detailed::OnTheStageDefaults,
             statuses: &[200],
+            backend_answers: 1.0,
             unrouted_paths: &[],
             route_series: Some(("POST", "/orders/{id}")),
         },
@@ -402,6 +448,7 @@ fn rows() -> Vec<Row> {
             throttle: None,
             detailed: Detailed::OnTheRoute,
             statuses: &[200],
+            backend_answers: 1.0,
             unrouted_paths: &[],
             route_series: Some(("ANY", "/{proxy+}")),
         },
@@ -416,6 +463,7 @@ fn rows() -> Vec<Row> {
             throttle: Some((0.0, 1)),
             detailed: Detailed::OnTheStageDefaults,
             statuses: &[200, 429],
+            backend_answers: 1.0,
             unrouted_paths: &[],
             route_series: Some(("GET", "/metered")),
         },
@@ -559,6 +607,17 @@ async fn every_routed_request_is_counted_in_the_series_its_status_belongs_to() {
                      {actual:?}"
                 );
             }
+            // The BACKEND's own latency is observed once per invocation a backend answered —
+            // never for a request the stage answered without one — so the series' sample count
+            // is that number and not how many requests the stage served.
+            let actual = samples(&router, INTEGRATION_LATENCY, dimensions).await;
+            assert_eq!(
+                actual,
+                Some(row.backend_answers),
+                "case {case:?}: expected {scope} to hold {} {INTEGRATION_LATENCY} samples, got \
+                 {actual:?}",
+                row.backend_answers
+            );
         }
 
         // WHICH series exist: the stage-level ones for a stage whose routes served something,
@@ -588,12 +647,199 @@ async fn every_routed_request_is_counted_in_the_series_its_status_belongs_to() {
                 DATA_PROCESSED.to_string(),
             ]
         };
+        // The backend-latency series exists only where a backend answered something.
+        if row.backend_answers > 0.0 {
+            expected_metrics.push(INTEGRATION_LATENCY.to_string());
+        }
         expected_metrics.sort();
         assert_eq!(
             metrics, expected_metrics,
             "case {case:?}: expected every metric of a routed request, got {held:?}"
         );
     }
+}
+
+/// A `REQUEST` authorizer's function that refuses every request it is asked about: the simple
+/// response payload format version 2.0 admits ("`isAuthorized`"), set to a refusal.
+const DENIES: &str = "def lambda_handler(event, context):\n    return {'isAuthorized': False}\n";
+
+/// The status a request its route's authorizer refused is answered with.
+const FORBIDDEN: u16 = 403;
+
+/// The stage that serves the gated route below, and the route itself.
+const GATED_STAGE: &str = "live";
+const GATED_ROUTE_KEY: &str = "GET /orders";
+const GATED_ROUTE_PATH: &str = "/orders";
+
+/// How many refused requests the case makes: more than one, so a counter reading the class
+/// cannot be confused with a flag.
+const REFUSED_REQUESTS: usize = 3;
+
+/// A request a route's AUTHORIZER refused is still traffic of the stage's route: it is counted
+/// in `Count` and in the lowercase `4xx` series under the api's own dimensions, and it has NO
+/// backend latency at all, because the refusal was decided before anything was relayed to the
+/// route's integration.
+#[tokio::test]
+async fn a_request_the_authorizer_refused_is_counted_as_a_client_error_with_no_backend_latency() {
+    let case = "a route whose REQUEST authorizer refuses every request";
+    let (router, engine) = emulator();
+    // The route's own backend, which this case proves is never reached, and the authorizer's
+    // function, which refuses.
+    let backend = given_function(&router, &engine, case, "unreached-backend", ECHO_EVENT).await;
+    let gate = given_function(&router, &engine, case, "refusing-gate", DENIES).await;
+
+    let (status, api) = control(
+        &router,
+        "POST",
+        "/v2/apis",
+        Some(json!({ "name": "gated-metrics-api", "protocolType": "HTTP" })),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "case {case:?}: CreateApi answered {status} {api}"
+    );
+    let api_id = api
+        .get("apiId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let host = api
+        .get("apiEndpoint")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .split_once("://")
+        .map(|(_scheme, rest)| rest.to_string())
+        .unwrap_or_default();
+
+    let (status, integration) = control(
+        &router,
+        "POST",
+        &format!("/v2/apis/{api_id}/integrations"),
+        Some(lambda_integration(&backend, "2.0")),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "case {case:?}: CreateIntegration answered {status} {integration}"
+    );
+    let integration_id = integration
+        .get("integrationId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    let (status, authorizer) = control(
+        &router,
+        "POST",
+        &format!("/v2/apis/{api_id}/authorizers"),
+        Some(json!({
+            "name": "refusing-gate",
+            "authorizerType": "REQUEST",
+            "authorizerUri": format!(
+                "arn:aws:apigateway:{REGION}:lambda:path/2015-03-31/functions/{gate}/invocations"
+            ),
+            "authorizerPayloadFormatVersion": "2.0",
+            "enableSimpleResponses": true,
+            "authorizerResultTtlInSeconds": 0,
+            "identitySource": ["$request.header.authorization"]
+        })),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "case {case:?}: CreateAuthorizer answered {status} {authorizer}"
+    );
+    let authorizer_id = authorizer
+        .get("authorizerId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    let (status, route) = control(
+        &router,
+        "POST",
+        &format!("/v2/apis/{api_id}/routes"),
+        Some(json!({
+            "routeKey": GATED_ROUTE_KEY,
+            "target": format!("integrations/{integration_id}"),
+            "authorizationType": "CUSTOM",
+            "authorizerId": authorizer_id
+        })),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "case {case:?}: CreateRoute answered {status} {route}"
+    );
+    let (status, stage) = control(
+        &router,
+        "POST",
+        &format!("/v2/apis/{api_id}/stages"),
+        Some(json!({ "stageName": GATED_STAGE, "autoDeploy": true })),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "case {case:?}: CreateStage answered {status} {stage}"
+    );
+
+    let path = format!("/{GATED_STAGE}{GATED_ROUTE_PATH}");
+    for attempt in 0..REFUSED_REQUESTS {
+        let answered = send(
+            &router,
+            &host,
+            "GET",
+            &path,
+            &[("authorization", "Bearer opaque-request-token")],
+        )
+        .await;
+        assert_eq!(
+            answered.status, FORBIDDEN,
+            "case {case:?}: expected request {attempt} at {path:?} to be refused \
+             {FORBIDDEN}, got {}",
+            answered.summary()
+        );
+    }
+
+    let refused = REFUSED_REQUESTS as f64;
+    for (scope, dimensions) in [
+        ("the api's own series", vec![(API_ID, api_id.clone())]),
+        (
+            "the stage's series",
+            vec![(API_ID, api_id.clone()), (STAGE, GATED_STAGE.to_string())],
+        ),
+    ] {
+        for (metric, expected) in [
+            (COUNT, refused),
+            (CLIENT_ERRORS, refused),
+            (SERVER_ERRORS, 0.0),
+        ] {
+            let actual = total(&router, metric, &dimensions).await;
+            assert_eq!(
+                actual,
+                Some(expected),
+                "case {case:?}: expected {scope} to hold {expected} in {metric}, got {actual:?}"
+            );
+        }
+        let actual = samples(&router, INTEGRATION_LATENCY, &dimensions).await;
+        assert_eq!(
+            actual,
+            Some(0.0),
+            "case {case:?}: expected {scope} to hold no {INTEGRATION_LATENCY} sample at all, \
+             got {actual:?}"
+        );
+    }
+    // And no backend-latency series exists for the api at all: nothing was relayed to the
+    // route's integration, so there is nothing that series could be about.
+    let held = series(&router, &api_id).await;
+    assert!(
+        !held
+            .iter()
+            .any(|(metric, _)| metric == INTEGRATION_LATENCY),
+        "case {case:?}: expected no {INTEGRATION_LATENCY} series for an api whose backend was \
+         never reached, got {held:?}"
+    );
 }
 
 /// The dimension pairs of a scope, ordered by name the way a series reports them.

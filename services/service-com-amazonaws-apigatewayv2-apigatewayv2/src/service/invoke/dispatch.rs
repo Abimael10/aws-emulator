@@ -68,6 +68,11 @@
 //! stage carries no variable for names no backend at all, so it is the "produced no
 //! response" class rather than a call to a URI carrying an unresolved reference.
 //!
+//! Beside the answer, this step reports how long the route's BACKEND took to answer the
+//! invocation the gateway relayed to it ([`Performed`]), which is the one measurement only the
+//! step that made the call can take — and the one the stage's backend-latency series is
+//! published from ([`super::request_metrics`]).
+//!
 //! The answer a BACKEND gave is then transformed by the integration's own
 //! `ResponseParameters` before the client reads it ([`response_parameters`]) — "you use
 //! response parameters to transform the HTTP response from a backend integration before
@@ -127,11 +132,59 @@ pub struct Dispatch {
     pub route_key: String,
 }
 
+/// What step 7 produced: the answer the caller is told, and how long the route's BACKEND took
+/// to answer the invocation the gateway relayed to it.
+///
+/// The latency is `None` for a request whose backend ANSWERED NOTHING — one refused before any
+/// backend was reached (the authorizer's decision, the stage's throttle, a mapping the request
+/// cannot satisfy), one whose route names a backend this gateway relays nothing to (an
+/// `HTTP_PROXY` upstream the caller is sent to itself), and one whose backend was invoked and
+/// never answered. That is the reading `IntegrationLatency` is published by
+/// ([`crate::service::metrics::INTEGRATION_LATENCY_METRIC`]): it measures the time between the
+/// gateway relaying the request and the backend's answer reaching it, so only a relayed
+/// invocation the backend answered has one.
+pub struct Performed {
+    /// The answer, as the caller reads it.
+    pub response: RtResponse,
+    /// How long the backend took to answer, for a request one answered.
+    pub integration_latency: Option<Duration>,
+}
+
+impl Performed {
+    /// An answer this step decided WITHOUT a backend answering it, which has no integration
+    /// latency to report.
+    pub fn gateway(response: RtResponse) -> Self {
+        Self {
+            response,
+            integration_latency: None,
+        }
+    }
+}
+
 /// Perform the authorizer's decision and then the route's integration.
 pub async fn perform<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &OperationContext<'_>,
+    dispatch: Dispatch,
+) -> Performed {
+    // The backend's own latency is reported by the ONE step that relayed the request to it and
+    // read its answer, which is why it is written through here rather than returned up each of
+    // the refusals below: every one of those is an answer no backend gave.
+    let mut integration_latency: Option<Duration> = None;
+    let response = answered(engine, ctx, dispatch, &mut integration_latency).await;
+    Performed {
+        response,
+        integration_latency,
+    }
+}
+
+/// The answer itself, recording into `integration_latency` how long a backend that ANSWERED
+/// took.
+async fn answered<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &OperationContext<'_>,
     mut dispatch: Dispatch,
+    integration_latency: &mut Option<Duration>,
 ) -> RtResponse {
     if let Some((authorizer, identity)) = dispatch.authorizer.clone() {
         let method = dispatch.request.method.clone();
@@ -180,7 +233,15 @@ pub async fn perform<Eng: Send + Sync + 'static>(
         &integration.integration_type,
         integration.integration_subtype.as_deref(),
     ) {
-        return service_action(engine, ctx, &dispatch, &integration, subtype).await;
+        return service_action(
+            engine,
+            ctx,
+            &dispatch,
+            &integration,
+            subtype,
+            integration_latency,
+        )
+        .await;
     }
     let Some(upstream) = resolved_uri(&dispatch, &integration) else {
         return json_response(UNPLACEABLE_STATUS, INTERNAL_MESSAGE, None);
@@ -189,7 +250,7 @@ pub async fn perform<Eng: Send + Sync + 'static>(
         &integration.integration_type,
         integration.integration_subtype.as_deref(),
     ) {
-        return lambda_proxy(ctx, &dispatch, &integration, &upstream).await;
+        return lambda_proxy(ctx, &dispatch, &integration, &upstream, integration_latency).await;
     }
     if integration.integration_type == crate::state::HTTP_PROXY_INTEGRATION_TYPE {
         // An `HTTP_PROXY` upstream is a URI the CALLER can reach, and this emulator opens no
@@ -222,18 +283,18 @@ pub async fn perform<Eng: Send + Sync + 'static>(
 ///
 /// Everything that does not need the transport is unchanged — the throttle, and the `307`
 /// an `HTTP_PROXY` upstream is answered with, which is the caller's to reach either way.
-pub fn unperformable<Eng: Send + Sync + 'static>(engine: &Eng, dispatch: &Dispatch) -> RtResponse {
+pub fn unperformable<Eng: Send + Sync + 'static>(engine: &Eng, dispatch: &Dispatch) -> Performed {
     let submission = throttle::metered(engine, dispatch);
     if let Some(refusal) = submission
         .as_ref()
         .and_then(throttle::Submission::refusal)
     {
-        return refusal;
+        return Performed::gateway(refusal);
     }
     if let Some(integration) = dispatch.integration.as_ref() {
         if integration.integration_type == crate::state::HTTP_PROXY_INTEGRATION_TYPE {
             if let Some(upstream) = resolved_uri(dispatch, integration) {
-                return redirect(&upstream);
+                return Performed::gateway(redirect(&upstream));
             }
         }
     }
@@ -244,7 +305,7 @@ pub fn unperformable<Eng: Send + Sync + 'static>(engine: &Eng, dispatch: &Dispat
         "this invoke is being served from a seam that carries no in-process transport, so \
          the route's integration was not performed"
     );
-    json_response(UNPLACEABLE_STATUS, INTERNAL_MESSAGE, None)
+    Performed::gateway(json_response(UNPLACEABLE_STATUS, INTERNAL_MESSAGE, None))
 }
 
 /// The integration's `IntegrationUri` with THIS stage's variables interpolated, or `None`
@@ -284,6 +345,7 @@ async fn lambda_proxy(
     dispatch: &Dispatch,
     integration: &Integration,
     upstream: &str,
+    integration_latency: &mut Option<Duration>,
 ) -> RtResponse {
     let payload_format = integration
         .payload_format_version
@@ -345,10 +407,19 @@ async fn lambda_proxy(
             return json_response(UNPLACEABLE_STATUS, INTERNAL_MESSAGE, None);
         }
     };
+    // MEASURED from the invocation being relayed to the function: a run that ANSWERED has a
+    // latency to report, whatever its answer was worth — a handler that raised answered with
+    // Lambda's own error document, and a reply this payload format cannot be read as is still
+    // a reply the backend gave — while a function the invocation never reached, and one that
+    // had not answered when the integration's deadline elapsed, have none.
+    let relayed = ::std::time::Instant::now();
     let ran = match lambda::invoke_function(ctx.callback(), &target, payload, deadline(integration))
         .await
     {
-        Ok(ran) => ran,
+        Ok(ran) => {
+            *integration_latency = Some(relayed.elapsed());
+            ran
+        }
         Err(unreached) => return unanswered(dispatch, unreached),
     };
     if ran.failed() {
@@ -408,7 +479,14 @@ async fn service_action<Eng: Send + Sync + 'static>(
     dispatch: &Dispatch,
     integration: &Integration,
     subtype: &str,
+    integration_latency: &mut Option<Duration>,
 ) -> RtResponse {
+    // MEASURED from the action being called, like every other backend this plane relays a
+    // request to: the service ANSWERED both the call it performed and the call it refused, so
+    // both have a latency to report, while a call that did not answer within the integration's
+    // deadline, one the request carried no required parameter for (nothing was called at all)
+    // and one that reached no service have none.
+    let called = ::std::time::Instant::now();
     let performed = service_action::perform(
         engine,
         ctx,
@@ -418,6 +496,12 @@ async fn service_action<Eng: Send + Sync + 'static>(
         deadline(integration),
     )
     .await;
+    if matches!(
+        &performed,
+        Ok(_) | Err(Unperformed::Answered(_))
+    ) {
+        *integration_latency = Some(called.elapsed());
+    }
     let unperformed = match performed {
         Ok(answered) => return answered,
         Err(unperformed) => unperformed,

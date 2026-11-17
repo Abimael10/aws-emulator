@@ -13,9 +13,10 @@
 //! the answer it ended in: a route the stage's `RouteSettings` throttled, one an authorizer
 //! refused and one whose backend produced nothing were all served BY a route, so they are
 //! counted like one a backend answered and the status alone decides which counter they land in.
-//! Beside the counters go the two measurements of the same request: how long answering it took
-//! ([`LATENCY_METRIC`]) and how many payload bytes it carried in and out
-//! ([`DATA_PROCESSED_METRIC`]).
+//! Beside the counters go the measurements of the same request: how long answering it took
+//! ([`LATENCY_METRIC`]), how long the route's BACKEND took to answer the invocation the gateway
+//! relayed to it ([`INTEGRATION_LATENCY_METRIC`], one sample per request a backend answered),
+//! and how many payload bytes it carried in and out ([`DATA_PROCESSED_METRIC`]).
 //!
 //! WHAT IS NOT COUNTED is a request NO route of the stage served ([`routed`]): a path no route
 //! key matches, a stage the api does not hold, a stage with no deployment released to it, and
@@ -81,6 +82,12 @@ pub const SERVER_ERROR_METRIC: &str = "5xx";
 /// How long answering one request took, end to end.
 pub const LATENCY_METRIC: &str = "Latency";
 
+/// How long the route's BACKEND took to answer the invocation the gateway relayed to it — the
+/// series both data planes of this service publish that measurement in
+/// ([`metrics::INTEGRATION_LATENCY_METRIC`]), so an api's backend latency has one name whichever
+/// plane served the call.
+pub use metrics::INTEGRATION_LATENCY_METRIC;
+
 /// How many payload bytes answering it carried, in and out.
 pub const DATA_PROCESSED_METRIC: &str = "DataProcessed";
 
@@ -106,6 +113,10 @@ const MILLIS_PER_SECOND: f64 = 1_000.0;
 /// known before it. A request no route of a stage served belongs to no series at all
 /// ([`planned`]), so nothing is published for it.
 ///
+/// `integration_latency` is how long the route's backend took to answer, for a request one
+/// ANSWERED, and `None` for a request no backend answered ([`crate::service::invoke::dispatch`]
+/// decides which) — which is what the backend-latency series is left out of.
+///
 /// Nothing here can fail the request: the stage has already answered, so an observation that
 /// could not be stored is reported where a developer can see it and nothing else.
 pub(super) fn published<Eng: Send + Sync + 'static>(
@@ -113,8 +124,9 @@ pub(super) fn published<Eng: Send + Sync + 'static>(
     req: &RtRequest,
     response: &RtResponse,
     latency: Duration,
+    integration_latency: Option<Duration>,
 ) {
-    let Some(planned) = planned(engine, req, response, latency) else {
+    let Some(planned) = planned(engine, req, response, latency, integration_latency) else {
         return;
     };
     let mut data: Vec<metrics::Datapoint> =
@@ -167,6 +179,7 @@ fn planned<Eng: Send + Sync + 'static>(
     req: &RtRequest,
     response: &RtResponse,
     latency: Duration,
+    integration_latency: Option<Duration>,
 ) -> Option<Planned> {
     let state = crate::state::service_state(engine)?;
     let store = state.lock();
@@ -192,6 +205,7 @@ fn planned<Eng: Send + Sync + 'static>(
             response.status().as_u16(),
             latency,
             request_payload_bytes(req).saturating_add(response_payload_bytes(response)),
+            integration_latency,
         ),
     })
 }
@@ -249,13 +263,23 @@ fn route_dimensions(route_key: &str) -> (String, String) {
 }
 
 /// What the series take of a request answered with `status`, in `latency`, carrying `bytes` of
-/// payload in and out.
+/// payload in and out, whose backend took `integration_latency` to answer when one answered.
 ///
 /// Which class the status falls in is the crate's ONE reading of each
 /// ([`crate::service::data_plane::is_client_error_status`] and its server-error counterpart),
 /// so the counter a request lands in and the refusal classes the other data plane meters by
 /// cannot disagree about where a status belongs.
-fn observations(status: u16, latency: Duration, bytes: usize) -> Vec<Observation> {
+///
+/// The backend's own latency is observed only for a request a backend ANSWERED: the measurement
+/// is the time between the gateway relaying the request and the answer reaching it, so a
+/// request no backend answered has none to report rather than a zero — which is what keeps the
+/// series' `SampleCount` the number of invocations a backend answered.
+fn observations(
+    status: u16,
+    latency: Duration,
+    bytes: usize,
+    integration_latency: Option<Duration>,
+) -> Vec<Observation> {
     let counted = |in_class: bool| {
         if in_class {
             ONE_REQUEST
@@ -263,7 +287,7 @@ fn observations(status: u16, latency: Duration, bytes: usize) -> Vec<Observation
             NO_REQUEST
         }
     };
-    vec![
+    let mut observations = vec![
         Observation {
             metric_name: COUNT_METRIC,
             value: ONE_REQUEST,
@@ -289,7 +313,15 @@ fn observations(status: u16, latency: Duration, bytes: usize) -> Vec<Observation
             value: bytes as f64,
             unit: BYTES_UNIT,
         },
-    ]
+    ];
+    if let Some(answered_in) = integration_latency {
+        observations.push(Observation {
+            metric_name: INTEGRATION_LATENCY_METRIC,
+            value: answered_in.as_secs_f64() * MILLIS_PER_SECOND,
+            unit: MILLISECONDS_UNIT,
+        });
+    }
+    observations
 }
 
 /// How many payload bytes the REQUEST carried, as the gateway measured them — the ONE reading
@@ -313,13 +345,19 @@ mod tests {
 
     use super::*;
 
-    /// The value `metric` was observed at, out of what one answered request contributes.
+    /// The value `metric` was observed at, out of what one answered request whose backend
+    /// answered contributes.
     fn observed(status: u16, metric: &str) -> f64 {
-        observations(status, Duration::from_millis(7), 11)
-            .into_iter()
-            .find(|observation| observation.metric_name == metric)
-            .map(|observation| observation.value)
-            .unwrap_or_else(|| panic!("no {metric} observation at all"))
+        observations(
+            status,
+            Duration::from_millis(7),
+            11,
+            Some(Duration::from_millis(3)),
+        )
+        .into_iter()
+        .find(|observation| observation.metric_name == metric)
+        .map(|observation| observation.value)
+        .unwrap_or_else(|| panic!("no {metric} observation at all"))
     }
 
     #[test]
@@ -355,6 +393,39 @@ mod tests {
                 actual, server,
                 "case {status}: expected the {SERVER_ERROR_METRIC} counter at {server}, got \
                  {actual}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_backend_latency_is_observed_exactly_for_a_request_a_backend_answered() {
+        // Rows differ along WHETHER a backend answered the invocation and how long it took:
+        // an answer that came back in no measurable time at all is still an answer, a longer
+        // one is the same observation in milliseconds, and a request no backend answered has
+        // no latency to report at all.
+        let cases: [(&str, Option<Duration>, Option<f64>); 4] = [
+            ("a backend that answered at once", Some(Duration::ZERO), Some(0.0)),
+            (
+                "a backend that answered in sub-millisecond time",
+                Some(Duration::from_micros(1_500)),
+                Some(1.5),
+            ),
+            (
+                "a backend that took a while",
+                Some(Duration::from_millis(250)),
+                Some(250.0),
+            ),
+            ("a request no backend answered", None, None),
+        ];
+        for (case, answered_in, expected) in cases {
+            let actual = observations(200, Duration::from_millis(9), 11, answered_in)
+                .into_iter()
+                .find(|observation| observation.metric_name == INTEGRATION_LATENCY_METRIC)
+                .map(|observation| observation.value);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected the {INTEGRATION_LATENCY_METRIC} observation \
+                 {expected:?}, got {actual:?}"
             );
         }
     }

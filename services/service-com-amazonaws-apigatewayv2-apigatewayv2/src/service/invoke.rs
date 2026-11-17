@@ -684,11 +684,15 @@ pub async fn serve<Eng: Send + Sync + 'static>(
     // MEASURED over the whole invoke, because that is what the access log reports as the
     // latency of answering this request.
     let started = ::std::time::Instant::now();
-    let answered = match resolved(engine, req, &request_id) {
-        Err(answered) => *answered,
-        Ok((decoration, Answer::Now(response))) => decorated(*response, &decoration),
+    let (answered, integration_latency) = match resolved(engine, req, &request_id) {
+        Err(answered) => (*answered, None),
+        Ok((decoration, Answer::Now(response))) => (decorated(*response, &decoration), None),
         Ok((decoration, Answer::Dispatch(dispatch))) => {
-            decorated(dispatch::perform(engine, ctx, *dispatch).await, &decoration)
+            let performed = dispatch::perform(engine, ctx, *dispatch).await;
+            (
+                decorated(performed.response, &decoration),
+                performed.integration_latency,
+            )
         }
     };
     let served = ::service_common::query_error_envelope::with_stated_request_id_header(
@@ -700,7 +704,7 @@ pub async fn serve<Eng: Send + Sync + 'static>(
     // what it LOGS about it ([`access_logs`]), delivered to the destination the stage names.
     // After the response is computed and never before: a counter counts a request that was
     // answered, and a record is about one.
-    request_metrics::published(engine, req, &served, latency);
+    request_metrics::published(engine, req, &served, latency, integration_latency);
     access_logs::delivered(engine, req, ctx, &request_id, &served, latency).await;
     served
 }
@@ -728,13 +732,17 @@ pub fn serve_without_transport<Eng: Send + Sync + 'static>(
 ) -> RtResponse {
     let request_id = proxy_event::mint_request_id();
     let started = ::std::time::Instant::now();
-    let answered = match resolved(&**engine, req, &request_id) {
-        Err(answered) => *answered,
-        Ok((decoration, Answer::Now(response))) => decorated(*response, &decoration),
-        Ok((decoration, Answer::Dispatch(dispatch))) => decorated(
-            performed_over_the_remembered_transport(engine, identity, req, *dispatch),
-            &decoration,
-        ),
+    let (answered, integration_latency) = match resolved(&**engine, req, &request_id) {
+        Err(answered) => (*answered, None),
+        Ok((decoration, Answer::Now(response))) => (decorated(*response, &decoration), None),
+        Ok((decoration, Answer::Dispatch(dispatch))) => {
+            let performed =
+                performed_over_the_remembered_transport(engine, identity, req, *dispatch);
+            (
+                decorated(performed.response, &decoration),
+                performed.integration_latency,
+            )
+        }
     };
     // No access-log record is delivered from here: the delivery is a CALL into the
     // CloudWatch Logs this emulator mounts, and this seam has no request of its own to
@@ -744,7 +752,13 @@ pub fn serve_without_transport<Eng: Send + Sync + 'static>(
     // The metric publication IS made from here: it is a write into the metric store this
     // emulator's CloudWatch holds on the same engine rather than a call over a transport, so
     // a request served from this seam is counted like any other.
-    request_metrics::published(&**engine, req, &served, started.elapsed());
+    request_metrics::published(
+        &**engine,
+        req,
+        &served,
+        started.elapsed(),
+        integration_latency,
+    );
     served
 }
 
@@ -767,7 +781,7 @@ fn performed_over_the_remembered_transport<Eng: Send + Sync + 'static>(
     identity: &::smithy_server_runtime::ServiceIdentity,
     req: &RtRequest,
     dispatch: dispatch::Dispatch,
-) -> RtResponse {
+) -> dispatch::Performed {
     let remembered = crate::state::service_state(&**engine)
         .and_then(|state| state.lock().invoke_transport.held());
     let (Some(callback), Some(head)) = (remembered, request_head(req)) else {
@@ -817,14 +831,14 @@ fn performed_over_the_remembered_transport<Eng: Send + Sync + 'static>(
     let answered = awaited(&handle, performed);
     drop(permit);
     match answered {
-        Some(response) => *response,
+        Some(performed) => *performed,
         None => {
             // The task panicked or was cancelled, which is an integration that produced no
             // response. The reason stays in this emulator's own log.
             ::tracing::warn!(
                 "the task performing this route's integration produced no answer to map"
             );
-            json_response(UNPLACEABLE_STATUS, INTERNAL_MESSAGE, None)
+            dispatch::Performed::gateway(json_response(UNPLACEABLE_STATUS, INTERNAL_MESSAGE, None))
         }
     }
 }
@@ -917,10 +931,10 @@ fn drivable_runtime() -> Option<::tokio::runtime::Handle> {
 /// ([`dispatch`]) is on the runtime's own timer, and the task stays cancellable.
 /// `block_in_place` hands this worker's queue to a replacement thread while it waits, so the
 /// runtime keeps serving every other request.
-fn awaited(
+fn awaited<Answered: Send + 'static>(
     handle: &::tokio::runtime::Handle,
-    work: impl ::std::future::Future<Output = RtResponse> + Send + 'static,
-) -> Option<Box<RtResponse>> {
+    work: impl ::std::future::Future<Output = Answered> + Send + 'static,
+) -> Option<Box<Answered>> {
     let task = handle.spawn(work);
     ::tokio::task::block_in_place(|| handle.block_on(task))
         .ok()
