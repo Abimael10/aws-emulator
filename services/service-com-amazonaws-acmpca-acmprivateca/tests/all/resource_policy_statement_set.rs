@@ -19,6 +19,13 @@
 //!    policy the CA already carried exactly as it was — which `GetPolicy` is what reports.
 //!    The rows span each kind of refusal: the grammar, the action, the principal and the
 //!    resource.
+//! 3. The refusal NAMES the one rule the document broke, so two documents breaking
+//!    different rules cannot carry the same message: a document nothing can read as a
+//!    policy is reported as the submitted text itself, byte for byte, while a document that
+//!    IS a policy and says something a private CA's policy cannot say is named by its rule
+//!    and is not echoed. The rows span the whole unreadable class (not JSON, a JSON value
+//!    that is not a policy, no usable `Statement`, a statement that is not one) along the
+//!    bytes they carry, beside one row per rule a readable policy can break.
 //!
 //! The per-statement catalogs themselves (which actions and which principal forms resolve)
 //! are tabled in `resource_policy_rules.rs`; this suite is about the document the
@@ -27,12 +34,12 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_acmpca_acmprivateca::state::{
-    different_resource_message, DISALLOWED_POLICY_ACTION_MESSAGE, INVALID_POLICY_MESSAGE,
-    POLICY_ALLOWED_ACTIONS, POLICY_NOT_FOUND_MESSAGE, POLICY_PRINCIPAL_NOT_FOUND_MESSAGE,
+    different_resource_message, DISALLOWED_POLICY_ACTION_MESSAGE, POLICY_ALLOWED_ACTIONS,
+    POLICY_NOT_FOUND_MESSAGE, POLICY_PRINCIPAL_NOT_FOUND_MESSAGE,
 };
 
 use crate::private_ca_lifecycle::{root_ca_request, string, Emulator, ACCOUNT, REGION};
-use crate::resource_policy::error_message;
+use crate::resource_policy::{error_message, INVALID_POLICY_PREFIX};
 
 /// A private CA created over the wire, named after `label`.
 ///
@@ -43,6 +50,13 @@ async fn certificate_authority(emulator: &Emulator, label: &str) -> String {
         .ok(label, "CreateCertificateAuthority", &root_ca_request(label))
         .await;
     string(&created, "CertificateAuthorityArn", label)
+}
+
+/// A refusal row whose `submitted` document cannot be read as a policy at all, so the
+/// refusal names no statement's rule: it reports the submitted text itself.
+fn unreadable(case: &'static str, submitted: String) -> (&'static str, String, String) {
+    let expected = format!("{INVALID_POLICY_PREFIX}{submitted}");
+    (case, submitted, expected)
 }
 
 /// A policy document carrying `statement` as its `Statement` element — one statement
@@ -312,22 +326,18 @@ async fn a_refused_document_leaves_the_carried_policy_untouched() {
     // not statements, it grants an action a CA cannot be shared for, it names an identity
     // that is not here, and it is about another authority.
     let refused: Vec<(&str, String, String)> = vec![
-        (
-            "a document that is not JSON",
-            "not a policy at all".to_string(),
-            INVALID_POLICY_MESSAGE.to_string(),
-        ),
-        (
+        // The rows whose document cannot be read as a policy at all are reported as the
+        // document itself, so each one's expectation is derived from what it submitted.
+        unreadable("a document that is not JSON", "not a policy at all".to_string()),
+        unreadable(
             "a document carrying no statement",
             json!({"Version": "2012-10-17"}).to_string(),
-            INVALID_POLICY_MESSAGE.to_string(),
         ),
-        (
+        unreadable(
             "a document whose statement list is empty",
             document(json!([])),
-            INVALID_POLICY_MESSAGE.to_string(),
         ),
-        (
+        unreadable(
             "a statement with no Effect",
             document(json!({
                 "Sid": "no-effect",
@@ -335,7 +345,6 @@ async fn a_refused_document_leaves_the_carried_policy_untouched() {
                 "Action": format!("acm-pca:{}", POLICY_ALLOWED_ACTIONS[0]),
                 "Resource": arn
             })),
-            INVALID_POLICY_MESSAGE.to_string(),
         ),
         (
             "a statement granting a disallowed action",
@@ -386,4 +395,223 @@ async fn a_refused_document_leaves_the_carried_policy_untouched() {
         gone.is_none(),
         "case {case:?}: expected the delete to remove the carried policy, got {gone:?}"
     );
+}
+
+/// What a document that cannot be READ as a policy at all is, spanning the whole class the
+/// grammar rejects, each row returned with the text as it is SUBMITTED.
+///
+/// The rows differ along the form of the failure (not JSON at all, a JSON value that is not
+/// a policy object, a policy object with no usable `Statement`, a statement that is not a
+/// statement) and along the BYTES the document carries — whitespace style, character class
+/// up to the last code point `AWSPolicy`'s pattern admits (U+00FF, from
+/// `smithy_query(query="operation",operation="PutPolicy")`) and length — because what is
+/// echoed has to be the submitted text rather than a re-rendering of it.
+fn unreadable_documents(ca_arn: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("a body that is not JSON", "this-is-not-json".to_string()),
+        ("a JSON scalar", "\"Allow\"".to_string()),
+        ("a JSON number", "42".to_string()),
+        (
+            "a JSON array of policy objects",
+            json!([{"Statement": [{"Effect": "Allow", "Action": "acm-pca:GetCertificate"}]}])
+                .to_string(),
+        ),
+        (
+            "a policy object with no Statement",
+            json!({"Version": "2012-10-17"}).to_string(),
+        ),
+        (
+            "a policy object whose statement list is empty",
+            json!({"Version": "2012-10-17", "Statement": []}).to_string(),
+        ),
+        (
+            "a statement list of strings",
+            json!({"Version": "2012-10-17", "Statement": ["Allow"]}).to_string(),
+        ),
+        (
+            "a statement with no Action",
+            document(json!({"Effect": "Allow", "Principal": {"AWS": ACCOUNT},
+                            "Resource": ca_arn})),
+        ),
+        (
+            "a statement with an Effect the policy language does not define",
+            document(json!({"Effect": "Permit", "Principal": {"AWS": ACCOUNT},
+                            "Action": format!("acm-pca:{}", POLICY_ALLOWED_ACTIONS[0]),
+                            "Resource": ca_arn})),
+        ),
+        (
+            // Tabs and newlines are inside `AWSPolicy`'s character class, and an echo of
+            // the submitted text keeps them where the caller put them.
+            "a document laid out over several lines",
+            "{\n\t\"Version\" : \"2012-10-17\",\n\t\"Statements\" : [ ]\n}\n".to_string(),
+        ),
+        (
+            // Up to the pattern's last code point (U+00FF): the echo is the caller's own
+            // bytes, so a document carrying non-ASCII text comes back carrying it.
+            "a document carrying non-ASCII text",
+            json!({"Version": "2012-10-17", "Comment": "grüß \u{00ff}"}).to_string(),
+        ),
+        (
+            "a document far longer than its one broken member",
+            json!({"Version": "2012-10-17", "Comment": "p".repeat(4096)}).to_string(),
+        ),
+    ]
+}
+
+/// One row of the refusal-diagnostics table: a document, the refusal it earns and the rule
+/// that refusal names.
+struct Refusal {
+    /// What the row is, for the assertion messages.
+    case: String,
+    /// The RULE the document breaks. Two rows naming the same rule earn the same message
+    /// and two rows naming different rules cannot, which is the contract under test.
+    rule: String,
+    /// The document as it is submitted.
+    submitted: String,
+    /// The message the refusal has to carry.
+    expected: String,
+    /// Whether that message carries the submitted document itself.
+    echoes_document: bool,
+}
+
+/// A statement that DENIES rather than grants, which the policy language reads perfectly
+/// well — so the document is a policy, and what it says is what cannot be accepted.
+fn denying_statement(sid: &str, ca_arn: &str) -> Value {
+    json!({
+        "Sid": sid,
+        "Effect": "Deny",
+        "Principal": {"AWS": ACCOUNT},
+        "Action": format!("acm-pca:{}", POLICY_ALLOWED_ACTIONS[0]),
+        "Resource": ca_arn
+    })
+}
+
+/// What a refused document's `Effect` rule is named by, pinned as the literal sentence: the
+/// rule itself, with nothing of the request in it.
+const ONLY_ALLOW_MESSAGE: &str = "InvalidPolicy: Only the Allow effect is supported";
+
+/// Rule 3: an `InvalidPolicyException` names the ONE rule the submitted document broke, so
+/// two documents breaking different rules cannot carry the same string.
+///
+/// A document that cannot be read as a policy at all broke no statement's rule — reading the
+/// statements is what failed — so the refusal reports the document itself, byte for byte
+/// after the fixed prefix; a document that IS a policy and says something a private CA's
+/// policy cannot say is named by its own rule and is NOT echoed. Nothing is attached either
+/// way.
+#[tokio::test]
+async fn put_policy_names_the_rule_each_refused_document_broke() {
+    let emulator = Emulator::new();
+    let arn = certificate_authority(&emulator, "refusal-diagnostics").await;
+
+    // A document nothing can read is its own rule, so each of these rows is a rule of its
+    // own and the message it earns is the text it submitted.
+    let mut rows: Vec<Refusal> = unreadable_documents(&arn)
+        .into_iter()
+        .map(|(case, submitted)| Refusal {
+            case: case.to_string(),
+            rule: format!("unreadable: {case}"),
+            expected: format!("{INVALID_POLICY_PREFIX}{submitted}"),
+            submitted,
+            echoes_document: true,
+        })
+        .collect();
+    // The classes a READABLE policy earns, each named by its rule rather than by the text
+    // that broke it: the statement does not grant, it grants what a CA cannot be shared
+    // for, it names an identity that is not here, it is about another authority. Two rows
+    // break the effect rule, through documents that differ, and both earn that rule's one
+    // sentence.
+    let readable: Vec<(&str, &str, String, String, bool)> = vec![
+        (
+            "a statement that denies",
+            "effect",
+            document(json!([denying_statement("denied", &arn)])),
+            ONLY_ALLOW_MESSAGE.to_string(),
+            false,
+        ),
+        (
+            "a denying statement beside a granting one",
+            "effect",
+            document(json!([
+                attachable_statement("granted", &arn),
+                denying_statement("denied", &arn)
+            ])),
+            ONLY_ALLOW_MESSAGE.to_string(),
+            false,
+        ),
+        (
+            "a statement granting a disallowed action",
+            "action",
+            document(disallowed_action_statement("disallowed", &arn)),
+            DISALLOWED_POLICY_ACTION_MESSAGE.to_string(),
+            false,
+        ),
+        (
+            "a statement naming an account that is not here",
+            "principal",
+            document(absent_principal_statement("absent", &arn)),
+            POLICY_PRINCIPAL_NOT_FOUND_MESSAGE.to_string(),
+            false,
+        ),
+        (
+            "a statement about another authority",
+            "resource",
+            document(other_resource_statement("elsewhere")),
+            different_resource_message(&arn, &json!(other_resource())),
+            false,
+        ),
+    ];
+    rows.extend(readable.into_iter().map(
+        |(case, rule, submitted, expected, echoes_document)| Refusal {
+            case: case.to_string(),
+            rule: rule.to_string(),
+            submitted,
+            expected,
+            echoes_document,
+        },
+    ));
+
+    let mut observed: Vec<(String, String, String)> = Vec::new();
+    for row in &rows {
+        let case = row.case.as_str();
+        let body = emulator
+            .refused(
+                case,
+                "PutPolicy",
+                &json!({"ResourceArn": arn, "Policy": row.submitted}),
+                "InvalidPolicyException",
+            )
+            .await;
+        let message = error_message(&body, case);
+        assert_eq!(
+            message, row.expected,
+            "case {case:?}: expected the refusal to name the rule this document broke, got \
+             {message:?}"
+        );
+        assert_eq!(
+            message.contains(row.submitted.as_str()),
+            row.echoes_document,
+            "case {case:?}: expected the document echoed in the refusal to be {echoed}, got \
+             {message:?}",
+            echoed = row.echoes_document
+        );
+        let carried = carried_policy(&emulator, case, &arn).await;
+        assert!(
+            carried.is_none(),
+            "case {case:?}: expected the refused document to attach nothing, got {carried:?}"
+        );
+        observed.push((row.case.clone(), row.rule.clone(), message));
+    }
+
+    // The whole point of the rule: the message IS the diagnosis, so two rows carry the same
+    // string exactly when they broke the same rule.
+    for (index, (case, rule, message)) in observed.iter().enumerate() {
+        for (other_case, other_rule, other) in &observed[index + 1..] {
+            assert_eq!(
+                message == other,
+                rule == other_rule,
+                "case {case:?} and case {other_case:?}: expected the refusals to match only \
+                 for one rule, got {message:?} and {other:?}"
+            );
+        }
+    }
 }

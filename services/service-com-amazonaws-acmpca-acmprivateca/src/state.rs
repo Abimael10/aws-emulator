@@ -297,11 +297,38 @@ pub const CERTIFICATE_NOT_FOUND_MESSAGE: &str = "Could not find specified certif
 /// sentence ([`POLICY_NOT_FOUND_MESSAGE`], [`PERMISSION_NOT_FOUND_MESSAGE`]).
 pub const CA_NOT_FOUND_MESSAGE: &str = "Could not find specified CA";
 
-/// What Amazon Web Services Private CA answers for a resource-based policy document it
-/// will not attach: the model's own sentence for `InvalidPolicyException`, naming no
-/// request of its own.
-pub const INVALID_POLICY_MESSAGE: &str =
-    "The resource policy is invalid or is missing a required statement.";
+/// The prefix every `InvalidPolicyException` message of this service carries, under which
+/// the rest of the sentence names the ONE rule the submitted document broke.
+///
+/// Each refusal of a resource-based policy document is a different diagnosis — the document
+/// cannot be read as a policy at all ([`malformed_policy_message`]), a statement does not
+/// grant ([`NON_ALLOW_EFFECT_MESSAGE`]), it grants an action a certificate authority cannot
+/// be shared for ([`DISALLOWED_POLICY_ACTION_MESSAGE`]), it names an identity that is not
+/// here ([`POLICY_PRINCIPAL_NOT_FOUND_MESSAGE`]) or it is about another resource
+/// ([`different_resource_message`]) — so no two of them carry the same string and a caller
+/// branching on the diagnostic can tell a document to repair from one that can never be
+/// accepted.
+pub const INVALID_POLICY_PREFIX: &str = "InvalidPolicy: ";
+
+/// What Amazon Web Services Private CA answers for a submitted document it cannot read as a
+/// policy AT ALL: the document itself, after [`INVALID_POLICY_PREFIX`].
+///
+/// A refusal names the rule that was broken, and the rule a document of this class broke is
+/// about the document rather than about anything a policy may say — there is no statement to
+/// blame, because reading the statements is what failed. So the message is BUILT FROM THE
+/// REQUEST: the rejected text verbatim, byte for byte as it was submitted and neither
+/// re-rendered nor clipped, which is what lets a caller submitting documents in a loop see
+/// WHICH one was rejected.
+///
+/// The class is the whole of what [`is_well_formed_policy`] reads: a body that is not JSON,
+/// and a JSON body that does not carry the policy grammar's required structure (no
+/// `Statement`, an empty statement list, a statement that is not an object, a statement with
+/// no `Effect` of the policy language or no `Action`). A document that IS a policy and says
+/// something a private CA's policy cannot say is named by ITS rule instead, so such a
+/// document is never echoed.
+pub fn malformed_policy_message(document: &str) -> String {
+    format!("{INVALID_POLICY_PREFIX}{document}")
+}
 
 /// What Amazon Web Services Private CA answers when a deleted CA has no restoration
 /// period to be restored inside: "A private CA deleted in the CREATING or FAILED state
@@ -727,7 +754,8 @@ pub fn permission_policy_document(
 /// private CA is:
 ///
 /// * the document has to BE a policy — the grammar [`is_well_formed_policy`] reads, whose
-///   refusal is the service's own [`INVALID_POLICY_MESSAGE`];
+///   refusal is the document itself ([`malformed_policy_message`]), because there is no
+///   statement left to blame;
 /// * each statement has to GRANT, so its `Effect` is `Allow` and nothing else
 ///   ([`NON_ALLOW_EFFECT_MESSAGE`]);
 /// * each statement has to name WHO it is about, in a `Principal` that names an identity
@@ -740,7 +768,7 @@ pub fn permission_policy_document(
 /// Nothing here rewrites the document.
 pub fn invalid_policy_reason(policy: &str, certificate_authority_arn: &str) -> Option<String> {
     if !is_well_formed_policy(policy) {
-        return Some(INVALID_POLICY_MESSAGE.to_string());
+        return Some(malformed_policy_message(policy));
     }
     // `is_well_formed_policy` read the document as JSON, so it parses, and it is an object
     // carrying statements.
@@ -784,6 +812,21 @@ pub const POLICY_GRANT_EFFECT: &str = "Allow";
 /// Wholly fixed text: the refusal is about the effect a private CA's resource policy can
 /// express, so neither the offending statement nor the document is echoed in it.
 pub const NON_ALLOW_EFFECT_MESSAGE: &str = "InvalidPolicy: Only the Allow effect is supported";
+
+/// What this service answers a policy statement that names no `Resource` at all: a sentence
+/// of its own under the one prefix every refusal of a policy document carries
+/// ([`INVALID_POLICY_PREFIX`]), so it is no other refusal's string but this rule's.
+///
+/// No recording covers a statement with no `Resource`, so the RULE is what is pinned — a
+/// resource-based policy's statement says which resource it is about — and the sentence is
+/// this service's own phrasing of it.
+pub const NO_POLICY_RESOURCE_MESSAGE: &str =
+    "InvalidPolicy: Each policy statement must name the Resource it is about.";
+
+/// What this service answers a policy statement that grants no action at all, for the reason
+/// [`NO_POLICY_RESOURCE_MESSAGE`] carries its own sentence.
+pub const NO_POLICY_ACTION_MESSAGE: &str =
+    "InvalidPolicy: Each policy statement must name the Action it grants.";
 
 /// Why the `Effect` of a policy statement is not one a private CA's resource policy can
 /// carry, or `None` when it grants.
@@ -870,9 +913,7 @@ fn different_resource_reason(
     certificate_authority_arn: &str,
 ) -> Option<String> {
     let Some(resource) = resource else {
-        return Some(
-            "Each policy statement must name the Resource it is about.".to_string(),
-        );
+        return Some(NO_POLICY_RESOURCE_MESSAGE.to_string());
     };
     // Every entry is judged on its own, so the refusal names the one value that was
     // rejected rather than the element it sat in.
@@ -881,7 +922,7 @@ fn different_resource_reason(
         other => vec![other],
     };
     if entries.is_empty() {
-        return Some("Each policy statement must name the Resource it is about.".to_string());
+        return Some(NO_POLICY_RESOURCE_MESSAGE.to_string());
     }
     for entry in entries {
         if entry.as_str() != Some(certificate_authority_arn) {
@@ -949,14 +990,14 @@ fn policy_grants_this_action(action: &str) -> bool {
 fn disallowed_action_reason(action: Option<&::serde_json::Value>) -> Option<String> {
     let not_allowed = || Some(DISALLOWED_POLICY_ACTION_MESSAGE.to_string());
     let Some(action) = action else {
-        return Some("Each policy statement must name the Action it grants.".to_string());
+        return Some(NO_POLICY_ACTION_MESSAGE.to_string());
     };
     let entries: Vec<&::serde_json::Value> = match action {
         ::serde_json::Value::Array(values) => values.iter().collect(),
         other => vec![other],
     };
     if entries.is_empty() {
-        return Some("Each policy statement must name the Action it grants.".to_string());
+        return Some(NO_POLICY_ACTION_MESSAGE.to_string());
     }
     for entry in entries {
         let Some(named) = entry.as_str() else {

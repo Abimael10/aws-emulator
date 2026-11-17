@@ -54,7 +54,8 @@ const ONLY_ALLOW_MESSAGE: &str = "InvalidPolicy: Only the Allow effect is suppor
 /// What it answers a statement naming no resource at all: this service's own sentence (no
 /// recording covers a `Resource` that names nothing), so the row below pins the sentence
 /// rather than the recorded diagnostic the rows beside it pin.
-const NO_RESOURCE_MESSAGE: &str = "Each policy statement must name the Resource it is about.";
+const NO_RESOURCE_MESSAGE: &str =
+    "InvalidPolicy: Each policy statement must name the Resource it is about.";
 
 /// A private CA created over the wire, named after `label`.
 ///

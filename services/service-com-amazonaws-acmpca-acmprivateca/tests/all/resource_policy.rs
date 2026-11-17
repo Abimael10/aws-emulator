@@ -18,8 +18,12 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_acmpca_acmprivateca::state::{
-    CA_NOT_FOUND_MESSAGE, INVALID_ARN_MESSAGE, INVALID_POLICY_MESSAGE, POLICY_NOT_FOUND_MESSAGE,
+    CA_NOT_FOUND_MESSAGE, INVALID_ARN_MESSAGE, POLICY_NOT_FOUND_MESSAGE,
 };
+
+/// The prefix every refusal of a resource-based policy document carries, pinned here as the
+/// recorded literal rather than read from the crate under test.
+pub(crate) const INVALID_POLICY_PREFIX: &str = "InvalidPolicy: ";
 
 use crate::private_ca_lifecycle::{
     active_ca, blob, own_ca_certificate, root_ca_request, string, wait_for_the_clock,
@@ -509,9 +513,10 @@ async fn put_policy_refuses_a_document_that_is_not_a_policy() {
             )
             .await;
         let message = error_message(&body, case);
+        let expected = format!("{INVALID_POLICY_PREFIX}{document}");
         assert_eq!(
-            message, INVALID_POLICY_MESSAGE,
-            "case {case:?}: expected PutPolicy to answer the service's policy sentence, got \
+            message, expected,
+            "case {case:?}: expected PutPolicy to report the un-readable document itself, got \
              {message:?}"
         );
 
