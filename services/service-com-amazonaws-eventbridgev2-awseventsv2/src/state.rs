@@ -11,15 +11,22 @@
 //! The resources that hang off a bus live in their own modules, re-exported
 //! here so every handler reaches one store: [`event_sources`] holds the
 //! EventSource registry and [`subscribers`] the subscriber registry, whose
-//! deliveries are made by [`subscriber_delivery`]. The `tags` module resolves
-//! one taggable ARN against all three registries, because tagging spans them.
+//! deliveries are made by [`subscriber_delivery`], and [`resource_policies`]
+//! holds the named policies attached to a bus. [`pagination`] is the one
+//! reading of the page size and the page token every List operation shares, and
+//! the `tags` module resolves one taggable ARN against all three registries,
+//! because tagging spans them.
 
 mod event_sources;
+mod pagination;
+mod resource_policies;
 pub mod subscriber_delivery;
 mod subscribers;
 mod tags;
 
 pub use event_sources::*;
+pub use pagination::*;
+pub use resource_policies::*;
 pub use subscribers::*;
 
 use std::collections::{BTreeMap, VecDeque};
@@ -221,6 +228,10 @@ pub struct EventBus {
     pub deduplicated_events: BTreeMap<String, (String, u64)>,
     /// The `ClientToken` the create that minted this bus carried, if any.
     pub client_token: Option<String>,
+    /// The named resource policies attached to this bus, keyed by `PolicyName`,
+    /// so a policy-addressed read is a lookup and an enumeration is in a stable
+    /// order. Bounded by the two names the service admits ([`POLICY_NAMES`]).
+    pub resource_policies: BTreeMap<String, ResourcePolicy>,
     /// When the clock owes this bus its next lifecycle transition: `CREATING` ->
     /// `ACTIVE`, or `DELETING` -> gone. `None` once the bus has settled.
     pub transition_due_at: Option<SystemTime>,
@@ -559,6 +570,16 @@ pub fn new_bus_id(seed: u64, now: SystemTime) -> String {
 /// Every one of the 128 bits is kept, so the id stays distinct per event for the
 /// reason [`new_bus_id`] gives: the rendering is injective and the bits are.
 pub fn new_event_id(seed: u64, now: SystemTime) -> String {
+    new_uuid_id(seed, now)
+}
+
+/// The 128 bits for `seed` rendered as a hyphenated lowercase UUID (8-4-4-4-12)
+/// — the ONE such rendering of this service's opaque server-assigned
+/// identifiers, so two of them cannot come to differ in form.
+///
+/// Every one of the 128 bits is kept, so an id stays distinct for the reason
+/// [`new_bus_id`] gives: the rendering is injective and the bits are.
+pub fn new_uuid_id(seed: u64, now: SystemTime) -> String {
     ::uuid::Uuid::from_u128(spread(seed, now)).to_string()
 }
 

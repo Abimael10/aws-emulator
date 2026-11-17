@@ -312,6 +312,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .collect::<::std::collections::BTreeMap<_, _>>(),
             events: Vec::new(),
             deduplicated_events: ::std::collections::BTreeMap::new(),
+            // A bus is created with no resource policy attached: a policy is
+            // written by `PutResourcePolicy`, never by a create.
+            resource_policies: ::std::collections::BTreeMap::new(),
             client_token: input.client_token.clone(),
             transition_due_at: Some(crate::state::lifecycle_due(now)),
             next_sequence_number: 1,

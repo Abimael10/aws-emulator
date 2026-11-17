@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetResourcePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetResourcePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Returns the named resource policy attached to an event bus.
 //!
 //! ## Shape of an operation
 //!
@@ -100,9 +92,14 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eventbridgev2-awsevents
 // here — hence the `GetResourcePolicyError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.eventbridgev2#GetResourcePolicy")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.eventbridgev2#GetResourcePolicy",
+    extra_errors = ["InternalException", "InvalidInputException"]
+)]
 #[derive(Debug)]
 pub enum GetResourcePolicyErrorModeled {
+    InternalException(InternalException),
+    InvalidInputException(InvalidInputException),
     ResourceNotFoundException(ResourceNotFoundException),
 }
 
@@ -157,18 +154,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetResourcePolicy"))
+        let _ = ctx;
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(GetResourcePolicyErrorModeled::InternalException(InternalException {
+                message: Some("the event bus store is unavailable on this engine".to_string()),
+            })
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+
+        // Which policy this read addresses, decided from the request alone.
+        // Neither name is reserved on a read — the bus owner reads both — so the
+        // only name a read refuses is one that is neither.
+        let policy_name = crate::state::requested_policy_name(input.policy_name.as_deref());
+        if !crate::state::is_named_policy(policy_name) {
+            return Err(GetResourcePolicyErrorModeled::InvalidInputException(
+                crate::state::unknown_policy_name(policy_name),
+            )
+            .into());
+        }
+
+        let mut state = store.lock();
+        // Reporting only: the sole write is materialising the lifecycle
+        // transitions the clock already made due.
+        state.settle_lifecycles(now);
+
+        let Some(bus) = state.bus(&input.resource_arn) else {
+            // A read resolves the whole ARN, identifier segment included: an
+            // identifier this service minted names a bus that is not there, and
+            // one it never handed out names no resource of this service at all.
+            return Err(GetResourcePolicyErrorModeled::ResourceNotFoundException(
+                state.bus_read_refusal(&input.resource_arn),
+            )
+            .into());
+        };
+        // There is no fallback between the two policies: a bus that holds no
+        // policy under the name asked for is refused for that policy, never
+        // answered with the other one.
+        let Some(policy) = bus.resource_policy(policy_name) else {
+            return Err(GetResourcePolicyErrorModeled::ResourceNotFoundException(
+                crate::state::resource_policy_not_found(policy_name, &input.resource_arn),
+            )
+            .into());
+        };
+
+        Ok(GetResourcePolicyOutput {
+            // The bus the stored policy is attached to, as the store holds it.
+            resource_arn: bus.arn.clone(),
+            policy_document: policy.document.clone(),
+            policy_name: policy_name.to_string(),
+            revision_id: policy.revision_id.clone(),
+        })
     }
 }

@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutResourcePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutResourcePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Attaches a named resource policy to an event bus.
 //!
 //! ## Shape of an operation
 //!
@@ -134,11 +126,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eventbridgev2-awsevents
 // here — hence the `PutResourcePolicyError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.eventbridgev2#PutResourcePolicy")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.eventbridgev2#PutResourcePolicy",
+    extra_errors = ["AccessDeniedException", "InternalException", "InvalidInputException"]
+)]
 #[derive(Debug)]
 pub enum PutResourcePolicyErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     ConcurrentModificationException(ConcurrentModificationException),
     ConflictException(ConflictException),
+    InternalException(InternalException),
+    InvalidInputException(InvalidInputException),
     PolicyLengthExceededException(PolicyLengthExceededException),
     PublicPolicyException(PublicPolicyException),
     ResourceNotFoundException(ResourceNotFoundException),
@@ -195,18 +193,151 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutResourcePolicy"))
+        let _ = ctx;
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(PutResourcePolicyErrorModeled::InternalException(InternalException {
+                message: Some("the event bus store is unavailable on this engine".to_string()),
+            })
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+
+        // Which policy this write addresses, decided from the request alone: the
+        // name it gave, or the customer-managed policy when it gave none.
+        let policy_name = crate::state::requested_policy_name(input.policy_name.as_deref());
+        if !crate::state::is_named_policy(policy_name) {
+            return Err(PutResourcePolicyErrorModeled::InvalidInputException(
+                crate::state::unknown_policy_name(policy_name),
+            )
+            .into());
+        }
+        // The two writers are exclusive in both directions, and a request
+        // reaching this emulator arrives as the bus owner, so the one policy it
+        // may write is the customer-managed one; naming the Resource Access
+        // Manager policy names the other party's.
+        if policy_name != crate::state::POLICY_NAME_DEFAULT {
+            return Err(PutResourcePolicyErrorModeled::AccessDeniedException(
+                crate::state::policy_write_denied(policy_name),
+            )
+            .into());
+        }
+
+        // The account's quota for this policy, which is a property of the
+        // DOCUMENT and is counted in bytes of UTF-8 as the member documents it.
+        // Checked BEFORE the document is read, so an oversized one is refused
+        // without being walked. The 389,120-byte service maximum is the member's
+        // own `@length`, which the boundary walk refuses before this handler
+        // runs.
+        let document_bytes = input.policy_document.len();
+        if document_bytes > crate::state::DEFAULT_POLICY_MAX_BYTES {
+            return Err(PutResourcePolicyErrorModeled::PolicyLengthExceededException(
+                PolicyLengthExceededException {
+                    message: Some(format!(
+                        "The {policy_name} resource policy document is {document_bytes} bytes, \
+                         which exceeds the quota of {} bytes",
+                        crate::state::DEFAULT_POLICY_MAX_BYTES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A policy document is a JSON string in the IAM policy language, so a
+        // value outside that grammar is not a policy this service can attach —
+        // refused as the bad parameter it is rather than stored unread. The
+        // grammar is the workspace's ONE reading of a resource-based policy, so
+        // two services handed one document cannot disagree about whether it is a
+        // policy. Parsed once here and both readings taken off the parsed value.
+        let document: ::serde_json::Value = ::serde_json::from_str(&input.policy_document)
+            .map_err(|_| {
+                invalid_policy_document(::service_common::iam_policy::PolicyDefect::NotJson)
+            })?;
+        if let Some(defect) = ::service_common::iam_policy::resource_policy_defect_of(&document) {
+            return Err(invalid_policy_document(defect));
+        }
+
+        // The public-access check of the customer-managed policy, which
+        // `PublicPolicyException` documents as always on and not disablable. It
+        // is the workspace's one reading of whether a resource-based document
+        // grants access to a principal nobody named, and is decided from the
+        // document alone, so it is answered before the store is read.
+        if ::service_common::public_resource_policy::grants_public_access_of(&document) {
+            return Err(PutResourcePolicyErrorModeled::PublicPolicyException(
+                PublicPolicyException {
+                    message: Some(PUBLIC_POLICY_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let mut state = store.lock();
+        // Materialise the lifecycle transitions the clock already made due, so
+        // this write sees the registry as of now.
+        state.settle_lifecycles(now);
+
+        // The id seed is taken before the bus is borrowed mutably; a seed a
+        // refused write leaves unused costs nothing but the counter advancing.
+        let seed = state.next_id_seed();
+        // A write resolves the whole ARN, identifier segment included: an
+        // identifier this service minted names a bus that is not there, and one
+        // it never handed out names no resource of this service at all.
+        let refusal = state.bus_read_refusal(&input.resource_arn);
+        let Some(bus) = state.event_buses.get_mut(&input.resource_arn) else {
+            return Err(PutResourcePolicyErrorModeled::ResourceNotFoundException(refusal).into());
+        };
+
+        // The caller's precondition, checked against the revision the store
+        // holds right now. A request that carries none writes unconditionally.
+        if let Some(expected) = input.expected_revision_id.as_deref() {
+            if !crate::state::revision_matches(bus.resource_policy(policy_name), expected) {
+                return Err(PutResourcePolicyErrorModeled::ConflictException(
+                    crate::state::revision_conflict(policy_name, expected),
+                )
+                .into());
+            }
+        }
+
+        // Every attempt stores a NEWLY generated revision id, which is what a
+        // later conditional write is compared against.
+        let revision_id = crate::state::new_policy_revision_id(seed, now);
+        bus.store_resource_policy(policy_name, input.policy_document.clone(), revision_id);
+        // The response reports the policy as the STORE now holds it, read back
+        // out of it rather than assembled from the request beside it.
+        let Some(stored) = bus.resource_policy(policy_name) else {
+            return Err(PutResourcePolicyErrorModeled::InternalException(InternalException {
+                message: Some("the resource policy just written is not readable".to_string()),
+            })
+            .into());
+        };
+
+        Ok(PutResourcePolicyOutput {
+            resource_arn: input.resource_arn.clone(),
+            policy_name: policy_name.to_string(),
+            // The revision the store now holds, read back out of it.
+            revision_id: Some(stored.revision_id.clone()),
+        })
     }
+}
+
+/// The whole `Message` of the `PublicPolicyException` this operation answers.
+///
+/// FIXED text of that error class: it states what was refused about the document
+/// — that attaching it would open the bus to every caller — and names nothing of
+/// the request, because the document the caller sent is what the caller already
+/// holds.
+const PUBLIC_POLICY_MESSAGE: &str = "The resource policy would grant public access to the event bus";
+
+/// The refusal of a `PolicyDocument` that is not a resource-based policy
+/// document: the modelled `InvalidInputException` for a request parameter that
+/// is "not valid", stating which clause of the policy language the document
+/// broke as the shared grammar words it.
+fn invalid_policy_document(
+    defect: ::service_common::iam_policy::PolicyDefect,
+) -> PutResourcePolicyError {
+    PutResourcePolicyErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(format!(
+            "PolicyDocument is not a resource policy document: {defect}"
+        )),
+    })
+    .into()
 }

@@ -168,19 +168,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let resume_after = resume_after.flatten();
 
-        // `MaxResults` is modelled `range(min: 1, max: 100)` with a default of
-        // 100, and the boundary validator refuses anything outside that window
-        // before the handler runs. An in-process caller can still hand over a
-        // value the wire never carries, so a value at or below zero takes the
-        // MODELLED DEFAULT rather than the range's minimum — a page of one is
-        // not what an absent member asks for — and anything above the maximum is
-        // capped at it.
-        let page_size = match input.max_results {
-            requested if requested > 0 => {
-                usize::try_from(requested.min(MAX_PAGE_SIZE)).unwrap_or(DEFAULT_PAGE_SIZE)
-            }
-            _ => DEFAULT_PAGE_SIZE,
-        };
+        // The page size this request asks for, read the one way every List
+        // operation of this service reads it.
+        let page_size = crate::state::page_size(input.max_results);
 
         // Ordered by name, the key `NamePrefix` filters on, with the ARN
         // breaking ties so the order is total and a page boundary is stable.
@@ -242,14 +232,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The largest page this operation returns, from the modelled `MaxResults`
-/// range (`range(min: 1, max: 100)`).
-const MAX_PAGE_SIZE: i32 = 100;
-
-/// The page size a request that names no `MaxResults` gets: the member's own
-/// modelled default, which is also the range's maximum.
-const DEFAULT_PAGE_SIZE: usize = 100;
-
 /// The total order `ListEventBuses` enumerates in, and exactly what a
 /// `NextToken` carries: the name the list is ordered by, with the ARN breaking
 /// ties.
@@ -259,27 +241,20 @@ struct PageKey {
     arn: String,
 }
 
-/// Separates the two fields inside a token. A unit separator cannot occur in
-/// either: `EventBusName` is `[A-Za-z0-9][\.\-_A-Za-z0-9]*` and `EventBusArn` is
-/// printable ASCII.
-const TOKEN_SEPARATOR: char = '\u{1f}';
-
-/// Render the page cursor as the opaque `NextToken` the next request replays.
-/// `NextToken` is modelled as an opaque string of 1..4096 characters, so the
-/// cursor is rendered in hex: an alphabet that survives any transport and that
-/// no client can mistake for a value it may construct itself.
+/// This operation's page cursor as the opaque `NextToken` the next request
+/// replays, rendered by the one page-token codec this service's List operations
+/// share ([`crate::state::encode_page_token`]).
 fn encode_next_token(key: &PageKey) -> String {
-    hex::encode(format!("{}{TOKEN_SEPARATOR}{}", key.name, key.arn))
+    crate::state::encode_page_token(&[&key.name, &key.arn])
 }
 
 /// Read a cursor back out of a `NextToken`. `None` when the token is not one
-/// this service issued.
+/// this service issued for this enumeration's cursor.
 fn decode_next_token(token: &str) -> Option<PageKey> {
-    let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
-    let (name, arn) = decoded.split_once(TOKEN_SEPARATOR)?;
+    let mut fields = crate::state::decode_page_token(token, 2)?.into_iter();
     Some(PageKey {
-        name: name.to_string(),
-        arn: arn.to_string(),
+        name: fields.next()?,
+        arn: fields.next()?,
     })
 }
 

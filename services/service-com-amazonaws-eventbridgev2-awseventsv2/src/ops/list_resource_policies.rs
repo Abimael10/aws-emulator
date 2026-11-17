@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListResourcePolicies
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListResourcePolicies`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListResourcePolicies::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the resource policies attached to an event bus as summaries.
 //!
 //! ## Shape of an operation
 //!
@@ -86,9 +78,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eventbridgev2-awsevents
 // here — hence the `ListResourcePoliciesError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.eventbridgev2#ListResourcePolicies")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.eventbridgev2#ListResourcePolicies",
+    extra_errors = ["InternalException"]
+)]
 #[derive(Debug)]
 pub enum ListResourcePoliciesErrorModeled {
+    InternalException(InternalException),
     ResourceNotFoundException(ResourceNotFoundException),
 }
 
@@ -143,18 +139,121 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListResourcePolicies` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListResourcePoliciesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListResourcePolicies"))
+        let _ = ctx;
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(ListResourcePoliciesErrorModeled::InternalException(InternalException {
+                message: Some("the event bus store is unavailable on this engine".to_string()),
+            })
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = store.lock();
+        // Reporting only: the sole write is materialising the lifecycle
+        // transitions the clock already made due.
+        state.settle_lifecycles(now);
+
+        let resume_after = input.next_token.as_deref().map(decode_next_token);
+        if let Some(None) = resume_after {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "NextToken is not a token this service issued",
+            ));
+        }
+        let resume_after = resume_after.flatten();
+
+        // The page size this request asks for, read the one way every List
+        // operation of this service reads it.
+        let page_size = crate::state::page_size(input.max_results);
+
+        let Some(bus) = state.bus(&input.resource_arn) else {
+            // A read resolves the whole ARN, identifier segment included: an
+            // identifier this service minted names a bus that is not there, and
+            // one it never handed out names no resource of this service at all.
+            return Err(ListResourcePoliciesErrorModeled::ResourceNotFoundException(
+                state.bus_read_refusal(&input.resource_arn),
+            )
+            .into());
+        };
+
+        // Ordered by policy name, which is the key a page boundary is taken on,
+        // so the order is total and a resumed page starts exactly where the
+        // previous one stopped.
+        let names: Vec<&String> = bus
+            .resource_policies
+            .keys()
+            .filter(|name| {
+                resume_after
+                    .as_deref()
+                    .is_none_or(|cursor| name.as_str() > cursor)
+            })
+            .collect();
+        let end = page_size.min(names.len());
+        let page = &names[..end];
+
+        let policy_summaries: Vec<ResourcePolicySummary> = page
+            .iter()
+            .filter_map(|name| {
+                bus.resource_policy(name)
+                    .map(|policy| policy.summary(name))
+            })
+            .collect();
+
+        // A token only when policies remain after this page, so a caller stops
+        // paging exactly when the enumeration is exhausted.
+        let next_token = (end < names.len())
+            .then(|| page.last().map(|name| encode_next_token(name)))
+            .flatten();
+
+        Ok(ListResourcePoliciesOutput {
+            policy_summaries: Some(policy_summaries),
+            next_token,
+        })
+    }
+}
+
+/// Render the page cursor — the last policy name of the page — as the opaque
+/// `NextToken` the next request replays, through the one page-token codec this
+/// service's List operations share ([`crate::state::encode_page_token`]).
+fn encode_next_token(policy_name: &str) -> String {
+    crate::state::encode_page_token(&[policy_name])
+}
+
+/// Read a cursor back out of a `NextToken`. `None` when the token is not one
+/// this service issued for this enumeration's cursor.
+fn decode_next_token(token: &str) -> Option<String> {
+    crate::state::decode_page_token(token, 1)?.into_iter().next()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_next_token, encode_next_token};
+
+    /// A cursor survives the token it is rendered as, and nothing else is read
+    /// as a cursor: the token is this operation's own encoding, so its
+    /// round-trip is pinned here beside it.
+    #[test]
+    fn a_cursor_round_trips_through_its_token() {
+        for (case, name) in [
+            ("the customer-managed policy", "default"),
+            ("the Resource Access Manager policy", "AWS_RAM"),
+        ] {
+            let token = encode_next_token(name);
+            assert_eq!(
+                decode_next_token(&token).as_deref(),
+                Some(name),
+                "case {case:?}: the cursor must survive its token {token:?}"
+            );
+        }
+
+        for (case, token) in [
+            ("not hex at all", "not-a-token"),
+            ("an odd number of digits", "abc"),
+            ("hex that is not UTF-8", "ff"),
+        ] {
+            assert!(
+                decode_next_token(token).is_none(),
+                "case {case:?}: {token:?} is not a token this service issued"
+            );
+        }
     }
 }

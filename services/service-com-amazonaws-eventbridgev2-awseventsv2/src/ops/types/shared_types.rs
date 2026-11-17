@@ -280,6 +280,12 @@ pub struct ConflictException {
     pub message: Option<String>,
 }
 
+#[smithy_macros::smithy(shape = "com.amazonaws.eventbridgev2#AccessDeniedException")]
+#[derive(Debug, Clone, Default)]
+pub struct AccessDeniedException {
+    pub message: Option<String>,
+}
+
 /// The values `BusState` accepts on the wire.
 pub const BUS_STATE_VALUES: &[&str] = &["ACTIVE", "CREATE_FAILED", "CREATING", "DELETE_FAILED", "DELETING", "UPDATE_FAILED", "UPDATING"];
 
