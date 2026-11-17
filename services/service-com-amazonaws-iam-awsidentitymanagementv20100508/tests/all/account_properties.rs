@@ -426,6 +426,20 @@ async fn a_write_whose_keys_span_two_namespaces_is_refused() {
     }
 }
 
+/// Whether the modelled key type ADMITS `key` — its published length and alphabet.
+///
+/// SOURCE: `accountPropertyKeyType` on `smithy_query(query="shape",
+/// shape="accountPropertyKeyType")` — length 1..50, pattern
+/// `^[A-Za-z][A-Za-z0-9/_-]*$` — read here off the published type, so each row below
+/// is classified by what the model says and not by the crate's own predicate.
+fn modelled_key_type_admits(key: &str) -> bool {
+    (1..=50).contains(&key.chars().count())
+        && key.starts_with(|first: char| first.is_ascii_alphabetic())
+        && key
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "/_-".contains(character))
+}
+
 /// RULE: a request that satisfies every constraint the model declares and breaks a
 /// rule this operation states only in prose is refused with the one client-input
 /// error the operation MODELS — `InvalidInputException`, HTTP 400, wire code
@@ -445,10 +459,14 @@ async fn a_key_the_key_shape_admits_but_that_names_no_property_is_refused_as_inv
     // 50-character maximum.
     let unqualified: &[&str] = &[
         "NoSeparator",
+        // The bare namespace the service serves: a name that qualifies nothing.
+        SERVED_NAMESPACE,
         "RoleManager/",
         "RoleManager/Nested/Property",
         "RoleManager//Enabled",
         "A",
+        "A/",
+        "A/B/C/D",
         "Role_Manager-9",
         "RoleManagerEnabled/",
     ];
@@ -467,11 +485,7 @@ async fn a_key_the_key_shape_admits_but_that_names_no_property_is_refused_as_inv
         // Every row must be one the MODEL admits: 1..50 characters of
         // `^[A-Za-z][A-Za-z0-9/_-]*$`, so what it breaks is the prose rule alone.
         assert!(
-            (1..=50).contains(&key.chars().count())
-                && key.starts_with(|first: char| first.is_ascii_alphabetic())
-                && key
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || "/_-".contains(c)),
+            modelled_key_type_admits(&key),
             "case {key:?}: this row must satisfy the published key shape"
         );
 
@@ -530,8 +544,11 @@ async fn a_key_outside_the_published_key_shape_is_refused() {
         "/RoleManager",
         "Role!Manager/Enabled",
         "Role Manager/Enabled",
+        // A space in the PROPERTY half, so the alphabet is taken over the whole key.
+        "RoleManager/En abled",
         "9RoleManager/Enabled",
         "_RoleManager/Enabled",
+        "-RoleManager/Enabled",
     ];
     let over_long = served_key(&"B".repeat(50 - SERVED_NAMESPACE.len()));
     assert_eq!(
@@ -545,6 +562,12 @@ async fn a_key_outside_the_published_key_shape_is_refused() {
         .map(|key| (*key).to_string())
         .chain([over_long])
     {
+        // Each row is outside the published key type, which is what makes its refusal
+        // a constraint violation rather than the form rule asserted below.
+        assert!(
+            !modelled_key_type_admits(&key),
+            "case {key:?}: this row must be outside the published key type"
+        );
         let router = router();
         let held = vec![param(&served_key("Held"), "kept")];
         put_properties_ok(&router, "the fixture property", &held).await;
