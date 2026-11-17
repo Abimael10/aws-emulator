@@ -25,16 +25,16 @@
 //! than slept for, and every wait is a poll for the CONDITION it waits on, so what these
 //! tests observe does not depend on how fast the host runs.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_glue_awsglue::state::{
-    ComAmazonawsGlueAwsglueState, JobRunEntry, DEFAULT_GLUE_VERSION, FIRST_JOB_RUN_ATTEMPT,
-    JOB_RUN_ID_PREFIX, JOB_RUN_SCRIPT_UNREADABLE_LEAD, JOB_RUN_SETTLES_AFTER,
-    JOB_RUN_STATE_FAILED, JOB_RUN_STATE_RUNNING, JOB_RUN_STATE_STARTING, MAX_RUNS_PER_JOB,
-    MAX_TIMEOUT_MINUTES, PYTHON_SHELL_JOB_LOG_GROUP, TERMINAL_JOB_RUN_STATES,
+    ComAmazonawsGlueAwsglueState, JobRunEntry, DEFAULT_GLUE_VERSION, DEFAULT_MAX_CONCURRENT_RUNS,
+    FIRST_JOB_RUN_ATTEMPT, JOB_RUN_ID_PREFIX, JOB_RUN_SCRIPT_UNREADABLE_LEAD,
+    JOB_RUN_SETTLES_AFTER, JOB_RUN_STATE_FAILED, JOB_RUN_STATE_RUNNING, JOB_RUN_STATE_STARTING,
+    MAX_RUNS_PER_JOB, MAX_TIMEOUT_MINUTES, PYTHON_SHELL_JOB_LOG_GROUP, TERMINAL_JOB_RUN_STATES,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -1306,4 +1306,364 @@ async fn a_job_keeps_a_bounded_number_of_runs() {
         Some(newest.id.as_str()),
         "the newest run must still be reported, got {run}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The ceiling a start is admitted against
+// ---------------------------------------------------------------------------
+
+/// One row of the admission table: the ceiling the job definition is created with, the
+/// ceiling an update then moves it to, and how many runs of the job may be in flight at
+/// once under each of them.
+struct AdmissionRow {
+    case: &'static str,
+    /// The `ExecutionProperty` the create names, or `Value::Null` for a definition naming
+    /// none at all.
+    created: Value,
+    /// The runs the created definition admits at once — its effective ceiling.
+    admits: usize,
+    /// The `ExecutionProperty` the update names, or `Value::Null` for an update naming
+    /// none, which resets the member like any other it does not carry.
+    updated: Value,
+    /// The runs the updated definition admits at once.
+    admits_after: usize,
+}
+
+/// The ceiling `GetJob` reports for `job_name`: `ExecutionProperty$MaxConcurrentRuns` on
+/// the stored definition, which is the figure a start is measured against.
+async fn reported_ceiling(router: &MultiServiceRouter, job_name: &str) -> Option<i64> {
+    let body = ok(router, "GetJob", &json!({ "JobName": job_name })).await;
+    body.get("Job")
+        .and_then(|job| job.get("ExecutionProperty"))
+        .and_then(|property| property.get("MaxConcurrentRuns"))
+        .and_then(Value::as_i64)
+}
+
+/// The ids `GetJobRuns` reports for `job_name`: what a client listing the job's runs sees,
+/// which is where a run a refused start had minted would show up.
+async fn listed_run_ids(router: &MultiServiceRouter, job_name: &str) -> BTreeSet<String> {
+    let page = ok(router, "GetJobRuns", &json!({ "JobName": job_name })).await;
+    page.get("JobRuns")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("GetJobRuns must report JobRuns for {job_name:?}, got {page}"))
+        .iter()
+        .filter_map(|run| run.get("Id").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Assert that one more start of `job_name` is refused for concurrency, and that the
+/// refusal left the job holding exactly the runs `admitted` names.
+async fn assert_start_refused_for_concurrency(
+    router: &MultiServiceRouter,
+    case: &str,
+    job_name: &str,
+    admitted: &[String],
+) {
+    let (status, answer) = call(router, "StartJobRun", &json!({ "JobName": job_name })).await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: the start past the job's ceiling must be refused, got {status} with \
+         {answer}"
+    );
+    assert!(
+        error_code(&answer).contains("ConcurrentRunsExceededException"),
+        "case {case:?}: expected ConcurrentRunsExceededException, got {answer}"
+    );
+    // Spelled out here rather than imported, so a wrong constant in the implementation
+    // cannot make this pass: the sentence is fixed text for this error class, naming
+    // neither the job, the runs in flight nor the ceiling they reached.
+    assert_eq!(
+        error_message(&answer),
+        "Concurrent runs exceeded.",
+        "case {case:?}: expected the fixed concurrency refusal, got {answer}"
+    );
+    let listed = listed_run_ids(router, job_name).await;
+    let expected: BTreeSet<String> = admitted.iter().cloned().collect();
+    assert_eq!(
+        listed, expected,
+        "case {case:?}: a refused start must create no run at all, and the job's runs are \
+         {listed:?}"
+    );
+}
+
+/// A start is admitted against the job's CURRENT `ExecutionProperty$MaxConcurrentRuns` —
+/// "the maximum number of concurrent runs allowed for the job. The default is 1. An error
+/// is returned when this threshold is reached" — counted over the runs of that job which
+/// have not finished: the start that would make the (N+1)th concurrent run is refused with
+/// the modelled concurrency error and creates no run at all, and an update that moves the
+/// ceiling moves WHEN that refusal fires.
+///
+/// The rows differ along the ceiling the definition is created with (named, or left at the
+/// documented default), the ceiling the update moves it to and the direction of that move:
+/// raised, lowered, left where it was, and reset by an update that names no
+/// `ExecutionProperty` at all.
+#[tokio::test]
+async fn the_ceiling_a_start_is_admitted_against_is_the_jobs_current_one() {
+    let (router, engine) = emulator_with_engine();
+    // "The default is 1" (`ExecutionProperty$MaxConcurrentRuns`), as this service spells it.
+    let default_ceiling = usize::try_from(DEFAULT_MAX_CONCURRENT_RUNS).unwrap_or(1);
+
+    let rows = vec![
+        AdmissionRow {
+            // The recorded case: a definition that names no execution property at all, whose
+            // ceiling an update then raises to two.
+            case: "the documented default, raised to two",
+            created: Value::Null,
+            admits: default_ceiling,
+            updated: json!({ "MaxConcurrentRuns": 2 }),
+            admits_after: 2,
+        },
+        AdmissionRow {
+            case: "one run, raised to three",
+            created: json!({ "MaxConcurrentRuns": 1 }),
+            admits: 1,
+            updated: json!({ "MaxConcurrentRuns": 3 }),
+            admits_after: 3,
+        },
+        AdmissionRow {
+            case: "three runs, lowered to one",
+            created: json!({ "MaxConcurrentRuns": 3 }),
+            admits: 3,
+            updated: json!({ "MaxConcurrentRuns": 1 }),
+            admits_after: 1,
+        },
+        AdmissionRow {
+            case: "two runs, left where they were",
+            created: json!({ "MaxConcurrentRuns": 2 }),
+            admits: 2,
+            updated: json!({ "MaxConcurrentRuns": 2 }),
+            admits_after: 2,
+        },
+        AdmissionRow {
+            case: "four runs, reset by an update that names no execution property",
+            created: json!({ "MaxConcurrentRuns": 4 }),
+            admits: 4,
+            updated: Value::Null,
+            admits_after: default_ceiling,
+        },
+    ];
+
+    for (row_index, row) in rows.into_iter().enumerate() {
+        let name = format!("admission-{row_index}");
+        let mut job = json!({});
+        if !row.created.is_null() {
+            job["ExecutionProperty"] = row.created.clone();
+        }
+        ok(&router, "CreateJob", &job_body(&name, job)).await;
+        assert_eq!(
+            reported_ceiling(&router, &name).await,
+            Some(i64::try_from(row.admits).unwrap_or(i64::MAX)),
+            "case {:?}: the created definition must report the ceiling this row counts \
+             against",
+            row.case
+        );
+
+        // Every start's run is held open, so all of them are in flight at once: the ceiling
+        // bounds what is IN FLIGHT, which is what the next start is measured against.
+        let mut admitted: Vec<String> = Vec::new();
+        for _ in 0..row.admits {
+            admitted.push(start_run(&router, &json!({ "JobName": name })).await);
+            set_due_instant(&engine, &name, far_future());
+        }
+        assert_start_refused_for_concurrency(&router, row.case, &name, &admitted).await;
+
+        // The update moves the ceiling, and the SAME call is then admitted or refused by the
+        // ceiling the job now carries rather than by the one it was created with.
+        let mut update = json!({
+            "Role": ROLE_ARN,
+            "Command": { "Name": "glueetl", "ScriptLocation": "s3://etl-scripts/etl.py" },
+        });
+        if !row.updated.is_null() {
+            update["ExecutionProperty"] = row.updated.clone();
+        }
+        ok(
+            &router,
+            "UpdateJob",
+            &json!({ "JobName": name, "JobUpdate": update }),
+        )
+        .await;
+        assert_eq!(
+            reported_ceiling(&router, &name).await,
+            Some(i64::try_from(row.admits_after).unwrap_or(i64::MAX)),
+            "case {:?}: the updated definition must report the ceiling the rest of this row \
+             counts against",
+            row.case
+        );
+
+        for admitted_so_far in row.admits..row.admits_after {
+            admitted.push(start_run(&router, &json!({ "JobName": name })).await);
+            set_due_instant(&engine, &name, far_future());
+            assert_eq!(
+                listed_run_ids(&router, &name).await.len(),
+                admitted_so_far + 1,
+                "case {:?}: the start the raised ceiling admits must be recorded",
+                row.case
+            );
+        }
+        assert_start_refused_for_concurrency(&router, row.case, &name, &admitted).await;
+
+        // The ceiling bounds what is in flight rather than how many runs were ever started:
+        // once the runs holding the slots have finished, a start is admitted again. They are
+        // read back until they HAVE come to rest, because the slot a run holds is freed when
+        // the run finishes and not when the call that started it answered.
+        runs_at_rest(&router, &engine, row.case, &name).await;
+        admitted.push(start_run(&router, &json!({ "JobName": name })).await);
+        set_due_instant(&engine, &name, far_future());
+        let listed = listed_run_ids(&router, &name).await;
+        assert_eq!(
+            listed,
+            admitted.iter().cloned().collect::<BTreeSet<String>>(),
+            "case {:?}: the job holds exactly the runs its admitted starts minted, got \
+             {listed:?}",
+            row.case
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A run's own arguments
+// ---------------------------------------------------------------------------
+
+/// A reported argument map as a `BTreeMap`, so what a read reports and what a start sent
+/// compare by member whichever map backs either and in whatever order each is rendered.
+fn argument_map(value: &Value) -> BTreeMap<String, String> {
+    value
+        .as_object()
+        .map(|members| {
+            members
+                .iter()
+                .map(|(name, value)| (name.clone(), value.as_str().unwrap_or_default().to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `JobRun$Arguments` is a PER-RUN property: it holds the overrides the start of that run
+/// carried and nothing else — "the job arguments associated with this run. For this job
+/// run, they replace the default arguments set in the job definition itself" — so the
+/// member is ABSENT from a run whose start sent none, however many `DefaultArguments` the
+/// job definition carries, and the definition goes on reporting its own.
+///
+/// Each row drives TWO runs of one job, one started with overrides and one started with
+/// none, and asserts both through the read that lists a job's runs and through the read of
+/// one run, because a client reconstructing what a run was invoked with may use either. The
+/// rows differ along how many default arguments the job carries, whether the override names
+/// the same keys as the defaults, and how many keys it sends.
+#[tokio::test]
+async fn a_run_records_only_the_arguments_its_own_start_sent() {
+    let (router, engine) = emulator_with_engine();
+    let no_arguments = json!({});
+
+    // (case, the job's DefaultArguments, the Arguments the overriding start sends)
+    let rows: Vec<(&str, Value, Value)> = vec![
+        (
+            "a job with no defaults at all",
+            Value::Null,
+            json!({ "--outcome": "boom" }),
+        ),
+        (
+            // The recorded case: one default, and an override of that same key.
+            "one default the override replaces",
+            json!({ "--outcome": "ok" }),
+            json!({ "--outcome": "boom" }),
+        ),
+        (
+            "several defaults the override names none of",
+            json!({ "--a": "1", "--b": "2", "--c": "3" }),
+            json!({ "--d": "4" }),
+        ),
+        (
+            "a default the override repeats, beside one of its own",
+            json!({ "--enable-metrics": "true" }),
+            json!({ "--enable-metrics": "true", "--extra": "yes" }),
+        ),
+    ];
+
+    for (row_index, (case, defaults, overrides)) in rows.into_iter().enumerate() {
+        let name = format!("per-run-arguments-{row_index}");
+        let mut job = json!({});
+        if !defaults.is_null() {
+            job["DefaultArguments"] = defaults.clone();
+        }
+        ok(&router, "CreateJob", &job_body(&name, job)).await;
+
+        // The run started with overrides, then the one started with none. Each is read back
+        // until it has come to rest, because the slot a run holds is freed when the run
+        // finishes — the job here admits the documented single run at a time.
+        let overriding = start_run(
+            &router,
+            &json!({ "JobName": name, "Arguments": overrides.clone() }),
+        )
+        .await;
+        run_at_rest(&router, &engine, case, &name, &overriding).await;
+        let plain = start_run(&router, &json!({ "JobName": name })).await;
+        run_at_rest(&router, &engine, case, &name, &plain).await;
+
+        let listed = runs_at_rest(&router, &engine, case, &name).await;
+        let by_id: BTreeMap<String, Value> = listed
+            .iter()
+            .filter_map(|run| {
+                run.get("Id")
+                    .and_then(Value::as_str)
+                    .map(|id| (id.to_string(), run.clone()))
+            })
+            .collect();
+
+        for (role, run_id, sent) in [
+            (
+                "the run whose start sent arguments",
+                overriding.clone(),
+                Some(overrides.clone()),
+            ),
+            ("the run whose start sent none", plain.clone(), None),
+        ] {
+            let from_listing = by_id.get(&run_id).cloned().unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: the runs of {name:?} must hold {role} ({run_id:?}), got \
+                     {listed:?}"
+                )
+            });
+            let from_read = get_run(&router, &name, &run_id).await;
+            for (read, reported) in [("GetJobRuns", &from_listing), ("GetJobRun", &from_read)] {
+                match sent.as_ref() {
+                    Some(arguments) => assert_eq!(
+                        argument_map(reported.get("Arguments").unwrap_or(&Value::Null)),
+                        argument_map(arguments),
+                        "case {case:?}: {read} must report {role} carrying exactly the \
+                         arguments that start sent, got {reported}"
+                    ),
+                    None => assert!(
+                        reported.get("Arguments").is_none(),
+                        "case {case:?}: {read} must report NO Arguments member on {role}, got \
+                         {reported}"
+                    ),
+                }
+                // `JobRun$ExecutionArguments` is that same per-run map, reported whatever it
+                // holds — so the run started with none carries the empty map there, and no
+                // default of the job's leaks into it either.
+                assert_eq!(
+                    argument_map(reported.get("ExecutionArguments").unwrap_or(&Value::Null)),
+                    argument_map(sent.as_ref().unwrap_or(&no_arguments)),
+                    "case {case:?}: {read} must report the per-run arguments as \
+                     ExecutionArguments on {role}, got {reported}"
+                );
+            }
+        }
+
+        // The defaults stayed on the DEFINITION, which is where every read of the job
+        // reports them.
+        let read_job = ok(&router, "GetJob", &json!({ "JobName": name })).await;
+        let reported_defaults = read_job
+            .get("Job")
+            .and_then(|job| job.get("DefaultArguments"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        assert_eq!(
+            argument_map(&reported_defaults),
+            argument_map(&defaults),
+            "case {case:?}: the job definition still reports its own DefaultArguments, got \
+             {read_job}"
+        );
+    }
 }
