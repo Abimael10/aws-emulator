@@ -21,7 +21,7 @@
 //! Asserted over a TABLE rather than one recorded call: every setting of the
 //! `MethodSetting` shape in both spellings, each with a value that differs from the one a
 //! created entry carries, and the key forms a client may spell (an escaped resource path,
-//! the root resource, a `~1`-escaped key, the `*/*` wildcard).
+//! the root resource, a method path spelled in one token, the `*/*` wildcard).
 
 use serde_json::{json, Value};
 
@@ -165,8 +165,8 @@ async fn either_spelling_of_a_setting_writes_the_same_method_setting() {
         // One method path per spelling, so each row proves which setting the spelling
         // wrote rather than merely that something changed. The key is the method the
         // pointer addressed.
-        let published_key = format!("~1{member}-published/GET");
-        let member_key = format!("~1{member}-member/GET");
+        let published_key = format!("{member}-published/GET");
+        let member_key = format!("{member}-member/GET");
         for (spelling, path, key) in [
             (
                 published,
@@ -209,17 +209,17 @@ async fn a_setting_addressed_by_its_member_name_is_keyed_by_the_method_it_names(
     // the two-token spelling, so it is keyed the same way), and the `*/*` wildcard
     // `Stage$methodSettings` documents for every method of the stage.
     let cases: Vec<(&str, &str, &str)> = vec![
-        ("a child resource", "/~1pets/GET/metricsEnabled", "~1pets/GET"),
-        ("the root resource", "/~1/GET/metricsEnabled", "~1/GET"),
+        ("a child resource", "/~1pets/GET/metricsEnabled", "pets/GET"),
+        ("the root resource", "/~1/GET/metricsEnabled", "/GET"),
         (
             "a nested resource path",
             "/~1pets~1{petId}/GET/metricsEnabled",
-            "~1pets~1{petId}/GET",
+            "pets/{petId}/GET",
         ),
         (
             "the whole method path in one token",
             "/~1pets~1POST/metricsEnabled",
-            "~1pets/POST",
+            "pets/POST",
         ),
         ("every method", "/*/*/metricsEnabled", "*/*"),
     ];

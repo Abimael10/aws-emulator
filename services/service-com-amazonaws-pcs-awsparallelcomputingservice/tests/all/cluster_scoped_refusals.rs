@@ -232,16 +232,18 @@ async fn every_client_error_carries_one_status_and_names_its_class_in_the_body()
 }
 
 /// RULE: a cluster-scoped operation whose `clusterIdentifier` resolves to no cluster of this
-/// account is refused as a permissions failure naming the caller, the action and the
-/// identifier — never as a not-found, and never disclosing whether the cluster exists.
+/// account is refused by the FORM of that identifier — a generated cluster id (`pcs_…`) is the
+/// not-found naming the cluster, a cluster NAME the permissions failure naming the caller, the
+/// action and the identifier, which discloses nothing about whether such a cluster exists.
 #[tokio::test]
 async fn a_cluster_scoped_call_naming_no_cluster_is_refused_about_the_caller() {
     let router = emulator();
 
     // The two forms `ClusterIdentifier` admits, neither of which names a cluster here
     // (`smithy_query(query="shape",shape="ClusterIdentifier")`:
-    // `^(pcs_[a-zA-Z0-9]+|[A-Za-z][A-Za-z0-9-]{2,40})$`).
-    for identifier in ["no-such-cluster", "pcs_00000000000000000000"] {
+    // `^(pcs_[a-zA-Z0-9]+|[A-Za-z][A-Za-z0-9-]{2,40})$`), each with the refusal its form
+    // earns.
+    for identifier in ["no-such-cluster", "AnotherMissingOne"] {
         for (operation, request) in cluster_scoped_calls(identifier) {
             let case = format!("{operation} naming {identifier}");
             let (status, refused) = call(&router, operation, &request).await;
@@ -264,6 +266,39 @@ async fn a_cluster_scoped_call_naming_no_cluster_is_refused_about_the_caller() {
                      {refused}"
                 );
             }
+        }
+    }
+
+    // The generated-id form: a value only this service mints, so one nothing holds names a
+    // cluster that is not there and the refusal is the modelled not-found, carrying the
+    // identifier as supplied and the kind of identifier that did not resolve.
+    for identifier in ["pcs_00000000000000000000", "pcs_0"] {
+        for (operation, request) in cluster_scoped_calls(identifier) {
+            let case = format!("{operation} naming {identifier}");
+            let (status, refused) = call(&router, operation, &request).await;
+            assert_eq!(
+                (status, error_code(&refused).as_str()),
+                (CLIENT_ERROR_STATUS, "ResourceNotFoundException"),
+                "case {case}: expected the not-found, got {status} with {refused}"
+            );
+            assert_eq!(
+                (
+                    refused["message"].as_str(),
+                    refused["resourceId"].as_str(),
+                    refused["resourceType"].as_str()
+                ),
+                (
+                    Some("AWS PCS couldn't find the cluster you specified."),
+                    Some(identifier),
+                    Some("Cluster ID")
+                ),
+                "case {case}: expected the cluster not-found and its modelled members, got \
+                 {refused}"
+            );
+            assert!(
+                refused.get("Message").is_none(),
+                "case {case}: a not-found carries no IAM sentence, got {refused}"
+            );
         }
     }
 }

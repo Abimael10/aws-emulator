@@ -246,18 +246,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.settle();
 
-        // The cluster is the boundary this call is authorized on, so an identifier that
-        // resolves to no cluster of this account is a permissions failure rather than a
-        // not-found; see `crate::state::cluster_authorization`. The principal it names was
-        // read before this store was locked.
+        // The cluster this create is scoped to has to resolve, and WHICH refusal an identifier
+        // that resolves to none earns is decided by its FORM: a generated cluster id names a
+        // cluster that is not there — which is what lets provisioning code that creates a
+        // cluster and then a queue by the id it was handed treat "not there yet" as
+        // retryable — and a cluster NAME is a permissions failure; see
+        // `crate::state::cluster_authorization`. That question is a total `str::starts_with`
+        // over the identifier as received — no index, no parse, no store — so asking it while
+        // this store's guard is held cannot fail for any value a caller sends. The principal a
+        // denial names was read before this store was locked, and nothing is written either
+        // way.
         let Some(cluster_id) = state.cluster_id_for(&input.cluster_identifier) else {
-            return Err(CreateQueueErrorModeled::AccessDeniedException(
-                crate::state::cluster_authorization::cluster_denied(
-                    &caller,
-                    Self::NAME,
-                    &input.cluster_identifier,
-                ),
-            )
+            return Err(match crate::state::cluster_authorization::unresolved_cluster(
+                &input.cluster_identifier,
+            ) {
+                crate::state::cluster_authorization::UnresolvedCluster::NotFound => {
+                    CreateQueueErrorModeled::ResourceNotFoundException(crate::state::not_found(
+                        crate::state::CLUSTER,
+                        &input.cluster_identifier,
+                    ))
+                }
+                crate::state::cluster_authorization::UnresolvedCluster::Denied => {
+                    CreateQueueErrorModeled::AccessDeniedException(
+                        crate::state::cluster_authorization::cluster_denied(
+                            &caller,
+                            Self::NAME,
+                            &input.cluster_identifier,
+                        ),
+                    )
+                }
+            }
             .into());
         };
 

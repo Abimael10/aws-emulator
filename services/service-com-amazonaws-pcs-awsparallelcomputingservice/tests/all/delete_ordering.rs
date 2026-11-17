@@ -475,9 +475,9 @@ async fn deleting_the_hierarchy_back_to_back_is_served() {
         );
     }
 
-    // The clock then removes all three, so every read of them is a miss. The CLUSTER is
-    // gone too, so a child read is refused about the caller (the cluster is the boundary
-    // such a call is authorized on) while the cluster's own read is a not-found.
+    // The clock then removes all three, so every read of them is a miss. The CLUSTER is gone
+    // too, and every read here names it by the GENERATED ID it was minted with, so each is
+    // the cluster's own not-found rather than a refusal about the caller.
     wait_past_the_owed_transition().await;
     wait_past_the_owed_transition().await;
     for (operation, body, expected_code) in [
@@ -487,7 +487,7 @@ async fn deleting_the_hierarchy_back_to_back_is_served() {
                 "clusterIdentifier": cluster.id.clone(),
                 "queueIdentifier": queue.id.clone(),
             }),
-            "AccessDeniedException",
+            "ResourceNotFoundException",
         ),
         (
             "GetComputeNodeGroup",
@@ -495,7 +495,7 @@ async fn deleting_the_hierarchy_back_to_back_is_served() {
                 "clusterIdentifier": cluster.id.clone(),
                 "computeNodeGroupIdentifier": group.id.clone(),
             }),
-            "AccessDeniedException",
+            "ResourceNotFoundException",
         ),
         (
             "GetCluster",

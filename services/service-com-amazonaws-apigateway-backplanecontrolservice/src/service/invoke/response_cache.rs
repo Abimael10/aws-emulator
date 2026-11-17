@@ -154,36 +154,23 @@ fn invalidation_refusal(req: &RtRequest, call: &resource_policy::Call<'_>) -> Ga
 /// `matched_path` of this stage: the entry keyed by THAT method, else the one that names
 /// every method of the stage, else none at all.
 ///
-/// A `methodSettings` key is the method path a patch addressed —
-/// `{resource_path}/{http_method}`, with the resource path's own `/` written as the JSON
-/// Pointer escape ([`ESCAPED_PATH_SEPARATOR`]) where the pointer spelled the method path in
-/// two reference tokens, decoded where it spelled it in one, and with the LEADING separator
-/// left to the pointer where the patch spelled the path the way
-/// `MethodSetting$ResourcePath` does (which is how a CloudFormation-managed stage is
-/// patched) — or [`EVERY_METHOD_SETTINGS_KEY`]. Every spelling of the method's own key is
-/// tried before the whole-stage one, and they are the only keys `UpdateStage` can store: a
-/// pointer whose resource half carries an unescaped separator names no method there, so no
-/// stored key can fail to resolve here. The whole-stage key is the fallback, which is what
-/// makes a `/*/*/caching/enabled` patch cache every method.
+/// A `methodSettings` key is the method path `Stage$methodSettings` documents —
+/// `{resource_path}/{http_method}` with the resource path's leading separator dropped — or
+/// [`EVERY_METHOD_SETTINGS_KEY`]. It is derived HERE from the deployed resource path and the
+/// verb through the one place that derives it ([`crate::state::method_settings_key`]), which
+/// is also what `UpdateStage` stores by, so whichever spelling a patch addressed the method
+/// in, the setting it wrote is the setting resolved here. The whole-stage key is the
+/// fallback, which is what makes a `/*/*/caching/enabled` patch cache every method.
 pub(super) fn method_settings_in_force<'s>(
     stage: &'s StageEntry,
     matched_path: &str,
     verb: &str,
 ) -> Option<&'s MethodSetting> {
     let verb = wire_verb(verb);
-    let escaped = matched_path.replace('/', ESCAPED_PATH_SEPARATOR);
-    let unprefixed = matched_path
-        .strip_prefix('/')
-        .unwrap_or(matched_path)
-        .replace('/', ESCAPED_PATH_SEPARATOR);
-    [
-        format!("{escaped}/{verb}"),
-        format!("{matched_path}/{verb}"),
-        format!("{unprefixed}/{verb}"),
-    ]
-    .iter()
-    .find_map(|key| stage.method_settings.get(key))
-    .or_else(|| stage.method_settings.get(EVERY_METHOD_SETTINGS_KEY))
+    stage
+        .method_settings
+        .get(&crate::state::method_settings_key(matched_path, &verb))
+        .or_else(|| stage.method_settings.get(EVERY_METHOD_SETTINGS_KEY))
 }
 
 /// The key the stage's cache holds this call's response under.

@@ -205,15 +205,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        // An integration takes ONE conditional operation at a time, so one a
-        // delete has already been accepted against takes no modify: the change is
-        // refused and the deletion stays on course, rather than a modify
-        // resurrecting an integration on its way out.
+        // An integration takes a change only in a STATE that admits one, and one a
+        // delete has already been accepted against is on its way out: the change is
+        // refused for the state the integration is in and the deletion stays on
+        // course, rather than a modify resurrecting an integration on its way out.
+        // That is the conflicting-STATE fault — "the integration is in an invalid
+        // state and can't perform the requested operation" — and not the
+        // conflicting-OPERATION one, which states that a conditional operation of the
+        // caller's own kind is in flight (a second delete of an integration already
+        // being deleted).
         if store.integrations[position].deletion_accepted() {
             return Err(
-                ModifyIntegrationErrorModeled::IntegrationConflictOperationFault(
-                    IntegrationConflictOperationFault {
-                        message: Some(st::INTEGRATION_CONFLICT_OPERATION.to_string()),
+                ModifyIntegrationErrorModeled::IntegrationConflictStateFault(
+                    IntegrationConflictStateFault {
+                        message: Some(st::INTEGRATION_CONFLICT_STATE.to_string()),
                     },
                 )
                 .into(),

@@ -54,11 +54,6 @@ const STAGE: &str = "s";
 /// makes: `/{RESOURCE_PART}`.
 const RESOURCE_PART: &str = "echo";
 
-/// The JSON Pointer escape of the `/` in a resource path, which is how an `UpdateStage` patch
-/// spells a method path in ONE reference token — and the spelling `GetStage` then reports the
-/// per-method `methodSettings` key under.
-const ESCAPED_SEPARATOR: &str = "~1";
-
 /// The `methodSettings` key that names every method of the stage.
 const EVERY_METHOD_KEY: &str = "*/*";
 
@@ -228,7 +223,7 @@ async fn deployed(router: &MultiServiceRouter, function_arn: &str, label: &str) 
 /// The `methodSettings` key API Gateway reports the per-method setting of `verb` on
 /// `/{RESOURCE_PART}` under, and the `UpdateStage` patch path that addresses it.
 fn method_key(verb: &str) -> String {
-    format!("{ESCAPED_SEPARATOR}{RESOURCE_PART}/{verb}")
+    format!("{RESOURCE_PART}/{verb}")
 }
 
 /// Gate the stage's execution logs: the stage-wide `loggingLevel` where `stage_wide` names one,

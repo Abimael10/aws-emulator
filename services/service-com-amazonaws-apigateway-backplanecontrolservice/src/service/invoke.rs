@@ -435,11 +435,6 @@ const IGNORED_CACHE_CONTROL_WARNING: &str =
 /// `/*/*/…` under it.
 const EVERY_METHOD_SETTINGS_KEY: &str = "*/*";
 
-/// The JSON Pointer escape a `methodSettings` key spells the `/` of a resource path with:
-/// a patch addresses `/~1pets/GET/caching/enabled`, and the key the stage stores is the
-/// method path exactly as the patch spelled it.
-const ESCAPED_PATH_SEPARATOR: &str = "~1";
-
 /// The mapping-expression prefix of a request HEADER, which is how both an authorizer's
 /// identity source and a method's request parameter name one.
 ///

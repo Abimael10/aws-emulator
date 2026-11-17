@@ -328,19 +328,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.settle();
 
-        // The cluster is the boundary this call is authorized on, so an identifier that
-        // resolves to no cluster of this account is a permissions failure rather than a
-        // not-found; see `crate::state::cluster_authorization`. It is asked AFTER the
-        // references this create carries into other services are resolved, so a request
-        // naming a profile or a subnet that does not exist is answered about that.
+        // The cluster this create is scoped to has to resolve, and WHICH refusal an identifier
+        // that resolves to none earns is decided by its FORM: a generated cluster id names a
+        // cluster that is not there, a cluster NAME is a permissions failure; see
+        // `crate::state::cluster_authorization`. That question is a total `str::starts_with`
+        // over the identifier as received — no index, no parse, no store — so asking it while
+        // this store's guard is held cannot fail for any value a caller sends. It is asked
+        // AFTER the references this create carries into other services are resolved, so a
+        // request naming a profile or a subnet that does not exist is answered about that.
         let Some(cluster_id) = state.cluster_id_for(&input.cluster_identifier) else {
-            return Err(CreateComputeNodeGroupErrorModeled::AccessDeniedException(
-                crate::state::cluster_authorization::cluster_denied(
-                    &caller,
-                    Self::NAME,
-                    &input.cluster_identifier,
-                ),
-            )
+            return Err(match crate::state::cluster_authorization::unresolved_cluster(
+                &input.cluster_identifier,
+            ) {
+                crate::state::cluster_authorization::UnresolvedCluster::NotFound => {
+                    CreateComputeNodeGroupErrorModeled::ResourceNotFoundException(
+                        crate::state::not_found(
+                            crate::state::CLUSTER,
+                            &input.cluster_identifier,
+                        ),
+                    )
+                }
+                crate::state::cluster_authorization::UnresolvedCluster::Denied => {
+                    CreateComputeNodeGroupErrorModeled::AccessDeniedException(
+                        crate::state::cluster_authorization::cluster_denied(
+                            &caller,
+                            Self::NAME,
+                            &input.cluster_identifier,
+                        ),
+                    )
+                }
+            }
             .into());
         };
 

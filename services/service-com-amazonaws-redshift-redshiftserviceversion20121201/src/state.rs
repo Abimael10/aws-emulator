@@ -3805,9 +3805,8 @@ pub const INTEGRATION_DELETE_TARGET_NOT_ACTIVE: &str = "Unable to perform delete
      the specified zero-ETL integration because its target Redshift data warehouse is not \
      active. Wait until the data warehouse is active and try again.";
 
-/// What an operation against one integration answers when ANOTHER operation
-/// against it is still in flight — a second delete of an integration already being
-/// deleted, or a modify of one.
+/// What an operation against one integration answers when ANOTHER operation of its own
+/// kind is still in flight — a second delete of an integration already being deleted.
 ///
 /// The sentence the model itself states for the condition
 /// (`smithy_query(query="shape", shape="IntegrationConflictOperationFault")`), so
@@ -3817,6 +3816,17 @@ pub const INTEGRATION_CONFLICT_OPERATION: &str =
     "A conflicting conditional operation is currently in progress against this resource. \
      This typically occurs when there are multiple requests being made to the same \
      resource at the same time, and these requests conflict with each other.";
+
+/// What an operation answers when the integration's own STATE does not admit it — a
+/// modify of an integration that is on its way out, whose status no longer takes a
+/// change.
+///
+/// The sentence the model itself states for the condition
+/// (`smithy_query(query="shape", shape="IntegrationConflictStateFault")`), the same way
+/// [`INTEGRATION_CONFLICT_OPERATION`] is the sentence of its own fault: the refusal says
+/// what the modelled fault means and nothing is invented beside it.
+pub const INTEGRATION_CONFLICT_STATE: &str =
+    "The integration is in an invalid state and can't perform the requested operation.";
 
 /// Why a `TargetArn` that names no namespace of either control plane is refused
 /// by an operation that FILTERS on it rather than creating against it.

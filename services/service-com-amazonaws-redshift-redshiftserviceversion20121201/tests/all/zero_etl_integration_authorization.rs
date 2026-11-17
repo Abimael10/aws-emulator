@@ -80,6 +80,11 @@ const CONFLICTING_OPERATION: &str =
      This typically occurs when there are multiple requests being made to the same \
      resource at the same time, and these requests conflict with each other.";
 
+/// The sentence an operation the integration's own STATE does not admit is refused with:
+/// a change asked of an integration that is on its way out.
+const CONFLICTING_STATE: &str =
+    "The integration is in an invalid state and can't perform the requested operation.";
+
 /// The sentence every operation answers for an `IntegrationArn` that resolves to
 /// no integration.
 const NOT_FOUND: &str = "The requested integration doesn't exist.";
@@ -619,10 +624,22 @@ async fn an_accepted_delete_keeps_reporting_the_integration_until_it_is_gone() {
         );
     }
 
-    // ... and it takes no further operation while it is on its way out.
-    for (action, extra) in [
-        ("DeleteIntegration", None),
-        ("ModifyIntegration", Some(("Description", "too late"))),
+    // ... and it takes no further operation while it is on its way out: a second DELETE
+    // collides with the delete already in flight (the conflicting-OPERATION fault), while a
+    // MODIFY is refused for the state the integration is in (the conflicting-STATE fault).
+    for (action, extra, code, sentence) in [
+        (
+            "DeleteIntegration",
+            None,
+            "IntegrationConflictOperationFault",
+            CONFLICTING_OPERATION,
+        ),
+        (
+            "ModifyIntegration",
+            Some(("Description", "too late")),
+            "IntegrationConflictStateFault",
+            CONFLICTING_STATE,
+        ),
     ] {
         let mut params: Vec<(String, String)> =
             vec![("IntegrationArn".to_string(), arn.clone())];
@@ -636,14 +653,9 @@ async fn an_accepted_delete_keeps_reporting_the_integration_until_it_is_gone() {
                 collided.error_code().as_deref(),
                 collided.text("Message").as_deref()
             ),
-            (
-                400,
-                Some("IntegrationConflictOperationFault"),
-                Some(CONFLICTING_OPERATION)
-            ),
-            "case {action} against an integration being deleted: expected 400 \
-             IntegrationConflictOperationFault with the conflicting-operation sentence, got {} \
-             / {:?} / {:?} with body {}",
+            (400, Some(code), Some(sentence)),
+            "case {action} against an integration being deleted: expected 400 {code} with its \
+             own sentence, got {} / {:?} / {:?} with body {}",
             collided.status,
             collided.error_code(),
             collided.text("Message"),

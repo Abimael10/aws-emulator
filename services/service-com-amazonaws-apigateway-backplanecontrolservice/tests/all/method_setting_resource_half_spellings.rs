@@ -8,13 +8,15 @@
 //!
 //! > A `methodSettings` key is the METHOD the patch addressed — "method paths defined
 //! > as {resource_path}/{http_method} for an individual method override, or /\*/\* for
-//! > overriding all methods in the stage" (`Stage$methodSettings`). The separator before the
-//! > HTTP method is a real one and every separator of the RESOURCE path is the JSON Pointer
-//! > escape `~1`, so a pointer that spells the resource path's leading separator either way
-//! > — escaped into its first reference token, or left to the pointer's own leading `/` —
-//! > names the one method and is keyed the one way. A resource half carrying an unescaped
-//! > separator of its own names no method, because nothing in the pointer says where the
-//! > resource path stops and the method begins, so it is the modelled `BadRequestException`.
+//! > overriding all methods in the stage" (`Stage$methodSettings`), written with the resource
+//! > path's separators REAL and its leading one dropped. Inside the PATCH PATH every
+//! > separator of the RESOURCE path is the JSON Pointer escape `~1` and the one before the
+//! > HTTP method is real, so a pointer that spells the resource path's leading separator
+//! > either way — escaped into its first reference token, or left to the pointer's own leading
+//! > `/` — names the one method and is keyed the one way. A resource half carrying an
+//! > unescaped separator of its own names no method, because nothing in the pointer says where
+//! > the resource path stops and the method begins, so it is the modelled
+//! > `BadRequestException`.
 //!
 //! The rows span what the rule generalises over: the DEPTH of the resource path (the root,
 //! a child, a nested one), the wildcard that stands for every method, and the two spellings
@@ -52,19 +54,19 @@ struct Row {
 const ROWS: &[Row] = &[
     Row {
         case: "a child resource",
-        key: "~1pets/GET",
+        key: "pets/GET",
         escaped: "/~1pets/GET/caching/enabled",
         unprefixed: Some("/pets/GET/caching/enabled"),
     },
     Row {
         case: "a nested resource path",
-        key: "~1pets~1{petId}/GET",
+        key: "pets/{petId}/GET",
         escaped: "/~1pets~1{petId}/GET/caching/enabled",
         unprefixed: Some("/pets~1{petId}/GET/caching/enabled"),
     },
     Row {
         case: "the root resource",
-        key: "~1/GET",
+        key: "/GET",
         escaped: "/~1/GET/caching/enabled",
         unprefixed: Some("//GET/caching/enabled"),
     },

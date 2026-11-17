@@ -8,13 +8,14 @@
 //! > `Stage$methodSettings` is "a map that defines the method settings for a Stage resource.
 //! > Keys … are method paths defined as {resource_path}/{http_method} for an individual
 //! > method override, or /\*/\* for overriding all methods in the stage". A key therefore
-//! > names a METHOD: the resource path with every separator of its own written as the JSON
-//! > Pointer escape `~1`, a real separator, then the HTTP method — and `*/*` for every method
-//! > of the stage. A patch path may spell that method several ways (the resource path's
-//! > leading separator escaped or left to the pointer's own, the separator before the HTTP
-//! > method escaped too so the whole method path rides in one reference token), and every one
-//! > of them addresses the one method, so a stage holds exactly ONE entry per method however
-//! > many spellings wrote it.
+//! > names a METHOD, in the method path's own spelling: the resource path with its separators
+//! > REAL and its leading one dropped — as the documented whole-stage path `/*/*` is keyed
+//! > `*/*` — a separator, then the HTTP method. The JSON Pointer escape `~1` belongs to the
+//! > patch PATH alone, which may spell that method several ways (the resource path's leading
+//! > separator escaped or left to the pointer's own, the separator before the HTTP method
+//! > escaped too so the whole method path rides in one reference token), and every one of them
+//! > addresses the one method, so a stage holds exactly ONE entry per method however many
+//! > spellings wrote it and no key carries an escape.
 //!
 //! The rows span what the rule generalises over: the DEPTH of the resource path (the root, a
 //! child, a nested one), the wildcard that stands for every method, and each spelling of the
@@ -49,7 +50,7 @@ struct Row {
 const ROWS: &[Row] = &[
     Row {
         case: "a child resource",
-        key: "~1pets/GET",
+        key: "pets/GET",
         spellings: &[
             // The resource path's leading separator escaped into the first token.
             ("/~1pets/GET/metrics/enabled", "metricsEnabled"),
@@ -62,7 +63,7 @@ const ROWS: &[Row] = &[
     },
     Row {
         case: "a nested resource path",
-        key: "~1pets~1{petId}/DELETE",
+        key: "pets/{petId}/DELETE",
         spellings: &[
             (
                 "/~1pets~1{petId}/DELETE/metrics/enabled",
@@ -77,7 +78,7 @@ const ROWS: &[Row] = &[
     },
     Row {
         case: "the root resource",
-        key: "~1/GET",
+        key: "/GET",
         spellings: &[
             ("/~1/GET/metrics/enabled", "metricsEnabled"),
             ("//GET/caching/enabled", "cachingEnabled"),
@@ -135,6 +136,13 @@ async fn every_spelling_of_one_method_writes_the_one_documented_key() {
             assert_eq!(
                 keys, expected_keys,
                 "case {case}: expected the keys {expected_keys:?}, got {keys:?}"
+            );
+            // No key carries the JSON Pointer escape: it is how a patch PATH spells a
+            // separator of the resource path, and a key is the method path itself.
+            assert!(
+                keys.iter().all(|key| !key.contains('~')),
+                "case {case}: a methodSettings key is a method path, never an escaped patch \
+                 path, got {keys:?}"
             );
             let read = get_stage(&gateway, &api, "prod").await;
             assert_eq!(

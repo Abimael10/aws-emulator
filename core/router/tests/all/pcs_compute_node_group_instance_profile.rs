@@ -18,10 +18,11 @@
 //!   instance profile of this account at all is refused in PCS's own words, since nobody
 //!   was asked about it;
 //! * a reference IAM does hold is passed on, and the create then resolves its cluster: a
-//!   cluster that does not exist is `AccessDeniedException`, since the cluster is the
-//!   boundary the call is authorized on, and a cluster that does gets the compute node
-//!   group, which reads back through `GetComputeNodeGroup` carrying the profile it was
-//!   created with.
+//!   cluster that does not exist is refused by the FORM of the identifier the request named —
+//!   a generated cluster id nothing holds is `ResourceNotFoundException`, a cluster NAME is
+//!   `AccessDeniedException`, since only a name leaves the question to the policies in force
+//!   — and a cluster that does exist gets the compute node group, which reads back through
+//!   `GetComputeNodeGroup` carrying the profile it was created with.
 //!
 //! The read and delete paths of a compute node group reference no instance profile and keep
 //! resolving their cluster first, which the PCS crate's own suites cover.
@@ -269,11 +270,16 @@ enum Expected {
     /// The value names no instance profile of this account: `ValidationException` in
     /// PCS's own words, since no call was made about it.
     ProfileNotOfThisAccount,
-    /// The profile resolves and the cluster does not exist. The cluster is the boundary a
-    /// compute node group create is authorized on, so the refusal is
-    /// `AccessDeniedException` naming the caller, the action and the identifier supplied —
+    /// The profile resolves and the cluster does not exist, named by a cluster NAME. Only a
+    /// name leaves whether the caller may act on it to the policies in force, so the refusal
+    /// is `AccessDeniedException` naming the caller, the action and the identifier supplied —
     /// which the PCS crate's own suites cover in full.
     ClusterDenied(&'static str),
+    /// The profile resolves and the cluster does not exist, named by a GENERATED cluster id.
+    /// Such a value can only have been minted by the service, so one nothing holds names a
+    /// cluster that is not there: the modelled `ResourceNotFoundException`, carrying the
+    /// identifier as supplied and the kind of identifier that did not resolve.
+    ClusterNotFound(&'static str),
 }
 
 /// One row of the table.
@@ -335,7 +341,7 @@ fn cases(account: &str, cluster_id: &str) -> Vec<Case> {
             cluster: ABSENT_CLUSTER_ID.to_string(),
             group: "absent-cluster-id",
             profile_arn: held.clone(),
-            expected: Expected::ClusterDenied(ABSENT_CLUSTER_ID),
+            expected: Expected::ClusterNotFound(ABSENT_CLUSTER_ID),
         },
         Case {
             case: "a profile IAM holds, on a cluster name that names no cluster",
@@ -637,6 +643,30 @@ fn a_compute_node_group_is_created_only_for_an_instance_profile_iam_holds() {
                                 && body.get("resourceType").is_none(),
                             "case {:?}: a refusal of the caller must report no resource, \
                              got {body}",
+                            case.case
+                        );
+                    }
+                    Expected::ClusterNotFound(identifier) => {
+                        assert_eq!(
+                            (status, error_code(&body).as_str()),
+                            (400, "ResourceNotFoundException"),
+                            "case {:?}: a resolvable profile on a cluster id that names no \
+                             cluster must be refused about the cluster, got {status} {body}",
+                            case.case
+                        );
+                        assert_eq!(
+                            (
+                                error_message(&body),
+                                body["resourceId"].as_str(),
+                                body["resourceType"].as_str()
+                            ),
+                            (
+                                "AWS PCS couldn't find the cluster you specified.".to_string(),
+                                Some(*identifier),
+                                Some("Cluster ID")
+                            ),
+                            "case {:?}: expected the cluster not-found and its modelled \
+                             members, got {body}",
                             case.case
                         );
                     }

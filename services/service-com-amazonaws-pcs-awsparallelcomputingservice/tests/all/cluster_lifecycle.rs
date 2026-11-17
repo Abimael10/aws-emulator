@@ -435,48 +435,62 @@ async fn a_child_create_refuses_a_cluster_it_cannot_find() {
     let router = emulator();
     active_cluster(&router, "demo-cluster").await;
 
-    // Rows: the operation, the request, and the identifier it names. Every row names a
-    // cluster that does not exist, in each of the two forms `ClusterIdentifier` allows.
-    let cases: Vec<(&str, Value)> = vec![
+    // Rows: the operation and the request. Every row names a cluster that does not exist,
+    // in each of the two forms `ClusterIdentifier` allows, and the refusal each form earns:
+    // the generated id is the not-found, the name the permissions failure.
+    let cases: Vec<(&str, Value, &str)> = vec![
         (
             "CreateComputeNodeGroup",
             create_compute_node_group("no-such-cluster", "demo-cng"),
+            "AccessDeniedException",
         ),
         (
             "CreateComputeNodeGroup",
             create_compute_node_group("pcs_0000000000000000", "demo-cng"),
+            "ResourceNotFoundException",
         ),
         (
             "CreateQueue",
             create_queue("no-such-cluster", "demo-queue", &[]),
+            "AccessDeniedException",
         ),
         (
             "CreateQueue",
             create_queue("pcs_0000000000000000", "demo-queue", &[]),
+            "ResourceNotFoundException",
         ),
         ("GetQueue", json!({
             "clusterIdentifier": "no-such-cluster",
             "queueIdentifier": "demo-queue",
-        })),
-        ("ListQueues", json!({"clusterIdentifier": "no-such-cluster"})),
+        }), "AccessDeniedException"),
+        (
+            "ListQueues",
+            json!({"clusterIdentifier": "no-such-cluster"}),
+            "AccessDeniedException",
+        ),
         ("GetComputeNodeGroup", json!({
             "clusterIdentifier": "no-such-cluster",
             "computeNodeGroupIdentifier": "demo-cng",
-        })),
+        }), "AccessDeniedException"),
+        ("GetComputeNodeGroup", json!({
+            "clusterIdentifier": "pcs_0000000000000000",
+            "computeNodeGroupIdentifier": "demo-cng",
+        }), "ResourceNotFoundException"),
     ];
-    for (operation, request) in cases {
+    for (operation, request, expected) in cases {
         let (status, body) = call(&router, operation, &request).await;
         assert_eq!(
             status, CLIENT_ERROR_STATUS,
             "case {operation} on an unknown cluster: expected the client-error status, got \
              {status} {body}"
         );
-        // The cluster is the boundary a child operation is authorized on, so an identifier
-        // that resolves to no cluster of this account is a permissions failure.
+        // Which refusal a child operation earns is decided by the FORM of the identifier it
+        // named: a generated cluster id names a cluster that is not there, a cluster name
+        // cannot be authorized at all.
         assert_eq!(
             body["__type"],
-            json!("AccessDeniedException"),
-            "case {operation} on an unknown cluster: got {body}"
+            json!(expected),
+            "case {operation} on an unknown cluster: expected {expected}, got {body}"
         );
     }
 

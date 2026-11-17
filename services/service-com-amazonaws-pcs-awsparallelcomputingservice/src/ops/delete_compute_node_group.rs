@@ -184,17 +184,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.settle();
 
-        // The cluster is the boundary this call is authorized on, so an identifier that
-        // resolves to no cluster of this account is a permissions failure rather than a
-        // not-found; see `crate::state::cluster_authorization`.
+        // The cluster this call is scoped to has to resolve, and WHICH refusal an identifier
+        // that resolves to none earns is decided by its FORM: a generated cluster id names a
+        // cluster that is not there, a cluster NAME is a permissions failure; see
+        // `crate::state::cluster_authorization`.
         let Some(cluster) = state.cluster_mut(&input.cluster_identifier) else {
-            return Err(DeleteComputeNodeGroupErrorModeled::AccessDeniedException(
-                crate::state::cluster_authorization::cluster_denied(
-                    &caller,
-                    Self::NAME,
-                    &input.cluster_identifier,
-                ),
-            )
+            return Err(match crate::state::cluster_authorization::unresolved_cluster(
+                &input.cluster_identifier,
+            ) {
+                crate::state::cluster_authorization::UnresolvedCluster::NotFound => {
+                    DeleteComputeNodeGroupErrorModeled::ResourceNotFoundException(
+                        crate::state::not_found(
+                            crate::state::CLUSTER,
+                            &input.cluster_identifier,
+                        ),
+                    )
+                }
+                crate::state::cluster_authorization::UnresolvedCluster::Denied => {
+                    DeleteComputeNodeGroupErrorModeled::AccessDeniedException(
+                        crate::state::cluster_authorization::cluster_denied(
+                            &caller,
+                            Self::NAME,
+                            &input.cluster_identifier,
+                        ),
+                    )
+                }
+            }
             .into());
         };
         let Some(group_id) = cluster
