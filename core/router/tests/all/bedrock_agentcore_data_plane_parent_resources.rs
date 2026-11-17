@@ -32,14 +32,19 @@ const GHOST_MEMORY: &str = "ghost-memory-9876543210";
 /// An id of the code interpreter shape that no create ever mints here.
 const GHOST_INTERPRETER: &str = "ghost_interpreter-9z8y7x6w5v";
 
-/// The actor and session the writes address.
-const ACTOR: &str = "actor-1";
-const SESSION: &str = "sess1";
+/// The actor and session the writes address. Shared with the sibling cross-plane suites,
+/// so a write and a later read of it address the one actor and session.
+pub(crate) const ACTOR: &str = "actor-1";
+pub(crate) const SESSION: &str = "sess1";
 
 /// AgentCore Control and the AgentCore data plane over ONE shared engine, exactly as
 /// `router/src/lib.rs` mounts them: the two share a signing name and are told apart by the
 /// route each model binds.
-fn emulator() -> MultiServiceRouter {
+///
+/// Shared with the sibling cross-plane suites of this test crate (see
+/// `all/bedrock_agentcore_memory_deletion_ends_data_plane_access.rs`) rather than copied,
+/// so the two cannot drift in how they mount the two planes.
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -55,8 +60,9 @@ fn emulator() -> MultiServiceRouter {
 }
 
 /// One restJson1 call, signed for the shared signing name; the ROUTE is what picks the
-/// plane that answers it.
-async fn call(
+/// plane that answers it. Shared with the sibling cross-plane suites, for the same reason
+/// [`emulator`] is.
+pub(crate) async fn call(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,
@@ -103,7 +109,7 @@ fn label(value: &str) -> String {
     out
 }
 
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -113,7 +119,7 @@ fn error_code(body: &Value) -> String {
         .to_string()
 }
 
-fn message(body: &Value) -> String {
+pub(crate) fn message(body: &Value) -> String {
     body.get("message")
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -122,7 +128,7 @@ fn message(body: &Value) -> String {
 
 /// `CreateMemory` on the control plane: `POST /memories/create`, answering the `memoryId`
 /// it minted.
-async fn create_memory(router: &MultiServiceRouter, name: &str) -> String {
+pub(crate) async fn create_memory(router: &MultiServiceRouter, name: &str) -> String {
     let (status, created) = call(
         router,
         "POST",
@@ -160,8 +166,9 @@ async fn create_code_interpreter(router: &MultiServiceRouter, name: &str) -> Str
         .to_string()
 }
 
-/// `CreateEvent` on the data plane: `POST /memories/{memoryId}/events`.
-async fn create_event(router: &MultiServiceRouter, memory: &str) -> (u16, Value) {
+/// `CreateEvent` on the data plane: `POST /memories/{memoryId}/events`. Shared with the
+/// sibling cross-plane suites, so both send the one body.
+pub(crate) async fn create_event(router: &MultiServiceRouter, memory: &str) -> (u16, Value) {
     call(
         router,
         "POST",
@@ -176,8 +183,9 @@ async fn create_event(router: &MultiServiceRouter, memory: &str) -> (u16, Value)
     .await
 }
 
-/// `IngestData` on the data plane: `POST /memories/{memoryId}/ingest`.
-async fn ingest_data(router: &MultiServiceRouter, memory: &str) -> (u16, Value) {
+/// `IngestData` on the data plane: `POST /memories/{memoryId}/ingest`. Shared for the same
+/// reason [`create_event`] is.
+pub(crate) async fn ingest_data(router: &MultiServiceRouter, memory: &str) -> (u16, Value) {
     call(
         router,
         "POST",
