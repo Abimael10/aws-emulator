@@ -3,32 +3,45 @@
 //! The validity WINDOW of an OpenID Connect token this service minted, at the exchange
 //! that spends it.
 //!
-//! RULE: a token this service mints is a time-bounded credential — its window is the one
-//! the issuance recorded (`TokenDuration` seconds, or the documented 15 minutes for a
-//! request naming none) — so presenting it to `GetCredentialsForIdentity` under this
-//! service's own provider name buys a credential only INSIDE that window: once the clock
-//! has closed it the exchange is refused with the modelled `NotAuthorizedException`
-//! (HTTP 400) and no credential, and a token this service cannot resolve at all buys
-//! nothing either. The refusal is answered before any role is resolved and before any
-//! session is minted or handed back, so a session the identity already holds does not
-//! outlive the token it was vended for.
+//! RULE: a token this service mints is a time-bounded credential whose NOMINAL window is
+//! the one the issuance recorded (`TokenDuration` seconds, or the documented 15 minutes for
+//! a request naming none), and the window a PRESENTED token is read against is that instant
+//! plus the clock-skew grace the model asks a caller to allow for: "Please provide for a
+//! small grace period, usually no more than 5 minutes, to account for clock skew"
+//! (`smithy_query(query="doc",shape="GetOpenIdTokenForDeveloperIdentityInput",member="TokenDuration")`).
+//! So presenting a token to `GetCredentialsForIdentity` under this service's own provider
+//! name buys a credential while that extended window is open — a token minted for the
+//! modelled minimum of one second included, and a token presented by a caller whose clock
+//! runs a little ahead of this service's with it — and once the clock has closed it the
+//! exchange is refused with the modelled `NotAuthorizedException` and no credential. A
+//! token this service cannot resolve at all buys nothing either. The refusal is answered
+//! before any role is resolved and before any session is minted or handed back, so a
+//! session the identity already holds does not outlive the token it was vended for.
 //!
-//! Every case asserts that rule over a TABLE of windows — the modelled minimum, windows
-//! the wait below also closes, the window of a request that names none, and the modelled
-//! maximum — rather than one recorded call. The harness is `identity_pool_flow`'s: one
-//! shared engine behind the same `MultiServiceRouter` the production router builds, with
-//! the role a vend assumes seeded into the IAM store of that same engine.
+//! Every case asserts that rule over a TABLE of windows — the modelled minimum, the window
+//! of a request that names none, and the modelled maximum among them — rather than one
+//! recorded call, and each row is read at three instants: inside its nominal window, past
+//! that window but inside the grace, and past the grace.
+//!
+//! Those instants are reached by AGEING the issuance each row is read against — the record
+//! this service keeps of the token it minted, held in the store of this suite's own engine —
+//! and never by waiting for wall-clock time to pass: a grace of minutes cannot be waited
+//! out, and an outcome that depends on how fast the host runs is no assertion at all.
+//! Holding that engine is why this suite stands its emulator up itself instead of borrowing
+//! `identity_pool_flow`'s, which keeps its engine to itself; everything else — the role a
+//! vend assumes, the request bodies — is the sibling suites' own.
 
-// `std::thread::sleep`, not `tokio::time::sleep`: the workspace pins tokio without the
-// `time` feature, and the wait has to pass on the same wall clock the handler reads
-// (`SystemTime::now`) in any case.
-use std::thread::sleep;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
+use service_com_amazonaws_cognitoidentity_awscognitoidentityservice as cognito;
+use smithy_server_runtime::MultiServiceRouter;
 
-use crate::developer_identity_tokens::{pool_with_developer_provider, token_request};
-use crate::identity_pool_flow::{cognito_trust_policy, error_code, seeded_role_arn, Emulator};
+use crate::developer_identity_tokens::token_request;
+use crate::identity_pool_flow::{
+    cognito_trust_policy, error_code, seed_role, seeded_role_arn, DEFAULT_REGION,
+};
 
 /// The operation the window is enforced at.
 const OPERATION: &str = "GetCredentialsForIdentity";
@@ -63,22 +76,112 @@ const NOT_A_COGNITO_TOKEN_MESSAGE: &str = "Invalid login token. Not a Cognito to
 const MIN_TOKEN_SECONDS: i64 = 1;
 const MAX_TOKEN_SECONDS: i64 = 86_400;
 
-/// The longest window this suite waits out, in seconds, and the wait itself: past that
-/// window, with a margin for a loaded test host. Only windows SHORTER than the wait are
-/// expected to have closed when it is over.
-const SHORT_WINDOW_SECONDS: i64 = 2;
-const PAST_THE_SHORT_WINDOWS: Duration = Duration::from_millis(2_500);
+/// The window of a mint that names no `TokenDuration`: "If you don't provide an expiration
+/// time, the token is valid for 15 minutes." (that member's own documentation).
+const DEFAULT_TOKEN_SECONDS: i64 = 900;
 
-/// A pool that names a developer provider AND can vend credentials: its `authenticated`
-/// role is seeded into the IAM store of the same engine and configured on the pool, which
-/// is the shape a pool has to be in for an exchange to be served at all. Answers its
-/// `IdentityPoolId`.
-async fn vending_pool(emulator: &Emulator, name: &str, developer_provider: &str) -> String {
-    let pool_id = pool_with_developer_provider(emulator, name, Some(developer_provider)).await;
-    let authenticated =
-        emulator.seed_role(&seeded_role_arn(name, "auth"), cognito_trust_policy(&pool_id));
-    emulator
-        .ok(
+/// How far past the instant its issuance recorded a presented token is still read as valid:
+/// the longest grace period the `TokenDuration` documentation asks a caller to allow for,
+/// "usually no more than 5 minutes, to account for clock skew". Spelled as a literal so the
+/// behaviour the wire shows is pinned by the test rather than read out of the code under
+/// test.
+const CLOCK_SKEW_GRACE: Duration = Duration::from_secs(300);
+
+/// One emulator holding this service, reached exactly as the production router reaches it,
+/// beside the engine it is mounted on: this suite reads and AGES the issuance records that
+/// engine holds, which is how it drives the clock the window is read against.
+struct Emulator {
+    router: MultiServiceRouter,
+    engine: Arc<engine::InMemoryEngine>,
+}
+
+impl Emulator {
+    fn new() -> Self {
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let mut router = MultiServiceRouter::new();
+        router.register_service(cognito::EmulatedService::new(Arc::clone(&engine)));
+        Self { router, engine }
+    }
+
+    /// Call one operation and answer its HTTP status with the parsed JSON body (`Null` for
+    /// an empty body), as a client calls it: `POST /` with `X-Amz-Target` on `awsJson1_1`.
+    async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
+        let request = http::Request::builder()
+            .method("POST")
+            .uri(format!(
+                "https://cognito-identity.{DEFAULT_REGION}.amazonaws.com/"
+            ))
+            .header("content-type", "application/x-amz-json-1.1")
+            .header(
+                "x-amz-target",
+                format!("AWSCognitoIdentityService.{operation}"),
+            )
+            // The SigV4 credential scope is what routes the request to this service and
+            // names the region its ids are minted in. Signatures are not verified unless
+            // the emulator is started with authentication on.
+            .header(
+                "authorization",
+                format!(
+                    "AWS4-HMAC-SHA256 \
+                     Credential=EMULATORTESTKEY12345/20260101/{DEFAULT_REGION}/cognito-identity/aws4_request, \
+                     SignedHeaders=host;x-amz-target, Signature=0"
+                ),
+            )
+            .body(bytes::Bytes::from(
+                serde_json::to_vec(body).expect("the request body serializes"),
+            ))
+            .expect("the request builds");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let bytes = response.into_body();
+        let parsed = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+                panic!(
+                    "operation {operation} answered a body that is not JSON ({error}): {}",
+                    String::from_utf8_lossy(&bytes)
+                )
+            })
+        };
+        (status, parsed)
+    }
+
+    /// A call that must succeed, answering its output object.
+    async fn ok(&self, operation: &str, body: &Value) -> Value {
+        let (status, parsed) = self.call(operation, body).await;
+        assert_eq!(
+            status, 200,
+            "{operation} on {body} expected HTTP 200, got {status} with {parsed}"
+        );
+        parsed
+    }
+
+    /// A pool that names a developer provider AND can vend credentials: its `authenticated`
+    /// role is seeded into the IAM store of the same engine and configured on the pool,
+    /// which is the shape a pool has to be in for an exchange to be served at all. Answers
+    /// its `IdentityPoolId`.
+    async fn vending_pool(&self, name: &str, developer_provider: &str) -> String {
+        let created = self
+            .ok(
+                "CreateIdentityPool",
+                &json!({
+                    "IdentityPoolName": name,
+                    "AllowUnauthenticatedIdentities": false,
+                    "DeveloperProviderName": developer_provider,
+                }),
+            )
+            .await;
+        let pool_id = created["IdentityPoolId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("CreateIdentityPool answers an IdentityPoolId: {created}"))
+            .to_string();
+        let authenticated = seed_role(
+            &self.engine,
+            &seeded_role_arn(name, "auth"),
+            cognito_trust_policy(&pool_id),
+        );
+        self.ok(
             "SetIdentityPoolRoles",
             &json!({
                 "IdentityPoolId": &pool_id,
@@ -86,45 +189,44 @@ async fn vending_pool(emulator: &Emulator, name: &str, developer_provider: &str)
             }),
         )
         .await;
-    pool_id
-}
+        pool_id
+    }
 
-/// Mint a token for `user` in `pool_id` with the window `token_duration` asks for (none
-/// when it is `None`), and answer the identity it resolved to with the token itself.
-async fn mint(
-    emulator: &Emulator,
-    pool_id: &str,
-    developer_provider: &str,
-    user: &str,
-    token_duration: Option<i64>,
-) -> (String, String) {
-    let answered = emulator
-        .ok(
-            MINT,
-            &token_request(
-                pool_id,
-                &[(developer_provider, user)],
-                None,
-                token_duration,
-            ),
-        )
-        .await;
-    let identity_id = answered["IdentityId"]
-        .as_str()
-        .unwrap_or_else(|| panic!("{MINT} answers an IdentityId: {answered}"))
-        .to_string();
-    let token = answered["Token"]
-        .as_str()
-        .unwrap_or_else(|| panic!("{MINT} answers a Token: {answered}"))
-        .to_string();
-    (identity_id, token)
-}
+    /// Mint a token for `user` in `pool_id` with the window `token_duration` asks for (none
+    /// when it is `None`), and answer the identity it resolved to with the token itself.
+    async fn mint(
+        &self,
+        pool_id: &str,
+        developer_provider: &str,
+        user: &str,
+        token_duration: Option<i64>,
+    ) -> (String, String) {
+        let answered = self
+            .ok(
+                MINT,
+                &token_request(
+                    pool_id,
+                    &[(developer_provider, user)],
+                    None,
+                    token_duration,
+                ),
+            )
+            .await;
+        let identity_id = answered["IdentityId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{MINT} answers an IdentityId: {answered}"))
+            .to_string();
+        let token = answered["Token"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{MINT} answers a Token: {answered}"))
+            .to_string();
+        (identity_id, token)
+    }
 
-/// The exchange itself: `GetCredentialsForIdentity` presenting `token` under this service's
-/// own provider name, as a client spends a minted token.
-async fn exchange(emulator: &Emulator, identity_id: &str, token: &str) -> (u16, Value) {
-    emulator
-        .call(
+    /// The exchange itself: `GetCredentialsForIdentity` presenting `token` under this
+    /// service's own provider name, as a client spends a minted token.
+    async fn exchange(&self, identity_id: &str, token: &str) -> (u16, Value) {
+        self.call(
             OPERATION,
             &json!({
                 "IdentityId": identity_id,
@@ -132,6 +234,71 @@ async fn exchange(emulator: &Emulator, identity_id: &str, token: &str) -> (u16, 
             }),
         )
         .await
+    }
+
+    /// Move the window the recorded issuance of `token` carries BACK by `elapsed`: the
+    /// record is left as it would be had it been minted that much earlier, which is the
+    /// same thing as reading it that much later and needs no wall clock to pass.
+    fn age_issuance(&self, case: &str, token: &str, elapsed: Duration) {
+        let state = cognito::state::service_state(&*self.engine)
+            .expect("this service's store is on this engine");
+        let mut store = state.lock();
+        let issued = store
+            .open_id_tokens
+            .get_mut(token)
+            .unwrap_or_else(|| panic!("case {case:?}: the issuance of a minted token is recorded"));
+        issued.issued_at = issued
+            .issued_at
+            .checked_sub(elapsed)
+            .unwrap_or_else(|| panic!("case {case:?}: the aged issuance instant is representable"));
+        issued.expiration = issued
+            .expiration
+            .checked_sub(elapsed)
+            .unwrap_or_else(|| panic!("case {case:?}: the aged expiration is representable"));
+    }
+
+    /// Record an issuance whose window is the one given, minted the way this service mints
+    /// one, and answer the token itself — a token already past its own window at the instant
+    /// it is recorded, which no mint over the wire can produce (`TokenDuration` is at least
+    /// one second).
+    fn record_issuance(
+        &self,
+        pool_id: &str,
+        identity_id: &str,
+        authenticated_by: &[String],
+        issued_at: SystemTime,
+        expiration: SystemTime,
+    ) -> String {
+        let token = cognito::state::open_id_token(
+            pool_id,
+            identity_id,
+            authenticated_by,
+            issued_at,
+            expiration,
+        );
+        let state = cognito::state::service_state(&*self.engine)
+            .expect("this service's store is on this engine");
+        state.lock().open_id_tokens.insert(
+            token.clone(),
+            cognito::state::IssuedOpenIdToken {
+                identity_id: identity_id.to_string(),
+                identity_pool_id: pool_id.to_string(),
+                issued_at,
+                expiration,
+                authenticated_by: authenticated_by.to_vec(),
+                principal_tags: None,
+            },
+        );
+        token
+    }
+
+    /// Whether the store still holds an issuance for `token`.
+    fn holds_issuance(&self, token: &str) -> bool {
+        let state = cognito::state::service_state(&*self.engine)
+            .expect("this service's store is on this engine");
+        let store = state.lock();
+        store.open_id_tokens.contains_key(token)
+    }
 }
 
 /// The `message` an error response carries.
@@ -179,56 +346,64 @@ fn assert_refused(case: &str, status: u16, body: &Value, message: &str) {
     );
 }
 
-/// RULE: the window a mint records is the window the exchange honours — inside it the
-/// token is spent for a credential, past it the exchange is refused.
+/// The seconds between the `iat` and the `exp` of a token this service minted, read from
+/// the token's own claims: the window the ISSUANCE recorded, which is what the mint answers
+/// for.
+fn claimed_window_seconds(case: &str, token: &str) -> i64 {
+    let read = ::service_common::jwt::read_unsecured(token)
+        .unwrap_or_else(|error| panic!("case {case:?}: a minted token is a compact JWS: {error:?}"));
+    let issued_at = read
+        .numeric_date("iat")
+        .unwrap_or_else(|| panic!("case {case:?}: a minted token carries an iat claim"));
+    let expiration = read
+        .numeric_date("exp")
+        .unwrap_or_else(|| panic!("case {case:?}: a minted token carries an exp claim"));
+    expiration - issued_at
+}
+
+/// RULE: the window a mint records is the NOMINAL window, and the window the exchange reads
+/// a presented token against is that instant plus the documented clock-skew grace — so a
+/// token is spent inside its nominal window, still spent for the grace past it, and refused
+/// only once the grace has closed too.
 #[tokio::test]
-async fn a_minted_token_is_exchanged_only_inside_the_window_its_issuance_recorded() {
+async fn a_minted_token_is_spent_until_the_clock_skew_grace_past_its_window_has_closed() {
     let emulator = Emulator::new();
     let developer_provider = "login.example.com";
-    let pool_id = vending_pool(&emulator, "token-window", developer_provider).await;
-    // One developer user identifier for every row, so re-minting also has to keep
-    // answering the SAME identity.
+    let pool_id = emulator
+        .vending_pool("token-window", developer_provider)
+        .await;
+    // One developer user identifier for every row, so re-minting also has to keep answering
+    // the SAME identity.
     let user = "backend-user-1";
 
-    // The rows differ along the window the mint asks for: each modelled bound, a window the
-    // wait below also closes, the window of a request that names none, and one well past
-    // the wait. The third field says whether the window is still open after the wait; the
-    // fourth says whether the row asserts the SERVED half too — the one-second row does
-    // not, because a mint and an exchange over the wire can take longer than that window on
-    // a loaded host, which would fail the test for its timing rather than for the rule.
-    let rows: Vec<(&str, Option<i64>, bool, bool)> = vec![
+    // The rows differ along the window the mint asks for: each modelled bound, the window of
+    // a request that names none, and windows in between. The second field is what the row
+    // sends as `TokenDuration`; the third is the nominal window it is owed in seconds.
+    let rows: Vec<(&str, Option<i64>, i64)> = vec![
         (
             "the modelled minimum window of one second",
             Some(MIN_TOKEN_SECONDS),
-            false,
-            false,
+            MIN_TOKEN_SECONDS,
         ),
-        (
-            "a window of two seconds",
-            Some(SHORT_WINDOW_SECONDS),
-            false,
-            true,
-        ),
+        ("a window of two seconds", Some(2), 2),
         (
             "no TokenDuration at all: the documented 15-minute default",
             None,
-            true,
-            true,
+            DEFAULT_TOKEN_SECONDS,
         ),
-        ("a window of one hour", Some(3_600), true, true),
+        ("a window of one hour", Some(3_600), 3_600),
         (
             "the modelled maximum window of 86400 seconds",
             Some(MAX_TOKEN_SECONDS),
-            true,
-            true,
+            MAX_TOKEN_SECONDS,
         ),
     ];
 
-    let mut spent: Vec<(&str, String, bool)> = Vec::new();
     let mut identity: Option<String> = None;
-    for (case, token_duration, open_after_the_wait, assert_served) in rows {
-        let (identity_id, token) =
-            mint(&emulator, &pool_id, developer_provider, user, token_duration).await;
+    for (case, token_duration, nominal) in rows {
+        let (identity_id, token) = emulator
+            .mint(&pool_id, developer_provider, user, token_duration)
+            .await;
         match &identity {
             Some(first) => assert_eq!(
                 &identity_id, first,
@@ -238,84 +413,125 @@ async fn a_minted_token_is_exchanged_only_inside_the_window_its_issuance_recorde
             None => identity = Some(identity_id.clone()),
         }
 
-        // Inside its window, whatever window was asked for, the token is spent.
-        if assert_served {
-            let (status, body) = exchange(&emulator, &identity_id, &token).await;
-            assert_eq!(
-                status, 200,
-                "case {case:?}: a token inside its window is exchanged, got {status} with {body}"
-            );
-            assert_served_credentials(case, &identity_id, &body);
-        }
-        spent.push((case, token, open_after_the_wait));
-    }
+        // The mint honours the duration its caller asked for EXACTLY: the grace is a
+        // tolerance the reading adds, never a window the issuance hands out.
+        let claimed = claimed_window_seconds(case, &token);
+        assert_eq!(
+            claimed, nominal,
+            "case {case:?}: the minted token's own window must be {nominal} seconds, got \
+             {claimed}"
+        );
 
-    // Nothing is minted and nothing is configured from here on, so the only thing that
-    // differs between the two halves of every row is the clock.
-    sleep(PAST_THE_SHORT_WINDOWS);
-    let identity_id = identity.expect("the table has rows");
-    for (case, token, open_after_the_wait) in spent {
-        let (status, body) = exchange(&emulator, &identity_id, &token).await;
-        if open_after_the_wait {
-            assert_eq!(
-                status, 200,
-                "case {case:?}: this window is still open, so the exchange is still served, \
-                 got {status} with {body}"
-            );
-            assert_served_credentials(case, &identity_id, &body);
-        } else {
-            assert_refused(case, status, &body, EXPIRED_MESSAGE);
-        }
+        // Inside its nominal window, whatever window was asked for, the token is spent —
+        // the one-second minimum included, which is the shortest window the model admits.
+        let (status, body) = emulator.exchange(&identity_id, &token).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: a token inside its window is exchanged, got {status} with {body}"
+        );
+        assert_served_credentials(case, &identity_id, &body);
+
+        // One second PAST the nominal window, and so inside the grace: still spendable.
+        let nominal_window = Duration::from_secs(u64::try_from(nominal).unwrap_or(0));
+        emulator.age_issuance(case, &token, nominal_window + Duration::from_secs(1));
+        let (status, body) = emulator.exchange(&identity_id, &token).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: a token inside the clock-skew grace past its window is still \
+             exchanged, got {status} with {body}"
+        );
+        assert_served_credentials(case, &identity_id, &body);
+
+        // A further grace on top of that puts the token past the grace as well, and nothing
+        // but the window the record is read against has changed between the two calls.
+        emulator.age_issuance(case, &token, CLOCK_SKEW_GRACE);
+        let (status, body) = emulator.exchange(&identity_id, &token).await;
+        assert_refused(case, status, &body, EXPIRED_MESSAGE);
     }
 }
 
 /// RULE, the same window from the other side: the answer does not depend on whether the
-/// issuance store still HOLDS the record — a token whose window has closed is refused as
-/// the expired token it is even after a later mint has swept that record away.
+/// issuance store still HOLDS the record — a token past its window and the grace is refused
+/// as the expired token it is even after a sweep has forgotten that record, and a token the
+/// grace still covers is neither swept nor refused.
 #[tokio::test]
-async fn a_token_whose_record_has_been_swept_is_still_refused_as_expired() {
+async fn the_sweep_gives_up_what_the_grace_no_longer_covers_and_nothing_else() {
     let emulator = Emulator::new();
     let developer_provider = "login.example.com";
-    let pool_id = vending_pool(&emulator, "token-sweep", developer_provider).await;
+    let pool_id = emulator
+        .vending_pool("token-sweep", developer_provider)
+        .await;
     let user = "backend-user-2";
-
-    // A two-second window, so the exchange made right after the mint is inside it even on
-    // a loaded host, while the wait below still closes it.
-    let (identity_id, short_lived) = mint(
-        &emulator,
-        &pool_id,
-        developer_provider,
-        user,
-        Some(SHORT_WINDOW_SECONDS),
-    )
-    .await;
-    let (status, body) = exchange(&emulator, &identity_id, &short_lived).await;
+    let (identity_id, live) = emulator
+        .mint(&pool_id, developer_provider, user, Some(MAX_TOKEN_SECONDS))
+        .await;
+    let (status, body) = emulator.exchange(&identity_id, &live).await;
     assert_eq!(
         status, 200,
         "a token inside its window is exchanged, got {status} with {body}"
     );
 
-    sleep(PAST_THE_SHORT_WINDOWS);
-    // A later mint is what sweeps the issuances the clock has expired, so this is the call
-    // that makes the first token's record disappear.
-    let (_, fresh) = mint(
-        &emulator,
+    // What the mint records for a developer-authenticated issuance: the provider the login
+    // was made under, and the user that provider authenticated.
+    let authenticated_by = vec![
+        developer_provider.to_string(),
+        format!("{developer_provider}:{pool_id}:{user}"),
+    ];
+    let now = SystemTime::now();
+    // Two issuances the clock has already taken past their nominal window, differing in
+    // whether the grace still covers them: one a second past it, one a minute past the whole
+    // grace.
+    let inside_the_grace = emulator.record_issuance(
         &pool_id,
-        developer_provider,
-        user,
-        Some(MAX_TOKEN_SECONDS),
-    )
-    .await;
-
-    let (status, body) = exchange(&emulator, &identity_id, &short_lived).await;
-    assert_refused(
-        "the swept token, past its window",
-        status,
-        &body,
-        EXPIRED_MESSAGE,
+        &identity_id,
+        &authenticated_by,
+        now - Duration::from_secs(901),
+        now - Duration::from_secs(1),
     );
+    let past_the_grace = emulator.record_issuance(
+        &pool_id,
+        &identity_id,
+        &authenticated_by,
+        now - Duration::from_secs(900) - CLOCK_SKEW_GRACE - Duration::from_secs(60),
+        now - CLOCK_SKEW_GRACE - Duration::from_secs(60),
+    );
+
+    let (status, body) = emulator.exchange(&identity_id, &inside_the_grace).await;
+    assert_eq!(
+        status, 200,
+        "a token the grace still covers is exchanged, got {status} with {body}"
+    );
+    assert_served_credentials("inside the grace", &identity_id, &body);
+    let (status, body) = emulator.exchange(&identity_id, &past_the_grace).await;
+    assert_refused("past the grace", status, &body, EXPIRED_MESSAGE);
+
+    // A mint is what sweeps the issuances the clock has run out on, so this is the call that
+    // decides which records are given up.
+    let (_, fresh) = emulator
+        .mint(&pool_id, developer_provider, user, Some(MAX_TOKEN_SECONDS))
+        .await;
+    assert!(
+        emulator.holds_issuance(&inside_the_grace),
+        "the sweep must keep a record the grace still covers"
+    );
+    assert!(
+        !emulator.holds_issuance(&past_the_grace),
+        "the sweep must give up a record past its window and the grace"
+    );
+
+    // And the answers are the same ones, the swept record included: what decides the
+    // exchange is the window, not whether the store still holds the issuance.
+    let (status, body) = emulator.exchange(&identity_id, &inside_the_grace).await;
+    assert_eq!(
+        status, 200,
+        "a token the grace still covers is exchanged after the sweep too, got {status} with \
+         {body}"
+    );
+    let (status, body) = emulator.exchange(&identity_id, &past_the_grace).await;
+    assert_refused("the swept token", status, &body, EXPIRED_MESSAGE);
+
     // The window of the token minted afterwards is its own, so the sweep costs it nothing.
-    let (status, body) = exchange(&emulator, &identity_id, &fresh).await;
+    let (status, body) = emulator.exchange(&identity_id, &fresh).await;
     assert_eq!(
         status, 200,
         "the freshly minted token is inside its own window, got {status} with {body}"
@@ -351,18 +567,20 @@ fn unsecured_jws(claims: &Value) -> String {
 async fn a_token_this_service_never_issued_buys_no_credential() {
     let emulator = Emulator::new();
     let developer_provider = "login.example.com";
-    let pool_id = vending_pool(&emulator, "token-unknown", developer_provider).await;
+    let pool_id = emulator
+        .vending_pool("token-unknown", developer_provider)
+        .await;
     // The identity exists and holds a credential from a token that WAS issued, so each row
     // below is refused on the token it presents and not on anything else.
-    let (identity_id, issued) = mint(
-        &emulator,
-        &pool_id,
-        developer_provider,
-        "backend-user-3",
-        Some(MAX_TOKEN_SECONDS),
-    )
-    .await;
-    let (status, body) = exchange(&emulator, &identity_id, &issued).await;
+    let (identity_id, issued) = emulator
+        .mint(
+            &pool_id,
+            developer_provider,
+            "backend-user-3",
+            Some(MAX_TOKEN_SECONDS),
+        )
+        .await;
+    let (status, body) = emulator.exchange(&identity_id, &issued).await;
     assert_eq!(
         status, 200,
         "the issued token is exchanged, got {status} with {body}"
@@ -407,13 +625,13 @@ async fn a_token_this_service_never_issued_buys_no_credential() {
     ];
 
     for (case, token, owed) in rows {
-        let (status, body) = exchange(&emulator, &identity_id, &token).await;
+        let (status, body) = emulator.exchange(&identity_id, &token).await;
         assert_refused(case, status, &body, owed);
     }
 
     // The token that WAS issued is untouched by any of it: the refusals decided on the
     // value presented, nothing else.
-    let (status, body) = exchange(&emulator, &identity_id, &issued).await;
+    let (status, body) = emulator.exchange(&identity_id, &issued).await;
     assert_eq!(
         status, 200,
         "the issued token is still exchanged, got {status} with {body}"

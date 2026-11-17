@@ -2053,9 +2053,35 @@ pub struct IssuedOpenIdToken {
 /// recorded itself, which is what makes its validity window readable here.
 pub const COGNITO_IDENTITY_LOGIN_PROVIDER: &str = COGNITO_IDENTITY_PRINCIPAL;
 
+/// How much the window a PRESENTED token is read against extends past the instant its
+/// issuance recorded, to absorb the difference between the caller's clock and this
+/// service's: "Please provide for a small grace period, usually no more than 5 minutes, to
+/// account for clock skew" (`GetOpenIdTokenForDeveloperIdentityInput$TokenDuration`, this
+/// service's model) — five minutes, the longest period that note calls for.
+///
+/// It is a tolerance on the READING side alone: a mint honours the duration its caller asked
+/// for exactly, writing that instant into the issuance and into the token's own `exp` claim,
+/// so a token says when it expires and is then still honoured for the grace past it. Without
+/// it a token minted at the low end of the modelled `TokenDuration` range — one second — is
+/// unusable by the time its caller presents it, and so is any token presented by a caller
+/// whose clock runs ahead of this service's.
+pub const PRESENTED_TOKEN_CLOCK_SKEW_GRACE: Duration = Duration::from_secs(300);
+
+/// Whether the window a presented token is read against is still open: the instant its
+/// issuance recorded, plus [`PRESENTED_TOKEN_CLOCK_SKEW_GRACE`].
+///
+/// A window whose close is past what this platform can represent is one the clock never
+/// reaches, so it counts as open rather than overflowing.
+pub fn presented_token_window_open(expiration: SystemTime, now: SystemTime) -> bool {
+    expiration
+        .checked_add(PRESENTED_TOKEN_CLOCK_SKEW_GRACE)
+        .is_none_or(|closes| closes > now)
+}
+
 /// How AWS words the refusal of a request presenting a token of this service whose validity
 /// window has closed — the window `GetOpenIdToken` / `GetOpenIdTokenForDeveloperIdentity`
-/// recorded when they minted it.
+/// recorded when they minted it, plus the clock-skew grace
+/// ([`PRESENTED_TOKEN_CLOCK_SKEW_GRACE`]) the reading of a presented token adds to it.
 ///
 /// Fixed text with no request- or state-derived part: the caller of a credential exchange
 /// holds no credential yet, so the refusal says that the token's time is up and nothing
@@ -2567,12 +2593,15 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
         revoked
     }
 
-    /// Forget every OpenID Connect token whose validity window has closed. The clock made
-    /// these due: an expired token names nothing, so the sweep runs whenever a token is
-    /// issued and no expired token is held for the life of the process.
+    /// Forget every OpenID Connect token whose validity window has closed — the window a
+    /// presented token is read against, the recorded instant plus the clock-skew grace
+    /// ([`presented_token_window_open`]), so the sweep never takes a record that is still
+    /// being honoured. The clock made these due: a token past that window names nothing, so
+    /// the sweep runs whenever a token is issued and no expired token is held for the life
+    /// of the process.
     pub fn purge_expired_open_id_tokens(&mut self, now: SystemTime) {
         self.open_id_tokens
-            .retain(|_, issued| issued.expiration > now);
+            .retain(|_, issued| presented_token_window_open(issued.expiration, now));
     }
 
     /// Record an issued OpenID Connect token, keeping the store within
@@ -2607,7 +2636,8 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
         self.open_id_tokens.insert(token, issued);
     }
 
-    /// The record of a token this service issued, while its window is still open. `None`
+    /// The record of a token this service issued, while its window is still open — the
+    /// window a presented token is read against ([`presented_token_window_open`]). `None`
     /// for a token this service did not issue, and for one whose window has closed.
     pub fn open_id_token_record(
         &self,
@@ -2616,7 +2646,7 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
     ) -> Option<&IssuedOpenIdToken> {
         self.open_id_tokens
             .get(token)
-            .filter(|issued| issued.expiration > now)
+            .filter(|issued| presented_token_window_open(issued.expiration, now))
     }
 
     /// The issuance a token presented under [`COGNITO_IDENTITY_LOGIN_PROVIDER`] resolves
@@ -2628,16 +2658,23 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
     /// the two are the same window ([`open_id_token`] writes the recorded instants into the
     /// claims): a token whose record a sweep has already forgotten is still answered as the
     /// expired token it is rather than as one this service never issued.
+    ///
+    /// Both readings extend that window by the clock-skew grace
+    /// ([`presented_token_window_open`]), so a token is honoured for a little past the
+    /// instant it says it expires at and the shortest window a mint can be asked for is one
+    /// a caller can actually spend.
     pub fn resolve_login_token(
         &self,
         token: &str,
         now: SystemTime,
     ) -> Result<&IssuedOpenIdToken, LoginTokenRefusal> {
-        if claimed_token_expiration(token).is_some_and(|expiration| expiration <= now) {
+        if claimed_token_expiration(token)
+            .is_some_and(|expiration| !presented_token_window_open(expiration, now))
+        {
             return Err(LoginTokenRefusal::Expired);
         }
         match self.open_id_tokens.get(token) {
-            Some(issued) if issued.expiration > now => Ok(issued),
+            Some(issued) if presented_token_window_open(issued.expiration, now) => Ok(issued),
             Some(_) => Err(LoginTokenRefusal::Expired),
             None => Err(LoginTokenRefusal::Unverifiable),
         }

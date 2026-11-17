@@ -58,6 +58,12 @@
 //! minted FOR one identity, so both its validity window and the identity it stands for are
 //! ones the service recorded and can read: such a token is a time-bounded credential of
 //! that identity, and it is honoured only inside that window and only for that identity.
+//! The window it is read against is the recorded one extended by the clock-skew grace the
+//! `TokenDuration` documentation asks a caller to allow for
+//! (`crate::state::PRESENTED_TOKEN_CLOCK_SKEW_GRACE`), so a token just minted for the
+//! shortest window the model admits is still spendable and a caller whose clock runs ahead
+//! of this service's is not refused for that.
+//!
 //! Both are read before any role is resolved and before any session is minted or handed
 //! back, and a request presenting a token whose window has closed, one this service cannot
 //! resolve at all, or one minted for another identity — the token of another identity pool
