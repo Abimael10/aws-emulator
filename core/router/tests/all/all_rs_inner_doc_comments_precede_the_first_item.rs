@@ -61,8 +61,12 @@ pub(crate) fn opens_an_inner_doc_comment(line: &str) -> bool {
 
 /// Which inner doc comments a class of file is read for — the one way the rule differs
 /// between the two classes of file an `all` target compiles.
+///
+/// Shared with [`super::automod_rooted_suites_keep_their_inner_doc_comments_first`], which
+/// reads the same rule for the files a macro-rooted target compiles, so the two cannot
+/// disagree about which comments break a build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InnerDocComments {
+pub(crate) enum InnerDocComments {
     /// Every inner doc comment, however deeply it is indented. This is the declaration
     /// root's reading, and deliberately the conservative one: a root holds nothing but
     /// comments and `#[path]`/`mod` pairs, so a note indented inside a later item is
@@ -82,7 +86,7 @@ enum InnerDocComments {
 /// line, including inside a multi-line string literal — a file that holds one of those in
 /// column one would be reported though it compiles. Nothing in the tree does, and a
 /// declaration root cannot, so the reader stays as simple as the rule.
-fn misplaced_inner_doc_comments(source: &str, read: InnerDocComments) -> Vec<String> {
+pub(crate) fn misplaced_inner_doc_comments(source: &str, read: InnerDocComments) -> Vec<String> {
     let Some(item_line) = first_item_line(source) else {
         return Vec::new();
     };

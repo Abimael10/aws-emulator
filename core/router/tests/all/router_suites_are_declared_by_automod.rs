@@ -87,7 +87,11 @@ enum Layout {
 /// root — that it holds the one call and nothing else, with no `tests/all.rs` beside it — and
 /// is where that rule is read. This reader answers a different question, for any member of the
 /// workspace: which layout a crate keeps, which is what the classification below is made of.
-fn automod_directory(source: &str) -> Option<&str> {
+///
+/// Shared with [`super::automod_rooted_suites_keep_their_inner_doc_comments_first`], which
+/// walks the directories the calls of a macro-rooted target name to reach the files that
+/// target compiles, so the two agree on what a call declares.
+pub(crate) fn automod_directory(source: &str) -> Option<&str> {
     let mut commented = false;
     for line in source.lines() {
         let code = line.trim_start();

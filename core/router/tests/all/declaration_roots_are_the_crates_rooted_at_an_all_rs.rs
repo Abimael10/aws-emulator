@@ -76,7 +76,11 @@ fn layout_on_disk(crate_dir: &Path) -> Layout {
 
 /// This crate, and each service crate: the crates of the workspace that hold an
 /// integration-test target.
-fn crate_dirs() -> Vec<PathBuf> {
+///
+/// Shared with [`super::automod_rooted_suites_keep_their_inner_doc_comments_first`], which
+/// enumerates the macro-rooted half of the same set, so the two readings are taken over the
+/// same crates.
+pub(crate) fn crate_dirs() -> Vec<PathBuf> {
     let root = workspace_root();
     let services = root.join("services");
     let entries = fs::read_dir(&services)
