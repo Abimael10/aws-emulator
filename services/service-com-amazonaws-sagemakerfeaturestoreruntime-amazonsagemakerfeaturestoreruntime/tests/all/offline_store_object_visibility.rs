@@ -63,6 +63,9 @@ const NOT_DELETED_MARKER: &str = "is_deleted: false";
 /// The event time the seeded record of every case carries.
 const SEEDED_EVENT_TIME: &str = "2026-06-01T07:08:09Z";
 
+/// The partition of the seeded record itself, which the ingested object occupies.
+const SEEDED_PARTITION: &str = "year=2026/month=06/day=01/hour=07";
+
 /// The four services on one shared engine.
 struct Aws {
     router: MultiServiceRouter,
@@ -602,9 +605,6 @@ struct Deletion {
 /// epoch), which stores it is aimed at, and whether the named record was ever ingested.
 #[tokio::test]
 async fn a_deletion_appends_the_deleted_record_marker_to_the_configured_prefix() {
-    // The partition of the seeded record itself, which the ingested object occupies.
-    const SEEDED_PARTITION: &str = "year=2026/month=06/day=01/hour=07";
-
     let rows: [Deletion; 10] = [
         Deletion {
             case: "a defaulted deletion after the record's event time",
@@ -713,7 +713,135 @@ async fn a_deletion_appends_the_deleted_record_marker_to_the_configured_prefix()
         },
     ];
 
-    for row in rows {
+    for row in &rows {
+        assert_deletion(row).await;
+    }
+}
+
+/// RULE: whether a deletion is REFUSED, and so whether anything is written in either store,
+/// is decided from the request and the event time of the record in the OnlineStore alone —
+/// `TargetStores` selects which store an accepted deletion is applied to, never whether it is
+/// allowed. So a `HardDelete` whose `EventTime` is older than the stored record's is answered
+/// `400` and appends no marker whichever stores it names, and an accepted deletion aimed away
+/// from the OnlineStore leaves the online record standing while the marker is still appended.
+///
+/// The rows differ along what the rule generalises over: which stores the deletion names (the
+/// OfflineStore alone, the OnlineStore alone, both named explicitly), where its `EventTime`
+/// falls relative to the record's (before, equal, after) and how it is spelled (ISO-8601,
+/// seconds since the epoch), the deletion MODE (defaulted, explicit `SoftDelete`,
+/// `HardDelete`), and whether the named record was ever ingested.
+#[tokio::test]
+async fn the_event_time_ordering_is_decided_whichever_stores_a_deletion_names() {
+    let rows: [Deletion; 9] = [
+        Deletion {
+            case: "an out-of-order HardDelete aimed at the OfflineStore alone",
+            mode: "&DeletionMode=HardDelete",
+            target_stores: "&TargetStores=OfflineStore",
+            identifier: "C1",
+            event_time: "2026-01-01T00:00:00Z",
+            status: 400,
+            partition: None,
+            online_record_remains: true,
+        },
+        Deletion {
+            case: "an out-of-order HardDelete aimed at the OfflineStore alone, in epoch seconds",
+            mode: "&DeletionMode=HardDelete",
+            target_stores: "&TargetStores=OfflineStore",
+            identifier: "C1",
+            // 2023-11-14T22:13:20Z, which is before the seeded record's event time.
+            event_time: "1700000000",
+            status: 400,
+            partition: None,
+            online_record_remains: true,
+        },
+        Deletion {
+            case: "an out-of-order HardDelete aimed at the OnlineStore alone",
+            mode: "&DeletionMode=HardDelete",
+            target_stores: "&TargetStores=OnlineStore",
+            identifier: "C1",
+            event_time: "2026-01-01T00:00:00Z",
+            status: 400,
+            partition: None,
+            online_record_remains: true,
+        },
+        Deletion {
+            case: "an out-of-order HardDelete naming both stores explicitly",
+            mode: "&DeletionMode=HardDelete",
+            target_stores: "&TargetStores=OfflineStore&TargetStores=OnlineStore",
+            identifier: "C1",
+            event_time: "2026-01-01T00:00:00Z",
+            status: 400,
+            partition: None,
+            online_record_remains: true,
+        },
+        Deletion {
+            case: "an out-of-order SoftDelete aimed at the OfflineStore alone",
+            mode: "&DeletionMode=SoftDelete",
+            target_stores: "&TargetStores=OfflineStore",
+            identifier: "C1",
+            event_time: "2026-01-01T00:00:00Z",
+            // "For SoftDelete, the existing (not deleted) record remains in the OnlineStore,
+            // though the delete record marker is still written to the OfflineStore."
+            status: 200,
+            partition: Some("year=2026/month=01/day=01/hour=00"),
+            online_record_remains: true,
+        },
+        Deletion {
+            case: "an out-of-order defaulted deletion aimed at the OnlineStore alone",
+            mode: "",
+            target_stores: "&TargetStores=OnlineStore",
+            identifier: "C1",
+            event_time: "2026-01-01T00:00:00Z",
+            status: 200,
+            partition: None,
+            online_record_remains: true,
+        },
+        Deletion {
+            case: "a HardDelete at exactly the record's event time, aimed at the OfflineStore \
+                   alone",
+            mode: "&DeletionMode=HardDelete",
+            target_stores: "&TargetStores=OfflineStore",
+            identifier: "C1",
+            event_time: SEEDED_EVENT_TIME,
+            status: 200,
+            partition: Some(SEEDED_PARTITION),
+            online_record_remains: true,
+        },
+        Deletion {
+            case: "a HardDelete after the record's event time, aimed at the OfflineStore alone",
+            mode: "&DeletionMode=HardDelete",
+            target_stores: "&TargetStores=OfflineStore",
+            identifier: "C1",
+            event_time: "2026-06-02T08:00:00Z",
+            status: 200,
+            partition: Some("year=2026/month=06/day=02/hour=08"),
+            online_record_remains: true,
+        },
+        Deletion {
+            case: "an out-of-order HardDelete of a record that was never ingested, aimed at the \
+                   OfflineStore alone",
+            mode: "&DeletionMode=HardDelete",
+            target_stores: "&TargetStores=OfflineStore",
+            identifier: "C9",
+            event_time: "2026-01-01T00:00:00Z",
+            // No record in the OnlineStore orders this deletion against anything, so it is
+            // accepted and the marker appended.
+            status: 200,
+            partition: Some("year=2026/month=01/day=01/hour=00"),
+            online_record_remains: true,
+        },
+    ];
+
+    for row in &rows {
+        assert_deletion(row).await;
+    }
+}
+
+/// Drive one row of a deletion table end to end: create the group with its offline store,
+/// seed the record `C1`, make the deletion the row states, and assert the status it answers,
+/// the marker it appends (or does not) and whether the OnlineStore still serves the record.
+async fn assert_deletion(row: &Deletion) {
+    {
         let case = row.case;
         let bucket = "features-deleted";
         let group = "offlinedeleted";
@@ -762,7 +890,7 @@ async fn a_deletion_appends_the_deleted_record_marker_to_the_configured_prefix()
                 "case {case:?}: expected no marker appended, got {keys:?}"
             );
             assert_online_record(&aws, case, group, row.online_record_remains).await;
-            continue;
+            return;
         };
         assert_eq!(
             keys.len(),

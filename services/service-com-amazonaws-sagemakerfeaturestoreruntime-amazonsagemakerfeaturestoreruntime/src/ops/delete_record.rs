@@ -9,7 +9,9 @@
 //! with the modelled `ValidationError` (400). A deletion is ordered against the stored
 //! record's own `EventTime`: the request's must be the SAME as it or after it, and a
 //! strictly older one does not delete — `SoftDelete` leaves the record standing,
-//! `HardDelete` answers 400 ([`DELETE_EVENT_TIME_OUT_OF_ORDER`]).
+//! `HardDelete` answers 400 ([`DELETE_EVENT_TIME_OUT_OF_ORDER`]). That ordering is decided
+//! whichever stores the request names: `TargetStores` selects which store the deletion is
+//! APPLIED to, not whether the request is allowed.
 //!
 //! The deletion is also APPENDED to the offline store of a group the control plane gave an
 //! `OfflineStoreConfig`, under that group's own `RoleArn`, as the deleted-record marker
@@ -273,17 +275,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and released with the block, before the offline append below is awaited, so no
         // guard is held across an await.
         //
-        // "A list of stores from which you're deleting the record. By default, Feature Store
-        // deletes the record from all of the stores that you're using for the FeatureGroup."
-        // The two stores are decided independently, as an ingestion decides them: the
-        // OnlineStore takes the deletion only when the group HAS one and the request names
-        // it, and the OfflineStore below takes the marker only when the group was created
-        // with an `OfflineStoreConfig` and the request names it.
+        // The ordering DECISION is made here for every deletion of a feature group that HAS
+        // an OnlineStore, whichever stores the request named, and only the online WRITE is
+        // conditioned on "A list of stores from which you're deleting the record. By
+        // default, Feature Store deletes the record from all of the stores that you're using
+        // for the FeatureGroup." The rule is stated over "the EventTime of the existing
+        // record in the OnlineStore", not over the stores a request happens to name, and the
+        // refusal it decides withholds the OFFLINE append too — so a deletion aimed at the
+        // OfflineStore alone is judged exactly as any other, as the sibling `UpdateRecord`
+        // judges its own ordering before its `TargetStores` shortcut. A group with no
+        // OnlineStore holds no record to order against, so there is nothing to compare.
         let refused_out_of_order = {
             let mut refused = false;
-            if crate::state::targets_online_store(input.target_stores.as_ref())
-                && definition.online_store_enabled
-            {
+            if definition.online_store_enabled {
                 let mut store = state.lock();
                 // A feature group that resolves but has taken no record yet has no online
                 // store here, and a record that was never ingested has nothing to remove
@@ -307,15 +311,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             stored_secs.is_some_and(|existing| requested_secs < existing);
                         if out_of_order {
                             refused = hard_delete;
-                        } else if hard_delete {
-                            group.remove_record(&identifier);
-                        } else {
-                            group.soft_delete_record(
-                                &identifier,
-                                &input.event_time,
-                                &definition.record_identifier_feature_name,
-                                &definition.event_time_feature_name,
-                            );
+                        } else if crate::state::targets_online_store(input.target_stores.as_ref())
+                        {
+                            // Only the WRITE is skipped for a deletion the request did not
+                            // aim at this store: the record it leaves standing is the one
+                            // the caller asked to keep online.
+                            if hard_delete {
+                                group.remove_record(&identifier);
+                            } else {
+                                group.soft_delete_record(
+                                    &identifier,
+                                    &input.event_time,
+                                    &definition.record_identifier_feature_name,
+                                    &definition.event_time_feature_name,
+                                );
+                            }
                         }
                     }
                 }
