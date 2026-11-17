@@ -243,7 +243,7 @@ pub fn role_session_arn(role_arn: &str, build_id: &str) -> Option<String> {
         .filter(|name| !name.is_empty())?;
     // The build's own id is `<projectName>:<uuid>`, and the uuid half is what names the
     // session.
-    let uuid = build_id.rsplit(':').next().unwrap_or(build_id);
+    let uuid = super::uuid_half(build_id);
     Some(format!(
         "arn:{}:sts::{}:assumed-role/{role_name}/{SESSION_NAME_PREFIX}{uuid}",
         parsed.partition, parsed.account

@@ -23,7 +23,10 @@
 //!
 //! AWS states the composition itself: "if path is set to MyArtifacts, namespaceType is set
 //! to BUILD_ID, and name is set to MyArtifact.zip, then the output artifact is stored in
-//! MyArtifacts/<build-ID>/MyArtifact.zip".
+//! MyArtifacts/<build-ID>/MyArtifact.zip". The build the namespace names is named by its
+//! own half of its id ([`super::uuid_half`]), the same half that names the stream its log
+//! went to and the session its calls were made as — a build's id also carries the project
+//! it belongs to, and the project is not part of where its output goes.
 //!
 //! An upload the build could not make is not reported as one it made: the phase ends in the
 //! client error CodeBuild reports for it — the buildspec declaring no artifact file at all,
@@ -113,7 +116,10 @@ pub fn destination_of(artifacts: &ProjectArtifacts, build_id: &str) -> Option<Ar
         .namespace_type
         .as_deref()
         .filter(|namespace| *namespace == NAMESPACE_TYPE_BUILD_ID)
-        .map(|_| build_id)
+        // The build in the artifact's location is the build itself, which is the uuid half
+        // of its id: the other half names the project the build belongs to, which the
+        // destination already addresses through its own members.
+        .map(|_| super::uuid_half(build_id))
         .unwrap_or_default();
     let name = artifacts
         .name
@@ -335,9 +341,19 @@ mod tests {
         }
     }
 
+    /// The id of the build the rows below compose a destination for: the
+    /// `<projectName>:<uuid>` pair this service mints for every build
+    /// ([`super::super::build_uuid`]), whose uuid half identifies the build itself.
+    const BUILD_ID: &str = "a-project:11111111-2222-3333-4444-555555555555";
+
+    /// The half of [`BUILD_ID`] that names the build itself, which is the segment a
+    /// destination asking for the build's namespace composes through.
+    const BUILD_UUID: &str = "11111111-2222-3333-4444-555555555555";
+
     /// RULE: an artifact's key is the destination's `path`, namespace and `name` composed
     /// in that order under the bucket its `location` names, with the parts that name
-    /// nothing left out.
+    /// nothing left out; the namespace a destination asks the build for is the build's own
+    /// half of its id, never the project half it also carries.
     ///
     /// The rows differ along what the rule generalises over: which of the three parts the
     /// destination states, whether the location carries a prefix, which namespace type it
@@ -374,9 +390,20 @@ mod tests {
                 ),
                 Some((
                     "out-bucket",
-                    "MyArtifacts/proj:a-build-id/MyArtifact.zip",
+                    "MyArtifacts/11111111-2222-3333-4444-555555555555/MyArtifact.zip",
                     true,
                 )),
+            ),
+            (
+                "the build id in the namespace, under nothing else",
+                artifacts(
+                    "out-bucket",
+                    None,
+                    Some(NAMESPACE_TYPE_BUILD_ID),
+                    None,
+                    None,
+                ),
+                Some(("out-bucket", BUILD_UUID, false)),
             ),
             (
                 "a namespace type that includes nothing",
@@ -408,7 +435,7 @@ mod tests {
             ),
         ];
         for (case, artifacts, expected) in rows {
-            let destination = destination_of(&artifacts, "proj:a-build-id");
+            let destination = destination_of(&artifacts, BUILD_ID);
             let read = destination
                 .as_ref()
                 .map(|destination| {

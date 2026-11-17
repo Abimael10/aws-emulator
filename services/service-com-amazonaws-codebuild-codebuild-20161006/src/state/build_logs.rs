@@ -14,9 +14,9 @@
 //!   otherwise the group CodeBuild creates for the project it belongs to
 //!   ([`DEFAULT_GROUP_PREFIX`]);
 //! * `CloudWatchLogsConfig$streamName` is "the PREFIX of the stream name", not the stream, so
-//!   the stream one build wrote is that prefix followed by the build's own id — and the id
-//!   alone when the configuration names no prefix. Two builds of one project therefore never
-//!   report the same stream.
+//!   the stream one build wrote is that prefix followed by the build's own half of its id
+//!   ([`super::uuid_half`]) — and that half alone when the configuration names no prefix. Two
+//!   builds of one project therefore never report the same stream.
 //! * `LogsLocation$cloudWatchLogsArn` states its own format
 //!   (`arn:${Partition}:logs:${Region}:${Account}:log-group:${LogGroupName}:log-stream:${LogStreamName}`),
 //!   so it is composed from the two names above rather than stated separately.
@@ -102,7 +102,7 @@ fn effective_s3_logs(config: Option<&LogsConfig>) -> S3LogsConfig {
 /// uuid half is what names the stream — the same half the session a build assumes its role
 /// in is named after.
 fn stream_name(configured_prefix: Option<&str>, build_id: &str) -> String {
-    let uuid = build_id.rsplit(':').next().unwrap_or(build_id);
+    let uuid = super::uuid_half(build_id);
     match configured_prefix.map(str::trim).filter(|p| !p.is_empty()) {
         Some(prefix) => format!("{}/{uuid}", prefix.trim_end_matches('/')),
         None => uuid.to_string(),

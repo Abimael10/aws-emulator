@@ -3192,6 +3192,19 @@ pub fn build_uuid(project_name: &str, build_number: i64, start_millis: i64) -> S
     derived_uuid("build", project_name, build_number, start_millis)
 }
 
+/// The UUID HALF of one of this service's `<name>:<uuid>` identifiers — the whole value
+/// when it carries no name half to drop.
+///
+/// A build's id is the `<projectName>:<uuid>` pair [`build_uuid`] mints, and the half that
+/// identifies the build ITSELF is what every resource named after a build is named with:
+/// the log stream its output is delivered to ([`build_logs_location`]), the role session
+/// its calls are made as ([`role_session_arn`]) and the namespace its output artifacts are
+/// stored under ([`destination_of`]). One reader for all of them, so the half they name
+/// cannot drift apart.
+pub fn uuid_half(id: &str) -> &str {
+    id.rsplit_once(':').map_or(id, |(_, uuid)| uuid)
+}
+
 /// A batch build's unique identifier — the UUID AWS puts after `<projectName>:`.
 ///
 /// [`build_uuid`]'s derivation, in its own namespace: the digest is taken over a
