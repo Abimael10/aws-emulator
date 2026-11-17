@@ -53,6 +53,7 @@ use std::time::Duration;
 
 pub mod export;
 mod ecs_analysis;
+mod ecs_recommendations;
 mod volumes;
 mod instances;
 mod licenses;
@@ -78,6 +79,7 @@ pub use licenses::*;
 pub use instances::*;
 pub use volumes::*;
 pub use ecs_analysis::*;
+pub use ecs_recommendations::*;
 
 use ::aws_smithy_types::DateTime;
 use ::service_com_amazonaws_cloudwatch_graniteserviceversion20100801 as cloudwatch;

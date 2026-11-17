@@ -27,15 +27,28 @@
 //! Every row differs along what that rule generalises over: the observed utilization, the
 //! current task size and the form it is registered in, how many tasks the service keeps
 //! running, the look-back period in force, and which analysis input is missing.
+//!
+//! The last suites here pin the same rule through the OTHER surface that serves these
+//! recommendations, `ExportECSServiceRecommendations`: the file an export job writes holds one
+//! row per recommendation this reader reports at that moment, each cell the value the reader
+//! reports for the member its `ExportableECSServiceField` column names — so the reader is the
+//! oracle for the file as well, and no row of it is of a service the reader reports nothing
+//! for. (The export's job record, destination keys, lifecycle and refusals are
+//! `ecs_service_recommendations_export.rs`.)
 
 use std::sync::Arc;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_computeoptimizer_computeoptimizerservice::ops::types::EXPORTABLE_E_C_S_SERVICE_FIELD_VALUES;
+use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
+    EXPORT_JOB_STEP, JOB_STATUS_COMPLETE, RESOURCE_TYPE_ECS_SERVICE,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
-    call, call_ecs, call_in_region, emulator_with_analysed_services,
-    emulator_with_analysed_services_and_engine, error_code, opt_in, seed_cloudwatch_series, REGION,
+    call, call_ecs, call_in_region, cell, create_bucket, csv_rows,
+    emulator_with_analysed_services, emulator_with_analysed_services_and_engine, error_code,
+    export_destination, get_object, opt_in, seed_cloudwatch_series, REGION,
 };
 
 /// The account id every ARN the emulator mints carries.
@@ -1463,4 +1476,847 @@ fn round2(value: f64) -> f64 {
 /// `recommended` capacity: the same share of the task in whole units, and never nothing.
 fn scaled(reserved: f64, current: f64, recommended: f64) -> i64 {
     ((reserved * recommended / current).round() as i64).max(1)
+}
+
+// ---------------------------------------------------------------------------
+// The EXPORT of these recommendations: `ExportECSServiceRecommendations` writes a file of the
+// recommendations this reader reports, so the reader is the oracle for every row and every
+// cell of it.
+// ---------------------------------------------------------------------------
+
+/// The export operation these suites drive.
+const EXPORT: &str = "ExportECSServiceRecommendations";
+
+/// The destination bucket the export fixtures write to. Compute Optimizer does not create it,
+/// so each fixture creates it through Amazon S3 first.
+const EXPORT_BUCKET: &str = "ecs-service-recommendation-export-files";
+
+/// The cluster the exported services run in.
+const EXPORT_CLUSTER: &str = "exports";
+
+/// How a cell holding several values separates them in the export file, so one exportable
+/// field is still one column. AWS publishes no layout for the file, so this is the emulator's
+/// own, asserted here as what a client reading the file sees.
+const LIST_SEPARATOR: &str = "|";
+
+/// The column whose cell states an instant rather than text.
+const TIMESTAMP_COLUMN: &str = "LastRefreshTimestamp";
+
+/// The one `ExportableECSServiceField` that names a member of an `ECSServiceRecommendation`
+/// this analysis records no value for: whether a target-tracking policy scales the service
+/// lives in Application Auto Scaling, which the analysis does not read, so the reader reports
+/// no `autoScalingConfiguration` and the column is empty in every row.
+const UNRECORDED_COLUMN: &str = "CurrentServiceConfigurationAutoScalingConfiguration";
+
+/// The Amazon ECS service of the findings catalog this crate seeds: a service of no ECS store,
+/// which `GetECSServiceRecommendations` therefore reports no recommendation for — so no row of
+/// an export file is of it either.
+fn catalog_only_service_arn() -> String {
+    format!("arn:aws:ecs:{REGION}:{ACCOUNT}:service/payments/checkout")
+}
+
+/// One Amazon ECS service of the export corpus: what it runs and what was observed on it.
+struct ExportedService {
+    service: &'static str,
+    /// Its ECS launch type — only a Fargate service is one Compute Optimizer analyses.
+    launch_type: &'static str,
+    /// The task definition's task-level `cpu`/`memory`, in the form it is registered with.
+    cpu: &'static str,
+    memory: &'static str,
+    desired_count: i64,
+    /// The `CPUUtilization` and `MemoryUtilization` observations published for it, as per
+    /// cent; empty for a service nothing was published for.
+    cpu_values: &'static [f64],
+    memory_values: &'static [f64],
+}
+
+/// The Amazon ECS services the export fixtures hold, spanning what the rule generalises over:
+/// a service the analysis would size DOWN (so its option saves money), one already at the
+/// smallest sufficient task size, one it would size UP (so its option saves nothing), one
+/// Compute Optimizer does not support, and one the analysis has no observation for.
+fn exported_services() -> Vec<ExportedService> {
+    vec![
+        ExportedService {
+            service: "overprovisioned",
+            launch_type: "FARGATE",
+            cpu: "1024",
+            memory: "2048",
+            desired_count: 2,
+            cpu_values: &[20.0, 40.0],
+            memory_values: &[30.0, 40.0],
+        },
+        ExportedService {
+            service: "optimized",
+            launch_type: "FARGATE",
+            cpu: "256",
+            memory: "512",
+            desired_count: 1,
+            cpu_values: &[50.0, 70.0],
+            memory_values: &[60.0, 70.0],
+        },
+        ExportedService {
+            service: "underprovisioned",
+            launch_type: "FARGATE",
+            // Registered in the `vCPU`/`GB` string forms, which the analysis reads as 512 CPU
+            // units and 1024 MiB.
+            cpu: "0.5 vCPU",
+            memory: "1GB",
+            desired_count: 3,
+            cpu_values: &[90.0, 99.0],
+            memory_values: &[95.0, 99.0],
+        },
+        ExportedService {
+            service: "ec2based",
+            launch_type: "EC2",
+            cpu: "512",
+            memory: "1024",
+            desired_count: 1,
+            cpu_values: &[40.0, 50.0],
+            memory_values: &[40.0, 50.0],
+        },
+        ExportedService {
+            service: "unobserved",
+            launch_type: "FARGATE",
+            cpu: "512",
+            memory: "1024",
+            desired_count: 1,
+            cpu_values: &[],
+            memory_values: &[],
+        },
+    ]
+}
+
+/// An emulator holding [`exported_services`] in the Amazon ECS store with their utilization in
+/// the CloudWatch store, the destination bucket created through Amazon S3 and the account
+/// opted in — everything an export of these recommendations needs, created the way a client
+/// creates it.
+async fn export_emulator(case: &str) -> MultiServiceRouter {
+    let (router, engine) = emulator_with_analysed_services_and_engine();
+    opt_in(&router).await;
+    create_bucket(&router, EXPORT_BUCKET).await;
+    create_cluster(&router, EXPORT_CLUSTER, case).await;
+    let published_at = now_secs() - 3_600;
+    for service in exported_services() {
+        let family = format!("{}family", service.service);
+        register_task_definition(&router, &family, service.cpu, service.memory, case).await;
+        create_service(
+            &router,
+            EXPORT_CLUSTER,
+            service.service,
+            &family,
+            service.launch_type,
+            service.desired_count,
+            case,
+        )
+        .await;
+        for (metric, values) in [
+            (CPU_METRIC, service.cpu_values),
+            (MEMORY_METRIC, service.memory_values),
+        ] {
+            if !values.is_empty() {
+                publish(
+                    &engine,
+                    EXPORT_CLUSTER,
+                    service.service,
+                    metric,
+                    values,
+                    published_at,
+                );
+            }
+        }
+    }
+    router
+}
+
+/// The recommendations the reader reports, in the order it reports them: the oracle every
+/// expected cell below is derived from.
+async fn reader_recommendations(router: &MultiServiceRouter, case: &str) -> Vec<Value> {
+    let (status, body) = call(router, "GetECSServiceRecommendations", json!({})).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: reading the recommendations: got {status}: {body}"
+    );
+    assert!(
+        body["nextToken"].is_null(),
+        "case {case:?}: the analysis fits one page, got {body}"
+    );
+    let reported = list(&body, "ecsServiceRecommendations", case);
+    assert!(
+        reported.len() > 1,
+        "case {case:?}: the corpus holds several analysed services, got {body}"
+    );
+    reported
+}
+
+/// Export the account's Amazon ECS service recommendations, asserting the call was accepted,
+/// and answer the whole response body.
+async fn export_ok(router: &MultiServiceRouter, case: &str, request: Value) -> Value {
+    let (status, body) = call(router, EXPORT, request.clone()).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected {request} to be accepted, got {status}: {body}"
+    );
+    body
+}
+
+/// Poll the job to `Complete`, the documented export-then-download workflow: the objects
+/// appear when the job REACHES its terminal status, and nothing here waits a fixed time for
+/// it.
+async fn polled_to_complete(router: &MultiServiceRouter, case: &str, job_id: &str) {
+    let mut status = String::new();
+    for _ in 0..200 {
+        let (code, body) = call(
+            router,
+            "DescribeRecommendationExportJobs",
+            json!({"jobIds": [job_id]}),
+        )
+        .await;
+        assert_eq!(code, 200, "case {case:?}: reading job {job_id}: got {body}");
+        let job = &body["recommendationExportJobs"][0];
+        status = job["status"].as_str().unwrap_or_default().to_string();
+        if status == JOB_STATUS_COMPLETE {
+            assert!(
+                job["failureReason"].is_null(),
+                "case {case:?}: a completed export carries no failure reason, got {job}"
+            );
+            return;
+        }
+        tokio::time::sleep(EXPORT_JOB_STEP).await;
+    }
+    panic!("case {case:?}: the job never completed, last status {status:?}");
+}
+
+/// Download one object, asserting it was readable, and answer it as text.
+async fn downloaded(router: &MultiServiceRouter, case: &str, bucket: &str, key: &str) -> String {
+    let (status, body) = get_object(router, bucket, key).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: downloading {key}: got {status}: {}",
+        String::from_utf8_lossy(&body)
+    );
+    String::from_utf8(body)
+        .unwrap_or_else(|error| panic!("case {case:?}: the object is text: {error}"))
+}
+
+/// Export with `fields`, wait for the job and answer the file's rows: the header row and one
+/// row per recommendation.
+async fn exported_rows(
+    router: &MultiServiceRouter,
+    case: &str,
+    fields: Option<&[&str]>,
+) -> Vec<Vec<String>> {
+    let mut request = json!({"s3DestinationConfig": {"bucket": EXPORT_BUCKET, "keyPrefix": "ecs"}});
+    if let Some(fields) = fields {
+        request["fieldsToExport"] = json!(fields);
+    }
+    let body = export_ok(router, case, request).await;
+    let job_id = body["jobId"].as_str().unwrap_or_default().to_string();
+    let (bucket, key, _) = export_destination(case, &body);
+    polled_to_complete(router, case, &job_id).await;
+    csv_rows(&downloaded(router, case, &bucket, &key).await)
+}
+
+/// A string member of a reported recommendation, or the empty cell where it reports none.
+fn text(reported: &Value, member: &str) -> String {
+    reported[member].as_str().unwrap_or_default().to_string()
+}
+
+/// A figure as the export file states it: at the two decimal places every figure this service
+/// reports is rounded to; the empty cell for a member the recommendation does not report.
+fn number_cell(value: Option<f64>) -> String {
+    value.map_or_else(String::new, |value| round2(value).to_string())
+}
+
+/// A list-valued member as one cell ([`LIST_SEPARATOR`]).
+fn list_cell(reported: &Value) -> String {
+    reported
+        .as_array()
+        .map(|values| {
+            values
+                .iter()
+                .map(|value| value.as_str().unwrap_or_default().to_string())
+                .collect::<Vec<String>>()
+                .join(LIST_SEPARATOR)
+        })
+        .unwrap_or_default()
+}
+
+/// The tags a recommendation reports as one cell, each as `key=value`.
+fn tags_cell(reported: &Value) -> String {
+    reported
+        .as_array()
+        .map(|tags| {
+            tags.iter()
+                .map(|tag| {
+                    format!(
+                        "{}={}",
+                        tag["key"].as_str().unwrap_or_default(),
+                        tag["value"].as_str().unwrap_or_default()
+                    )
+                })
+                .collect::<Vec<String>>()
+                .join(LIST_SEPARATOR)
+        })
+        .unwrap_or_default()
+}
+
+/// A list of containers — the task definition's own, or the ones the recommendation option
+/// would run — as one cell: each container's name and the reservations it carries, under the
+/// member names the model gives them.
+fn containers_cell(reported: &Value) -> String {
+    reported
+        .as_array()
+        .map(|containers| {
+            containers
+                .iter()
+                .map(container_cell)
+                .collect::<Vec<String>>()
+                .join(LIST_SEPARATOR)
+        })
+        .unwrap_or_default()
+}
+
+/// One container of such a list.
+fn container_cell(container: &Value) -> String {
+    let mut reservations: Vec<String> = Vec::new();
+    if let Some(cpu) = container["cpu"].as_i64() {
+        reservations.push(format!("cpu={cpu}"));
+    }
+    let memory = &container["memorySizeConfiguration"];
+    if let Some(value) = memory["memory"].as_i64() {
+        reservations.push(format!("memory={value}"));
+    }
+    if let Some(value) = memory["memoryReservation"].as_i64() {
+        reservations.push(format!("memoryReservation={value}"));
+    }
+    let name = container["containerName"].as_str().unwrap_or_default();
+    if reservations.is_empty() {
+        return name.to_string();
+    }
+    format!("{name}:{}", reservations.join(";"))
+}
+
+/// The value the reader reports for one named statistic of one named series of a metric list.
+fn reported_metric(metrics: &Value, name: &str, statistic: &str, member: &str) -> Option<f64> {
+    metrics
+        .as_array()?
+        .iter()
+        .find(|metric| {
+            metric["name"].as_str() == Some(name) && metric["statistic"].as_str() == Some(statistic)
+        })
+        .and_then(|metric| metric[member].as_f64())
+}
+
+/// The cell the export file must carry under `column` for the recommendation the READER
+/// reports — the whole expectation for a row, derived from the reader's own answer.
+///
+/// Every value of `ExportableECSServiceField` is covered (`smithy_query query="shape"
+/// shape="ExportableECSServiceField"`); the timestamp column is compared as an instant by the
+/// caller.
+fn expected_cell(column: &str, reported: &Value) -> String {
+    let configuration = &reported["currentServiceConfiguration"];
+    let option = &reported["serviceRecommendationOptions"][0];
+    let preferences = &reported["effectiveRecommendationPreferences"];
+    let savings = &option["savingsOpportunity"];
+    let after = &option["savingsOpportunityAfterDiscounts"];
+    match column {
+        "AccountId" => text(reported, "accountId"),
+        "ServiceArn" => text(reported, "serviceArn"),
+        "LaunchType" => text(reported, "launchType"),
+        "Finding" => text(reported, "finding"),
+        "FindingReasonCodes" => list_cell(&reported["findingReasonCodes"]),
+        "CurrentPerformanceRisk" => text(reported, "currentPerformanceRisk"),
+        "LookbackPeriodInDays" => number_cell(reported["lookbackPeriodInDays"].as_f64()),
+        "Tags" => tags_cell(&reported["tags"]),
+        // The configuration of the current service.
+        "CurrentServiceConfigurationCpu" => number_cell(configuration["cpu"].as_f64()),
+        "CurrentServiceConfigurationMemory" => number_cell(configuration["memory"].as_f64()),
+        "CurrentServiceConfigurationTaskDefinitionArn" => {
+            text(configuration, "taskDefinitionArn")
+        }
+        UNRECORDED_COLUMN => text(configuration, "autoScalingConfiguration"),
+        "CurrentServiceContainerConfigurations" => {
+            containers_cell(&configuration["containerConfigurations"])
+        }
+        // The utilization observed on it, under the statistic the column names.
+        "UtilizationMetricsCpuMaximum" => number_cell(reported_metric(
+            &reported["utilizationMetrics"],
+            "Cpu",
+            "Maximum",
+            "value",
+        )),
+        "UtilizationMetricsMemoryMaximum" => number_cell(reported_metric(
+            &reported["utilizationMetrics"],
+            "Memory",
+            "Maximum",
+            "value",
+        )),
+        // The recommendation option: the task size, its projection, its containers and what
+        // adopting it saves.
+        "RecommendationOptionsCpu" => number_cell(option["cpu"].as_f64()),
+        "RecommendationOptionsMemory" => number_cell(option["memory"].as_f64()),
+        "RecommendationOptionsProjectedUtilizationMetricsCpuMaximum" => {
+            number_cell(reported_metric(
+                &option["projectedUtilizationMetrics"],
+                "Cpu",
+                "Maximum",
+                "upperBoundValue",
+            ))
+        }
+        "RecommendationOptionsProjectedUtilizationMetricsMemoryMaximum" => {
+            number_cell(reported_metric(
+                &option["projectedUtilizationMetrics"],
+                "Memory",
+                "Maximum",
+                "upperBoundValue",
+            ))
+        }
+        "RecommendationOptionsContainerRecommendations" => {
+            containers_cell(&option["containerRecommendations"])
+        }
+        "RecommendationOptionsSavingsOpportunityPercentage" => {
+            number_cell(savings["savingsOpportunityPercentage"].as_f64())
+        }
+        "RecommendationOptionsEstimatedMonthlySavingsCurrency" => {
+            text(&savings["estimatedMonthlySavings"], "currency")
+        }
+        "RecommendationOptionsEstimatedMonthlySavingsValue" => {
+            number_cell(savings["estimatedMonthlySavings"]["value"].as_f64())
+        }
+        "RecommendationOptionsSavingsOpportunityAfterDiscountsPercentage" => {
+            number_cell(after["savingsOpportunityPercentage"].as_f64())
+        }
+        "RecommendationOptionsEstimatedMonthlySavingsCurrencyAfterDiscounts" => {
+            text(&after["estimatedMonthlySavings"], "currency")
+        }
+        "RecommendationOptionsEstimatedMonthlySavingsValueAfterDiscounts" => {
+            number_cell(after["estimatedMonthlySavings"]["value"].as_f64())
+        }
+        // The preferences the recommendation says it was generated under.
+        "EffectiveRecommendationPreferencesLookBackPeriod" => text(preferences, "lookBackPeriod"),
+        "EffectiveRecommendationPreferencesSavingsEstimationMode" => {
+            text(&preferences["savingsEstimationMode"], "source")
+        }
+        column => panic!("column {column:?} is not covered by this expectation"),
+    }
+}
+
+/// The instant one cell of the timestamp column states, as a count of whole milliseconds —
+/// `None` for a cell that states no instant at all.
+///
+/// The file states the instant in RFC 3339 while a modelled timestamp crosses the wire as a
+/// JSON number, so both sides are compared at the millisecond resolution an AWS JSON timestamp
+/// states.
+fn stated_millis(cell: &str) -> Option<i64> {
+    let at = ::aws_smithy_types::DateTime::from_str(
+        cell,
+        ::aws_smithy_types::date_time::Format::DateTime,
+    )
+    .ok()?;
+    Some(
+        at.secs()
+            .saturating_mul(1_000)
+            .saturating_add(i64::from(at.subsec_nanos() / 1_000_000)),
+    )
+}
+
+/// Every field the model declares has an expectation above — a field the model adds fails here
+/// rather than going unasserted — and a recommendation reporting nothing has an empty cell
+/// under each of them.
+#[test]
+fn the_export_expectation_covers_every_modelled_field() {
+    for field in EXPORTABLE_E_C_S_SERVICE_FIELD_VALUES {
+        if *field == TIMESTAMP_COLUMN {
+            continue;
+        }
+        let expected = expected_cell(field, &json!({}));
+        assert!(
+            expected.is_empty(),
+            "field {field:?}: a recommendation reporting nothing has an empty cell, got \
+             {expected:?}"
+        );
+    }
+}
+
+/// The export file holds the recommendations `GetECSServiceRecommendations` reports for the
+/// same account at the same moment: one row per recommendation, in the order the reader
+/// reports them, every cell the value the reader reports for the `ExportableECSServiceField`
+/// naming that column — and the header is exactly the fields the request asked for, or the
+/// whole modelled field set when it asked for none. One row per field selection.
+#[tokio::test]
+async fn the_export_file_holds_what_the_ecs_service_reader_reports() {
+    let every_field: Vec<&str> = EXPORTABLE_E_C_S_SERVICE_FIELD_VALUES.to_vec();
+
+    // (case, the `fieldsToExport` the request carries, the columns the file must then carry)
+    type Selection = (&'static str, Option<Vec<&'static str>>, Vec<&'static str>);
+    let selections: Vec<Selection> = vec![
+        (
+            "the service and its finding",
+            Some(vec![
+                "AccountId",
+                "ServiceArn",
+                "LaunchType",
+                "Finding",
+                "FindingReasonCodes",
+                "CurrentPerformanceRisk",
+            ]),
+            vec![
+                "AccountId",
+                "ServiceArn",
+                "LaunchType",
+                "Finding",
+                "FindingReasonCodes",
+                "CurrentPerformanceRisk",
+            ],
+        ),
+        (
+            "the current task size, its containers and its tags, in the request's own order",
+            Some(vec![
+                "Tags",
+                "CurrentServiceContainerConfigurations",
+                "CurrentServiceConfigurationTaskDefinitionArn",
+                "CurrentServiceConfigurationMemory",
+                "CurrentServiceConfigurationCpu",
+                UNRECORDED_COLUMN,
+                "ServiceArn",
+            ]),
+            vec![
+                "Tags",
+                "CurrentServiceContainerConfigurations",
+                "CurrentServiceConfigurationTaskDefinitionArn",
+                "CurrentServiceConfigurationMemory",
+                "CurrentServiceConfigurationCpu",
+                UNRECORDED_COLUMN,
+                "ServiceArn",
+            ],
+        ),
+        (
+            // A field asked for twice is one column, so neither the file nor the work of
+            // building it grows with a list that repeats.
+            "the option, its savings and its containers, one field asked for twice",
+            Some(vec![
+                "ServiceArn",
+                "RecommendationOptionsCpu",
+                "RecommendationOptionsMemory",
+                "RecommendationOptionsSavingsOpportunityPercentage",
+                "RecommendationOptionsEstimatedMonthlySavingsCurrency",
+                "RecommendationOptionsEstimatedMonthlySavingsValue",
+                "RecommendationOptionsContainerRecommendations",
+                "ServiceArn",
+            ]),
+            vec![
+                "ServiceArn",
+                "RecommendationOptionsCpu",
+                "RecommendationOptionsMemory",
+                "RecommendationOptionsSavingsOpportunityPercentage",
+                "RecommendationOptionsEstimatedMonthlySavingsCurrency",
+                "RecommendationOptionsEstimatedMonthlySavingsValue",
+                "RecommendationOptionsContainerRecommendations",
+            ],
+        ),
+        (
+            "the utilization columns, the projection, the preferences and the instant",
+            Some(vec![
+                "ServiceArn",
+                "UtilizationMetricsCpuMaximum",
+                "UtilizationMetricsMemoryMaximum",
+                "RecommendationOptionsProjectedUtilizationMetricsCpuMaximum",
+                "RecommendationOptionsProjectedUtilizationMetricsMemoryMaximum",
+                "LookbackPeriodInDays",
+                "EffectiveRecommendationPreferencesLookBackPeriod",
+                "EffectiveRecommendationPreferencesSavingsEstimationMode",
+                TIMESTAMP_COLUMN,
+            ]),
+            vec![
+                "ServiceArn",
+                "UtilizationMetricsCpuMaximum",
+                "UtilizationMetricsMemoryMaximum",
+                "RecommendationOptionsProjectedUtilizationMetricsCpuMaximum",
+                "RecommendationOptionsProjectedUtilizationMetricsMemoryMaximum",
+                "LookbackPeriodInDays",
+                "EffectiveRecommendationPreferencesLookBackPeriod",
+                "EffectiveRecommendationPreferencesSavingsEstimationMode",
+                TIMESTAMP_COLUMN,
+            ],
+        ),
+        (
+            // A request that selects no field gets every field the model declares for the
+            // resource type (`ExportableECSServiceField`).
+            "no field selection at all",
+            None,
+            every_field,
+        ),
+    ];
+
+    for (case, fields, columns) in selections {
+        // A fresh emulator per row: one Amazon ECS service export job is in progress per
+        // Region at a time, so each row gets its own store rather than waiting on the previous
+        // row's job.
+        let router = export_emulator(case).await;
+        let reported = reader_recommendations(&router, case).await;
+
+        let rows = exported_rows(&router, case, fields.as_deref()).await;
+        let header = rows.first().cloned().unwrap_or_default();
+        assert_eq!(
+            header, columns,
+            "case {case:?}: the header row is the fields the request asked for, got {rows:?}"
+        );
+        let data = rows.get(1..).unwrap_or_default();
+        assert_eq!(
+            data.len(),
+            reported.len(),
+            "case {case:?}: expected one row per reported recommendation ({}), got {data:?}",
+            reported.len()
+        );
+
+        for (row, recommendation) in data.iter().zip(&reported) {
+            let service = text(recommendation, "serviceArn");
+            for column in &header {
+                let held = cell(&header, row, column);
+                if column == TIMESTAMP_COLUMN {
+                    // "The timestamp of when the Amazon ECS service recommendation was last
+                    // generated": the instant the reader reports for the same recommendation.
+                    let expected = recommendation["lastRefreshTimestamp"]
+                        .as_f64()
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "case {case:?}: the reader states when the recommendation was \
+                                 generated, got {recommendation}"
+                            )
+                        });
+                    assert_eq!(
+                        stated_millis(held),
+                        stated_millis(
+                            &::aws_smithy_types::DateTime::from_secs_f64(expected)
+                                .fmt(::aws_smithy_types::date_time::Format::DateTime)
+                                .unwrap_or_default()
+                        ),
+                        "case {case:?}: column {column} of {service} must state the instant the \
+                         reader reports ({expected}), got {held:?} in {row:?}"
+                    );
+                    continue;
+                }
+                let expected = expected_cell(column, recommendation);
+                assert_eq!(
+                    held, expected,
+                    "case {case:?}: column {column} of {service} must hold what the reader \
+                     reports ({expected:?}), got {row:?}"
+                );
+            }
+        }
+
+        // The file is of the services the READER reports, so the service the findings catalog
+        // alone holds — which the reader reports no recommendation for — is in no row of it.
+        if header.iter().any(|column| column == "ServiceArn") {
+            let exported: Vec<&str> = data
+                .iter()
+                .map(|row| cell(&header, row, "ServiceArn"))
+                .collect();
+            let expected: Vec<String> = reported
+                .iter()
+                .map(|recommendation| text(recommendation, "serviceArn"))
+                .collect();
+            assert_eq!(
+                exported, expected,
+                "case {case:?}: the exported services must be the ones the reader reports"
+            );
+            let catalog_only = catalog_only_service_arn();
+            assert!(
+                !exported.contains(&catalog_only.as_str()),
+                "case {case:?}: {catalog_only} is a service no ECS store holds and the reader \
+                 reports nothing for, so no row is of it, got {exported:?}"
+            );
+        }
+    }
+}
+
+/// The file is not a sheet of empty cells: every member the Amazon ECS service reader reports
+/// is filled for at least one exported row, under the column the field set names for it —
+/// including the after-discount savings the account's `savingsEstimationMode` preference
+/// activates — and the one column that names a member this analysis records nothing for is
+/// empty in every row. The metadata file beside it states what the export was of.
+#[tokio::test]
+async fn the_exported_rows_carry_the_ecs_service_members_the_reader_reports() {
+    let case = "the filled columns";
+    let router = export_emulator(case).await;
+    // "Specify the `AfterDiscounts` status to activate the preference": with it active the
+    // reader reports an after-discount saving for each option, so the file's after-discount
+    // columns carry one too.
+    let (status, body) = call(
+        &router,
+        "PutRecommendationPreferences",
+        json!({"resourceType": RESOURCE_TYPE_ECS_SERVICE, "savingsEstimationMode": "AfterDiscounts"}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "activating the savings estimation mode preference: got {status}: {body}"
+    );
+    let reported = reader_recommendations(&router, case).await;
+
+    let rows = exported_rows(&router, case, None).await;
+    let header = rows.first().cloned().unwrap_or_default();
+    let data = rows.get(1..).unwrap_or_default();
+    assert_eq!(
+        data.len(),
+        reported.len(),
+        "expected one row per reported recommendation ({}), got {data:?}",
+        reported.len()
+    );
+
+    // Every column the field set declares, except the one no member of this analysis fills,
+    // carries what the reader reports for at least one of the analysed services.
+    for column in EXPORTABLE_E_C_S_SERVICE_FIELD_VALUES {
+        if *column == UNRECORDED_COLUMN {
+            for row in data {
+                assert!(
+                    cell(&header, row, column).is_empty(),
+                    "column {column} names a member this analysis records nothing for, so it is \
+                     empty, got {row:?}"
+                );
+            }
+            continue;
+        }
+        let filled = data
+            .iter()
+            .filter(|row| !cell(&header, row, column).is_empty())
+            .count();
+        assert!(
+            filled > 0,
+            "column {column} must carry what the reader reports for at least one of the \
+             analysed services, got {data:?}"
+        );
+    }
+
+    // And the file's rows still agree with the reader cell by cell under the activated
+    // preference, which is where the after-discount columns come from.
+    for (row, recommendation) in data.iter().zip(&reported) {
+        for column in ["RecommendationOptionsSavingsOpportunityAfterDiscountsPercentage",
+                       "RecommendationOptionsEstimatedMonthlySavingsCurrencyAfterDiscounts",
+                       "RecommendationOptionsEstimatedMonthlySavingsValueAfterDiscounts"] {
+            let expected = expected_cell(column, recommendation);
+            assert_eq!(
+                cell(&header, row, column),
+                expected,
+                "column {column} must hold what the reader reports ({expected:?}), got {row:?}"
+            );
+        }
+    }
+
+    let body = export_ok(
+        &router,
+        "the metadata file",
+        json!({"s3DestinationConfig": {"bucket": EXPORT_BUCKET}}),
+    )
+    .await;
+    let job_id = body["jobId"].as_str().unwrap_or_default().to_string();
+    let (bucket, _, metadata_key) = export_destination("the metadata file", &body);
+    polled_to_complete(&router, "the metadata file", &job_id).await;
+    let metadata = downloaded(&router, "the metadata file", &bucket, &metadata_key).await;
+    let metadata: Value = serde_json::from_slice(metadata.as_bytes())
+        .unwrap_or_else(|error| panic!("the metadata file is JSON: {error}"));
+    assert_eq!(
+        metadata["resourceType"].as_str(),
+        Some(RESOURCE_TYPE_ECS_SERVICE),
+        "the metadata names the exported resource type, got {metadata}"
+    );
+    assert_eq!(
+        metadata["exportFile"]["rowCount"].as_u64(),
+        Some(reported.len() as u64),
+        "the metadata counts the rows the file holds ({}), got {metadata}",
+        reported.len()
+    );
+}
+
+/// The filters an export carries select exactly what the same filters select for the READER —
+/// "an array of objects to specify a filter that exports a more specific set of ...
+/// recommendations" — so a client can reconcile the file with the reader's answer. One row per
+/// filter of the surface's vocabulary, spanning filters that select recommendations and
+/// filters that select none.
+#[tokio::test]
+async fn the_export_filters_select_what_the_ecs_service_reader_selects() {
+    // (case, the filters the reader and the export both carry)
+    let rows: Vec<(&str, Value)> = vec![
+        (
+            "a finding the analysis reached",
+            json!([{"name": "Finding", "values": ["Overprovisioned"]}]),
+        ),
+        (
+            "the other two findings at once",
+            json!([{"name": "Finding", "values": ["Optimized", "Underprovisioned"]}]),
+        ),
+        (
+            "a finding reason code the analysis reached",
+            json!([{"name": "FindingReasonCode", "values": ["MemoryUnderprovisioned"]}]),
+        ),
+        (
+            "a finding reason code of the other side",
+            json!([{"name": "FindingReasonCode", "values": ["CPUOverprovisioned"]}]),
+        ),
+        (
+            // Both names at once, selecting a combination no analysed service carries: the
+            // under-provisioned service's CPU cannot also be sized down.
+            "a finding and a reason code no service carries together",
+            json!([{"name": "Finding", "values": ["Underprovisioned"]},
+                   {"name": "FindingReasonCode", "values": ["CPUOverprovisioned"]}]),
+        ),
+        (
+            "a filter carrying no value, which constrains nothing",
+            json!([{"name": "Finding", "values": []}]),
+        ),
+    ];
+
+    let mut saw_selected = false;
+    let mut saw_nothing = false;
+    for (case, filters) in rows {
+        let router = export_emulator(case).await;
+        let (status, read) = call(
+            &router,
+            "GetECSServiceRecommendations",
+            json!({"filters": filters.clone()}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: reading with {filters}: got {status}: {read}"
+        );
+        let selected: Vec<String> = list(&read, "ecsServiceRecommendations", case)
+            .iter()
+            .map(|recommendation| text(recommendation, "serviceArn"))
+            .collect();
+
+        let body = export_ok(
+            &router,
+            case,
+            json!({
+                "s3DestinationConfig": {"bucket": EXPORT_BUCKET},
+                "fieldsToExport": ["ServiceArn", "Finding", "FindingReasonCodes"],
+                "filters": filters.clone(),
+            }),
+        )
+        .await;
+        let job_id = body["jobId"].as_str().unwrap_or_default().to_string();
+        let (bucket, key, _) = export_destination(case, &body);
+        polled_to_complete(&router, case, &job_id).await;
+        let rows = csv_rows(&downloaded(&router, case, &bucket, &key).await);
+        let header = rows.first().cloned().unwrap_or_default();
+        let exported: Vec<String> = rows
+            .get(1..)
+            .unwrap_or_default()
+            .iter()
+            .map(|row| cell(&header, row, "ServiceArn").to_string())
+            .collect();
+        assert_eq!(
+            exported, selected,
+            "case {case:?}: the filter {filters} selected {selected:?} for the reader, so the \
+             export file holds those rows"
+        );
+        saw_selected |= !selected.is_empty();
+        saw_nothing |= selected.is_empty();
+    }
+    assert!(
+        saw_selected && saw_nothing,
+        "the table must span a filter that selects recommendations and one that selects none, \
+         or it proves nothing (selected some: {saw_selected}, selected none: {saw_nothing})"
+    );
 }

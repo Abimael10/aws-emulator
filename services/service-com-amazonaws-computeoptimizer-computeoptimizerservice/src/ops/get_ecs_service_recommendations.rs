@@ -28,6 +28,13 @@
 //! recommendations for an unsupported resource"); a service the analysis has merely not
 //! reached yet is absent from the answer, which stays a successful empty result.
 //!
+//! The computation itself is the crate's own
+//! ([`crate::state::ecs_service_recommendation`], and
+//! [`crate::state::analysed_ecs_services`] for the whole sweep), shared with
+//! `ExportECSServiceRecommendations`: the file that export writes holds exactly the
+//! recommendations this reader reports, so a row of it and a response of this operation
+//! cannot disagree.
+//!
 //! ## What the recommendation option costs
 //!
 //! A task on Fargate is billed per vCPU-hour and per GB-hour, so the monthly cost of BOTH
@@ -169,49 +176,12 @@ impl From<GetECSServiceRecommendationsErrorModeled> for GetECSServiceRecommendat
 // (`crate::state`), shared with `GetECSServiceRecommendationProjectedMetrics`, which
 // projects a series onto the very option computed here.
 
-/// The `ECSServiceMetricName` values (`E_C_S_SERVICE_METRIC_NAME_VALUES`): "`Cpu` — The
-/// amount of CPU capacity that's used in the service. `Memory` — The amount of memory
-/// that's used in the service."
-const METRIC_NAME_CPU: &str = "Cpu";
-/// See [`METRIC_NAME_CPU`].
-const METRIC_NAME_MEMORY: &str = "Memory";
-/// The `ECSServiceMetricStatistic` values (`E_C_S_SERVICE_METRIC_STATISTIC_VALUES`).
-const STATISTIC_MAXIMUM: &str = "Maximum";
-/// See [`STATISTIC_MAXIMUM`].
-const STATISTIC_AVERAGE: &str = "Average";
-
-/// The `ECSServiceLaunchType` value an analysable service runs with: Compute Optimizer
-/// "generates recommendations for Amazon ECS services on Fargate". Named here so the
-/// refusal of a service that runs on anything else can state it; the vocabulary itself is
-/// the crate's one ([`crate::state::ECS_SERVICE_LAUNCH_TYPE_FARGATE`]).
-const LAUNCH_TYPE_FARGATE: &str = crate::state::ECS_SERVICE_LAUNCH_TYPE_FARGATE;
-
-/// The `ECSServiceRecommendationFinding` values
-/// (`E_C_S_SERVICE_RECOMMENDATION_FINDING_VALUES`), as the model documents them:
-/// `Underprovisioned` — "there's not enough memory or CPU"; `Overprovisioned` — "there's
-/// excessive memory or CPU"; `Optimized` — "both the CPU and memory of your Amazon ECS
-/// service meet the performance requirements of your workload".
-const FINDING_UNDERPROVISIONED: &str = "Underprovisioned";
-/// See [`FINDING_UNDERPROVISIONED`].
-const FINDING_OVERPROVISIONED: &str = "Overprovisioned";
-/// See [`FINDING_UNDERPROVISIONED`].
-const FINDING_OPTIMIZED: &str = "Optimized";
-
-/// The `ECSServiceRecommendationFindingReasonCode` values
-/// (`E_C_S_SERVICE_RECOMMENDATION_FINDING_REASON_CODE_VALUES`): one per dimension that can
-/// be "sized up to enhance the performance of your workload" or "sized down while still
-/// meeting the performance requirements of your workload".
-const REASON_CPU_UNDERPROVISIONED: &str = "CPUUnderprovisioned";
-/// See [`REASON_CPU_UNDERPROVISIONED`].
-const REASON_CPU_OVERPROVISIONED: &str = "CPUOverprovisioned";
-/// See [`REASON_CPU_UNDERPROVISIONED`].
-const REASON_MEMORY_UNDERPROVISIONED: &str = "MemoryUnderprovisioned";
-/// See [`REASON_CPU_UNDERPROVISIONED`].
-const REASON_MEMORY_OVERPROVISIONED: &str = "MemoryOverprovisioned";
-
-// `CurrentPerformanceRisk` is one enum shared by every recommendation this service
-// reports, so its values are the crate-level constants
-// (`crate::state::PERFORMANCE_RISK_*`) rather than a second copy here.
+// The vocabularies a reported recommendation is spelled in — the `ECSServiceMetricName` and
+// `ECSServiceMetricStatistic` values, the `ECSServiceLaunchType` an analysable service runs
+// with, the `ECSServiceRecommendationFinding` and its reason codes, and the shared
+// `CurrentPerformanceRisk` — are the crate's own (`crate::state`), because the recommendation
+// itself is computed there: this handler reports what that one computation answers, so it and
+// the EXPORT of the same recommendations cannot spell or compute one member differently.
 
 /// The `GetRecommendationError$code` this emulator reports for a requested service Compute
 /// Optimizer does not support: it does not run on Fargate, or its task definition sets no
@@ -220,23 +190,6 @@ const REASON_MEMORY_OVERPROVISIONED: &str = "MemoryOverprovisioned";
 /// reason an analysis is REFUSED rather than merely missing; its `message` states the
 /// reason in full.
 const ERROR_CODE_UNSUPPORTED_RESOURCE: &str = "UnsupportedResource";
-
-/// The public on-demand price of ONE vCPU-hour and ONE GB-hour of AWS Fargate compute, in
-/// [`crate::state::CURRENCY_USD`] — the two figures AWS Fargate's own pricing is published
-/// as ("you pay for the amount of vCPU and memory resources that your containerized
-/// application requests", charged per vCPU per hour and per GB per hour).
-///
-/// Every money figure an ECS service recommendation reports is computed from these two
-/// prices, exactly as the EBS and Lambda analyses of this service compute theirs from their
-/// own price tables, so the recommendation's figures agree with each other and with the
-/// [`crate::state::SAVINGS_ESTIMATION_SOURCE`] it names.
-const FARGATE_PRICE_PER_VCPU_HOUR: f64 = 0.040_48;
-/// See [`FARGATE_PRICE_PER_VCPU_HOUR`].
-const FARGATE_PRICE_PER_GB_HOUR: f64 = 0.004_445;
-
-/// CPU units in one vCPU, the unit the Fargate vCPU-hour price is charged in: "1024 CPU
-/// units is the equivalent of 1 vCPU" (the ECS model's `RegisterTaskDefinitionRequest$cpu`).
-const CPU_UNITS_PER_VCPU: f64 = 1024.0;
 
 /// The `GetECSServiceRecommendations` operation.
 ///
@@ -379,38 +332,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // likewise enumerates only this region's services, so a service created at one
         // endpoint is never analysed at another.
         let explicit = !requested.is_empty();
-        let mut candidates: Vec<Candidate> = {
+        let mut candidates: Vec<crate::state::EcsServiceCandidate> = {
             let inventory = inventory.lock();
             if explicit {
                 requested
                     .into_iter()
-                    .map(|reference| Candidate {
-                        config: (reference.region == region)
-                            .then(|| crate::state::ecs_service_config(&inventory, &reference))
-                            .flatten(),
-                        reference,
-                        look_back_period: String::new(),
-                        after_discounts: false,
+                    .map(|reference| {
+                        crate::state::ecs_named_candidate(&inventory, reference, &region)
                     })
                     .collect()
             } else {
-                inventory
-                    .services
-                    .values()
-                    .filter(|record| record.is_active())
-                    .filter_map(|record| {
-                        let reference = crate::state::parse_ecs_service_arn(&record.arn)?;
-                        if reference.region != region {
-                            return None;
-                        }
-                        Some(Candidate {
-                            config: crate::state::ecs_service_config(&inventory, &reference),
-                            reference,
-                            look_back_period: String::new(),
-                            after_discounts: false,
-                        })
-                    })
-                    .collect()
+                crate::state::ecs_service_candidates(&inventory, &region)
             }
         };
         candidates.sort_by(|left, right| left.reference.arn.cmp(&right.reference.arn));
@@ -431,15 +363,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // preference store by the scope precedence every preference read uses.
         {
             let preferences = state.lock();
-            for candidate in &mut candidates {
-                let effective = effective_preferences(
-                    &preferences,
-                    &candidate.reference.arn,
-                    &candidate.reference.account_id,
-                );
-                candidate.after_discounts = effective.after_discounts();
-                candidate.look_back_period = effective.look_back_period;
-            }
+            crate::state::ecs_candidate_preferences(&preferences, &mut candidates);
         }
 
         let now = cloudwatch::state::now_secs();
@@ -467,7 +391,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ));
                 break;
             }
-            match analyse(candidate, &observations, now) {
+            match crate::state::ecs_service_recommendation(candidate, &observations, now) {
                 Ok(recommendation) => {
                     if filters.matches(&recommendation) {
                         recommendations.push(recommendation);
@@ -479,12 +403,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // analysis has merely not reached — nothing is recorded for it, or no
                 // observation of it falls in the look-back period — is no failure of the
                 // request at all, so it is absent from the answer either way.
-                Err(NoAnalysis::Unsupported(error)) => {
+                Err(crate::state::EcsNoAnalysis::Unsupported(reason)) => {
                     if explicit {
-                        errors.push(error);
+                        errors.push(recommendation_error(
+                            &candidate.reference.arn,
+                            ERROR_CODE_UNSUPPORTED_RESOURCE,
+                            reason,
+                        ));
                     }
                 }
-                Err(NoAnalysis::NotAnalysed) => {}
+                Err(crate::state::EcsNoAnalysis::NotAnalysed) => {}
             }
         }
 
@@ -537,38 +465,6 @@ fn recommendation_error(
         code: Some(code.to_string()),
         message: Some(message.into()),
     }
-}
-
-/// One service the request put in scope, with the state the analysis reads.
-struct Candidate {
-    /// Which service this is ([`crate::state::parse_ecs_service_arn`]).
-    reference: crate::state::EcsServiceRef,
-    /// What the ECS store holds for it ([`crate::state::ecs_service_config`]), or `None`
-    /// when it holds no ACTIVE record.
-    config: Option<crate::state::EcsServiceConfig>,
-    /// The `LookBackPeriodPreference` in force for it, resolved from this service's own
-    /// preference store once every candidate is known.
-    look_back_period: String,
-    /// Whether the `SavingsEstimationMode` preference in force for it activates reporting
-    /// savings net of Savings Plans discounts, from the same resolution.
-    after_discounts: bool,
-}
-
-/// The preferences in force for one service: the value from the most specific scope that
-/// sets one for the `EcsService` resource type, and the service's documented defaults for
-/// every preference no record sets.
-///
-/// The resolution is the preference store's OWN
-/// ([`crate::state::ComAmazonawsComputeoptimizerComputeoptimizerserviceState::effective_preferences_for`]) —
-/// "the ONE resolution in this service", which `GetEffectiveRecommendationPreferences` and
-/// every other recommendation reader state their preferences from — so this read cannot
-/// drift from them on the precedence or on the defaults.
-fn effective_preferences(
-    preferences: &crate::state::ComAmazonawsComputeoptimizerComputeoptimizerserviceState,
-    arn: &str,
-    account_id: &str,
-) -> crate::state::EffectivePreferences {
-    preferences.effective_preferences_for(arn, crate::state::RESOURCE_TYPE_ECS_SERVICE, account_id)
 }
 
 /// The `Finding` / `FindingReasonCode` values one request filters on.
@@ -643,326 +539,8 @@ fn requested_filters(
     Ok(requested)
 }
 
-/// Why one candidate the request put in scope produced no recommendation.
-enum NoAnalysis {
-    /// Compute Optimizer does not support the resource, so the analysis REFUSED it: the
-    /// `errors` list of a request that named it carries this entry.
-    Unsupported(GetRecommendationError),
-    /// The analysis has not reached the resource — this service holds no record of it, or
-    /// no observation of it falls in the look-back period — so there is no recommendation
-    /// yet, which is the steady state of a newly enrolled account: the resource is absent
-    /// from the answer and the request has not failed.
-    NotAnalysed,
-}
-
-/// The recommendation for one service, or why the analysis produced none for it.
-fn analyse(
-    candidate: &Candidate,
-    observations: &cloudwatch::state::ComAmazonawsCloudwatchGraniteserviceversion20100801State,
-    now: f64,
-) -> Result<ECSServiceRecommendation, NoAnalysis> {
-    let arn = candidate.reference.arn.as_str();
-    let Some(config) = &candidate.config else {
-        return Err(NoAnalysis::NotAnalysed);
-    };
-    // "Compute Optimizer generates recommendations for Amazon ECS services on Fargate."
-    if crate::state::ecs_launch_type_of(config) != Some(LAUNCH_TYPE_FARGATE) {
-        return Err(NoAnalysis::Unsupported(recommendation_error(
-            arn,
-            ERROR_CODE_UNSUPPORTED_RESOURCE,
-            format!(
-                "Compute Optimizer generates Amazon ECS service recommendations for services on \
-                 {LAUNCH_TYPE_FARGATE} only, and {arn} does not run on {LAUNCH_TYPE_FARGATE}."
-            ),
-        )));
-    }
-    // A Fargate task definition carries task-level CPU and memory ("This field is required
-    // for Fargate"); without them there is no current size to compare utilization against.
-    let (Some(current_cpu), Some(current_memory)) = (config.cpu_units, config.memory_mib) else {
-        return Err(NoAnalysis::Unsupported(recommendation_error(
-            arn,
-            ERROR_CODE_UNSUPPORTED_RESOURCE,
-            format!(
-                "The task definition of {arn} sets no task-level cpu and memory, so its Amazon \
-                 ECS service utilization cannot be sized."
-            ),
-        )));
-    };
-    if current_cpu <= 0 || current_memory <= 0 {
-        return Err(NoAnalysis::Unsupported(recommendation_error(
-            arn,
-            ERROR_CODE_UNSUPPORTED_RESOURCE,
-            format!(
-                "The task definition of {arn} sets a task-level cpu of {current_cpu} and memory \
-                 of {current_memory}, which is not a Fargate task size."
-            ),
-        )));
-    }
-
-    // The window the analysis reads: the effective look-back period, back from now
-    // ([`crate::state::ecs_observed_utilization`]). The day count is the crate's own
-    // ([`crate::state::look_back_period_in_days`]), the one every recommendation reader
-    // reports `lookbackPeriodInDays` from.
-    let look_back_days = crate::state::look_back_period_in_days(&candidate.look_back_period);
-    let observed = crate::state::ecs_observed_utilization(
-        observations,
-        &candidate.reference,
-        &candidate.look_back_period,
-        now,
-    );
-    let Some((cpu, memory)) = observed.both() else {
-        return Err(NoAnalysis::NotAnalysed);
-    };
-
-    // The size each dimension needs: the observed PEAK carried with the crate's one
-    // recommendation headroom (`crate::state::RECOMMENDATION_HEADROOM`, the service's
-    // documented `PERCENT_20`). The recommendation option is then the smallest Fargate
-    // task size that holds both ([`crate::state::ecs_recommended_task_size`], the one task
-    // size rule this service's two ECS service readers share).
-    let required_cpu = crate::state::ecs_required_capacity(current_cpu, cpu.maximum);
-    let required_memory = crate::state::ecs_required_capacity(current_memory, memory.maximum);
-    let (option_cpu, option_memory) = crate::state::ecs_recommended_task_size(
-        current_cpu,
-        current_memory,
-        cpu.maximum,
-        memory.maximum,
-    );
-
-    // "The service CPU configuration can be sized up to enhance the performance of your
-    // workload" / "can be sized down while still meeting the performance requirements of
-    // your workload", per dimension. A reason code describes the DIMENSION, not the joint
-    // option, so each one is judged against the smallest size the catalog offers for THAT
-    // dimension alone: a dimension whose own requirement fits a smaller size can be sized
-    // down even when the other dimension forces the recommended task up, and a dimension
-    // already at the catalog's smallest size cannot be sized down however little it uses.
-    let cpu_under = required_cpu > current_cpu;
-    let memory_under = required_memory > current_memory;
-    let cpu_over = crate::state::ecs_smallest_fargate_cpu(required_cpu) < current_cpu;
-    let memory_over = crate::state::ecs_smallest_fargate_memory(required_memory) < current_memory;
-    let mut finding_reason_codes = Vec::new();
-    if cpu_under {
-        finding_reason_codes.push(REASON_CPU_UNDERPROVISIONED.to_string());
-    }
-    if cpu_over {
-        finding_reason_codes.push(REASON_CPU_OVERPROVISIONED.to_string());
-    }
-    if memory_under {
-        finding_reason_codes.push(REASON_MEMORY_UNDERPROVISIONED.to_string());
-    }
-    if memory_over {
-        finding_reason_codes.push(REASON_MEMORY_OVERPROVISIONED.to_string());
-    }
-    // A dimension that is too small is a performance problem and a dimension that is too
-    // large is a cost one, so under-provisioning decides the finding when both hold:
-    // "When Compute Optimizer detects that there's not enough memory or CPU, an Amazon ECS
-    // service is considered under-provisioned."
-    let finding = if cpu_under || memory_under {
-        FINDING_UNDERPROVISIONED
-    } else if cpu_over || memory_over {
-        FINDING_OVERPROVISIONED
-    } else {
-        FINDING_OPTIMIZED
-    };
-    // "The risk of the current Amazon ECS service not meeting the performance needs of its
-    // workloads. The higher the risk, the more likely the current service can't meet the
-    // performance requirements of its workload." AWS publishes no numeric rule for the
-    // four `CurrentPerformanceRisk` values, so this emulator reports the risk it can
-    // actually derive: how many of the two analysed dimensions are already past their
-    // target utilization — neither (`VeryLow`), one (`Medium`) or both (`High`). `Low` is
-    // DELIBERATELY unreachable here: it would have to grade how far past the target one
-    // dimension is, and an ECS service recommendation is analysed over exactly two
-    // dimensions with no published gradation between them, so reporting it would claim a
-    // finer judgement than the analysis makes.
-    let current_performance_risk = match u8::from(cpu_under) + u8::from(memory_under) {
-        0 => crate::state::PERFORMANCE_RISK_VERY_LOW,
-        1 => crate::state::PERFORMANCE_RISK_MEDIUM,
-        _ => crate::state::PERFORMANCE_RISK_HIGH,
-    };
-
-    // What moving the service to the recommended task size saves per month, on the public
-    // Fargate prices: the difference between what the two sizes cost for the tasks this
-    // service keeps running, and that saving "as a percentage of monthly cost"
-    // (`SavingsOpportunity$savingsOpportunityPercentage`). A recommendation that costs the
-    // same or MORE saves nothing rather than a negative amount — an under-provisioned
-    // service is recommended a bigger task — which is the arithmetic every other analysis
-    // of this service reports a saving with.
-    let current_cost = fargate_monthly_cost(current_cpu, current_memory, config.desired_tasks);
-    let option_cost = fargate_monthly_cost(option_cpu, option_memory, config.desired_tasks);
-    let saved = crate::state::round_hundredths((current_cost - option_cost).max(0.0));
-    let saved_percentage = crate::state::percentage_of(saved, current_cost);
-
-    Ok(ECSServiceRecommendation {
-        service_arn: Some(arn.to_string()),
-        account_id: Some(candidate.reference.account_id.clone()),
-        current_service_configuration: Some(ServiceConfiguration {
-            memory: Some(current_memory),
-            cpu: Some(current_cpu),
-            container_configurations: Some(config.containers.clone()),
-            // Whether a target-tracking policy scales the service lives in Application Auto
-            // Scaling, which this analysis does not read, so the member is omitted rather
-            // than guessed.
-            auto_scaling_configuration: None,
-            task_definition_arn: config.task_definition_arn.clone(),
-        }),
-        utilization_metrics: Some(vec![
-            utilization_metric(METRIC_NAME_CPU, STATISTIC_MAXIMUM, cpu.maximum),
-            utilization_metric(METRIC_NAME_CPU, STATISTIC_AVERAGE, cpu.average),
-            utilization_metric(METRIC_NAME_MEMORY, STATISTIC_MAXIMUM, memory.maximum),
-            utilization_metric(METRIC_NAME_MEMORY, STATISTIC_AVERAGE, memory.average),
-        ]),
-        // "The number of days the Amazon ECS service utilization metrics were analyzed":
-        // the window the look-back preference sets, which is the window read above.
-        lookback_period_in_days: look_back_days,
-        launch_type: Some(LAUNCH_TYPE_FARGATE.to_string()),
-        // The analysis is current to the newest observation it read; it changes when a
-        // newer one is published, not when somebody reads it.
-        last_refresh_timestamp: Some(cloudwatch::state::to_timestamp(
-            cpu.newest_secs.max(memory.newest_secs),
-        )),
-        finding: Some(finding.to_string()),
-        finding_reason_codes: Some(finding_reason_codes),
-        service_recommendation_options: Some(vec![ECSServiceRecommendationOption {
-            memory: Some(option_memory),
-            cpu: Some(option_cpu),
-            // The money the recommendation is for, computed from the two task sizes above
-            // and the public Fargate price table.
-            savings_opportunity: Some(SavingsOpportunity {
-                savings_opportunity_percentage: saved_percentage,
-                estimated_monthly_savings: Some(EstimatedMonthlySavings {
-                    currency: Some(crate::state::CURRENCY_USD.to_string()),
-                    value: saved,
-                }),
-            }),
-            // The saving net of Savings Plans discounts is reported only once the account
-            // activates the savings-estimation-mode preference — "specify the
-            // `AfterDiscounts` status to activate the preference". This emulator records no
-            // Savings Plans commitment against a service's Fargate spend, so the
-            // after-discount figures are the on-demand ones, which is exactly what the
-            // reported [`crate::state::SAVINGS_ESTIMATION_SOURCE`] says they came from.
-            savings_opportunity_after_discounts: candidate.after_discounts.then(|| {
-                ECSSavingsOpportunityAfterDiscounts {
-                    savings_opportunity_percentage: saved_percentage,
-                    estimated_monthly_savings: Some(ECSEstimatedMonthlySavings {
-                        currency: Some(crate::state::CURRENCY_USD.to_string()),
-                        value: saved,
-                    }),
-                }
-            }),
-            // The utilization each observed statistic becomes at the recommended task size
-            // ([`crate::state::ecs_projected_utilization_metrics`]), the one projection
-            // `GetECSServiceRecommendationProjectedMetrics` reports a series of for this
-            // same option.
-            projected_utilization_metrics: Some(crate::state::ecs_projected_utilization_metrics(
-                cpu,
-                memory,
-                (current_cpu, current_memory),
-                (option_cpu, option_memory),
-            )),
-            // "The CPU and memory size recommendations for the containers within the task":
-            // each container's OWN reservation, carried to the recommended task size in the
-            // proportion of the task it reserves today. A task definition that reserves
-            // nothing per container has no container recommendation to report.
-            container_recommendations: (!config.containers.is_empty()).then(|| {
-                config
-                    .containers
-                    .iter()
-                    .map(|container| {
-                        container_recommendation(
-                            container,
-                            (current_cpu, option_cpu),
-                            (current_memory, option_memory),
-                        )
-                    })
-                    .collect()
-            }),
-        }]),
-        current_performance_risk: Some(current_performance_risk.to_string()),
-        effective_recommendation_preferences: Some(ECSEffectiveRecommendationPreferences {
-            // The savings estimation mode names the PRICING source the estimate above came
-            // from (`ECSSavingsEstimationModeSource`): the public Fargate prices this
-            // analysis holds, never an account's own Cost Explorer or Cost Optimization Hub
-            // data — the one source constant this service reports every money figure from.
-            savings_estimation_mode: Some(ECSSavingsEstimationMode {
-                source: Some(crate::state::SAVINGS_ESTIMATION_SOURCE.to_string()),
-            }),
-            look_back_period: Some(candidate.look_back_period.clone()),
-        }),
-        tags: Some(config.tags.clone()),
-    })
-}
-
-/// What a month of one Amazon ECS service on Fargate costs: the vCPU-hours and GB-hours
-/// `tasks` tasks of a `cpu_units`/`memory_mib` task size bill over a month, at
-/// [`FARGATE_PRICE_PER_VCPU_HOUR`] and [`FARGATE_PRICE_PER_GB_HOUR`].
-///
-/// The month is the crate's one [`crate::state::HOURS_PER_MONTH`] and the GB the crate's
-/// one [`crate::state::MB_PER_GB`] (a task-level `memory` of `1024` MiB is "`1GB`", per the
-/// ECS model's `RegisterTaskDefinitionRequest$memory`), so this cost and every other
-/// monthly figure this service reports are months of the same length in the same units. A
-/// service that keeps no task running costs nothing, which is what its stored task count
-/// says.
-fn fargate_monthly_cost(cpu_units: i32, memory_mib: i32, tasks: i32) -> f64 {
-    let tasks = f64::from(tasks.max(0));
-    let vcpus = f64::from(cpu_units.max(0)) / CPU_UNITS_PER_VCPU;
-    let gigabytes = f64::from(memory_mib.max(0)) / crate::state::MB_PER_GB;
-    crate::state::round_hundredths(
-        tasks
-            * (vcpus * FARGATE_PRICE_PER_VCPU_HOUR + gigabytes * FARGATE_PRICE_PER_GB_HOUR)
-            * crate::state::HOURS_PER_MONTH,
-    )
-}
-
-/// One `ContainerRecommendation`: the container's reservations at the recommended task
-/// size. `cpu` is carried on the CPU sizes and both memory members on the memory sizes,
-/// each as the pair `(current, recommended)`, so a container keeps the share of the task it
-/// reserves today; a member the task definition sets no reservation for is recommended
-/// none, because there is no reservation to resize.
-fn container_recommendation(
-    container: &ContainerConfiguration,
-    cpu: (i32, i32),
-    memory: (i32, i32),
-) -> ContainerRecommendation {
-    ContainerRecommendation {
-        container_name: container.container_name.clone(),
-        cpu: container
-            .cpu
-            .map(|reserved| scaled_reservation(reserved, cpu.0, cpu.1)),
-        memory_size_configuration: container.memory_size_configuration.as_ref().map(
-            |configuration| MemorySizeConfiguration {
-                memory: configuration
-                    .memory
-                    .map(|reserved| scaled_reservation(reserved, memory.0, memory.1)),
-                memory_reservation: configuration
-                    .memory_reservation
-                    .map(|reserved| scaled_reservation(reserved, memory.0, memory.1)),
-            },
-        ),
-    }
-}
-
-/// A container reservation of `reserved` out of a task of `current` capacity, at a task of
-/// `recommended` capacity: the same share of the task, in whole units.
-///
-/// A positive reservation stays positive however far the task shrinks — a container that
-/// reserves capacity today cannot be recommended a reservation of nothing, which would be a
-/// container definition that reserves nothing rather than a smaller one.
-fn scaled_reservation(reserved: i32, current: i32, recommended: i32) -> i32 {
-    if reserved <= 0 || current <= 0 {
-        return reserved;
-    }
-    crate::state::ecs_rounded_units(
-        f64::from(reserved) * f64::from(recommended) / f64::from(current),
-    )
-    .max(1)
-}
-
-/// One `ECSServiceUtilizationMetric`: what a named statistic of a named series was over the
-/// look-back period.
-fn utilization_metric(name: &str, statistic: &str, value: f64) -> ECSServiceUtilizationMetric {
-    ECSServiceUtilizationMetric {
-        name: Some(name.to_string()),
-        statistic: Some(statistic.to_string()),
-        value,
-    }
-}
+// The RECOMMENDATION itself — which services the analysis has inputs for, what it reads for
+// each of them and every member it reports — is `crate::state::ecs_service_recommendation`,
+// shared with `ExportECSServiceRecommendations`, so the file that export writes holds exactly
+// what this reader answers.
 

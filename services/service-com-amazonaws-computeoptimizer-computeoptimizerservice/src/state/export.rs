@@ -28,10 +28,12 @@
 //!   disagree. A field the stored analysis records no value for is an empty cell, and so is one
 //!   that names no member of the surface's recommendation at all. Where a surface's
 //!   recommendation carries members the shared findings-catalog row does not — the Amazon EC2
-//!   instance surface, whose options carry an instance type, and the Aurora and RDS database
-//!   surface, whose catalog row records the database's own configuration — the row is built from
-//!   the observation the reader reports the recommendation from rather than from that catalog
-//!   row, so the one rule serves both.
+//!   instance surface, whose options carry an instance type, the Aurora and RDS database
+//!   surface, whose catalog row records the database's own configuration, and the Amazon ECS
+//!   service surface, whose recommendation is computed from the Amazon ECS inventory and the
+//!   utilization published for it rather than recorded in that catalog at all — the row is built
+//!   from the observation the reader reports the recommendation from rather than from that
+//!   catalog row, so the one rule serves both.
 //! * the metadata file — what the export job itself was: its id, the resource type and
 //!   account(s) it covers, the recommendation preferences it was asked for, the file format and
 //!   columns of the export file, how many rows it holds and where both objects were written.
@@ -75,9 +77,11 @@ use super::{
     RESOURCE_TYPE_LICENSE, RESOURCE_TYPE_RDS_DB_INSTANCE, SAVINGS_ESTIMATION_SOURCE,
 };
 use crate::ops::types::{
-    DBStorageConfiguration, RDSDBRecommendation, RDSDBUtilizationMetric, SavingsOpportunity,
+    DBStorageConfiguration, ECSServiceRecommendation, MemorySizeConfiguration,
+    RDSDBRecommendation, RDSDBUtilizationMetric, SavingsOpportunity,
     EXPORTABLE_AUTO_SCALING_GROUP_FIELD_VALUES, EXPORTABLE_IDLE_FIELD_VALUES,
     EXPORTABLE_INSTANCE_FIELD_VALUES, EXPORTABLE_R_D_S_D_B_FIELD_VALUES,
+    EXPORTABLE_E_C_S_SERVICE_FIELD_VALUES,
 };
 
 /// The one `FileFormat` the model declares: "The only export file format currently supported
@@ -191,6 +195,14 @@ pub struct ExportPlan {
     /// `GetRDSDatabaseRecommendations` reported at that moment. Empty for every other resource
     /// type's export, which no database row belongs to.
     pub analysed_databases: Vec<AnalysedResource>,
+    /// The Amazon ECS service recommendations the account held when the export was created
+    /// ([`super::analysed_ecs_services`]): the ACTIVE services of its own Amazon ECS inventory
+    /// the analysis has inputs for. They are resolved with the plan — "the export is of the
+    /// recommendations the account held when it asked for the export" — so an exported file
+    /// holds exactly the services `GetECSServiceRecommendations` reported at that moment, each
+    /// row carrying the members that reader reports for it. Empty for every other resource
+    /// type's export, which no Amazon ECS service row belongs to.
+    pub analysed_ecs_services: Vec<ECSServiceRecommendation>,
     /// The Amazon EBS volumes the account held an analysis for when the export was created
     /// ([`super::analysed_volumes`]): the volumes of its own Amazon EC2 inventory. They are
     /// resolved with the plan, for the same reason the databases are, so an exported file holds
@@ -570,6 +582,21 @@ pub fn create_export_job<Eng: Send + Sync + 'static, F: ExportFilter>(
         } else {
             Vec::new()
         },
+        // The Amazon ECS services the account holds a recommendation for, resolved through the
+        // ONE sweep every Amazon ECS service surface of this service reads them by, so an
+        // export and a read of the same moment cannot differ on which services have a
+        // recommendation or on any member of one.
+        analysed_ecs_services: if request.resource_type == RESOURCE_TYPE_ECS_SERVICE {
+            super::analysed_ecs_services(
+                &**engine,
+                &guard,
+                &region,
+                ::engine::emulator_account_id(),
+                now,
+            )
+        } else {
+            Vec::new()
+        },
         // The volumes the account holds an analysis for, resolved through the ONE rule every
         // EBS volume surface of this service reads them by, under the look-back period in
         // force for them — so an export and a read of the same moment cannot differ on which
@@ -936,13 +963,14 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
     /// no other account's analysis, so neither of them selects any row away or adds one —
     /// they are stated in the metadata file as what the export was asked for.
     ///
-    /// Compute Optimizer reports recommendations for an ENROLLED account only, and only once
-    /// the analysis its enrollment starts is due, so an export created before then holds the
-    /// header row alone — exactly what the recommendation readers report at that moment.
+    /// Compute Optimizer reports an account's STORED analysis to an ENROLLED account only, and
+    /// only once the analysis its enrollment starts is due, so an export of that analysis
+    /// created before then holds the header row alone — exactly what the recommendation
+    /// readers of it report at that moment. A surface whose recommendations are computed from
+    /// another service's inventory and the utilization published for it carries its own
+    /// reader's gate instead ([`Self::rows_of_resource_type`]), so the file and that reader
+    /// agree at every instant.
     fn export_rows(&self, plan: &ExportPlan) -> Vec<ExportRow> {
-        if !self.enrollment.analysis_visible() {
-            return Vec::new();
-        }
         // When the analysis these rows are of was generated: the instant every reader of this
         // service reports for it ([`Enrollment::last_analysis_refresh`]), so a file states the
         // same instant the reader reports.
@@ -950,7 +978,34 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
             .enrollment
             .last_analysis_refresh()
             .map(|generated| generated.as_secs_f64());
-        let mut rows = match plan.resource_type.as_str() {
+        let mut rows = self.rows_of_resource_type(plan, last_refresh);
+        rows.retain(|row| row_matches_filters(row, &plan.resource_type, &plan.filters));
+        rows
+    }
+
+    /// The rows of the job's resource type, before the request's filters select among them:
+    /// each surface's own, built from the SAME analysis its recommendation reader reports from
+    /// and gated by the gate that reader applies.
+    fn rows_of_resource_type(
+        &self,
+        plan: &ExportPlan,
+        last_refresh: Option<f64>,
+    ) -> Vec<ExportRow> {
+        // The Amazon ECS service recommendations the plan resolved. That analysis is computed
+        // from the Amazon ECS inventory and the utilization published for it rather than
+        // recorded with this account's enrollment, so it carries the gate its READER carries
+        // (already applied when the plan resolved it) rather than the stored analysis's.
+        if plan.resource_type == RESOURCE_TYPE_ECS_SERVICE {
+            return plan
+                .analysed_ecs_services
+                .iter()
+                .map(|recommendation| ecs_service_row(recommendation, last_refresh))
+                .collect();
+        }
+        if !self.enrollment.analysis_visible() {
+            return Vec::new();
+        }
+        match plan.resource_type.as_str() {
             RESOURCE_TYPE_AUTO_SCALING_GROUP => self.auto_scaling_group_export_rows(
                 &plan.region,
                 &plan.cpu_vendor_architectures,
@@ -981,9 +1036,7 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
             resource_type => {
                 self.analysed_resource_export_rows(resource_type, &plan.region, last_refresh)
             }
-        };
-        rows.retain(|row| row_matches_filters(row, &plan.resource_type, &plan.filters));
-        rows
+        }
     }
 
     /// The export rows of the Auto Scaling group analysis: one per recommendation option of
@@ -2216,6 +2269,267 @@ fn idle_row(
         put(&mut row, "LastRefreshTimestamp", timestamp(at));
     }
     row
+}
+
+/// One Amazon ECS service recommendation as an export row: the value of every
+/// `ExportableECSServiceField` the recommendation carries, taken from the member that field
+/// names.
+///
+/// `recommendation` is the one `GetECSServiceRecommendations` reports for the same service
+/// ([`super::ecs_service_recommendation`], the ONE computation both surfaces read), so an
+/// exported row and that reader's response cannot disagree about any column. An Amazon ECS
+/// service recommendation carries the service's current task size and container definitions,
+/// the utilization observed on it, the task size the analysis would move it to and what
+/// containers it then recommends — none of which the shared findings-catalog row records — so
+/// this surface builds its rows from the recommendation itself, as the Amazon EC2 instance and
+/// the database surfaces do.
+fn ecs_service_row(
+    recommendation: &ECSServiceRecommendation,
+    last_refresh: Option<f64>,
+) -> ExportRow {
+    let text = |member: &Option<String>| member.clone().unwrap_or_default();
+    let mut row = ExportRow::new();
+    put(&mut row, "AccountId", text(&recommendation.account_id));
+    put(
+        &mut row,
+        arn_field_of(RESOURCE_TYPE_ECS_SERVICE),
+        text(&recommendation.service_arn),
+    );
+    put(&mut row, "LaunchType", text(&recommendation.launch_type));
+    put(&mut row, "Finding", text(&recommendation.finding));
+    put_list(
+        &mut row,
+        "FindingReasonCodes",
+        recommendation
+            .finding_reason_codes
+            .as_deref()
+            .unwrap_or_default(),
+    );
+    put(
+        &mut row,
+        "CurrentPerformanceRisk",
+        text(&recommendation.current_performance_risk),
+    );
+    put_number(
+        &mut row,
+        "LookbackPeriodInDays",
+        recommendation.lookback_period_in_days,
+    );
+
+    // "The configuration of the current Amazon ECS service": the task size it runs today, the
+    // task definition it runs and that definition's container reservations.
+    if let Some(configuration) = &recommendation.current_service_configuration {
+        if let Some(cpu) = configuration.cpu {
+            put(&mut row, "CurrentServiceConfigurationCpu", cpu.to_string());
+        }
+        if let Some(memory) = configuration.memory {
+            put(
+                &mut row,
+                "CurrentServiceConfigurationMemory",
+                memory.to_string(),
+            );
+        }
+        put(
+            &mut row,
+            "CurrentServiceConfigurationTaskDefinitionArn",
+            text(&configuration.task_definition_arn),
+        );
+        put(
+            &mut row,
+            "CurrentServiceConfigurationAutoScalingConfiguration",
+            text(&configuration.auto_scaling_configuration),
+        );
+        let containers: Vec<String> = configuration
+            .container_configurations
+            .iter()
+            .flatten()
+            .map(|container| {
+                container_cell(
+                    container.container_name.as_deref(),
+                    container.cpu,
+                    container.memory_size_configuration.as_ref(),
+                )
+            })
+            .collect();
+        put_list(
+            &mut row,
+            "CurrentServiceContainerConfigurations",
+            &containers,
+        );
+    }
+    for metric in recommendation.utilization_metrics.iter().flatten() {
+        put_ecs_utilization(
+            &mut row,
+            "UtilizationMetrics",
+            metric.name.as_deref(),
+            metric.statistic.as_deref(),
+            metric.value,
+        );
+    }
+
+    // The recommendation option: the task size the analysis would move the service to, the
+    // utilization projected onto it, what the containers then reserve and what adopting it
+    // saves. Each `RecommendationOptions*` field names ONE option, and this analysis reports
+    // one per service.
+    if let Some(option) = recommendation
+        .service_recommendation_options
+        .iter()
+        .flatten()
+        .next()
+    {
+        if let Some(cpu) = option.cpu {
+            put(&mut row, "RecommendationOptionsCpu", cpu.to_string());
+        }
+        if let Some(memory) = option.memory {
+            put(&mut row, "RecommendationOptionsMemory", memory.to_string());
+        }
+        put_savings(&mut row, SERVICE_OPTION, option.savings_opportunity.as_ref());
+        if let Some(after) = &option.savings_opportunity_after_discounts {
+            put_savings_after_discounts(
+                &mut row,
+                SERVICE_OPTION,
+                after.savings_opportunity_percentage,
+                after
+                    .estimated_monthly_savings
+                    .as_ref()
+                    .map(|savings| (savings.currency.clone().unwrap_or_default(), savings.value)),
+            );
+        }
+        for metric in option.projected_utilization_metrics.iter().flatten() {
+            // The projection is a single value computed from the observation, so both reported
+            // bounds are that value and the column states it.
+            put_ecs_utilization(
+                &mut row,
+                SERVICE_OPTION_PROJECTED_METRICS,
+                metric.name.as_deref(),
+                metric.statistic.as_deref(),
+                metric.upper_bound_value,
+            );
+        }
+        let containers: Vec<String> = option
+            .container_recommendations
+            .iter()
+            .flatten()
+            .map(|container| {
+                container_cell(
+                    container.container_name.as_deref(),
+                    container.cpu,
+                    container.memory_size_configuration.as_ref(),
+                )
+            })
+            .collect();
+        put_list(
+            &mut row,
+            "RecommendationOptionsContainerRecommendations",
+            &containers,
+        );
+    }
+
+    // The preferences the recommendation was generated under, as the recommendation itself
+    // reports them: the Amazon ECS service field set declares a column for each member an
+    // `ECSEffectiveRecommendationPreferences` carries.
+    if let Some(preferences) = &recommendation.effective_recommendation_preferences {
+        put(
+            &mut row,
+            "EffectiveRecommendationPreferencesLookBackPeriod",
+            text(&preferences.look_back_period),
+        );
+        put(
+            &mut row,
+            "EffectiveRecommendationPreferencesSavingsEstimationMode",
+            preferences
+                .savings_estimation_mode
+                .as_ref()
+                .map(|mode| text(&mode.source))
+                .unwrap_or_default(),
+        );
+    }
+    let tags: Vec<String> = recommendation
+        .tags
+        .iter()
+        .flatten()
+        .map(|tag| {
+            format!(
+                "{}={}",
+                tag.key.clone().unwrap_or_default(),
+                tag.value.clone().unwrap_or_default()
+            )
+        })
+        .collect();
+    put_list(&mut row, "Tags", &tags);
+    // "The timestamp of when the Amazon ECS service recommendation was last generated": the
+    // instant the recommendation reports — the newest observation it was computed from — and
+    // otherwise the instant this account's analysis was last refreshed, which is what every
+    // other export file of this service states.
+    let refreshed = recommendation
+        .last_refresh_timestamp
+        .map(|at| at.as_secs_f64())
+        .or(last_refresh);
+    if let Some(at) = refreshed {
+        put(&mut row, "LastRefreshTimestamp", timestamp(at));
+    }
+    row
+}
+
+/// The `ExportableECSServiceField` prefix of the ONE recommendation option an Amazon ECS
+/// service recommendation carries, and of the utilization that option is projected to run at.
+const SERVICE_OPTION: &str = "RecommendationOptions";
+/// See [`SERVICE_OPTION`].
+const SERVICE_OPTION_PROJECTED_METRICS: &str = "RecommendationOptionsProjectedUtilizationMetrics";
+
+/// One observed or projected Amazon ECS service metric, in the column the field set names for
+/// that metric AND that statistic — and in no column at all for a statistic it names none for.
+///
+/// `ExportableECSServiceField` declares one column per analysed metric, naming the statistic it
+/// reports that metric under, while the recommendation reports each metric under every
+/// statistic it was observed with. So the observation a column holds is the one the column's
+/// own name states, and an observation the field set names no column for is reported in none
+/// rather than under a name the model does not give it.
+fn put_ecs_utilization(
+    row: &mut ExportRow,
+    prefix: &str,
+    name: Option<&str>,
+    statistic: Option<&str>,
+    value: f64,
+) {
+    let (Some(name), Some(statistic)) = (name, statistic) else {
+        return;
+    };
+    let field = format!("{prefix}{name}{statistic}");
+    if EXPORTABLE_E_C_S_SERVICE_FIELD_VALUES.contains(&field.as_str()) {
+        put_number(row, &field, value);
+    }
+}
+
+/// One container of an Amazon ECS task as a cell: its name and each reservation it carries,
+/// under the member names the model gives them, since one exportable field is one column.
+///
+/// AWS publishes no layout for the export file, so this is the emulator's own. The task
+/// definition's containers (`ContainerConfiguration`) and the containers the recommendation
+/// option would run (`ContainerRecommendation`) declare the same three members, so both are
+/// stated the same way and a client reads the two columns alike.
+fn container_cell(
+    container_name: Option<&str>,
+    cpu: Option<i32>,
+    memory: Option<&MemorySizeConfiguration>,
+) -> String {
+    let mut reservations: Vec<String> = Vec::new();
+    if let Some(cpu) = cpu {
+        reservations.push(format!("cpu={cpu}"));
+    }
+    if let Some(memory) = memory {
+        if let Some(value) = memory.memory {
+            reservations.push(format!("memory={value}"));
+        }
+        if let Some(value) = memory.memory_reservation {
+            reservations.push(format!("memoryReservation={value}"));
+        }
+    }
+    let name = container_name.unwrap_or_default();
+    if reservations.is_empty() {
+        return name.to_string();
+    }
+    format!("{name}:{}", reservations.join(";"))
 }
 
 /// Write the export objects of every job the clock has already made due, and start this

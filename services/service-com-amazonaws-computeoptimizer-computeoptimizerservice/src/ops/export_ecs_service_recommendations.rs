@@ -13,6 +13,12 @@
 //! `GetECSServiceRecommendations` selects with ([`crate::state::ecs_filter_rejection`]), and
 //! `DescribeRecommendationExportJobs` is the reader of what this call records.
 //!
+//! The FILE the job writes holds the recommendations `GetECSServiceRecommendations` reports at
+//! the moment the export was created: the shared rule resolves them through the one sweep that
+//! reader reads ([`crate::state::analysed_ecs_services`]) and states each row's cells from the
+//! recommendation itself ([`crate::state::export`]), so a row of the file and that reader's
+//! response cannot disagree.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements

@@ -31,7 +31,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::ops::types::EXPORTABLE_AUTO_SCALING_GROUP_FIELD_VALUES;
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::export::MISSING_DESTINATION_MESSAGE;
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
-    service_state, AnalysedResource, RdsDatabaseDetail, ANALYSIS_DELAY, EXPORT_JOB_STEP,
+    service_state, AnalysedResource, RdsDatabaseDetail, EXPORT_JOB_STEP,
     JOB_STATUS_COMPLETE, JOB_STATUS_FAILED, RESOURCE_TYPE_AUTO_SCALING_GROUP,
     RESOURCE_TYPE_EBS_VOLUME, RESOURCE_TYPE_EC2_INSTANCE, RESOURCE_TYPE_ECS_SERVICE,
     RESOURCE_TYPE_IDLE, RESOURCE_TYPE_LAMBDA_FUNCTION, RESOURCE_TYPE_LICENSE,
@@ -40,8 +40,9 @@ use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
-    call, cell, create_bucket, csv_rows, delete_bucket, emulator, emulator_with_engine,
-    error_code, export_destination, get_object, opt_in, ACCOUNT,
+    call, call_ecs, cell, create_bucket, csv_rows, delete_bucket, emulator,
+    emulator_with_analysed_services_and_engine, error_code, export_destination, get_object,
+    make_analysis_due, opt_in, seed_cloudwatch_series, ACCOUNT, ANALYSED_SUBNET,
 };
 
 /// The destination bucket these fixtures export to.
@@ -100,13 +101,105 @@ const EXPORTS: &[(&str, &str, &[&str])] = &[
 /// An emulator with the account opted in and the destination bucket created, and with the
 /// analysis the enrollment starts already due — which is what a recommendation reader reports
 /// over, so it is what an export file holds.
+///
+/// Every resource type exported here has an analysed resource of the account: the rows of the
+/// findings catalog this crate holds, the account's own Amazon EBS volumes and Amazon Aurora or
+/// RDS database, and the Amazon ECS service created below — a resource type whose
+/// recommendation is computed over the service that OWNS the resource holds a row only once
+/// that service holds one.
 async fn analysed_emulator() -> MultiServiceRouter {
-    let (router, engine) = emulator_with_engine();
+    let (router, engine) = emulator_with_analysed_services_and_engine();
     record_analysed_database(&engine);
+    create_analysed_ecs_service(&router, &engine).await;
     create_bucket(&router, BUCKET).await;
     opt_in(&router).await;
-    tokio::time::sleep(ANALYSIS_DELAY + SLACK).await;
+    // The analysis becomes readable because its stored instant is already past, not because
+    // the suite waited for the clock to reach it.
+    make_analysis_due(&engine);
     router
+}
+
+/// The Amazon ECS cluster, service and task definition family [`create_analysed_ecs_service`]
+/// creates.
+const ECS_CLUSTER: &str = "payments";
+/// See [`ECS_CLUSTER`].
+const ECS_SERVICE: &str = "checkout";
+/// See [`ECS_CLUSTER`].
+const ECS_FAMILY: &str = "checkout-task";
+
+/// Create one Amazon ECS service of the account's own inventory, over Amazon ECS's own wire,
+/// and publish the `AWS/ECS` utilization its recommendation is computed from.
+///
+/// An Amazon ECS service recommendation is an analysis of a Fargate service the Amazon ECS
+/// store holds and of the utilization published for it, so the Amazon ECS export holds a row
+/// only once both exist — exactly as the database export holds one only once the account has an
+/// analysed database. `AWS/ECS` is a namespace AWS reserves for the service that owns the
+/// metric, which no client call may write, so the series is seeded into the metric store the
+/// way Amazon ECS writes it.
+async fn create_analysed_ecs_service(
+    router: &MultiServiceRouter,
+    engine: &Arc<engine::InMemoryEngine>,
+) {
+    for (operation, request) in [
+        ("CreateCluster", json!({"clusterName": ECS_CLUSTER})),
+        (
+            "RegisterTaskDefinition",
+            json!({
+                "family": ECS_FAMILY,
+                "networkMode": "awsvpc",
+                "requiresCompatibilities": ["FARGATE"],
+                "cpu": "1024",
+                "memory": "2048",
+                "containerDefinitions": [{
+                    "name": "web",
+                    "image": "public.ecr.aws/nginx/nginx:latest",
+                    "cpu": 128,
+                    "memory": 256,
+                }],
+            }),
+        ),
+        (
+            "CreateService",
+            json!({
+                "cluster": ECS_CLUSTER,
+                "serviceName": ECS_SERVICE,
+                "taskDefinition": ECS_FAMILY,
+                "desiredCount": 2,
+                "launchType": "FARGATE",
+                "networkConfiguration": {
+                    "awsvpcConfiguration": {
+                        "subnets": [ANALYSED_SUBNET],
+                        "securityGroups": ["sg-0123456789abcdef0"],
+                    }
+                },
+                "tags": [{ "key": "env", "value": "test" }],
+            }),
+        ),
+    ] {
+        let (status, body) = call_ecs(router, operation, request.clone()).await;
+        assert_eq!(
+            status, 200,
+            "expected {operation} to answer 200 for {request}, got {status}: {body}"
+        );
+    }
+
+    let published_at =
+        ::service_com_amazonaws_cloudwatch_graniteserviceversion20100801::state::now_secs()
+            - 3_600.0;
+    for metric in ["CPUUtilization", "MemoryUtilization"] {
+        seed_cloudwatch_series(
+            engine,
+            "AWS/ECS",
+            metric,
+            &[
+                ("ClusterName", ECS_CLUSTER),
+                ("ServiceName", ECS_SERVICE),
+            ],
+            Some("Percent"),
+            published_at,
+            &[20.0, 40.0],
+        );
+    }
 }
 
 /// Record one analysed Amazon Aurora or RDS database into the findings catalog, the way
