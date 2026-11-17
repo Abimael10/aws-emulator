@@ -47,7 +47,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use tokio::time::sleep;
 
 use crate::db_instances::{call, expect_error, expect_ok, subtrees, text, texts, REGION};
-use crate::rds_s3_integration::{create_bucket, emulator, kms, put_object_policy, role, s3};
+use crate::rds_s3_integration::{create_bucket, emulator, export_role_policy, kms, role, s3};
 
 /// The canonical account id every generated emulator presents.
 const ACCOUNT: &str = "000000000000";
@@ -250,7 +250,7 @@ async fn destination(bucket: &str, role_name: &str) -> Destination {
         &router,
         role_name,
         st::EXPORT_SERVICE_PRINCIPAL,
-        Some(put_object_policy(bucket)),
+        Some(export_role_policy(bucket)),
     )
     .await;
     Destination {
@@ -828,11 +828,12 @@ struct RefusalRow {
 ///
 /// The rows span the two conditions `InvalidS3BucketFault` covers (a bucket that does not
 /// exist and one whose name is no bucket name), the bucket outside the export's Region that
-/// is refused as the parameter value it is, the two conditions `IamRoleNotFound` covers (a
-/// role IAM holds nothing under and one whose trust policy admits another principal) and the
-/// two `KMSKeyNotAccessibleFault` covers (a key KMS holds nothing under and one whose own
-/// policy authorizes the export role for nothing), each with its own bucket, role and key so
-/// the variable parts differ from row to row.
+/// is refused as the parameter value it is, a role IAM holds nothing under — which is a
+/// principal the export's KMS grant cannot be created for, so it carries the KEY's fault —
+/// the role whose trust policy admits another principal that `IamRoleNotFound` covers, and
+/// the two `KMSKeyNotAccessibleFault` covers for the key itself (a key KMS holds nothing
+/// under and one whose own policy authorizes the export role for nothing), each with its own
+/// bucket, role and key so the variable parts differ from row to row.
 #[tokio::test]
 async fn each_export_refusal_carries_the_services_own_sentence() {
     let destination = destination("emu-refusal-bucket", "emu-refusal-role").await;
@@ -856,7 +857,7 @@ async fn each_export_refusal_carries_the_services_own_sentence() {
         &destination.router,
         "emu-refusal-untrusting",
         st::RDS_SERVICE_PRINCIPAL,
-        Some(put_object_policy(&destination.bucket)),
+        Some(export_role_policy(&destination.bucket)),
     )
     .await;
     // A key whose own policy grants the export role nothing: in KMS no principal holds a
@@ -909,16 +910,21 @@ async fn each_export_refusal_carries_the_services_own_sentence() {
             message: format!("The S3 bucket {elsewhere} isn't located in the current AWS Region."),
         },
         RefusalRow {
+            // The export's KMS grant is created FOR the role the request names, so a role
+            // IAM holds nothing under is a grant that cannot be created: recorded behaviour
+            // answers that with the key fault in the generic "specified KMS key" wording —
+            // naming the key the request passed and neither the role nor the action — where
+            // a key that is itself unusable carries the other sentence two rows down.
             case: "a role IAM holds nothing under",
             bucket: None,
             role_arn: Some(absent.clone()),
             key_id: None,
-            status: 404,
-            code: "IamRoleNotFound",
+            status: 400,
+            code: "KMSKeyNotAccessibleFault",
             message: format!(
-                "The principal {} isn't allowed to assume the IAM role {absent} or the IAM \
-                 role {absent} doesn't exist.",
-                st::EXPORT_SERVICE_PRINCIPAL
+                "The specified KMS key [{}] does not exist, is not enabled or you do not \
+                 have permissions to access it.",
+                destination.key_id
             ),
         },
         RefusalRow {

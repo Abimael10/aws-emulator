@@ -206,7 +206,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A receipt names an existing chat item and is recorded against it, and answers
         // THAT item's `Id`: the answer follows from the message the receipt names, so
         // acknowledging one message again records the same acknowledgement and answers the
-        // same `Id` without any token to replay from.
+        // same `Id` and the same instant it was acknowledged at, without any token to replay
+        // from (see [`crate::state::ChatSession::record_receipt`]).
         if let Some(kind) = receipt_kind(&input.content_type) {
             let Some(message_id) = receipt_message_id(input.content.as_deref()) else {
                 return Err(crate::scaffolded::Scaffolded::validation(

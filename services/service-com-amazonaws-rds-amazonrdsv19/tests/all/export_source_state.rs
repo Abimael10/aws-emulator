@@ -31,7 +31,7 @@ use service_com_amazonaws_rds_amazonrdsv19::state as st;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::db_instances::{call, expect_error, expect_ok, optional_text, subtrees, text, REGION};
-use crate::rds_s3_integration::{create_bucket, emulator, kms, put_object_policy, role};
+use crate::rds_s3_integration::{create_bucket, emulator, export_role_policy, kms, role};
 
 /// The canonical account id every generated emulator presents.
 const ACCOUNT: &str = "000000000000";
@@ -182,7 +182,7 @@ async fn fixture() -> Fixture {
         &router,
         "emu-source-state-role",
         st::EXPORT_SERVICE_PRINCIPAL,
-        Some(put_object_policy(&bucket)),
+        Some(export_role_policy(&bucket)),
     )
     .await;
     let fixture = Fixture {

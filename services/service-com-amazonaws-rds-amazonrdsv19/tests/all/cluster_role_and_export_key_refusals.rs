@@ -34,7 +34,7 @@
 //! them, so the key the export resolves is a key that service really holds.
 
 use crate::db_instances::{call, expect_error, expect_ok, subtrees, text, wait_for_settle, REGION};
-use crate::rds_s3_integration::{create_bucket, emulator, kms, put_object_policy, role};
+use crate::rds_s3_integration::{create_bucket, emulator, export_role_policy, kms, role};
 use service_com_amazonaws_rds_amazonrdsv19::state as st;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -306,7 +306,7 @@ async fn fixture() -> Fixture {
         &router,
         "rds-export-key-precedence-role",
         st::EXPORT_SERVICE_PRINCIPAL,
-        Some(put_object_policy(bucket)),
+        Some(export_role_policy(bucket)),
     )
     .await;
     let enabled_key = created_key(&router, "the export's enabled key").await;

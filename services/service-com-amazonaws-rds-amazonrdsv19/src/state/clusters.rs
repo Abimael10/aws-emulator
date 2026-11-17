@@ -267,11 +267,16 @@ impl std::fmt::Debug for BacktrackPoint {
 }
 
 impl DbClusterRecord {
-    /// Apply a change whose due instant has passed. Returns whether the record is now
+    /// Apply every change whose due instant has passed. Returns whether the record is now
     /// gone, so the caller drops it from the store — the same contract as
     /// [`DbInstanceRecord::settle`].
+    ///
+    /// A delete that takes a final snapshot is a progression of two steps, and both are
+    /// applied in one pass when both came due: each step's span runs from the instant the
+    /// step before it was due, so a read that comes after the whole progression reports where
+    /// the clock has taken it rather than one step per read.
     pub(super) fn settle(&mut self, now: Instant) -> bool {
-        if self.pending_status.as_ref().is_some_and(|p| now >= p.due_at) {
+        while self.pending_status.as_ref().is_some_and(|p| now >= p.due_at) {
             let pending = self.pending_status.take().expect("checked just above");
             match pending.change {
                 PendingChange::Status(status) => {
@@ -280,7 +285,8 @@ impl DbClusterRecord {
                     // snapshot a delete asked for — still owes the removal that delete
                     // accepted, so the clock takes it from here.
                     if self.status == DB_CLUSTER_STATUS_DELETING {
-                        self.pending_status = Some(PendingStatus::removal_in_a_moment());
+                        self.pending_status =
+                            Some(PendingStatus::removal_in_a_moment_after(pending.due_at));
                     }
                 }
                 PendingChange::Removal => return true,

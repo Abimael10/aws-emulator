@@ -16,7 +16,7 @@
 
 use std::time::Instant;
 
-use super::{now_as_wire_timestamp, PendingChange, PendingStatus};
+use super::{PendingChange, PendingStatus};
 use crate::ops::types::CancelExportTaskOutput;
 
 /// `ExportTask$Status` — "The progress status of the export task": the export has been
@@ -155,20 +155,24 @@ pub fn export_role_not_found_message(role_arn: &str) -> String {
 }
 
 /// What an `IamRoleMissingPermissionsFault` carries: the role can be assumed but is not
-/// authorized to perform the object write the export makes on the destination bucket.
+/// authorized to make one of the calls the export makes on the destination bucket.
 ///
 /// Amazon RDS words this fault as ONE statement of the authorization that is missing — the
-/// role, the action and the bucket — and nothing else: the two variable parts are the
-/// request's `IamRoleArn` and `S3BucketName`, and the action is the object write the export
-/// performs ([`super::EXPORT_OBJECT_WRITE_ACTION`]). It prescribes no remedy and says
-/// nothing about WHICH policy withheld the authorization, so both halves of the decision —
-/// a role whose own policies do not grant the write, and a destination bucket whose policy
-/// denies it — report the same sentence.
-pub fn export_role_missing_permissions_message(role_arn: &str, bucket: &str) -> String {
-    format!(
-        "The IAM role {role_arn} isn't authorized to call {} on the S3 bucket {bucket}.",
-        super::EXPORT_OBJECT_WRITE_ACTION
-    )
+/// role, the action and the bucket — and nothing else: the three variable parts are the
+/// request's `IamRoleArn`, the S3 action of the call that FAILED, and `S3BucketName`. The
+/// action is not a constant: the export makes its calls in order and the one named is the
+/// first of them the role cannot make ([`super::ExportRoleDefect::MissingPermissions`]), so
+/// a role granted nothing on the bucket is reported against the bucket-location read the
+/// export performs first and a role denied only the write against that write. It prescribes
+/// no remedy and says nothing about WHICH policy withheld the authorization, so both halves
+/// of the decision — a role whose own policies do not grant the call, and a destination
+/// bucket whose policy denies it — report the same sentence.
+pub fn export_role_missing_permissions_message(
+    role_arn: &str,
+    action: &str,
+    bucket: &str,
+) -> String {
+    format!("The IAM role {role_arn} isn't authorized to call {action} on the S3 bucket {bucket}.")
 }
 
 /// What a `KMSKeyNotAccessibleFault` carries where a CREATE names a `KmsKeyId` KMS will not
@@ -192,19 +196,45 @@ pub fn target_kms_key_not_accessible_message(key_id: &str) -> String {
     )
 }
 
-/// What the same fault carries on the EXPORT path, where `KmsKeyId` is the key the exported
-/// data is encrypted with: Amazon RDS words this one as a statement about the key itself,
-/// naming the identifier the request carried and nothing else.
+/// What the same fault carries on the EXPORT path for a condition of THE KEY ITSELF, where
+/// `KmsKeyId` is the key the exported data is encrypted with: Amazon RDS words this one as a
+/// statement about the key, naming the identifier the request carried and nothing else.
 ///
-/// It is the ONE sentence of the export's key fault, whichever condition left the key
-/// unusable — a key KMS holds nothing under, a key it holds disabled, and a key whose own
-/// policy withholds the `kms:CreateGrant` / `kms:DescribeKey` the export has to perform on it
-/// (`KmsKeyId`). Amazon RDS words all of them as the key's own absence, so the sentence names
+/// It is the sentence for every condition that leaves the KEY unusable — a key KMS holds
+/// nothing under, a key it holds disabled, and a key whose own policy withholds the
+/// `kms:CreateGrant` / `kms:DescribeKey` the export has to perform on it (`KmsKeyId`). Amazon
+/// RDS words all of them as the key's own absence (recorded behavior), so the sentence names
 /// neither the role the export runs under nor the KMS action that was withheld, and its one
 /// variable part is the key reference echoed exactly as the request spelled it (key id, key
 /// ARN, alias name or alias ARN).
+///
+/// A request the export's key GRANT could not be created for — rather than one whose key is
+/// unusable — takes the same fault in the other wording Amazon RDS uses for it:
+/// [`export_key_grant_not_created_message`].
 pub fn export_kms_key_not_accessible_message(key_id: &str) -> String {
     format!("The KMS key {key_id} doesn't exist or is disabled.")
+}
+
+/// What the export's key fault carries where the GRANT the export needs could not be created
+/// at all, because the principal it would be created for could not be resolved: the request's
+/// `IamRoleArn` names no role this account holds, so there is nothing to grant
+/// `kms:CreateGrant` / `kms:DescribeKey` to ("the caller of this operation must be authorized
+/// to run the following operations", `KmsKeyId`).
+///
+/// Recorded behavior decides both halves of this answer, because the model declares both
+/// `KMSKeyNotAccessibleFault` and `IamRoleNotFoundFault` for the operation and says nothing
+/// about which input takes which: Amazon RDS answers a syntactically valid `IamRoleArn`
+/// naming no existing role with `KMSKeyNotAccessibleFault` (400), worded as the generic
+/// "specified KMS key" sentence its other key faults carry
+/// ([`kms_key_not_accessible_message`]) rather than as the key's own absence above — it is the
+/// GRANT that failed, not the key. Its one variable part is the `KmsKeyId` the request
+/// carried, echoed exactly as it spelled it, and it names neither the role nor the action.
+///
+/// Stated here beside the family's other wordings, through the one function that builds that
+/// sentence, so the two conditions of the export's key fault each have one place that words
+/// them and neither can drift from the other.
+pub fn export_key_grant_not_created_message(key_id: &str) -> String {
+    kms_key_not_accessible_message(key_id)
 }
 
 /// What a request whose `SourceArn` names a resource of ANOTHER Region is refused with.
@@ -352,41 +382,53 @@ pub struct ExportTaskRecord {
 }
 
 impl ExportTaskRecord {
-    /// Apply a change whose due instant has passed. Returns whether the record is now
+    /// Apply every change whose due instant has passed. Returns whether the record is now
     /// gone, exactly as every other record's `settle` does.
+    ///
+    /// An export's progression has two steps, so a read that comes after BOTH of them were
+    /// due reports the task as far along as the clock has taken it: each step's span runs
+    /// from the instant the step before it was due ([`PendingStatus::in_a_moment_after`]),
+    /// and they are applied in one pass. A caller polling at its own interval therefore sees
+    /// a terminal status as soon as the clock owed one, rather than one step per poll.
     ///
     /// A task that reaches a terminal status has ENDED, so this is also where
     /// `TaskEndTime` is taken: the instant the clock made the terminal status due is the
     /// instant the task stopped, whether or not anybody was reading.
     pub(super) fn settle(&mut self, now: Instant) -> bool {
-        if self
+        while self
             .pending_status
             .as_ref()
-            .is_none_or(|pending| now < pending.due_at)
+            .is_some_and(|pending| now >= pending.due_at)
         {
-            return false;
-        }
-        let pending = self.pending_status.take().expect("checked just above");
-        match pending.change {
-            PendingChange::Status(status) => {
-                self.status = status;
-                // An export that has STARTED writing is not finished: the clock owes it the
-                // `COMPLETE` it ends in, so a caller polling the task walks the same
-                // STARTING → IN_PROGRESS → COMPLETE progression the real service reports.
-                if self.status == EXPORT_TASK_STATUS_IN_PROGRESS {
-                    self.pending_status =
-                        Some(PendingStatus::in_a_moment(EXPORT_TASK_STATUS_COMPLETE));
+            let pending = self.pending_status.take().expect("checked just above");
+            match pending.change {
+                PendingChange::Status(status) => {
+                    self.status = status;
+                    // An export that has STARTED writing is not finished: the clock owes it
+                    // the `COMPLETE` it ends in, one span after this step was due, so a
+                    // caller polling the task walks the same STARTING → IN_PROGRESS →
+                    // COMPLETE progression the real service reports.
+                    if self.status == EXPORT_TASK_STATUS_IN_PROGRESS {
+                        self.pending_status = Some(PendingStatus::in_a_moment_after(
+                            pending.due_at,
+                            EXPORT_TASK_STATUS_COMPLETE,
+                        ));
+                    }
+                    if self.status == EXPORT_TASK_STATUS_COMPLETE {
+                        // "The progress of the snapshot or cluster export task as a
+                        // percentage": an export that finished exported all of its source.
+                        self.percent_progress = COMPLETE_PERCENT_PROGRESS;
+                    }
+                    if self.is_terminal() && self.task_end_time.is_none() {
+                        // The instant the clock made this status DUE is the instant the task
+                        // stopped, whether or not anybody was reading, so a task first read
+                        // long after it finished reports when it finished.
+                        self.task_end_time =
+                            Some(super::wire_timestamp_at(pending.due_at, now));
+                    }
                 }
-                if self.status == EXPORT_TASK_STATUS_COMPLETE {
-                    // "The progress of the snapshot or cluster export task as a
-                    // percentage": an export that finished exported all of its source.
-                    self.percent_progress = COMPLETE_PERCENT_PROGRESS;
-                }
-                if self.is_terminal() && self.task_end_time.is_none() {
-                    self.task_end_time = Some(now_as_wire_timestamp());
-                }
+                PendingChange::Removal => return true,
             }
-            PendingChange::Removal => return true,
         }
         false
     }
@@ -436,6 +478,106 @@ impl ExportTaskRecord {
             failure_cause: self.failure_cause.clone(),
             warning_message: self.warning_message.clone(),
             source_type: Some(self.source_type.clone()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    /// One export task as `StartExportTask` records it: `STARTING`, with the clock owing it
+    /// the rest of its progression.
+    fn started_task() -> ExportTaskRecord {
+        ExportTaskRecord {
+            identifier: "task".to_string(),
+            region: "us-west-2".to_string(),
+            source_arn: "arn:aws:rds:us-west-2:000000000000:snapshot:source".to_string(),
+            source_type: EXPORT_SOURCE_TYPE_SNAPSHOT.to_string(),
+            export_only: Vec::new(),
+            snapshot_time: crate::state::now_as_wire_timestamp(),
+            task_start_time: crate::state::now_as_wire_timestamp(),
+            task_end_time: None,
+            s3_bucket: "destination".to_string(),
+            s3_prefix: None,
+            iam_role_arn: "arn:aws:iam::000000000000:role/export".to_string(),
+            kms_key_id: "key".to_string(),
+            status: EXPORT_TASK_STATUS_STARTING.to_string(),
+            pending_status: Some(PendingStatus::in_a_moment(EXPORT_TASK_STATUS_IN_PROGRESS)),
+            percent_progress: INITIAL_PERCENT_PROGRESS,
+            total_extracted_data_in_gb: 0,
+            failure_cause: None,
+            warning_message: None,
+        }
+    }
+
+    /// ONE read reports the export as far along as the clock has taken it, however many of
+    /// its steps came due while nobody was reading — so a caller polling at its own interval
+    /// sees the terminal status the clock owed rather than one step per poll.
+    ///
+    /// The clock is driven here rather than waited on: each row settles a freshly started
+    /// task at a chosen instant after its start.
+    #[test]
+    fn one_read_reports_every_step_the_clock_already_owed() {
+        let span = super::super::STATUS_TRANSITION_DELAY;
+        // (case, how long after the start the ONE read comes, the status it reports, the
+        // progress it reports). The offsets sit between the due instants rather than on
+        // them, so no row depends on how fast the host runs.
+        let rows: [(&str, Duration, &str, i32); 4] = [
+            (
+                "a read before the first step is due",
+                Duration::ZERO,
+                EXPORT_TASK_STATUS_STARTING,
+                INITIAL_PERCENT_PROGRESS,
+            ),
+            (
+                "a read after the first step came due",
+                span + span / 2,
+                EXPORT_TASK_STATUS_IN_PROGRESS,
+                INITIAL_PERCENT_PROGRESS,
+            ),
+            (
+                "a read after both steps came due",
+                span * 2 + span / 2,
+                EXPORT_TASK_STATUS_COMPLETE,
+                COMPLETE_PERCENT_PROGRESS,
+            ),
+            (
+                "a read long after the whole progression",
+                span * 100,
+                EXPORT_TASK_STATUS_COMPLETE,
+                COMPLETE_PERCENT_PROGRESS,
+            ),
+        ];
+
+        for (case, after, status, progress) in rows {
+            let started = Instant::now();
+            let mut task = started_task();
+            let gone = task.settle(started + after);
+            assert!(
+                !gone,
+                "case {case:?}: an export task is not removed by its own progression"
+            );
+            assert_eq!(
+                task.status, status,
+                "case {case:?}: expected {status}, got {} ",
+                task.status
+            );
+            assert_eq!(
+                task.percent_progress, progress,
+                "case {case:?}: expected {progress}% progress, got {}",
+                task.percent_progress
+            );
+            assert_eq!(
+                task.task_end_time.is_some(),
+                task.is_terminal(),
+                "case {case:?}: a task carries an end time exactly when it has ended, got \
+                 status {} and end time {:?}",
+                task.status,
+                task.task_end_time
+            );
         }
     }
 }

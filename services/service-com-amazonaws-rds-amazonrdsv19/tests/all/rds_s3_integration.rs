@@ -78,10 +78,14 @@ fn trust_policy(principal: &str) -> String {
     )
 }
 
-/// An identity policy granting the object write an export performs on `bucket`.
-pub(crate) fn put_object_policy(bucket: &str) -> String {
+/// The identity policy an export role carries, as the user guide's export role carries it:
+/// the actions `IamRoleArn` lists ("s3:PutObject* s3:GetObject* s3:ListBucket
+/// s3:DeleteObject* s3:GetBucketLocation") on `bucket` and on the objects in it, which are
+/// the two resource forms that member names ("arn:aws:s3:::your-s3-bucket
+/// arn:aws:s3:::your-s3-bucket/*").
+pub(crate) fn export_role_policy(bucket: &str) -> String {
     format!(
-        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::{bucket}/*"}}]}}"#
+        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":["s3:PutObject*","s3:GetObject*","s3:ListBucket","s3:DeleteObject*","s3:GetBucketLocation"],"Resource":["arn:aws:s3:::{bucket}","arn:aws:s3:::{bucket}/*"]}}]}}"#
     )
 }
 
@@ -833,7 +837,7 @@ async fn export_fixture(bucket: &str, role_name: &str) -> ExportFixture {
         &router,
         role_name,
         st::EXPORT_SERVICE_PRINCIPAL,
-        Some(put_object_policy(bucket)),
+        Some(export_role_policy(bucket)),
     )
     .await;
 
@@ -1015,15 +1019,16 @@ async fn an_export_writes_its_objects_and_completes() {
             "case {case:?}: ExportOnly limits what is written, got {unexpected:?}"
         );
 
-        // The file that says what was exported is JSON and names the tables that were
-        // written.
+        // The file that says what was exported is JSON: ONE object describing the export,
+        // whose per-table status names the tables that were written.
         let manifest = object_bytes(&fixture, &manifest_key).await;
         let document: Value = serde_json::from_slice(&manifest).unwrap_or_else(|error| {
             panic!("case {case:?}: the export's JSON file must parse: {error}")
         });
         let entries = document
-            .as_array()
-            .unwrap_or_else(|| panic!("case {case:?}: expected a JSON array, got {document}"));
+            .get("perTableStatus")
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| panic!("case {case:?}: expected perTableStatus in {document}"));
         assert_eq!(
             entries.len(),
             expected_tables.len(),
@@ -1183,7 +1188,7 @@ async fn each_documented_export_refusal_is_answered_with_its_own_code() {
         router,
         "rds-export-untrusted",
         st::RDS_SERVICE_PRINCIPAL,
-        Some(put_object_policy(&fixture.bucket)),
+        Some(export_role_policy(&fixture.bucket)),
     )
     .await;
     expect_error(
@@ -1204,7 +1209,7 @@ async fn each_documented_export_refusal_is_answered_with_its_own_code() {
         "IamRoleNotFound",
     );
 
-    // A role that may be assumed but is granted no object write.
+    // A role that may be assumed but is granted nothing on the destination.
     let unprivileged = role(
         router,
         "rds-export-unprivileged",
@@ -1213,7 +1218,7 @@ async fn each_documented_export_refusal_is_answered_with_its_own_code() {
     )
     .await;
     expect_error(
-        "a role without s3:PutObject",
+        "a role granted nothing on the destination",
         call(
             router,
             "StartExportTask",
@@ -1376,17 +1381,20 @@ async fn a_denying_bucket_policy_refuses_the_export() {
 }
 
 /// One row of the missing-permissions table: the case, the role the export is asked to run
-/// under and the destination bucket, which are the two values the refusal's sentence names.
+/// under, the destination bucket, and the S3 action of the call that fails first — the three
+/// values the refusal's sentence names.
 struct MissingPermissionsRow {
     case: &'static str,
     role_arn: String,
     bucket: String,
+    action: &'static str,
 }
 
 /// Rule: the `IamRoleMissingPermissionsFault` refusal carries Amazon RDS's own fixed
-/// sentence for that error class, whose only variable parts are the request's `IamRoleArn`
-/// and `S3BucketName` — whichever half of the authorization decision withheld the object
-/// write.
+/// sentence for that error class, whose variable parts are the request's `IamRoleArn` and
+/// `S3BucketName` and the S3 action of the call that failed — the FIRST of the calls the
+/// export makes on the destination that the role's effective policy does not allow, whichever
+/// half of the decision withheld it.
 ///
 /// The rows span what the rule generalises over: the role's own policies not granting the
 /// write (one role carrying no policy at all, one granted it on a DIFFERENT bucket, one
@@ -1414,14 +1422,15 @@ async fn the_missing_permissions_refusal_carries_the_service_s_own_sentence() {
         None,
     )
     .await;
-    // A role granted the write on the FIXTURE's bucket only, asked to write another one.
+    // A role granted the export's calls on the FIXTURE's bucket only, asked to write another
+    // one.
     let other_bucket = "emu-export-msg-other";
     create_bucket(router, other_bucket, REGION).await;
     let elsewhere = role(
         router,
         "rds-export-msg-elsewhere",
         st::EXPORT_SERVICE_PRINCIPAL,
-        Some(put_object_policy(&fixture.bucket)),
+        Some(export_role_policy(&fixture.bucket)),
     )
     .await;
     // And a bucket whose own policy DENIES the write to a role whose identity policy grants
@@ -1432,7 +1441,7 @@ async fn the_missing_permissions_refusal_carries_the_service_s_own_sentence() {
         router,
         "rds-export-msg-denied",
         st::EXPORT_SERVICE_PRINCIPAL,
-        Some(put_object_policy(deny_bucket)),
+        Some(export_role_policy(deny_bucket)),
     )
     .await;
     s3(router)
@@ -1448,21 +1457,28 @@ async fn the_missing_permissions_refusal_carries_the_service_s_own_sentence() {
             case: "a role carrying no identity policy",
             role_arn: bare,
             bucket: fixture.bucket.clone(),
+            // Nothing is granted, so the FIRST call the export makes is the one that fails.
+            action: "s3:GetBucketLocation",
         },
         MissingPermissionsRow {
             case: "a role with a long name carrying no identity policy",
             role_arn: long_name,
             bucket: fixture.bucket.clone(),
+            action: "s3:GetBucketLocation",
         },
         MissingPermissionsRow {
-            case: "a role granted the write on another bucket only",
+            case: "a role granted the export's calls on another bucket only",
             role_arn: elsewhere,
             bucket: other_bucket.to_string(),
+            action: "s3:GetBucketLocation",
         },
         MissingPermissionsRow {
-            case: "a bucket policy denying the role the write",
+            case: "a bucket policy denying the role the write it is otherwise granted",
             role_arn: denied,
             bucket: deny_bucket.to_string(),
+            // The role may read the destination, so the export gets as far as the write the
+            // bucket's own policy denies, and THAT is the call reported.
+            action: "s3:PutObject",
         },
     ];
 
@@ -1484,11 +1500,11 @@ async fn the_missing_permissions_refusal_carries_the_service_s_own_sentence() {
             400,
             "IamRoleMissingPermissions",
         );
-        // The sentence Amazon RDS words this fault as, with the role and the bucket of THIS
-        // request in it and nothing else.
+        // The sentence Amazon RDS words this fault as, with the role, the call that failed
+        // and the bucket of THIS request in it and nothing else.
         let expected = format!(
-            "The IAM role {} isn't authorized to call s3:PutObject on the S3 bucket {}.",
-            row.role_arn, row.bucket
+            "The IAM role {} isn't authorized to call {} on the S3 bucket {}.",
+            row.role_arn, row.action, row.bucket
         );
         let message = text(&body, "Message");
         assert_eq!(

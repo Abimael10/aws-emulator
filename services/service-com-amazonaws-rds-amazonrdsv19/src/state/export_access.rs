@@ -5,8 +5,8 @@
 //!
 //! "The provided IAM role must have access to the S3 bucket" (`StartExportTask`), and the
 //! role Amazon RDS assumes to write an export is one that trusts the EXPORT principal
-//! `export.rds.amazonaws.com` and carries a policy granting it the object write the export
-//! performs ("Provide access to an Amazon S3 bucket using an IAM role", Exporting DB
+//! `export.rds.amazonaws.com` and carries a policy granting it the calls the export makes on
+//! the destination ("Provide access to an Amazon S3 bucket using an IAM role", Exporting DB
 //! snapshot data to Amazon S3). The key is "the ID of the Amazon Web Services KMS key to
 //! use to encrypt the data exported to Amazon S3" (`KmsKeyId`), and the export cannot run
 //! under a key that does not exist or is not enabled.
@@ -18,6 +18,12 @@
 
 use super::export_objects::bucket_policy;
 
+/// The IAM action the FIRST call an export makes on its destination is authorized by: before
+/// anything is written, the export has to find out which Region the bucket is in, which is
+/// the `s3:GetBucketLocation` the role's policy has to grant ("include the following required
+/// actions ... s3:GetBucketLocation", `IamRoleArn`).
+pub const EXPORT_BUCKET_LOCATION_ACTION: &str = "s3:GetBucketLocation";
+
 /// The IAM action one export object write performs: it writes the exported file into the
 /// destination bucket, which is the `s3:PutObject` the role's policy has to grant ("include
 /// the following required actions to allow the transfer of files from Amazon RDS or Amazon
@@ -27,29 +33,36 @@ pub const EXPORT_OBJECT_WRITE_ACTION: &str = "s3:PutObject";
 /// What is wrong with the role an export was asked to run under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExportRoleDefect {
-    /// IAM answered that the value names no role this account holds, or that the role it
-    /// holds does not let the export principal assume it: the modelled
-    /// `IamRoleNotFoundFault`, "The IAM role is missing for exporting to an Amazon S3
-    /// bucket".
+    /// IAM answered that this account holds NO role under the name the value carries. The
+    /// export's KMS grant is created FOR that role, so a principal that cannot be resolved
+    /// is a grant that cannot be created, and the request is refused as the key fault that
+    /// failed grant carries ([`super::export_key_grant_not_created_message`], which records
+    /// the answer) rather than as a statement about the role.
+    Absent,
+    /// IAM holds the role, and the trust policy it carries does not let the export principal
+    /// assume it: the modelled `IamRoleNotFoundFault`, which that one sentence reports as the
+    /// principal not being allowed to assume the role or the role not existing.
     NotAssumable,
-    /// The role is assumable, but nothing grants it the object write the export performs,
-    /// or the destination bucket's own policy denies it: the modelled
-    /// `IamRoleMissingPermissionsFault`, which both halves of the decision are refused with
-    /// in the one wording [`super::export_role_missing_permissions_message`] builds.
-    MissingPermissions,
+    /// The role is assumable, but the FIRST of the calls the export makes on the destination
+    /// that its effective policy does not allow is this one — nothing grants it, or the
+    /// destination bucket's own policy denies it: the modelled
+    /// `IamRoleMissingPermissionsFault`, whose sentence names the call that failed
+    /// ([`super::export_role_missing_permissions_message`]).
+    MissingPermissions(&'static str),
 }
 
 /// Judge the export role the way Amazon RDS does before it accepts an export: `None` for a
 /// role the export can run under, and the defect that stops it otherwise.
 ///
-/// `bucket` is the destination, whose objects are the resource the write is authorized on
-/// and whose own policy is the other half of the decision.
+/// `bucket` is the destination, whose own policy is the other half of every call's decision
+/// and whose objects are the resource the object write is authorized on.
 ///
 /// Nothing is refused on an answer this emulator could not get: a value naming no role of
-/// this account, an IAM that is not mounted beside this service, or policies that could not
-/// be enumerated each leave the role unjudged, exactly as
-/// [`::service_common::iam_role::held_role_is_unassumable`] leaves a role IAM holds nothing
-/// under.
+/// this account, or an IAM that is not mounted beside this service, leaves the role unjudged.
+/// Policies that could not be enumerated leave the IDENTITY half of each call's decision
+/// untaken — they ground no refusal, and they withdraw none either: the destination's own
+/// explicit deny is an answer the object store gave, so it still refuses the export. Only
+/// what IAM and the object store ANSWERED grounds a defect.
 pub async fn export_role_defect<Eng: Send + Sync + 'static>(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     engine: &Eng,
@@ -57,7 +70,15 @@ pub async fn export_role_defect<Eng: Send + Sync + 'static>(
     role_arn: &str,
     bucket: &str,
 ) -> Option<ExportRoleDefect> {
-    if ::service_common::iam_role::role_is_unassumable(
+    // The EXISTENCE of the role is asked first and on its own, because the two answers are
+    // reported as different faults: a role this account holds nothing under is a principal
+    // the export's KMS grant cannot be created for, while a role it HOLDS that does not
+    // trust the export principal is the role's own fault
+    // ([`::service_common::iam_role::role_is_absent`] is stated for exactly this pair).
+    if ::service_common::iam_role::role_is_absent(ctx, region, role_arn).await {
+        return Some(ExportRoleDefect::Absent);
+    }
+    if ::service_common::iam_role::held_role_is_unassumable(
         ctx,
         region,
         role_arn,
@@ -67,38 +88,50 @@ pub async fn export_role_defect<Eng: Send + Sync + 'static>(
     {
         return Some(ExportRoleDefect::NotAssumable);
     }
-    // The objects the export writes: everything under the destination bucket, which is the
-    // resource form the required actions are granted on
-    // ("arn:aws:s3:::your-s3-bucket/*", `IamRoleArn`).
+    // The destination itself, which the bucket-level call is authorized on
+    // ("arn:aws:s3:::your-s3-bucket", `IamRoleArn`), and the objects the export writes,
+    // which the object write is ("arn:aws:s3:::your-s3-bucket/*").
+    let destination = ::service_com_amazonaws_s3_amazons3::state::bucket_arn(bucket);
     let objects = ::service_com_amazonaws_s3_amazons3::state::object_arn(bucket, "*");
     let principals = export_principals(role_arn);
     let context = export_context(role_arn);
-    let request = ::service_common::iam_authorization::Request::new(
-        EXPORT_OBJECT_WRITE_ACTION,
-        &objects,
-        &principals,
-    )
-    .with_context(&context);
-    // The bucket's own policy is read first: "an explicit deny in any policy overrides any
-    // allow", so a bucket that denies the role the write refuses the export whatever the
-    // role carries.
-    if let Some(policy) = bucket_policy(engine, bucket) {
-        if ::service_common::iam_authorization::resource_decision(&policy, &request)
-            == ::service_common::iam_authorization::Decision::Denied
-        {
-            return Some(ExportRoleDefect::MissingPermissions);
+    let policy = bucket_policy(engine, bucket);
+    // The role's own identity policies: a role carrying none of them can make none of the
+    // calls below, which is what the missing-permissions fault reports. A set of documents
+    // this emulator could not read establishes NOTHING about what the role may do, so that
+    // half of the decision is simply not taken — it never turns into a refusal, and it never
+    // withdraws the other half either.
+    let documents = role_identity_documents(ctx, region, role_arn).await;
+    // Each call the export makes on the destination, IN THE ORDER it makes them: the role is
+    // judged call by call and the FIRST one it cannot make is the one reported, because that
+    // is the call that failed — the export never gets to the next one.
+    for (action, resource) in [
+        (EXPORT_BUCKET_LOCATION_ACTION, destination.as_str()),
+        (EXPORT_OBJECT_WRITE_ACTION, objects.as_str()),
+    ] {
+        let request =
+            ::service_common::iam_authorization::Request::new(action, resource, &principals)
+                .with_context(&context);
+        // The bucket's own policy is read first: "an explicit deny in any policy overrides
+        // any allow", so a bucket that denies the role this call refuses the export whatever
+        // the role carries — and whether or not the role's own documents could be read, since
+        // a deny does not depend on them.
+        if let Some(policy) = &policy {
+            if ::service_common::iam_authorization::resource_decision(policy, &request)
+                == ::service_common::iam_authorization::Decision::Denied
+            {
+                return Some(ExportRoleDefect::MissingPermissions(action));
+            }
+        }
+        if let Some(documents) = &documents {
+            if ::service_common::iam_authorization::identity_decision(documents, &request)
+                != ::service_common::iam_authorization::Decision::Allowed
+            {
+                return Some(ExportRoleDefect::MissingPermissions(action));
+            }
         }
     }
-    // And the role's own identity policies have to GRANT it: a role carrying none of them
-    // cannot write the export, which is what the missing-permissions fault reports. A set
-    // of documents this emulator could not read establishes nothing.
-    let documents = role_identity_documents(ctx, region, role_arn).await?;
-    if ::service_common::iam_authorization::identity_decision(&documents, &request)
-        == ::service_common::iam_authorization::Decision::Allowed
-    {
-        return None;
-    }
-    Some(ExportRoleDefect::MissingPermissions)
+    None
 }
 
 /// Every spelling of the role a resource-based policy may name: the role's own ARN, and the

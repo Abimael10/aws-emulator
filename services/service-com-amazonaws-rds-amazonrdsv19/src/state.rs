@@ -236,7 +236,7 @@ pub use events::{
 };
 pub use export_tasks::{
     cross_region_export_bucket_message, cross_region_export_source_message,
-    export_kms_key_not_accessible_message, export_part_id,
+    export_key_grant_not_created_message, export_kms_key_not_accessible_message, export_part_id,
     export_role_missing_permissions_message, export_role_not_found_message, export_source_of,
     export_task_already_exists_message, export_task_not_found_message, export_task_quota_message,
     invalid_export_only_message, invalid_export_source_arn_message,
@@ -1869,6 +1869,31 @@ impl PendingStatus {
         }
     }
 
+    /// A transition to `status`, due [`STATUS_TRANSITION_DELAY`] after `previous` — the
+    /// instant the transition BEFORE it in the same progression became due.
+    ///
+    /// What a record whose progression has more than one step owes the clock: the span of the
+    /// second step runs from the moment the first was due, not from the moment somebody
+    /// looked. So a caller that reads a resource long after it started moving finds the
+    /// progression as far along as the clock has taken it, rather than one step per read.
+    pub fn in_a_moment_after(previous: Instant, status: &str) -> Self {
+        Self {
+            change: PendingChange::Status(status.to_string()),
+            due_at: previous + STATUS_TRANSITION_DELAY,
+        }
+    }
+
+    /// The record's removal from the store, due [`STATUS_TRANSITION_DELAY`] after `previous`
+    /// — the instant the transition before it became due, for the reason
+    /// [`Self::in_a_moment_after`] gives: the second step of a progression is owed from the
+    /// first step's due instant, not from the moment somebody looked.
+    pub fn removal_in_a_moment_after(previous: Instant) -> Self {
+        Self {
+            change: PendingChange::Removal,
+            due_at: previous + STATUS_TRANSITION_DELAY,
+        }
+    }
+
     /// The record's removal from the store, due [`STATUS_TRANSITION_DELAY`] from now.
     pub fn removal_in_a_moment() -> Self {
         Self {
@@ -3359,7 +3384,23 @@ pub fn uuid_text(bytes: &[u8]) -> String {
 
 /// The current instant as the modelled timestamp shapes carry it.
 pub fn now_as_wire_timestamp() -> ::aws_smithy_types::DateTime {
-    let seconds = SystemTime::now()
+    wire_timestamp_of(SystemTime::now())
+}
+
+/// The instant a change the clock owed became DUE, as the modelled timestamp shapes carry it:
+/// the wall-clock reading of `due_at`, taken as how long ago it passed.
+///
+/// What a record whose progression settled LATE reports for the moment it reached that state:
+/// the state was reached when the clock made it due, not when somebody finally looked, so a
+/// resource first read long after it finished reports the instant it finished.
+pub fn wire_timestamp_at(due_at: Instant, now: Instant) -> ::aws_smithy_types::DateTime {
+    let late = now.saturating_duration_since(due_at);
+    wire_timestamp_of(SystemTime::now().checked_sub(late).unwrap_or_else(SystemTime::now))
+}
+
+/// `instant` as the modelled timestamp shapes carry it.
+fn wire_timestamp_of(instant: SystemTime) -> ::aws_smithy_types::DateTime {
+    let seconds = instant
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64();

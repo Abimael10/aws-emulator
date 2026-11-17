@@ -381,10 +381,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // "The provided IAM role must have access to the S3 bucket": a role the export
-        // principal cannot assume is the modelled `IamRoleNotFoundFault`, and one that can
-        // be assumed but is not granted the object write — or is denied it by the bucket's
-        // own policy — is the modelled `IamRoleMissingPermissionsFault`.
+        // "The provided IAM role must have access to the S3 bucket". The role is resolved and
+        // then judged call by call, and each answer is reported as the fault that answer
+        // carries: a role IAM holds nothing under is a principal the export's KMS GRANT
+        // cannot be created for, which the recorded behaviour of this operation answers as
+        // the key fault in its "specified KMS key" wording
+        // ([`crate::state::export_key_grant_not_created_message`], which also records why the
+        // two conditions of that fault are worded differently); a role IAM HOLDS that the
+        // export principal cannot assume is the modelled `IamRoleNotFoundFault`; and a role
+        // that can be assumed but cannot make one of the calls the export makes on the
+        // destination — because nothing grants it, or because the bucket's own policy denies
+        // it — is the modelled `IamRoleMissingPermissionsFault`, naming the first such call.
         match crate::state::export_role_defect(
             ctx,
             &*self.engine,
@@ -394,6 +401,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .await
         {
+            Some(crate::state::ExportRoleDefect::Absent) => {
+                return Err(StartExportTaskErrorModeled::KMSKeyNotAccessibleFault(
+                    KMSKeyNotAccessibleFault {
+                        message: Some(crate::state::export_key_grant_not_created_message(
+                            &input.kms_key_id,
+                        )),
+                    },
+                )
+                .into())
+            }
             Some(crate::state::ExportRoleDefect::NotAssumable) => {
                 return Err(StartExportTaskErrorModeled::IamRoleNotFoundFault(
                     IamRoleNotFoundFault {
@@ -404,11 +421,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into())
             }
-            Some(crate::state::ExportRoleDefect::MissingPermissions) => {
+            Some(crate::state::ExportRoleDefect::MissingPermissions(action)) => {
                 return Err(StartExportTaskErrorModeled::IamRoleMissingPermissionsFault(
                     IamRoleMissingPermissionsFault {
                         message: Some(crate::state::export_role_missing_permissions_message(
                             &input.iam_role_arn,
+                            action,
                             &input.s3_bucket_name,
                         )),
                     },
@@ -559,6 +577,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 body: table.body.clone(),
             })
             .collect();
+        // What both of the export's own JSON files say about the export ITSELF: built once,
+        // so the per-table file and the summary beside it cannot disagree about the export
+        // they describe.
+        let summary = crate::state::ExportSummary {
+            export_task_identifier: &input.export_task_identifier,
+            source_arn: &source.arn,
+            source_type: source.source_type,
+            s3_bucket: &input.s3_bucket_name,
+            s3_prefix: input.s3_prefix.as_deref(),
+            kms_key_id: &input.kms_key_id,
+            export_only: &export_only,
+        };
         objects.push(crate::state::ExportedObject {
             key: crate::state::tables_info_key(
                 &prefix,
@@ -566,6 +596,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 tables.len(),
             ),
             body: crate::state::tables_info_document(
+                &summary,
                 &tables,
                 started,
                 ::std::time::SystemTime::now(),
@@ -578,15 +609,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         objects.push(crate::state::ExportedObject {
             key: crate::state::export_info_key(&prefix, &input.export_task_identifier),
             body: crate::state::export_info_document(
-                &crate::state::ExportSummary {
-                    export_task_identifier: &input.export_task_identifier,
-                    source_arn: &source.arn,
-                    source_type: source.source_type,
-                    s3_bucket: &input.s3_bucket_name,
-                    s3_prefix: input.s3_prefix.as_deref(),
-                    kms_key_id: &input.kms_key_id,
-                    export_only: &export_only,
-                },
+                &summary,
                 &tables,
                 started,
                 ::std::time::SystemTime::now(),

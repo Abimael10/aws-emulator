@@ -324,15 +324,21 @@ pub fn export_info_document(
     .to_string()
 }
 
-/// The JSON file that says what the export wrote: one entry per exported table, naming the
-/// table it came from, the status it ended in, the size it wrote, the part files it was
-/// written to and the source-to-exported type mapping of each of its columns — the contents
-/// the user guide describes for it.
+/// The JSON file that says what the export wrote: ONE object describing the export, carrying
+/// one entry per exported table under `perTableStatus` — naming the table it came from, the
+/// status it ended in, the size it wrote, the part files it was written to and the
+/// source-to-exported type mapping of each of its columns — which is the content the user
+/// guide describes for it.
+///
+/// It is an OBJECT and not a bare list: the file describes the export whose tables it lists,
+/// so the export's own identity and destination are in it beside them, and a client reads one
+/// document whichever part of it it wants.
 ///
 /// `started` and `ended` are the instants the export ran between, which the per-table
 /// statistics report.
 #[must_use]
 pub fn tables_info_document(
+    summary: &ExportSummary<'_>,
     tables: &[ExportedTable],
     started: SystemTime,
     ended: SystemTime,
@@ -373,7 +379,17 @@ pub fn tables_info_document(
             })
         })
         .collect();
-    ::serde_json::Value::Array(entries).to_string()
+    ::serde_json::json!({
+        "exportTaskIdentifier": summary.export_task_identifier,
+        "sourceArn": summary.source_arn,
+        "sourceType": summary.source_type,
+        "s3Bucket": summary.s3_bucket,
+        "s3Prefix": summary.s3_prefix.unwrap_or_default(),
+        "status": super::EXPORT_TASK_STATUS_COMPLETE,
+        "tablesExported": tables.len(),
+        "perTableStatus": entries,
+    })
+    .to_string()
 }
 
 /// `SizeGB`-style whole gigabytes of `bytes`, which is the unit both the export's own JSON
