@@ -737,10 +737,19 @@ fn declared_spelling(input_schema: &Schema, key: &str, value: &str) -> Option<&'
 /// framework's reader reads one back.
 const WIRE_BOOLEANS: [&str; 2] = ["true", "false"];
 
-/// The spelling the wire writes the boolean `value` names, when `key` names a BOOLEAN member
-/// of `input_schema` and the value spells one of them in another ASCII case; `None` when the
-/// key names no boolean member, when the value is already spelled as the wire writes it, or
-/// when it is no boolean at all — which is refused by the framework's reader as before.
+/// The spelling the wire writes the boolean `key` carries, when `key` names a BOOLEAN member
+/// of `input_schema` and the value the request sent is not already spelled that way; `None`
+/// when the key names no boolean member, when the value is already spelled as the wire writes
+/// it, or when it carries an escape, which the framework's reader decodes and this reading
+/// does not.
+///
+/// EC2 reads such a parameter as the FLAG it is rather than refusing a request for the way its
+/// value is written: a value that spells `true` in any ASCII case sets the flag, and every
+/// other value — another spelling of `false`, a digit, a word, an empty value — leaves it
+/// unset. That is the reading the recorded traffic shows (EC2 answering the dry-run verdict
+/// for a `DryRun` spelled in another case rather than refusing the body as unreadable), and
+/// the one a client that sends a flag the service cannot read as `true` is answered under:
+/// the request is SERVED, and the parameters a handler would refuse it for are reached.
 fn wire_boolean_spelling(
     input_schema: &Schema,
     key: &str,
@@ -749,10 +758,16 @@ fn wire_boolean_spelling(
     if !names_boolean_member(input_schema, key) {
         return None;
     }
-    let spelled = WIRE_BOOLEANS
-        .iter()
-        .copied()
-        .find(|spelling| value.eq_ignore_ascii_case(spelling))?;
+    // An escaped value is left exactly as the request sent it, for the framework's reader to
+    // decode and read as before — the same line [`recased_body`] draws for every value.
+    if value.contains('%') || value.contains('+') {
+        return None;
+    }
+    let spelled = if value.eq_ignore_ascii_case(WIRE_BOOLEANS[0]) {
+        WIRE_BOOLEANS[0]
+    } else {
+        WIRE_BOOLEANS[1]
+    };
     (spelled != value).then_some(spelled)
 }
 

@@ -193,7 +193,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the caller signed for is the one whose partition it is asking about — and the
         // one opt-in the request itself evidences.
         let signed_region = crate::state::request_region(ctx.parts());
-        let regions = crate::state::regions_for_request(&signed_region);
+        // Each Region is reported with the endpoint it is ANNOUNCED at, which is a name in the
+        // zone THIS emulator answers in rather than one in a zone Amazon Web Services serves:
+        // `DescribeRegions` is the call a multi-region client discovers where to send its next
+        // requests with, so an address it cannot reach would send that client out of the
+        // emulated environment ([`crate::state::announced_region_endpoint`]).
+        let announced_zone = crate::state::announced_endpoint_zone(ctx);
+        let regions = crate::state::regions_for_request(&signed_region, &announced_zone);
 
         // `RegionNames` holds "the names of the Regions", and the model bounds its length
         // nowhere, so the one caller-sized list this request carries is bounded before any

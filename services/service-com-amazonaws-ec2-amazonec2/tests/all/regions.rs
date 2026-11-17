@@ -12,16 +12,21 @@
 //! The rules under test:
 //!
 //! 1. A request reports every Region of the PARTITION it was signed for, each with its
-//!    Region name, its EC2 service endpoint (`ec2.<region>.<partition dns suffix>`) and
-//!    its opt-in status; a Region the account must opt in to is reported only when the
-//!    request asks for it.
-//! 2. `AllRegions` adds "Regions that are disabled for your account".
+//!    Region name, the endpoint that Region is ANNOUNCED at (`ec2.<region>.<the zone this
+//!    emulator answers in>`) and its opt-in status; a Region the account must opt in to is
+//!    reported only when the request asks for it.
+//! 2. `AllRegions` adds "Regions that are disabled for your account", and is read as the
+//!    FLAG it is: a value that spells `true` in any ASCII case sets it, any other value
+//!    leaves it unset, and either way the request is served.
 //! 3. `RegionNames` reports the Regions it names, "whether they are enabled and disabled
 //!    for your account"; a name that is no Region of the partition is refused with
 //!    `InvalidParameterValue`.
 //! 4. `Filters` are ANDed with one another and ORed over each filter's values, with EC2's
 //!    `*` / `?` wildcards; a filter the operation does not document is refused, and the
 //!    ceilings on one request's filtering work are enforced at the factor, not the product.
+//!    The `endpoint` filter matches the endpoint AWS PUBLISHES for a Region
+//!    (`ec2.<region>.<the partition's DNS suffix>`, the form its own doc gives) as well as
+//!    the one this emulator announces.
 //! 5. `DryRun` performs nothing and answers 412 `DryRunOperation`.
 //! 6. The describe is a read: repeating it answers the same Regions.
 //!
@@ -34,7 +39,7 @@ use ec2::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::ec2_query::{element, error_code, filters, indexed, unescaped};
+use super::ec2_query::{element, error_code, filters, indexed, member as envelope_member, unescaped};
 
 /// The Regions of the commercial partition every account can use WITHOUT opting in: the
 /// "Regions that are enabled by default" table of the Amazon Web Services Account
@@ -79,6 +84,34 @@ const OPT_IN_SAMPLE: [&str; 6] = [
 /// hands back is not needed here.
 fn emulator() -> MultiServiceRouter {
     super::ec2_query::emulator().0
+}
+
+/// The DNS zone this emulator may announce a name of its own in, for every call this suite
+/// drives: the suites run the service in process on no port at all, where the base a later
+/// request addresses is `smithy_server_runtime::UNSERVED_URL_BASE` — a host RFC 6761
+/// reserves so that nothing resolves it — and the zone of an announced name is that base's
+/// own host.
+fn announced_zone() -> &'static str {
+    let base = smithy_server_runtime::UNSERVED_URL_BASE;
+    base.split_once("://").map_or(base, |(_, authority)| authority)
+}
+
+/// The endpoint `region` is ANNOUNCED at: this service's endpoint prefix and the Region
+/// code in the zone this emulator answers in ([`announced_zone`]) — the value
+/// `Region$Endpoint` carries, because `DescribeRegions` is the call a multi-region client
+/// discovers where to send its next requests with, and a name under a zone Amazon Web
+/// Services serves would send it out of the emulated environment.
+fn announced_endpoint(region: &str) -> String {
+    format!("ec2.{region}.{}", announced_zone())
+}
+
+/// The endpoint identity Amazon Web Services PUBLISHES for `region`: this service's
+/// endpoint prefix, the Region code and the DNS suffix of the Region's partition —
+/// `ec2.us-east-1.amazonaws.com`, the form the `endpoint` filter's own doc gives
+/// (`smithy_query(query="doc",shape="DescribeRegionsRequest",member="Filters")`), which
+/// that filter matches beside the announced endpoint above.
+fn published_endpoint(region: &str, dns_suffix: &str) -> String {
+    format!("ec2.{region}.{dns_suffix}")
 }
 
 /// One `DescribeRegions` call signed for `region`, with `params` as extra form fields.
@@ -169,7 +202,8 @@ type FilterCase<'a> = (
 // ---------------------------------------------------------------------------
 
 /// A commercial-partition call reports exactly the Regions that are enabled by default,
-/// each `opt-in-not-required`, with the commercial endpoint and no invented geography.
+/// each `opt-in-not-required`, announced at this emulator's own endpoint for that Region and
+/// with no invented geography.
 #[tokio::test]
 async fn a_commercial_call_reports_the_regions_enabled_by_default() {
     let router = emulator();
@@ -189,8 +223,9 @@ async fn a_commercial_call_reports_the_regions_enabled_by_default() {
         for region in regions(signed, &body) {
             assert_eq!(
                 region.endpoint,
-                format!("ec2.{}.amazonaws.com", region.name),
-                "case {signed:?}: expected the Region's own EC2 endpoint, got {region:?}"
+                announced_endpoint(&region.name),
+                "case {signed:?}: expected the Region's own endpoint in this emulator's \
+                 zone, got {region:?}"
             );
             assert_eq!(
                 region.opt_in_status, "opt-in-not-required",
@@ -222,8 +257,9 @@ async fn a_commercial_call_reports_the_regions_enabled_by_default() {
     }
 }
 
-/// A call signed for a Region of another partition reports THAT partition's Regions, with
-/// that partition's endpoint DNS suffix.
+/// A call signed for a Region of another partition reports THAT partition's Regions, each
+/// announced at this emulator's own endpoint for it and each still MATCHED by the endpoint
+/// identity AWS publishes for it under that partition's DNS suffix.
 ///
 /// The rows are the non-commercial partitions this emulator's Region catalog
 /// (`emulator_telemetry::policy::KNOWN_REGIONS`) holds Regions of, each with the
@@ -271,14 +307,35 @@ async fn a_call_reports_the_regions_of_its_own_partition() {
         for region in regions(signed, &body) {
             assert_eq!(
                 region.endpoint,
-                format!("ec2.{}.{suffix}", region.name),
-                "case {signed:?}: expected the partition's {suffix} endpoint, got {region:?}"
+                announced_endpoint(&region.name),
+                "case {signed:?}: expected the Region's own endpoint in this emulator's \
+                 zone, got {region:?}"
             );
             assert_eq!(
                 region.opt_in_status, "opt-in-not-required",
                 "case {signed:?}: a Region of the caller's own partition needs no opt-in, got {region:?}"
             );
         }
+
+        // The partition's own DNS suffix is what the `endpoint` filter is written against,
+        // so filtering on the endpoint AWS publishes for one Region of this partition
+        // selects exactly that Region.
+        let named = expected[0];
+        let (status, body) = describe(
+            &router,
+            signed,
+            &filters(&[("endpoint", &[published_endpoint(named, suffix).as_str()])]),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {signed:?}: expected 200 from the endpoint filter, got {status} {body}"
+        );
+        assert_eq!(
+            region_names(signed, &body),
+            sorted(&[named]),
+            "case {signed:?}: the {suffix} endpoint of {named} must select it, got {body}"
+        );
     }
 }
 
@@ -323,6 +380,119 @@ async fn an_enabled_region_is_served() {
         assert_eq!(
             status, 200,
             "case {signed:?}: expected 200, got {status} {body}"
+        );
+    }
+}
+
+/// A Region's `regionEndpoint` is the endpoint THIS emulator announces for that Region: its
+/// own first labels — the service's endpoint prefix and the Region code — in the zone this
+/// emulator answers in, never a host under a zone Amazon Web Services publishes its own
+/// endpoints in.
+///
+/// `DescribeRegions` is the call a multi-region client discovers where to send its next
+/// requests with, so the value is an address that client then resolves and dials: a name in
+/// a zone AWS serves resolves nowhere near this process — or, worse, at genuine AWS
+/// infrastructure — and sends the client out of the emulated environment carrying the
+/// credentials it holds. The identity of the Region stays in the name, so one Region's
+/// endpoint is still distinguishable from another's.
+///
+/// The rows span what the rule generalises over: the Region a call is signed for, Regions
+/// that are enabled and Regions that are not, and the partitions whose Regions carry a
+/// different published DNS suffix — the request asks for ALL Regions, so every Region of the
+/// partition is a row of the table.
+#[tokio::test]
+async fn a_region_is_announced_at_this_emulators_own_endpoint_for_it() {
+    let router = emulator();
+    // The zones AWS publishes its own service endpoints in: a `regionEndpoint` under any of
+    // them is an address this emulator does not answer on.
+    let aws_zones = ["amazonaws.com", "amazonaws.com.cn", "api.aws", "aws"];
+
+    for signed in [
+        "us-east-1",
+        "eu-west-3",
+        "cn-north-1",
+        "us-gov-east-1",
+        "us-iso-west-1",
+        "eu-isoe-west-1",
+    ] {
+        let (status, body) = describe(
+            &router,
+            signed,
+            &[("AllRegions".to_string(), "true".to_string())],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {signed:?}: expected 200, got {status} {body}"
+        );
+        let reported = regions(signed, &body);
+        assert!(
+            !reported.is_empty(),
+            "case {signed:?}: expected the partition's Regions, got {body}"
+        );
+        for region in &reported {
+            assert_eq!(
+                region.endpoint,
+                announced_endpoint(&region.name),
+                "case {signed:?}: expected {:?}, got {:?}",
+                announced_endpoint(&region.name),
+                region.endpoint
+            );
+            for zone in aws_zones {
+                assert!(
+                    !region.endpoint.ends_with(zone),
+                    "case {signed:?}: a Region must not be announced in the {zone:?} zone, \
+                     got {:?}",
+                    region.endpoint
+                );
+            }
+        }
+        // Two Regions never share an announced endpoint: the identity of the Region is
+        // what a client tells one endpoint from another by.
+        let mut announced: Vec<String> =
+            reported.iter().map(|region| region.endpoint.clone()).collect();
+        let announced_count = announced.len();
+        announced.sort();
+        announced.dedup();
+        assert_eq!(
+            announced.len(),
+            announced_count,
+            "case {signed:?}: every Region must be announced at its own endpoint, got \
+             {announced:?}"
+        );
+    }
+
+    // The `endpoint` filter selects a Region by EITHER form: the endpoint this emulator
+    // announces for it, and the endpoint identity AWS publishes for it — the form the
+    // filter's own doc gives.
+    let cases: [(&str, &str, &str); 4] = [
+        ("the announced endpoint", "us-east-1", "announced"),
+        ("the published endpoint", "us-east-1", "published"),
+        (
+            "the announced endpoint of a disabled Region",
+            "af-south-1",
+            "announced",
+        ),
+        (
+            "the published endpoint of a disabled Region",
+            "af-south-1",
+            "published",
+        ),
+    ];
+    for (case, region, form) in cases {
+        let value = if form == "announced" {
+            announced_endpoint(region)
+        } else {
+            published_endpoint(region, "amazonaws.com")
+        };
+        let mut params = vec![("AllRegions".to_string(), "true".to_string())];
+        params.extend(filters(&[("endpoint", &[value.as_str()])]));
+        let (status, body) = describe(&router, "us-east-1", &params).await;
+        assert_eq!(status, 200, "case {case:?}: expected 200, got {status} {body}");
+        assert_eq!(
+            region_names(case, &body),
+            sorted(&[region]),
+            "case {case:?}: {value:?} must select {region}, got {body}"
         );
     }
 }
@@ -386,8 +556,84 @@ async fn all_regions_adds_the_disabled_regions() {
         );
         assert_eq!(
             found.endpoint,
-            format!("ec2.{disabled}.amazonaws.com"),
+            announced_endpoint(disabled),
             "case {case:?}: a disabled Region still reports its endpoint, got {found:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rule 2b: a boolean selector is read as the flag it is
+// ---------------------------------------------------------------------------
+
+/// `AllRegions` is a FLAG: a value that spells `true` in any ASCII case sets it and every
+/// other value leaves it unset, and either way the request is SERVED — the way a value is
+/// written is never what the describe is refused for. So a request a client wrote its flag
+/// unusually in still reports Regions, and one whose filter selects none is answered a
+/// present-and-empty `regionInfo` rather than a refusal.
+///
+/// The rows span what the rule generalises over: the two spellings the wire writes a flag
+/// in, the same two in another ASCII case, the digits a client may write a flag as, a word,
+/// an empty value and a near-miss of the spelling that would set it — crossed with a filter
+/// that selects nothing, which is the shape that makes an empty `regionInfo` the answer.
+#[tokio::test]
+async fn an_all_regions_value_that_does_not_spell_true_leaves_the_flag_unset() {
+    let router = emulator();
+    // (the value `AllRegions` carries, whether it sets the flag)
+    let spellings: [(&str, bool); 10] = [
+        ("true", true),
+        ("TRUE", true),
+        ("True", true),
+        ("tRuE", true),
+        ("false", false),
+        ("FALSE", false),
+        ("1", false),
+        ("0", false),
+        ("", false),
+        ("ture", false),
+    ];
+
+    for (value, sets_the_flag) in spellings {
+        let case = format!("AllRegions={value:?}");
+        let params = vec![("AllRegions".to_string(), value.to_string())];
+        let (status, body) = describe(&router, "us-east-1", &params).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200, got {status} {body}"
+        );
+        let reported = region_names(&case, &body);
+        let enabled = sorted(&ENABLED_BY_DEFAULT);
+        if sets_the_flag {
+            assert!(
+                reported.len() > enabled.len(),
+                "case {case:?}: the flag is set, so the disabled Regions are reported too, \
+                 got {reported:?}"
+            );
+        } else {
+            assert_eq!(
+                reported, enabled,
+                "case {case:?}: the flag is unset, so only the enabled Regions are \
+                 reported, got {reported:?}"
+            );
+        }
+
+        // The same value beside a filter that selects nothing: the request is still served,
+        // and `regionInfo` is reported present and empty rather than absent.
+        let mut narrowed = params.clone();
+        narrowed.extend(filters(&[("region-name", &["no-such-region-1"])]));
+        let (status, body) = describe(&router, "us-east-1", &narrowed).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 for the filtered read, got {status} {body}"
+        );
+        assert!(
+            region_names(&case, &body).is_empty(),
+            "case {case:?}: a filter that selects nothing reports no Region, got {body}"
+        );
+        assert_eq!(
+            envelope_member(&body, "regionInfo").as_deref(),
+            Some(""),
+            "case {case:?}: expected a present-and-empty regionInfo, got {body}"
         );
     }
 }
@@ -395,7 +641,6 @@ async fn all_regions_adds_the_disabled_regions() {
 // ---------------------------------------------------------------------------
 // Rule 3: RegionNames
 // ---------------------------------------------------------------------------
-
 /// A Region named by `RegionNames` is reported, whatever its opt-in status; naming none
 /// reports the enabled ones.
 ///

@@ -3,16 +3,18 @@
 //! End-to-end cover for how this service READS a boolean request parameter, driven over the
 //! wire it speaks: `ec2Query`, an `application/x-www-form-urlencoded` POST answered with XML.
 //!
-//! The rule under test: a BOOLEAN parameter is read without regard to ASCII case, so a
-//! request spelling its value `TRUE`, `True` or `FALSE` carries the boolean it spells and is
-//! SERVED — a `DryRun` spelled that way is answered the dry-run verdict, not refused as a
-//! body the service could not read. Three things follow, and each is a test below:
+//! The rule under test: a BOOLEAN parameter is read as the FLAG it is rather than refused
+//! for the way its value is written — a value that spells `true` in any ASCII case sets the
+//! flag, and every other value leaves it unset — so a `DryRun` spelled `TRUE` is answered
+//! the dry-run verdict and one carrying a value that is no boolean at all is SERVED with the
+//! flag unset, not refused as a body the service could not read. Three things follow, and
+//! each is a test below:
 //!
 //! 1. every spelling of each boolean, on every operation that carries one, is read as the
 //!    value it spells — the `true` spellings stop the call at the dry-run verdict and the
 //!    `false` spellings do not stop it at all;
-//! 2. a value that is no boolean in any case is still refused, so the rule widens the CASE a
-//!    boolean may be written in and nothing else;
+//! 2. a value that spells neither boolean leaves the flag UNSET and the call is performed,
+//!    which is how the recorded wire shows EC2 reading such a parameter;
 //! 3. a value of a member that is not a boolean is untouched by it — a filter value that
 //!    reads like one is still compared as the request sent it.
 //!
@@ -126,25 +128,35 @@ async fn every_case_of_false_is_read_as_the_flag_it_spells() {
     }
 }
 
-/// RULE 2: a value that is no boolean in ANY case is still refused — the rule is about the
-/// case a boolean may be written in, not about accepting anything in a boolean's place.
+/// RULE 2: a value that spells NEITHER boolean leaves the flag unset and the call is
+/// performed — a boolean parameter is a flag the service reads, not a value it refuses the
+/// whole request over.
+///
+/// The rows span what the rule generalises over: a word, a numeral, a near-miss of the
+/// spelling that WOULD set the flag, an empty value, the two digits a client may write a
+/// flag as, and a value carrying no ASCII letter at all. None of them is `true` in any case,
+/// so none may set the flag: a 412 would mean the value had been taken for `true`.
 #[tokio::test]
-async fn a_value_that_is_no_boolean_is_still_refused() {
+async fn a_value_that_spells_neither_boolean_leaves_the_flag_unset() {
     let (router, _engine) = emulator();
 
-    // Rows: a word, a numeral, a near-miss of a declared spelling and an empty value.
-    for value in ["yes", "1", "truthy", ""] {
+    for value in ["yes", "no", "1", "0", "truthy", "ture", "", "-"] {
         let case = format!("DryRun={value:?}");
         let (status, body) = call(&router, REGION, "DescribeVpcs", &[p("DryRun", value)]).await;
         assert_eq!(
-            status, 400,
-            "case {case:?}: expected HTTP 400, got {status} with body {body}"
+            status, 200,
+            "case {case:?}: expected HTTP 200, got {status} with body {body}"
         );
-        // Whatever the code, the call must not have been read as EITHER boolean: a 412 would
-        // mean the value was taken for `true`, and a 200 for `false`.
         assert_ne!(
             status, DRY_RUN_STATUS,
-            "case {case:?}: a value that is no boolean must not set the flag, got {body}"
+            "case {case:?}: a value that does not spell `true` must not set the flag, got \
+             {body}"
+        );
+        // The call was performed, so it reports the Region's own VPCs rather than a refusal.
+        assert_eq!(
+            elements(&body, "vpcId").len(),
+            1,
+            "case {case:?}: expected the Region's default VPC to be reported, got {body}"
         );
     }
 }

@@ -151,10 +151,11 @@ pub const OPT_IN_STATUS_OPTED_IN: &str = "opted-in";
 /// `Region$OptInStatus` for a Region that requires an opt-in the account has not made.
 pub const OPT_IN_STATUS_NOT_OPTED_IN: &str = "not-opted-in";
 
-/// Every filter `DescribeRegions` documents, as its `Filters` member lists them
-/// (`smithy_query(query="doc",shape="DescribeRegionsRequest",member="Filters")`). A
-/// filter outside this set is refused; a filter inside it is answered by
-/// [`RegionRecord::filter_values`], which must cover every entry.
+/// Every attribute `DescribeRegions` documents a filter for, as its `Filters` member lists
+/// them (`smithy_query(query="doc",shape="DescribeRegionsRequest",member="Filters")`): the
+/// attributes a Region carries a value for, each answered by
+/// [`RegionRecord::filter_values`], which must cover every entry. A filter naming anything
+/// else is refused.
 pub const REGION_FILTERS: [&str; 3] = ["endpoint", "opt-in-status", "region-name"];
 
 /// The [`NON_COMMERCIAL_PARTITIONS`] entry `region` belongs to, or `None` when `region`
@@ -180,14 +181,53 @@ pub fn partition_dns_suffix(region: &str) -> &'static str {
     partition_of(region).map_or(COMMERCIAL_DNS_SUFFIX, |(_, suffix)| *suffix)
 }
 
-/// `region`'s EC2 service endpoint: this service's endpoint prefix, the Region code, and
-/// the DNS suffix of the Region's partition — `ec2.us-east-1.amazonaws.com`, the form
-/// `DescribeRegions`'s `endpoint` filter doc gives.
+/// The endpoint identity Amazon Web Services PUBLISHES for `region`: this service's endpoint
+/// prefix, the Region code, and the DNS suffix of the Region's partition —
+/// `ec2.us-east-1.amazonaws.com`, the form `DescribeRegions`'s `endpoint` filter doc gives.
+///
+/// A NAME, not an address to dial: it is the published identity of a Region's endpoint, which
+/// is what the `endpoint` filter is written against ([`RegionRecord::filter_values`]). What a
+/// report ANNOUNCES as the endpoint a client then sends its requests to is
+/// [`announced_region_endpoint`], because a name in a zone Amazon Web Services serves resolves
+/// nowhere near this process.
 pub fn region_endpoint(region: &str) -> String {
     format!(
         "{EC2_ENDPOINT_PREFIX}.{region}.{}",
         partition_dns_suffix(region)
     )
+}
+
+/// The host a Region's EC2 endpoint is ANNOUNCED at: this service's endpoint prefix and the
+/// Region code — so each Region is announced its OWN endpoint — in the DNS zone THIS emulator
+/// answers in (`announced_zone`, as [`announced_endpoint_zone`] reads it), which for an
+/// emulator reached at an address is the loopback zone: `ec2.us-east-1.localhost`.
+///
+/// `Region$Endpoint` is "The Region service endpoint", so it is an address a multi-region
+/// client RESOLVES and then sends its next requests to. A name under a zone Amazon Web
+/// Services serves resolves nowhere near this process, or worse to genuine infrastructure, so
+/// announcing one sends that client out of the emulated environment carrying the credentials
+/// it holds. The Region a request is served for is read off its credential scope, so every
+/// Region of this emulator is reached at the one endpoint it answers on — the name announced
+/// here keeps the Region in its first labels, which is what lets a client tell one Region's
+/// endpoint from another's.
+pub fn announced_region_endpoint(region: &str, announced_zone: &str) -> String {
+    format!("{EC2_ENDPOINT_PREFIX}.{region}.{announced_zone}")
+}
+
+/// The DNS zone THIS emulator may announce a name of its own in, for the request being served:
+/// the zone of the endpoint the request reached, or of the address this process is served at
+/// for a caller that addressed one of Amazon Web Services' own hosts.
+///
+/// Read through the tree's one reading of both questions
+/// (`service_common::data_plane_addressing`), so this service writes no second rule for which
+/// host is the emulator's own; an emulator reached at an ADDRESS names no zone, and that
+/// reading answers the loopback zone for it.
+pub fn announced_endpoint_zone(ctx: &::smithy_server_runtime::OperationContext<'_>) -> String {
+    use ::service_common::data_plane_addressing as addressing;
+
+    let authority = addressing::reached_emulator_endpoint_of_parts(ctx.parts())
+        .unwrap_or_else(|| addressing::emulator_endpoint_authority(ctx));
+    addressing::announced_zone_of_authority(&authority)
 }
 
 /// Every Region of the partition `region` belongs to, in Region-code order.
@@ -302,8 +342,13 @@ pub const AUTH_FAILURE: &str = "AuthFailure";
 pub struct RegionRecord {
     /// `us-east-1` — the Region code.
     pub region_name: String,
-    /// The Region's EC2 service endpoint, as [`region_endpoint`] builds it.
+    /// The Region's EC2 service endpoint as this emulator ANNOUNCES it, which is the value a
+    /// report carries ([`announced_region_endpoint`]).
     pub endpoint: String,
+    /// The endpoint identity Amazon Web Services publishes for the Region
+    /// ([`region_endpoint`]) — the form the `endpoint` filter's own doc gives, matched by that
+    /// filter beside the announced one so a request written against either selects the Region.
+    pub published_endpoint: String,
     /// `opt-in-not-required`, `opted-in` or `not-opted-in`.
     pub opt_in_status: &'static str,
 }
@@ -337,9 +382,14 @@ impl RegionRecord {
 
     /// The values the EC2 filter `name` compares against this Region, or `None` when
     /// `name` is not one of [`REGION_FILTERS`].
+    ///
+    /// The `endpoint` attribute carries TWO values: the endpoint this emulator announces for
+    /// the Region and the endpoint identity Amazon Web Services publishes for it (the form the
+    /// filter's own doc gives, `ec2.us-east-1.amazonaws.com`), so a request that filters on
+    /// either selects the Region — the values of one filter are ORed.
     pub fn filter_values(&self, name: &str) -> Option<Vec<&str>> {
         let values = match name {
-            "endpoint" => vec![self.endpoint.as_str()],
+            "endpoint" => vec![self.endpoint.as_str(), self.published_endpoint.as_str()],
             "opt-in-status" => vec![self.opt_in_status],
             "region-name" => vec![self.region_name.as_str()],
             _ => return None,
@@ -350,14 +400,15 @@ impl RegionRecord {
 
 /// The Regions a request signed for `signed_region` can see, in Region-code order:
 /// every Region of that Region's partition ([`regions_in_partition_of`]), each with its
-/// endpoint and its opt-in status.
+/// endpoint — announced in `announced_zone`, the zone this emulator answers in
+/// ([`announced_region_endpoint`]) — and its opt-in status.
 ///
 /// A well-formed `signed_region` the catalog does not hold is reported beside them, so a
 /// caller is never told the Region it is calling in does not exist — the same allowance
 /// `GetSpotPlacementScores` makes for the Region a call was signed for. A credential
 /// scope is caller-controlled text, so one that is not shaped like a Region code
 /// ([`region_name_is_well_formed`]) adds nothing.
-pub fn regions_for_request(signed_region: &str) -> Vec<RegionRecord> {
+pub fn regions_for_request(signed_region: &str, announced_zone: &str) -> Vec<RegionRecord> {
     let mut names: Vec<&str> = regions_in_partition_of(signed_region);
     if region_name_is_well_formed(signed_region) && !names.contains(&signed_region) {
         names.push(signed_region);
@@ -367,7 +418,8 @@ pub fn regions_for_request(signed_region: &str) -> Vec<RegionRecord> {
         .into_iter()
         .map(|name| RegionRecord {
             region_name: name.to_string(),
-            endpoint: region_endpoint(name),
+            endpoint: announced_region_endpoint(name, announced_zone),
+            published_endpoint: region_endpoint(name),
             opt_in_status: region_opt_in_status(name),
         })
         .collect()
