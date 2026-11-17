@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeTableStatistics
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeTableStatistics`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeTableStatistics::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the per-table accounting of the run the task named is on — the
+//! schema and table each entry belongs to, the rows its full load moved and the state that
+//! load left it in — projected out of [`crate::state::task_run`], with this operation's
+//! own documented filtering and paging.
+//! The notes below are the scaffold's, kept for the next reader.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +154,132 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeTableStatistics` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeTableStatisticsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeTableStatistics"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(invalid_state(
+                "the dms emulator is mounted on an engine that holds no state for it".to_string(),
+            ));
+        };
+
+        let filters = input.filters.unwrap_or_default();
+        check_filter_names(&filters)?;
+        // This operation's own range: "Default: 100 Constraints: Minimum 20, maximum 500"
+        // (`MaxRecords` doc), which is a larger page than the service's other describes
+        // take.
+        let size = crate::state::page_size_in_range(
+            input.max_records,
+            crate::state::MAX_RECORDS_MIN,
+            MAX_RECORDS_MAX,
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        let now = ::std::time::SystemTime::now();
+        // What a table's statistics say is what its load did, so the load the clock has
+        // made due runs before they are read.
+        crate::state::advance_task_runs(&*self.engine, ctx.callback(), now).await;
+        let mut store = state.lock();
+        store.settle(now);
+
+        let Some(task) = store.replication_tasks.get(&input.replication_task_arn) else {
+            return Err(DescribeTableStatisticsErrorModeled::ResourceNotFoundFault(
+                ResourceNotFoundFault {
+                    message: Some(format!(
+                        "ReplicationTaskArn {} does not name a replication task in this account",
+                        input.replication_task_arn
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // One entry per table the task's run covers, each with the key a later page
+        // resumes at. A task that has never run, and one whose full load has not begun,
+        // has no per-table accounting yet — which is an empty answer, not a missing
+        // resource.
+        let matching: Vec<(String, TableStatistics)> = task
+            .table_statistics()
+            .into_iter()
+            .filter(|statistics| matches_filters(statistics, &filters))
+            .map(|statistics| (page_key(&statistics), statistics))
+            .collect();
+
+        let (page, marker) =
+            crate::state::paginate(&matching, input.marker.as_ref(), size, |entry| entry.0.as_str())
+                .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        Ok(DescribeTableStatisticsOutput {
+            replication_task_arn: Some(task.arn.clone()),
+            table_statistics: Some(
+                matching[page]
+                    .iter()
+                    .map(|(_, statistics)| statistics.clone())
+                    .collect(),
+            ),
+            marker,
+        })
     }
+}
+
+/// Largest `MaxRecords` this operation accepts: "Constraints: Minimum 20, maximum 500".
+/// Only the maximum differs from the service's other paginated describes — this operation
+/// pages per TABLE of one task rather than per resource of an account — so the minimum is
+/// the one `crate::state::MAX_RECORDS_MIN` they all read.
+const MAX_RECORDS_MAX: i32 = 500;
+
+/// The filter names the `Filters` member doc publishes: "Valid filter names: schema-name |
+/// table-name | table-state".
+const DOCUMENTED_FILTERS: &[&str] = &["schema-name", "table-name", "table-state"];
+
+/// Refuse a filter name this operation does not document, rather than ignoring it and
+/// answering with tables the caller asked to exclude.
+fn check_filter_names(filters: &[Filter]) -> Result<(), DescribeTableStatisticsError> {
+    for filter in filters {
+        if !DOCUMENTED_FILTERS.contains(&filter.name.as_str()) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "{} is not a supported filter name; the valid filter names are {}",
+                filter.name,
+                DOCUMENTED_FILTERS.join(" | ")
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `statistics` satisfies every filter the request carries: "A combination of
+/// filters creates an AND condition where each record matches all specified filters"
+/// (`Filters` doc), and each filter admits the records whose matching attribute is one of
+/// its values.
+fn matches_filters(statistics: &TableStatistics, filters: &[Filter]) -> bool {
+    let admits = |filter: &Filter, value: Option<&String>| {
+        value.is_some_and(|value| filter.values.contains(value))
+    };
+    filters.iter().all(|filter| match filter.name.as_str() {
+        "schema-name" => admits(filter, statistics.schema_name.as_ref()),
+        "table-name" => admits(filter, statistics.table_name.as_ref()),
+        "table-state" => admits(filter, statistics.table_state.as_ref()),
+        // `check_filter_names` has already refused every other name.
+        _ => true,
+    })
+}
+
+/// The key a page of these statistics resumes at: one task's entries are identified by the
+/// TABLE each describes, since this answer carries one entry per table and no ARNs. The
+/// two names are joined by a character neither of them carries, so no two entries of one
+/// task share a key.
+fn page_key(statistics: &TableStatistics) -> String {
+    format!(
+        "{}\u{1f}{}",
+        statistics.schema_name.as_deref().unwrap_or_default(),
+        statistics.table_name.as_deref().unwrap_or_default()
+    )
+}
+
+/// The error this operation models for a resource that cannot be used for a migration in
+/// the state it is in. The DMS model declares no server-side fault, so the unreachable "no
+/// store" branch uses it too rather than a 501, which would claim the operation is
+/// unimplemented.
+fn invalid_state(message: String) -> DescribeTableStatisticsError {
+    DescribeTableStatisticsErrorModeled::InvalidResourceStateFault(InvalidResourceStateFault {
+        message: Some(message),
+    })
+    .into()
 }

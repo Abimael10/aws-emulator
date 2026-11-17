@@ -32,10 +32,17 @@ hex = { workspace = true }
 # given against EC2 before it persists a group. Only the generated client is needed — the
 # emulator supplies the transport.
 aws-sdk-ec2 = { version = "1", default-features = false }
+# The AWS SDK for Amazon S3, driven over the same in-process callback: a replication task
+# whose endpoints are Amazon S3 buckets performs its full load through the object store's
+# OWN operations — it lists the source bucket for the tables the task's mappings select and
+# writes each table's rows as a full-load object at the target.
+aws-sdk-s3 = { version = "1", default-features = false }
 # `iam_role::role_is_unassumable`: the ONE reading of a caller-supplied role ARN against
 # the account's IAM records, which `CreateEndpoint` resolves `ServiceAccessRoleArn`
 # through. `arn::region_label` is the one reading of a caller-supplied Region as a Region
-# LABEL, which the EC2 endpoint above is built from.
+# LABEL, which the EC2 endpoint above is built from. `s3_client` and `s3_object_read` are
+# the one construction of the hop into the object store and the one reading of what its
+# answer about an object established, which a full load moves rows over.
 service-common = { path = "../common" }
 
 [build-dependencies]

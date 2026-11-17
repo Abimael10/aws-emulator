@@ -143,9 +143,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Reporting only: every answer comes from the store, so `ctx` carries nothing
-        // this operation needs.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::scaffolded::Scaffolded::validation(
                 "the dms emulator is mounted on an engine that holds no state for it",
@@ -158,11 +155,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(crate::scaffolded::Scaffolded::validation)?;
         let without_settings = input.without_settings.unwrap_or_default();
 
+        let now = ::std::time::SystemTime::now();
+        // A task stops being `running` when the run it is on finishes, which is work the
+        // clock owes: the full load it has made due runs before any task's status, stop
+        // reason or statistics are read.
+        crate::state::advance_task_runs(&*self.engine, ctx.callback(), now).await;
         let mut store = state.lock();
         // A read reports what the clock has already made due: a task whose `creating`
         // span has elapsed reads `ready` here, and one whose `deleting` span has elapsed
         // is gone, whether or not anybody called in between.
-        store.settle(::std::time::SystemTime::now());
+        store.settle(now);
 
         let matching: Vec<&crate::state::ReplicationTaskRecord> = store
             .ordered_tasks()

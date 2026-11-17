@@ -337,6 +337,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }),
             cdc_stop_position: input.cdc_stop_position,
             tags: crate::state::tags_for(&arn, input.tags),
+            // Only `StartReplicationTask` puts a task on a run.
+            run: None,
             // `creating` is not terminal: the task is owed `ready`, so a caller that
             // starts it straight away still sees the transient status.
             pending: Some(crate::state::Pending::after(

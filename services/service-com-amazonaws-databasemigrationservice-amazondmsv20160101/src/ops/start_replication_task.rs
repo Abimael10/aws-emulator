@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartReplicationTask
-//! IMPLEMENTED: moves the persisted task into `starting` and records its start date in
-//! [`crate::state`], so a following `DescribeReplicationTasks` observes the new status.
+//! IMPLEMENTED: moves the persisted task into `starting`, records its start date and puts
+//! it on a RUN in [`crate::state`] — the full load that run performs between the task's
+//! endpoints, and the stop a task with no change-capture phase after it arrives at — so a
+//! following `DescribeReplicationTasks` observes the new status and, once the clock has
+//! carried the run that far, the finished load's statistics and stop reason.
 //! The notes below are the scaffold's, kept for the next reader.
 //!
 //! ## Shape of an operation
@@ -163,8 +166,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Every answer comes from the store; `ctx` carries nothing this operation needs.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(invalid_state(
                 "the dms emulator is mounted on an engine that holds no state for it".to_string(),
@@ -179,6 +180,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = ::std::time::SystemTime::now();
+        // A task this account already has running is owed the full load the clock has
+        // made due, so what this task is started BESIDE is up to date before its own
+        // status is read — and a task that has already finished reads `stopped` here,
+        // which is a status it can be started again from.
+        crate::state::advance_task_runs(&*self.engine, ctx.callback(), now).await;
         let mut store = state.lock();
         store.settle(now);
 
@@ -218,6 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         task.status = crate::state::TASK_STARTING.to_string();
         task.start_date = Some(now);
+        let migration_type = task.migration_type.clone();
         // A task that is starting again carries neither the reason it stopped nor the
         // failure of its last run.
         task.stop_reason = None;
@@ -232,6 +239,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(position) = input.cdc_stop_position {
             task.cdc_stop_position = Some(position);
         }
+        // The run this start puts the task on: its full load becomes due once the task is
+        // `running`, and a task whose migration type has no phase after that load stops
+        // itself when the load finishes. Starting again replaces the previous run's
+        // accounting, since the statistics a task reports are those of the run it is on.
+        task.run = Some(crate::state::TaskRun::starting(
+            now,
+            &migration_type,
+            &input.start_replication_task_type,
+        ));
         // `starting` is not terminal: the task is owed `running`.
         task.pending = Some(crate::state::Pending::after(
             now,

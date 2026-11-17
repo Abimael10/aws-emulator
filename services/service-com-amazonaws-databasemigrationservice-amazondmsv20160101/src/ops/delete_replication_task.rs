@@ -132,8 +132,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Every answer comes from the store; `ctx` carries nothing this operation needs.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(invalid_state(
                 "the dms emulator is mounted on an engine that holds no state for it".to_string(),
@@ -141,6 +139,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
+        // Whether a task is still running is what decides this delete, and a run the
+        // clock has already finished is one the task is no longer on: the work it owes
+        // happens before the status is read.
+        crate::state::advance_task_runs(&*self.engine, ctx.callback(), now).await;
         let mut store = state.lock();
         store.settle(now);
 

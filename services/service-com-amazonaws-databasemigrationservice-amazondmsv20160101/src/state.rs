@@ -12,6 +12,13 @@
 //!
 //! [`settle`]: ComAmazonawsDatabasemigrationserviceAmazondmsv20160101State::settle
 
+/// The RUN of a replication task: the full load it performs between the endpoints' own
+/// data planes, the per-task and per-table accounting that load records, and the stop a
+/// task with no phase after it arrives at.
+pub mod task_run;
+
+pub use task_run::{advance_task_runs, TaskRun};
+
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -917,6 +924,10 @@ pub struct ReplicationTaskRecord {
     pub cdc_stop_position: Option<String>,
     /// The task's tags.
     pub tags: Vec<Tag>,
+    /// The run `StartReplicationTask` started, if the task has ever been started: what
+    /// its full load moved, and what the clock still owes it
+    /// ([`task_run`]).
+    pub run: Option<TaskRun>,
     /// The transition the clock owes this task, if any.
     pub pending: Option<Pending>,
     /// Creation order, so a describe scans tasks oldest first.
@@ -957,9 +968,10 @@ impl ReplicationTaskRecord {
             // no checkpoint to report.
             recovery_checkpoint: None,
             replication_task_arn: Some(self.arn.clone()),
-            // Statistics describe a migration that ran. This emulator migrates no
-            // data, so it reports none rather than synthesizing counters.
-            replication_task_stats: None,
+            // The statistics of the run this task is on, or has finished: the full load's
+            // progress, what it loaded and the instants it was started and stopped at
+            // ([`ReplicationTaskRecord::stats`]). A task that has never run reports none.
+            replication_task_stats: self.stats(),
             task_data: self.task_data.clone(),
             // Only `MoveReplicationTask` sets the instance a task is moving to.
             target_replication_instance_arn: None,
@@ -1036,6 +1048,11 @@ impl ComAmazonawsDatabasemigrationserviceAmazondmsv20160101State {
                     }
                 }
             }
+            // A started task is owed more than its next status: the run it is on records
+            // the time it has been running, and a full load whose finish the clock has
+            // passed is finished — which, for a task with no phase after it, is the stop
+            // it arrives at on its own.
+            task.settle_run(now);
         }
     }
 
@@ -1234,14 +1251,25 @@ pub fn decode_marker(marker: &str) -> Option<String> {
 /// "Constraints: Minimum 20, maximum 100", which the model's plain `IntegerOptional`
 /// does not express.
 pub fn page_size(max_records: Option<i32>) -> Result<usize, String> {
+    page_size_in_range(max_records, MAX_RECORDS_MIN, MAX_RECORDS_MAX)
+}
+
+/// The same reading of `MaxRecords` for an operation whose own member doc publishes a
+/// DIFFERENT range — `DescribeTableStatistics` accepts up to 500 of them — so both
+/// operations refuse a value outside their range with one sentence rather than two
+/// readings of the same member.
+pub fn page_size_in_range(
+    max_records: Option<i32>,
+    minimum: i32,
+    maximum: i32,
+) -> Result<usize, String> {
     let requested = max_records.unwrap_or(DEFAULT_MAX_RECORDS);
-    if !(MAX_RECORDS_MIN..=MAX_RECORDS_MAX).contains(&requested) {
-        return Err(format!(
-            "MaxRecords {requested} is outside the supported range \
-             {MAX_RECORDS_MIN}-{MAX_RECORDS_MAX}"
-        ));
+    let refusal =
+        || format!("MaxRecords {requested} is outside the supported range {minimum}-{maximum}");
+    if !(minimum..=maximum).contains(&requested) {
+        return Err(refusal());
     }
-    Ok(usize::try_from(requested).unwrap_or(MAX_RECORDS_MAX as usize))
+    usize::try_from(requested).map_err(|_| refusal())
 }
 
 /// The span of `records` one page covers when resuming at `marker`, plus the marker
