@@ -96,7 +96,7 @@ async fn get_policy_version(harness: &Harness, version_arn: &str) -> (u16, Value
 /// Every `(path, value)` in `body` whose member name is one of [`DATE_TIME_MEMBERS`],
 /// however deeply nested — a timestamp is rarely the response's own member (an approver's
 /// response time, a listed session's expiration), so the whole document is walked.
-fn date_time_members(path: &str, body: &Value, found: &mut Vec<(String, Value)>) {
+pub(crate) fn date_time_members(path: &str, body: &Value, found: &mut Vec<(String, Value)>) {
     match body {
         Value::Object(members) => {
             for (member, value) in members {
