@@ -21,7 +21,7 @@
 
 use serde_json::{json, Value};
 
-use crate::harness::{member_of, Emulator, PAST_WEB_APP_UPDATE_SPAN, ROLE};
+use crate::harness::{member_of, Emulator, ROLE};
 
 /// An IAM Identity Center instance ARN satisfying `IdentityCenterInstanceArn`'s modelled
 /// pattern `^arn:[\w-]+:sso:::instance/(sso)?ins-[a-zA-Z0-9-.]{16}$`.
@@ -221,9 +221,6 @@ async fn an_update_assigns_the_members_it_carries() {
                 "case {case:?}: expected the endpoint to keep its VPC, got {reported}"
             );
         }
-
-        // Past the roll-out window, so the next row is not read as racing this one.
-        tokio::time::sleep(PAST_WEB_APP_UPDATE_SPAN).await;
     }
 }
 
@@ -289,9 +286,8 @@ async fn an_update_that_addresses_nothing_is_refused() {
 /// `ConflictException` (409) and the winner's value is what the web app reports.
 ///
 /// The two calls are polled CONCURRENTLY (`tokio::join!`), which is what two SDK clients
-/// writing at once do; the rows then differ along how the second writer arrives — in
-/// flight at the same moment, and sent while the first roll-out is still in progress —
-/// because the rule is about the window, not about the thread.
+/// writing at once do; a writer that arrives after the winner's answer was read overlaps
+/// nothing and is served, because the rule is about calls in flight at the same time.
 #[tokio::test]
 async fn concurrent_updates_have_exactly_one_winner() {
     let emulator = Emulator::new();
@@ -359,32 +355,9 @@ async fn concurrent_updates_have_exactly_one_winner() {
          got {record}"
     );
 
-    // A further writer that arrives while that roll-out is still in progress is refused
-    // on the same rule, and changes nothing.
-    let late = emulator
-        .call(
-            "UpdateWebApp",
-            json!({"WebAppId": &web_app_id, "AccessEndpoint": "https://late.example.com"}),
-        )
-        .await;
-    assert_eq!(
-        (late.status, late.error_code().as_str()),
-        (409, "ConflictException"),
-        "case \"a writer inside the window\": expected 409 ConflictException, got {} with \
-         body {}",
-        late.status,
-        late.body
-    );
-    let unchanged = described(&emulator, "a writer inside the window", &web_app_id).await;
-    assert_eq!(
-        member_of(&unchanged, "AccessEndpoint").as_str(),
-        Some(expected),
-        "case \"a writer inside the window\": expected the refused update to change nothing, \
-         got {unchanged}"
-    );
-
-    // Once the roll-out completes, the next update is accepted again.
-    tokio::time::sleep(PAST_WEB_APP_UPDATE_SPAN).await;
+    // A writer that arrives AFTER the winner's answer was read overlaps nothing, so it
+    // is served and its value is what the web app then reports: the conflict is between
+    // calls in flight at the same time, not a window the web app sits in afterwards.
     let after = emulator
         .call(
             "UpdateWebApp",
@@ -393,13 +366,15 @@ async fn concurrent_updates_have_exactly_one_winner() {
         .await;
     assert_eq!(
         after.status, 200,
-        "case \"after the window\": expected the next update accepted, got {} with body {}",
+        "case \"a writer after the winner was answered\": expected the next update accepted, \
+         got {} with body {}",
         after.status, after.body
     );
-    let settled = described(&emulator, "after the window", &web_app_id).await;
+    let settled = described(&emulator, "a writer after the winner was answered", &web_app_id).await;
     assert_eq!(
         member_of(&settled, "AccessEndpoint").as_str(),
         Some("https://after.example.com"),
-        "case \"after the window\": expected the accepted update applied, got {settled}"
+        "case \"a writer after the winner was answered\": expected the accepted update \
+         applied, got {settled}"
     );
 }

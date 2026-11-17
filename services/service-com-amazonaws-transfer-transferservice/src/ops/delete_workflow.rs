@@ -5,9 +5,9 @@
 //! Releases one stored workflow by `WorkflowId`, and with it the executions of that
 //! workflow — nothing can address a run of a workflow that no longer exists. A workflow
 //! a server still attaches through its `WorkflowDetails` is IN USE, so the delete is
-//! refused with the modelled `InvalidRequestException` naming those servers rather than
-//! leaving them pointing at a workflow that no longer exists; an unknown id answers the
-//! modelled `ResourceNotFoundException`.
+//! refused with the modelled `InvalidRequestException` naming the server that pins it
+//! rather than leaving that server pointing at a workflow that no longer exists; an
+//! unknown id answers the modelled `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -184,17 +184,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A workflow a server attaches is in use: deleting it would leave that
         // server's `WorkflowDetails` naming a workflow that no longer exists, so the
         // request is refused with the modelled `InvalidRequestException` (HTTP 400)
-        // and the workflow stays. The caller detaches it (`UpdateServer`) first.
+        // and the workflow stays. The caller detaches it (`UpdateServer`) first. The
+        // refusal names the server that pins it — the FIRST in `ServerId` order, so the
+        // same state always reports the same one — which is what the caller has to
+        // detach the workflow from.
         let in_use = guard.servers_using_workflow(&input.workflow_id);
-        if !in_use.is_empty() {
-            let message = format!(
-                "the workflow cannot be deleted while it is attached to server(s) {}",
-                in_use.join(", ")
-            );
-            return Err(DeleteWorkflowErrorModeled::InvalidRequestException(
-                InvalidRequestException { message },
-            )
-            .into());
+        if let Some(server_id) = in_use.first() {
+            let refusal = st::workflow_in_use_by_server(server_id);
+            return Err(DeleteWorkflowErrorModeled::InvalidRequestException(refusal).into());
         }
 
         guard.workflows.remove(&input.workflow_id);

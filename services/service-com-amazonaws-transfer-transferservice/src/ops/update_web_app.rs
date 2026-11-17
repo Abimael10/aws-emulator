@@ -14,11 +14,13 @@
 //! — the same endpoint, in different subnets — and a web app with no VPC endpoint has
 //! none to update, which is a malformed request rather than a new endpoint.
 //!
-//! A web app applies ONE update at a time: a second update that arrives while the first
-//! is still being applied is refused with the modelled `ConflictException` (409), so two
-//! concurrent writers have exactly one winner and the losing caller is told to retry
-//! rather than silently overwriting the winner. The window is
-//! `crate::state::WEB_APP_UPDATE_SPAN`, stored as the instant it ends; nothing sleeps.
+//! A web app applies ONE update at a time: an update that arrives while another is
+//! still being applied to the SAME web app is refused with the modelled
+//! `ConflictException` (409), so two concurrent writers have exactly one winner and the
+//! losing caller is told to retry rather than silently overwriting the winner. The guard
+//! is the claim in `crate::state::web_app_write_claim`, held only while the write may
+//! still happen — so a caller that updates again AFTER reading this call's answer is
+//! served, and only a caller whose call overlaps another's is refused.
 //!
 //! ## Shape of an operation
 //!
@@ -182,76 +184,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: "the transfer service state is unavailable".to_string(),
             })
         })?;
-        let now = ::std::time::Instant::now();
 
-        let mut guard = state.lock();
-        let Some(stored) = guard.web_apps.get_mut(&input.web_app_id) else {
-            return Err(st::not_found(
-                UpdateWebAppErrorModeled::ResourceNotFoundException(st::unknown_web_app(
-                    &input.web_app_id,
-                )),
-            ));
+        // One writer of this web app's configuration at a time: a write that arrives
+        // while another is still being applied is refused with the modelled
+        // `ConflictException` (HTTP 409) rather than racing it, so two concurrent
+        // writers have exactly one winner and the web app ends up with one submitter's
+        // values. The claim is OWNED for as long as this write may still happen and
+        // released when `_claim` is dropped — on every exit below, and on a request
+        // cancelled at the await. See `crate::state::web_app_write_claim`.
+        let _claim = match st::web_app_write_claim::claim(
+            &state,
+            &input.web_app_id,
+            st::web_app_write_claim::Object::Configuration,
+        ) {
+            Ok(claim) => claim,
+            Err(st::web_app_write_claim::Refusal::Conflict) => {
+                return Err(
+                    UpdateWebAppErrorModeled::ConflictException(st::web_app_update_conflict())
+                        .into(),
+                );
+            }
+            Err(st::web_app_write_claim::Refusal::NoSuchWebApp) => {
+                return Err(st::not_found(
+                    UpdateWebAppErrorModeled::ResourceNotFoundException(st::unknown_web_app(
+                        &input.web_app_id,
+                    )),
+                ));
+            }
         };
 
-        // One update at a time: while the web app is still applying the previous one
-        // there is no second roll-out to begin, so this request is refused rather than
-        // raced against it.
-        if stored.update_in_flight(now) {
-            return Err(
-                UpdateWebAppErrorModeled::ConflictException(st::web_app_update_conflict()).into(),
-            );
-        }
+        // The claim is held across this point, which is where an update of the same web
+        // app that is in flight AT THE SAME TIME reaches the claim above and is refused.
+        st::web_app_write_claim::admit_a_racing_writer().await;
 
-        // A VPC endpoint can be re-configured; one that does not exist cannot be. The
-        // refusal is decided BEFORE anything is written, so a refused update changes
-        // nothing.
-        if let Some(UpdateWebAppEndpointDetails::Vpc(_)) = input.endpoint_details.as_ref() {
-            if !matches!(
-                stored.endpoint_details.as_ref(),
-                Some(DescribedWebAppEndpointDetails::Vpc(_))
-            ) {
-                return Err(UpdateWebAppErrorModeled::InvalidRequestException(
-                    st::web_app_has_no_vpc_endpoint(),
-                )
-                .into());
-            }
-        }
+        // The state lock is taken for the write alone and released before the claim is,
+        // which the release needs it to be.
+        let web_app_id = {
+            let mut guard = state.lock();
+            let Some(stored) = guard.web_apps.get_mut(&input.web_app_id) else {
+                return Err(st::not_found(
+                    UpdateWebAppErrorModeled::ResourceNotFoundException(st::unknown_web_app(
+                        &input.web_app_id,
+                    )),
+                ));
+            };
 
-        if let Some(access_endpoint) = input.access_endpoint {
-            stored.access_endpoint = access_endpoint;
-        }
-        if let Some(web_app_units) = input.web_app_units {
-            stored.web_app_units = Some(web_app_units);
-        }
-        // The one member an identity-provider update carries is the role; the instance
-        // and the application registered in it are the web app's own, from its create.
-        if let Some(UpdateWebAppIdentityProviderDetails::IdentityCenterConfig(requested)) =
-            input.identity_provider_details
-        {
-            if let Some(DescribedWebAppIdentityProviderDetails::IdentityCenterConfig(config)) =
-                stored.identity_provider_details.as_mut()
-            {
-                if let Some(role) = requested.role {
-                    config.role = Some(role);
+            // A VPC endpoint can be re-configured; one that does not exist cannot be.
+            // The refusal is decided BEFORE anything is written, so a refused update
+            // changes nothing.
+            if let Some(UpdateWebAppEndpointDetails::Vpc(_)) = input.endpoint_details.as_ref() {
+                if !matches!(
+                    stored.endpoint_details.as_ref(),
+                    Some(DescribedWebAppEndpointDetails::Vpc(_))
+                ) {
+                    return Err(UpdateWebAppErrorModeled::InvalidRequestException(
+                        st::web_app_has_no_vpc_endpoint(),
+                    )
+                    .into());
                 }
             }
-        }
-        // The endpoint keeps the id it was created with — it is the same endpoint — and
-        // takes the subnets the update names.
-        if let Some(UpdateWebAppEndpointDetails::Vpc(requested)) = input.endpoint_details {
-            if let Some(DescribedWebAppEndpointDetails::Vpc(vpc)) =
-                stored.endpoint_details.as_mut()
+
+            if let Some(access_endpoint) = input.access_endpoint {
+                stored.access_endpoint = access_endpoint;
+            }
+            if let Some(web_app_units) = input.web_app_units {
+                stored.web_app_units = Some(web_app_units);
+            }
+            // The one member an identity-provider update carries is the role; the
+            // instance and the application registered in it are the web app's own, from
+            // its create.
+            if let Some(UpdateWebAppIdentityProviderDetails::IdentityCenterConfig(requested)) =
+                input.identity_provider_details
             {
-                if let Some(subnet_ids) = requested.subnet_ids {
-                    vpc.subnet_ids = Some(subnet_ids);
+                if let Some(DescribedWebAppIdentityProviderDetails::IdentityCenterConfig(
+                    config,
+                )) = stored.identity_provider_details.as_mut()
+                {
+                    if let Some(role) = requested.role {
+                        config.role = Some(role);
+                    }
                 }
             }
-        }
+            // The endpoint keeps the id it was created with — it is the same endpoint —
+            // and takes the subnets the update names.
+            if let Some(UpdateWebAppEndpointDetails::Vpc(requested)) = input.endpoint_details {
+                if let Some(DescribedWebAppEndpointDetails::Vpc(vpc)) =
+                    stored.endpoint_details.as_mut()
+                {
+                    if let Some(subnet_ids) = requested.subnet_ids {
+                        vpc.subnet_ids = Some(subnet_ids);
+                    }
+                }
+            }
 
-        // The roll-out this call begins, which the next one is judged against.
-        stored.begin_update(now);
-        let web_app_id = stored.web_app_id.clone();
-        drop(guard);
+            stored.web_app_id.clone()
+        };
 
         Ok(UpdateWebAppOutput { web_app_id })
     }

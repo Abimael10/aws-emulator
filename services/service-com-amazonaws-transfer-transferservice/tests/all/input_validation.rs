@@ -330,7 +330,7 @@ async fn identity_provider_details_are_required_exactly_for_the_types_that_use_t
             json!({"IdentityProviderType": "API_GATEWAY"}),
             Some(vec![
                 "IdentityProviderDetails",
-                "IdentityProviderType is API_GATEWAY",
+                "IdentityProviderType: API_GATEWAY",
             ]),
         ),
         (
@@ -338,7 +338,7 @@ async fn identity_provider_details_are_required_exactly_for_the_types_that_use_t
             json!({"IdentityProviderType": "AWS_DIRECTORY_SERVICE"}),
             Some(vec![
                 "IdentityProviderDetails",
-                "IdentityProviderType is AWS_DIRECTORY_SERVICE",
+                "IdentityProviderType: AWS_DIRECTORY_SERVICE",
             ]),
         ),
         (
@@ -346,7 +346,7 @@ async fn identity_provider_details_are_required_exactly_for_the_types_that_use_t
             json!({"IdentityProviderType": "AWS_LAMBDA"}),
             Some(vec![
                 "IdentityProviderDetails",
-                "IdentityProviderType is AWS_LAMBDA",
+                "IdentityProviderType: AWS_LAMBDA",
             ]),
         ),
         (

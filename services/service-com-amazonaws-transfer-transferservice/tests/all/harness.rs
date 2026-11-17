@@ -55,11 +55,6 @@ pub(crate) const PAST_START_SPAN: Duration = st::SERVER_START_SPAN.saturating_ad
 /// [`PAST_START_SPAN`].
 pub(crate) const PAST_STOP_SPAN: Duration = st::SERVER_STOP_SPAN.saturating_add(SETTLE_MARGIN);
 
-/// Wait out the window a web app spends applying an `UpdateWebApp`, on the same basis
-/// as [`PAST_START_SPAN`].
-pub(crate) const PAST_WEB_APP_UPDATE_SPAN: Duration =
-    st::WEB_APP_UPDATE_SPAN.saturating_add(SETTLE_MARGIN);
-
 /// An SSH public key whose body satisfies `SshPublicKeyBody`'s modelled pattern
 /// `^\s*(ssh|ecdsa)-[a-z0-9-]+[ \t]+(([A-Za-z0-9+/]{4})*...)$`.
 pub(crate) const SSH_KEY: &str = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ==";

@@ -1,9 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Three more of this service's refusal `Message` RULES, each asserted over a TABLE
+//! Seven of this service's refusal `Message` RULES, each asserted over a TABLE
 //! whose rows differ along what the rule generalises over. The sibling suite
 //! `error_message_rules.rs` pins the duplicate, not-found, state-conflict and
-//! `ValidationException` families; these three are the ones it does not cover.
+//! `ValidationException` families; these seven are the ones it does not cover.
+//!
+//! Every one of them is the same requirement seen from a different operation: a
+//! refusal's `Message` is the text the SERVICE states for that error class — its fixed
+//! part word for word, and its variable parts (a member name, a deciding member's value,
+//! a resource identifier) filled from the request or from this service's state. A
+//! sentence that only describes the rule in this emulator's own words is a defect even
+//! when the status and the error code are right, because a client that matches or logs
+//! the service's refusal no longer recognises it.
 //!
 //! 1. A documented either/or member pair ("specify exactly one of A and B") is violated
 //!    by naming NEITHER member, or — where the pair's text is fixed for the condition —
@@ -25,6 +33,25 @@
 //!    a listing. The rows span ten `@paginated` operations and a table of forged tokens
 //!    differing in form and length, including both published bounds of `NextToken`'s
 //!    modelled `len 1..6144`.
+//! 4. A write of a web app the service could not carry out because another write of the
+//!    same web app was in flight answers ONE fixed sentence with no slot at all, naming
+//!    the write that could not be done. The rows differ along which members the writers
+//!    carry, how many overlap and which of two web apps is written; a writer that
+//!    arrives after the winner was answered overlaps nothing and is served.
+//! 5. The both-half of the connector configuration either/or, over the operations and the
+//!    stored configurations rule 1 does not reach: an update of a connector of each kind,
+//!    and a create carrying each of the other members.
+//! 6. A `DeleteWorkflow` of a workflow a server still attaches answers a fixed sentence
+//!    plus ONE variable part read from this service's STATE — the referencing server's id
+//!    — since the request names only the workflow. The rows differ along the trigger the
+//!    workflow is attached through, how many servers attach it and which workflow is
+//!    addressed.
+//! 7. A server configuration whose `IdentityProviderType` makes `IdentityProviderDetails`
+//!    required and that carries none answers a fixed sentence plus ONE variable part read
+//!    from the REQUEST — the identity-provider type. The rows span every
+//!    `IdentityProviderType` value that requires the details, crossed with the other
+//!    members the request carries and with both operations that resolve a server
+//!    configuration.
 //!
 //! Every request goes over the real wire path (`POST /` with
 //! `X-Amz-Target: TransferService.<Op>`) through the shared [`crate::harness`], so what
@@ -33,6 +60,7 @@
 use serde_json::{json, Value};
 
 use crate::harness::{member_of, Answer, Emulator, ROLE};
+use crate::web_app_customization_write_guard::{create_web_app, futures_of};
 
 /// Satisfies `DirectoryId`'s modelled `len 12..12`, pattern `^d-[0-9a-f]{10}$`.
 const DIRECTORY_ID: &str = "d-0123456789";
@@ -98,8 +126,8 @@ fn assert_message(
 const LOCAL_PROFILE: &str = "p-11111111111111111";
 
 /// RULE: a request that names NEITHER member of a documented either/or pair is told that
-/// one of the two is needed; one that names BOTH the connector configurations is told the
-/// two cannot be sent together. The text follows the condition reported, not the whole
+/// one of the two is needed; one that names BOTH the connector configurations is told that
+/// only one of the two may be sent. The text follows the condition reported, not the whole
 /// rule, and names only the two members.
 ///
 /// The rows differ along the member pair (`As2Config`/`SftpConfig` on a connector,
@@ -191,7 +219,7 @@ async fn an_either_or_pair_reports_the_half_of_the_rule_the_request_broke() {
                     "SftpConfig": {"UserSecretId": "sftp"},
                 }),
             ),
-            "As2Config and SftpConfig cannot both be specified".to_string(),
+            "Only one of As2Config or SftpConfig must be specified".to_string(),
         ),
         (
             "UpdateConnector adding an As2Config to a stored SFTP connector",
@@ -200,7 +228,7 @@ async fn an_either_or_pair_reports_the_half_of_the_rule_the_request_broke() {
                 &update_base,
                 json!({"As2Config": {"LocalProfileId": LOCAL_PROFILE}}),
             ),
-            "As2Config and SftpConfig cannot both be specified".to_string(),
+            "Only one of As2Config or SftpConfig must be specified".to_string(),
         ),
         (
             "CreateAgreement naming neither directory configuration",
@@ -527,4 +555,642 @@ async fn a_forged_next_token_is_refused_with_one_fixed_text_for_every_listing() 
         "case \"a NextToken the service issued\": expected 200, got {} with body {}",
         second.status, second.body
     );
+}
+
+// ---------------------------------------------------------------------------
+// Rule 4: one sentence for a web-app write the service could not carry out
+// ---------------------------------------------------------------------------
+
+/// The sentence a web-app update that could not be carried out is refused with, written
+/// out as a literal rather than read off the crate under test, so the WORDING is what
+/// these rows are held to. It is the same `Unable to <verb> WebApp …` sentence the two
+/// writes of a web app's CUSTOMIZATION carry (`web_app_customization_conflict_message.rs`
+/// pins those), with no sub-resource to name.
+const WEB_APP_UPDATE_CONFLICT: &str = "Unable to update WebApp";
+
+/// RULE: an `UpdateWebApp` the service could not carry out because another update of the
+/// same web app was in flight is refused 409 `ConflictException` with that ONE sentence,
+/// whatever the update carried and whichever web app it addressed.
+#[tokio::test]
+async fn a_web_app_update_that_lost_carries_the_services_conflict_sentence() {
+    // (case, the members each racing writer carries beyond `WebAppId`)
+    let rows: Vec<(&str, Vec<Value>)> = vec![
+        (
+            "two writers assigning different access endpoints",
+            vec![
+                json!({"AccessEndpoint": "https://racer-0.example.com"}),
+                json!({"AccessEndpoint": "https://racer-1.example.com"}),
+            ],
+        ),
+        (
+            "two writers assigning different unit counts",
+            vec![
+                json!({"WebAppUnits": {"Provisioned": 2}}),
+                json!({"WebAppUnits": {"Provisioned": 7}}),
+            ],
+        ),
+        (
+            "a writer carrying both members against one carrying nothing but the id",
+            vec![
+                json!({"AccessEndpoint": "https://both.example.com",
+                       "WebAppUnits": {"Provisioned": 3}}),
+                json!({}),
+            ],
+        ),
+        (
+            "three writers at once",
+            vec![
+                json!({"AccessEndpoint": "https://three-0.example.com"}),
+                json!({"AccessEndpoint": "https://three-1.example.com"}),
+                json!({"WebAppUnits": {"Provisioned": 5}}),
+            ],
+        ),
+        (
+            "five writers at once",
+            vec![
+                json!({"AccessEndpoint": "https://five-0.example.com"}),
+                json!({"AccessEndpoint": "https://five-1.example.com"}),
+                json!({"AccessEndpoint": "https://five-2.example.com"}),
+                json!({"WebAppUnits": {"Provisioned": 9}}),
+                json!({}),
+            ],
+        ),
+    ];
+
+    for (case, writers) in rows {
+        let emulator = Emulator::new();
+        // A SECOND web app, created first, so the one under test is not the only one the
+        // store holds: a sentence that named the web app it was about would differ
+        // between the two, and these rows would catch it.
+        let other = create_web_app(&emulator).await;
+        let web_app_id = create_web_app(&emulator).await;
+        assert_ne!(
+            other, web_app_id,
+            "case {case:?}: the two web apps must have different ids"
+        );
+
+        // Every value the requests carried, none of which may reach the refusal.
+        let mut submitted: Vec<String> = vec![web_app_id.clone(), other.clone()];
+        for members in &writers {
+            if let Some(endpoint) = member_of(members, "AccessEndpoint").as_str() {
+                submitted.push(endpoint.to_string());
+            }
+        }
+        let absent: Vec<&str> = submitted.iter().map(String::as_str).collect();
+
+        let calls = writers.iter().map(|members| {
+            let mut request = members.clone();
+            request["WebAppId"] = json!(&web_app_id);
+            emulator.call("UpdateWebApp", request)
+        });
+        let answers = futures_of(calls).await;
+
+        let served = answers.iter().filter(|answer| answer.status == 200).count();
+        assert_eq!(
+            served,
+            1,
+            "case {case:?}: expected exactly one winning update, got the statuses {:?}",
+            answers
+                .iter()
+                .map(|answer| answer.status)
+                .collect::<Vec<_>>()
+        );
+        let mut refused = 0;
+        for (index, answer) in answers.iter().enumerate() {
+            if answer.status == 200 {
+                continue;
+            }
+            // 409 is `ConflictException`'s modelled `@httpError` for `UpdateWebApp`.
+            assert_message(
+                &format!("{case} (writer {index} lost)"),
+                answer,
+                409,
+                "ConflictException",
+                WEB_APP_UPDATE_CONFLICT,
+                &absent,
+            );
+            refused += 1;
+        }
+        assert_eq!(
+            refused,
+            writers.len() - 1,
+            "case {case:?}: every writer but the winner must be refused"
+        );
+
+        // A writer that arrives AFTER the winner was answered overlaps nothing, so it is
+        // served: the sentence above belongs to the condition two overlapping calls
+        // produce, and the claim is released with the write that took it.
+        let late = emulator
+            .call(
+                "UpdateWebApp",
+                json!({"WebAppId": &web_app_id, "AccessEndpoint": "https://late.example.com"}),
+            )
+            .await;
+        assert_eq!(
+            late.status, 200,
+            "case {case:?}: expected the writer that arrived after the winner's answer to be \
+             served, got {} with body {}",
+            late.status, late.body
+        );
+
+        // The OTHER web app was never written, so an update of its own is served: the
+        // refusals above are about the web app that was applying one, not a mode the
+        // service fell into.
+        let untouched = emulator
+            .call(
+                "UpdateWebApp",
+                json!({"WebAppId": &other, "AccessEndpoint": "https://other.example.com"}),
+            )
+            .await;
+        assert_eq!(
+            untouched.status, 200,
+            "case {case:?}: expected the untouched web app's update served, got {} with \
+             body {}",
+            untouched.status, untouched.body
+        );
+    }
+}
+
+/// RULE (the same class, told apart): the sentence names the WRITE that could not be
+/// carried out, so an update of the web app itself and a write of its customization are
+/// different sentences for the one condition.
+#[tokio::test]
+async fn the_conflict_sentence_names_the_write_that_could_not_be_carried_out() {
+    let emulator = Emulator::new();
+    let web_app_id = create_web_app(&emulator).await;
+
+    // Two updates of the web app ITSELF, overlapping: the loser carries the sentence for
+    // a write of the web app.
+    let updates: Vec<Value> = vec![
+        json!({"AccessEndpoint": "https://first.example.com"}),
+        json!({"AccessEndpoint": "https://second.example.com"}),
+    ];
+    let calls = updates.iter().map(|members| {
+        let mut request = members.clone();
+        request["WebAppId"] = json!(&web_app_id);
+        emulator.call("UpdateWebApp", request)
+    });
+    let answers = futures_of(calls).await;
+    let update_losers: Vec<&Answer> = answers
+        .iter()
+        .filter(|answer| answer.status != 200)
+        .collect();
+    assert_eq!(
+        update_losers.len(),
+        1,
+        "expected exactly one losing update, got the statuses {:?}",
+        answers
+            .iter()
+            .map(|answer| answer.status)
+            .collect::<Vec<_>>()
+    );
+    let update_text = assert_message(
+        "an update of the web app itself",
+        update_losers[0],
+        409,
+        "ConflictException",
+        WEB_APP_UPDATE_CONFLICT,
+        &[web_app_id.as_str()],
+    );
+
+    // The two writes of its CUSTOMIZATION take a claim of their own, so of two that
+    // overlap one loses — with the sentence for the write that lost, which is not the
+    // one above.
+    let customization: Vec<(&str, Value)> = vec![
+        ("UpdateWebAppCustomization", json!({"Title": "assigned"})),
+        ("DeleteWebAppCustomization", json!({})),
+    ];
+    let calls = customization.iter().map(|(op, members)| {
+        let mut request = members.clone();
+        request["WebAppId"] = json!(&web_app_id);
+        emulator.call(op, request)
+    });
+    let answers = futures_of(calls).await;
+    let losers: Vec<String> = answers
+        .iter()
+        .filter(|answer| answer.status != 200)
+        .map(message_of)
+        .collect();
+    assert_eq!(
+        losers.len(),
+        1,
+        "expected exactly one losing customization write, got the statuses {:?}",
+        answers
+            .iter()
+            .map(|answer| answer.status)
+            .collect::<Vec<_>>()
+    );
+    assert_ne!(
+        losers[0], update_text,
+        "case \"an update of the web app against a write of its customization\": expected \
+         each write's own sentence, both are {update_text:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Rule 5: naming both connector configurations, over the rest of the class
+// ---------------------------------------------------------------------------
+
+/// The sentence a request naming BOTH alternative configurations is refused with, and the
+/// sibling sentence for naming NEITHER: two parallel statements of the one either/or over
+/// the same two member names, told apart by which half the request broke.
+const BOTH_CONFIGS: &str = "Only one of As2Config or SftpConfig must be specified";
+const NEITHER_CONFIG: &str = "One of As2Config or SftpConfig must be specified";
+
+/// Create one connector and hand back its `ConnectorId`.
+async fn create_connector(emulator: &Emulator, case: &str, request: Value) -> String {
+    let answer = emulator.call("CreateConnector", request).await;
+    assert_eq!(
+        answer.status, 200,
+        "case {case:?}: expected CreateConnector 200, got {} with body {}",
+        answer.status, answer.body
+    );
+    answer
+        .get("ConnectorId")
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: expected a ConnectorId, got {}", answer.body))
+        .to_string()
+}
+
+/// RULE (rule 1's both-half, over the rest of the class): a connector configuration that
+/// names both `As2Config` and `SftpConfig` is refused 400 `InvalidRequestException` with
+/// the service's sentence for that half of the either/or — whichever operation resolves
+/// the configuration, whichever kind the stored connector was, and whatever else the
+/// request carried.
+#[tokio::test]
+async fn naming_both_connector_configurations_states_that_only_one_may_be() {
+    let emulator = Emulator::new();
+
+    // Two stored connectors, one of each kind, so an UPDATE can break the pair from
+    // either side.
+    let sftp_connector = create_connector(
+        &emulator,
+        "a stored SFTP connector",
+        json!({
+            "AccessRole": ROLE,
+            "Url": "sftp://partner.example.com",
+            "SftpConfig": {"UserSecretId": "sftp"},
+        }),
+    )
+    .await;
+    let as2_connector = create_connector(
+        &emulator,
+        "a stored AS2 connector",
+        json!({
+            "AccessRole": ROLE,
+            "Url": "https://partner.example.com/as2",
+            "As2Config": {"LocalProfileId": LOCAL_PROFILE},
+        }),
+    )
+    .await;
+
+    // (case, operation, request, the half of the rule the request broke)
+    let rows: Vec<(&str, &str, Value, &str)> = vec![
+        (
+            "CreateConnector naming both configurations and no Url",
+            "CreateConnector",
+            json!({
+                "AccessRole": ROLE,
+                "As2Config": {"LocalProfileId": LOCAL_PROFILE},
+                "SftpConfig": {"UserSecretId": "sftp"},
+            }),
+            BOTH_CONFIGS,
+        ),
+        (
+            "CreateConnector naming both configurations and a connection bound",
+            "CreateConnector",
+            json!({
+                "AccessRole": ROLE,
+                "Url": "https://partner.example.com/as2",
+                "As2Config": {"LocalProfileId": LOCAL_PROFILE},
+                "SftpConfig": {"UserSecretId": "sftp", "MaxConcurrentConnections": 2},
+            }),
+            BOTH_CONFIGS,
+        ),
+        (
+            "UpdateConnector adding an SftpConfig to the stored AS2 connector",
+            "UpdateConnector",
+            json!({
+                "ConnectorId": &as2_connector,
+                "SftpConfig": {"UserSecretId": "sftp"},
+            }),
+            BOTH_CONFIGS,
+        ),
+        (
+            "UpdateConnector naming both configurations at once",
+            "UpdateConnector",
+            json!({
+                "ConnectorId": &sftp_connector,
+                "As2Config": {"LocalProfileId": LOCAL_PROFILE},
+                "SftpConfig": {"UserSecretId": "sftp"},
+            }),
+            BOTH_CONFIGS,
+        ),
+        (
+            "CreateConnector naming neither configuration: the sibling half",
+            "CreateConnector",
+            json!({"AccessRole": ROLE, "Url": "sftp://partner.example.com"}),
+            NEITHER_CONFIG,
+        ),
+    ];
+
+    for (case, op, request, expected) in rows {
+        let answer = emulator.call(op, request).await;
+        // 400 is `InvalidRequestException`'s modelled `@httpError`.
+        assert_message(
+            case,
+            &answer,
+            400,
+            "InvalidRequestException",
+            expected,
+            &[
+                ROLE,
+                LOCAL_PROFILE,
+                sftp_connector.as_str(),
+                as2_connector.as_str(),
+            ],
+        );
+    }
+
+    // The two halves are parallel statements of the one rule over the same two member
+    // names: the both-half is the neither-half with the "Only" that says which half of
+    // the rule the request broke.
+    let parallel = format!(
+        "Only {}{}",
+        NEITHER_CONFIG[..1].to_lowercase(),
+        &NEITHER_CONFIG[1..]
+    );
+    assert_eq!(
+        BOTH_CONFIGS, parallel,
+        "case \"the two halves of one either/or\": expected the both-half to read \
+         {parallel:?}, got {BOTH_CONFIGS:?}"
+    );
+    assert_ne!(
+        BOTH_CONFIGS, NEITHER_CONFIG,
+        "case \"the two halves of one either/or\": expected the condition reported to be \
+         distinguishable"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Rule 6: the server that pins a workflow a delete addressed
+// ---------------------------------------------------------------------------
+
+/// The refusal a `DeleteWorkflow` of a pinned workflow answers: the fixed sentence plus
+/// the one variable part, the referencing server's id — built here from the test's OWN
+/// state, so each row proves where that part comes from.
+fn workflow_in_use(server_id: &str) -> String {
+    format!("Workflow is still in use by server {server_id}")
+}
+
+/// Create one workflow and hand back its `WorkflowId`.
+async fn create_delete_workflow(emulator: &Emulator, case: &str, description: &str) -> String {
+    let answer = emulator
+        .call(
+            "CreateWorkflow",
+            json!({
+                "Description": description,
+                "Steps": [{"Type": "DELETE", "DeleteStepDetails": {"Name": "drop"}}],
+            }),
+        )
+        .await;
+    assert_eq!(
+        answer.status, 200,
+        "case {case:?}: expected CreateWorkflow 200, got {} with body {}",
+        answer.status, answer.body
+    );
+    answer
+        .get("WorkflowId")
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: expected a WorkflowId, got {}", answer.body))
+        .to_string()
+}
+
+/// RULE: deleting a workflow a server still attaches through its `WorkflowDetails` is
+/// refused 400 `InvalidRequestException` with the service's sentence naming the server
+/// that pins it, read from this service's STATE — the request names only the workflow.
+///
+/// The rows differ along the trigger the workflow is attached through (both members of
+/// `WorkflowDetails`), how many servers attach it at once, and which workflow is
+/// addressed.
+#[tokio::test]
+async fn deleting_a_pinned_workflow_names_the_server_that_pins_it() {
+    // (case, the `WorkflowDetails` trigger each attaching server uses)
+    let rows: Vec<(&str, Vec<&str>)> = vec![
+        ("one server attaching through OnUpload", vec!["OnUpload"]),
+        (
+            "one server attaching through OnPartialUpload",
+            vec!["OnPartialUpload"],
+        ),
+        (
+            "two servers attaching it, through both triggers",
+            vec!["OnUpload", "OnPartialUpload"],
+        ),
+        (
+            "three servers attaching it",
+            vec!["OnUpload", "OnUpload", "OnPartialUpload"],
+        ),
+    ];
+
+    for (case, triggers) in rows {
+        let emulator = Emulator::new();
+        // A SECOND workflow, and a server attaching THAT one, so neither the workflow
+        // under test nor a server that references it is the only candidate in the store.
+        let other = create_delete_workflow(&emulator, case, "the other workflow").await;
+        let workflow_id = create_delete_workflow(&emulator, case, "the pinned workflow").await;
+        let other_server = emulator
+            .create_server(json!({
+                "WorkflowDetails": {"OnUpload": [{"WorkflowId": &other, "ExecutionRole": ROLE}]},
+            }))
+            .await;
+
+        let mut attaching: Vec<String> = Vec::new();
+        for &trigger in &triggers {
+            attaching.push(
+                emulator
+                    .create_server(json!({
+                        "WorkflowDetails": {
+                            trigger: [{"WorkflowId": &workflow_id, "ExecutionRole": ROLE}],
+                        },
+                    }))
+                    .await,
+            );
+        }
+        // The server the refusal names is the first of them in `ServerId` order, so one
+        // state always reports one server.
+        attaching.sort();
+        let expected = workflow_in_use(&attaching[0]);
+
+        let answer = emulator
+            .call("DeleteWorkflow", json!({"WorkflowId": &workflow_id}))
+            .await;
+        assert_message(
+            case,
+            &answer,
+            400,
+            "InvalidRequestException",
+            &expected,
+            &[workflow_id.as_str(), other.as_str(), other_server.as_str()],
+        );
+
+        // Detaching every server that pinned it lets the delete through, which is what
+        // the refusal asked for — so the sentence named a condition the caller can clear.
+        for server_id in &attaching {
+            let detached = emulator
+                .call(
+                    "UpdateServer",
+                    json!({"ServerId": server_id,
+                           "WorkflowDetails": {"OnUpload": [], "OnPartialUpload": []}}),
+                )
+                .await;
+            assert_eq!(
+                detached.status, 200,
+                "case {case:?}: expected UpdateServer to detach the workflow, got {} with \
+                 body {}",
+                detached.status, detached.body
+            );
+        }
+        let deleted = emulator
+            .call("DeleteWorkflow", json!({"WorkflowId": &workflow_id}))
+            .await;
+        assert_eq!(
+            deleted.status, 200,
+            "case {case:?}: expected the detached workflow to delete, got {} with body {}",
+            deleted.status, deleted.body
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rule 7: what the absent identity-provider details are required FOR
+// ---------------------------------------------------------------------------
+
+/// The refusal a server configuration that requires `IdentityProviderDetails` and names
+/// none answers: the fixed sentence plus the one variable part, the `IdentityProviderType`
+/// the REQUEST chose.
+fn details_required_for(identity_provider_type: &str) -> String {
+    format!("IdentityProviderDetails required for IdentityProviderType: {identity_provider_type}")
+}
+
+/// Every `IdentityProviderType` the model documents `IdentityProviderDetails` as
+/// "Required when `IdentityProviderType` is set to" — `AWS_DIRECTORY_SERVICE`,
+/// `AWS_LAMBDA` and `API_GATEWAY`
+/// (`smithy_query(query="doc",shape="CreateServerRequest",member="IdentityProviderDetails")`),
+/// which is the whole modelled value set `[SERVICE_MANAGED, API_GATEWAY,
+/// AWS_DIRECTORY_SERVICE, AWS_LAMBDA]` except the service-managed one. Each entry carries
+/// the `IdentityProviderDetails` member that type IS configured through, for the control
+/// that the same request with it is served.
+const PROVIDERS_REQUIRING_DETAILS: [(&str, &str); 3] = [
+    ("API_GATEWAY", "Url"),
+    ("AWS_DIRECTORY_SERVICE", "DirectoryId"),
+    ("AWS_LAMBDA", "Function"),
+];
+
+/// The `IdentityProviderDetails` configured through `member`, whose value satisfies that
+/// member's modelled constraints.
+fn provider_details(member: &str) -> Value {
+    match member {
+        "Url" => json!({"Url": "https://example.invalid/auth"}),
+        "DirectoryId" => json!({"DirectoryId": DIRECTORY_ID}),
+        "Function" => json!({"Function": LAMBDA_IDP}),
+        other => panic!("{other} is not an IdentityProviderDetails member this suite configures"),
+    }
+}
+
+/// RULE: a server configuration whose `IdentityProviderType` requires
+/// `IdentityProviderDetails` and carries none is refused 400 `InvalidRequestException`
+/// with the service's sentence naming what the details are required FOR — the deciding
+/// member and the value the request chose.
+///
+/// The rows span every `IdentityProviderType` that requires the details, crossed with the
+/// other members the request carries and with both operations that resolve a server
+/// configuration.
+#[tokio::test]
+async fn a_server_missing_its_identity_provider_details_is_told_what_they_are_required_for() {
+    let emulator = Emulator::new();
+
+    // A stored server an UPDATE can re-type, so the same rule is reached through
+    // `UpdateServer` as through `CreateServer`.
+    let server_id = emulator.create_server(json!({})).await;
+
+    for (identity_provider_type, details_member) in PROVIDERS_REQUIRING_DETAILS {
+        let expected = details_required_for(identity_provider_type);
+
+        // (case, operation, request, the values that must not reach the Message)
+        let rows: Vec<(String, &str, Value, Vec<String>)> = vec![
+            (
+                format!("CreateServer as {identity_provider_type} with no details"),
+                "CreateServer",
+                json!({"IdentityProviderType": identity_provider_type}),
+                vec![],
+            ),
+            (
+                format!("CreateServer as {identity_provider_type} with a role and tags"),
+                "CreateServer",
+                json!({
+                    "IdentityProviderType": identity_provider_type,
+                    "LoggingRole": ROLE,
+                    "Tags": [{"Key": "team", "Value": "files"}],
+                }),
+                vec![ROLE.to_string(), "team".to_string()],
+            ),
+            (
+                format!("UpdateServer to {identity_provider_type} with no details"),
+                "UpdateServer",
+                json!({
+                    "ServerId": &server_id,
+                    "IdentityProviderType": identity_provider_type,
+                }),
+                vec![server_id.clone()],
+            ),
+        ];
+
+        for (case, op, request, absent) in rows {
+            let answer = emulator.call(op, request).await;
+            let absent: Vec<&str> = absent.iter().map(String::as_str).collect();
+            assert_message(
+                &case,
+                &answer,
+                400,
+                "InvalidRequestException",
+                &expected,
+                &absent,
+            );
+        }
+
+        // The control: the SAME configuration carrying the details that type is
+        // configured through is served, so the refusal is about the absent member rather
+        // than about the type.
+        let served = emulator
+            .call(
+                "CreateServer",
+                json!({
+                    "IdentityProviderType": identity_provider_type,
+                    "IdentityProviderDetails": provider_details(details_member),
+                }),
+            )
+            .await;
+        assert_eq!(
+            served.status, 200,
+            "case \"CreateServer as {identity_provider_type} with its details\": expected \
+             200, got {} with body {}",
+            served.status, served.body
+        );
+    }
+
+    // The deciding member's value is the only part that varies: the three sentences are
+    // the one template filled from the request.
+    let texts: Vec<String> = PROVIDERS_REQUIRING_DETAILS
+        .iter()
+        .map(|(identity_provider_type, _)| details_required_for(identity_provider_type))
+        .collect();
+    for (index, text) in texts.iter().enumerate() {
+        for other in texts.iter().skip(index + 1) {
+            assert_ne!(
+                text, other,
+                "case \"one sentence per identity-provider type\": expected the type to reach \
+                 the text, got {texts:?}"
+            );
+        }
+    }
 }

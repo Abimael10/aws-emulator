@@ -70,6 +70,7 @@ pub mod sftp_target;
 pub mod ssh_public_key_body;
 pub mod tagged_resource;
 pub mod web_app_customization;
+pub mod web_app_write_claim;
 pub mod workflow_runs;
 mod security_policies;
 mod host_key_material;
@@ -948,6 +949,18 @@ pub fn ssh_public_key_already_exists(user_name: &str) -> ResourceExistsException
 /// or already deleted.
 pub fn unknown_workflow(workflow_id: &str) -> ResourceNotFoundException {
     resource_not_found(&NOT_FOUND_WORKFLOW, workflow_id)
+}
+
+/// `InvalidRequestException`'s `Message` for a `DeleteWorkflow` of a workflow a server
+/// still attaches through its `WorkflowDetails`, as the service states it: the fixed
+/// sentence followed by the one variable part, the id of the referencing server — read
+/// from this service's own state
+/// ([`ComAmazonawsTransferTransferserviceState::servers_using_workflow`]), since the
+/// request names only the workflow.
+pub fn workflow_in_use_by_server(server_id: &str) -> InvalidRequestException {
+    InvalidRequestException {
+        message: format!("Workflow is still in use by server {server_id}"),
+    }
 }
 
 /// Lift an operation's modelled not-found variant into its error channel, answered
@@ -2090,6 +2103,18 @@ fn required_when(member: &str, condition: &str) -> String {
     format!("{member} must be specified when {condition}")
 }
 
+/// "`<member>` required for `<deciding member>`: `<value>`" — a member the model
+/// documents as required for particular VALUES of another member, and did not send.
+///
+/// This service states that class of requirement as what the missing member is needed
+/// FOR, naming the deciding member and the value the request chose — the same
+/// `<member> required for <condition>` form [`ENDPOINT_DETAILS_REQUIRED_FOR_VPC`] takes —
+/// rather than as the condition the request was submitted under ([`required_when`], which
+/// words a requirement a member's own value or a list's membership carries).
+fn required_for_value(member: &str, deciding_member: &str, value: &str) -> String {
+    format!("{member} required for {deciding_member}: {value}")
+}
+
 /// "`<member>` must be specified" — a member the model documents as part of what the
 /// request names, with no condition attached, and did not send.
 fn required_member(member: &str) -> String {
@@ -2136,12 +2161,13 @@ fn one_of_required(first: &str, second: &str) -> String {
     format!("One of {first} or {second} must be specified")
 }
 
-/// "`<first>` and `<second>` cannot both be specified" — the OTHER half of the same
+/// "Only one of `<first>` or `<second>` must be specified" — the OTHER half of the same
 /// either/or: two alternative members of which the request named both, so which
-/// configuration to build is ambiguous. A different condition from
-/// [`one_of_required`]'s, so a different text.
+/// configuration to build is ambiguous. A different condition from [`one_of_required`]'s,
+/// so a different text — and the two halves are deliberately PARALLEL sentences over the
+/// same two member names, this one adding the "Only" that says which half was broken.
 fn not_both_of(first: &str, second: &str) -> String {
-    format!("{first} and {second} cannot both be specified")
+    format!("Only one of {first} or {second} must be specified")
 }
 
 /// The violation an either/or member pair reports for the way it was violated, or
@@ -2288,7 +2314,11 @@ impl ServerConfig<'_> {
             self.identity_provider_details.is_some(),
         ) {
             (true, false) => {
-                return Some(required_when("IdentityProviderDetails", &provider_condition))
+                return Some(required_for_value(
+                    "IdentityProviderDetails",
+                    "IdentityProviderType",
+                    self.identity_provider_type,
+                ))
             }
             (false, true) => {
                 return Some(forbidden_when(
@@ -2550,54 +2580,32 @@ pub struct WebApp {
     /// see [`no_web_app_customization`]. No `CreateWebApp` member can set one, so a new
     /// web app starts with `None`.
     pub customization: Option<WebAppCustomization>,
-    /// When the update this web app is CURRENTLY applying completes, or `None` when it
-    /// is applying none — see [`WEB_APP_UPDATE_SPAN`].
-    pub update_due: Option<Instant>,
+    /// Whether a write of this web app's own CONFIGURATION is being applied right now,
+    /// and so whether a second one that arrives is a racing writer — see
+    /// [`web_app_write_claim`], which is the one place this is taken and released.
+    pub configuration_write_in_flight: bool,
     /// Whether a write of this web app's CUSTOMIZATION is being applied right now, and
     /// so whether a second one that arrives is a racing writer — see
     /// [`web_app_customization`], which is the one place this is taken and released.
     pub customization_write_in_flight: bool,
 }
 
-/// How long a web app is applying an `UpdateWebApp` before the next update may begin.
+/// `ConflictException`'s `Message` for a write of a web app's own configuration that
+/// could not be carried out because another write of it was still being applied.
 ///
-/// Changing a web app's identity provider, access endpoint, units or endpoint is a
-/// configuration roll-out, not a map write: the service applies ONE at a time, so a
-/// second update that arrives while the first is still being applied is refused with
-/// the modelled `ConflictException` rather than racing it — which is what makes two
-/// concurrent writers have exactly one winner. AWS documents no span for the roll-out,
-/// so this one is CHOSEN on the same basis as [`SERVER_START_SPAN`]: long enough that a
-/// caller writing straight after a write — and making several further calls first —
-/// still meets the window. The due instant is stored and read on the next call;
-/// nothing sleeps for it.
-pub const WEB_APP_UPDATE_SPAN: Duration = Duration::from_secs(3);
-
-impl WebApp {
-    /// Whether an update of this web app is still being applied at `now`.
-    pub fn update_in_flight(&self, now: Instant) -> bool {
-        self.update_due.is_some_and(|due| now < due)
-    }
-
-    /// Record that this web app has begun applying an update, which completes
-    /// [`WEB_APP_UPDATE_SPAN`] later.
-    pub fn begin_update(&mut self, now: Instant) {
-        self.update_due = Some(now + WEB_APP_UPDATE_SPAN);
-    }
-}
-
-/// `ConflictException`'s `Message` for a web-app update that arrived while the web app
-/// was still applying another one.
-///
-/// Fixed for the condition and carrying no request data, like every other refusal text
-/// in this module: the web app a caller addressed is the one it named.
-pub const WEB_APP_UPDATE_IN_PROGRESS: &str =
-    "An update is already in progress for this web app; wait for it to complete and \
-     try again.";
+/// The service's own sentence for the condition: it states that the write could not be
+/// done and names the resource by the service's own name for it, in the same
+/// `Unable to <verb> WebApp …` form the two writes of a web app's CUSTOMIZATION are
+/// refused with ([`web_app_customization::UPDATE_CONFLICT`] and its sibling, which add
+/// the sub-resource they address). Fixed for the condition in its entirety: it has no
+/// slot for the web app id or anything else from the request or the store — the web app
+/// a caller addressed is the one it named — so every loser of every race reads the same.
+pub const WEB_APP_UPDATE_CONFLICT: &str = "Unable to update WebApp";
 
 /// The conflict payload for an update of a web app that is still applying another.
 pub fn web_app_update_conflict() -> ConflictException {
     ConflictException {
-        message: WEB_APP_UPDATE_IN_PROGRESS.to_string(),
+        message: WEB_APP_UPDATE_CONFLICT.to_string(),
     }
 }
 

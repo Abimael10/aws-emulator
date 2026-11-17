@@ -291,10 +291,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // customization object at all until `UpdateWebAppCustomization` assigns
             // one.
             customization: None,
-            // A new web app is applying no update yet — see `state::WEB_APP_UPDATE_SPAN`.
-            update_due: None,
-            // And no write of its customization is in flight — see
-            // `state::web_app_customization`.
+            // And no write of this web app's configuration or of its customization is in
+            // flight — see `state::web_app_write_claim`.
+            configuration_write_in_flight: false,
             customization_write_in_flight: false,
         };
         guard.web_apps.insert(web_app_id.clone(), web_app);
