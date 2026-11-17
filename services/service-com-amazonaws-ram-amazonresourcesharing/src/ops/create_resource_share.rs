@@ -408,6 +408,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             last_updated_time: now,
             feature_set: crate::state::FEATURE_SET_STANDARD.to_string(),
             attached_permissions,
+            // A new share has removed no permission, so nothing stops a resource
+            // type's default permission being derived onto it.
+            removed_permissions: std::collections::BTreeSet::new(),
             resource_share_configuration: configuration,
         };
         store.insert_share(share.clone());

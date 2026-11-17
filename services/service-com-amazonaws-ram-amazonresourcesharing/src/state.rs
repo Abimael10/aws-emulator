@@ -31,7 +31,7 @@ pub use aws_managed_permissions::*;
 pub use permission_attachments::*;
 pub use permission_deletion::*;
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
@@ -558,6 +558,14 @@ pub struct ShareRecord {
     /// beside the default permission of every resource type the share shares that none
     /// of them applies to.
     pub attached_permissions: BTreeMap<String, SharePermissionRecord>,
+    /// The ARNs of the managed permissions `DisassociateResourceSharePermission` has
+    /// REMOVED from this share, so the share is no longer governed by one of them even
+    /// when it is the published default of a resource type the share shares and would
+    /// otherwise be derived back onto it
+    /// ([`ComAmazonawsRamAmazonresourcesharingState::share_permissions`]). An attach of
+    /// the permission, and a resource of its type newly shared — which is when RAM
+    /// attaches the type's default permission — put it back.
+    pub removed_permissions: BTreeSet<String>,
     /// The share's configuration, always stored: a create that names none stores
     /// the service defaults, so every read reports the structure.
     pub resource_share_configuration: ResourceShareConfiguration,
@@ -1318,6 +1326,13 @@ impl ComAmazonawsRamAmazonresourcesharingState {
         // not a principal, is associated directly and invites nobody.
         if started && association_type == ASSOCIATION_TYPE_PRINCIPAL && view.external {
             self.invite(share, entity, now);
+        }
+        // RAM governs the resources of a type a share shares by that type's default
+        // managed permission when the share holds none of its own for the type, so a
+        // share that starts sharing a resource of a type whose default it had removed is
+        // governed by that default again from this call on.
+        if started && association_type == ASSOCIATION_TYPE_RESOURCE {
+            self.restore_removed_permissions(&share.arn, entity);
         }
         view
     }

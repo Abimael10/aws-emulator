@@ -13,12 +13,14 @@
 //!
 //! An attachment is stored per `(share, permission ARN)` pair with the version of the
 //! permission that was attached, so a read reports the version the share is actually
-//! governed by.
+//! governed by. `DisassociateResourceSharePermission` removes one, which the share
+//! records so a permission it removed is not derived back onto it.
 
 use super::{
-    default_aws_managed_permission, resource_type_matches,
-    ComAmazonawsRamAmazonresourcesharingState, PermissionRecord, PermissionVersionRecord,
-    ShareRecord, ASSOCIATION_STATUS_ASSOCIATED, FIRST_PERMISSION_VERSION,
+    association_is_attaching, default_aws_managed_permission, resource_type_matches,
+    resource_type_of_arn, ComAmazonawsRamAmazonresourcesharingState, PermissionRecord,
+    PermissionVersionRecord, ShareRecord, ASSOCIATION_STATUS_ASSOCIATED, ASSOCIATION_TYPE_RESOURCE,
+    FIRST_PERMISSION_VERSION,
 };
 use crate::ops::types::ResourceSharePermissionSummary;
 
@@ -67,7 +69,11 @@ impl ShareRecord {
     /// Attach `attachment` to this share, replacing whatever was attached under the
     /// same permission ARN — an attach of a permission the share already holds moves
     /// the share onto the version this one names and adds nothing.
+    ///
+    /// An attach is also what puts back a permission a removal took away, so the
+    /// removal stops suppressing it.
     pub fn attach_permission(&mut self, attachment: SharePermissionRecord) {
+        self.removed_permissions.remove(&attachment.permission_arn);
         self.attached_permissions
             .insert(attachment.permission_arn.clone(), attachment);
     }
@@ -76,6 +82,20 @@ impl ShareRecord {
     /// was attached (and so whether the attached set changed).
     pub fn detach_permission(&mut self, permission_arn: &str) -> bool {
         self.attached_permissions.remove(permission_arn).is_some()
+    }
+
+    /// REMOVE the permission `permission_arn` from this share: detach it if the share
+    /// held it by name, and record the removal so the share is not governed by it even
+    /// when it is the published default of a resource type the share shares.
+    ///
+    /// `DisassociateResourceSharePermission` "removes a managed permission from a
+    /// resource share" and "permission changes take effect immediately" (the
+    /// operation's own documentation), so what a removal has to leave behind is a share
+    /// no longer governed by that permission — whether the share held it by name or by
+    /// the derivation that governs a shared resource type by its default permission.
+    pub fn remove_permission(&mut self, permission_arn: &str) {
+        self.detach_permission(permission_arn);
+        self.removed_permissions.insert(permission_arn.to_string());
     }
 }
 
@@ -160,6 +180,82 @@ impl ComAmazonawsRamAmazonresourcesharingState {
             .collect()
     }
 
+    /// Forget the removal of every permission of the resource type `resource_arn` names
+    /// from the share `share_arn`, so that type's default permission is derived onto
+    /// the share again.
+    ///
+    /// Called where a share starts sharing a resource: RAM governs a resource type a
+    /// share shares by that type's default managed permission when the share holds none
+    /// of its own, so a removal does not outlive the resources it was made without. A
+    /// resource whose ARN names no type ([`resource_type_of_arn`]) restores nothing.
+    pub fn restore_removed_permissions(&mut self, share_arn: &str, resource_arn: &str) {
+        let Some(resource_type) = resource_type_of_arn(resource_arn) else {
+            return;
+        };
+        // Taken off the share so the removals can be sifted against the permissions
+        // this store holds, then put back less the ones this resource type restores.
+        let Some(mut removed) = self
+            .resource_shares
+            .get_mut(share_arn)
+            .map(|share| std::mem::take(&mut share.removed_permissions))
+        else {
+            return;
+        };
+        removed.retain(|arn| {
+            self.permission(arn).is_none_or(|permission| {
+                !resource_type_matches(&permission.resource_type, &resource_type)
+            })
+        });
+        if let Some(share) = self.resource_shares.get_mut(share_arn) {
+            share.removed_permissions = removed;
+        }
+    }
+
+    /// Remove the managed permission `permission_arn` from the live share `share_arn`,
+    /// and answer whether the share took the removal.
+    ///
+    /// `false` means no live share has that ARN, so nothing was removed.
+    pub fn remove_share_permission(&mut self, share_arn: &str, permission_arn: &str) -> bool {
+        let Some(share) = self.live_share_mut(share_arn) else {
+            return false;
+        };
+        share.remove_permission(permission_arn);
+        true
+    }
+
+    /// Whether the share `share_arn` currently SHARES a resource of the resource type
+    /// `resource_type`: it has a resource association of that type on the attach path
+    /// ([`association_is_attaching`]).
+    ///
+    /// These are the "resources of the relevant resource type currently attached to the
+    /// resource share" that a removal of the permission governing them is refused for
+    /// (`DisassociateResourceSharePermission`'s own documentation). A resource whose
+    /// association was torn down is attached to nothing, so it holds no removal back.
+    pub fn shares_resource_type(&self, share_arn: &str, resource_type: &str) -> bool {
+        self.associations.values().any(|record| {
+            record.resource_share_arn == share_arn
+                && record.association_type == ASSOCIATION_TYPE_RESOURCE
+                && association_is_attaching(&record.status)
+                && resource_type_of_arn(&record.associated_entity)
+                    .is_some_and(|shared| resource_type_matches(&shared, resource_type))
+        })
+    }
+
+    /// The ARNs of the managed permissions that govern the resources of type
+    /// `resource_type` in the share `share_arn`, in permission ARN order.
+    ///
+    /// Every permission a read of the share reports ([`Self::share_permissions`]) that
+    /// applies to the type, so one the share holds by name and one derived from what it
+    /// shares both count: what decides whether the resources of a type would be left
+    /// ungoverned is which permissions the share is read as holding for that type.
+    pub fn permissions_governing_type(&self, share_arn: &str, resource_type: &str) -> Vec<String> {
+        self.share_permissions(share_arn)
+            .into_iter()
+            .filter(|holder| resource_type_matches(&holder.permission.resource_type, resource_type))
+            .map(|holder| holder.arn().to_string())
+            .collect()
+    }
+
     /// Attach the managed permission `permission_arn` to the live share `share_arn` at
     /// the permission's default version, detaching every permission named in `replaced`
     /// first, and answer whether the share took the attachment.
@@ -225,7 +321,11 @@ impl ComAmazonawsRamAmazonresourcesharingState {
                 continue;
             }
             let default = default_aws_managed_permission(&resource_type)
-                .and_then(|entry| self.permissions.get(&entry.arn()));
+                .map(|entry| entry.arn())
+                // A permission a removal took away from this share no longer governs
+                // it, so it is not derived back onto it.
+                .filter(|arn| !share.removed_permissions.contains(arn))
+                .and_then(|arn| self.permissions.get(&arn));
             if let Some(permission) = default {
                 if let Some(version) = permission.version(None) {
                     attached.push(AttachedPermission {
@@ -260,6 +360,37 @@ pub fn permission_already_attached_message(
         "Resource share {share_arn} already has permission {attached} associated for \
          resource type {resource_type}. Set replace to true to replace it."
     )
+}
+
+/// The message of the `InvalidParameterException` a removal renders when the share
+/// still shares resources of the permission's resource type and this is the only
+/// permission it holds for that type.
+///
+/// "You can remove a managed permission from a resource share only if there are
+/// currently no resources of the relevant resource type currently attached to the
+/// resource share" (`DisassociateResourceSharePermission`'s own documentation): the
+/// resources of a type a share shares are governed by the permissions the share holds
+/// for that type, so removing the last of them would leave them governed by nothing.
+/// The message names the permission the request asked to remove and the resource type
+/// whose resources are using it.
+pub fn last_permission_for_resource_type_message(
+    permission_arn: &str,
+    resource_type: &str,
+) -> String {
+    format!(
+        "The permission {permission_arn} cannot be disassociated because it is the last \
+         permission being used by resources of type {resource_type} in the share."
+    )
+}
+
+/// The message of the `InvalidParameterException` a removal renders when the share is
+/// not governed by the permission the request names at all.
+///
+/// A removal acts on the ATTACHMENT of a permission to a share, so a permission that
+/// share does not hold — by name or by derivation — names no attachment to remove, and
+/// the message names both halves of the pair the caller asked for.
+pub fn permission_not_attached_message(share_arn: &str, permission_arn: &str) -> String {
+    format!("Permission {permission_arn} is not associated with resource share {share_arn}.")
 }
 
 /// The message of the `InvalidParameterException` an attach renders when the request

@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateResourceSharePermission
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateResourceSharePermission`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Removes one managed permission from one resource share, so the share is no longer
+//! governed by it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateResourceSharePermission::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Permission changes take effect immediately", and "you can remove a managed
+//! permission from a resource share only if there are currently no resources of the
+//! relevant resource type currently attached to the resource share" (the operation's
+//! own documentation): the resources of a type a share shares are governed by the
+//! permissions the share holds for that type, so a removal that would leave them
+//! governed by nothing is refused and the share is left as it was. A removal that is
+//! served takes the permission out of the share's permission set
+//! ([`crate::state::ComAmazonawsRamAmazonresourcesharingState::remove_share_permission`]),
+//! which is what `ListResourceSharePermissions` and the `permissionArn` filter of
+//! `GetResourceShares` then report.
+//!
+//! Idempotent through `clientToken`: a repeat of the same request answers for the
+//! removal the first call made rather than removing a second time.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +183,179 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateResourceSharePermission` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateResourceSharePermissionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateResourceSharePermission"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DisassociateResourceSharePermissionErrorModeled::ServerInternalException(
+                ServerInternalException {
+                    message: "the resource share store is unavailable".to_string(),
+                },
+            )
+        })?;
+
+        // The model constrains none of these members, so every rule below is applied
+        // here, each rendered as the modelled error RAM words that refusal with.
+        if let Some(why) =
+            crate::state::share_arn_rejection("resourceShareArn", &input.resource_share_arn)
+                .or_else(|| {
+                    crate::state::permission_arn_rejection("permissionArn", &input.permission_arn)
+                })
+        {
+            return Err(
+                DisassociateResourceSharePermissionErrorModeled::MalformedArnException(
+                    MalformedArnException { message: why },
+                )
+                .into(),
+            );
+        }
+        if let Some(why) = input
+            .client_token
+            .as_deref()
+            .and_then(crate::state::client_token_rejection)
+        {
+            return Err(
+                DisassociateResourceSharePermissionErrorModeled::InvalidClientTokenException(
+                    InvalidClientTokenException { message: why },
+                )
+                .into(),
+            );
+        }
+
+        let mut store = state.lock();
+        let now = store.tick();
+        store.settle_due_associations(now);
+        store.settle_due_permissions(now);
+
+        // Every parameter other than the token itself, so a retry of this request is
+        // told apart from a different request that reuses the token.
+        let fingerprint =
+            crate::state::fingerprint(&[&input.resource_share_arn, &input.permission_arn]);
+
+        if let Some(token) = input.client_token.clone() {
+            if let Some(record) = store.client_token_record(Self::NAME, &token) {
+                if record.fingerprint != fingerprint {
+                    // This operation models no `IdempotentParameterMismatchException`
+                    // (`smithy_query(query="operation",operation="DisassociateResourceSharePermission")`),
+                    // so a token reused for another request is refused as the invalid
+                    // client token it is, with the sentence RAM words that clash with.
+                    return Err(
+                        DisassociateResourceSharePermissionErrorModeled::InvalidClientTokenException(
+                            InvalidClientTokenException {
+                                message: crate::state::IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE
+                                    .to_string(),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                // A repeat removes nothing further: the removal the first call made is
+                // the answer — but only while the share it was made on still exists, so
+                // a token cannot answer for a share that is gone.
+                if store.live_share(&input.resource_share_arn).is_some() {
+                    return Ok(DisassociateResourceSharePermissionOutput {
+                        return_value: Some(true),
+                        client_token: Some(token),
+                    });
+                }
+            }
+        }
+
+        // A share `DeleteResourceShare` has removed holds no permission for this call
+        // to remove from it.
+        if store.live_share(&input.resource_share_arn).is_none() {
+            return Err(
+                DisassociateResourceSharePermissionErrorModeled::UnknownResourceException(
+                    UnknownResourceException {
+                        message: crate::state::unknown_share_message(&input.resource_share_arn),
+                    },
+                )
+                .into(),
+            );
+        }
+        // The permission's own record is what names the resource type the removal is
+        // judged against, so an ARN this account holds no permission under names
+        // nothing to remove.
+        let resource_type = store
+            .permission(&input.permission_arn)
+            .map(|permission| permission.resource_type.clone())
+            .ok_or_else(|| {
+                DisassociateResourceSharePermissionErrorModeled::UnknownResourceException(
+                    UnknownResourceException {
+                        message: crate::state::unknown_permission_message(&input.permission_arn),
+                    },
+                )
+            })?;
+
+        let governing =
+            store.permissions_governing_type(&input.resource_share_arn, &resource_type);
+        // A permission the share is not governed by — one it never held, or one an
+        // earlier removal already took away — names no attachment to remove.
+        if !governing.iter().any(|arn| arn == &input.permission_arn) {
+            return Err(
+                DisassociateResourceSharePermissionErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: crate::state::permission_not_attached_message(
+                            &input.resource_share_arn,
+                            &input.permission_arn,
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+        // "You can remove a managed permission from a resource share only if there are
+        // currently no resources of the relevant resource type currently attached to
+        // the resource share": while the share shares resources of the permission's
+        // type, removing it is refused and the share is left as it was. "A resource
+        // share can have only one permission per resource type"
+        // (`AssociateResourceSharePermission$replace`), so the permission removed is
+        // the last one those resources are being governed by, which is what the
+        // refusal says.
+        if store.shares_resource_type(&input.resource_share_arn, &resource_type) {
+            return Err(
+                DisassociateResourceSharePermissionErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: crate::state::last_permission_for_resource_type_message(
+                            &input.permission_arn,
+                            &resource_type,
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let removed =
+            store.remove_share_permission(&input.resource_share_arn, &input.permission_arn);
+        if !removed {
+            return Err(
+                DisassociateResourceSharePermissionErrorModeled::UnknownResourceException(
+                    UnknownResourceException {
+                        message: crate::state::unknown_share_message(&input.resource_share_arn),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // RAM generates a token when the request omits one and reports it either way,
+        // so a caller can repeat the call idempotently.
+        let client_token = match input.client_token {
+            Some(token) => token,
+            None => store.fresh_uuid(),
+        };
+        store.remember_client_token(
+            Self::NAME,
+            &client_token,
+            fingerprint,
+            input.resource_share_arn.clone(),
+        );
+
+        Ok(DisassociateResourceSharePermissionOutput {
+            // "A return value of true indicates that the request succeeded": the
+            // permission no longer governs the share.
+            return_value: Some(true),
+            client_token: Some(client_token),
+        })
     }
 }
+
