@@ -2,13 +2,17 @@
 
 //! What status an S3 Control success carries, driven end to end over HTTP.
 //!
-//! The rule under test: a successful call whose modelled output is
-//! `smithy.api#Unit` — the model declares no response document for it, so the
-//! answer has nothing to put in a body — is answered `204 No Content` with an
-//! empty body, while a call that DOES report a document is answered 200 with
-//! one. The status is a property of the class of answer, not of the verb or the
-//! resource: a `PUT` that reports nothing back answers 204 just as a `DELETE`
-//! does, and a `DELETE` that reports a document would answer 200.
+//! The rule under test: the status of a success is the one the OPERATION
+//! answers, read per member rather than from the shape of its output. A call
+//! that reports a document answers 200 with one. A call whose modelled output is
+//! `smithy.api#Unit` reports no document, and most of this service's such
+//! members answer `204 No Content` with an empty body — but the empty output
+//! shape alone does not decide it: the account-level public-access block PUT
+//! answers the `200` its model declares, with an empty body whose emptiness the
+//! transport frames as `content-length: 0` (a 204 carries no such header).
+//! Neither the verb nor the resource decides the status either: a `PUT` that
+//! reports nothing back answers 204 just as a `DELETE` does, and a `DELETE` that
+//! reported a document would answer 200.
 //!
 //! Each row below differs along something that rule generalises over: the
 //! operation, the resource family it belongs to (access points, Access Grants,
@@ -38,6 +42,12 @@ const OTHER_REGION: &str = "eu-central-1";
 /// The status a success that reports a document carries — the Smithy default,
 /// and what every reader of this service answers.
 const WITH_DOCUMENT: u16 = 200;
+
+/// The status an empty-body success whose answer is the modelled 200 carries, as
+/// the service states it
+/// ([`::service_com_amazonaws_s3control_awss3controlservicev20180820::state::EMPTY_BODY_OK_SUCCESS_STATUS`]).
+const EMPTY_BODY_OK: u16 =
+    service_com_amazonaws_s3control_awss3controlservicev20180820::state::EMPTY_BODY_OK_SUCCESS_STATUS;
 
 // ---------------------------------------------------------------------------
 // The calls this suite drives, written here because they are the operations
@@ -406,9 +416,9 @@ async fn the_access_point_surface_answers_no_content_where_it_reports_no_documen
 }
 
 #[tokio::test]
-async fn the_public_access_block_surface_answers_no_content_for_its_put_and_its_delete() {
+async fn the_public_access_block_put_answers_an_empty_ok_and_its_delete_no_content() {
     let emulator = Emulator::start();
-    let mut rows = Vec::new();
+    let mut no_content = Vec::new();
 
     // The rows differ in which of the four settings the request carries at all,
     // in their values, and in the Region the request is signed for (the
@@ -439,11 +449,22 @@ async fn the_public_access_block_surface_answers_no_content_for_its_put_and_its_
 
     for region in [REGION, OTHER_REGION] {
         for (case, members) in &bodies {
-            rows.push(row(
-                format!("PutPublicAccessBlock, {case}, signed for {region}"),
-                put_public_access_block(&emulator, ACCOUNT, region, members).await,
-            ));
-            // The configuration the 204 stored is the one reported back.
+            let put = put_public_access_block(&emulator, ACCOUNT, region, members).await;
+            // The PUT reports no document, and it is still an OK rather than a
+            // No Content: the status is this member's own answer.
+            assert_eq!(
+                put.status, EMPTY_BODY_OK,
+                "case {case:?} signed for {region}: expected PutPublicAccessBlock to answer \
+                 {EMPTY_BODY_OK}, got {} with body {:?}",
+                put.status, put.body
+            );
+            assert!(
+                put.body.trim().is_empty(),
+                "case {case:?} signed for {region}: expected no document in the body, got {:?}",
+                put.body
+            );
+            // The OK is a real store, not a shallow success: the reader answers
+            // the configuration back.
             let read = get_public_access_block(&emulator, ACCOUNT, region).await;
             assert_eq!(
                 read.status, WITH_DOCUMENT,
@@ -453,12 +474,12 @@ async fn the_public_access_block_surface_answers_no_content_for_its_put_and_its_
             );
         }
 
-        rows.push(row(
+        no_content.push(row(
             format!("DeletePublicAccessBlock, a configuration that is there ({region})"),
             delete_public_access_block(&emulator, ACCOUNT, region).await,
         ));
         // A repeat delete asks for the state the account is already in.
-        rows.push(row(
+        no_content.push(row(
             format!("DeletePublicAccessBlock, no configuration left ({region})"),
             delete_public_access_block(&emulator, ACCOUNT, region).await,
         ));
@@ -467,14 +488,14 @@ async fn the_public_access_block_surface_answers_no_content_for_its_put_and_its_
         assert_eq!(
             (gone.status, gone.code().as_str()),
             (404, "NoSuchPublicAccessBlockConfiguration"),
-            "region {region}: expected the 204 delete to have removed the configuration, \
-             got {} with body {}",
+            "region {region}: expected the {NO_CONTENT} delete to have removed the \
+             configuration, got {} with body {}",
             gone.status,
             gone.body
         );
     }
 
-    assert_no_content(rows);
+    assert_no_content(no_content);
 }
 
 #[tokio::test]

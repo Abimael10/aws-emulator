@@ -392,21 +392,36 @@ pub const MAX_STORAGE_LENS_TAGS: usize = 50;
 /// The status an operation of this service whose response carries NO document
 /// answers a success with: `204 No Content`.
 ///
-/// This holds for every member whose modelled output is `smithy.api#Unit`: the
-/// model declares no response shape at all for it, so a success has nothing to
-/// put in a body, and the wire answers No Content. The model's `http.code` for
-/// most of them is the Smithy default of 200, which is stale for a member that
-/// carries no body — and the model itself codes the same empty-body answer 204
-/// where it states a code (`CreateStorageLensGroup`,
-/// `DeleteBucketTagging`, `DeleteStorageLensGroup`, `UpdateStorageLensGroup`,
-/// `TagResource`, `UntagResource`). A 200 there promises a document the
-/// response does not carry, so a client that distinguishes the two — one that
-/// parses a body only when there is one, or that asserts the status it was
-/// told — takes the wrong branch.
+/// This holds for the members whose modelled output is `smithy.api#Unit` and
+/// whose wire answer carries no body at all: the model declares no response
+/// shape for them, so a success has nothing to put in a body, and the wire
+/// answers No Content. The model's `http.code` for most of them is the Smithy
+/// default of 200, which is stale for a member that carries no body — and the
+/// model itself codes the same empty-body answer 204 where it states a code
+/// (`CreateStorageLensGroup`, `DeleteBucketTagging`, `DeleteStorageLensGroup`,
+/// `UpdateStorageLensGroup`, `TagResource`, `UntagResource`). A 200 there
+/// promises a document the response does not carry, so a client that
+/// distinguishes the two — one that parses a body only when there is one, or
+/// that asserts the status it was told — takes the wrong branch.
+///
+/// It is NOT a property of the empty output shape alone: the status is each
+/// member's own answer, and the one whose answer is the modelled 200 keeps it
+/// ([`EMPTY_BODY_OK_SUCCESS_STATUS`]).
 ///
 /// The operations that DO report a document keep the modelled 200, because they
 /// answer one.
 pub const NO_CONTENT_SUCCESS_STATUS: u16 = 204;
+
+/// The status an empty-output member whose wire answer is the status the model
+/// declares reports a success with: `200 OK`, with an empty body.
+///
+/// The account-level `PublicAccessBlock` put answers this one rather than
+/// [`NO_CONTENT_SUCCESS_STATUS`]: its answer carries no document either, but it
+/// is an OK whose emptiness is stated in the framing `content-length: 0` that a
+/// 200 carries and a `204 No Content` must not carry at all. So the success
+/// status is read per member, from what that member answers, and the empty
+/// output shape it shares with the No Content members decides nothing.
+pub const EMPTY_BODY_OK_SUCCESS_STATUS: u16 = 200;
 
 /// How many entries one page of `ListStorageLensConfigurations` carries.
 ///

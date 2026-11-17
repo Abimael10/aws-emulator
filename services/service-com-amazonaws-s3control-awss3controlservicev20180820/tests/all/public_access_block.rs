@@ -38,13 +38,21 @@ use std::sync::Arc;
 use service_com_amazonaws_s3_amazons3::state::BucketPublicAccessBlock;
 use smithy_server_runtime::MultiServiceRouter;
 
-// The status a call of this surface whose response carries no document — the
-// put and the delete, whose modelled output is `smithy.api#Unit` — answers a
-// success with: the service's own constant, read through the shared test
-// harness so every suite asserts the one value.
+// The status a call of this surface whose response carries no document answers
+// a success with: the DELETE answers `204 No Content`, the PUT the `200` its
+// model declares ([`PUT_OK`]) — both read through the service's own constants,
+// via the shared test harness, so every suite asserts the one value.
 use crate::access_point_lifecycle::{
     FOREIGN_ACCOUNT_CODE, FOREIGN_ACCOUNT_MESSAGE, FOREIGN_ACCOUNT_STATUS, NO_CONTENT,
 };
+
+/// The status `PutPublicAccessBlock` answers a success with: the `200` the model
+/// declares for it, with an empty body
+/// ([`::service_com_amazonaws_s3control_awss3controlservicev20180820::state::EMPTY_BODY_OK_SUCCESS_STATUS`]).
+/// Its answer reports no document, as the delete's does, and the status is still
+/// not the delete's: it is read per member from what that member answers.
+pub(crate) const PUT_OK: u16 =
+    service_com_amazonaws_s3control_awss3controlservicev20180820::state::EMPTY_BODY_OK_SUCCESS_STATUS;
 
 /// The region every request in this suite is signed for.
 const REGION: &str = "us-west-2";
@@ -335,10 +343,15 @@ async fn put_then_get_round_trips_every_combination_of_the_four_settings() {
     for settings in every_combination() {
         let put = emulator.put(ACCOUNT, settings).await;
         assert_eq!(
-            put.status, NO_CONTENT,
-            "case {settings:?}: expected PutPublicAccessBlock to answer {NO_CONTENT}, got {} with \
+            put.status, PUT_OK,
+            "case {settings:?}: expected PutPublicAccessBlock to answer {PUT_OK}, got {} with \
              body {}",
             put.status, put.body
+        );
+        assert!(
+            put.body.trim().is_empty(),
+            "case {settings:?}: expected the put to report no document, got body {}",
+            put.body
         );
 
         let read = emulator.get(ACCOUNT).await;
@@ -395,7 +408,7 @@ async fn absence_is_distinct_from_a_configuration_whose_settings_are_all_false()
 
     assert_eq!(
         emulator.put(ACCOUNT, all_false).await.status,
-        NO_CONTENT,
+        PUT_OK,
         "case {:?}: expected the all-false put to be accepted",
         "all four settings false"
     );
@@ -485,7 +498,7 @@ async fn a_setting_the_request_omits_is_stored_and_reported_as_false() {
     for (case, members, settings) in rows {
         let put = emulator.put_body(ACCOUNT, &members).await;
         assert_eq!(
-            put.status, NO_CONTENT,
+            put.status, PUT_OK,
             "case {case:?}: expected PutPublicAccessBlock to accept the payload, got {} with \
              body {}",
             put.status, put.body
@@ -512,7 +525,7 @@ async fn a_configuration_call_addressed_in_another_account_is_refused() {
     let mine = [true, false, true, false];
     let theirs = [false, true, false, true];
 
-    assert_eq!(emulator.put(ACCOUNT, mine).await.status, NO_CONTENT);
+    assert_eq!(emulator.put(ACCOUNT, mine).await.status, PUT_OK);
 
     // One row per operation of this surface, each addressed in an account the
     // caller holds no credentials for: the answer is the same refusal, before
@@ -597,7 +610,7 @@ async fn the_store_cannot_be_grown_by_naming_accounts_the_caller_does_not_hold()
     ] {
         let stored = emulator.put(ACCOUNT, settings).await;
         assert_eq!(
-            stored.status, NO_CONTENT,
+            stored.status, PUT_OK,
             "case {case:?}: expected the caller's own put to be accepted, got {} with body {}",
             stored.status, stored.body
         );
@@ -656,7 +669,7 @@ async fn the_number_of_stored_configurations_is_bounded_and_a_delete_releases_th
     emulator.hold_configurations_for(quota - 1);
     let stored = emulator.put(ACCOUNT, [true; 4]).await;
     assert_eq!(
-        stored.status, NO_CONTENT,
+        stored.status, PUT_OK,
         "expected the put that fills the last slot to be accepted, got {} with body {}",
         stored.status, stored.body
     );
@@ -666,7 +679,7 @@ async fn the_number_of_stored_configurations_is_bounded_and_a_delete_releases_th
     let replaced = emulator.put(ACCOUNT, [false; 4]).await;
     assert_eq!(
         (replaced.status, emulator.get(ACCOUNT).await.settings()),
-        (NO_CONTENT, expected([false; 4])),
+        (PUT_OK, expected([false; 4])),
         "expected a replace at the bound to be accepted and reported, got {} with body {}",
         replaced.status,
         replaced.body
@@ -681,7 +694,7 @@ async fn the_number_of_stored_configurations_is_bounded_and_a_delete_releases_th
     );
     let after_the_delete = emulator.put(ACCOUNT, [true; 4]).await;
     assert_eq!(
-        after_the_delete.status, NO_CONTENT,
+        after_the_delete.status, PUT_OK,
         "expected the put after the delete to be accepted, got {} with body {}",
         after_the_delete.status, after_the_delete.body
     );
@@ -827,7 +840,7 @@ async fn a_call_in_a_foreign_account_is_denied_whatever_the_account_value_looks_
     // rows are compared against a surface that is being served.
     assert_eq!(
         emulator.put(ACCOUNT, mine).await.status,
-        NO_CONTENT,
+        PUT_OK,
         "expected the caller's own put to be accepted"
     );
 

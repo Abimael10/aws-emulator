@@ -410,7 +410,7 @@ async fn the_account_configuration_refusal_names_the_account_the_request_address
     let holder = ACCOUNT;
     assert_eq!(
         put_public_access_block(&emulator, holder).await.status,
-        NO_CONTENT,
+        crate::public_access_block::PUT_OK,
         "expected the configuration to be stored for {holder}"
     );
     let served = get_public_access_block(&emulator, holder).await;

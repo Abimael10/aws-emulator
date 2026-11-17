@@ -214,31 +214,37 @@ impl ObjectStore {
     /// Put the account-level configuration `settings`, or remove it altogether for `None`,
     /// through S3 Control's own operations — the API a client configures it with.
     async fn set_account_configuration(&self, case: &str, settings: Option<[bool; 4]>) {
-        let reply = match settings {
+        // The put reports no document and answers the 200 its model declares;
+        // the delete answers 204 No Content.
+        let (reply, expected) = match settings {
             Some(settings) => {
                 let members: String = SETTINGS
                     .iter()
                     .zip(settings)
                     .map(|(member, value)| format!("<{member}>{value}</{member}>"))
                     .collect();
-                self.s3control(
-                    REGION,
-                    "PUT",
-                    ACCOUNT_CONFIGURATION_URI,
-                    &format!(
-                        "<PublicAccessBlockConfiguration xmlns=\"{XMLNS}\">{members}\
-                         </PublicAccessBlockConfiguration>"
-                    ),
+                (
+                    self.s3control(
+                        REGION,
+                        "PUT",
+                        ACCOUNT_CONFIGURATION_URI,
+                        &format!(
+                            "<PublicAccessBlockConfiguration xmlns=\"{XMLNS}\">{members}\
+                             </PublicAccessBlockConfiguration>"
+                        ),
+                    )
+                    .await,
+                    crate::public_access_block::PUT_OK,
                 )
-                .await
             }
-            None => {
+            None => (
                 self.s3control(REGION, "DELETE", ACCOUNT_CONFIGURATION_URI, "")
-                    .await
-            }
+                    .await,
+                NO_CONTENT,
+            ),
         };
         assert_eq!(
-            reply.status, NO_CONTENT,
+            reply.status, expected,
             "case {case:?}: the account-level configuration must be written first, got {} with \
              body {}",
             reply.status, reply.body

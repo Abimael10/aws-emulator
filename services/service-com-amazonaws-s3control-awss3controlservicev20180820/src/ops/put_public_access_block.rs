@@ -9,6 +9,11 @@
 //! state from an account that has none, which `GetPublicAccessBlock` answers
 //! `NoSuchPublicAccessBlockConfiguration` for.
 //!
+//! The success carries no document, and it is answered with the `200` the model
+//! declares for this member rather than the `204 No Content` the service's other
+//! empty-body answers carry
+//! ([`crate::state::EMPTY_BODY_OK_SUCCESS_STATUS`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -85,13 +90,15 @@ impl PutPublicAccessBlockOutput {
         ::aws_smithy_schema::ShapeType::Structure,
         &[],
     )
-    // The status is the 204 No Content this service answers an empty-body
-    // success with ([`crate::state::NO_CONTENT_SUCCESS_STATUS`]); the model's
-    // defaulted 200 is stale for a member that carries no document at all.
+    // The status is the 200 the model declares for this member
+    // ([`crate::state::EMPTY_BODY_OK_SUCCESS_STATUS`]): the answer carries no
+    // document, but it is an OK whose emptiness travels in `content-length: 0`,
+    // not a No Content — the sibling empty-body members that DO answer 204 are
+    // the ones [`crate::state::NO_CONTENT_SUCCESS_STATUS`] states.
     .with_http(::aws_smithy_schema::traits::HttpTrait::new(
         "PUT",
         "/v20180820/configuration/publicAccessBlock",
-        Some(crate::state::NO_CONTENT_SUCCESS_STATUS),
+        Some(crate::state::EMPTY_BODY_OK_SUCCESS_STATUS),
     ));
 }
 
@@ -155,7 +162,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "PutPublicAccessBlock";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::PUT_PUBLIC_ACCESS_BLOCK_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = PUT_PUBLIC_ACCESS_BLOCK_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = crate::state::NO_CONTENT_SUCCESS_STATUS;
+    const SUCCESS_STATUS: u16 = crate::state::EMPTY_BODY_OK_SUCCESS_STATUS;
 
     async fn handle(
         &self,

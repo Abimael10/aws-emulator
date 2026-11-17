@@ -470,10 +470,12 @@ async fn a_public_policy_is_refused_exactly_where_block_public_policy_is_in_forc
                 )
                 .await;
             assert_eq!(
-                put.status, NO_CONTENT,
-                "case {source:?}: expected PutPublicAccessBlock to answer {NO_CONTENT}, got {} \
-                 with body {}",
-                put.status, put.body
+                put.status,
+                crate::public_access_block::PUT_OK,
+                "case {source:?}: expected PutPublicAccessBlock to answer {}, got {} with body {}",
+                crate::public_access_block::PUT_OK,
+                put.status,
+                put.body
             );
         }
 
