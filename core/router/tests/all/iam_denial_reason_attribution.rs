@@ -16,10 +16,9 @@
 //! from the session policies the temporary credential was minted with. All four are HTTP
 //! 403 with the awsQuery error code `AccessDenied`, and a ceiling or a scope NARROWS rather
 //! than revokes: the same principal is still served the calls the document it runs under
-//! allows. Whether the message then continues with the pointer at the request's
-//! authorization details is a fact about the ACTION alone, not about which document decided
-//! — so the clause is read with that continuation dropped by shape, never by pinning the
-//! per-request authorization id it names.
+//! allows. The message then continues with the pointer at the request's authorization
+//! details whichever document decided it — so the clause is read with that continuation
+//! dropped by shape, never by pinning the per-request authorization id it names.
 //!
 //! Two services have to agree for the fourth of those clauses to be reachable at all — STS
 //! mints the session and records the scope it was minted with, IAM holds the user, the role
@@ -29,10 +28,8 @@
 //!
 //! The rows span what the rule generalises over: WHICH document decided the refusal (all
 //! four), WHICH operation of the deciding service asked (a read of one user, a read of that
-//! user's keys, a read of its group memberships), WHICH credential class signed (a
-//! long-term user key and a role session's temporary credential), and WHETHER the action's
-//! refusal continues with the authorization-details pointer (two that do, one that does
-//! not).
+//! user's keys, a read of its group memberships), and WHICH credential class signed (a
+//! long-term user key and a role session's temporary credential).
 
 use std::sync::Arc;
 
@@ -63,20 +60,6 @@ const SESSION: &str = "attributed";
 
 /// The managed policy that is the caller's permissions boundary.
 const BOUNDARY_POLICY: &str = "reason-ceiling";
-
-/// Where the authorization details of one refused request are read, which is the head of
-/// the continuation a refusal of some actions carries. Matched by SHAPE: the authorization
-/// id that follows it is a fact of the request, so no row pins its value.
-const AUTHORIZATION_DETAILS_PAGE: &str =
-    "https://us-east-1.console.aws.amazon.com/iam/home?region=us-east-1#/authorization-details/";
-
-/// What separates the reason clause from that continuation.
-const POINTER_HEAD: &str = ". Go to ";
-
-/// The rest of the continuation, between the page the details are read on and the
-/// authorization id a reader of them takes.
-const POINTER_TAIL: &str = " for complete details, or call the GetRequestAuthorizationDetails \
-                            API with the following authorization id: ";
 
 /// A trust policy admitting the account root, which is the delegation that lets a principal
 /// of this account the identity policies allow assume the role.
@@ -214,17 +197,11 @@ fn everything() -> Vec<String> {
     vec!["*".to_string()]
 }
 
-/// One operation a row asks for: the awsQuery action, the `iam:` action a policy statement
-/// names it by, and whether AWS continues ITS refusal with the authorization-details
-/// pointer.
+/// One operation a row asks for: the awsQuery action, and the `iam:` action a policy
+/// statement names it by.
 struct Operation {
     action: &'static str,
     iam_action: &'static str,
-    /// SOURCE: the message the service answers that action's refused call with — the fact
-    /// `services/service-com-amazonaws-iam-awsidentitymanagementv20100508/tests/all/access_denied_message_wording.rs`
-    /// owns the table for. Two actions recorded with the pointer and one recorded with the
-    /// sentence alone are taken, so the clause is shown not to move with the continuation.
-    details: bool,
 }
 
 /// The three operations the rows ask for: each addresses ONE user by name, so every row is
@@ -233,17 +210,14 @@ const OPERATIONS: &[Operation] = &[
     Operation {
         action: "GetUser",
         iam_action: "iam:GetUser",
-        details: true,
     },
     Operation {
         action: "ListAccessKeys",
         iam_action: "iam:ListAccessKeys",
-        details: true,
     },
     Operation {
         action: "ListGroupsForUser",
         iam_action: "iam:ListGroupsForUser",
-        details: false,
     },
 ];
 
@@ -517,51 +491,33 @@ impl Estate {
     }
 }
 
-/// The reason clause of `message`, and the authorization id of the continuation that
-/// follows it — `None` where the message ends at the reason.
+/// The reason clause of `message`: what follows the sentence's head, with the pointer at
+/// the request's authorization details taken off.
 ///
 /// The head is asserted here, so a row that diverges on the principal, the action or the
-/// resource says so rather than reporting a mangled clause; the continuation is matched by
-/// SHAPE, since the id in it is a fact of the request this run made.
-fn reason_and_pointer(
+/// resource says so rather than reporting a mangled clause; the continuation is read by the
+/// suite that owns that reader (`iam_authorization_details_pointer.rs`), which asserts its
+/// fixed text and that one id is named in both of its slots — the id itself is a fact of the
+/// request this run made, so no row pins its value.
+fn reason_of(
     case: &str,
     message: &str,
     principal: &str,
     iam_action: &str,
     named_as: &str,
-) -> (String, Option<String>) {
+) -> String {
+    use crate::iam_authorization_details_pointer as pointer;
+
     let head =
         format!("User: {principal} is not authorized to perform: {iam_action} on resource: {named_as} ");
-    let rest = message.strip_prefix(&head).unwrap_or_else(|| {
-        panic!("case {case:?}: expected the refusal to open {head:?}, got {message:?}")
-    });
-    match rest.split_once(POINTER_HEAD) {
-        None => (rest.to_string(), None),
-        Some((reason, pointer)) => {
-            let (page, id) = pointer.split_once(POINTER_TAIL).unwrap_or_else(|| {
-                panic!(
-                    "case {case:?}: expected the continuation to name where the details are \
-                     read and under which authorization id, got {pointer:?}"
-                )
-            });
-            let pointed_at = page.strip_prefix(AUTHORIZATION_DETAILS_PAGE).unwrap_or_else(|| {
-                panic!(
-                    "case {case:?}: expected the continuation to point at IAM's \
-                     authorization-details page, got {page:?}"
-                )
-            });
-            assert!(
-                !pointed_at.is_empty(),
-                "case {case:?}: expected an authorization id in the continuation, got {pointer:?}"
-            );
-            assert_eq!(
-                pointed_at, id,
-                "case {case:?}: expected one authorization id for the same refused call, got \
-                 {pointed_at:?} and {id:?}"
-            );
-            (reason.to_string(), Some(id.to_string()))
-        }
-    }
+    pointer::pointed_at(case, message);
+    let sentence = pointer::sentence_of(case, message);
+    sentence
+        .strip_prefix(&head)
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: expected the refusal to open {head:?}, got {message:?}")
+        })
+        .to_string()
 }
 
 /// Assert that `body` is the refusal of `operation` on `target` that `cause` decides, and
@@ -585,7 +541,7 @@ fn assert_refusal(
         "case {case:?}: expected the error code AccessDenied, got {code:?}: {body}"
     );
     let message = message_of(body);
-    let (reason, pointed_at) = reason_and_pointer(
+    let reason = reason_of(
         case,
         &message,
         estate.principal(cause),
@@ -597,18 +553,6 @@ fn assert_refusal(
         reason, expected,
         "case {case:?}: expected the clause naming the document that decided the refusal, \
          {expected:?}, got {reason:?} in {message:?}"
-    );
-    assert_eq!(
-        pointed_at.is_some(),
-        operation.details,
-        "case {case:?}: expected the refusal of {} to {} the pointer at the request's \
-         authorization details, got {message:?}",
-        operation.iam_action,
-        if operation.details {
-            "carry"
-        } else {
-            "end before"
-        }
     );
     reason
 }

@@ -5,23 +5,21 @@
 //! The rule under test: the message names what the decision was made about — `User: ` +
 //! the ARN of the principal that signed the request + ` is not authorized to perform: ` +
 //! the IAM action the call was decided on + ` on resource: ` + the resource it was decided
-//! against + ` ` + why the decision went that way — and ENDS there, which is the refusal
-//! AWS documents. Only for the actions whose refusal AWS continues with the pointer at
-//! the request's authorization details does that sentence go on: the console page, at IAM's
-//! own endpoint Region whichever Region the caller addressed, and the authorization id of
-//! the refused request, named in both of the pointer's slots, whether or not the caller
-//! held any document for the evaluation to read. Which of the two an action is answered
-//! with is a fact about that action, not about the call: nothing else selects the wording —
-//! not the Region the request addressed, not which documents the caller held, not the
-//! resource form, not whether the call reads or writes, not how often it is made, and not
-//! WHY the decision went the way it did — so a refusal explained by an explicit `Deny`
-//! about the request carries the wording that action's withheld refusal carries.
+//! against + ` ` + why the decision went that way — and then GOES ON to point at the
+//! authorization details of that decision: the console page, at IAM's own endpoint Region
+//! whichever Region the caller addressed, and the authorization id of the refused request,
+//! named in both of the pointer's slots. EVERY refusal this service answers from the
+//! authorization gate carries that pointer: nothing selects it away — not which action was
+//! asked for, not the Region the request addressed, not which documents the caller held,
+//! not the resource form, not whether the call reads or writes, not how often it is made,
+//! and not WHY the decision went the way it did, since an evaluation ran in every one of
+//! those cases and so has details to point at in every one of them.
 //!
 //! Each suite is a TABLE whose rows differ along what the rule generalises over: which
-//! operation is refused and therefore which of the two wordings it is answered with,
-//! whether the resource is an ARN, a path-scoped collection, the account-wide `*` or a
-//! named entity, which of the two refusals it is (an explicit `Deny` about the request, or
-//! no `Allow` for it), and whether the caller held any document at all.
+//! operation is refused, whether the resource is an ARN, a path-scoped collection, the
+//! account-wide `*` or a named entity, which of the two refusals it is (an explicit `Deny`
+//! about the request, or no `Allow` for it), and whether the caller held any document at
+//! all.
 //!
 //! The awsQuery harness is the one `tests/all/user_lifecycle.rs` owns and the other
 //! suites in this crate share, so a request is built and read exactly one way.
@@ -102,9 +100,6 @@ struct Case {
     named_as: String,
     /// The clause closing the sentence.
     reason: String,
-    /// Whether the refusal points at the authorization details of an evaluation: this
-    /// action's refusal is one AWS words with that pointer.
-    details: bool,
 }
 
 /// The rows. Each runs against its own fresh IAM user, so the documents a row puts are
@@ -118,7 +113,6 @@ fn cases(policy_arn: &str) -> Vec<Case> {
     ];
     vec![
         // A collection read with no parameters: the account's users at the root path.
-        // iam:ListUsers is worded with the sentence alone.
         Case {
             case: "implicit deny on a collection read",
             policies: Vec::new(),
@@ -127,10 +121,9 @@ fn cases(policy_arn: &str) -> Vec<Case> {
             iam_action: "iam:ListUsers",
             named_as: format!("arn:aws:iam::{account}:user/"),
             reason: no_allow("iam:ListUsers"),
-            details: false,
         },
         // The same read with a page size: a parameter that does not touch the decision
-        // must not touch the wording either.
+        // must not touch the message either.
         Case {
             case: "implicit deny on a collection read asking for one item",
             policies: Vec::new(),
@@ -139,7 +132,6 @@ fn cases(policy_arn: &str) -> Vec<Case> {
             iam_action: "iam:ListUsers",
             named_as: format!("arn:aws:iam::{account}:user/"),
             reason: no_allow("iam:ListUsers"),
-            details: false,
         },
         // A path-scoped collection: the resource the refusal names is the prefix the
         // request addressed, not the root.
@@ -151,10 +143,9 @@ fn cases(policy_arn: &str) -> Vec<Case> {
             iam_action: "iam:ListGroups",
             named_as: format!("arn:aws:iam::{account}:group/eng/tools/"),
             reason: no_allow("iam:ListGroups"),
-            details: false,
         },
-        // Another collection and another action, to show the resource form is not what
-        // selects the wording.
+        // Another collection and another action, to show the resource form moves nothing
+        // but the resource the refusal names.
         Case {
             case: "implicit deny listing roles",
             policies: Vec::new(),
@@ -163,7 +154,6 @@ fn cases(policy_arn: &str) -> Vec<Case> {
             iam_action: "iam:ListRoles",
             named_as: format!("arn:aws:iam::{account}:role/"),
             reason: no_allow("iam:ListRoles"),
-            details: false,
         },
         // A request that addresses the account's whole configuration: the resource is
         // the account-wide one, so the message carries no ARN at all.
@@ -175,7 +165,6 @@ fn cases(policy_arn: &str) -> Vec<Case> {
             iam_action: "iam:GetAccountAuthorizationDetails",
             named_as: "*".to_string(),
             reason: no_allow("iam:GetAccountAuthorizationDetails"),
-            details: false,
         },
         // A request that addresses ONE entity by name: the refusal names the entity.
         Case {
@@ -186,10 +175,9 @@ fn cases(policy_arn: &str) -> Vec<Case> {
             iam_action: "iam:GetGroup",
             named_as: "group payroll".to_string(),
             reason: no_allow("iam:GetGroup"),
-            details: false,
         },
         // A WRITE refused on one entity, worded like the reads above: what the call does
-        // is not what selects the wording either.
+        // moves nothing in the refusal either.
         Case {
             case: "implicit deny removing a tag from one policy",
             policies: Vec::new(),
@@ -201,11 +189,10 @@ fn cases(policy_arn: &str) -> Vec<Case> {
             iam_action: "iam:UntagPolicy",
             named_as: format!("policy {policy_arn}"),
             reason: no_allow("iam:UntagPolicy"),
-            details: false,
         },
-        // The few actions whose refusal AWS continues with the pointer, on the resource
-        // forms their requests take: a read of one user, a read of that user's keys, a
-        // write of its tags, a wildcard collection and the account singleton.
+        // More actions on the resource forms their requests take: a read of one user, a
+        // read of that user's keys, a write of its tags, a wildcard collection and the
+        // account singleton.
         Case {
             case: "implicit deny reading one user by name",
             policies: Vec::new(),
@@ -214,7 +201,6 @@ fn cases(policy_arn: &str) -> Vec<Case> {
             iam_action: "iam:GetUser",
             named_as: target.clone(),
             reason: no_allow("iam:GetUser"),
-            details: true,
         },
         Case {
             case: "implicit deny listing one user's access keys",
@@ -224,7 +210,6 @@ fn cases(policy_arn: &str) -> Vec<Case> {
             iam_action: "iam:ListAccessKeys",
             named_as: target.clone(),
             reason: no_allow("iam:ListAccessKeys"),
-            details: true,
         },
         Case {
             case: "implicit deny tagging one user",
@@ -234,7 +219,6 @@ fn cases(policy_arn: &str) -> Vec<Case> {
             iam_action: "iam:TagUser",
             named_as: target.clone(),
             reason: no_allow("iam:TagUser"),
-            details: true,
         },
         Case {
             case: "implicit deny listing the account's OIDC providers",
@@ -244,7 +228,6 @@ fn cases(policy_arn: &str) -> Vec<Case> {
             iam_action: "iam:ListOpenIDConnectProviders",
             named_as: format!("arn:aws:iam::{account}:oidc-provider/*"),
             reason: no_allow("iam:ListOpenIDConnectProviders"),
-            details: true,
         },
         Case {
             case: "implicit deny listing one user's tags",
@@ -254,7 +237,6 @@ fn cases(policy_arn: &str) -> Vec<Case> {
             iam_action: "iam:ListUserTags",
             named_as: target.clone(),
             reason: no_allow("iam:ListUserTags"),
-            details: true,
         },
         Case {
             case: "implicit deny reading one user's embedded policy",
@@ -267,7 +249,6 @@ fn cases(policy_arn: &str) -> Vec<Case> {
             iam_action: "iam:GetUserPolicy",
             named_as: target.clone(),
             reason: no_allow("iam:GetUserPolicy"),
-            details: true,
         },
         Case {
             case: "implicit deny listing one user's embedded policies",
@@ -277,12 +258,9 @@ fn cases(policy_arn: &str) -> Vec<Case> {
             iam_action: "iam:ListUserPolicies",
             named_as: target.clone(),
             reason: no_allow("iam:ListUserPolicies"),
-            details: true,
         },
         // The same two reads of a ROLE: a request that addresses one entity of another
-        // type, so neither the entity type nor the resource form selects the wording —
-        // each of these actions is one AWS words with the pointer, as the user's tag
-        // listing above is.
+        // type, so neither the entity type nor the resource form moves the refusal.
         Case {
             case: "implicit deny listing one role's tags",
             policies: Vec::new(),
@@ -291,7 +269,6 @@ fn cases(policy_arn: &str) -> Vec<Case> {
             iam_action: "iam:ListRoleTags",
             named_as: format!("role {TARGET}"),
             reason: no_allow("iam:ListRoleTags"),
-            details: true,
         },
         Case {
             case: "implicit deny listing one role's embedded policies",
@@ -301,7 +278,6 @@ fn cases(policy_arn: &str) -> Vec<Case> {
             iam_action: "iam:ListRolePolicies",
             named_as: format!("role {TARGET}"),
             reason: no_allow("iam:ListRolePolicies"),
-            details: true,
         },
         Case {
             case: "implicit deny writing an account property",
@@ -317,12 +293,10 @@ fn cases(policy_arn: &str) -> Vec<Case> {
             iam_action: "iam:PutAccountProperties",
             named_as: "*".to_string(),
             reason: no_allow("iam:PutAccountProperties"),
-            details: true,
         },
         // The two halves of the account's credential report: both are decided on the
-        // account-wide resource, like the account property above, and both are refused with
-        // the pointer — the read as well as the write, so nothing about the direction of the
-        // call selects the wording.
+        // account-wide resource, like the account property above — the read as well as the
+        // write, so nothing about the direction of the call moves the refusal.
         Case {
             case: "implicit deny generating the account's credential report",
             policies: Vec::new(),
@@ -331,7 +305,6 @@ fn cases(policy_arn: &str) -> Vec<Case> {
             iam_action: "iam:GenerateCredentialReport",
             named_as: "*".to_string(),
             reason: no_allow("iam:GenerateCredentialReport"),
-            details: true,
         },
         Case {
             case: "implicit deny reading the account's credential report",
@@ -341,11 +314,9 @@ fn cases(policy_arn: &str) -> Vec<Case> {
             iam_action: "iam:GetCredentialReport",
             named_as: "*".to_string(),
             reason: no_allow("iam:GetCredentialReport"),
-            details: true,
         },
         // The account's password policy is decided on the same account-wide resource, and
-        // its refusal ENDS at the reason: nothing has been observed answering the pointer
-        // for this action, so it takes the documented sentence.
+        // its refusal is worded exactly as the two above are.
         Case {
             case: "implicit deny reading the account's password policy",
             policies: Vec::new(),
@@ -354,12 +325,10 @@ fn cases(policy_arn: &str) -> Vec<Case> {
             iam_action: "iam:GetAccountPasswordPolicy",
             named_as: "*".to_string(),
             reason: no_allow("iam:GetAccountPasswordPolicy"),
-            details: false,
         },
         // A caller holding a document that grants something ELSE: the same withholding,
-        // reached with a document in force rather than none. Which wording the refusal
-        // takes is the action's, so these two rows differ from their no-document twins
-        // above in nothing at all.
+        // reached with a document in force rather than none, so these two rows differ from
+        // their no-document twins above in nothing at all.
         Case {
             case: "withheld collection read, the caller holding a grant for another action",
             policies: vec![(
@@ -371,7 +340,6 @@ fn cases(policy_arn: &str) -> Vec<Case> {
             iam_action: "iam:ListUsers",
             named_as: format!("arn:aws:iam::{account}:user/"),
             reason: no_allow("iam:ListUsers"),
-            details: false,
         },
         Case {
             case: "withheld key listing, the caller holding a grant for another action",
@@ -384,7 +352,6 @@ fn cases(policy_arn: &str) -> Vec<Case> {
             iam_action: "iam:ListAccessKeys",
             named_as: target.clone(),
             reason: no_allow("iam:ListAccessKeys"),
-            details: true,
         },
         // A grant for the refused action itself whose CONDITION does not hold at the
         // instant of the call: the statement was read and does not apply, which is again
@@ -401,7 +368,6 @@ fn cases(policy_arn: &str) -> Vec<Case> {
             iam_action: "iam:ListUserTags",
             named_as: target.clone(),
             reason: no_allow("iam:ListUserTags"),
-            details: true,
         },
         Case {
             case: "withheld collection read, the caller's grant not yet in effect",
@@ -414,7 +380,6 @@ fn cases(policy_arn: &str) -> Vec<Case> {
             iam_action: "iam:ListUsers",
             named_as: format!("arn:aws:iam::{account}:user/"),
             reason: no_allow("iam:ListUsers"),
-            details: false,
         },
         // A grant for the same action on ANOTHER resource: the statement was read and
         // does not cover the request, which is the same withholding.
@@ -433,10 +398,9 @@ fn cases(policy_arn: &str) -> Vec<Case> {
             iam_action: "iam:GetGroup",
             named_as: "group payroll".to_string(),
             reason: no_allow("iam:GetGroup"),
-            details: false,
         },
         // An explicit `Deny` over a grant for everything: the other reason clause, on a
-        // collection read. The deny itself explains the refusal, so nothing follows it.
+        // collection read. An evaluation decided it too, so it is pointed at like the rest.
         Case {
             case: "explicit deny on a collection read",
             policies: vec![
@@ -451,7 +415,6 @@ fn cases(policy_arn: &str) -> Vec<Case> {
             iam_action: "iam:ListUsers",
             named_as: format!("arn:aws:iam::{account}:user/"),
             reason: EXPLICIT_DENY.to_string(),
-            details: false,
         },
         // An explicit `Deny` on a request that addresses one entity by name.
         Case {
@@ -468,11 +431,10 @@ fn cases(policy_arn: &str) -> Vec<Case> {
             iam_action: "iam:GetGroup",
             named_as: "group payroll".to_string(),
             reason: EXPLICIT_DENY.to_string(),
-            details: false,
         },
-        // An explicit `Deny` of an action whose refusal carries the pointer: WHICH wording
-        // a refusal takes is a fact about the action, so the pointer closes this one too —
-        // the evaluation it names ran whatever the decision was.
+        // An explicit `Deny` of a read of one user: the pointer closes this one as it
+        // closes the withheld refusals above, since the evaluation it names ran whatever
+        // the decision was.
         Case {
             case: "explicit deny reading one user by name",
             policies: vec![
@@ -487,11 +449,9 @@ fn cases(policy_arn: &str) -> Vec<Case> {
             iam_action: "iam:GetUser",
             named_as: target.clone(),
             reason: EXPLICIT_DENY.to_string(),
-            details: true,
         },
-        // An explicit `Deny` of another action whose refusal carries the pointer, on a
-        // request that addresses one entity: the same wording as that action's withheld
-        // refusal.
+        // An explicit `Deny` of another action on a request that addresses one entity: the
+        // same wording as that action's withheld refusal.
         Case {
             case: "explicit deny listing one user's tags",
             policies: vec![
@@ -506,7 +466,6 @@ fn cases(policy_arn: &str) -> Vec<Case> {
             iam_action: "iam:ListUserTags",
             named_as: target.clone(),
             reason: EXPLICIT_DENY.to_string(),
-            details: true,
         },
         // An explicit `Deny` on the account-wide read.
         Case {
@@ -523,12 +482,11 @@ fn cases(policy_arn: &str) -> Vec<Case> {
             iam_action: "iam:GetAccountAuthorizationDetails",
             named_as: "*".to_string(),
             reason: EXPLICIT_DENY.to_string(),
-            details: false,
         },
-        // Two more actions on the default wording, reached on resource forms the rows
-        // above do not use: a write naming the policy ARN the request addressed, and a
-        // read naming the identity ARN it addressed. What the message ends at is neither
-        // the resource form's doing nor the operation kind's.
+        // Two more actions reached on resource forms the rows above do not use: a write
+        // naming the policy ARN the request addressed, and a read naming the identity ARN
+        // it addressed. What the message carries is neither the resource form's doing nor
+        // the operation kind's.
         Case {
             case: "withheld tag removal naming the policy ARN",
             policies: Vec::new(),
@@ -543,9 +501,8 @@ fn cases(policy_arn: &str) -> Vec<Case> {
             iam_action: "iam:UntagPolicy",
             named_as: format!("policy arn:aws:iam::{account}:policy/payroll"),
             reason: no_allow("iam:UntagPolicy"),
-            details: false,
         },
-        // The same wording on a READ whose resource is the ARN the request addressed.
+        // The same on a READ whose resource is the ARN the request addressed.
         Case {
             case: "withheld policy-grant report naming the identity ARN",
             policies: Vec::new(),
@@ -560,7 +517,6 @@ fn cases(policy_arn: &str) -> Vec<Case> {
             iam_action: "iam:ListPoliciesGrantingServiceAccess",
             named_as: format!("arn:aws:iam::{account}:user/payroll"),
             reason: no_allow("iam:ListPoliciesGrantingServiceAccess"),
-            details: false,
         },
     ]
 }
@@ -595,11 +551,11 @@ async fn managed_policy(router: &MultiServiceRouter) -> String {
 }
 
 /// RULE: a refusal's message names the principal, the action and the resource the decision
-/// was made on, closed by why it went that way, and ENDS there — continuing with the
-/// pointer at the request's authorization details only for the actions AWS answers that
-/// pointer for, whichever way their decision went.
+/// was made on, closed by why it went that way, and then by the pointer at that request's
+/// authorization details — whichever action was asked for and whichever way the decision
+/// went.
 #[tokio::test]
-async fn a_refusal_names_the_decision_and_is_worded_as_its_action_is() {
+async fn a_refusal_names_the_decision_and_points_at_its_authorization_details() {
     let router = router();
     target_user(&router).await;
     let policy_arn = managed_policy(&router).await;
@@ -626,8 +582,8 @@ async fn a_refusal_names_the_decision_and_is_worded_as_its_action_is() {
         );
 
         let message = element(&body, "Message");
-        // The sentence the decision is named in, and — for the refusals AWS points at an
-        // evaluation from — the pointer at its authorization details.
+        // The sentence the decision is named in, and the pointer at the authorization
+        // details of that decision.
         assert_access_denied_message(
             case.case,
             &message,
@@ -647,30 +603,19 @@ async fn a_refusal_names_the_decision_and_is_worded_as_its_action_is() {
         let clause = message
             .strip_prefix(&sentence)
             .expect("the sentence the shared assertion just matched");
-        if case.details {
-            assert!(
-                authorization_details_id(clause).is_some(),
-                "case {:?}: expected the refusal to point at the authorization details of \
-                 the request, got {clause:?} after the reason",
-                case.case
-            );
-        } else {
-            assert!(
-                clause.is_empty(),
-                "case {:?}: expected the message to end at the reason {:?}, got {clause:?} \
-                 after it",
-                case.case,
-                case.reason
-            );
-        }
+        assert!(
+            authorization_details_id(clause).is_some(),
+            "case {:?}: expected the refusal to point at the authorization details of the \
+             request, got {clause:?} after the reason",
+            case.case
+        );
     }
 }
 
 /// RULE: every part of the message is a fact of the request and of the documents in
 /// force, so repeating the same refused call — and making it in another Region — answers
-/// the identical message: the sentence alone for an action AWS words with it, and the
-/// sentence closed by that request's own authorization details for an action it points at
-/// an evaluation from.
+/// the identical message: the sentence naming the decision, closed by the pointer at that
+/// request's own authorization details.
 #[tokio::test]
 async fn the_same_refused_call_is_worded_identically_every_time() {
     let router = router();
@@ -712,7 +657,9 @@ async fn the_same_refused_call_is_worded_identically_every_time() {
         }
     }
 
-    // The two actions worded with the sentence alone: every attempt reads exactly it.
+    // Every one of the three: the sentence is the same every time, and what follows it is
+    // the pointer at the authorization details of THAT refusal, whose id names the one
+    // request — so the id is the same across the attempts and across the Regions too.
     for (action, iam_action, named_as, messages) in [
         (
             "ListUsers",
@@ -726,50 +673,40 @@ async fn the_same_refused_call_is_worded_identically_every_time() {
             format!("policy {policy_arn}"),
             &removals,
         ),
+        (
+            "ListAccessKeys",
+            "iam:ListAccessKeys",
+            format!("user {TARGET}"),
+            &keyings,
+        ),
     ] {
         let expected = format!(
             "User: {caller} is not authorized to perform: {iam_action} on resource: \
              {named_as} {}",
             no_allow(iam_action),
         );
+        let mut ids: Vec<String> = Vec::new();
         for (attempt, message) in messages.iter().enumerate() {
-            assert_eq!(
-                message, &expected,
-                "case {action} attempt {attempt}: expected every refusal of the same call \
-                 to read {expected:?}, got {message:?}"
-            );
+            let clause = message.strip_prefix(&expected).unwrap_or_else(|| {
+                panic!(
+                    "case {action} attempt {attempt}: expected every refusal of the same \
+                     call to open {expected:?}, got {message:?}"
+                )
+            });
+            let pointed_at = authorization_details_id(clause).unwrap_or_else(|| {
+                panic!(
+                    "case {action} attempt {attempt}: expected the refusal to point at the \
+                     authorization details of the request, got {clause:?} after the reason"
+                )
+            });
+            ids.push(pointed_at.to_string());
         }
+        assert!(
+            ids.windows(2).all(|pair| pair[0] == pair[1]),
+            "case {action}: expected one authorization id for the same refused call, got \
+             {ids:?}"
+        );
     }
-
-    // The action AWS points at an evaluation from: the sentence is the same every time,
-    // and what follows it is the pointer at the authorization details of THAT refusal,
-    // whose id names the one request — so the id is the same across the attempts too.
-    let expected = format!(
-        "User: {caller} is not authorized to perform: iam:ListAccessKeys on resource: user \
-         {TARGET} {}",
-        no_allow("iam:ListAccessKeys"),
-    );
-    let mut ids: Vec<String> = Vec::new();
-    for (attempt, message) in keyings.iter().enumerate() {
-        let clause = message.strip_prefix(&expected).unwrap_or_else(|| {
-            panic!(
-                "case ListAccessKeys attempt {attempt}: expected every refusal of the same \
-                 call to be worded alike, got {message:?}"
-            )
-        });
-        let pointed_at = authorization_details_id(clause).unwrap_or_else(|| {
-            panic!(
-                "case ListAccessKeys attempt {attempt}: expected the refusal to point at \
-                 the authorization details of the request, got {clause:?} after the reason"
-            )
-        });
-        ids.push(pointed_at.to_string());
-    }
-    assert!(
-        ids.windows(2).all(|pair| pair[0] == pair[1]),
-        "case ListAccessKeys: expected one authorization id for the same refused call, got \
-         {ids:?}"
-    );
 }
 
 /// RULE: the page the pointer names is IAM's own, at its one endpoint Region, whichever
@@ -844,33 +781,29 @@ fn names_resource(action: &str, user_name: &str) -> String {
 
 /// RULE: a refusal reached because the only statement for the action is conditioned on an
 /// instant the call is not yet past is the same WITHHOLDING as one reached with no
-/// document at all — so it is worded as that action is: the sentence closed by the
-/// pointer at the request's authorization details for an action AWS answers that pointer
-/// for, and the sentence alone for every other — while the sibling action the same
+/// document at all — so it is worded as every other refusal is, the sentence closed by the
+/// pointer at the request's authorization details — while the sibling action the same
 /// document already grants is served.
 #[tokio::test]
-async fn a_grant_not_yet_in_effect_is_withheld_and_worded_as_its_action_is() {
+async fn a_grant_not_yet_in_effect_is_withheld_and_points_at_its_details() {
     let router = router();
 
     // (case, the action granted from a past instant and therefore served, the action
-    //  granted only from a future instant and therefore refused, whether that action's
-    //  withheld refusal carries the pointer)
-    let cases: &[(&str, &str, &str, bool)] = &[
+    //  granted only from a future instant and therefore refused)
+    let cases: &[(&str, &str, &str)] = &[
         (
             "a tag listing not yet in effect",
             "GetUser",
             "ListUserTags",
-            true,
         ),
         (
             "a user listing not yet in effect",
             "ListUserTags",
             "ListUsers",
-            false,
         ),
     ];
 
-    for (row, (case, in_effect, not_yet, details)) in cases.iter().enumerate() {
+    for (row, (case, in_effect, not_yet)) in cases.iter().enumerate() {
         let user_name = format!("conditioned{row}");
         // ONE document holding both statements, so each is decided on its own clause.
         let access_key_id = principal(
@@ -929,18 +862,10 @@ async fn a_grant_not_yet_in_effect_is_withheld_and_worded_as_its_action_is() {
             &names_resource(not_yet, &user_name),
             &no_allow(&iam_action),
         );
-        if *details {
-            assert!(
-                !pointed_at.is_empty(),
-                "case {case:?}: expected the refusal of {not_yet} to point at the \
-                 authorization details of the request, got {message:?}"
-            );
-        } else {
-            assert!(
-                pointed_at.is_empty(),
-                "case {case:?}: expected the refusal of {not_yet} to end at the reason, got \
-                 the authorization id {pointed_at:?} in {message:?}"
-            );
-        }
+        assert!(
+            !pointed_at.is_empty(),
+            "case {case:?}: expected the refusal of {not_yet} to point at the authorization \
+             details of the request, got {message:?}"
+        );
     }
 }

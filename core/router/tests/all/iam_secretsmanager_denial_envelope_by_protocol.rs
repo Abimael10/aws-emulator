@@ -15,7 +15,9 @@
 //! — at HTTP 400 with the error type `AccessDeniedException`. That pair varies with the
 //! PROTOCOL and with nothing else: not with which principal was refused, not with which
 //! document refused it, not with which of IAM's two rules did, and not with which action was
-//! asked for.
+//! asked for. The identity service goes on to point at the authorization details of the
+//! decision — its own console page and its own API — which is a fact about the service that
+//! SERVES those details, so a refusal from the secret store carries no such continuation.
 //!
 //! Only a cross-service suite can pin the relationship: each half of the pair is owned by one
 //! service crate, so a crate-local suite reads one envelope and can never compare the two for
@@ -58,6 +60,11 @@ const AMBIENT_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
 
 /// The name of the one inline policy a row puts in force on its user.
 const POLICY_NAME: &str = "in-force";
+
+/// The signing name of the identity service, whose refusals go on to point at the
+/// authorization details of the decision — a page and an API of that service alone, so a
+/// refusal served by any OTHER service carries no such continuation.
+const IDENTITY_SERVICE: &str = "iam";
 
 /// Which wire protocol a call is addressed over, and therefore which envelope its refusal
 /// travels in.
@@ -379,6 +386,35 @@ fn error_message(wire: Wire, body: &str) -> String {
     }
 }
 
+/// The sentence a decision is worded in, with the identity service's authorization-details
+/// pointer taken off where the refusal carries one.
+///
+/// The pointer names that service's own console page and its own API, so it closes the
+/// refusals IAM serves and none of the secret store's. Where it is there, the clause is
+/// read by the suite that owns that reader
+/// (`iam_authorization_details_pointer.rs`), which asserts it well-formed — the page, and
+/// ONE authorization id in both of its slots — rather than pinning the id, which is a fact
+/// of the request this run made.
+fn sentence_of(case: &str, call: &Call, message: &str) -> String {
+    use crate::iam_authorization_details_pointer as pointer;
+
+    if !message.contains(pointer::POINTER_HEAD) {
+        assert_ne!(
+            call.signing_name, IDENTITY_SERVICE,
+            "case {case:?}: expected the identity service's refusal to point at the \
+             authorization details of the decision, got {message:?}"
+        );
+        return message.to_string();
+    }
+    assert_eq!(
+        call.signing_name, IDENTITY_SERVICE,
+        "case {case:?}: expected no authorization-details pointer from a service that does \
+         not serve them, got {message:?}"
+    );
+    pointer::pointed_at(case, message);
+    pointer::sentence_of(case, message)
+}
+
 /// Create the user a row is about, put its document in force, mint its long-term key, and
 /// answer `(the user's ARN, its access key id)`.
 async fn given_principal(
@@ -465,19 +501,21 @@ async fn an_authorization_refusals_envelope_follows_the_protocol_not_the_princip
                 .insert((status, code));
 
             // What the refusal CARRIES is about the principal and the action, closed by which
-            // of IAM's rules refused the call.
+            // of IAM's rules refused the call — and then, where the serving service is the
+            // identity service itself, by the pointer at that decision's details.
             let message = error_message(call.wire, &body);
+            let sentence = sentence_of(&case, call, &message);
             let opening = format!(
                 "User: {user_arn} is not authorized to perform: {}",
                 call.iam_action
             );
             assert!(
-                message.starts_with(&opening),
+                sentence.starts_with(&opening),
                 "case {case:?}: expected the refusal to open {opening:?}, got {message:?}"
             );
             let clause = principal.reason.clause(call.iam_action);
             assert!(
-                message.ends_with(&clause),
+                sentence.ends_with(&clause),
                 "case {case:?}: expected the refusal to close {clause:?}, got {message:?}"
             );
         }
@@ -504,7 +542,8 @@ async fn an_authorization_refusals_envelope_follows_the_protocol_not_the_princip
 /// RULE, read as the relationship the two protocols stand in: for ONE principal and ONE
 /// decision, the two services answer the SAME sentence in DIFFERENT envelopes — the status
 /// and the code are the protocol's, while the principal, the action's own name and the reason
-/// are the decision's.
+/// are the decision's, and only the service that serves the authorization details of a
+/// decision goes on to point at them.
 #[tokio::test]
 async fn one_principals_two_refusals_differ_only_in_their_envelope() {
     let router = build_router();
@@ -519,7 +558,7 @@ async fn one_principals_two_refusals_differ_only_in_their_envelope() {
         let message = error_message(call.wire, &body);
 
         assert_eq!(
-            message,
+            sentence_of(&case, call, &message),
             expected_sentence(&user_arn, call),
             "case {case:?}: expected IAM's sentence for this decision, got {message:?}"
         );

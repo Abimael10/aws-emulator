@@ -3,23 +3,22 @@
 //! The WORDING of the `AccessDenied` message IAM answers a refused call with when a
 //! permissions boundary is part of the decision, end to end over the awsQuery wire.
 //!
-//! RULE: whether a refusal's message continues with the pointer at the request's
-//! authorization details is decided by the ACTION the call asked for and by nothing else:
-//! not by which document refused it, not by whether the refusal withheld a grant or is
-//! explained by an explicit `Deny`, and not by what is attached to the caller — attaching a
-//! permissions boundary, attaching one that admits the very action, attaching one that
-//! admits everything, and attaching one that is silent on the action all leave the wording
-//! of the refusal exactly where the action puts it. The reason clause still names the
-//! document that withheld or denied the call (the identity-based policies where nothing
-//! granted it, the boundary where they did and the ceiling capped it), since that is a
-//! different fact about the same decision.
+//! RULE: a refusal's message continues with the pointer at the request's authorization
+//! details in every case: not only for some actions, not only where a particular document
+//! refused it, not only where the refusal withheld a grant rather than being explained by
+//! an explicit `Deny`, and whatever is attached to the caller — attaching a permissions
+//! boundary, attaching one that admits the very action, attaching one that admits
+//! everything, and attaching one that is silent on the action all leave the refusal where
+//! the decision puts it. The reason clause still names the document that withheld or
+//! denied the call (the identity-based policies where nothing granted it, the boundary
+//! where they did and the ceiling capped it), since that is a different fact about the same
+//! decision.
 //!
 //! Each suite is a TABLE whose rows differ along what the rule generalises over: which
-//! operation is refused and therefore which of the two wordings its refusal takes,
-//! whether a boundary is attached at all, what that boundary admits (the action itself,
-//! every action, another action only) or denies, which document the refusal is explained
-//! by, whether the request addresses one entity or a collection, and whether the call
-//! reads or writes.
+//! operation is refused, whether a boundary is attached at all, what that boundary admits
+//! (the action itself, every action, another action only) or denies, which document the
+//! refusal is explained by, whether the request addresses one entity or a collection, and
+//! whether the call reads or writes.
 //!
 //! The awsQuery harness is the one `tests/all/user_lifecycle.rs` owns and the other suites
 //! in this crate share, so a request is built and read exactly one way; the fixtures are
@@ -55,8 +54,7 @@ const EVERY_ACTION: &str = "iam:*";
 const ANY_RESOURCE: &str = "*";
 
 /// One operation a row refuses: the awsQuery call it makes, the IAM action the decision is
-/// made on, the resource a refusal names, and which of the two wordings AWS answers its
-/// WITHHELD refusal with.
+/// made on, and the resource a refusal names.
 struct Subject {
     /// The awsQuery `Action` and the form parameters it carries.
     action: &'static str,
@@ -66,17 +64,10 @@ struct Subject {
     /// The resource as a refusal NAMES it: the entity a request addressing one names, and
     /// the collection ARN a list read is decided on.
     named_as: String,
-    /// Whether AWS continues this action's refusal with the authorization-details
-    /// pointer.
-    details: bool,
 }
 
-/// The operations the rows refuse.
-///
-/// SOURCE for the `details` column: the message the service answers that action's refused
-/// call with — the fact `tests/all/access_denied_message_wording.rs` owns the table for.
-/// Four actions it records the pointer for and two it records the sentence alone for are
-/// taken here, so a boundary is shown not to move either wording.
+/// The operations the rows refuse: reads and a write, on an entity and on two collections,
+/// so neither what the call does nor the form of its resource is left untested.
 fn subjects() -> Vec<Subject> {
     let target = format!("user {TARGET}");
     let addressed = vec![("UserName".to_string(), TARGET.to_string())];
@@ -86,23 +77,20 @@ fn subjects() -> Vec<Subject> {
             params: addressed.clone(),
             iam_action: "iam:ListAccessKeys",
             named_as: target.clone(),
-            details: true,
         },
         Subject {
             action: "ListUserTags",
             params: addressed.clone(),
             iam_action: "iam:ListUserTags",
             named_as: target.clone(),
-            details: true,
         },
         Subject {
             action: "GetUser",
             params: addressed.clone(),
             iam_action: "iam:GetUser",
             named_as: target.clone(),
-            details: true,
         },
-        // A WRITE, so what the call does is shown not to select the wording either.
+        // A WRITE, so what the call does is shown not to move the refusal either.
         Subject {
             action: "TagUser",
             params: [
@@ -115,21 +103,18 @@ fn subjects() -> Vec<Subject> {
             .concat(),
             iam_action: "iam:TagUser",
             named_as: target,
-            details: true,
         },
         Subject {
             action: "ListUsers",
             params: Vec::new(),
             iam_action: "iam:ListUsers",
             named_as: collection("user", "/"),
-            details: false,
         },
         Subject {
             action: "ListGroups",
             params: Vec::new(),
             iam_action: "iam:ListGroups",
             named_as: collection("group", "/"),
-            details: false,
         },
     ]
 }
@@ -269,8 +254,7 @@ async fn target_user(router: &MultiServiceRouter) {
 }
 
 /// Assert that `body` is the refusal `refusal` of `iam_action` on `named_as`, and that it
-/// carries the authorization-details pointer exactly when `details` says this refusal is
-/// one AWS points at an evaluation from.
+/// carries the pointer at the authorization details of that decision.
 fn assert_refusal(
     case: &str,
     body: &str,
@@ -286,8 +270,7 @@ fn assert_refusal(
         error_code(body)
     );
     let message = element(body, "Message");
-    // The sentence the decision is named in, and the id of the pointer that follows it —
-    // empty where the message ends at the reason.
+    // The sentence the decision is named in, and the id of the pointer that follows it.
     let pointed_at = assert_access_denied_message(
         case,
         &message,
@@ -296,22 +279,18 @@ fn assert_refusal(
         &subject.named_as,
         &refusal.reason(subject.iam_action, boundary),
     );
-    let points = subject.details;
-    assert_eq!(
+    assert!(
         !pointed_at.is_empty(),
-        points,
-        "case {case:?}: expected the refusal of {} to {} the pointer at the request's \
+        "case {case:?}: expected the refusal of {} to carry the pointer at the request's \
          authorization details, got {message:?}",
-        subject.iam_action,
-        if points { "carry" } else { "end before" }
+        subject.iam_action
     );
 }
 
-/// RULE: a refusal carries the authorization-details pointer exactly when the action is
-/// one AWS answers that pointer for — whichever document withheld or denied the call, and
-/// whatever ceiling is attached to the caller.
+/// RULE: a refusal carries the authorization-details pointer whichever document withheld
+/// or denied the call, and whatever ceiling is attached to the caller.
 #[tokio::test]
-async fn a_boundary_does_not_move_which_wording_a_refusal_takes() {
+async fn a_boundary_does_not_move_whether_a_refusal_is_pointed_at() {
     let router = router();
     target_user(&router).await;
 
@@ -453,10 +432,9 @@ impl Move {
 
 /// RULE: the ceiling in force is read at the instant of the call, so attaching, replacing
 /// and removing it moves WHICH document the reason clause names — and never whether the
-/// message points at the request's authorization details, which is the action's and the
-/// refusal kind's alone.
+/// message points at the request's authorization details, which every refusal does.
 #[tokio::test]
-async fn moving_the_ceiling_leaves_the_pointer_where_the_action_puts_it() {
+async fn moving_the_ceiling_leaves_every_refusal_pointed_at() {
     let router = router();
     target_user(&router).await;
     let user_name = "recapped";
@@ -475,8 +453,8 @@ async fn moving_the_ceiling_leaves_the_pointer_where_the_action_puts_it() {
     .await;
     let caller = user_arn(user_name);
 
-    // The two legs made in every state: an action AWS points at an evaluation from, and
-    // one it words with the sentence alone.
+    // The two legs made in every state: a read of one entity and a collection read, so
+    // neither resource form is left untested.
     let legs: Vec<Subject> = subjects()
         .into_iter()
         .filter(|subject| ["ListAccessKeys", "ListUsers"].contains(&subject.action))

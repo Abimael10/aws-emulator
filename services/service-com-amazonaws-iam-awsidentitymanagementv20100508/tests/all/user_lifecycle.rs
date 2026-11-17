@@ -280,15 +280,14 @@ pub(crate) const HARNESS_REGION: &str = "us-east-1";
 /// Assert that `actual` is the whole `AccessDenied` message AWS words for a refused IAM
 /// call: the sentence naming the principal that signed it, the action it asked for and
 /// the resource the decision was made on, closed by `reason` (an explicit deny, or no
-/// policy allowing the action) — followed either by nothing, or by the pointer at the
-/// authorization details of the evaluation that withheld the grant.
+/// policy allowing the action) — and then by the pointer at the authorization details of
+/// that decision.
 ///
-/// Which of the two a given refusal carries is what `tests/all/access_denied_message_wording.rs`
-/// is the table for; every other suite asserts the part it set up — the principal, the
-/// action, the resource and the reason — and that a continuation, where there is one, is
-/// exactly that pointer and carries one id in both of its slots. The id is answered back
-/// for a caller comparing two refusals, and is empty for a refusal that ends at the
-/// reason.
+/// Every refusal the authorization gate answers carries that pointer, which
+/// `tests/all/access_denied_message_wording.rs` is the table for; every other suite
+/// asserts the part it set up — the principal, the action, the resource and the reason —
+/// and that the continuation is exactly that pointer and carries one id in both of its
+/// slots. The id is answered back for a caller comparing two refusals.
 pub(crate) fn assert_access_denied_message(
     case: &str,
     actual: &str,
@@ -309,15 +308,15 @@ pub(crate) fn assert_access_denied_message(
     };
     let pointed_at = authorization_details_id(rest);
     assert!(
-        rest.is_empty() || pointed_at.is_some(),
-        "case {case:?}: expected the refusal to end at the reason or to continue with the \
-         authorization-details pointer, got {rest:?} after it"
+        pointed_at.is_some(),
+        "case {case:?}: expected the refusal to continue with the authorization-details \
+         pointer, got {rest:?} after the reason"
     );
     pointed_at.unwrap_or_default().to_string()
 }
 
-/// The fixed text of the clause a refusal that withheld a grant continues with, up to the
-/// authorization id: the page the details are read on.
+/// The fixed text of the clause a refusal continues with, up to the authorization id: the
+/// page the details are read on.
 pub(crate) const AUTHORIZATION_DETAILS_PREFIX: &str =
     ". Go to https://us-east-1.console.aws.amazon.com/iam/home?region=us-east-1\
      #/authorization-details/";

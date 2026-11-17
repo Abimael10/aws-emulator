@@ -11,13 +11,11 @@
 //! deny). A refused call is answered HTTP 403 with the error code `AccessDenied`
 //! ([`crate::scaffolded::Scaffolded::access_denied`]) and a message built from the three
 //! things the decision was made about — the principal, the action and the resource —
-//! closed by why the decision went that way ([`not_authorized`]) — the refusal AWS
-//! documents. For the few actions whose refusal AWS continues with the pointer at the
-//! request's authorization details ([`NAMES_AUTHORIZATION_DETAILS`]), a refusal that
-//! WITHHELD the call — nothing in force allowed it, the implicit deny — says where those
-//! details are read and under which authorization id ([`not_authorized_with_details`]);
-//! every other refusal, and any refusal explained by an explicit `Deny` (the statement the
-//! reason already names IS the explanation), ends at the reason.
+//! closed by why the decision went that way and then by the pointer at the authorization
+//! details of that decision: where they are read and under which authorization id
+//! ([`not_authorized`]). That pointer closes EVERY refusal this gate answers, whichever
+//! action was asked for and whichever document decided it — an evaluation ran in every
+//! case, so there are details of it to point at in every case.
 //!
 //! The five pieces, each held in exactly one place:
 //!
@@ -755,66 +753,21 @@ fn authorize_request(
             || capped == Decision::Denied,
         "the policies in force on the caller do not permit this call"
     );
-    // AWS's refusal is the sentence that ENDS at the reason, which is what this gate
-    // answers unless the call asked for one of the actions whose refusal AWS CONTINUES
-    // with the pointer at the request's authorization details
-    // ([`NAMES_AUTHORIZATION_DETAILS`]). WHICH of the two wordings a refusal carries is a
-    // fact about the ACTION alone: the evaluation whose details the pointer names ran
-    // whatever the decision was, so a refusal explained by an explicit `Deny` carries the
-    // pointer exactly as one that withheld a grant does — recorded behaviour for a
-    // `GetUser` an identity-based statement explicitly denies, whose message carries the
-    // pointer after the explicit-deny reason.
-    if NAMES_AUTHORIZATION_DETAILS.contains(&action) {
-        return Err(not_authorized_with_details(
-            &principal,
-            action,
-            named_as,
-            &reason,
-            &authorization_id(ctx, &principal, action, resource),
-        ));
-    }
-    Err(not_authorized(&principal, action, named_as, &reason))
+    // AWS's refusal does not end at the reason: it goes on to point at the authorization
+    // details of the evaluation that decided the call — the page they are read on and the
+    // authorization id of THIS request — so the decision can be traced after the fact.
+    // That continuation is a fact about the REFUSAL and not about what was asked: the
+    // evaluation it names ran whatever the action, whoever the caller, whichever document
+    // decided and whichever Region the request addressed, so every refusal this gate
+    // answers carries it.
+    Err(not_authorized(
+        &principal,
+        action,
+        named_as,
+        &reason,
+        &authorization_id(ctx, &principal, action, resource),
+    ))
 }
-
-/// The actions whose refusal AWS CONTINUES with the pointer at the request's authorization
-/// details, instead of ending at the reason the decision went that way.
-///
-/// The refusal AWS documents ("Troubleshoot access denied error messages", IAM User Guide)
-/// is the single sentence naming the principal, the action, the resource and why — which
-/// is what [`not_authorized`] words and what EVERY action here is refused with: this list
-/// is the positive evidence for the continuation, so an action nobody has observed the
-/// pointer for is answered the documented sentence rather than a continuation nothing
-/// supports. Which of the two an action carries is a fact about THAT action — nothing
-/// about the caller, the resource, the Region, the number of attempts or whether the call
-/// reads or writes selects it — and the `AccessDenied` of an authorization refusal is
-/// service-common, its text modelled nowhere (`smithy_query(query="operation",
-/// operation="ListUsers,ListAccessKeys")` declares only `ServiceFailureException` and, for
-/// a request naming an entity, `NoSuchEntityException`), so the continuation cannot be read
-/// off the model either.
-///
-/// SOURCE, for adding an entry: the message the service answers that action's withheld
-/// call with, where it carries the pointer.
-/// `tests/all/access_denied_message_wording.rs` is the table that reads both wordings back.
-const NAMES_AUTHORIZATION_DETAILS: &[&str] = &[
-    GENERATE_CREDENTIAL_REPORT,
-    GET_CREDENTIAL_REPORT,
-    GET_OUTBOUND_WEB_IDENTITY_FEDERATION_INFO,
-    GET_USER,
-    // The two reads of what a USER embeds, each recorded answering its withheld call with
-    // the pointer — the same wording their role counterparts below are recorded with, which
-    // is why each is here per the SOURCE above rather than derived from the other.
-    GET_USER_POLICY,
-    LIST_USER_POLICIES,
-    LIST_ACCESS_KEYS,
-    LIST_ATTACHED_ROLE_POLICIES,
-    LIST_OPEN_ID_CONNECT_PROVIDERS,
-    LIST_ROLE_POLICIES,
-    LIST_ROLE_TAGS,
-    LIST_USER_TAGS,
-    PUT_ACCOUNT_PROPERTIES,
-    SET_SECURITY_TOKEN_SERVICE_PREFERENCES,
-    TAG_USER,
-];
 
 /// Where the authorization details of ONE refused request are read: the console page for
 /// an authorization id.
@@ -831,24 +784,6 @@ const NAMES_AUTHORIZATION_DETAILS: &[&str] = &[
 /// them, not of the refusal that names one.
 const AUTHORIZATION_DETAILS_PAGE: &str =
     "https://us-east-1.console.aws.amazon.com/iam/home?region=us-east-1#/authorization-details/";
-
-/// [`not_authorized`], closed by the pointer to the authorization details of the
-/// evaluation that withheld the call: the page those details are read on, and the
-/// authorization id a reader of them takes.
-fn not_authorized_with_details(
-    principal: &str,
-    action: &str,
-    named_as: &str,
-    reason: &str,
-    authorization_id: &str,
-) -> AccessDenied {
-    AccessDenied::new(format!(
-        "User: {principal} is not authorized to perform: {action} on resource: {named_as} \
-         {reason}. Go to {AUTHORIZATION_DETAILS_PAGE}{authorization_id} for complete \
-         details, or call the GetRequestAuthorizationDetails API with the following \
-         authorization id: {authorization_id}"
-    ))
-}
 
 /// The authorization id of THIS request: the handle its refusal points at.
 ///
@@ -897,18 +832,30 @@ fn authorization_id(
 
 /// The `AccessDenied` text AWS words a call it will not perform for its caller with:
 /// what the refusal is about — the principal that signed the request, the action it
-/// asked for and the resource it asked for it on — closed by `reason`, which says why.
+/// asked for and the resource it asked for it on — closed by `reason`, which says why,
+/// and then by the pointer at the authorization details of that decision: the page they
+/// are read on and `authorization_id`, the handle of THIS request, which the pointer
+/// names in both of its slots because one refusal has one id.
 ///
 /// ONE wording for the code, so a refusal an operation reaches for a reason of its own
 /// is worded exactly as the policy decision above is, differing only in that reason.
 /// Every part of it is a fact of the request and of the account's state, so the same
 /// refused call is worded the same on every run and in every Region.
-/// [`not_authorized_with_details`] is this sentence continued by the pointer at the
-/// authorization details of an evaluation that withheld a grant.
-pub fn not_authorized(principal: &str, action: &str, named_as: &str, reason: &str) -> AccessDenied {
+/// [`not_authorized_without_reason`] is the OTHER wording this service answers: the one
+/// for a refusal no evaluation of the policies in force explains, which therefore has
+/// neither a reason to state nor details to point at.
+pub fn not_authorized(
+    principal: &str,
+    action: &str,
+    named_as: &str,
+    reason: &str,
+    authorization_id: &str,
+) -> AccessDenied {
     AccessDenied::new(format!(
         "User: {principal} is not authorized to perform: {action} on resource: {named_as} \
-         {reason}"
+         {reason}. Go to {AUTHORIZATION_DETAILS_PAGE}{authorization_id} for complete \
+         details, or call the GetRequestAuthorizationDetails API with the following \
+         authorization id: {authorization_id}"
     ))
 }
 

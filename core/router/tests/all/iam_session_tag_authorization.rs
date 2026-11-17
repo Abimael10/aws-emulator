@@ -240,10 +240,12 @@ fn assert_withheld(case: &str, role_name: &str, session_name: &str, status: u16,
         Some("AccessDenied"),
         "case {case:?}: {session_name} expected the error code AccessDenied, got {body}"
     );
-    assert_eq!(
-        element(body, "Message"),
-        withheld_message(role_name, session_name),
-        "case {case:?}: {session_name} expected IAM's withheld-grant sentence, got {body}"
+    // The sentence this suite set up, closed by the pointer every refusal of the gate
+    // carries (`iam_authorization_details_pointer.rs`, which owns that clause's reader).
+    crate::iam_authorization_details_pointer::assert_points_at_details(
+        case,
+        &element(body, "Message"),
+        &withheld_message(role_name, session_name),
     );
 }
 

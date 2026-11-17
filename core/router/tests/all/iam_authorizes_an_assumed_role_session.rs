@@ -314,15 +314,17 @@ async fn an_assumed_role_session_is_decided_against_the_roles_policies() {
                     "case {case:?}: expected AccessDenied, got {code:?}: {body}"
                 );
                 let message = message_of(&body);
-                assert_eq!(
-                    message,
-                    not_authorized(
+                // The sentence this row set up, closed by the pointer every refusal of the
+                // gate carries (`iam_authorization_details_pointer.rs` owns that reader).
+                crate::iam_authorization_details_pointer::assert_points_at_details(
+                    &case,
+                    &message,
+                    &not_authorized(
                         &role_name,
                         listing.iam_action,
                         &listing.resource,
-                        "with an explicit deny in an identity-based policy"
+                        "with an explicit deny in an identity-based policy",
                     ),
-                    "case {case:?}: expected IAM's explicit-deny refusal, got {message:?}"
                 );
             } else {
                 assert_eq!(
@@ -378,19 +380,18 @@ async fn a_session_of_a_role_with_no_policy_is_refused() {
             listing.action
         );
         let message = message_of(&body);
-        assert_eq!(
-            message,
-            not_authorized(
+        crate::iam_authorization_details_pointer::assert_points_at_details(
+            listing.action,
+            &message,
+            &not_authorized(
                 role_name,
                 listing.iam_action,
                 &listing.resource,
                 &format!(
                     "because no identity-based policy allows the {} action",
                     listing.iam_action
-                )
+                ),
             ),
-            "case {:?}: expected IAM's implicit-deny refusal, got {message:?}",
-            listing.action
         );
     }
 }
