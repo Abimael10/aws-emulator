@@ -655,6 +655,11 @@ pub struct Diagnosis {
     /// ([`MAX_SCOPE_VISITS`]), spent by every state that analysis visits, in this
     /// definition and in every machine nested in it.
     scope_visits: usize,
+    /// The order the DEFINITION writes its members in, which is the order the problems
+    /// found in them are reported in ([`MemberOrder`]): the walk reads every object of
+    /// the definition through it, so what it reports follows the submitted document
+    /// rather than the parse's sorting of the names.
+    order: MemberOrder,
 }
 
 /// A walk with every budget of it unspent.
@@ -669,6 +674,7 @@ impl Default for Diagnosis {
             errors_only: false,
             first_error_only: false,
             scope_visits: MAX_SCOPE_VISITS,
+            order: MemberOrder::none(),
         }
     }
 }
@@ -724,6 +730,18 @@ impl Diagnosis {
         self.diagnostics.push(found);
     }
 
+    /// This walk, reading every object of the definition in the order `order` says
+    /// that definition writes its members in.
+    pub(super) fn ordered_by(mut self, order: MemberOrder) -> Self {
+        self.order = order;
+        self
+    }
+
+    /// That order, for the walk to read one object's members through.
+    pub(super) fn order(&self) -> &MemberOrder {
+        &self.order
+    }
+
     /// Whether this walk reports WARNINGS at all: the lints that cost a walk of their
     /// own are built only where one can be reported.
     pub(super) fn warnings_wanted(&self) -> bool {
@@ -777,6 +795,11 @@ pub(super) const SUBJECT_SEPARATOR: &str = ", ";
 /// so a caller fixing a definition is told all of them rather than one per attempt,
 /// and what a create refuses a definition for cannot disagree with what
 /// `ValidateStateMachineDefinition` reports `FAIL` for.
+///
+/// The subjects are stated in the order the members they are about are written in the
+/// SUBMITTED definition, which is the order the walk reads every object of it in
+/// ([`MemberOrder`]) — not sorted by location, which is what the parse's own ordering
+/// of an object's names would state them in.
 ///
 /// The message is bounded by the walk itself rather than by the definition: the walk
 /// reports at most [`MAX_DIAGNOSTICS`] errors, each one's quoted value is capped by
@@ -834,6 +857,10 @@ pub(super) fn collect(definition: &str, mut found: Diagnosis) -> Diagnosis {
         ));
         return found;
     }
+    // What is found in the definition is reported in the order the definition writes
+    // the members it is found in, so that order is read off the submitted document
+    // before anything is judged.
+    let mut found = found.ordered_by(MemberOrder::of(definition));
     match serde_json::from_str::<Value>(definition) {
         Ok(document) => diagnose_machine(
             &document,
@@ -928,7 +955,7 @@ pub(super) fn diagnose_machine(
             required_fields_message(&missing),
         ));
     }
-    for field in document.keys() {
+    for field in into.order().names(prefix, document) {
         if !machine_fields(processor).contains(&field.as_str()) {
             into.push(error(
                 SCHEMA_VALIDATION_FAILED,
@@ -997,7 +1024,11 @@ pub(super) fn diagnose_machine(
     // states are judged and reported after them: the diagnostic is about the machine,
     // so it follows the ones about its states.
     let terminal = states.values().any(ends_an_execution);
-    for (name, state) in states {
+    // The states are judged in the order the definition DECLARES them, so what is
+    // reported about one state follows what is reported about the state written before
+    // it.
+    let declared_states = nested_at(prefix, "/States");
+    for (name, state) in into.order().members(&declared_states, states) {
         if !into.looking() {
             break;
         }
@@ -1024,7 +1055,7 @@ pub(super) fn diagnose_machine(
     // A machine that declares no entry point at all has no graph to judge this way:
     // that it carries no `StartAt` is already reported above, and every state of it
     // would be unreached for that one reason.
-    for name in states.keys() {
+    for name in into.order().names(&declared_states, states) {
         if !into.looking() {
             break;
         }
@@ -1199,7 +1230,7 @@ fn diagnose_state<'a>(
     // beside it say how ([`state_fields`]), so each field outside that set is
     // reported on its own, located at the STATE — the field belongs to the state
     // rather than to a position under it.
-    for field in state.keys() {
+    for field in into.order().names(&here, state) {
         if !state_fields(state_type).contains(&field.as_str()) {
             into.push(error(
                 SCHEMA_VALIDATION_FAILED,
@@ -1323,8 +1354,10 @@ fn diagnose_state<'a>(
     if into.warnings_wanted() {
         // POSSIBLY_UNDEFINED_VARIABLE: one diagnostic per FIELD that reads a
         // variable nothing reaching that field assigns, which is the granularity
-        // `location` documents (`/States/<StateName>/<FieldName>`).
-        for (field, read) in variable_reads(state) {
+        // `location` documents (`/States/<StateName>/<FieldName>`), reported in the
+        // order the state writes those fields.
+        let reads = variable_reads(state, &here, into.order());
+        for (field, read) in reads {
             if own.contains(&read) || scopes.holds(declared, &read) {
                 continue;
             }
@@ -1438,7 +1471,7 @@ fn diagnose_error_handlers(
                     required_fields_message(&missing),
                 ));
             }
-            for field in entry.keys() {
+            for field in into.order().names(&at_entry, entry) {
                 if !fields.contains(&field.as_str()) {
                     into.push(error(
                         SCHEMA_VALIDATION_FAILED,
@@ -1826,8 +1859,9 @@ fn assigned_variables(state: &Map<String, Value>) -> BTreeSet<String> {
 }
 
 /// Every variable one state's own fields READ: the path from the state to the field
-/// that reads it, and the variable's name, each pair once and in a deterministic
-/// order.
+/// that reads it, and the variable's name, each pair once and in the order the state
+/// — at `state_at`, in the order `order` says the definition writes it — writes those
+/// fields.
 ///
 /// A read is what [`super::variable_references`] reports a state referencing a
 /// variable through, so the lint below and `DescribeStateMachine`'s
@@ -1840,7 +1874,11 @@ fn assigned_variables(state: &Map<String, Value>) -> BTreeSet<String> {
 /// The walk is the one [`walk_fields`] does for every field this module reads, so the
 /// path a field is reported at is the same one every other diagnostic about it
 /// carries.
-fn variable_reads(state: &Map<String, Value>) -> Vec<(String, String)> {
+fn variable_reads(
+    state: &Map<String, Value>,
+    state_at: &str,
+    order: &MemberOrder,
+) -> Vec<(String, String)> {
     let mut found: BTreeSet<(String, String)> = BTreeSet::new();
     let roots: Vec<(String, &Value, bool)> = state
         .iter()
@@ -1865,7 +1903,9 @@ fn variable_reads(state: &Map<String, Value>) -> Vec<(String, String)> {
             found.insert((path.to_string(), name));
         }
     });
-    found.into_iter().collect()
+    let mut reads: Vec<(String, String)> = found.into_iter().collect();
+    order.paths(state_at, &mut reads);
+    reads
 }
 
 /// The query language `declared` names, `None` when the member is absent, or why it
@@ -1997,7 +2037,7 @@ fn diagnose_jsonata_state(
     here: &str,
     into: &mut Diagnosis,
 ) {
-    for member in state.keys() {
+    for member in into.order().names(here, state) {
         // A `"<name>.$"` member is a JSONPath reference field, which is how that
         // language — and only that one — spells a member read from the state's data.
         if JSONPATH_ONLY_MEMBERS.contains(&member.as_str()) || member.ends_with(".$") {
@@ -2025,7 +2065,7 @@ fn diagnose_jsonata_state(
             }
         }
     }
-    for (member, value) in state {
+    for (member, value) in into.order().members(here, state) {
         if NESTED_MACHINE_MEMBERS.contains(&member.as_str()) {
             continue;
         }
@@ -2034,8 +2074,10 @@ fn diagnose_jsonata_state(
             // One diagnostic per FIELD that reads the term, which is the granularity
             // `location` documents (`/States/<StateName>/<FieldName>`): a member
             // carrying several such fields is several problems to fix, each at its own
-            // place in the caller's document.
-            for (field, read) in fields_reading(value, term) {
+            // place in the caller's document, reported in the order the member writes
+            // those fields.
+            let reading = fields_reading(value, term, &nested_at(here, format_args!("/{shown}")), into.order());
+            for (field, read) in reading {
                 into.push(error(
                     UNSUPPORTED_JSONATA_EXPRESSION,
                     at(here, &format!("/{shown}{field}")),
@@ -2064,7 +2106,7 @@ fn diagnose_jsonata_rule(
     let Some(rule) = rule.as_object() else {
         return;
     };
-    for (member, value) in rule {
+    for (member, value) in into.order().members(here, rule) {
         if member == "Variable" || member.ends_with(".$") {
             let shown = echoed(member);
             into.push(error(
@@ -2101,9 +2143,16 @@ fn diagnose_jsonata_rule(
 /// itself such an expression — paired with the field expression that read the term
 /// there ([`field_read`]).
 ///
-/// The list is sorted lexicographically, which is what makes the per-field list of one
-/// member deterministic whatever shape the document has.
-fn fields_reading(value: &Value, term: &str) -> Vec<(String, String)> {
+/// The list is in the order the definition writes those fields, read off `order` for
+/// the member at `member_at`: a field the order does not carry falls after the ones it
+/// does, in the lexicographic order that makes the per-field list of one member
+/// deterministic whatever shape the document has.
+fn fields_reading(
+    value: &Value,
+    term: &str,
+    member_at: &str,
+    order: &MemberOrder,
+) -> Vec<(String, String)> {
     let mut found = Vec::new();
     walk_fields(vec![(String::new(), value, false)], |path, text, _| {
         // One field is one problem to fix, so it is reported once: the field
@@ -2117,6 +2166,7 @@ fn fields_reading(value: &Value, term: &str) -> Vec<(String, String)> {
         }
     });
     found.sort();
+    order.paths(member_at, &mut found);
     found
 }
 
@@ -2236,11 +2286,21 @@ fn diagnose_jsonpath_state(
     }
     // NO_DOLLAR: "No `.$` on a field that appears to be a JSONPath or Intrinsic
     // Function".
-    for member in PAYLOAD_TEMPLATE_MEMBERS {
-        let Some(template) = state.get(*member).and_then(Value::as_object) else {
+    // NO_DOLLAR: "No `.$` on a field that appears to be a JSONPath or Intrinsic
+    // Function". The state's own members are read in the order the definition writes
+    // them, as everywhere here, so a state carrying two payload templates reports the
+    // one it writes first first.
+    for (member, declared) in into.order().members(here, state) {
+        if !PAYLOAD_TEMPLATE_MEMBERS.contains(&member.as_str()) {
+            continue;
+        }
+        let Some(template) = declared.as_object() else {
             continue;
         };
-        for (key, value) in template {
+        let members = into
+            .order()
+            .members(&nested_at(here, format_args!("/{member}")), template);
+        for (key, value) in members {
             let Some(text) = value.as_str() else {
                 continue;
             };
@@ -2262,7 +2322,7 @@ fn diagnose_jsonpath_state(
     }
     // NO_PATH: "Field value looks like a path, but field name does not end with
     // 'Path'".
-    for (member, value) in state {
+    for (member, value) in into.order().members(here, state) {
         let Some(text) = value.as_str() else {
             continue;
         };

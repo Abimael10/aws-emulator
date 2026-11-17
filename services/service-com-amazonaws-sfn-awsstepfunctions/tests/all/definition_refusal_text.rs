@@ -168,19 +168,14 @@ fn field_reads() -> Vec<FieldRead> {
         },
         FieldRead {
             case: "two members of the same term, one per field",
-            definition: jsonata_machine(json!({
-                "Type": "Task",
-                "Resource": "arn:aws:states:::aws-sdk:sts:getCallerIdentity",
-                "Arguments": {},
-                "Output": {
-                    "error": "{% $states.errorOutput.Error %}",
-                    "cause": "{% $states.errorOutput.Cause %}"
-                },
-                "Next": "Done"
-            })),
+            // Written as the TEXT it is submitted as: the order the two offending
+            // members are WRITTEN is what the reported order follows, and a
+            // re-serialized document writes them in an order of its own.
+            definition: r#"{"QueryLanguage":"JSONata","StartAt":"S","States":{"S":{"Type":"Task","Resource":"arn:aws:states:::aws-sdk:sts:getCallerIdentity","Arguments":{},"Output":{"error":"{% $states.errorOutput.Error %}","cause":"{% $states.errorOutput.Cause %}"},"Next":"Done"},"Done":{"Type":"Succeed"}}}"#
+                .to_string(),
             expected: vec![
-                at("/States/S/Output/cause", "$states.errorOutput.Cause"),
                 at("/States/S/Output/error", "$states.errorOutput.Error"),
+                at("/States/S/Output/cause", "$states.errorOutput.Cause"),
             ],
         },
         FieldRead {

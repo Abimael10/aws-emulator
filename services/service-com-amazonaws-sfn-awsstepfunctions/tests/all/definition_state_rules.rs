@@ -356,18 +356,14 @@ fn scopes() -> Vec<Scope> {
         // ---- $states.errorOutput: bound only inside a Catch ----
         Scope {
             case: "two Output fields of a Task read the error output",
-            definition: jsonata_machine(json!({
-                "Type": "Task",
-                "Resource": "arn:aws:lambda:us-west-2:000000000000:function:f",
-                "Output": {
-                    "error": "{% $states.errorOutput.Error %}",
-                    "cause": "{% $states.errorOutput.Cause %}"
-                },
-                "Next": "Done"
-            })),
+            // Written as the TEXT it is submitted as: the reported order follows the
+            // order the two offending members are WRITTEN, which a re-serialized
+            // document does not preserve.
+            definition: r#"{"QueryLanguage":"JSONata","StartAt":"S","States":{"S":{"Type":"Task","Resource":"arn:aws:lambda:us-west-2:000000000000:function:f","Output":{"error":"{% $states.errorOutput.Error %}","cause":"{% $states.errorOutput.Cause %}"},"Next":"Done"},"Done":{"Type":"Succeed"}}}"#
+                .to_string(),
             expected: vec![
-                unsupported("/States/S/Output/cause"),
                 unsupported("/States/S/Output/error"),
+                unsupported("/States/S/Output/cause"),
             ],
         },
         Scope {

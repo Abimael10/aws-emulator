@@ -20290,6 +20290,7 @@ dependencies = [
  "md-5 0.10.6",
  "percent-encoding",
  "quick-xml",
+ "serde",
  "serde_json",
  "serde_json_path",
  "service-com-amazonaws-backup-cryocontrollerusermanager",

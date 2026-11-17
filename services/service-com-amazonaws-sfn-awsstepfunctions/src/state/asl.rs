@@ -181,6 +181,7 @@ mod echo;
 mod intrinsics;
 mod jsonpath;
 mod map_items;
+mod member_order;
 mod walk;
 mod work_events;
 mod work_meter;
@@ -205,6 +206,10 @@ use map_items::*;
 // this file.
 use echo::*;
 use intrinsics::*;
+// The order a definition writes its members in, which is the order the problems found
+// in them are reported in: one concern in a file of its own, reachable unqualified from
+// here and from the walk that reports them ([`diagnose`]).
+use member_order::*;
 use work_events::*;
 
 /// The ASL predefined error name for a failure the interpreter itself raises
@@ -2054,7 +2059,12 @@ pub fn validate_single_state(definition: &str) -> Result<(), String> {
             .or_insert_with(|| json!({ "Type": "Succeed" }));
     }
     let machine = json!({ "StartAt": SINGLE_STATE_NAME, "States": Value::Object(states) });
-    let mut found = Diagnosis::until_first_error();
+    // The request's own document is the STATE, which the machine above declares under
+    // one name: the order its members are written in is read off that document at the
+    // position the walk judges it at, so what is reported about it follows the request
+    // rather than the parse's sorting of the names.
+    let mut found = Diagnosis::until_first_error()
+        .ordered_by(MemberOrder::within(&inside_the_single_state(), definition));
     diagnose_machine(
         &machine,
         "",
@@ -2123,6 +2133,16 @@ fn missing_field_message(member: &str) -> String {
     format!("Missing required field: '{}'", echoed(member))
 }
 
+/// Where the WRAPPED walk judges the state the request supplied: the position of the
+/// one state the machine built around it declares.
+///
+/// Read both by the diagnostic that reports back about that state and by the member
+/// order the request's own document is read with, so the two cannot disagree about
+/// where the state sits.
+fn inside_the_single_state() -> String {
+    format!("/States/{SINGLE_STATE_NAME}")
+}
+
 /// What a diagnostic of the WRAPPED walk says about the state the request supplied.
 ///
 /// The lone state is judged by declaring it as the one state of a state machine, so
@@ -2133,7 +2153,7 @@ fn missing_field_message(member: &str) -> String {
 fn about_the_single_state(found: &Diagnostic) -> String {
     let declared = format!("state '{SINGLE_STATE_NAME}'");
     let message = found.message.replace(&declared, SINGLE_STATE_LABEL);
-    let inside = format!("/States/{SINGLE_STATE_NAME}");
+    let inside = inside_the_single_state();
     let member = found
         .location
         .as_deref()

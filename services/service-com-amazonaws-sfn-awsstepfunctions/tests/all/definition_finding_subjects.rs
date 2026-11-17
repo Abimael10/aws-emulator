@@ -32,12 +32,19 @@ const NO_LOCATION: &str = "null";
 
 /// The subjects the `InvalidDefinition` for `definition` quotes, in order.
 async fn subjects(emulator: &Emulator, case: &str, index: usize, definition: &Value) -> String {
+    submitted(emulator, case, index, &definition.to_string()).await
+}
+
+/// The same, for a definition submitted as the TEXT it is written as: a rule about the
+/// order a definition writes its members in cannot be driven through a re-serialized
+/// document, which writes them in an order of its own.
+async fn submitted(emulator: &Emulator, case: &str, index: usize, definition: &str) -> String {
     let (status, body) = emulator
         .call(
             "CreateStateMachine",
             &json!({
                 "name": format!("findings-{index}"),
-                "definition": definition.to_string(),
+                "definition": definition,
                 "roleArn": ROLE_ARN,
             }),
         )
@@ -194,6 +201,173 @@ async fn a_create_refuses_what_the_validation_reports() {
         assert!(
             stated.contains(code),
             "expected the create's subjects to carry {code:?}, got {stated:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The order the subjects are stated in: the definition's own
+// ---------------------------------------------------------------------------
+
+/// What a subject says about a field the Amazon States Language does not declare
+/// (`asl::field_not_supported_message`), stated at `location`.
+fn unsupported_field(field: &str, location: &str) -> String {
+    format!("SCHEMA_VALIDATION_FAILED: Field '{field}' is not supported at {location}")
+}
+
+/// What a subject says about a reserved `$states` term an expression read where the
+/// language does not bind it (`asl::field_does_not_exist`), stated at `location`.
+fn does_not_exist(field: &str, location: &str) -> String {
+    format!("UNSUPPORTED_JSONATA_EXPRESSION: Field '{field}' does not exist. at {location}")
+}
+
+/// Every ERROR diagnostic `ValidateStateMachineDefinition` reports for `definition`,
+/// each stated the way a refusal's subject states it, in the order they are reported.
+///
+/// The two reports are one walk's, so a row below asserts the order through both: what
+/// the validation lists and what the create quotes cannot disagree.
+async fn diagnosed(emulator: &Emulator, case: &str, definition: &str) -> Vec<String> {
+    let validated = emulator
+        .ok(
+            "ValidateStateMachineDefinition",
+            &json!({ "definition": definition }),
+        )
+        .await;
+    validated
+        .get("diagnostics")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|diagnostic| {
+            let member = |name: &str| {
+                diagnostic
+                    .get(name)
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| {
+                        panic!("case {case:?}: expected a '{name}' on {diagnostic:?}")
+                    })
+                    .to_string()
+            };
+            let location = diagnostic
+                .get("location")
+                .and_then(Value::as_str)
+                .unwrap_or(NO_LOCATION);
+            format!("{}: {} at {location}", member("code"), member("message"))
+        })
+        .collect()
+}
+
+/// The problems found in a definition are reported in the order the SUBMITTED
+/// definition writes the members they are about — not sorted by location, and not in
+/// the order a parse that sorts an object's names would visit them.
+///
+/// The rows differ along what the rule generalises over: WHERE the members sit (the
+/// state machine object, one state, a payload template under a state, an entry of a
+/// `Catch` array, a state list nested in a `Parallel` branch, the `States` map itself,
+/// an element of a list inside a template member), how the written order relates to the
+/// sorted one (reversed, mixed, equal) and which KIND of problem is found there (a field
+/// the language does not declare, a reserved term read out of scope). Two of the rows are
+/// the same definition with its two offending members written the other way round, so
+/// what decides the order is the document and nothing else.
+#[tokio::test]
+async fn the_subjects_follow_the_order_the_definition_writes_its_members_in() {
+    // (case, the definition AS SUBMITTED, the subjects it must be refused with, in
+    // order)
+    let rows: Vec<(&str, &str, Vec<String>)> = vec![
+        (
+            "two fields of one state, written in reverse of their sorted order",
+            r#"{"StartAt":"S","States":{"S":{"Type":"Pass","End":true,"zeta":1,"alpha":2}}}"#,
+            vec![
+                unsupported_field("zeta", "/States/S"),
+                unsupported_field("alpha", "/States/S"),
+            ],
+        ),
+        (
+            "the same two fields, written in their sorted order",
+            r#"{"StartAt":"S","States":{"S":{"Type":"Pass","End":true,"alpha":1,"zeta":2}}}"#,
+            vec![
+                unsupported_field("alpha", "/States/S"),
+                unsupported_field("zeta", "/States/S"),
+            ],
+        ),
+        (
+            "two fields of the state machine object, written around the ones it owes",
+            r#"{"zeta":1,"StartAt":"S","alpha":2,"States":{"S":{"Type":"Succeed"}}}"#,
+            vec![
+                unsupported_field("zeta", "/"),
+                unsupported_field("alpha", "/"),
+            ],
+        ),
+        (
+            "one field in each of two states, the states written in reverse order",
+            r#"{"StartAt":"Zed","States":{"Zed":{"Type":"Pass","Next":"Able","zeta":1},"Able":{"Type":"Pass","End":true,"alpha":2}}}"#,
+            vec![
+                unsupported_field("zeta", "/States/Zed"),
+                unsupported_field("alpha", "/States/Able"),
+            ],
+        ),
+        (
+            "two fields of a Catch entry",
+            r#"{"StartAt":"S","States":{"S":{"Type":"Task","Resource":"arn:aws:lambda:us-west-2:000000000000:function:f","Catch":[{"ErrorEquals":["States.ALL"],"Next":"Done","zeta":1,"alpha":2}],"End":true},"Done":{"Type":"Succeed"}}}"#,
+            vec![
+                unsupported_field("zeta", "/States/S/Catch[0]"),
+                unsupported_field("alpha", "/States/S/Catch[0]"),
+            ],
+        ),
+        (
+            "two fields of a state inside a Parallel branch",
+            r#"{"StartAt":"P","States":{"P":{"Type":"Parallel","Branches":[{"StartAt":"In","States":{"In":{"Type":"Pass","End":true,"zulu":1,"bravo":2}}}],"End":true}}}"#,
+            vec![
+                unsupported_field("zulu", "/States/P/Branches[0]/States/In"),
+                unsupported_field("bravo", "/States/P/Branches[0]/States/In"),
+            ],
+        ),
+        (
+            "two members of one JSONata Output reading the error output",
+            r#"{"QueryLanguage":"JSONata","StartAt":"T","States":{"T":{"Type":"Pass","Output":{"error":"{% $states.errorOutput.Error %}","cause":"{% $states.errorOutput.Cause %}"},"End":true}}}"#,
+            vec![
+                does_not_exist("$states.errorOutput.Error", "/States/T/Output/error"),
+                does_not_exist("$states.errorOutput.Cause", "/States/T/Output/cause"),
+            ],
+        ),
+        (
+            "the same Output with its two members written the other way round",
+            r#"{"QueryLanguage":"JSONata","StartAt":"T","States":{"T":{"Type":"Pass","Output":{"cause":"{% $states.errorOutput.Cause %}","error":"{% $states.errorOutput.Error %}"},"End":true}}}"#,
+            vec![
+                does_not_exist("$states.errorOutput.Cause", "/States/T/Output/cause"),
+                does_not_exist("$states.errorOutput.Error", "/States/T/Output/error"),
+            ],
+        ),
+        (
+            // A field inside a LIST is written where its member is: its elements keep
+            // the order the list writes them, and the member written after the list
+            // follows all of them — where sorting the locations would put `after`
+            // first.
+            "offending fields inside a list, and a member written after the list",
+            r#"{"QueryLanguage":"JSONata","StartAt":"T","States":{"T":{"Type":"Pass","Output":{"all":["{% $states.errorOutput.Cause %}","{% $states.errorOutput.Error %}"],"after":"{% $states.errorOutput.Why %}"},"End":true}}}"#,
+            vec![
+                does_not_exist("$states.errorOutput.Cause", "/States/T/Output/all[0]"),
+                does_not_exist("$states.errorOutput.Error", "/States/T/Output/all[1]"),
+                does_not_exist("$states.errorOutput.Why", "/States/T/Output/after"),
+            ],
+        ),
+    ];
+
+    let emulator = Emulator::new();
+    for (index, (case, definition, expected)) in rows.into_iter().enumerate() {
+        let stated = submitted(&emulator, case, 200 + index, definition).await;
+        let wanted = expected.join(", ");
+        assert_eq!(
+            stated, wanted,
+            "case {case:?}: expected the subjects {wanted:?}, got {stated:?}"
+        );
+
+        let reported = diagnosed(&emulator, case, definition).await;
+        assert_eq!(
+            reported, expected,
+            "case {case:?}: expected the validation to report {expected:?} in that order, got \
+             {reported:?}"
         );
     }
 }

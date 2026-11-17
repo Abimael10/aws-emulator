@@ -35,6 +35,11 @@ http = { workspace = true }
 # as, so the walk keeps each sub-document's own bytes rather than re-encoding a parsed
 # copy (`state::asl::echo`).
 serde_json = { workspace = true, features = ["raw_value"] }
+# The deserialization traits the ONE reading of a definition's own member ORDER is
+# written as (`state::asl::member_order`): a seed handed to `serde_json`, so the order
+# the submitted document writes its members in is read off that maintained parser
+# rather than off a scan of the text here.
+serde = { workspace = true }
 # Percent-encodes the fields of the form an `awsQuery` service's request IS, over the
 # unreserved set AWS's own canonical request states.
 percent-encoding = "2"
