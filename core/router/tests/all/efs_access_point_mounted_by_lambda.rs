@@ -20,11 +20,10 @@
 //! point belongs to a second file system, and where the function mounts it.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use serde_json::{json, Value};
-use service_com_amazonaws_efs_magnolioapiservice_v20150201::state as efs_state;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::lambda_signing_name_routing::{AUTHORIZATION, REGION, ROLE, ZIP_FILE};
@@ -42,7 +41,13 @@ fn efs_authorization() -> String {
 /// One emulator carrying both services over ONE shared engine, as the production router
 /// builds them.
 fn emulator() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    emulator_on(&Arc::new(engine::InMemoryEngine::new()))
+}
+
+/// The same pair of services mounted on an engine the CALLER holds, for a suite that drives
+/// the stored clock as well as the wire.
+pub(crate) fn emulator_on(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
+    let engine = Arc::clone(engine);
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(
@@ -58,10 +63,10 @@ fn emulator() -> MultiServiceRouter {
 
 /// One answer, reduced to what the assertions read: the status, the wire error code (`""`
 /// on a success) and the JSON body.
-struct Answer {
-    status: u16,
-    code: String,
-    body: Value,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) code: String,
+    pub(crate) body: Value,
 }
 
 /// Dispatch one restJson1 call to `host` with the credential scope `authorization`.
@@ -112,13 +117,18 @@ async fn call(
 }
 
 /// One call to EFS.
-async fn efs(router: &MultiServiceRouter, method: &str, uri: &str, body: Option<Value>) -> Answer {
+pub(crate) async fn efs(
+    router: &MultiServiceRouter,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> Answer {
     let host = format!("elasticfilesystem.{REGION}.amazonaws.com");
     call(router, &host, &efs_authorization(), method, uri, body).await
 }
 
 /// One call to the Lambda control plane.
-async fn lambda(
+pub(crate) async fn lambda(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,
@@ -129,13 +139,20 @@ async fn lambda(
 }
 
 /// The string member `key` of `body`.
-fn member(body: &Value, key: &str) -> String {
+pub(crate) fn member(body: &Value, key: &str) -> String {
     body[key].as_str().unwrap_or_default().to_string()
 }
 
-/// Create an EFS file system and report its id, waiting out the clock-owed
-/// `creating` -> `available` transition an access point cannot be added before.
-async fn available_file_system(router: &MultiServiceRouter, token: &str) -> String {
+/// How long a poll here waits for a clock-owed EFS transition to land before giving up.
+/// Generous: it is only ever reached when the transition never comes at all.
+const SETTLE_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How long a poll waits before looking again.
+const LOOK_AGAIN_IN: Duration = Duration::from_millis(20);
+
+/// Create an EFS file system and report its id, polling until the clock-owed
+/// `creating` -> `available` transition an access point cannot be added before has landed.
+pub(crate) async fn available_file_system(router: &MultiServiceRouter, token: &str) -> String {
     let created = efs(
         router,
         "POST",
@@ -148,12 +165,39 @@ async fn available_file_system(router: &MultiServiceRouter, token: &str) -> Stri
         "CreateFileSystem {token:?}: expected 201, got {} {}",
         created.status, created.body
     );
-    tokio::time::sleep(efs_state::CREATING_FOR + Duration::from_millis(150)).await;
-    member(&created.body, "FileSystemId")
+    let file_system_id = member(&created.body, "FileSystemId");
+    await_available(router, &file_system_id).await;
+    file_system_id
+}
+
+/// Look at `file_system_id` through EFS's own `DescribeFileSystems` until it reports the
+/// settled lifecycle state, or until [`SETTLE_DEADLINE`] has passed. Waits for the
+/// CONDITION rather than for a fixed time, so a slower or a faster host both pass.
+async fn await_available(router: &MultiServiceRouter, file_system_id: &str) {
+    let deadline = Instant::now() + SETTLE_DEADLINE;
+    let mut last = String::new();
+    while Instant::now() < deadline {
+        let described = efs(
+            router,
+            "GET",
+            &format!("/2015-02-01/file-systems?FileSystemId={file_system_id}"),
+            None,
+        )
+        .await;
+        last = member(&described.body["FileSystems"][0], "LifeCycleState");
+        if last == "available" {
+            return;
+        }
+        tokio::time::sleep(LOOK_AGAIN_IN).await;
+    }
+    panic!(
+        "file system {file_system_id:?}: expected DescribeFileSystems to report LifeCycleState \
+         \"available\", last saw {last:?}"
+    );
 }
 
 /// Create an access point on `file_system_id` and report its ARN, as EFS minted it.
-async fn access_point_arn(
+pub(crate) async fn access_point_arn(
     router: &MultiServiceRouter,
     case: &str,
     file_system_id: &str,
@@ -191,6 +235,11 @@ async fn access_point_arn(
 }
 
 /// The `CreateFunction` body for a function mounting `configs`.
+///
+/// Every such function is attached to a VPC: an EFS file system is reached through a mount
+/// target inside one, so Lambda takes a function that mounts an access point of it only when
+/// the function's own configuration names the subnet its network interface sits in and the
+/// security group that governs it.
 fn create_body(name: &str, configs: &Value) -> Value {
     json!({
         "FunctionName": name,
@@ -198,6 +247,10 @@ fn create_body(name: &str, configs: &Value) -> Value {
         "Runtime": "python3.12",
         "Handler": "index.handler",
         "Code": { "ZipFile": ZIP_FILE },
+        "VpcConfig": {
+            "SubnetIds": ["subnet-0123456789abcdef0"],
+            "SecurityGroupIds": ["sg-0123456789abcdef0"],
+        },
         "FileSystemConfigs": configs,
     })
 }

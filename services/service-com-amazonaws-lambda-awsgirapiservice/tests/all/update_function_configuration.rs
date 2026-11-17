@@ -474,7 +474,13 @@ fn cases() -> Vec<Case> {
         Case {
             label: "file-system-mounted",
             package: Package::Zip,
+            // An Amazon EFS access point is reached through a mount target inside a VPC, so
+            // the function that mounts one is attached to that VPC in the same request.
             patch: json!({
+                "VpcConfig": {
+                    "SubnetIds": ["subnet-0123456789abcdef0"],
+                    "SecurityGroupIds": ["sg-0123456789abcdef0"],
+                },
                 "FileSystemConfigs": [{
                     "Arn": "arn:aws:elasticfilesystem:us-east-1:000000000000:access-point/fsap-0123456789abcdef0",
                     "LocalMountPath": "/mnt/shared",

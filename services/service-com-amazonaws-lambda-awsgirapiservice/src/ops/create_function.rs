@@ -565,6 +565,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // An Amazon EFS file system is reached through a mount target INSIDE a VPC, so a
+        // function that mounts one of its access points has to sit on a network interface in
+        // that VPC itself: a configuration naming such an access point without a `VpcConfig`
+        // that attaches the function describes a mount that could never be made, and is
+        // refused here before anything is created rather than left to an invocation whose
+        // handler finds nothing at the mount path (see
+        // [`crate::state::file_system_attachment`], including the access point kinds that
+        // need no attachment).
+        if let Some(message) = crate::state::unreachable_file_system_refusal(
+            input.file_system_configs.as_deref(),
+            input.vpc_config.as_ref(),
+        ) {
+            return Err(invalid_parameter(message));
+        }
+
         // "The dead-letter queue for failed asynchronous invocations" (`DeadLetterConfig`)
         // names the queue or topic the event of an invocation Lambda gave up on is written
         // to — written by Lambda acting as the function's OWN execution role, so a target

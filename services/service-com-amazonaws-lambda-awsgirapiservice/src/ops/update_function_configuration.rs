@@ -651,6 +651,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // An Amazon EFS file system is reached through a mount target INSIDE a VPC, so the
+        // configuration this request would LEAVE BEHIND has to attach the function to one
+        // before it mounts an access point of it: the mounts and the attachment are judged
+        // as the pair the function would run with — the half this request installs, or the
+        // stored half it leaves alone — so neither a mount added to a function outside a VPC
+        // nor an attachment taken away from a function that mounts one gets through (see
+        // [`crate::state::file_system_attachment`]).
+        if input.file_system_configs.is_some() || input.vpc_config.is_some() {
+            let file_system_configs = input
+                .file_system_configs
+                .clone()
+                .unwrap_or_else(|| record.config.file_system_configs.clone());
+            let vpc_config = input
+                .vpc_config
+                .clone()
+                .or_else(|| record.config.vpc_config.clone());
+            if let Some(message) = crate::state::unreachable_file_system_refusal(
+                Some(&file_system_configs),
+                vpc_config.as_ref(),
+            ) {
+                return Err(invalid_parameter(message));
+            }
+        }
+
         // "The dead-letter queue for failed asynchronous invocations" (`DeadLetterConfig`)
         // names the queue or topic the event of an invocation Lambda gave up on is written
         // to, and Lambda writes it acting as the function's OWN execution role, so a target

@@ -284,6 +284,13 @@ pub use event_source_resource_policy::SourcePolicies;
 pub mod vpc_attachment_authorization;
 pub use vpc_attachment_authorization::unattachable_vpc_config;
 
+/// Whether the file system a configuration mounts can be reached from where the function
+/// runs — the other half of what a VPC configuration decides — lives in
+/// [`file_system_attachment`], beside the reading above, and is re-exported for the same
+/// reason: a handler names it as `crate::state::…`.
+pub mod file_system_attachment;
+pub use file_system_attachment::unreachable_file_system_refusal;
+
 /// The attachment itself — the elastic network interfaces Lambda stands up in the account's
 /// EC2 inventory for a function's configured subnets, and the VPC those subnets resolve to —
 /// lives in [`vpc_interfaces`], beside the authorization above that gates it, and is
