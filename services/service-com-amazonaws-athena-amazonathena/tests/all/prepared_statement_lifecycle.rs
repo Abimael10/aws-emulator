@@ -2,23 +2,23 @@
 
 //! End-to-end tests for Athena's prepared-statement slice: `CreatePreparedStatement`
 //! registers a statement in the workgroup it belongs to and `GetPreparedStatement`,
-//! `BatchGetPreparedStatement`, `UpdatePreparedStatement` and `DeletePreparedStatement`
-//! address that same record, driven over the wire (awsJson1_1, `x-amz-target:
-//! AmazonAthena.<Operation>`) through the same router the emulator boots, so every
-//! assertion is about what an SDK client observes.
+//! `BatchGetPreparedStatement`, `ListPreparedStatements`, `UpdatePreparedStatement` and
+//! `DeletePreparedStatement` address that same record, driven over the wire (awsJson1_1,
+//! `x-amz-target: AmazonAthena.<Operation>`) through the same router the emulator boots, so
+//! every assertion is about what an SDK client observes.
 //!
 //! Each test states a rule and asserts it over a TABLE of inputs rather than one request:
 //! the rows differ along whatever the rule generalises over — whether a description was
 //! carried, the character set and the length of the statement name, the size and the form
-//! of the query string, which workgroup holds the statement, and how many names a batch
-//! read asks for.
+//! of the query string, which workgroup holds the statement, how many names a batch
+//! read asks for, and how many statements a listing's page asks for.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_athena_amazonathena::state::{
     no_prepared_statement_with_name, prepared_statement_already_exists,
     prepared_statement_does_not_exist, prepared_statement_name_not_found,
     prepared_statement_not_found, too_many_prepared_statement_names, too_many_prepared_statements,
-    ERROR_CODE_INVALID_INPUT, ERROR_CODE_STATEMENT_NOT_FOUND,
+    ERROR_CODE_INVALID_INPUT, ERROR_CODE_STATEMENT_NOT_FOUND, INVALID_NEXT_TOKEN,
     MAX_PREPARED_STATEMENTS_PER_WORK_GROUP, MAX_PREPARED_STATEMENT_NAMES_PER_BATCH,
     WORK_GROUP_NOT_FOUND,
 };
@@ -905,4 +905,438 @@ async fn an_operation_naming_a_resource_this_account_does_not_hold_is_refused() 
         status, 400,
         "a refused create must have persisted nothing, got {status} with {absent:?}"
     );
+}
+
+/// One `ListPreparedStatements` page of `work_group`: `(status, body)`.
+async fn list_page(
+    router: &MultiServiceRouter,
+    work_group: &str,
+    max_results: Option<i64>,
+    next_token: Option<&str>,
+) -> (u16, Value) {
+    let mut request = json!({ "WorkGroup": work_group });
+    if let Some(max_results) = max_results {
+        request["MaxResults"] = json!(max_results);
+    }
+    if let Some(token) = next_token {
+        request["NextToken"] = json!(token);
+    }
+    call(router, "ListPreparedStatements", &request).await
+}
+
+/// Every summary the listing of `work_group` reports, following the tokens it hands back and
+/// asking for `page_size` on each page.
+///
+/// The walk is bounded by the statements one workgroup can hold, so a listing that handed
+/// back a token forever fails the test rather than spinning.
+async fn listed_summaries(
+    router: &MultiServiceRouter,
+    work_group: &str,
+    page_size: Option<i64>,
+) -> Vec<Value> {
+    let mut summaries: Vec<Value> = Vec::new();
+    let mut token: Option<String> = None;
+    for _ in 0..=MAX_PREPARED_STATEMENTS_PER_WORK_GROUP {
+        let (status, body) = list_page(router, work_group, page_size, token.as_deref()).await;
+        assert_eq!(
+            status, 200,
+            "the listing of {work_group} (page size {page_size:?}) must answer 200, \
+             got {status} with {body:?}"
+        );
+        let page = body["PreparedStatements"]
+            .as_array()
+            .unwrap_or_else(|| {
+                panic!("the listing of {work_group} must report a list, got {body:?}")
+            })
+            .clone();
+        if let Some(size) = page_size {
+            assert!(
+                i64::try_from(page.len()).unwrap_or(i64::MAX) <= size,
+                "a page may hold at most the {size} asked for, got {} in {body:?}",
+                page.len()
+            );
+        }
+        summaries.extend(page);
+        match body["NextToken"].as_str() {
+            None => return summaries,
+            Some(next) => token = Some(next.to_string()),
+        }
+    }
+    panic!("the listing of {work_group} never ran out of pages");
+}
+
+/// The statement names a run of summaries reports, in the order they were reported.
+fn names_of(summaries: &[Value]) -> Vec<String> {
+    summaries
+        .iter()
+        .map(|summary| {
+            summary["StatementName"]
+                .as_str()
+                .unwrap_or_else(|| panic!("a summary must name its statement, got {summary:?}"))
+                .to_string()
+        })
+        .collect()
+}
+
+/// One row of the listing table: the workgroup listed and the statements it is given.
+struct ListingCase {
+    case: &'static str,
+    work_group: String,
+    names: Vec<String>,
+}
+
+/// A listing of a workgroup reports exactly the statements THAT workgroup holds when it is
+/// called — one a create registered is reported, one a delete removed is not, and a
+/// statement another workgroup holds is never reported here.
+#[tokio::test]
+async fn a_listing_reports_exactly_the_statements_the_addressed_workgroup_holds() {
+    let router = router();
+    const HOLDER: &str = "prepared-statement-listing";
+    const OTHER: &str = "prepared-statement-listing-other";
+    const EMPTY: &str = "prepared-statement-listing-empty";
+    for work_group in [HOLDER, OTHER, EMPTY] {
+        create_work_group(&router, work_group).await;
+    }
+
+    let rows: Vec<ListingCase> = vec![
+        ListingCase {
+            case: "a created workgroup holding several statements",
+            work_group: HOLDER.to_string(),
+            // Names spanning the character classes the modelled pattern admits, and
+            // deliberately not created in sorted order.
+            names: vec![
+                "zz_last".to_string(),
+                "_aZ0@:".to_string(),
+                "mid_statement".to_string(),
+                name_of_length(256),
+            ],
+        },
+        ListingCase {
+            case: "another workgroup holding a statement of the SAME name as the first",
+            work_group: OTHER.to_string(),
+            names: vec!["mid_statement".to_string(), "only_here".to_string()],
+        },
+        ListingCase {
+            case: "the workgroup every account has without creating one",
+            work_group: DEFAULT_WORK_GROUP.to_string(),
+            names: vec!["in_the_default_work_group".to_string()],
+        },
+        ListingCase {
+            case: "a workgroup holding no statement at all",
+            work_group: EMPTY.to_string(),
+            names: Vec::new(),
+        },
+    ];
+
+    for row in &rows {
+        for name in &row.names {
+            create_statement(
+                &router,
+                &json!({
+                    "WorkGroup": row.work_group,
+                    "StatementName": name,
+                    "QueryStatement": format!("SELECT * FROM t WHERE n = '{name}' AND k = ?"),
+                    "Description": format!("statement {name}"),
+                }),
+            )
+            .await;
+        }
+    }
+
+    for row in &rows {
+        let case = row.case;
+        let summaries = listed_summaries(&router, &row.work_group, None).await;
+        let mut expected = row.names.clone();
+        // One stable order a paged walk can rely on, which this service reports a
+        // workgroup's statements in: statement-name order, so it does not depend on the
+        // order the creates arrived in.
+        expected.sort();
+        assert_eq!(
+            names_of(&summaries),
+            expected,
+            "case {case:?}: expected exactly {expected:?}, got {summaries:?}"
+        );
+
+        // `PreparedStatementSummary` is "the name and last modified time of the prepared
+        // statement": the instant it reports is the one the full read of that same record
+        // reports, and the members only the full read carries are absent from a summary.
+        for summary in &summaries {
+            let name = summary["StatementName"].as_str().unwrap_or_default();
+            let (status, read) = read_statement(&router, &row.work_group, name).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: {name} must be readable, got {status} with {read:?}"
+            );
+            assert_eq!(
+                summary["LastModifiedTime"], read["LastModifiedTime"],
+                "case {case:?}: expected {name}'s stored instant {:?}, got {:?}",
+                read["LastModifiedTime"], summary["LastModifiedTime"]
+            );
+            for absent in ["QueryStatement", "Description", "WorkGroupName"] {
+                assert!(
+                    summary[absent].is_null(),
+                    "case {case:?}: a summary carries no {absent}, got {summary:?}"
+                );
+            }
+        }
+    }
+
+    // The listing follows every later write to the workgroup: a delete takes its statement
+    // out of it, a create puts one in, and an update leaves the statement listed exactly
+    // once with the instant that write stored.
+    let (status, deleted) = call(
+        &router,
+        "DeletePreparedStatement",
+        &json!({ "WorkGroup": HOLDER, "StatementName": "mid_statement" }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the statement must be deleted, got {status} with {deleted:?}"
+    );
+    create_statement(
+        &router,
+        &json!({
+            "WorkGroup": HOLDER,
+            "StatementName": "added_later",
+            "QueryStatement": "SELECT 1",
+        }),
+    )
+    .await;
+    let (status, updated) = call(
+        &router,
+        "UpdatePreparedStatement",
+        &json!({
+            "WorkGroup": HOLDER,
+            "StatementName": "zz_last",
+            "QueryStatement": "SELECT 2",
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the statement must be updated, got {status} with {updated:?}"
+    );
+
+    let summaries = listed_summaries(&router, HOLDER, None).await;
+    let mut expected = vec![
+        "zz_last".to_string(),
+        "_aZ0@:".to_string(),
+        name_of_length(256),
+        "added_later".to_string(),
+    ];
+    expected.sort();
+    assert_eq!(
+        names_of(&summaries),
+        expected,
+        "after a delete, a create and an update the listing must report {expected:?}, \
+         got {summaries:?}"
+    );
+    let listed_update = summaries
+        .iter()
+        .find(|summary| summary["StatementName"] == json!("zz_last"))
+        .unwrap_or_else(|| panic!("the updated statement must be listed, got {summaries:?}"));
+    let (_, read_update) = read_statement(&router, HOLDER, "zz_last").await;
+    assert_eq!(
+        listed_update["LastModifiedTime"], read_update["LastModifiedTime"],
+        "the listing must report the instant the update stored {:?}, got {:?}",
+        read_update["LastModifiedTime"], listed_update["LastModifiedTime"]
+    );
+
+    // The other workgroups are untouched by writes to this one: a statement is addressed by
+    // its name TOGETHER WITH its workgroup.
+    assert_eq!(
+        names_of(&listed_summaries(&router, OTHER, None).await),
+        vec!["mid_statement".to_string(), "only_here".to_string()],
+        "the other workgroup's statements must be unaffected"
+    );
+    assert!(
+        listed_summaries(&router, EMPTY, None).await.is_empty(),
+        "a workgroup nothing was written to still holds no statement"
+    );
+}
+
+/// Whatever page size a caller asks for, following the tokens walks the listing once: the
+/// pages concatenate to the same sequence a single page reports, each page holds at most
+/// what was asked for, and the last page of a listing hands back no token.
+#[tokio::test]
+async fn every_page_size_walks_the_whole_listing_exactly_once() {
+    let router = router();
+    const WORK_GROUP: &str = "prepared-statement-paging";
+    create_work_group(&router, WORK_GROUP).await;
+
+    let held: Vec<String> = (0..7).map(|n| format!("stmt_{n}")).collect();
+    for name in &held {
+        create_statement(
+            &router,
+            &json!({
+                "WorkGroup": WORK_GROUP,
+                "StatementName": name,
+                "QueryStatement": "SELECT ?",
+            }),
+        )
+        .await;
+    }
+
+    // Page sizes spanning the rule: none asked for, one at a time, sizes that divide the
+    // total and sizes that do not, the total itself, and the published bounds of
+    // `MaxPreparedStatementsCount` (1 to 50).
+    let page_sizes: Vec<Option<i64>> = vec![None, Some(1), Some(2), Some(3), Some(7), Some(50)];
+    for page_size in page_sizes {
+        let names = names_of(&listed_summaries(&router, WORK_GROUP, page_size).await);
+        assert_eq!(
+            names, held,
+            "case {page_size:?}: expected the whole listing {held:?}, got {names:?}"
+        );
+    }
+
+    // A page that leaves statements behind it hands back a token, and the page that reports
+    // the last of them hands back none.
+    let (status, first) = list_page(&router, WORK_GROUP, Some(6), None).await;
+    assert_eq!(
+        status, 200,
+        "the first page must answer 200, got {status} with {first:?}"
+    );
+    let token = first["NextToken"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a truncated page must carry a token, got {first:?}"))
+        .to_string();
+    let (status, last) = list_page(&router, WORK_GROUP, Some(6), Some(&token)).await;
+    assert_eq!(
+        status, 200,
+        "the last page must answer 200, got {status} with {last:?}"
+    );
+    assert_eq!(
+        names_of(last["PreparedStatements"].as_array().unwrap_or(&Vec::new())),
+        vec!["stmt_6".to_string()],
+        "the last page must report what the first left behind, got {last:?}"
+    );
+    assert!(
+        last["NextToken"].is_null(),
+        "the last page of a listing hands back no token, got {last:?}"
+    );
+
+    // One step past either published bound of `MaxPreparedStatementsCount` is refused as
+    // invalid input, by the constraint rather than by this handler.
+    for size in [0, 51] {
+        let (status, refused) = list_page(&router, WORK_GROUP, Some(size), None).await;
+        assert_eq!(
+            status, 400,
+            "case {size}: a page size outside the modelled range must be refused, \
+             got {status} with {refused:?}"
+        );
+        assert_eq!(
+            error_code(&refused),
+            INVALID_REQUEST,
+            "case {size}: expected {INVALID_REQUEST}, got {refused:?}"
+        );
+        assert!(
+            message(&refused).contains("validation error"),
+            "case {size}: expected the validation sentence, got {:?}",
+            message(&refused)
+        );
+    }
+}
+
+/// A listing is refused when it addresses a workgroup this account does not hold, and when
+/// it carries a `NextToken` this service did not mint for THAT workgroup's listing — a page
+/// it cannot resume is a bad request rather than an empty answer.
+#[tokio::test]
+async fn a_listing_refuses_an_absent_workgroup_and_a_token_it_did_not_mint() {
+    let router = router();
+    const WORK_GROUP: &str = "prepared-statement-token";
+    const NEIGHBOUR: &str = "prepared-statement-token-neighbour";
+    const ABSENT_WORK_GROUP: &str = "prepared-statement-token-absent";
+    for work_group in [WORK_GROUP, NEIGHBOUR] {
+        create_work_group(&router, work_group).await;
+    }
+    for name in ["stmt_one", "stmt_two"] {
+        for work_group in [WORK_GROUP, NEIGHBOUR] {
+            create_statement(
+                &router,
+                &json!({
+                    "WorkGroup": work_group,
+                    "StatementName": name,
+                    "QueryStatement": "SELECT ?",
+                }),
+            )
+            .await;
+        }
+    }
+
+    // A token this service minted for the NEIGHBOUR's listing: the same account, the same
+    // operation, another workgroup.
+    let (_, neighbour_page) = list_page(&router, NEIGHBOUR, Some(1), None).await;
+    let neighbours_token = neighbour_page["NextToken"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the neighbour's page must carry a token, got {neighbour_page:?}"))
+        .to_string();
+    // And one it minted for ANOTHER listing of this account: the workgroups themselves.
+    let (_, work_groups_page) = call(&router, "ListWorkGroups", &json!({ "MaxResults": 1 })).await;
+    let work_groups_token = work_groups_page["NextToken"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the workgroup listing must carry a token, got {work_groups_page:?}"))
+        .to_string();
+
+    // (the case, the request, the sentence it is refused with)
+    let rows: Vec<(&str, Value, String)> = vec![
+        (
+            "a workgroup this account does not hold",
+            json!({ "WorkGroup": ABSENT_WORK_GROUP }),
+            WORK_GROUP_NOT_FOUND.to_string(),
+        ),
+        (
+            "a token that is not even the shape of a minted one",
+            json!({ "WorkGroup": WORK_GROUP, "NextToken": "not-a-token" }),
+            INVALID_NEXT_TOKEN.to_string(),
+        ),
+        (
+            "a token of the right form that this service never minted",
+            json!({ "WorkGroup": WORK_GROUP, "NextToken": "00112233445566778899aabb" }),
+            INVALID_NEXT_TOKEN.to_string(),
+        ),
+        (
+            "a token minted for another workgroup's listing",
+            json!({ "WorkGroup": WORK_GROUP, "NextToken": neighbours_token }),
+            INVALID_NEXT_TOKEN.to_string(),
+        ),
+        (
+            "a token minted for another listing of this account",
+            json!({ "WorkGroup": WORK_GROUP, "NextToken": work_groups_token }),
+            INVALID_NEXT_TOKEN.to_string(),
+        ),
+    ];
+
+    for (case, request, expected_message) in rows {
+        let (status, refused) = call(&router, "ListPreparedStatements", &request).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with {refused:?}"
+        );
+        assert_eq!(
+            error_code(&refused),
+            INVALID_REQUEST,
+            "case {case:?}: expected {INVALID_REQUEST}, got {refused:?}"
+        );
+        assert_eq!(
+            message(&refused),
+            expected_message,
+            "case {case:?}: expected the message {expected_message:?}, got {:?}",
+            message(&refused)
+        );
+        assert_eq!(
+            refused["AthenaErrorCode"].as_str(),
+            Some(ERROR_CODE_INVALID_INPUT),
+            "case {case:?}: expected the input class, got {refused:?}"
+        );
+    }
+
+    // None of those refusals wrote the store: both workgroups still list what they held.
+    for work_group in [WORK_GROUP, NEIGHBOUR] {
+        assert_eq!(
+            names_of(&listed_summaries(&router, work_group, None).await),
+            vec!["stmt_one".to_string(), "stmt_two".to_string()],
+            "a refused listing must leave {work_group}'s statements as they were"
+        );
+    }
 }
