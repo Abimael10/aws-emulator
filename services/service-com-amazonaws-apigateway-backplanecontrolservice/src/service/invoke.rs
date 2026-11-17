@@ -287,6 +287,9 @@ pub(crate) mod simulated_request;
 /// word — and bound — one line of that log through this module, so a trace of a served
 /// request and the log of a simulated one cannot say it two ways.
 pub(crate) mod stage_logs;
+/// The `AWS/ApiGateway` series a deployed stage PUBLISHES about the requests it answered,
+/// which is the only report a client gets of the traffic a stage served.
+mod stage_metrics;
 /// The X-Ray trace context this stage propagates onto the call its integration makes.
 mod trace_context;
 /// What a deployed stage answers a call no deployed method serves — which is an
@@ -1485,20 +1488,18 @@ pub async fn serve<Eng: Send + Sync + 'static>(
         },
         &request_id,
     );
+    // How long answering the whole request took, read once the response has been computed and
+    // reported by both of the things the stage says about a request it answered.
+    let latency = started.elapsed();
+    // What the STAGE PUBLISHES about the request it just answered: the `AWS/ApiGateway` series
+    // of the stage's own traffic ([`stage_metrics`]), which is what every dashboard and every
+    // alarm over this api reads. Off the answer, like the logs below.
+    stage_metrics::published(engine, req, &served, latency, &recorded.observed);
     // What the STAGE logs about the request it just answered — its access-log record and the
     // execution log its method settings turn on — delivered to the destinations the stage
     // and the account name ([`stage_logs`]). After the response is computed and never
     // before: a record is about a request that was answered.
-    stage_logs::delivered(
-        engine,
-        req,
-        ctx,
-        &request_id,
-        &served,
-        started.elapsed(),
-        &recorded,
-    )
-    .await;
+    stage_logs::delivered(engine, req, ctx, &request_id, &served, latency, &recorded).await;
     served
 }
 
@@ -2172,6 +2173,9 @@ async fn serving<Eng: Send + Sync + 'static>(
                 .cloned()
         };
         if let Some(held) = held {
+            // The stage's cache ANSWERED this call, so no integration is performed for it:
+            // that is what the stage publishes as a hit of the method's cache.
+            recorded.observed.cache_hit();
             return match integration_response::mapped(
                 integration.method.as_ref(),
                 &integration.call,
@@ -2181,6 +2185,12 @@ async fn serving<Eng: Send + Sync + 'static>(
                 Err(unserved) => refuse(unserved, recorded),
             };
         }
+    }
+
+    // The method's cache was consulted for this call — it has one — and did not answer it, so
+    // the integration is performed below: a MISS of that cache.
+    if caching.is_some() {
+        recorded.observed.cache_missed();
     }
 
     // An integration that names an HTTP ENDPOINT this emulator serves is performed by
@@ -2200,6 +2210,9 @@ async fn serving<Eng: Send + Sync + 'static>(
     // holds: filled by the integration below, and left for the passed-on half to read off
     // the response the endpoint it reached answered ([`integration_response::served_answer`]).
     let mut answered = None;
+    // When the call was RELAYED to the integration, so what the stage publishes as the
+    // integration's own latency is measured around the one place this call is performed.
+    let relayed = ::std::time::Instant::now();
     let served = if let Some(passed_on) = passed_on {
         if let Some(reason) = integration.unusable_connection.clone() {
             return refuse(
@@ -2346,6 +2359,9 @@ async fn serving<Eng: Send + Sync + 'static>(
             Err(unserved) => return refuse(unserved, recorded),
         }
     };
+    // An integration ANSWERED this call — every outcome that got no answer returned above —
+    // so the span it took is what the stage publishes as the integration's latency.
+    recorded.observed.integration_answered_in(relayed.elapsed());
 
     // What the integration answered is what the stage's cache now holds, for as long as
     // the method's TTL says — which is how the NEXT request to it is answered without the

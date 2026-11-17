@@ -84,13 +84,21 @@ use std::time::Duration;
 use super::{RtRequest, RtResponse};
 use smithy_server_runtime::OperationContext;
 
-/// What serving ONE request left for the logs the stage delivers once it has been answered.
+/// What serving ONE request left for what the stage REPORTS about it once it has been
+/// answered: the logs this module delivers, and the metrics the stage publishes
+/// ([`super::stage_metrics`]).
 ///
-/// Filled by the serving path as it decides the request and read here, because neither half
-/// of it can be recovered from the response: the values an AUTHORIZATION published are not in
-/// the body, and a refusal's own gateway response type is not either.
+/// Filled by the serving path as it decides the request and read by both, because none of it
+/// can be recovered from the response: the values an AUTHORIZATION published are not in the
+/// body, a refusal's own gateway response type is not either, and neither is what the stage's
+/// cache did with the request or how long its integration took. One carrier, threaded through
+/// the serving once, so the two reports cannot see different facts about one request.
 #[derive(Debug, Default)]
 pub(super) struct Recorded {
+    /// What serving the request OBSERVED for the stage's own metrics: whether its cache
+    /// answered it, and how long the method's integration took
+    /// ([`super::stage_metrics::Observed`]).
+    pub(super) observed: super::stage_metrics::Observed,
     /// What this request's own AUTHORIZATION published about the caller — a custom
     /// authorizer's `principalId` and context values, a user pool's claims — each under the
     /// `$context` member path a reference reads it by, which a record's format may name as
