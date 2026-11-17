@@ -2234,10 +2234,6 @@ async fn an_effective_patch_read_refuses_what_it_cannot_report() {
             "the ARN of a baseline of another Region, at this endpoint",
             baseline_arn(REGION, &elsewhere),
         ),
-        // A baseline Systems Manager predefines is reachable through this endpoint, but
-        // what Patch Manager approves in its own baseline is held nowhere here, so there
-        // is no approval configuration to report effective patches from.
-        ("the predefined default baseline", predefined),
     ];
     for (case, baseline_id) in absent {
         let (status, response) = effective(&router, REGION, &baseline_id, &[]).await;
@@ -2253,6 +2249,23 @@ async fn an_effective_patch_read_refuses_what_it_cannot_report() {
             "case {case}: expected the sentence Patch Manager words, got {response}"
         );
     }
+
+    // A baseline Systems Manager predefines is reachable through this endpoint and carries
+    // the approval configuration published with it, so an effective-patch read of one is
+    // SERVED from that configuration rather than refused as absent.
+    let case = "the predefined default baseline";
+    let (status, served) = effective(&router, REGION, &predefined, &[]).await;
+    assert_eq!(
+        status, 200,
+        "case {case}: expected the read to be served for {predefined:?}, got {status} {served}"
+    );
+    assert!(
+        served["EffectivePatches"]
+            .as_array()
+            .is_some_and(|patches| !patches.is_empty()),
+        "case {case}: expected the patches the published configuration makes effective, got \
+         {served}"
+    );
 
     let invalid: Vec<(&str, String)> = vec![
         (

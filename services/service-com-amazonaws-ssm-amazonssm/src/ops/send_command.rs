@@ -391,7 +391,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // command as it will be recorded. The guard ends with this block, so the deliveries
         // below — which reach the store that owns the guests, and yield between nodes — hold
         // no guard of this service's own.
-        let (mut invocations, scripts, record) = {
+        let (mut invocations, scripts, patch_baseline_runs, record) = {
         let mut store = state.lock();
         let Some(document) = store.resolve_document_for_request(&input.document_name, &region, now)
         else {
@@ -585,6 +585,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
+        // The patch-baseline operation each node's agent performs, for a document that
+        // declares one: the one step of THIS document whose action is the patch-baseline
+        // operation on the node's platform, with its inputs resolved from the parameters the
+        // send supplied ([`crate::state::patch_runs`]). Read while the node inventory is to
+        // hand — the node's platform with it, since that is what decides which operating
+        // system the node is patched against — and performed below, so a send of the document
+        // Patch Manager publishes starts a patching operation rather than reaching a node
+        // with nothing to do.
+        //
+        // Bounded before the document is read, not after: a send selects its nodes by
+        // criteria the caller writes (`Key=InstanceIds,Values=*` selects every node of the
+        // Region) and resolving the step reads the document's content, so the nodes one
+        // request can make this process do that for are capped the way a delivery is
+        // (`commands::MAX_GUEST_DELIVERIES_PER_SEND`). A node past the cap is left as the
+        // delivery below leaves it.
+        let patch_baseline_runs: Vec<(String, crate::state::patch_runs::PatchBaselineRun, String)> =
+            resolved
+                .iter()
+                .take(crate::state::commands::MAX_GUEST_DELIVERIES_PER_SEND)
+                .filter_map(|id| {
+                    let node = store.managed_node(&region, id)?;
+                    let platform = node.properties.platform_type.clone()?;
+                    let run = crate::state::patch_runs::requested(
+                        &version.content,
+                        &platform,
+                        &supplied,
+                        &version.parsed.parameters,
+                    )?;
+                    Some((id.clone(), run, platform))
+                })
+                .collect();
+
         let command_id = store.mint_command_id();
         let record = crate::state::commands::CommandRecord {
             command_id,
@@ -620,7 +652,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             status_details: crate::state::commands::COMMAND_STATUS_PENDING.to_string(),
             invocations: ::std::collections::BTreeMap::new(),
         };
-        (invocations, scripts, record)
+        (invocations, scripts, patch_baseline_runs, record)
         };
         // The agent in each node's guest RUNS the script: performed with this store's guard
         // released, since the run reaches the store that owns the guest. What it answered is
@@ -680,7 +712,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
 
+        // Which operating system each node is patched against, resolved with NO guard of
+        // this service held, because it is read off the image the node was launched from —
+        // another service's state ([`crate::state::patch_runs::node_operating_system`]).
+        let patch_baseline_runs: Vec<(String, crate::state::patch_runs::PatchBaselineRun, &str)> =
+            patch_baseline_runs
+                .iter()
+                .map(|(id, run, platform)| {
+                    let operating_system = crate::state::patch_runs::node_operating_system(
+                        &*self.engine,
+                        id,
+                        Some(platform.as_str()),
+                    );
+                    (id.clone(), run.clone(), operating_system)
+                })
+                .collect();
+
         let mut store = state.lock();
+        // The patch-baseline operation is performed against THIS service's own store — the
+        // patch baselines, the node's patch group and the compliance report the patch reads
+        // project — rather than in the node's guest, so it runs with this store's guard held.
+        // What it reported is the node's new patch compliance
+        // ([`crate::state::patch_runs::perform`]); the step is reported as having run on the
+        // nodes it reached, and a node it could not report for is left as the delivery above
+        // left it.
+        for (id, run, operating_system) in &patch_baseline_runs {
+            if !crate::state::patch_runs::perform(
+                &mut store,
+                &region,
+                id,
+                operating_system,
+                run,
+                now,
+            ) {
+                continue;
+            }
+            if let Some(invocation) = invocations.get_mut(id) {
+                invocation.delivered(crate::state::commands::InvocationOutcome {
+                    plugin_name: run.step_name.clone(),
+                    // The patching operation reports what it found through the compliance
+                    // report the patch reads project, not through a shell's output, so
+                    // nothing is reported as having been written on the node.
+                    output: Vec::new(),
+                    response_code: crate::state::commands::SUCCESSFUL_RESPONSE_CODE,
+                    due_at,
+                    delivered: true,
+                });
+            }
+        }
         let record = crate::state::commands::CommandRecord {
             invocations,
             ..record

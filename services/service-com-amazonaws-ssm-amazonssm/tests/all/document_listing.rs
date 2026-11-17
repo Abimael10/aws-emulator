@@ -64,6 +64,7 @@ const PUBLISHED_AUTOMATIONS: &[&str] = &[
 
 /// The published `Command` documents, in name order.
 const PUBLISHED_COMMANDS: &[&str] = &[
+    "AWS-RunPatchBaseline",
     "AWS-RunPowerShellScript",
     "AWS-RunShellScript",
     "AWS-UpdateSSMAgent",
@@ -679,6 +680,7 @@ async fn filters_narrow_the_listing_by_one_attribute() {
         .copied()
         .chain(PUBLISHED_POLICIES.iter().copied())
         .chain([
+            "AWS-RunPatchBaseline",
             "AWS-RunPowerShellScript",
             "AWS-UpdateSSMAgent",
             "ApproveNodeAccess",
@@ -726,7 +728,11 @@ async fn filters_narrow_the_listing_by_one_attribute() {
         (
             "a prefix of the published catalogue",
             json!({ "Filters": [{ "Key": "Name", "Values": ["AWS-Run"] }] }),
-            sorted(&["AWS-RunPowerShellScript", "AWS-RunShellScript"]),
+            sorted(&[
+                "AWS-RunPatchBaseline",
+                "AWS-RunPowerShellScript",
+                "AWS-RunShellScript",
+            ]),
         ),
         (
             "two prefixes are ORed",

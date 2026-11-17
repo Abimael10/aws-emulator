@@ -32,8 +32,8 @@ use sha2::{Digest, Sha256};
 use super::maintenance_windows::calendar_instant;
 use super::patch_baselines::{PatchBaselineRecord, DEFAULT_APPROVED_PATCHES_COMPLIANCE_LEVEL};
 use super::patch_properties::{
-    PATCH_SET_OPERATING_SYSTEM, PROPERTY_CLASSIFICATION, PROPERTY_MSRC_SEVERITY, PROPERTY_PRODUCT,
-    PROPERTY_PRODUCT_FAMILY, PROPERTY_SEVERITY, PUBLISHED_PATCH_METADATA,
+    PATCH_SET_OPERATING_SYSTEM, PROPERTY_CLASSIFICATION, PROPERTY_MSRC_SEVERITY, PROPERTY_PRIORITY,
+    PROPERTY_PRODUCT, PROPERTY_PRODUCT_FAMILY, PROPERTY_SEVERITY, PUBLISHED_PATCH_METADATA,
 };
 use crate::ops::types::{EffectivePatch, Patch, PatchFilterGroup, PatchStatus};
 
@@ -188,6 +188,12 @@ pub struct PublishedPatch {
     /// "The severity level of the patch" (`Patch$Severity`), where the operating system
     /// publishes severity levels.
     pub severity: Option<String>,
+    /// The package priority this patch carries, where the operating system publishes
+    /// priorities instead of classifications — the property a `PRIORITY` patch filter
+    /// selects on ([`super::patch_properties::PROPERTY_PRIORITY`]), which is what the
+    /// Debian-based distributions publish. Not a member of the modelled `Patch`, so it is
+    /// held for selection rather than reported.
+    pub priority: Option<String>,
     /// "The language of the patch if it's language-specific" (`Patch$Language`).
     pub language: Option<String>,
     /// The patch set this patch belongs to, which is what a `PATCH_SET` filter selects
@@ -230,6 +236,7 @@ impl PublishedPatch {
             PROPERTY_CLASSIFICATION => self.classification.as_deref(),
             PROPERTY_MSRC_SEVERITY => self.msrc_severity.as_deref(),
             PROPERTY_SEVERITY => self.severity.as_deref(),
+            PROPERTY_PRIORITY => self.priority.as_deref(),
             _ => None,
         }
     }
@@ -331,6 +338,7 @@ pub fn published_patches(operating_system: &str, at: SystemTime) -> Vec<Publishe
                     rotated(group.classifications, ordinal + release.month_ordinal),
                     rotated(group.msrc_severities, ordinal + release.month_ordinal),
                     rotated(group.severities, ordinal + 3 * release.month_ordinal),
+                    rotated(group.priorities, ordinal + release.month_ordinal),
                     release,
                     ordinal,
                 ));
@@ -589,6 +597,7 @@ fn published_patch(
     classification: Option<&'static str>,
     msrc_severity: Option<&'static str>,
     severity: Option<&'static str>,
+    priority: Option<&'static str>,
     release: &MonthlyRelease,
     ordinal: u64,
 ) -> PublishedPatch {
@@ -623,6 +632,7 @@ fn published_patch(
         classification: classification.map(str::to_string),
         msrc_severity: msrc_severity.map(str::to_string),
         severity: severity.map(str::to_string),
+        priority: priority.map(str::to_string),
         language: windows.then(|| LANGUAGE_NEUTRAL.to_string()),
         patch_set,
     }

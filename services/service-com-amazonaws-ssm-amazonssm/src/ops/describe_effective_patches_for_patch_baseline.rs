@@ -192,11 +192,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A baseline the account created here holds the approval configuration this read
         // computes from. A baseline Systems Manager predefines is reachable through the
-        // same endpoint, and what Patch Manager approves in its own baseline is Patch
-        // Manager's own and is held nowhere here, so neither resolves to an approval
-        // configuration this read could project — both are reported the way every
-        // operation of this service reports a baseline it cannot read.
-        let Some(baseline) = store.patch_baseline(&region, &baseline_id) else {
+        // same endpoint and carries the configuration published with it
+        // ([`crate::state::patch_baselines::predefined_baseline_record`]), so it is read
+        // from that definition; a well-formed id that names neither is reported the way
+        // every operation of this service reports a baseline it cannot read.
+        let predefined =
+            crate::state::patch_baselines::predefined_baseline_with_id(&region, &baseline_id).map(
+                |baseline| {
+                    crate::state::patch_baselines::predefined_baseline_record(&region, baseline)
+                },
+            );
+        let Some(baseline) = store
+            .patch_baseline(&region, &baseline_id)
+            .or(predefined.as_ref())
+        else {
             return Err(
                 DescribeEffectivePatchesForPatchBaselineErrorModeled::DoesNotExistException(
                     DoesNotExistException {

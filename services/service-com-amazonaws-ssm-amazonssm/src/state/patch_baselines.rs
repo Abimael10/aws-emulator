@@ -22,12 +22,16 @@
 //! Not every baseline is the account's own: Systems Manager PREDEFINES one baseline per
 //! supported operating system ([`PREDEFINED_BASELINES`]) that exists in every account
 //! without anybody creating it, and which is the default until a register says otherwise.
-//! A predefined baseline is owned by Systems Manager rather than by the account reading
-//! it, so it is named by its full ARN: "To reset the Amazon Web Services-predefined patch
-//! baseline as the default, specify the full patch baseline Amazon Resource Name (ARN) as
-//! the baseline ID value" (`RegisterDefaultPatchBaseline`). A baseline the account
-//! created is named by its own id, and either spelling of either resolves through
-//! [`super::ComAmazonawsSsmAmazonssmState::resolve_patch_baseline`].
+//! What such a baseline approves is published with it, as the approval rules the AWS
+//! Systems Manager User Guide's "Predefined patch baselines" documents for each of them
+//! ([`PredefinedRule`]), so one is read as the same record a created baseline is
+//! ([`predefined_baseline_record`]) and the one reader of a baseline works out which
+//! patches it makes effective. A predefined baseline is owned by Systems Manager rather
+//! than by the account reading it, so it is named by its full ARN: "To reset the Amazon Web
+//! Services-predefined patch baseline as the default, specify the full patch baseline Amazon
+//! Resource Name (ARN) as the baseline ID value" (`RegisterDefaultPatchBaseline`). A
+//! baseline the account created is named by its own id, and either spelling of either
+//! resolves through [`super::ComAmazonawsSsmAmazonssmState::resolve_patch_baseline`].
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -35,8 +39,13 @@ use std::time::SystemTime;
 
 use sha2::{Digest, Sha256};
 
+use super::patch_properties::{
+    PROPERTY_CLASSIFICATION, PROPERTY_MSRC_SEVERITY, PROPERTY_PRIORITY, PROPERTY_SEVERITY,
+};
 use super::{parse_resource_query, ComAmazonawsSsmAmazonssmState, ARN_SERVICE};
-use crate::ops::types::{PatchBaselineIdentity, PatchFilterGroup, PatchRuleGroup, PatchSource};
+use crate::ops::types::{
+    PatchBaselineIdentity, PatchFilter, PatchFilterGroup, PatchRule, PatchRuleGroup, PatchSource,
+};
 
 /// The resource portion a patch baseline's ARN carries before the baseline's id, from the
 /// ARN `RegisterDefaultPatchBaseline` documents
@@ -338,7 +347,76 @@ pub struct PredefinedBaseline {
     /// The operating system the baseline applies to: one of the modelled
     /// `OperatingSystem` values (`crate::ops::types::OPERATING_SYSTEM_VALUES`).
     pub operating_system: &'static str,
+    /// Which patches Patch Manager approves in it ([`PredefinedRule`]).
+    pub approval_rules: &'static [PredefinedRule],
 }
+
+/// How many days after a patch is released a predefined baseline approves it: the
+/// auto-approval delay the AWS Systems Manager User Guide's "Predefined patch baselines"
+/// gives for each of them, within the modelled `PatchRule$ApproveAfterDays` range (0..360).
+pub const PREDEFINED_APPROVAL_DELAY_DAYS: i32 = 7;
+
+/// One approval rule of a predefined baseline: the patch filters that select the patches it
+/// approves, each as a `PatchFilter` key ([`crate::ops::types::PATCH_FILTER_KEY_VALUES`])
+/// and the values that key admits.
+///
+/// A rule of a predefined baseline approves what it selects after
+/// [`PREDEFINED_APPROVAL_DELAY_DAYS`], at the compliance level a baseline that names none
+/// carries ([`DEFAULT_APPROVED_PATCHES_COMPLIANCE_LEVEL`]), so neither is restated per rule.
+#[derive(Debug, Clone, Copy)]
+pub struct PredefinedRule {
+    /// The filters a patch has to meet for this rule to approve it: `(key, values)`, the
+    /// same pairs a caller writes in a `PatchFilterGroup`.
+    pub filters: &'static [(&'static str, &'static [&'static str])],
+}
+
+/// What the predefined baselines of the RPM-based distributions approve: the
+/// security advisories of the distribution at the two severities those baselines name, and
+/// its bug fixes — the rules the "Predefined patch baselines" guide section documents for
+/// Amazon Linux, CentOS, Oracle Linux, Red Hat Enterprise Linux and the Red Hat rebuilds,
+/// stated with the property values that distribution's own advisories publish
+/// ([`super::patch_properties`]).
+const SECURITY_ADVISORY_RULES: &[PredefinedRule] = &[
+    PredefinedRule {
+        filters: &[
+            (PROPERTY_CLASSIFICATION, &["Security"]),
+            (PROPERTY_SEVERITY, &["Critical", "Important"]),
+        ],
+    },
+    PredefinedRule {
+        filters: &[(PROPERTY_CLASSIFICATION, &["Bugfix"])],
+    },
+];
+
+/// What the predefined Windows baseline approves: the operating system's critical and
+/// security updates at the two Microsoft severities that baseline names (same guide
+/// section), stated with the classifications and severities Windows patches publish.
+const WINDOWS_UPDATE_RULES: &[PredefinedRule] = &[PredefinedRule {
+    filters: &[
+        (
+            PROPERTY_CLASSIFICATION,
+            &["CriticalUpdates", "SecurityUpdates"],
+        ),
+        (PROPERTY_MSRC_SEVERITY, &["Critical", "Important"]),
+    ],
+}];
+
+/// What the predefined baselines of the Debian-based distributions approve: the packages of
+/// the priorities those baselines name (same guide section), which is the property a
+/// Debian-based distribution publishes in place of a classification.
+const DEBIAN_PRIORITY_RULES: &[PredefinedRule] = &[PredefinedRule {
+    filters: &[(
+        PROPERTY_PRIORITY,
+        &["Required", "Important", "Standard"],
+    )],
+}];
+
+/// What the predefined baselines of the two operating systems whose advisories carry a
+/// classification and no severity approve — macOS and SUSE Linux Enterprise: the
+/// classifications their own update catalogues publish for a security-related update.
+const CLASSIFIED_SECURITY_RULES: &[PredefinedRule] = &[PredefinedRule {
+    filters: &[(PROPERTY_CLASSIFICATION, &["Security", "Recommended"])],
+}];
 
 /// The predefined baseline of each operating system Patch Manager supports — the
 /// `AWS-…DefaultPatchBaseline` of that operating system, as Patch Manager names them, with
@@ -348,64 +426,133 @@ pub const PREDEFINED_BASELINES: &[PredefinedBaseline] = &[
     PredefinedBaseline {
         name: "AWS-AlmaLinuxDefaultPatchBaseline",
         operating_system: "ALMA_LINUX",
+        approval_rules: SECURITY_ADVISORY_RULES,
     },
     PredefinedBaseline {
         name: "AWS-AmazonLinuxDefaultPatchBaseline",
         operating_system: "AMAZON_LINUX",
+        approval_rules: SECURITY_ADVISORY_RULES,
     },
     PredefinedBaseline {
         name: "AWS-AmazonLinux2DefaultPatchBaseline",
         operating_system: "AMAZON_LINUX_2",
+        approval_rules: SECURITY_ADVISORY_RULES,
     },
     PredefinedBaseline {
         name: "AWS-AmazonLinux2022DefaultPatchBaseline",
         operating_system: "AMAZON_LINUX_2022",
+        approval_rules: SECURITY_ADVISORY_RULES,
     },
     PredefinedBaseline {
         name: "AWS-AmazonLinux2023DefaultPatchBaseline",
         operating_system: "AMAZON_LINUX_2023",
+        approval_rules: SECURITY_ADVISORY_RULES,
     },
     PredefinedBaseline {
         name: "AWS-CentOSDefaultPatchBaseline",
         operating_system: "CENTOS",
+        approval_rules: SECURITY_ADVISORY_RULES,
     },
     PredefinedBaseline {
         name: "AWS-DebianDefaultPatchBaseline",
         operating_system: "DEBIAN",
+        approval_rules: DEBIAN_PRIORITY_RULES,
     },
     PredefinedBaseline {
         name: "AWS-MacOSDefaultPatchBaseline",
         operating_system: "MACOS",
+        approval_rules: CLASSIFIED_SECURITY_RULES,
     },
     PredefinedBaseline {
         name: "AWS-OracleLinuxDefaultPatchBaseline",
         operating_system: "ORACLE_LINUX",
+        approval_rules: SECURITY_ADVISORY_RULES,
     },
     PredefinedBaseline {
         name: "AWS-RaspbianDefaultPatchBaseline",
         operating_system: "RASPBIAN",
+        approval_rules: DEBIAN_PRIORITY_RULES,
     },
     PredefinedBaseline {
         name: "AWS-RedHatDefaultPatchBaseline",
         operating_system: "REDHAT_ENTERPRISE_LINUX",
+        approval_rules: SECURITY_ADVISORY_RULES,
     },
     PredefinedBaseline {
         name: "AWS-RockyLinuxDefaultPatchBaseline",
         operating_system: "ROCKY_LINUX",
+        approval_rules: SECURITY_ADVISORY_RULES,
     },
     PredefinedBaseline {
         name: "AWS-SuseDefaultPatchBaseline",
         operating_system: "SUSE",
+        approval_rules: CLASSIFIED_SECURITY_RULES,
     },
     PredefinedBaseline {
         name: "AWS-UbuntuDefaultPatchBaseline",
         operating_system: "UBUNTU",
+        approval_rules: DEBIAN_PRIORITY_RULES,
     },
     PredefinedBaseline {
         name: "AWS-DefaultPatchBaseline",
         operating_system: DEFAULT_OPERATING_SYSTEM,
+        approval_rules: WINDOWS_UPDATE_RULES,
     },
 ];
+
+/// The baseline record a predefined baseline IS at `region`'s endpoint: its identity and
+/// the approval configuration Patch Manager publishes for it
+/// ([`PredefinedBaseline::approval_rules`]), as the same record a baseline the account
+/// created is held as — so which patches it makes effective is worked out by the one reader
+/// of a baseline ([`super::patch_catalog::effective_patches`]) rather than a second way.
+///
+/// Nothing of it is stored: it is derived from the published definition on each read, so two
+/// reads of one predefined baseline agree and no call can change it. The instants are the
+/// epoch, because a baseline nobody created was created at no instant this endpoint holds
+/// and a derived instant would move between reads.
+pub fn predefined_baseline_record(region: &str, baseline: &PredefinedBaseline) -> PatchBaselineRecord {
+    PatchBaselineRecord {
+        baseline_id: predefined_baseline_id(region, baseline.name),
+        region: region.to_string(),
+        name: baseline.name.to_string(),
+        operating_system: baseline.operating_system.to_string(),
+        global_filters: None,
+        approval_rules: Some(PatchRuleGroup {
+            patch_rules: baseline
+                .approval_rules
+                .iter()
+                .map(|rule| PatchRule {
+                    patch_filter_group: PatchFilterGroup {
+                        patch_filters: rule
+                            .filters
+                            .iter()
+                            .map(|(key, values)| PatchFilter {
+                                key: (*key).to_string(),
+                                values: values.iter().map(|value| (*value).to_string()).collect(),
+                            })
+                            .collect(),
+                    },
+                    compliance_level: None,
+                    approve_after_days: Some(PREDEFINED_APPROVAL_DELAY_DAYS),
+                    approve_until_date: None,
+                    enable_non_security: None,
+                })
+                .collect(),
+        }),
+        approved_patches: Vec::new(),
+        approved_patches_compliance_level: DEFAULT_APPROVED_PATCHES_COMPLIANCE_LEVEL.to_string(),
+        approved_patches_enable_non_security: DEFAULT_APPROVED_PATCHES_ENABLE_NON_SECURITY,
+        rejected_patches: Vec::new(),
+        rejected_patches_action: DEFAULT_REJECTED_PATCHES_ACTION.to_string(),
+        description: None,
+        sources: Vec::new(),
+        available_security_updates_compliance_status: None,
+        client_token: None,
+        tags: BTreeMap::new(),
+        created_date: SystemTime::UNIX_EPOCH,
+        modified_date: SystemTime::UNIX_EPOCH,
+    }
+}
 
 /// The baseline Systems Manager predefines for `operating_system`, or `None` for a value
 /// outside the modelled enum — which the boundary walk refuses before a handler runs.

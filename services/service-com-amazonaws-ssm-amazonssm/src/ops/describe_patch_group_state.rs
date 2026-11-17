@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribePatchGroupState
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribePatchGroupState`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! The high-level patch compliance of ONE patch group, aggregated over its nodes — the
+//! read half of this service's Patch Manager slice. This is the ONLY file to touch for
+//! this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribePatchGroupState::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Every figure is counted from the compliance reports the patching operations of the
+//! group's nodes left ([`crate::state::instance_patch_states`], written by
+//! [`crate::state::patch_runs`] when the patch-baseline document is sent to a node), and
+//! each is a count of NODES whose own report carries patches in that state — so this read
+//! and `DescribeInstancePatchStatesForPatchGroup`, which reports those same reports one by
+//! one, cannot disagree.
+//!
+//! A node belongs to the group its patch-group tag names
+//! ([`crate::state::patch_runs::PATCH_GROUP_TAG_KEYS`]), recorded on the report when the
+//! run was performed, so a group no node has been patched in holds no report and is
+//! reported as holding no node — which is what this endpoint knows, rather than a refusal.
 //!
 //! ## Shape of an operation
 //!
@@ -180,18 +186,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribePatchGroupState` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribePatchGroupStateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribePatchGroupState"))
+        // `PatchGroup`'s presence, its 1..256 length and its pattern are MODELLED
+        // constraints the centralized walk has already refused anything outside of, so what
+        // is left to decide is which reports the group holds.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribePatchGroupStateErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some("the patch compliance store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // "Returns high-level aggregated patch compliance state information for a patch
+        // group": a count of the NODES of the group whose own report
+        // ([`crate::state::instance_patch_states`]) carries patches in each state — so every
+        // figure here is counted from the reports the patching operations of this group's
+        // nodes left, and a group no node of has been patched in is reported as holding no
+        // node at all rather than as a group that does not exist. A READ: nothing is
+        // written, so a later caller sees the same reports.
+        let region = crate::state::request_region(ctx.parts());
+        let store = state.lock();
+        let reports: Vec<&crate::state::instance_patch_states::InstancePatchStateRecord> = store
+            .instance_patch_states_in_group(&region, &input.patch_group)
+            .map(|(_, report)| report)
+            .collect();
+        // One node counts towards a figure when the count that figure is about is above
+        // zero for it: "the number of managed nodes with missing patches from the patch
+        // baseline" is a count of NODES, not of patches.
+        let nodes_with = |count: &dyn Fn(
+            &crate::state::instance_patch_states::InstancePatchStateRecord,
+        ) -> i32| {
+            let held = reports.iter().filter(|report| count(report) > 0).count();
+            i32::try_from(held).unwrap_or(i32::MAX)
+        };
+        // The figures the model leaves optional carry a count all the same: every report
+        // this endpoint holds was left by a run that counted each state, so the count of the
+        // nodes in it is known rather than absent.
+        let counted = |count: &dyn Fn(
+            &crate::state::instance_patch_states::InstancePatchStateRecord,
+        ) -> i32| Some(nodes_with(count));
+
+        Ok(DescribePatchGroupStateOutput {
+            instances: i32::try_from(reports.len()).unwrap_or(i32::MAX),
+            instances_with_installed_patches: nodes_with(&|report| report.installed_count),
+            instances_with_installed_other_patches: nodes_with(&|report| {
+                report.installed_other_count
+            }),
+            instances_with_installed_pending_reboot_patches: counted(&|report| {
+                report.installed_pending_reboot_count.unwrap_or_default()
+            }),
+            instances_with_installed_rejected_patches: counted(&|report| {
+                report.installed_rejected_count.unwrap_or_default()
+            }),
+            instances_with_missing_patches: nodes_with(&|report| report.missing_count),
+            instances_with_failed_patches: nodes_with(&|report| report.failed_count),
+            instances_with_not_applicable_patches: nodes_with(&|report| {
+                report.not_applicable_count
+            }),
+            instances_with_unreported_not_applicable_patches: counted(&|report| {
+                report.unreported_not_applicable_count.unwrap_or_default()
+            }),
+            instances_with_critical_non_compliant_patches: counted(&|report| {
+                report.critical_non_compliant_count.unwrap_or_default()
+            }),
+            instances_with_security_non_compliant_patches: counted(&|report| {
+                report.security_non_compliant_count.unwrap_or_default()
+            }),
+            instances_with_other_non_compliant_patches: counted(&|report| {
+                report.other_non_compliant_count.unwrap_or_default()
+            }),
+            instances_with_available_security_updates: counted(&|report| {
+                report.available_security_update_count.unwrap_or_default()
+            }),
+        })
     }
 }

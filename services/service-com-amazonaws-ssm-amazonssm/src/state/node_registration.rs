@@ -52,11 +52,13 @@
 //! made due: that write was owed at the same instant whether or not anybody called, which
 //! is why a REPORTING operation of this service takes it before it reads the node store.
 //! Nothing else about a node is rewritten afterwards — a registration happens once, and
-//! what the agent reported then is what the record keeps. What the node store can hold this
-//! way is bounded by the instance store it is derived from (Amazon EC2's own
-//! `MAX_STORED_INSTANCES`): at most one node per instance of that store, per Region.
+//! what the agent reported then is what the record keeps — except the TAGS the node
+//! reports, which are the instance's own tag set rather than a copy frozen at registration.
+//! What the node store can hold this way is bounded by the instance store it is derived from
+//! (Amazon EC2's own `MAX_STORED_INSTANCES`): at most one node per instance of that store,
+//! per Region.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant, SystemTime};
 
 use ::service_com_amazonaws_ec2_amazonec2::state as ec2;
@@ -126,6 +128,11 @@ pub const PLATFORM_TYPE_LINUX: &str = "Linux";
 /// terminated, or no longer running as such a profile — is dropped, because
 /// `DescribeInstanceInformation` reports no node for it. A node registered any other way (a
 /// hybrid activation's) is left alone: its registration is not this instance's to withdraw.
+///
+/// A node this projection already registered also has the TAGS it reports brought in line
+/// with the instance's own, because they are the instance's tags rather than something the
+/// registration froze: that is what a `tag:` target selects a node by and what Patch Manager
+/// reads a node's patch group from.
 pub fn settle_registrations<Eng: Send + Sync + 'static>(engine: &Eng, region: &str) {
     let registered = registered_nodes(engine, region, SystemTime::now());
     let Some(state) = super::service_state(engine) else {
@@ -145,8 +152,26 @@ pub fn settle_registrations<Eng: Send + Sync + 'static>(engine: &Eng, region: &s
         let Some(id) = node.node_id().map(str::to_string) else {
             continue;
         };
-        if store.managed_node(region, &id).is_none() {
-            store.insert_managed_node(region, node);
+        match store.managed_node_mut(region, &id) {
+            None => {
+                store.insert_managed_node(region, node);
+            }
+            Some(held) if held.registered_from_instance => {
+                // A registration happens once, so nothing else about the node is rewritten
+                // — except the TAGS it reports, which are the instance's own: an instance
+                // tagged after its agent registered carries that tag, and a tag only
+                // Systems Manager holds for the node (`AddTagsToResource`) is left alone.
+                //
+                // A tag REMOVED from the instance is not reconciled: the two sources are
+                // held in one map, so dropping what the instance no longer carries would
+                // drop the tags Systems Manager holds of its own with it. Telling them
+                // apart needs a per-tag source on the record, which is left to the change
+                // that gives the node store one.
+                for (key, value) in node.tags {
+                    held.tags.insert(key, value);
+                }
+            }
+            Some(_) => {}
         }
     }
 }
@@ -229,6 +254,11 @@ struct ManagedInstance {
     launch_time: SystemTime,
     /// `InstanceProperty$AvailabilityZone`.
     availability_zone: String,
+    /// The instance's own tags, which are the tags the managed node it registers carries:
+    /// the node IS that instance, so a `tag:` target and a node's patch group are read off
+    /// the tags the instance holds (`Target`: "you could specify `tag:ServerRole` … to run
+    /// a command on instances that include EC2 tags of `ServerRole,WebServer`").
+    tags: BTreeMap<String, String>,
 }
 
 impl ManagedInstance {
@@ -253,6 +283,7 @@ impl ManagedInstance {
             architecture: instance.architecture.clone(),
             launch_time: instance.launch_time,
             availability_zone: instance.placement_az.clone(),
+            tags: instance.tags.clone(),
         })
     }
 
@@ -275,6 +306,10 @@ impl ManagedInstance {
         // The node runs the one agent build this emulator publishes, which is therefore the
         // latest one it knows of.
         node.is_latest_version = Some(true);
+        // The tags of the node are the INSTANCE's own tags: it is the same resource, which
+        // is why a tag target selects it and why Patch Manager reads a node's patch group
+        // off them ([`super::patch_runs::PATCH_GROUP_TAG_KEYS`]).
+        node.tags = self.tags;
         let reported = &mut node.properties;
         reported.agent_version = Some(SSM_AGENT_VERSION.to_string());
         reported.iam_role = iam_role;

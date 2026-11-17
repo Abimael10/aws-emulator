@@ -816,10 +816,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .is_some_and(|stored| stored == crate::state::TIER_ADVANCED)
             && tier != crate::state::TIER_ADVANCED
         {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "Parameter {name} is an {} parameter and can't be reverted to the {tier} tier",
-                crate::state::TIER_ADVANCED
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::tier_downgrade_message(),
+            ));
         }
         let limit = crate::state::value_limit(&tier);
         if input.value.len() > limit {

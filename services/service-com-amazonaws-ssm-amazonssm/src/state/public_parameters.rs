@@ -8,14 +8,17 @@
 //! and never stored by this service: it is AWS's own published data, and a read resolves it
 //! against whatever this emulator holds of that data rather than against the store.
 //!
-//! What it holds of it today is what the services that publish an image publish about it:
-//! every public Systems Manager parameter name of this endpoint, and the value it resolves to
-//! (`ComAmazonawsEc2Amazonec2State::public_ssm_parameter_values`) — the ONE place this
-//! emulator records what a public parameter resolves to, so Parameter Store and the service
-//! that publishes it cannot disagree about it and an id a read reports is an AMI the account
-//! can really launch, describe or hand to a service that provisions compute from one. An
-//! alias whose image was deregistered resolves to nothing, exactly as the describe reports
-//! none.
+//! What it holds of it today is two catalogues, read as one. The Global Infrastructure
+//! reference data AWS publishes in every Region ([`super::global_infrastructure`]) — the
+//! Regions, their long names, partitions and endpoint domains — is the same at every
+//! endpoint and is held here. Beside it is what the services that publish an image publish
+//! about it: every public Systems Manager parameter name of this endpoint, and the value it
+//! resolves to (`ComAmazonawsEc2Amazonec2State::public_ssm_parameter_values`) — the ONE
+//! place this emulator records what such a parameter resolves to, so Parameter Store and the
+//! service that publishes it cannot disagree about it and an id a read reports is an AMI the
+//! account can really launch, describe or hand to a service that provisions compute from
+//! one. An alias whose image was deregistered resolves to nothing, exactly as the describe
+//! reports none.
 //!
 //! Nothing here writes: the catalog is projected from EC2's image state on each read, so a
 //! read of it changes nothing a later caller sees and the values it reports are the values
@@ -99,31 +102,51 @@ pub fn invalid_namespace_message(path: &str) -> String {
 
 /// Every parameter AWS publishes at this endpoint, in ascending canonical-name order — the
 /// order a hierarchy read's resume cursor is total in.
+///
+/// Two catalogues, read as one: the Global Infrastructure reference data AWS publishes in
+/// every Region ([`super::global_infrastructure`]), which is the same at every endpoint and
+/// is held here, and the names the services that publish an image publish about it, which
+/// are projected from that service's own image state.
 pub fn published_records<Eng: Send + Sync + 'static>(
     engine: &Eng,
     region: &str,
 ) -> Vec<ParameterRecord> {
-    let Some(state) = ec2::service_state(engine) else {
-        // No Amazon EC2 store on this engine is no image catalog to publish, so this
-        // endpoint publishes nothing rather than inventing a value for a name.
-        return Vec::new();
-    };
-    let store = state.lock();
-    store
-        .public_ssm_parameter_values(::engine::emulator_account_id())
+    let mut records: Vec<ParameterRecord> = super::global_infrastructure::published_names()
         .into_iter()
-        .map(|(name, published)| {
-            let published_at = published
-                .published_at
-                .as_deref()
-                .and_then(parsed_instant)
-                // The instant the image was published is the instant its parameter last
-                // changed; a date this emulator cannot read reports the epoch rather than
-                // now, so a read never reports an instant that moves between two reads.
-                .unwrap_or(SystemTime::UNIX_EPOCH);
-            published_record(region, &name, &published.value, published_at)
+        .map(|(name, value)| {
+            published_record(
+                region,
+                &name,
+                &value,
+                super::global_infrastructure::PUBLISHED_AT,
+            )
         })
-        .collect()
+        .collect();
+    if let Some(state) = ec2::service_state(engine) {
+        let store = state.lock();
+        records.extend(
+            store
+                .public_ssm_parameter_values(::engine::emulator_account_id())
+                .into_iter()
+                .map(|(name, published)| {
+                    let published_at = published
+                        .published_at
+                        .as_deref()
+                        .and_then(parsed_instant)
+                        // The instant the image was published is the instant its parameter
+                        // last changed; a date this emulator cannot read reports the epoch
+                        // rather than now, so a read never reports an instant that moves
+                        // between two reads.
+                        .unwrap_or(SystemTime::UNIX_EPOCH);
+                    published_record(region, &name, &published.value, published_at)
+                }),
+        );
+    }
+    // One ascending order over both catalogues, which is what makes a hierarchy read's
+    // resume cursor total: no name can be in both, since neither publishes in the other's
+    // hierarchy.
+    records.sort_by(|left, right| canonical_name(&left.name).cmp(canonical_name(&right.name)));
+    records
 }
 
 /// The parameter AWS publishes under `name` at this endpoint, or `None` for a name AWS

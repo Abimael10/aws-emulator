@@ -233,15 +233,20 @@ async fn an_update_runs_the_association_against_the_nodes_it_applied() {
 
         // Once the clock owes the run's result, the association reports it: a count of the
         // nodes the run reached, and the instant it finished. A configuration that reached no
-        // node has no execution to report at any instant.
+        // node settles the same way, over no count of targets by status, because a count of
+        // targets by status is a count over executions and there were none.
         age_runs(&engine);
         let read = described(&router, case, &json!({"AssociationId": association_id})).await;
         if row.reaches.is_empty() {
-            assert!(
-                read["Overview"]["AssociationStatusAggregatedCount"].is_null()
-                    && read["LastExecutionDate"].is_null(),
-                "case {case:?}: expected no execution for a run that reached no node, got \
+            assert_eq!(
+                read["Overview"]["Status"], json!("Success"),
+                "case {case:?}: expected a run that reached no node to settle Success, got \
                  {read:?}"
+            );
+            assert!(
+                read["Overview"]["AssociationStatusAggregatedCount"].is_null(),
+                "case {case:?}: expected no count of targets by status for a run that reached \
+                 no node, got {read:?}"
             );
         } else {
             assert_eq!(

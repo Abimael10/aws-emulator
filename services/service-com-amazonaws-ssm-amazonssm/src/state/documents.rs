@@ -770,6 +770,11 @@ pub const PUBLISHED_DOCUMENTS: &[PublishedDocument] = &[
         document_type: DOCUMENT_TYPE_POLICY,
         content: inventory::GATHER_SOFTWARE_INVENTORY,
     },
+    PublishedDocument {
+        name: patch_runs::RUN_PATCH_BASELINE_DOCUMENT,
+        document_type: "Command",
+        content: patch_runs::RUN_PATCH_BASELINE,
+    },
 ];
 
 /// The `DocumentType` of a document that tells the agent on a managed node WHAT TO COLLECT

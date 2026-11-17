@@ -222,6 +222,11 @@ pub mod secure_string;
 /// read resolves beside the parameters this account wrote.
 pub mod public_parameters;
 
+/// The AWS Global Infrastructure reference data published in that hierarchy: the Regions,
+/// their long names, the partition each belongs to and the domain its endpoints are served
+/// from.
+pub mod global_infrastructure;
+
 /// The reserved hierarchy of that same `/aws` namespace through which a read of Parameter
 /// Store serves an Amazon Web Services Secrets Manager secret.
 pub mod secretsmanager_reference;
@@ -317,6 +322,10 @@ pub mod custom_inventory;
 /// The per-patch compliance data a patching operation reported for one node, and the filter
 /// keys and page a read of it accepts.
 pub mod instance_patches;
+
+/// The patch-baseline run Patch Manager performs on a managed node when the document it
+/// publishes for that is sent to one, and the compliance that run reports.
+pub mod patch_runs;
 
 /// The OpsMetadata objects Application Manager holds for this account: what a create
 /// persists, the ARN it is reached by, and the two ways an ARN can name none.
@@ -1140,6 +1149,24 @@ pub fn policies_require_advanced_message() -> String {
         "You can't assign parameter policies to a standard-parameter tier. You must upgrade \
          the parameter to use the advanced-parameter tier. For more information, see \
          {ADVANCED_PARAMETERS_GUIDE}"
+    )
+}
+
+/// What a put that would take an ADVANCED parameter back to the standard tier is refused
+/// with: "You can change a standard parameter to an advanced parameter any time. But you
+/// can't revert an advanced parameter to a standard parameter" (`PutParameter`'s `Tier`
+/// doc).
+///
+/// Fixed text throughout — nothing of the request is echoed into it: the refusal states the
+/// rule, the way out of it (delete the advanced parameter and recreate it) and the ceiling
+/// the standard tier would then hold the value to, which is that tier's own content size
+/// limit ([`STANDARD_VALUE_LIMIT`]) in characters.
+pub fn tier_downgrade_message() -> String {
+    format!(
+        "This parameter uses the advanced-parameter tier. You can't downgrade a parameter \
+         from the advanced-parameter tier to the standard-parameter tier. If necessary, you \
+         can delete the advanced parameter and recreate it as a standard parameter. Be aware \
+         that standard parameters have a value limit of {STANDARD_VALUE_LIMIT} characters."
     )
 }
 

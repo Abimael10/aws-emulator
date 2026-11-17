@@ -149,6 +149,23 @@ fn catalogue_rows() -> Vec<Published<'static>> {
             ],
             platforms: PLATFORM_TYPES,
         },
+        Published {
+            // The Command document Patch Manager publishes to scan or install patches:
+            // its one step performs the patch-baseline operation rather than running a
+            // script, so it is restricted to no platform.
+            case: "the patch-baseline command document",
+            name: "AWS-RunPatchBaseline",
+            document_type: "Command",
+            schema_version: "2.2",
+            parameters: &[
+                "Operation",
+                "SnapshotId",
+                "InstallOverrideList",
+                "RebootOption",
+                "BaselineOverride",
+            ],
+            platforms: PLATFORM_TYPES,
+        },
     ]
 }
 

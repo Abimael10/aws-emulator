@@ -14,12 +14,15 @@
 //! # What puts a report here
 //!
 //! Patch compliance is gathered ON the node, by the patching operation Patch Manager runs
-//! there, and reported from inside it — no operation of this service's model reports one,
-//! and the patch document that performs such a run is not among the documents this
-//! emulator publishes ([`super::PUBLISHED_DOCUMENTS`]), so nothing a caller can send
-//! starts one. The store therefore holds the reports that have been made and invents
-//! none: a patch group whose nodes have never been patched is reported as holding no
-//! state, which is what this endpoint knows, rather than compliance nobody collected.
+//! there: a send of the patch-baseline document Systems Manager publishes is what starts
+//! one ([`super::patch_runs`]), and the report it leaves is this record. The store holds
+//! the reports that have been made and invents none: a patch group whose nodes have never
+//! been patched is reported as holding no state, which is what this endpoint knows, rather
+//! than compliance nobody collected.
+//!
+//! Every count a report carries is counted from the patch rows that run reported
+//! ([`super::instance_patches::PatchComplianceRow`]), so the counts and the per-patch
+//! detail are one report read two ways rather than two figures that could disagree.
 //!
 //! # What a read reports
 //!
@@ -210,6 +213,30 @@ pub fn named_instance_patch_state_page_size(max_results: Option<i32>) -> Result<
 /// values (`crate::ops::types::PATCH_OPERATION_TYPE_VALUES`).
 pub const OPERATION_SCAN: &str = "Scan";
 
+/// The compliance level a baseline assigns a patch whose absence makes a node critically
+/// non-compliant: "the number of patches per node that are specified as `Critical` for
+/// compliance reporting in the patch baseline aren't installed"
+/// (`InstancePatchState$CriticalNonCompliantCount`), from the modelled
+/// `PatchComplianceLevel` vocabulary (`crate::ops::types::PATCH_COMPLIANCE_LEVEL_VALUES`).
+pub const COMPLIANCE_LEVEL_CRITICAL: &str = "CRITICAL";
+
+/// The patch classifications that say a patch is "specified as `Security` in a patch
+/// advisory" (`InstancePatchState$SecurityNonCompliantCount`): the classification an
+/// RPM-based, SUSE or macOS advisory publishes a security update under, and the one Windows
+/// publishes it under (`super::patch_properties`' published classifications).
+pub const SECURITY_CLASSIFICATIONS: &[&str] = &["Security", "SecurityUpdates"];
+
+/// The states a patch is NOT COMPLIANT with its baseline in: the baseline wants the patch on
+/// the node and it is not there — "these patches might be missing, have failed installation,
+/// were rejected, or were installed but awaiting a required managed node reboot"
+/// (`DescribePatchGroupState$InstancesWithCriticalNonCompliantPatches`) names the first two
+/// of those as states a row carries; a patch the baseline defines that is not to be
+/// installed on this node is compliant, and a patch that IS installed is compliant.
+pub const NON_COMPLIANT_STATES: &[&str] = &[
+    super::instance_patches::STATE_MISSING,
+    super::instance_patches::STATE_FAILED,
+];
+
 /// The other patching operation of the same vocabulary: "INSTALL installs missing
 /// patches".
 pub const OPERATION_INSTALL: &str = "Install";
@@ -290,6 +317,9 @@ pub struct InstancePatchStateRecord {
     /// "The number of patches per node that are specified as other than `Critical` or
     /// `Security` but aren't compliant with the patch baseline."
     pub other_non_compliant_count: Option<i32>,
+    /// What this patching operation reported about each patch it found, which is the detail
+    /// the counts above are counted from and what `DescribeInstancePatches` reports.
+    pub patches: Vec<super::instance_patches::PatchComplianceRow>,
 }
 
 impl InstancePatchStateRecord {
@@ -331,7 +361,89 @@ impl InstancePatchStateRecord {
             critical_non_compliant_count: None,
             security_non_compliant_count: None,
             other_non_compliant_count: None,
+            patches: Vec::new(),
         }
+    }
+
+    /// The report one patching operation leaves: `rows` as it found them, with every count
+    /// counted from them.
+    ///
+    /// No count is stated twice: each is how many of `rows` are in the state that count is
+    /// about, so the figures a high-level read reports are the rows a per-patch read
+    /// reports. The three counts that are about a patch's COMPLIANCE rather than its state
+    /// are counted over the patches that are NOT COMPLIANT — the ones the baseline wants on
+    /// the node and are not there ([`NON_COMPLIANT_STATES`]), which is what "aren't
+    /// compliant with the patch baseline" (`InstancePatchState$OtherNonCompliantCount`)
+    /// names; a patch the baseline defines that is not to be installed on this node is
+    /// compliant and counts towards none of them. Of those, the ones the baseline assigns
+    /// the critical compliance level are the critically non-compliant ones, the rest that
+    /// are "specified as `Security` in a patch advisory" are the security non-compliant
+    /// ones, and what is left is the other non-compliant ones.
+    pub fn from_rows(
+        instance_id: &str,
+        patch_group: &str,
+        baseline_id: &str,
+        operation: &str,
+        started: SystemTime,
+        ended: SystemTime,
+        rows: Vec<super::instance_patches::PatchComplianceRow>,
+    ) -> Self {
+        use super::instance_patches as patches;
+        let count = |state: &str| -> i32 {
+            let held = rows.iter().filter(|row| row.state == state).count();
+            i32::try_from(held).unwrap_or(i32::MAX)
+        };
+        let counted = |held: usize| -> i32 { i32::try_from(held).unwrap_or(i32::MAX) };
+        let non_compliant = rows
+            .iter()
+            .filter(|row| NON_COMPLIANT_STATES.contains(&row.state.as_str()));
+        let critical = counted(
+            non_compliant
+                .clone()
+                .filter(|row| row.compliance_level.as_deref() == Some(COMPLIANCE_LEVEL_CRITICAL))
+                .count(),
+        );
+        let security = counted(
+            non_compliant
+                .clone()
+                .filter(|row| {
+                    row.compliance_level.as_deref() != Some(COMPLIANCE_LEVEL_CRITICAL)
+                        && SECURITY_CLASSIFICATIONS.contains(&row.classification.as_str())
+                })
+                .count(),
+        );
+        let not_on_node = counted(non_compliant.count());
+        let mut report = Self::reported(
+            instance_id,
+            patch_group,
+            baseline_id,
+            operation,
+            started,
+            ended,
+        );
+        report.installed_count = count(patches::STATE_INSTALLED);
+        report.installed_other_count = count(patches::STATE_INSTALLED_OTHER);
+        report.installed_pending_reboot_count =
+            Some(count(patches::STATE_INSTALLED_PENDING_REBOOT));
+        report.installed_rejected_count = Some(count(patches::STATE_INSTALLED_REJECTED));
+        report.missing_count = count(patches::STATE_MISSING);
+        report.failed_count = count(patches::STATE_FAILED);
+        report.not_applicable_count = count(patches::STATE_NOT_APPLICABLE);
+        // "The number of patches beyond the supported limit of `NotApplicableCount` that
+        // aren't reported by name to Inventory": every patch this run found is reported by
+        // name below, so none of them is unreported.
+        report.unreported_not_applicable_count = Some(0);
+        report.available_security_update_count =
+            Some(count(patches::STATE_AVAILABLE_SECURITY_UPDATE));
+        report.critical_non_compliant_count = Some(critical);
+        report.security_non_compliant_count = Some(security);
+        report.other_non_compliant_count = Some(
+            not_on_node
+                .saturating_sub(critical)
+                .saturating_sub(security),
+        );
+        report.patches = rows;
+        report
     }
 
     /// The figure this report holds for the count `key` names, or `None` when the key names

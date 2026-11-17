@@ -93,6 +93,11 @@ pub const MAX_COMMANDS_RETAINED: usize = 1_000;
 /// (`GetCommandInvocationResult$ResponseCode`).
 pub const NO_RESPONSE_CODE: i32 = -1;
 
+/// The `ResponseCode` of a step that SUCCEEDED: "the zero that means the step succeeded"
+/// — the exit code a plugin that performed its work reports
+/// (`GetCommandInvocationResult$ResponseCode`).
+pub const SUCCESSFUL_RESPONSE_CODE: i32 = 0;
+
 /// The target `Key` that names managed nodes by their node ids, and the value that names
 /// every node of the Region: `Key=InstanceIds,Values=instance-id-1,…` and
 /// `Key=InstanceIds,Values=*` (the `Target` doc's Run Command formats).

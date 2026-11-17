@@ -202,17 +202,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(crate::scaffolded::Scaffolded::validation)?;
 
         // What has been reported for this node id. The patching operation that runs ON the
-        // node leaves a compliance report ([`crate::state::instance_patch_states`]), and that
-        // report records HOW MANY patches of each state it found rather than WHICH they
-        // were — so a node whose report this endpoint holds lists no patch ROW either, and
-        // naming patches from a count would be inventing them. No call of this service's model
-        // performs such a run, so an id this endpoint holds no report for reports the nothing
-        // it holds rather than compliance nobody collected.
+        // node leaves a compliance report ([`crate::state::instance_patch_states`]) holding
+        // one row per patch it found ([`patches::PatchComplianceRow`]), which is what this
+        // read reports, narrowed by every filter the request carries. An id no patching
+        // operation has reported for reports the nothing this endpoint holds rather than
+        // compliance nobody collected.
         let region = crate::state::request_region(ctx.parts());
+        let filters = input.filters.as_deref().unwrap_or_default();
         let store = state.lock();
         let reported: Vec<PatchComplianceData> = store
             .instance_patch_state(&region, &input.instance_id)
-            .map(|_counts_only| Vec::new())
+            .map(|report| {
+                report
+                    .patches
+                    .iter()
+                    .filter(|row| {
+                        filters.iter().all(|filter| {
+                            row.matches_filter(
+                                filter.key.as_deref().unwrap_or_default(),
+                                filter.values.as_deref().unwrap_or_default(),
+                            )
+                        })
+                    })
+                    .map(patches::PatchComplianceRow::to_patch_compliance_data)
+                    .collect()
+            })
             .unwrap_or_default();
 
         // The token this read hands out is the position the next page starts at within the

@@ -822,18 +822,24 @@ async fn an_association_runs_on_the_nodes_its_targets_select() {
          {succeeded}"
     );
 
-    // The association that reached no node reports no execution, however long the other
-    // one's run took to finish.
+    // The association that reached no node settles too: its execution is over as soon as
+    // the targets have been evaluated, and it reports the result of a run over no node —
+    // `Success`, with no count of targets by status, because there were no targets.
     let reached_nothing = describe_association(&router, &other_id).await;
     assert_eq!(
-        reached_nothing["Overview"]["Status"], json!("Pending"),
-        "case \"an unregistered node\": expected an association that reached no node to stay \
-         Pending, got {reached_nothing}"
+        reached_nothing["Overview"]["Status"], json!("Success"),
+        "case \"an unregistered node\": expected an association that reached no node to settle \
+         Success, got {reached_nothing}"
+    );
+    assert_eq!(
+        reached_nothing["Overview"]["DetailedStatus"], json!("Success"),
+        "case \"an unregistered node\": expected the detail of a finished run, got \
+         {reached_nothing}"
     );
     assert!(
-        reached_nothing["Overview"]["AssociationStatusAggregatedCount"].is_null()
-            && reached_nothing["LastExecutionDate"].is_null(),
-        "case \"an unregistered node\": expected no execution at all, got {reached_nothing}"
+        reached_nothing["Overview"]["AssociationStatusAggregatedCount"].is_null(),
+        "case \"an unregistered node\": expected no count of targets by status, got \
+         {reached_nothing}"
     );
 
     // `StartAssociationsOnce` runs it again: a second run finishes on the clock too, and
@@ -950,4 +956,231 @@ async fn association_when_successful(
         );
         tokio::time::sleep(POLL_PAUSE).await;
     }
+}
+
+/// Launch one instance carrying `tags`, through the `TagSpecifications` of Amazon EC2's own
+/// `RunInstances` ("the tags to apply to the resources that are created during instance
+/// launch"), as the instance id that service answered.
+///
+/// Every key and value is free of `&`, `=`, `+`, `%` and spaces, so it travels in the form
+/// body as written, the way every other value these cases send does.
+async fn launch_tagged(
+    router: &MultiServiceRouter,
+    case: &str,
+    image: &str,
+    profile: &str,
+    tags: &[(&str, &str)],
+) -> String {
+    let mut parameters: Vec<(String, String)> = vec![
+        ("ImageId".to_string(), image.to_string()),
+        ("MinCount".to_string(), "1".to_string()),
+        ("MaxCount".to_string(), "1".to_string()),
+        (
+            "IamInstanceProfile.Name".to_string(),
+            profile.to_string(),
+        ),
+        (
+            "TagSpecification.1.ResourceType".to_string(),
+            "instance".to_string(),
+        ),
+    ];
+    for (index, (key, value)) in tags.iter().enumerate() {
+        let entry = index + 1;
+        parameters.push((
+            format!("TagSpecification.1.Tag.{entry}.Key"),
+            (*key).to_string(),
+        ));
+        parameters.push((
+            format!("TagSpecification.1.Tag.{entry}.Value"),
+            (*value).to_string(),
+        ));
+    }
+    let borrowed: Vec<(&str, &str)> = parameters
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect();
+    let (status, body) = ec2(router, REGION, "RunInstances", &borrowed).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: RunInstances must launch, got {status} with {body}"
+    );
+    element(&body, "instanceId")
+        .unwrap_or_else(|| panic!("case {case:?}: RunInstances reports an instance id: {body}"))
+}
+
+/// The tags this service reports for the resource `instance_id` names, keyed by tag key.
+async fn node_tags(router: &MultiServiceRouter, case: &str, instance_id: &str) -> Vec<(String, String)> {
+    let (status, body) = call_in_region(
+        router,
+        REGION,
+        "ListTagsForResource",
+        &json!({ "ResourceType": "ManagedInstance", "ResourceId": instance_id }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: ListTagsForResource must answer, got {status} with {body}"
+    );
+    let mut held: Vec<(String, String)> = body["TagList"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|tag| {
+            (
+                tag["Key"].as_str().unwrap_or_default().to_string(),
+                tag["Value"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    held.sort();
+    held
+}
+
+/// RULE: a managed node registered from an Amazon EC2 instance IS that instance, so the tags
+/// it carries are the instance's own — which is what a `tag:` target selects it by and what
+/// Patch Manager reads its patch group from. An instance tagged after its agent registered
+/// carries that tag too.
+#[tokio::test]
+async fn a_registered_node_carries_the_tags_of_its_instance() {
+    let router = emulator();
+    let profile = Profile {
+        name: "patch-manager-node",
+        trusts: EC2_PRINCIPAL,
+        grant: Grant::Inline(GRANTS_REGISTRATION),
+    };
+    create_profile(&router, &profile).await;
+    let image = image_id(&router, AL2023_PARAMETER).await;
+
+    let case = "an instance tagged at launch";
+    let instance = launch_tagged(
+        &router,
+        case,
+        &image,
+        profile.name,
+        &[("PatchGroup", "production"), ("ServerRole", "web")],
+    )
+    .await;
+    node_when_registered(&router, case, REGION, &instance).await;
+
+    assert_eq!(
+        node_tags(&router, case, &instance).await,
+        vec![
+            ("PatchGroup".to_string(), "production".to_string()),
+            ("ServerRole".to_string(), "web".to_string()),
+        ],
+        "case {case:?}: the node carries the tags the launch put on the instance"
+    );
+
+    // A tag target selects the node by one of those tags, and selects nothing by a value the
+    // instance does not carry.
+    for (tag, value, selects) in [
+        ("tag:ServerRole", "web", true),
+        ("tag:PatchGroup", "production", true),
+        ("tag:ServerRole", "database", false),
+    ] {
+        let (status, sent) = call_in_region(
+            &router,
+            REGION,
+            "SendCommand",
+            &json!({
+                "DocumentName": "AWS-RunPatchBaseline",
+                "Targets": [{ "Key": tag, "Values": [value] }],
+                "Parameters": { "Operation": ["Scan"] },
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the send must be served for {tag}={value}, got {status} with {sent}"
+        );
+        assert_eq!(
+            sent["Command"]["TargetCount"].as_i64(),
+            Some(i64::from(selects)),
+            "case {case:?}: {tag}={value} must select {} node, got {sent}",
+            i64::from(selects)
+        );
+    }
+
+    // The patch run that reached the node recorded the patch group its tag names, which is
+    // what the patch-group read aggregates over.
+    let (status, states) = call_in_region(
+        &router,
+        REGION,
+        "DescribeInstancePatchStates",
+        &json!({ "InstanceIds": [instance] }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: the patch-state read must answer, got {status} with {states}"
+    );
+    assert_eq!(
+        states["InstancePatchStates"][0]["PatchGroup"].as_str(),
+        Some("production"),
+        "case {case:?}: the report carries the patch group the instance's tag names, got \
+         {states}"
+    );
+    let (status, group) = call_in_region(
+        &router,
+        REGION,
+        "DescribePatchGroupState",
+        &json!({ "PatchGroup": "production" }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: the patch-group read must answer, got {status} with {group}"
+    );
+    assert_eq!(
+        group["Instances"].as_i64(),
+        Some(1),
+        "case {case:?}: the group holds the node whose tag names it, got {group}"
+    );
+
+    // A tag put on the instance AFTER its agent registered reaches the node too: the tags
+    // are the instance's, brought in line whenever this service settles its registrations,
+    // not a copy frozen at registration.
+    let case = "an instance tagged after it registered";
+    let (status, tagged) = ec2(
+        &router,
+        REGION,
+        "CreateTags",
+        &[
+            ("ResourceId.1", instance.as_str()),
+            ("Tag.1.Key", "Environment"),
+            ("Tag.1.Value", "staging"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: CreateTags must succeed, got {status} with {tagged}"
+    );
+    let (status, sent) = call_in_region(
+        &router,
+        REGION,
+        "SendCommand",
+        &json!({
+            "DocumentName": "AWS-RunPatchBaseline",
+            "Targets": [{ "Key": "tag:Environment", "Values": ["staging"] }],
+            "Parameters": { "Operation": ["Scan"] },
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: the send must be served, got {status} with {sent}"
+    );
+    assert_eq!(
+        sent["Command"]["TargetCount"].as_i64(),
+        Some(1),
+        "case {case:?}: the new tag selects the node, got {sent}"
+    );
+    assert!(
+        node_tags(&router, case, &instance)
+            .await
+            .contains(&("Environment".to_string(), "staging".to_string())),
+        "case {case:?}: the node carries the tag the instance was given"
+    );
 }

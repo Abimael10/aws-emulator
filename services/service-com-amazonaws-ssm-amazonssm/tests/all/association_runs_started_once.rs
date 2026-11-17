@@ -165,21 +165,40 @@ async fn association_when_run_finished(
     }
 }
 
-/// An association that reached no node reports no execution at ANY instant: its own progress
-/// is `Pending`, and a count of targets by status is a count over executions and there are
-/// none.
-fn assert_no_execution(case: &str, held: &Value) {
+/// An association whose run reached NO node settles like any other: State Manager has
+/// nothing to dispatch the document to, so the execution is over as soon as the targets have
+/// been evaluated — `Success`, over no count of targets by status, because a count of targets
+/// by status is a count over executions and there were none.
+///
+/// Polled like every other settling read here ([`association_when_run_finished`]), so the
+/// case is about WHETHER it settles rather than about the instant it is read at.
+async fn assert_settled_over_no_node(
+    router: &MultiServiceRouter,
+    case: &str,
+    region: &str,
+    association_id: &str,
+) {
+    let until = Instant::now() + DEADLINE;
+    let held = loop {
+        let held = description(router, case, region, association_id).await;
+        if held["Overview"]["Status"] == json!("Success") {
+            break held;
+        }
+        assert!(
+            Instant::now() < until,
+            "case {case:?}: expected an association that reached no node to settle Success, \
+             got {held}"
+        );
+        tokio::time::sleep(POLL_PAUSE).await;
+    };
     assert_eq!(
-        held["Overview"]["Status"],
-        json!("Pending"),
-        "case {case:?}: expected an association that reached no node to stay Pending, got \
-         {held}"
+        held["Overview"]["DetailedStatus"],
+        json!("Success"),
+        "case {case:?}: expected the detail of a finished run, got {held}"
     );
     assert!(
-        held["Overview"]["AssociationStatusAggregatedCount"].is_null()
-            && held["LastExecutionDate"].is_null()
-            && held["LastSuccessfulExecutionDate"].is_null(),
-        "case {case:?}: expected no execution at all, got {held}"
+        held["Overview"]["AssociationStatusAggregatedCount"].is_null(),
+        "case {case:?}: expected no count of targets by status, got {held}"
     );
 }
 
@@ -272,8 +291,7 @@ async fn a_request_runs_every_association_it_names_on_the_nodes_its_targets_sele
     let mut first: Vec<Option<f64>> = Vec::new();
     for ((case, _, nodes, _), id) in rows.iter().zip(&ids) {
         if *nodes == 0 {
-            let held = description(&router, case, REGION, id).await;
-            assert_no_execution(case, &held);
+            assert_settled_over_no_node(&router, case, REGION, id).await;
             first.push(None);
             continue;
         }
@@ -324,9 +342,9 @@ async fn a_request_runs_every_association_it_names_on_the_nodes_its_targets_sele
             continue;
         }
         if *nodes == 0 {
-            // Dispatched to no node, so there is no execution to report for this run either.
-            let held = description(&router, case, REGION, id).await;
-            assert_no_execution(case, &held);
+            // Dispatched to no node: this run settles over no count of targets by status,
+            // the way the create's did.
+            assert_settled_over_no_node(&router, case, REGION, id).await;
             continue;
         }
         let earlier = earlier.unwrap_or_else(|| {

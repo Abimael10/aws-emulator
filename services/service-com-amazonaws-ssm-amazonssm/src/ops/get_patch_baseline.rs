@@ -253,15 +253,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // retrieve information about an Amazon Web Services managed patch baseline, specify
         // the full Amazon Resource Name (ARN) of the baseline" — so an id of one is read
         // from its definition rather than from the created-baseline map. That definition
-        // holds the baseline's identity: the name Patch Manager gives it, the operating
+        // holds the baseline's identity (the name Patch Manager gives it, the operating
         // system it applies to, and the ARN a read names it by, which is the spelling
-        // `GetDefaultPatchBaseline` reports it under. Which patches Patch Manager approves
-        // in it is Patch Manager's own and is held nowhere here, so those members are left
-        // unreported rather than reported empty, which would say the baseline approves and
-        // rejects nothing.
+        // `GetDefaultPatchBaseline` reports it under) together with the approval
+        // configuration published with it, so the members that say which patches it
+        // approves are projected from that record exactly as a created baseline's are
+        // ([`crate::state::patch_baselines::predefined_baseline_record`]). The instants
+        // that record carries are not reported: nobody created it, so there is no creation
+        // instant this endpoint holds.
         if let Some(predefined) =
             crate::state::patch_baselines::predefined_baseline_with_id(&region, &baseline_id)
         {
+            let record =
+                crate::state::patch_baselines::predefined_baseline_record(&region, predefined);
             return Ok(GetPatchBaselineOutput {
                 baseline_id: Some(crate::state::patch_baselines::patch_baseline_arn(
                     &region,
@@ -269,6 +273,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )),
                 name: Some(predefined.name.to_string()),
                 operating_system: Some(predefined.operating_system.to_string()),
+                global_filters: Some(record.reported_global_filters()),
+                approval_rules: Some(record.reported_approval_rules()),
+                approved_patches: Some(record.approved_patches.clone()),
+                approved_patches_compliance_level: Some(
+                    record.approved_patches_compliance_level.clone(),
+                ),
+                approved_patches_enable_non_security: Some(
+                    record.approved_patches_enable_non_security,
+                ),
+                rejected_patches: Some(record.rejected_patches.clone()),
+                rejected_patches_action: Some(record.rejected_patches_action.clone()),
                 ..GetPatchBaselineOutput::default()
             });
         }
