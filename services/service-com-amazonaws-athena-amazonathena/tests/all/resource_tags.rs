@@ -858,9 +858,10 @@ async fn a_listing_pages_the_tags_a_resource_holds() {
         "TagResource must be accepted, got {status} with {body:?}"
     );
 
-    // `MaxResults` has a modelled floor of 75, which is already above the tags one resource
-    // can hold, so every page carries everything and none hands back a token.
-    for max_results in [Value::Null, json!(75), json!(1000)] {
+    // `MaxResults` has a modelled floor ([`MODELLED_MIN_PAGE_SIZE`]), which is already above
+    // the tags one resource can hold, so every page carries everything and none hands back a
+    // token.
+    for max_results in [Value::Null, json!(MODELLED_MIN_PAGE_SIZE), json!(1000)] {
         let mut request = json!({ "ResourceARN": resource_arn });
         if !max_results.is_null() {
             request["MaxResults"] = max_results.clone();
@@ -1098,4 +1099,385 @@ async fn a_tag_holds_only_the_characters_the_model_names() {
              {after:?}"
         );
     }
+}
+
+/// The only bound `ListTagsForResource$MaxResults` publishes: the minimum of the `@range` on
+/// `MaxTagsCount`, read with
+/// `smithy_query(query="operation",operation="ListTagsForResource")`. That shape declares no
+/// maximum, so every value above this one is inside the range as well.
+const MODELLED_MIN_PAGE_SIZE: i64 = 75;
+
+/// AWS's sentence for a `MaxResults` below that minimum: the envelope one broken modelled
+/// constraint is stated in, naming the member as the API spells it and the requirement it
+/// broke.
+///
+/// The clause states no VALUE because that is how this service renders every refusal of a
+/// modelled input constraint, for every operation — the rendering lives in the shared
+/// validation renderer and is pinned for a whole table of operations and constraint classes
+/// by the `boundary_validation_refusal` suite, which this listing only has to agree with.
+fn page_size_below_the_bound() -> String {
+    format!(
+        "1 validation error detected: Value at 'maxResults' failed to satisfy constraint: \
+         Member must have value greater than or equal to {MODELLED_MIN_PAGE_SIZE}"
+    )
+}
+
+/// RULE: the page size a tag listing takes is the modelled `MaxResults` of
+/// `ListTagsForResource`, so a request at or above the minimum that member publishes is
+/// served and one below it is refused as invalid input — and since that minimum is already
+/// above `MAX_TAGS_PER_RESOURCE`, a served page carries every tag the resource holds and
+/// hands back no `NextToken`.
+///
+/// The rows differ along where the asked-for size sits relative to the published bound: AT
+/// it, one step above it, far above it, the largest value the modelled integer carries, one
+/// step below it, far below it, zero and negative.
+#[tokio::test]
+async fn the_page_size_a_tag_listing_takes_is_the_one_the_model_publishes() {
+    let router = router();
+    let work_group = "tag_page_size_wg";
+    let (status, body) = call(&router, "CreateWorkGroup", &json!({ "Name": work_group })).await;
+    assert_eq!(
+        status, 200,
+        "CreateWorkGroup({work_group}) must be accepted, got {status} with {body:?}"
+    );
+    let resource_arn = arn(WORK_GROUP_RESOURCE_TYPE, work_group);
+    let written = [("owner", "analytics"), ("env", "prod"), ("cost-center", "1234")];
+    let (status, body) = tag(&router, &resource_arn, &written).await;
+    assert_eq!(
+        status, 200,
+        "TagResource must be accepted, got {status} with {body:?}"
+    );
+
+    for (case, max_results) in [
+        ("at the published minimum", MODELLED_MIN_PAGE_SIZE),
+        ("one above the published minimum", MODELLED_MIN_PAGE_SIZE + 1),
+        ("far above the published minimum", 1_000),
+        (
+            "the largest value the modelled integer carries",
+            i64::from(i32::MAX),
+        ),
+    ] {
+        let (status, body) = call(
+            &router,
+            "ListTagsForResource",
+            &json!({ "ResourceARN": resource_arn, "MaxResults": max_results }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected MaxResults {max_results} to be served, got {status} \
+             with {body:?}"
+        );
+        assert_eq!(
+            body["Tags"].as_array().map(Vec::len),
+            Some(written.len()),
+            "case {case:?}: expected all {} tags on one page, got {body:?}",
+            written.len()
+        );
+        assert!(
+            body["NextToken"].is_null(),
+            "case {case:?}: a page that reported every tag hands back no NextToken, got \
+             {body:?}"
+        );
+    }
+
+    let stated = page_size_below_the_bound();
+    for (case, max_results) in [
+        ("one below the published minimum", MODELLED_MIN_PAGE_SIZE - 1),
+        ("a single result", 1),
+        ("no results at all", 0),
+        ("a negative page size", -1),
+    ] {
+        let (status, body) = call(
+            &router,
+            "ListTagsForResource",
+            &json!({ "ResourceARN": resource_arn, "MaxResults": max_results }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected MaxResults {max_results} to be refused with 400, got \
+             {status} with {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            INVALID_REQUEST,
+            "case {case:?}: expected the code {INVALID_REQUEST}, got {body:?}"
+        );
+        assert_eq!(
+            message(&body),
+            stated,
+            "case {case:?}: expected the message {stated:?}, got {body:?}"
+        );
+    }
+
+    // A refused listing reported nothing and changed nothing: the resource still holds
+    // exactly the tags that were written onto it.
+    let held = held_tags(&router, &resource_arn).await;
+    assert_eq!(
+        held,
+        expected_tags(&written),
+        "expected the written tags to be untouched by a refused listing, got {held:?}"
+    );
+}
+
+/// RULE: `ListTagsForResource` REPORTS — it answers with the tags the resource its
+/// `ResourceARN` names holds and changes nothing a later caller sees, so the same listing
+/// repeated answers the same whatever page size it asks for, and the resource's own read
+/// answers afterwards exactly what it answered before.
+///
+/// The rows differ along the resource type listed and the page size asked for, and every row
+/// asserts the listing reports that resource's OWN tags — each carries its name as a tag
+/// value, so a listing reading another resource's list fails here.
+#[tokio::test]
+async fn a_tag_listing_reports_without_changing_what_a_later_caller_sees() {
+    let router = router();
+    for resource in taggable_resources() {
+        register(&router, &resource).await;
+        let resource_arn = arn(resource.resource_type, resource.name);
+        let written: Vec<(&str, &str)> = vec![("owner", "analytics"), ("resource", resource.name)];
+        let (status, body) = tag(&router, &resource_arn, &written).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: TagResource must be accepted, got {status} with {body:?}",
+            resource.case
+        );
+
+        // The read this resource type answers for ITSELF, where that read is settled: a
+        // capacity reservation reports a status its own clock owes, so two reads of it differ
+        // for a reason that has nothing to do with a tag listing, and its tags are compared
+        // through the listing alone.
+        let own_read = match resource.resource_type {
+            WORK_GROUP_RESOURCE_TYPE => {
+                Some(("GetWorkGroup", json!({ "WorkGroup": resource.name })))
+            }
+            DATA_CATALOG_RESOURCE_TYPE => Some(("GetDataCatalog", json!({ "Name": resource.name }))),
+            _ => None,
+        };
+        let before = match own_read.as_ref() {
+            Some((operation, request)) => Some(call(&router, operation, request).await),
+            None => None,
+        };
+
+        let mut request = json!({ "ResourceARN": resource_arn });
+        let (status, reported) = call(&router, "ListTagsForResource", &request).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: the listing must answer 200, got {status} with {reported:?}",
+            resource.case
+        );
+        for page_size in [MODELLED_MIN_PAGE_SIZE, MODELLED_MIN_PAGE_SIZE + 1, 1_000] {
+            request["MaxResults"] = json!(page_size);
+            let (status, again) = call(&router, "ListTagsForResource", &request).await;
+            assert_eq!(
+                status, 200,
+                "case {:?}/{page_size}: the listing must answer 200, got {status} with \
+                 {again:?}",
+                resource.case
+            );
+            assert_eq!(
+                again, reported,
+                "case {:?}/{page_size}: a repeated listing must report exactly what the \
+                 first one did ({reported:?}), got {again:?}",
+                resource.case
+            );
+        }
+
+        let held = held_tags(&router, &resource_arn).await;
+        assert_eq!(
+            held,
+            expected_tags(&written),
+            "case {:?}: expected the listing to report this resource's own tags, got {held:?}",
+            resource.case
+        );
+        if let (Some((operation, request)), Some(before)) = (own_read.as_ref(), before) {
+            let after = call(&router, operation, request).await;
+            assert_eq!(
+                after, before,
+                "case {:?}: {operation} must answer after the listings exactly what it \
+                 answered before ({before:?}), got {after:?}",
+                resource.case
+            );
+        }
+    }
+}
+
+/// One resource a tag listing is taken through its whole life for: it is created, tagged,
+/// listed, removed, and created again under the same name.
+struct Removable {
+    /// What the row is, for an assertion message.
+    case: &'static str,
+    /// The resource type its ARN carries.
+    resource_type: &'static str,
+    /// The resource's name.
+    name: &'static str,
+    /// The operation that registers it, and the request that does so.
+    creator: &'static str,
+    create: Value,
+    /// The operation that removes it from the account, and the request that does so.
+    remover: &'static str,
+    removal: Value,
+}
+
+/// RULE: the tags a listing reports are held by the RESOURCE, not by the ARN that addresses
+/// it, so once the account no longer holds the resource the same ARN resolves to nothing and
+/// the listing is the modelled miss — and a resource later created under that same name
+/// starts with the tags its own create carried and none of the removed resource's.
+///
+/// The rows differ along the resource type whose record is removed and the call that removes
+/// it.
+#[tokio::test]
+async fn a_tag_listing_follows_the_resource_out_of_the_account() {
+    let router = router();
+    let rows: Vec<Removable> = vec![
+        Removable {
+            case: "a workgroup",
+            resource_type: WORK_GROUP_RESOURCE_TYPE,
+            name: "deleted_tags_wg",
+            creator: "CreateWorkGroup",
+            create: json!({ "Name": "deleted_tags_wg" }),
+            remover: "DeleteWorkGroup",
+            removal: json!({ "WorkGroup": "deleted_tags_wg" }),
+        },
+        Removable {
+            case: "a data catalog",
+            resource_type: DATA_CATALOG_RESOURCE_TYPE,
+            name: "deleted_tags_catalog",
+            creator: "CreateDataCatalog",
+            create: json!({
+                "Name": "deleted_tags_catalog",
+                "Type": "LAMBDA",
+                "Parameters": {
+                    "function": "arn:aws:lambda:us-east-1:111122223333:function:meta"
+                }
+            }),
+            remover: "DeleteDataCatalog",
+            removal: json!({ "Name": "deleted_tags_catalog" }),
+        },
+    ];
+
+    for row in rows {
+        let Removable {
+            case,
+            resource_type,
+            name,
+            creator,
+            create,
+            remover: remove,
+            removal,
+        } = row;
+        let (status, body) = call(&router, creator, &create).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: {creator} must be accepted, got {status} with {body:?}"
+        );
+        let resource_arn = arn(resource_type, name);
+        let written = [("owner", "analytics"), ("env", "prod")];
+        let (status, body) = tag(&router, &resource_arn, &written).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: TagResource must be accepted, got {status} with {body:?}"
+        );
+        let held = held_tags(&router, &resource_arn).await;
+        assert_eq!(
+            held,
+            expected_tags(&written),
+            "case {case:?}: expected the written tags to be reported, got {held:?}"
+        );
+
+        let (status, body) = call(&router, remove, &removal).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: {remove} must be accepted, got {status} with {body:?}"
+        );
+        let stated = could_not_find_resource(&resource_arn);
+        let (status, body) = call(
+            &router,
+            "ListTagsForResource",
+            &json!({ "ResourceARN": resource_arn }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the listing of a removed resource to be refused with \
+             400, got {status} with {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            RESOURCE_NOT_FOUND,
+            "case {case:?}: expected the code {RESOURCE_NOT_FOUND}, got {body:?}"
+        );
+        assert_eq!(
+            message(&body),
+            stated,
+            "case {case:?}: expected the message {stated:?}, got {body:?}"
+        );
+
+        // A resource created again under the same name is a NEW resource, and the ARN now
+        // reports the tags IT holds.
+        let (status, body) = call(&router, creator, &create).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: {creator} must be accepted a second time, got {status} with \
+             {body:?}"
+        );
+        let held = held_tags(&router, &resource_arn).await;
+        assert_eq!(
+            held,
+            Vec::<(String, String)>::new(),
+            "case {case:?}: expected a resource created again to hold no tags, got {held:?}"
+        );
+    }
+}
+
+/// RULE: a listing materialises nothing — the account's default workgroup holds no record of
+/// its own until a change writes one, so reading its tags answers the empty list and leaves
+/// the account's registry exactly as it was.
+///
+/// The rows differ along the page size the read asks for and how often it is repeated.
+#[tokio::test]
+async fn listing_the_default_workgroups_tags_materialises_no_record() {
+    let router = router();
+    let before = work_group_registry(&router).await;
+
+    let resource_arn = arn(WORK_GROUP_RESOURCE_TYPE, DEFAULT_WORK_GROUP);
+    for page_size in [Value::Null, json!(MODELLED_MIN_PAGE_SIZE), json!(1_000)] {
+        let mut request = json!({ "ResourceARN": resource_arn });
+        if !page_size.is_null() {
+            request["MaxResults"] = page_size.clone();
+        }
+        let (status, body) = call(&router, "ListTagsForResource", &request).await;
+        assert_eq!(
+            status, 200,
+            "case {page_size:?}: expected the default workgroup's tags to be reported, got \
+             {status} with {body:?}"
+        );
+        assert_eq!(
+            body["Tags"],
+            json!([]),
+            "case {page_size:?}: expected the empty tag list, got {body:?}"
+        );
+        assert!(
+            body["NextToken"].is_null(),
+            "case {page_size:?}: expected no NextToken, got {body:?}"
+        );
+    }
+
+    let after = work_group_registry(&router).await;
+    assert_eq!(
+        after, before,
+        "expected the workgroup registry to be left exactly as it was ({before:?}), got \
+         {after:?}"
+    );
+}
+
+/// Everything `ListWorkGroups` reports of the account's workgroup registry, as one value to
+/// compare a later reading of it against.
+async fn work_group_registry(router: &MultiServiceRouter) -> Value {
+    let (status, body) = call(router, "ListWorkGroups", &json!({})).await;
+    assert_eq!(
+        status, 200,
+        "ListWorkGroups must answer 200, got {status} with {body:?}"
+    );
+    body
 }
