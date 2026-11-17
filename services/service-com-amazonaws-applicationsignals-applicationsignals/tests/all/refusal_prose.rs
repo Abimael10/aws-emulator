@@ -9,8 +9,9 @@
 //!   must be populated, and nothing of the rest of the request;
 //! * an update that would change a stored SLO's evaluation kind states the DIRECTION it
 //!   attempted, read off the stored record's kind and the kind of the supplied config;
-//! * a create whose name is already stored states the SLO that already exists, by the ARN of
-//!   the record the store holds under that name;
+//! * a create whose name is already stored states, in fixed text that identifies nothing,
+//!   that the identifier is taken — the same sentence for every refused create, sequential
+//!   or racing;
 //! * the TAGGING plane, which addresses every kind of resource by `ResourceArn` alone, names
 //!   the resource generically and echoes the ARN the request carried, whichever kind that ARN
 //!   addresses;
@@ -32,7 +33,7 @@ use crate::slo_evaluation_kind::{
     request_based_sli_config, request_based_sli_config_with_queries, sli_config_with_queries,
 };
 use crate::slo_lifecycle::{
-    arn_uri_segment, call, create, router, sli_config, ACCOUNT, REGION,
+    arn_uri_segment, call, create, name_path_segment, router, sli_config, ACCOUNT, REGION,
 };
 use crate::tag_attachment::tag_resource;
 
@@ -43,12 +44,15 @@ use crate::tag_attachment::tag_resource;
 pub(crate) const MISSING_SLI_CONFIG: &str =
     "Either SliConfig or RequestBasedSliConfig must be populated";
 
-/// The sentence a create whose `Name` is already stored is refused with: AWS's fixed text
-/// "Slo with arn '" … "' already exists." around the ARN of the SLO that already exists,
-/// which is its only variable part.
-pub(crate) fn slo_already_exists(stored_arn: &str) -> String {
-    format!("Slo with arn '{stored_arn}' already exists.")
-}
+/// The sentence a create whose `Name` is already stored is refused with: AWS's fixed text for
+/// this error class, entirely, with no variable part and no trailing period.
+pub(crate) const IDENTIFIER_TAKEN: &str = "A resource with the same identifier already exists";
+
+/// The sentence the `ConflictException` shape itself is DOCUMENTED with
+/// (`smithy_query(query="shape",shape="ConflictException")`). A shape's documentation is not
+/// the wire message of a refusal, so no conflict may answer it.
+pub(crate) const CONFLICT_SHAPE_DOC: &str =
+    "This operation attempted to create a resource that already exists.";
 
 /// The sentence a batch delete's per-item failure states for an ARN that names no stored
 /// configuration. One sentence for both ways a configuration goes, which this path does not
@@ -333,14 +337,46 @@ async fn an_update_that_switches_the_evaluation_kind_states_the_direction() {
     }
 }
 
-/// A create under a `Name` already stored is refused 409 `ConflictException` whose sentence
-/// names the existing SLO by the ARN the create that won returned.
+/// Assert that `message` is the whole fixed sentence of the taken-identifier conflict class:
+/// it identifies NOTHING, so none of `identifiers` (the name the request sent, the ARN the
+/// stored record carries, the account and the region around it) occurs in it, it is not the
+/// error shape's documentation, and it carries no trailing period.
+///
+/// `pub(crate)` so the sibling suite that asserts the same rule over its own rows checks it
+/// through this one spelling rather than a second copy.
+pub(crate) fn assert_identifies_nothing(label: &str, message: &str, identifiers: &[&str]) {
+    assert_eq!(
+        message, IDENTIFIER_TAKEN,
+        "case {label}: expected {IDENTIFIER_TAKEN:?}, got {message:?}"
+    );
+    assert_ne!(
+        message, CONFLICT_SHAPE_DOC,
+        "case {label}: expected this error class's sentence, not the shape's documentation, \
+         got {message:?}"
+    );
+    assert!(
+        !message.ends_with('.'),
+        "case {label}: the sentence carries no trailing period, got {message:?}"
+    );
+    for identifier in identifiers {
+        assert!(
+            !message.contains(identifier),
+            "case {label}: the sentence identifies nothing, but it states {identifier:?}: \
+             {message:?}"
+        );
+    }
+}
+
+/// A create under a `Name` already stored is refused 409 `ConflictException` with the fixed
+/// sentence of that error class, which identifies neither the name the request sent nor the
+/// record that holds it.
 ///
 /// The rows differ along the name's form — the character classes the modelled
 /// `ServiceLevelObjectiveName` pattern `^[0-9A-Za-z][-._0-9A-Za-z ]{0,126}[0-9A-Za-z]$` admits
-/// — including the shortest name it admits and one of its maximum length.
+/// — including the shortest name it admits and one of its maximum length — and along the rest
+/// of the repeated request, which the wording does not depend on either.
 #[tokio::test]
-async fn a_create_whose_identifier_is_taken_names_the_existing_slo() {
+async fn a_create_whose_identifier_is_taken_states_the_fixed_conflict_sentence() {
     let longest = format!("a{}z", "b".repeat(126));
     let names = vec![
         "taken-slo".to_string(),
@@ -376,6 +412,13 @@ async fn a_create_whose_identifier_is_taken_names_the_existing_slo() {
                 "a request-based config under the same name",
                 json!({ "Name": name, "RequestBasedSliConfig": request_based_sli_config("x") }),
             ),
+            (
+                "the same name with other members along",
+                json!({ "Name": name, "SliConfig": sli_config("orders", "POST /orders", 9.0),
+                        "Description": "a different description",
+                        "Goal": { "AttainmentGoal": 95.0 },
+                        "Tags": [{ "Key": "team", "Value": "orders" }] }),
+            ),
         ] {
             let (status, answer) = create(&router, body).await;
             let label = format!("{name:?} / {why}");
@@ -390,12 +433,27 @@ async fn a_create_whose_identifier_is_taken_names_the_existing_slo() {
                 "case {label}: expected a ConflictException, got {answer}"
             );
             let message = answer["Message"].as_str().unwrap_or_default();
-            let expected = slo_already_exists(&stored_arn);
-            assert_eq!(
-                message, expected,
-                "case {label}: expected {expected:?}, got {message:?}"
+            assert_identifies_nothing(
+                &label,
+                message,
+                &[name.as_str(), stored_arn.as_str(), "arn:", ACCOUNT, REGION],
             );
         }
+
+        // Round trip: the refused creates left the record the store holds under that name
+        // readable and unchanged, so the sentence is about a create that wrote nothing.
+        let (status, fetched) =
+            call(&router, "GET", &format!("/slo/{}", name_path_segment(name)), None).await;
+        assert_eq!(
+            status, 200,
+            "case {name:?}: expected the stored SLO to still be readable, got {status} with \
+             {fetched}"
+        );
+        assert_eq!(
+            fetched["Slo"], created["Slo"],
+            "case {name:?}: expected a refused create to leave the record untouched, got {:?}",
+            fetched["Slo"]
+        );
     }
 
     // The admitted side: another name is still created, so the conflict is about the
@@ -411,6 +469,95 @@ async fn a_create_whose_identifier_is_taken_names_the_existing_slo() {
             status, 200,
             "case {name:?}: expected distinct names to be served on one store, got {status} \
              with {created}"
+        );
+    }
+}
+
+/// The SAME sentence reaches every loser of a RACE: of N creates arriving together on one
+/// name, exactly one is admitted and each of the other N-1 reads the fixed conflict sentence,
+/// identifying nothing — not even the ARN the winner was handed.
+///
+/// The rows differ along how many callers race (two, and a pool large enough that several
+/// losers are refused from different threads) and along the name's form, and each racer sends
+/// a DIFFERENT body, so nothing but the name can be what the refusal is about.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_loser_of_a_create_race_reads_the_same_fixed_sentence() {
+    for (racers, name) in [(2usize, "raced-slo"), (8, "raced.slo spaced"), (8, "7A")] {
+        let case = format!("{racers} racers on {name:?}");
+        let router = std::sync::Arc::new(router());
+
+        let mut tasks = Vec::new();
+        for racer in 0..racers {
+            let router = std::sync::Arc::clone(&router);
+            let body = json!({
+                "Name": name,
+                "Description": format!("racer {racer}"),
+                "SliConfig": sli_config("checkout", "GET /cart", 100.0 + racer as f64),
+            });
+            tasks.push(tokio::spawn(
+                async move { create(&router, body).await },
+            ));
+        }
+
+        let mut winners: Vec<Value> = Vec::new();
+        let mut losers: Vec<Value> = Vec::new();
+        for task in tasks {
+            let (status, answer) = task.await.expect("the racing create completed");
+            match status {
+                200 => winners.push(answer),
+                409 => losers.push(answer),
+                other => panic!(
+                    "case {case}: expected every racer to answer 200 or 409, got {other} with \
+                     {answer}"
+                ),
+            }
+        }
+
+        assert_eq!(
+            winners.len(),
+            1,
+            "case {case}: expected exactly one create to be admitted, got {} with {winners:?}",
+            winners.len()
+        );
+        assert_eq!(
+            losers.len(),
+            racers - 1,
+            "case {case}: expected every other racer to be refused, got {} with {losers:?}",
+            losers.len()
+        );
+        let stored_arn = winners[0]["Slo"]["Arn"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+
+        for (index, loser) in losers.iter().enumerate() {
+            let label = format!("{case} / loser {index}");
+            assert_eq!(
+                loser["__type"].as_str(),
+                Some("ConflictException"),
+                "case {label}: expected a ConflictException, got {loser}"
+            );
+            let message = loser["Message"].as_str().unwrap_or_default();
+            assert_identifies_nothing(
+                &label,
+                message,
+                &[name, stored_arn.as_str(), "arn:", ACCOUNT, REGION],
+            );
+        }
+
+        // One winner means one stored record, and it is the one the admitted create answered.
+        let (status, fetched) =
+            call(&router, "GET", &format!("/slo/{}", name_path_segment(name)), None).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: expected the admitted create's record to be readable, got {status} \
+             with {fetched}"
+        );
+        assert_eq!(
+            fetched["Slo"], winners[0]["Slo"],
+            "case {case}: expected the stored record to be the one the winner answered, got \
+             {:?}",
+            fetched["Slo"]
         );
     }
 }

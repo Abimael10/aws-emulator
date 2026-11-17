@@ -11,6 +11,17 @@ Issue-Commit: 56ff870e65d226f4952f88c474cf52081981448e
 
 # CreateServiceLevelObjective ConflictException message is generic instead of naming the existing SLO ARN
 
+> _SUPERSEDED. The wording this report asked for (`Slo with arn '<arn>' already exists.`) was
+> implemented and it REGRESSED the behavioural units
+> `application-signals.slo-duplicate-name-conflict-rejected` and
+> `application-signals.concurrent-create-slo-same-name-exactly-one-wins`, which record AWS
+> answering a duplicate `Name` with the fixed, identifier-free sentence
+> `A resource with the same identifier already exists` (no ARN, no trailing period). Those
+> recorded responses are the authority, so the generic sentence this report calls a defect is
+> the correct one and has been restored; see
+> `issues/things-that-now-work/release-gate-7ac311ed859a-behavioral.md`. Do not re-apply the
+> template below._
+
 > _Note: this issue was identified against the code base at commit `56ff870e65d226f4952f88c474cf52081981448e`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation
