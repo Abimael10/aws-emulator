@@ -425,6 +425,10 @@ pub mod stack_refactor_actions;
 /// create or an update, and the signals `SignalResource` releases it with.
 pub mod wait_conditions;
 
+/// The `UpdatePolicy` that asks for an Auto Scaling group to be REPLACED by an update rather
+/// than changed in place, and the name the replacement is created under.
+mod replacing_update;
+
 /// The rollback TRIGGERS of one stack operation: the CloudWatch alarms a
 /// `RollbackConfiguration` names, and the rollback an alarm in `ALARM` forces.
 pub mod rollback_triggers;

@@ -714,6 +714,141 @@ impl super::StoredStack {
             })
         });
     }
+
+    /// Record ONE resource signal on the stack and materialise what it owes: the signal is
+    /// kept whatever the stack was doing, a wait the signals now satisfy proceeds, and a
+    /// FAILURE signal that something WAITS for fails the operation in flight at once.
+    ///
+    /// "Sends a signal to the specified resource with a success or failure status", and "a
+    /// failure signal causes CloudFormation to immediately fail the stack creation or update"
+    /// (`SignalResource$Status`) — so the operation does not reach the terminal status it was
+    /// headed for, and it is rolled back exactly as every other failure of it is: a failed
+    /// create's rollback removes what the create had already made
+    /// ([`ExpiredWaitOwes::Removal`]) and a failed update is reverted to the previous stack
+    /// configuration ([`ExpiredWaitOwes::Revert`]), unless the request that started it asked
+    /// for the failed state to be kept. That is the one rule for every sender: a client's own
+    /// `SignalResource` call ([`crate::ops::signal_resource`]) and the instances of a signalled
+    /// resource ([`super::provisioning::instance_signals`]) are both recorded here, because
+    /// what the stack does about a signal follows from the signal rather than from the caller.
+    ///
+    /// `awaited` is the resource TYPE the template declares the signalled resource as, where
+    /// the operation in flight WAITS for signals on that declaration
+    /// ([`template::waits_for_resource_signals`]), and `None` for a signal nothing waits for:
+    /// such a signal is recorded and reported on nothing, and nothing about the stack turns on
+    /// it.
+    ///
+    /// Called with the store locked; the answer is the work that failure leaves for the
+    /// services that own the stack's resources, which the caller performs with the lock
+    /// RELEASED. `None` is a signal that failed nothing, and a failure whose rollback owes
+    /// those services nothing of its own.
+    pub fn record_resource_signal(
+        &mut self,
+        logical_id: &str,
+        unique_id: &str,
+        signal_status: &str,
+        awaited: Option<&str>,
+        now: SystemTime,
+    ) -> Option<ExpiredWaitOwes> {
+        // The signal itself is recorded whatever the stack was doing and whatever the logical
+        // id names. A unique id already recorded is the same signal again.
+        let first_time = self.record_signal(logical_id, unique_id, signal_status, now);
+        // A wait condition the operation is waiting AT proceeds once the signals it waits for
+        // have arrived: this is what makes the terminal status due, and it is a no-op while
+        // any of the operation's wait conditions is short of its `Count`.
+        self.release_wait_conditions(now);
+        // Something only WAITS for a signal while the operation that waits is in flight and
+        // the resource's own declaration asks it to.
+        let in_flight = self.pending.is_some()
+            && matches!(
+                self.status.as_str(),
+                super::status::CREATE_IN_PROGRESS | super::status::UPDATE_IN_PROGRESS
+            );
+        let resource_type = awaited.filter(|_| in_flight && first_time)?;
+        let updating = self.status == super::status::UPDATE_IN_PROGRESS;
+        // The resource as the stack holds it: an event reports the physical id the operation
+        // in flight gave it, where it has one, and the properties it was deployed with.
+        let held = self
+            .current_resources()
+            .into_iter()
+            .find(|resource| resource.logical_id == logical_id);
+        let physical_resource_id = held
+            .as_ref()
+            .map(|resource| resource.physical_resource_id.clone())
+            .filter(|physical| !physical.is_empty());
+        let resource_properties = held.as_ref().and_then(StoredResource::properties_blob);
+        let failing = signal_status == super::resource_signal_status::FAILURE;
+        let resource_status = match (updating, failing) {
+            (false, false) => super::resource_status::CREATE_IN_PROGRESS,
+            (false, true) => super::resource_status::CREATE_FAILED,
+            (true, false) => super::resource_status::UPDATE_IN_PROGRESS,
+            (true, true) => super::resource_status::UPDATE_FAILED,
+        };
+        let operation_id = self
+            .last_operation()
+            .map(|operation| operation.operation_id.clone());
+        let client_request_token = self.client_request_token.clone();
+        self.record_resource_event(
+            now,
+            logical_id,
+            physical_resource_id,
+            resource_type,
+            resource_status,
+            Some(signal_received(signal_status, unique_id)),
+            resource_properties,
+            operation_id,
+            client_request_token,
+        );
+        if !failing {
+            // A success signal is what the operation was waiting for: it carries on to the
+            // terminal status its own clock already owes.
+            return None;
+        }
+        // The resource the signal failed does not reach the completion the walk had planned
+        // for it: the event above IS its terminal event, so the planned one is rewritten to
+        // this failure and retired — nothing reports, or goes on reporting, a completion the
+        // resource never reached.
+        self.fail_reported_resource_event(
+            logical_id,
+            resource_status,
+            &signal_received(signal_status, unique_id),
+        );
+        // The stack's own reason is the summary naming the resource that failed it — the
+        // signal itself is what that resource's own event above reports.
+        let reason = super::resource_failure_summary(
+            if updating {
+                super::failed_action::UPDATE
+            } else {
+                super::failed_action::CREATE
+            },
+            [logical_id],
+        );
+        let failed_status = if updating {
+            super::status::UPDATE_FAILED
+        } else {
+            super::status::CREATE_FAILED
+        };
+        // A failed operation is rolled back unless the request that started it asked for the
+        // failed state to be kept ("DO_NOTHING: Do nothing if stack creation fails", which
+        // `DisableRollback` also spells): the stack rests in the failed status only where none
+        // of that follows, which is the one case a stack-level event reports it.
+        if self.disable_rollback {
+            self.fail_transition(now, failed_status, reason.clone());
+            return None;
+        }
+        self.fail_transition_superseded(now, failed_status, reason.clone());
+        if updating {
+            self.begin_owed_update_rollback(now, reason);
+            return Some(ExpiredWaitOwes::Revert);
+        }
+        self.begin_rollback(now, reason);
+        // With the records the stack HOLDS, which is the set the removal reports a deletion of.
+        Some(ExpiredWaitOwes::Removal {
+            resources: self.current_resources(),
+            held: self.held_resource_ids(),
+            needs: super::provisioning::dependencies_in_flight(self),
+            policies: self.rolled_back_resource_policies(),
+        })
+    }
 }
 
 /// The `StackStatusReason` a stack whose WAIT ran out reports: the summary naming the

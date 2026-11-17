@@ -5,12 +5,15 @@
 //!
 //! RULE: **a `CreationPolicy`'s `ResourceSignal` on a resource whose signals are sent by the
 //! Amazon EC2 instances it consists of — an Auto Scaling group's launched instances, or an
-//! `AWS::EC2::Instance` itself — receives one SUCCESS signal per such instance, under that
+//! `AWS::EC2::Instance` itself — receives one signal per such instance, under that
 //! instance's own id as the signal's `UniqueId`, once the service that owns the resource
 //! reports the instance serving and that instance's boot configuration asks it to signal its
-//! stack with a success; so the create reaches a terminal status with no call from the client,
-//! while a resource whose instances are not told to signal — or are told to report the failure
-//! of their own bootstrap — receives nothing and is held to its `Timeout`.** CloudFormation "doesn't proceed with a stack creation or update until
+//! stack: a SUCCESS counts towards the wait's `Count`, so the create reaches a terminal status
+//! with no call from the client, while a FAILURE — a bootstrap reporting that it failed —
+//! "causes CloudFormation to immediately fail the stack creation or update"
+//! (`SignalResource$Status`), so the operation does not wait out its `Timeout`. A resource
+//! whose instances are not told to signal IT receives nothing and is held to that
+//! `Timeout`.** CloudFormation "doesn't proceed with a stack creation or update until
 //! resources receive the required number of signals or the timeout period is exceeded", those
 //! signals come from the instances (`SignalResource` "is useful in cases where you want to
 //! send signals from anywhere other than an Amazon EC2 instance", and `CreationPolicy`
@@ -25,14 +28,22 @@
 //!
 //! The rows span what the rule generalises over: which type the gate is declared on (a group
 //! and an instance), how many instances send the signals (two, three and one), how the boot
-//! configuration asks for them (the API's own command and the helper script), which resource
+//! configuration asks for them (the API's own command and the helper script), how the
+//! invocation is laid out (on one line, and the way a long CLI invocation is habitually
+//! written — one option per continued line, with the values quoted), which resource
 //! it names (this one, another one, and one the instance builds at boot), how many commands
 //! the bootstrap runs before it (none, and the `cfn-init` AWS documents before it), which
-//! status it asks for (a success, the failure of the bootstrap each way states it), whether it
-//! asks at all, and whether the group's capacity is stated outright or left to its `MinSize`.
+//! status it asks for (a success, and the failure of the bootstrap each way states it),
+//! whether it asks at all, and whether the group's capacity is stated outright or left to its
+//! `MinSize`.
 //! A further case has the group's instances come into service across SEVERAL passes, which is
 //! what a gate reaching its `Count` over time depends on — and `resource_signal_waits.rs` is
 //! the suite for the wait itself, which these rows do not re-pin.
+//!
+//! The last suite here is the UPDATE side of the same gate: an `UpdatePolicy` that asks for an
+//! Auto Scaling group to be REPLACED rather than changed deploys a NEW group, whose own
+//! `CreationPolicy` signals decide the update — so a replacement whose instances report their
+//! bootstrap failed is rejected and the stack is rolled back to the group it had.
 
 use std::time::{Duration, Instant};
 
@@ -103,6 +114,21 @@ fn signals_failure_through_the_helper(logical_id: &str) -> String {
     format!(
         "#!/bin/bash\n/opt/aws/bin/cfn-signal -e 1 --stack my-stack --resource {logical_id} \
          --region us-east-1\n"
+    )
+}
+
+/// The boot configuration of an instance whose signalling command is written the way a long
+/// CLI invocation is habitually written: one option per line, each line but the last continued
+/// with a backslash, with the values quoted. A line continuation does not end the command line,
+/// so the options below the first one are that invocation's own.
+fn signals_across_continued_lines(logical_id: &str, signal_status: &str) -> String {
+    format!(
+        "#!/bin/bash\nset -u\nINSTANCE_ID=$(curl -sS \
+         http://169.254.169.254/latest/meta-data/instance-id)\nfor _ in $(seq 1 30); do\n  if aws \
+         cloudformation signal-resource \\\n    --region us-east-1 \\\n    --stack-name \
+         \"my-stack\" \\\n    --logical-resource-id \"{logical_id}\" \\\n    --unique-id \
+         \"$INSTANCE_ID\" \\\n    --status \"{signal_status}\"; then\n    exit 0\n  fi\n  sleep \
+         10\ndone\nexit 1\n"
     )
 }
 
@@ -189,6 +215,20 @@ enum Owner {
     Instance,
 }
 
+/// What the boot configuration of a row's instances asks them to send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sends {
+    /// A SUCCESS signal, which is what releases the gate.
+    Success,
+    /// Nothing at all: the configuration invokes no signalling command, or invokes it for
+    /// another resource, so the gate receives nothing and is held to its `Timeout`.
+    Nothing,
+    /// A FAILURE signal — the bootstrap reporting that it failed — which "causes
+    /// CloudFormation to immediately fail the stack creation or update"
+    /// (`SignalResource$Status`).
+    Failure,
+}
+
 /// One row: a template whose gate waits for the signals its own instances send, and how many
 /// of them send one.
 struct GateRow {
@@ -201,8 +241,8 @@ struct GateRow {
     /// How many instances the resource brings up, each of which signals once where its boot
     /// configuration asks it to.
     instances: usize,
-    /// Whether that boot configuration asks for a signal at all.
-    signalling: bool,
+    /// What that boot configuration asks them to send.
+    sends: Sends,
 }
 
 fn gate_rows() -> Vec<GateRow> {
@@ -219,7 +259,7 @@ fn gate_rows() -> Vec<GateRow> {
             gate: "Group",
             owner: Owner::AutoScalingGroup,
             instances: 2,
-            signalling: true,
+            sends: Sends::Success,
         },
         GateRow {
             case: "a group of three whose instances signal through the helper script",
@@ -233,7 +273,7 @@ fn gate_rows() -> Vec<GateRow> {
             gate: "Group",
             owner: Owner::AutoScalingGroup,
             instances: 3,
-            signalling: true,
+            sends: Sends::Success,
         },
         GateRow {
             case: "a group whose capacity is left to its MinSize, signalling through the API",
@@ -247,7 +287,7 @@ fn gate_rows() -> Vec<GateRow> {
             gate: "Group",
             owner: Owner::AutoScalingGroup,
             instances: 2,
-            signalling: true,
+            sends: Sends::Success,
         },
         GateRow {
             case: "an instance that signals for itself through the helper script",
@@ -259,7 +299,7 @@ fn gate_rows() -> Vec<GateRow> {
             gate: "Node",
             owner: Owner::Instance,
             instances: 1,
-            signalling: true,
+            sends: Sends::Success,
         },
         GateRow {
             case: "a group whose instances are told to do something other than signal",
@@ -273,7 +313,7 @@ fn gate_rows() -> Vec<GateRow> {
             gate: "Group",
             owner: Owner::AutoScalingGroup,
             instances: 2,
-            signalling: false,
+            sends: Sends::Nothing,
         },
         GateRow {
             case: "a group whose instances are given no boot configuration at all",
@@ -282,7 +322,7 @@ fn gate_rows() -> Vec<GateRow> {
             gate: "Group",
             owner: Owner::AutoScalingGroup,
             instances: 2,
-            signalling: false,
+            sends: Sends::Nothing,
         },
         GateRow {
             case: "an instance given no boot configuration at all",
@@ -291,7 +331,7 @@ fn gate_rows() -> Vec<GateRow> {
             gate: "Node",
             owner: Owner::Instance,
             instances: 1,
-            signalling: false,
+            sends: Sends::Nothing,
         },
         GateRow {
             case: "a group whose instances report the FAILURE of their own bootstrap through \
@@ -306,7 +346,7 @@ fn gate_rows() -> Vec<GateRow> {
             gate: "Group",
             owner: Owner::AutoScalingGroup,
             instances: 2,
-            signalling: false,
+            sends: Sends::Failure,
         },
         GateRow {
             case: "an instance that reports the FAILURE of its own bootstrap through the \
@@ -319,7 +359,7 @@ fn gate_rows() -> Vec<GateRow> {
             gate: "Node",
             owner: Owner::Instance,
             instances: 1,
-            signalling: false,
+            sends: Sends::Failure,
         },
         GateRow {
             case: "a group whose instances signal ANOTHER resource of the same stack",
@@ -333,7 +373,7 @@ fn gate_rows() -> Vec<GateRow> {
             gate: "Group",
             owner: Owner::AutoScalingGroup,
             instances: 2,
-            signalling: false,
+            sends: Sends::Nothing,
         },
         GateRow {
             case: "a group whose instances build the resource they signal at boot",
@@ -347,7 +387,7 @@ fn gate_rows() -> Vec<GateRow> {
             gate: "Group",
             owner: Owner::AutoScalingGroup,
             instances: 2,
-            signalling: true,
+            sends: Sends::Success,
         },
         GateRow {
             case: "a group whose instances initialise another resource before signalling this \
@@ -362,7 +402,51 @@ fn gate_rows() -> Vec<GateRow> {
             gate: "Group",
             owner: Owner::AutoScalingGroup,
             instances: 2,
-            signalling: true,
+            sends: Sends::Success,
+        },
+        GateRow {
+            case: "a group whose instances report their bootstrap's FAILURE with the \
+                   invocation written across continued lines",
+            stack: "instance-signals-continued-failure",
+            template: group_template(
+                Some("2"),
+                2,
+                Some(signals_across_continued_lines("Group", "FAILURE")),
+                "instance-signals-continued-failure-behind",
+            ),
+            gate: "Group",
+            owner: Owner::AutoScalingGroup,
+            instances: 2,
+            sends: Sends::Failure,
+        },
+        GateRow {
+            case: "a group whose instances signal ANOTHER resource, across continued lines",
+            stack: "instance-signals-continued-elsewhere",
+            template: group_template(
+                Some("2"),
+                2,
+                Some(signals_across_continued_lines("SomeOtherResource", "SUCCESS")),
+                "instance-signals-continued-elsewhere-behind",
+            ),
+            gate: "Group",
+            owner: Owner::AutoScalingGroup,
+            instances: 2,
+            sends: Sends::Nothing,
+        },
+        GateRow {
+            case: "a group whose instances signal this one with a quoted SUCCESS, across \
+                   continued lines",
+            stack: "instance-signals-continued-success",
+            template: group_template(
+                Some("2"),
+                2,
+                Some(signals_across_continued_lines("Group", "SUCCESS")),
+                "instance-signals-continued-success-behind",
+            ),
+            gate: "Group",
+            owner: Owner::AutoScalingGroup,
+            instances: 2,
+            sends: Sends::Success,
         },
     ]
 }
@@ -428,34 +512,42 @@ async fn owned_instance_ids(
     physical_id: &str,
 ) -> Vec<String> {
     match row.owner {
-        Owner::AutoScalingGroup => {
-            let (code, body) = autoscaling(
-                router,
-                "DescribeAutoScalingGroups",
-                &[("AutoScalingGroupNames.member.1", physical_id)],
-            )
-            .await;
-            assert_eq!(
-                code, 200,
-                "case {case:?}: expected Amazon EC2 Auto Scaling to describe {physical_id}, got \
-                 {code} {body}"
-            );
-            let in_service: Vec<String> = xml_texts(&body, "InstanceId")
-                .into_iter()
-                .zip(xml_texts(&body, "LifecycleState"))
-                .filter(|(_, state)| state == "InService")
-                .map(|(instance_id, _)| instance_id)
-                .collect();
-            let mut sorted = in_service;
-            sorted.sort();
-            sorted
-        }
+        Owner::AutoScalingGroup => in_service_instance_ids(case, router, physical_id).await,
         Owner::Instance => vec![physical_id.to_string()],
     }
 }
 
+/// The ids of the instances Amazon EC2 Auto Scaling reports IN SERVICE in one group, sorted —
+/// the one reader of that set in this suite, so a case that asks about a group's instances and
+/// one that asks about a replacement's cannot read them differently.
+async fn in_service_instance_ids(
+    case: &str,
+    router: &MultiServiceRouter,
+    group: &str,
+) -> Vec<String> {
+    let (code, body) = autoscaling(
+        router,
+        "DescribeAutoScalingGroups",
+        &[("AutoScalingGroupNames.member.1", group)],
+    )
+    .await;
+    assert_eq!(
+        code, 200,
+        "case {case:?}: expected Amazon EC2 Auto Scaling to describe {group}, got {code} {body}"
+    );
+    let mut in_service: Vec<String> = xml_texts(&body, "InstanceId")
+        .into_iter()
+        .zip(xml_texts(&body, "LifecycleState"))
+        .filter(|(_, state)| state == "InService")
+        .map(|(instance_id, _)| instance_id)
+        .collect();
+    in_service.sort();
+    in_service
+}
+
 /// The `UniqueId`s of the signals the stack's event stream reports for one resource, sorted:
-/// every event whose reason is a received signal, which is how this service reports one.
+/// every event whose reason is a received SUCCESS signal, which is how this service reports
+/// one.
 async fn signalled_unique_ids(
     case: &str,
     router: &MultiServiceRouter,
@@ -467,15 +559,19 @@ async fn signalled_unique_ids(
         code, 200,
         "case {case:?}: expected DescribeStackEvents({stack}) to answer, got {code} {body}"
     );
-    let mut unique_ids: Vec<String> = xml_blocks(&body, "member")
+    signals_of_status(&body, logical_id, "SUCCESS")
+}
+
+/// The `UniqueId`s of the signals of one STATUS an event stream reports for a resource, sorted:
+/// every event whose reason is a received signal of that status ([`signalled_unique_ids`] is
+/// the SUCCESS reading of it).
+fn signals_of_status(body: &str, logical_id: &str, signal_status: &str) -> Vec<String> {
+    let prefix = format!("Received {signal_status} signal with UniqueId ");
+    let mut unique_ids: Vec<String> = xml_blocks(body, "member")
         .iter()
         .filter(|event| xml_text(event, "LogicalResourceId").as_deref() == Some(logical_id))
         .filter_map(|event| xml_text(event, "ResourceStatusReason"))
-        .filter_map(|reason| {
-            reason
-                .strip_prefix("Received SUCCESS signal with UniqueId ")
-                .map(str::to_string)
-        })
+        .filter_map(|reason| reason.strip_prefix(&prefix).map(str::to_string))
         .collect();
     unique_ids.sort();
     unique_ids.dedup();
@@ -494,7 +590,7 @@ async fn a_creation_policy_is_signalled_by_the_instances_of_the_resource_it_gate
             "case {case:?}: expected CreateStack to succeed, got {code} {created}"
         );
 
-        if !row.signalling {
+        if row.sends == Sends::Nothing {
             // Nothing told these instances to signal, so the gate receives nothing and the
             // create is still in flight long after the instances are up.
             tokio::time::sleep(HOLDING_WINDOW).await;
@@ -520,6 +616,50 @@ async fn a_creation_policy_is_signalled_by_the_instances_of_the_resource_it_gate
                 signalled.is_empty(),
                 "case {case:?}: expected no signal to be reported for {}, got {signalled:?}",
                 row.gate
+            );
+            continue;
+        }
+
+        if row.sends == Sends::Failure {
+            // A bootstrap that reports its own FAILURE is a failure signal, and "a failure
+            // signal causes CloudFormation to immediately fail the stack creation or update":
+            // the create does not wait out its `Timeout` — it fails and rolls back, which is
+            // what a create's own `OnFailure` default asks for.
+            let status = settled_status(case, &router, stack).await;
+            assert_eq!(
+                status, "ROLLBACK_COMPLETE",
+                "case {case:?}: expected the failed bootstrap to fail the create at once and \
+                 roll it back, got {status:?}; events {:?}",
+                event_trail(&router, stack).await
+            );
+            // ...reported on the gated resource as the signal it is, under the id of the
+            // instance that sent it, and not as the wait having run out.
+            let (_, events) = call(
+                &router,
+                "DescribeStackEvents",
+                &[member("StackName", stack)],
+            )
+            .await;
+            let failed = signals_of_status(&events, row.gate, "FAILURE");
+            assert!(
+                !failed.is_empty(),
+                "case {case:?}: expected a FAILURE signal to be reported for {}, got the \
+                 events {:?}",
+                row.gate,
+                event_trail(&router, stack).await
+            );
+            for unique_id in &failed {
+                assert!(
+                    crate::harness::is_service_assigned_id(unique_id, "i"),
+                    "case {case:?}: expected the signal's UniqueId to be the instance id that \
+                     sent it, got {unique_id:?}"
+                );
+            }
+            let succeeded = signals_of_status(&events, row.gate, "SUCCESS");
+            assert!(
+                succeeded.is_empty(),
+                "case {case:?}: expected no SUCCESS signal from a failed bootstrap, got \
+                 {succeeded:?}"
             );
             continue;
         }
@@ -983,6 +1123,381 @@ async fn a_gate_is_released_by_whichever_of_a_group_s_instances_is_told_to_signa
         "case {CASE:?}: expected exactly the signal of the instance that was told to send \
          one, got {signalled:?}"
     );
+}
+
+/// How a row's update changes the launch configuration of the group it deploys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaunchChange {
+    /// The launch TEMPLATE RESOURCE the group launches from takes a new version: its own
+    /// `UserData` changes, which changes the launch configuration of every group that launches
+    /// from it.
+    TheLaunchTemplateResource,
+    /// The group's OWN `LaunchTemplate` property changes: the version it floats on, stated as
+    /// one of the two words `LaunchTemplateSpecification$Version` documents.
+    TheGroupsOwnSpecification,
+}
+
+/// One row: the group's `UpdatePolicy`, what the update changes, what its instances report,
+/// and what the update settles as.
+struct ReplacingUpdateRow {
+    case: &'static str,
+    stack: &'static str,
+    /// `WillReplace` exactly as the declaration spells it — a template may spell a boolean
+    /// property as a boolean or as the text of one, and both deploy — or `None` for a group
+    /// whose `UpdatePolicy` asks for no replacement at all.
+    will_replace: Option<serde_json::Value>,
+    change: LaunchChange,
+    /// How many instances the group holds, which is also its gate's `Count`.
+    instances: usize,
+    /// The exit code the instances of the UPDATED configuration report from their bootstrap:
+    /// `0` is the bootstrap that succeeded, a non-zero one its failure.
+    exit_code: &'static str,
+    /// The `StackStatus` the update settles in.
+    settles: &'static str,
+    /// Whether the group the stack reports afterwards is a NEW one.
+    replaced: bool,
+}
+
+fn replacing_update_rows() -> Vec<ReplacingUpdateRow> {
+    vec![
+        ReplacingUpdateRow {
+            case: "the launch template the group launches from takes a new version and the \
+                   replacement's instances signal success",
+            stack: "replacing-update-swapped",
+            will_replace: Some(json!(true)),
+            change: LaunchChange::TheLaunchTemplateResource,
+            instances: 2,
+            exit_code: "0",
+            settles: "UPDATE_COMPLETE",
+            replaced: true,
+        },
+        ReplacingUpdateRow {
+            case: "the launch template takes a new version and the replacement's instances \
+                   report their bootstrap FAILED",
+            stack: "replacing-update-rejected",
+            will_replace: Some(json!(true)),
+            change: LaunchChange::TheLaunchTemplateResource,
+            instances: 1,
+            exit_code: "1",
+            settles: "UPDATE_ROLLBACK_COMPLETE",
+            replaced: false,
+        },
+        ReplacingUpdateRow {
+            case: "the group's own launch template specification changes, WillReplace spelled \
+                   as a string",
+            stack: "replacing-update-specification",
+            will_replace: Some(json!("true")),
+            change: LaunchChange::TheGroupsOwnSpecification,
+            instances: 1,
+            exit_code: "0",
+            settles: "UPDATE_COMPLETE",
+            replaced: true,
+        },
+        ReplacingUpdateRow {
+            case: "a group whose UpdatePolicy asks for no replacement keeps the group the \
+                   stack has",
+            stack: "replacing-update-absent",
+            will_replace: None,
+            change: LaunchChange::TheLaunchTemplateResource,
+            instances: 1,
+            exit_code: "0",
+            settles: "UPDATE_COMPLETE",
+            replaced: false,
+        },
+    ]
+}
+
+/// The boot configuration of an instance that reports the outcome of its own bootstrap with
+/// the helper script's exit code: "a non-zero exit code" is the failure of that bootstrap, and
+/// `0` its success. `generation` is what makes one revision's configuration differ from
+/// another's.
+fn signals_the_bootstrap(logical_id: &str, exit_code: &str, generation: &str) -> String {
+    format!(
+        "#!/bin/bash\n# generation {generation}\n/opt/aws/bin/cfn-signal -e {exit_code} --stack \
+         my-stack --resource {logical_id} --region us-east-1\n"
+    )
+}
+
+/// The two words `LaunchTemplateSpecification$Version` documents beside a version number: "the
+/// version number, `$Latest`, or `$Default`", both of which name a version of the template
+/// rather than a number of this suite's choosing.
+const FLOATING_VERSIONS: [&str; 2] = ["$Latest", "$Default"];
+
+/// A template whose Auto Scaling group carries the `CreationPolicy` its instances signal and
+/// the `UpdatePolicy` a row declares, launching from a launch template of the same stack.
+fn replacing_update_template(
+    row: &ReplacingUpdateRow,
+    user_data: &str,
+    version: &str,
+) -> String {
+    let update_policy = match &row.will_replace {
+        Some(will_replace) => {
+            json!({"AutoScalingReplacingUpdate": {"WillReplace": will_replace}})
+        }
+        // The OTHER Auto Scaling update policy, which asks for the instances of the group to
+        // be replaced rather than the group itself.
+        None => json!({"AutoScalingRollingUpdate": {"MinInstancesInService": 1}}),
+    };
+    json!({"Resources": {
+        "Launch": {
+            "Type": "AWS::EC2::LaunchTemplate",
+            "Properties": {"LaunchTemplateData": {
+                "ImageId": IMAGE_ID,
+                "InstanceType": INSTANCE_TYPE,
+                "UserData": {"Fn::Base64": user_data},
+            }},
+        },
+        "Group": {
+            "Type": "AWS::AutoScaling::AutoScalingGroup",
+            "Properties": {
+                "MinSize": "1",
+                "MaxSize": "4",
+                "DesiredCapacity": row.instances.to_string(),
+                "AvailabilityZones": ["us-east-1a"],
+                "LaunchTemplate": {
+                    "LaunchTemplateId": {"Ref": "Launch"},
+                    "Version": version,
+                },
+            },
+            "CreationPolicy": {"ResourceSignal": {"Count": row.instances, "Timeout": "PT15M"}},
+            "UpdatePolicy": update_policy,
+        },
+    }})
+    .to_string()
+}
+
+/// How long a row gives one stack operation to reach a terminal status: generous room for the
+/// spans this emulator's own clock owes (the instances coming up, the replacement's create, the
+/// rollback behind a refused replacement) on a loaded machine, and far short of the `PT15M`
+/// every row's `CreationPolicy` asks the wait to run for — so a row that fails here failed
+/// because nothing terminal was ever reported.
+const SETTLING_DEADLINE: Duration = Duration::from_secs(90);
+
+/// How often a row re-reads `DescribeStacks`, exactly as a client's waiter polls.
+const POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// The status one stack operation settles in, polled until it is terminal.
+async fn settled_operation(case: &str, router: &MultiServiceRouter, stack: &str) -> String {
+    let deadline = Instant::now() + SETTLING_DEADLINE;
+    loop {
+        let status = stack_status(case, router, stack).await;
+        if !status.ends_with("_IN_PROGRESS") {
+            return status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected the operation to reach a terminal status within \
+             {SETTLING_DEADLINE:?}, got {status:?}; events {:?}",
+            event_trail(router, stack).await
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Every Auto Scaling group the owning service holds, sorted: what a replaced group must be
+/// gone from, and what the group a completed update reports must be in.
+async fn groups_the_service_holds(case: &str, router: &MultiServiceRouter) -> Vec<String> {
+    let (code, body) = autoscaling(router, "DescribeAutoScalingGroups", &[]).await;
+    assert_eq!(
+        code, 200,
+        "case {case:?}: expected Amazon EC2 Auto Scaling to describe its groups, got {code} \
+         {body}"
+    );
+    let mut names = xml_texts(&body, "AutoScalingGroupName");
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// The groups the owning service holds once it holds exactly `expected`, polled for: the
+/// group a deployment asked for and the one it discarded are the owning service's to create
+/// and remove on its own clock, so what a case waits for is the SET it ends up holding rather
+/// than a span.
+async fn settled_groups_the_service_holds(
+    case: &str,
+    router: &MultiServiceRouter,
+    expected: &[String],
+) -> Vec<String> {
+    let deadline = Instant::now() + SETTLING_DEADLINE;
+    loop {
+        let held = groups_the_service_holds(case, router).await;
+        if held == expected {
+            return held;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected Amazon EC2 Auto Scaling to hold exactly {expected:?} \
+             within {SETTLING_DEADLINE:?}, got {held:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// The ids of the instances Amazon EC2 Auto Scaling reports in service in one group once it
+/// reports `expected` of them, polled for: a group the owning service has just been asked for
+/// brings its instances up on its own clock, so what a case waits for is that set rather than a
+/// span.
+async fn settled_instance_ids(
+    case: &str,
+    router: &MultiServiceRouter,
+    group: &str,
+    expected: usize,
+) -> Vec<String> {
+    let deadline = Instant::now() + SETTLING_DEADLINE;
+    loop {
+        let in_service = in_service_instance_ids(case, router, group).await;
+        if in_service.len() >= expected {
+            return in_service;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected the owning service to report {expected} instance(s) in \
+             service in {group} within {SETTLING_DEADLINE:?}, got {in_service:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+#[tokio::test]
+async fn a_replacing_update_policy_swaps_the_group_and_a_failed_signal_rejects_the_replacement() {
+    for row in replacing_update_rows() {
+        let case = row.case;
+        let stack = row.stack;
+        let router = router();
+        // The configuration the stack is CREATED with: a bootstrap that succeeds, so the
+        // create's own gate is released by its instances and the row starts from a group that
+        // is really serving.
+        let created = replacing_update_template(
+            &row,
+            &signals_the_bootstrap("Group", "0", "one"),
+            FLOATING_VERSIONS[0],
+        );
+        let (code, body) = create_stack(&router, stack, &created, &[]).await;
+        assert_eq!(
+            code, 200,
+            "case {case:?}: expected CreateStack to succeed, got {code} {body}"
+        );
+        let status = settled_operation(case, &router, stack).await;
+        assert_eq!(
+            status, "CREATE_COMPLETE",
+            "case {case:?}: expected the signalled create to complete, got {status:?}; events \
+             {:?}",
+            event_trail(&router, stack).await
+        );
+        let group_before = physical_id(&router, stack, "Group").await;
+        let instances_before =
+            settled_instance_ids(case, &router, &group_before, row.instances).await;
+        assert_eq!(
+            instances_before.len(),
+            row.instances,
+            "case {case:?}: expected the created group to hold {} serving instance(s), got \
+             {instances_before:?}",
+            row.instances
+        );
+
+        // The update: whichever half of the group's launch configuration this row changes.
+        let changed = match row.change {
+            LaunchChange::TheLaunchTemplateResource => replacing_update_template(
+                &row,
+                &signals_the_bootstrap("Group", row.exit_code, "two"),
+                FLOATING_VERSIONS[0],
+            ),
+            LaunchChange::TheGroupsOwnSpecification => replacing_update_template(
+                &row,
+                &signals_the_bootstrap("Group", "0", "one"),
+                FLOATING_VERSIONS[1],
+            ),
+        };
+        let (code, body) = call(
+            &router,
+            "UpdateStack",
+            &[member("StackName", stack), member("TemplateBody", &changed)],
+        )
+        .await;
+        assert_eq!(
+            code, 200,
+            "case {case:?}: expected UpdateStack to be accepted, got {code} {body}"
+        );
+        let status = settled_operation(case, &router, stack).await;
+        assert_eq!(
+            status, row.settles,
+            "case {case:?}: expected the update to settle on {:?}, got {status:?}; events {:?}",
+            row.settles,
+            event_trail(&router, stack).await
+        );
+
+        // The group the stack publishes: a NEW one where the policy asked for the group to be
+        // replaced and the replacement came up, and the one the stack already had where it did
+        // not — a rejected replacement leaves the original group serving, and a policy that
+        // asks for no replacement changes the group that exists.
+        let group_after = physical_id(&router, stack, "Group").await;
+        assert_eq!(
+            group_after != group_before,
+            row.replaced,
+            "case {case:?}: expected a replaced group: {}, got {group_after:?} against \
+             {group_before:?}; events {:?}",
+            row.replaced,
+            event_trail(&router, stack).await
+        );
+        assert!(
+            !group_after.is_empty(),
+            "case {case:?}: expected the stack to report a group after the update"
+        );
+
+        // ...and it is the one the OWNING service really holds: exactly one group of this
+        // stack exists there, so no discarded group is left behind. Polled for, because
+        // creating the group the deployment asked for and removing the one it discarded are
+        // that service's own work.
+        let held =
+            settled_groups_the_service_holds(case, &router, std::slice::from_ref(&group_after))
+                .await;
+        assert_eq!(
+            held,
+            vec![group_after.clone()],
+            "case {case:?}: expected Amazon EC2 Auto Scaling to hold exactly the group the \
+             stack reports, got {held:?}"
+        );
+        let instances_after =
+            settled_instance_ids(case, &router, &group_after, row.instances).await;
+        assert_eq!(
+            instances_after.len(),
+            row.instances,
+            "case {case:?}: expected the group the stack reports to hold {} serving \
+             instance(s), got {instances_after:?}",
+            row.instances
+        );
+
+        // The signals the replacement's instances sent are what decided it: a bootstrap that
+        // reported FAILURE is reported on the group as the failure signal it is, and that is
+        // what the update was failed by rather than the wait running out.
+        let (_, events) = call(
+            &router,
+            "DescribeStackEvents",
+            &[member("StackName", stack)],
+        )
+        .await;
+        let failed = signals_of_status(&events, "Group", "FAILURE");
+        if row.exit_code == "0" {
+            assert!(
+                failed.is_empty(),
+                "case {case:?}: expected no failure signal to be reported, got {failed:?}"
+            );
+            continue;
+        }
+        assert!(
+            !failed.is_empty(),
+            "case {case:?}: expected the failed bootstrap to be reported as a FAILURE signal \
+             on the group, got the events {:?}",
+            event_trail(&router, stack).await
+        );
+        for unique_id in &failed {
+            assert!(
+                crate::harness::is_service_assigned_id(unique_id, "i"),
+                "case {case:?}: expected the failure signal's UniqueId to be the instance id \
+                 that sent it, got {unique_id:?}"
+            );
+        }
+    }
 }
 
 #[tokio::test]

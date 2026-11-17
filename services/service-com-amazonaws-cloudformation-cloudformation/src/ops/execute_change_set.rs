@@ -815,6 +815,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 } else {
                     crate::state::provisioning::FailedResourceRevert::WithTheStackRollback
                 },
+                // ...and the declarations it deploys are resolved again where a value one of
+                // them reads has moved, so a resource is deployed with the values in force
+                // after this deployment's own changes
+                // ([`crate::state::provisioning::StackProvenance::declarations_resolve_again`]).
+                declarations_resolve_again: true,
                 ..stack.provenance()
             };
 

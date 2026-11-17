@@ -165,26 +165,24 @@ pub(super) async fn settle_instance_signals(
             // reports. The walk is bounded either way — it reads each serving instance of one
             // gate at most once, and that set is bounded by the capacity the owning service
             // lets a group have.
-            let mut signalled: Vec<String> = Vec::new();
+            let mut signalled: Vec<(String, &'static str)> = Vec::new();
             let unsignalled = instances
                 .into_iter()
                 .filter(|instance_id| !gate.signalled_already.contains(instance_id));
             for instance_id in unsignalled {
-                if signalled.len() >= gate.needed {
+                if signalled.len() >= gate.needed || asks_for_failure_of(&signalled) {
                     break;
                 }
                 let read = Box::pin(ec2_instance::boot_configuration(ctx, region, &instance_id));
                 if let Ok(Some(boot)) = read.await {
-                    // A configuration that asks for the FAILURE of its own bootstrap is
-                    // asking this create to fail: no success signal is recorded for it, so the
-                    // wait runs out and the create fails and rolls back
-                    // ([`super::settle_expired_waits`]) — the terminal status such a stack
-                    // reaches, reported on the `Timeout` rather than on the signal, since what
-                    // failed that bootstrap is work this emulator did not run.
-                    if asked_signal_status(&boot, &gate.logical_id)
-                        == Some(crate::state::resource_signal_status::SUCCESS)
-                    {
-                        signalled.push(instance_id);
+                    // A configuration that asks for the FAILURE of its own bootstrap sends
+                    // that failure: "a failure signal causes CloudFormation to immediately
+                    // fail the stack creation or update" (`SignalResource$Status`), so one
+                    // such instance is the whole of what this gate's pass has to find — the
+                    // operation does not reach a terminal status it was headed for, and is
+                    // rolled back ([`crate::state::StoredStack::record_resource_signal`]).
+                    if let Some(status) = asked_signal_status(&boot, &gate.logical_id) {
+                        signalled.push((instance_id, status));
                     }
                 }
             }
@@ -192,66 +190,117 @@ pub(super) async fn settle_instance_signals(
                 continue;
             }
             let now = SystemTime::now();
+            // What a FAILURE signal's failure leaves for the services that own the stack's
+            // resources, performed with the store RELEASED exactly as every other call this
+            // module makes.
+            let owed = {
+                let mut store = state.lock();
+                let Some(stack) = store.resolve_mut(region, &stack_id) else {
+                    continue;
+                };
+                let mut owed = None;
+                for (instance_id, status) in &signalled {
+                    // Keyed by the signalled resource and the signal's unique id, so an
+                    // instance already counted is not counted twice however many passes read
+                    // it serving ([`crate::state::StoredStack::record_signal`]), and recorded
+                    // through the one rule every signal this service receives is held to: the
+                    // signal is reported on the resource it was sent to, a wait its `Count` is
+                    // now met by proceeds, and a FAILURE fails the operation at once.
+                    let owes = stack.record_resource_signal(
+                        &gate.logical_id,
+                        instance_id,
+                        status,
+                        Some(&gate.resource_type),
+                        now,
+                    );
+                    owed = owed.or(owes);
+                }
+                owed
+            };
+            // "ROLLBACK — Roll back the stack creation. This is the default": the resources a
+            // failed CREATE had already made are removed again in the services that own them.
+            // A failed UPDATE's revert is the one path every rollback this service owes goes
+            // through ([`crate::state::settle_due_rollbacks`]), which the operation driving
+            // this pass performs for itself.
+            let Some(crate::state::wait_conditions::ExpiredWaitOwes::Removal {
+                resources,
+                held,
+                needs,
+                policies,
+            }) = owed
+            else {
+                continue;
+            };
+            let deleted = Box::pin(unwind(
+                ctx,
+                region,
+                &resources,
+                &Teardown {
+                    stack_id: &stack_id,
+                    held: &held,
+                    needs: &needs,
+                    on_refusal: OnRefusal::Stop,
+                    policies,
+                    // The first walk of this rollback: nothing has been refused yet.
+                    left_alone: NOTHING_LEFT_ALONE,
+                },
+            ))
+            .await;
             let mut store = state.lock();
             let Some(stack) = store.resolve_mut(region, &stack_id) else {
                 continue;
             };
-            for instance_id in &signalled {
-                // Keyed by the signalled resource and the signal's unique id, so an instance
-                // already counted is not counted twice however many passes read it serving
-                // ([`crate::state::StoredStack::record_signal`]).
-                let first_time = stack.record_signal(
-                    &gate.logical_id,
-                    instance_id,
-                    crate::state::resource_signal_status::SUCCESS,
-                    now,
-                );
-                if !first_time {
-                    continue;
+            stack.schedule_resource_events(&deleted.transitions);
+            stack.record_materialised_resources(deleted.resources);
+            // A resource whose owning service accepted the delete and still holds it holds
+            // this rollback open: it is not reported complete while a resource it removed is
+            // still there.
+            stack.record_stabilisations(&deleted.removing, SystemTime::now());
+            if let Some(failure) = deleted.failure {
+                // Reported once this teardown has asked about every resource it still can
+                // ([`crate::state::StoredStack::hold_teardown_failure`]).
+                if !stack.hold_teardown_failure(
+                    &deleted.transitions,
+                    &deleted.removing,
+                    &deleted.refused,
+                    crate::state::status::ROLLBACK_FAILED,
+                    &failure,
+                ) {
+                    stack.fail_transition(
+                        SystemTime::now(),
+                        crate::state::status::ROLLBACK_FAILED,
+                        failure,
+                    );
                 }
-                let properties = stack
-                    .current_resources()
-                    .into_iter()
-                    .find(|resource| resource.logical_id == gate.logical_id)
-                    .and_then(|resource| resource.properties_blob());
-                let operation_id = stack
-                    .last_operation()
-                    .map(|operation| operation.operation_id.clone());
-                let client_request_token = stack.client_request_token.clone();
-                // The signal is reported on the resource it was sent to, worded as every
-                // signal this service records is ([`crate::state::wait_conditions`]), while
-                // the resource is still the one being created.
-                stack.record_resource_event(
-                    now,
-                    &gate.logical_id,
-                    Some(gate.physical_resource_id.clone()),
-                    &gate.resource_type,
-                    crate::state::resource_status::CREATE_IN_PROGRESS,
-                    Some(crate::state::wait_conditions::signal_received(
-                        crate::state::resource_signal_status::SUCCESS,
-                        instance_id,
-                    )),
-                    properties,
-                    operation_id,
-                    client_request_token,
-                );
             }
-            // A wait the signals have now satisfied proceeds, which is what makes the
-            // operation's terminal status due; a gate still short of its `Count` holds, and
-            // this is a no-op for it.
-            stack.release_wait_conditions(now);
         }
     }
 }
 
+/// Whether one of the signals a pass has found is a FAILURE: the operation is failed by it, so
+/// nothing further is read for that gate.
+fn asks_for_failure_of(signalled: &[(String, &'static str)]) -> bool {
+    signalled
+        .iter()
+        .any(|(_, status)| *status == crate::state::resource_signal_status::FAILURE)
+}
+
 /// The gates of one stack whose signals come from the resource's own instances: the
-/// unsatisfied resource-signal waits of the CREATE in flight, for a resource of a type whose
+/// unsatisfied resource-signal waits of the operation in flight, for a resource of a type whose
 /// instances signal and that the operation has already given a physical id.
 ///
-/// A `CreationPolicy` "is invoked during resource creation", so only a create is read here;
-/// every other wait — a wait condition, an update — is left to the client's own signals.
+/// A `CreationPolicy` "is invoked during resource creation", so the waits read here are the
+/// ones the operation that CREATES the resource is held at — a create, and an update that adds
+/// the resource or REPLACES it, which is what opened the barrier
+/// ([`crate::state::StoredStack::opening_barriers`]). Every other wait — one whose signals a
+/// client sends — is left to that client's own `SignalResource` calls.
 fn open_instance_gates(stack: &crate::state::StoredStack) -> Vec<InstanceGate> {
-    if stack.pending.is_none() || stack.status != crate::state::status::CREATE_IN_PROGRESS {
+    if stack.pending.is_none()
+        || !matches!(
+            stack.status.as_str(),
+            crate::state::status::CREATE_IN_PROGRESS | crate::state::status::UPDATE_IN_PROGRESS
+        )
+    {
         return Vec::new();
     }
     let resources = stack.current_resources();
@@ -356,16 +405,27 @@ const SIGNAL_RESOURCE_COMMAND: &str = "signal-resource";
 /// says happened.
 ///
 /// The two ways of asking are AWS's own, and the options are read as the words those commands
-/// publish, so a value a template builds at boot (`-e $?`) states no failure here: what
-/// failed such a bootstrap is work this emulator did not run.
+/// publish — split as a shell splits them, so a quoted value and a continued line are read as
+/// the one invocation they are — and a value a template builds at boot (`-e $?`) or the
+/// bootstrap itself computes (`--status "${STATUS}"`, set by a test the script runs) states no
+/// failure here: what such a bootstrap did is work this emulator did not run, and the instance
+/// the owning service reports serving is one that came up.
 fn asked_signal_status(boot_configuration: &str, logical_id: &str) -> Option<&'static str> {
     let asked = decoded(boot_configuration);
     let mut asked_failure = None;
     for invocation in signal_invocations(&asked) {
-        // The words of THAT invocation: an option joined to its value by `=` is the pair it
-        // is, which is why the separator counts as one here.
-        let tokens: Vec<&str> = invocation
-            .split(|character: char| character.is_whitespace() || character == '=')
+        // The WORDS of that invocation, split as a shell splits them: the quoting and the
+        // escaping — a line continuation's own backslash among them — are the shell's rules,
+        // so they are read by the maintained word splitter rather than by a reading of this
+        // crate's. An option joined to its value by `=` is the pair it is, which is why that
+        // separator is split on here; a command line the splitter will not read (an unclosed
+        // quote) states no option this read can rely on, so nothing is taken from it.
+        let Ok(words) = ::shell_words::split(invocation) else {
+            continue;
+        };
+        let tokens: Vec<&str> = words
+            .iter()
+            .flat_map(|word| word.split('='))
             .filter(|token| !token.is_empty())
             .collect();
         if names_another_resource(&tokens, logical_id) {
@@ -385,15 +445,16 @@ fn asked_signal_status(boot_configuration: &str, logical_id: &str) -> Option<&'s
 /// its own.
 ///
 /// A command line ends at a newline or at one of the separators a shell starts another command
-/// at.
+/// at — and a newline a BACKSLASH escapes ends nothing: that is a line continuation, so the
+/// command line goes on to the next line and the options written there are this invocation's
+/// ([`command_line_end`]). A long CLI invocation is habitually written that way, and reading it
+/// as the first line alone would read an invocation's whole option list as absent.
 ///
 /// Bounded in both directions, the configuration being a value a caller stored: the text read
 /// is at most one configuration's documented size ([`decoded`]), each step advances past the
 /// END of the invocation it took — so no byte is scanned twice and the invocations cannot
 /// overlap — and each invocation is a SLICE of that text rather than a copy of it.
 fn signal_invocations(asked: &str) -> Vec<&str> {
-    const SEPARATORS: [char; 4] = ['\n', ';', '&', '|'];
-
     let mut invocations = Vec::new();
     let mut rest = asked;
     loop {
@@ -405,10 +466,32 @@ fn signal_invocations(asked: &str) -> Vec<&str> {
             return invocations;
         };
         let invocation = &rest[at..];
-        let end = invocation.find(SEPARATORS).unwrap_or(invocation.len());
+        let end = command_line_end(invocation);
         invocations.push(&invocation[..end]);
         rest = &invocation[end..];
     }
+}
+
+/// Where the command line that starts at the beginning of `invocation` ENDS: the first
+/// separator a shell starts another command at that is not a line continuation.
+///
+/// A backslash immediately before a newline continues the command line, so the scan passes that
+/// newline and goes on looking. Every other separator ends the line, and a line nothing ends is
+/// the rest of the text. Each byte is looked at once, so the scan is bounded by the text it
+/// walks.
+fn command_line_end(invocation: &str) -> usize {
+    const SEPARATORS: [char; 4] = ['\n', ';', '&', '|'];
+
+    let mut from = 0;
+    while let Some(found) = invocation[from..].find(SEPARATORS) {
+        let at = from + found;
+        let continued = invocation[at..].starts_with('\n') && invocation[..at].ends_with('\\');
+        if !continued {
+            return at;
+        }
+        from = at + 1;
+    }
+    invocation.len()
 }
 
 /// Whether this invocation names a resource OTHER than `logical_id`: an argument it states

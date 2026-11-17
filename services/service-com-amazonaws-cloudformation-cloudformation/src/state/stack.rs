@@ -610,6 +610,12 @@ impl StoredStack {
                 &mut budget,
             );
         }
+        // ...and a resource an `UpdatePolicy` asks this deployment to REPLACE rather than
+        // change takes a physical name of its own, now that the identities in force are
+        // settled: the walk then creates the replacement beside the resource the stack has and
+        // takes the old one down afterwards, which is what that attribute asks for
+        // ([`super::replacing_update`]).
+        super::replacing_update::rename_replacements(&declared, &mut resources, &already_created);
         // The outputs are evaluated against the identities now in force, which is why this
         // is after the carry-forward above: a resource whose id the owning service assigned
         // carries the one it minted, and an output naming that resource must report THAT.
@@ -2064,15 +2070,18 @@ impl StoredStack {
     /// Only a CREATE or an UPDATE waits: those are the operations CloudFormation "doesn't
     /// proceed with … until resources receive the required number of signals"
     /// (`SignalResource`), while a delete or a rollback removes what is there and waits
-    /// for nothing. A wait a `CreationPolicy` declares is a wait of the CREATE alone — that
-    /// attribute "is invoked during resource creation" — so an update that re-deploys the
-    /// same resource is not held at it
-    /// ([`wait_conditions::DeclaredWaitCondition::only_on_create`]), while a wait condition
-    /// waits whichever operation deploys it. A wait condition the stack has ALREADY deployed
-    /// and that this
+    /// for nothing. A wait a `CreationPolicy` declares is a wait of the CREATE of the
+    /// RESOURCE — that attribute "is invoked during resource creation" — so an update that
+    /// changes the resource in place is not held at it
+    /// ([`wait_conditions::DeclaredWaitCondition::only_on_create`]) while one that CREATES the
+    /// resource is ([`Self::deployment_creates`]): a resource the update adds, and the new
+    /// physical resource of one it replaces, each has to receive the signals its
+    /// `CreationPolicy` asks for. A wait condition waits whichever operation deploys it. A
+    /// wait condition the stack has ALREADY deployed and that this
     /// deployment declares unchanged is not waited at a second time — it is the same
     /// satisfied wait condition ("you can't update a wait condition that has already been
-    /// satisfied unless you also change the handle").
+    /// satisfied unless you also change the handle") — while one this deployment creates anew
+    /// waits for its own signals.
     fn opening_barriers(
         &self,
         now: SystemTime,
@@ -2091,12 +2100,44 @@ impl StoredStack {
             .wait_conditions
             .iter()
             .filter(|declared| {
-                !declared.only_on_create() || in_progress == status::CREATE_IN_PROGRESS
+                if in_progress == status::CREATE_IN_PROGRESS {
+                    return !self.already_satisfied(&declared.logical_id);
+                }
+                // An UPDATE: whether it CREATES the resource is what decides both halves.
+                let creating = self.deployment_creates(&declared.logical_id);
+                if declared.only_on_create() {
+                    return creating;
+                }
+                creating || !self.already_satisfied(&declared.logical_id)
             })
-            .filter(|declared| !self.already_satisfied(&declared.logical_id))
             .cloned()
             .map(|declared| wait_conditions::WaitConditionBarrier::open(declared, now))
             .collect()
+    }
+
+    /// Whether the deployment in flight CREATES the resource `logical_id` rather than changing
+    /// the one the stack has: the stack holds no deployed resource under the identity this
+    /// deployment gives it.
+    ///
+    /// Both ways that happens are one answer: a resource the deployment ADDS, which the stack
+    /// has no record of at all, and the NEW physical resource of one it REPLACES, which the
+    /// stack holds under another identity ([`provisioning::is_same_resource`] is the one rule
+    /// that decides it, shared with the walk that carries the deployment out).
+    fn deployment_creates(&self, logical_id: &str) -> bool {
+        let Some(deployment) = &self.pending_deployment else {
+            return false;
+        };
+        let Some(declared) = deployment
+            .resources
+            .iter()
+            .find(|resource| resource.logical_id == logical_id)
+        else {
+            return false;
+        };
+        !self.resources.iter().any(|deployed| {
+            provisioning::already_deployed(&deployed.resource)
+                && provisioning::is_same_resource(&deployed.resource, declared)
+        })
     }
 
     /// Whether the wait condition under this logical id is one the stack already has,
@@ -3108,6 +3149,11 @@ impl StoredStack {
             // template is what says so, and how that revert is reported
             // ([`provisioning::FailedResourceRevert`]).
             failed_resource_revert: provisioning::FailedResourceRevert::None,
+            // A deployment that deploys RECORDS rather than declarations — a rollback, a
+            // resumption, a revert — cannot resolve a declaration again, so it withholds
+            // nothing; the operation deploying a template says otherwise
+            // ([`provisioning::StackProvenance::declarations_resolve_again`]).
+            declarations_resolve_again: false,
             // A stack holds no record of another stack's resources, so the index of which
             // stack manages which physical name is the STORE's to read: the operation that
             // deploys this stack fills it in
