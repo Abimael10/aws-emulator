@@ -931,6 +931,15 @@ impl ComAmazonawsCloudwatchlogsLogs20140328State {
         }
     }
 
+    /// Materialise every log-group metering pass the clock has ALREADY made due, as of
+    /// `now_ms` ([`LogGroupRecord::materialize_due_metering`]). Called by a reporting
+    /// operation before it reads a group's stored volume.
+    pub fn materialize_due_log_group_metering(&mut self, now_ms: i64) {
+        for group in self.log_groups.values_mut() {
+            group.materialize_due_metering(now_ms);
+        }
+    }
+
     /// How many queries of this account are still in flight, which is what
     /// [`MAX_CONCURRENT_QUERIES`] bounds.
     ///
@@ -2011,7 +2020,18 @@ pub struct LogGroupRecord {
     /// authentication is allowed on operations until it is explicitly disabled.").
     /// `PutBearerTokenAuthentication` is what moves it; a new group is not enabled.
     pub bearer_token_authentication_enabled: bool,
-    pub stored_bytes: i64,
+    /// The volume the service's metering last MEASURED for this group, which is the figure
+    /// `LogGroup$storedBytes` reports.
+    ///
+    /// NOT the volume the group holds right now ([`LogGroupRecord::held_bytes`]): the two
+    /// differ for every event ingested since the last pass, and the measurement catches up
+    /// only when the next pass falls due ([`LOG_GROUP_METERING_INTERVAL_MS`]). Zero for a
+    /// group no pass has measured yet, whatever has been written into it.
+    pub metered_bytes: i64,
+    /// The instant up to which this group's stored volume has been metered: the next pass
+    /// falls due [`LOG_GROUP_METERING_INTERVAL_MS`] after it. Starts at the group's creation
+    /// instant, so a group's first pass is due one cycle after it was created.
+    pub metered_through_ms: i64,
     pub tags: BTreeMap<String, String>,
     /// The group's log streams, keyed by `logStreamName`.
     pub streams: BTreeMap<String, LogStreamRecord>,
@@ -2065,7 +2085,8 @@ pub struct LogGroupRecord {
 }
 
 impl LogGroupRecord {
-    /// A brand-new log group: the class default, no retention, no stored bytes.
+    /// A brand-new log group: the class default, no retention, nothing metered yet (its
+    /// first metering pass falls due one cycle after it was created).
     pub fn new(region: &str, name: &str, creation_time_ms: i64) -> Self {
         Self {
             name: name.to_string(),
@@ -2077,7 +2098,8 @@ impl LogGroupRecord {
             log_group_class: DEFAULT_LOG_GROUP_CLASS.to_string(),
             deletion_protection_enabled: false,
             bearer_token_authentication_enabled: false,
-            stored_bytes: 0,
+            metered_bytes: 0,
+            metered_through_ms: creation_time_ms,
             tags: BTreeMap::new(),
             streams: BTreeMap::new(),
             subscription_filters: BTreeMap::new(),
@@ -2099,6 +2121,46 @@ impl LogGroupRecord {
     /// move the two apart.
     pub fn metric_filter_count(&self) -> i32 {
         i32::try_from(self.metric_filters.len()).unwrap_or(i32::MAX)
+    }
+
+    /// The volume this log group HOLDS: the bytes of the events its streams hold, counted the
+    /// way CloudWatch Logs counts one stored event ([`StoredEvent::stored_bytes`]).
+    ///
+    /// DERIVED from the streams rather than kept beside them — as
+    /// [`LogGroupRecord::metric_filter_count`] is — so no ingest or removal path can move the
+    /// figure and the events apart: a stream that goes takes its bytes with it, and what the
+    /// per-stream storage ceiling discards stops counting the moment it is discarded.
+    ///
+    /// This is NOT what `LogGroup$storedBytes` reports. That member reports what the service's
+    /// metering last measured ([`LogGroupRecord::metered_bytes`]), and this is what the next
+    /// pass will measure.
+    pub fn held_bytes(&self) -> i64 {
+        self.streams
+            .values()
+            .map(LogStreamRecord::stored_bytes)
+            .fold(0i64, i64::saturating_add)
+    }
+
+    /// Materialise the metering the clock has ALREADY made due for this group, as of `now_ms`.
+    ///
+    /// The volume a log group stores is measured on a cycle
+    /// ([`LOG_GROUP_METERING_INTERVAL_MS`]) rather than counted off each write, so the figure
+    /// `storedBytes` reports is owed by the clock and not by a call: the pass was due at the
+    /// same instant whether or not anybody read the group. A reporting operation calls this
+    /// before it reads, so what it reports is the measurement the clock already owed — never a
+    /// figure that moved because something was read.
+    pub fn materialize_due_metering(&mut self, now_ms: i64) {
+        let elapsed = now_ms.saturating_sub(self.metered_through_ms);
+        let passes = elapsed / LOG_GROUP_METERING_INTERVAL_MS.max(1);
+        if passes < 1 {
+            return;
+        }
+        // Up to the LAST pass the cycle owed, so the next one falls due a whole cycle after
+        // it rather than a cycle after this read.
+        self.metered_through_ms = self
+            .metered_through_ms
+            .saturating_add(passes.saturating_mul(LOG_GROUP_METERING_INTERVAL_MS));
+        self.metered_bytes = self.held_bytes();
     }
 
     /// The regular expression patterns this group's metric filters carry between them,
@@ -2631,8 +2693,9 @@ impl LogStreamRecord {
         self.last_event_timestamp = self.events.last().map(|e| e.timestamp);
     }
 
-    /// The bytes the stream's events occupy, counted the way a log group's
-    /// `storedBytes` counts them.
+    /// The bytes the stream's events occupy, counted the way CloudWatch Logs counts one
+    /// stored event ([`StoredEvent::stored_bytes`]). What the owning log group HOLDS is the
+    /// sum of these ([`LogGroupRecord::held_bytes`]).
     pub fn stored_bytes(&self) -> i64 {
         self.events
             .iter()
@@ -2641,13 +2704,14 @@ impl LogStreamRecord {
     }
 
     /// Hold the stream inside the emulator's storage ceiling ([`MAX_STREAM_EVENTS`] /
-    /// [`MAX_STREAM_BYTES`]) by discarding the oldest events, and answer how many bytes
-    /// went, so the owning log group's `storedBytes` can be reduced by the same amount.
+    /// [`MAX_STREAM_BYTES`]) by discarding the oldest events.
     ///
     /// Events are stored oldest-first, so the discarded run is a prefix. A single event
     /// can never exceed the byte ceiling (a log event is capped at 1 MB on the way in),
-    /// so the newest event always survives.
-    pub fn enforce_storage_ceiling(&mut self) -> i64 {
+    /// so the newest event always survives. What is left is what the owning log group
+    /// HOLDS ([`LogGroupRecord::held_bytes`]), which is derived from the streams, so a
+    /// caller has nothing to subtract from anywhere.
+    pub fn enforce_storage_ceiling(&mut self) {
         let mut kept_bytes = self.stored_bytes();
         let mut discard = 0usize;
         while discard < self.events.len()
@@ -2656,12 +2720,7 @@ impl LogStreamRecord {
             kept_bytes = kept_bytes.saturating_sub(self.events[discard].stored_bytes());
             discard += 1;
         }
-        let discarded_bytes = self.events[..discard]
-            .iter()
-            .map(StoredEvent::stored_bytes)
-            .fold(0i64, i64::saturating_add);
         self.events.drain(..discard);
-        discarded_bytes
     }
 }
 
@@ -2712,7 +2771,7 @@ impl StoredEvent {
         }
     }
 
-    /// What this event adds to its log group's `storedBytes`: the UTF-8 message plus
+    /// What this event adds to the volume its log group HOLDS: the UTF-8 message plus
     /// the documented 26-byte per-event overhead.
     pub fn stored_bytes(&self) -> i64 {
         i64::try_from(self.message.len()).unwrap_or(i64::MAX) + EVENT_OVERHEAD_BYTES

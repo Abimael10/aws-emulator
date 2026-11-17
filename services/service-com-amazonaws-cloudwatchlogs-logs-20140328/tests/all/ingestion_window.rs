@@ -110,14 +110,11 @@ async fn described_stream(logs: &Logs, group: &str) -> Value {
         .unwrap_or_else(|| panic!("DescribeLogStreams must report the stream, got {page}"))
 }
 
-/// The `storedBytes` `DescribeLogGroups` reports for `group`.
+/// The `storedBytes` `DescribeLogGroups` reports for `group`, read once the group's
+/// metering pass has come round: the figure that member carries is what metering measured,
+/// not what an ingest just wrote ([`crate::harness::metered_bytes`]).
 async fn stored_bytes(logs: &Logs, group: &str) -> i64 {
-    let page = logs
-        .ok("DescribeLogGroups", &json!({"logGroupIdentifiers": [group]}))
-        .await;
-    page["logGroups"][0]["storedBytes"]
-        .as_i64()
-        .unwrap_or_else(|| panic!("a log group reports storedBytes, got {page}"))
+    crate::harness::metered_bytes(logs, group).await
 }
 
 /// What one event of `message` adds to a log group's `storedBytes`: the UTF-8 message

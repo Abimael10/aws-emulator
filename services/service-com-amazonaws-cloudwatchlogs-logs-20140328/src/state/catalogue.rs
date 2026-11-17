@@ -81,6 +81,25 @@ pub const DEFAULT_LIST_LIMIT: i32 = 50;
 /// `DescribeLogGroups` and `ListLogGroups` report a group as soon as it is created.
 pub const AGGREGATE_SUMMARY_VISIBILITY_DELAY_MS: i64 = 3_000;
 
+/// How often the service MEASURES the volume a log group stores, which is the figure
+/// `LogGroup$storedBytes` reports.
+///
+/// That member is "The number of bytes stored" — a figure the service meters for a log group
+/// on its own cycle rather than one counted off the events a request just wrote, which is why
+/// `PutRetentionPolicy` can state that events already marked for deletion "are also not
+/// included when you use an API to retrieve the storedBytes value": what the member reports is
+/// the last MEASUREMENT, not what the group holds at the instant of the read. So a group whose
+/// events arrived since the last pass reports the figure that pass measured — zero for a group
+/// that has never been metered — and the figure moves only when the next pass falls due.
+///
+/// The cycle's length is this emulator's own choice (the service publishes none). It is
+/// deliberately far longer than the spans this emulator owes a resource's STATUS: a status is a
+/// transition a caller waits on, while this is a measurement a caller must not see follow its
+/// own writes — a client that reads straight after ingesting has to be answered the figure the
+/// service would have answered then. The instant each pass falls due is stored on the group and
+/// never slept on ([`crate::state::LogGroupRecord::materialize_due_metering`]).
+pub const LOG_GROUP_METERING_INTERVAL_MS: i64 = 60 * 60 * 1_000;
+
 /// The shortest `logGroupNamePattern` the model admits: `LogGroupNameRegexPattern`
 /// carries `@length(min: 3, max: 129)`.
 pub const LOG_GROUP_NAME_PATTERN_MIN_LEN: usize = 3;

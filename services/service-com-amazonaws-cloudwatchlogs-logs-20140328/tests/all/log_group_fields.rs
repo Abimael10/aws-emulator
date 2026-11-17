@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 
-use crate::harness::{batch, group_with_stream, now_ms, Logs, REGION};
+use crate::harness::{batch, group_with_stream, metered_bytes, now_ms, Logs, REGION};
 
 /// The fields CloudWatch Logs generates for every log event, so every one of them is
 /// reported at 100% whenever the searched window holds an event. Source: the operation's
@@ -540,9 +540,11 @@ async fn reporting_the_fields_changes_nothing_a_later_caller_sees() {
         .describe_group("read-only")
         .await
         .expect("case the group after the report: the group is still there");
+    let held = metered_bytes(&logs, "read-only").await;
     assert!(
-        group.get("storedBytes").and_then(Value::as_i64).unwrap_or(0) > 0,
-        "case the group after the report: its stored bytes are unchanged by a read, got {group}"
+        held > 0,
+        "case the group after the report: its stored events are unchanged by a read, got \
+         {held} measured bytes for {group}"
     );
 }
 

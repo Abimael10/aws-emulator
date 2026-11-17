@@ -41,15 +41,11 @@ async fn stream_names(logs: &Logs, group: &str) -> Vec<String> {
         .collect()
 }
 
-/// The `storedBytes` `DescribeLogGroups` reports for one log group.
+/// The `storedBytes` `DescribeLogGroups` reports for one log group, read once the group's
+/// metering pass has come round: the figure that member carries is what metering measured,
+/// not what an ingest or a removal just changed ([`crate::harness::metered_bytes`]).
 async fn stored_bytes(logs: &Logs, group: &str) -> i64 {
-    let page = logs
-        .ok("DescribeLogGroups", &json!({"logGroupIdentifiers": [group]}))
-        .await;
-    page["logGroups"][0]
-        .get("storedBytes")
-        .and_then(Value::as_i64)
-        .unwrap_or_else(|| panic!("a log group carries storedBytes, got {page}"))
+    crate::harness::metered_bytes(logs, group).await
 }
 
 /// The `message` values `GetLogEvents` reads back from one stream, in the order returned.

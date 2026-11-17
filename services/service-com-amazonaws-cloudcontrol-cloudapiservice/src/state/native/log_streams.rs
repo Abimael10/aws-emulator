@@ -193,13 +193,11 @@ impl NativeResourceProvider for LogStreamProvider {
             .log_groups
             .get_mut(&group_name)
             .ok_or(NativeRefusal::NotFound)?;
-        let stream = group
-            .streams
-            .remove(&stream_name)
-            .ok_or(NativeRefusal::NotFound)?;
-        // The events the stream held leave with it, so the group's own `storedBytes` — what
-        // the owning service reports for it — no longer counts them.
-        group.stored_bytes = group.stored_bytes.saturating_sub(stream.stored_bytes());
+        // The events the stream held leave with it, so the volume the group holds — what the
+        // owning service's metering measures for it — no longer counts them.
+        if group.streams.remove(&stream_name).is_none() {
+            return Err(NativeRefusal::NotFound);
+        }
         Ok(())
     }
 }

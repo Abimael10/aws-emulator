@@ -29,8 +29,8 @@
 //! THE INGESTION WINDOW is per event, not per batch: an event more than
 //! [`MAX_EVENT_FUTURE_MS`] in the future, older than [`MAX_EVENT_AGE_MS`], or preceding
 //! the log group's retention period is not stored — so it is not readable, does not move
-//! the stream's event-time summary and does not count towards the log group's
-//! `storedBytes` — and the batch's remaining events are processed as usual. The BATCH
+//! the stream's event-time summary and does not count towards the volume the log group
+//! holds — and the batch's remaining events are processed as usual. The BATCH
 //! constraints are the other half and are not reported that way: a batch out of
 //! chronological order, one carrying an event over the per-event size limit, one whose
 //! counted size exceeds [`MAX_BATCH_BYTES`], and one whose in-window events span more than
@@ -44,7 +44,9 @@
 //! service deletes events that have passed a log group's retention period, except that
 //! the ceiling here is a size rather than an age, because this emulator holds its state
 //! in memory. Only the discarded events become unreadable; nothing else about the call
-//! changes, and a log group's `storedBytes` always reports what is still held.
+//! changes. An ingested batch moves no `storedBytes` figure of its own: that member reports
+//! what the log group's metering last measured ([`crate::state::LOG_GROUP_METERING_INTERVAL_MS`]),
+//! and the next pass measures whatever is still held then.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`PutLogEvents::handle`] with real behaviour and
@@ -245,7 +247,7 @@ enum Admission {
     /// Inside the ingestion horizon, but before the log group's retention period —
     /// `expiredLogEventEndIndex`.
     Expired,
-    /// Inside the window: stored, readable, and counted in `storedBytes`.
+    /// Inside the window: stored, readable, and counted in what the group holds.
     Accepted,
     /// Further ahead of the clock than [`MAX_EVENT_FUTURE_MS`] —
     /// `tooNewLogEventStartIndex`.
@@ -621,10 +623,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutLogEvents<Eng>
             .iter()
             .map(|event| (event.timestamp, event.message.clone()))
             .collect();
-        let added_bytes: i64 = batch
-            .iter()
-            .map(crate::state::StoredEvent::stored_bytes)
-            .sum();
         // A fresh token on every accepted batch, minted from the same counter so it is
         // unique for the life of the store, and persisted on the stream below.
         let next_sequence_token = crate::state::mint_sequence_token(store.take_ingestion_seq());
@@ -687,7 +685,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutLogEvents<Eng>
         }
         // Keep the stream inside the emulator's storage ceiling by dropping its oldest
         // events, so repeated writes cannot grow the store without bound.
-        let discarded_bytes = stream.enforce_storage_ceiling();
+        stream.enforce_storage_ceiling();
         stream.refresh_event_times();
         // `lastIngestionTime` is "the time of the most recent log event ingested": a call
         // that ingested nothing did not move it.
@@ -695,14 +693,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutLogEvents<Eng>
             stream.last_ingestion_time = Some(ingestion_time);
         }
         stream.upload_sequence_token = Some(next_sequence_token.clone());
-        // The group's `storedBytes` reports what is held: this batch's bytes, less what
-        // the ceiling discarded. Written in one step, after the stream is settled, so no
-        // failure path can leave it half-applied.
-        group.stored_bytes = group
-            .stored_bytes
-            .saturating_add(added_bytes)
-            .saturating_sub(discarded_bytes)
-            .max(0);
+        // Nothing accounts for the batch's bytes here: what the group HOLDS is derived from
+        // its streams ([`crate::state::LogGroupRecord::held_bytes`]), so storing the events
+        // IS the accounting, and the figure `storedBytes` reports is what the group's next
+        // metering pass measures rather than anything this ingest writes.
 
         // The AUDIT half of the group's data protection policies: each detection this batch
         // made is delivered as a finding into the log group the policy's Audit action names,

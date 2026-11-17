@@ -6,7 +6,10 @@
 //! `logGroupNamePattern` answers the REDUCED projection of each group the service serves
 //! for a pattern search — its identity and classification members only — and is a WALK over
 //! the account's log groups, so its `nextToken` reports how far that walk got rather than
-//! what is left to report. This is the ONLY file to touch for this operation.
+//! what is left to report. `storedBytes` is the figure the group's METERING last measured
+//! ([`crate::state::LOG_GROUP_METERING_INTERVAL_MS`]) rather than the volume the group holds
+//! at the instant of the read, so a listing taken straight after an ingest does not count
+//! what that ingest wrote. This is the ONLY file to touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`DescribeLogGroups::handle`] with real behaviour and
@@ -259,7 +262,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             )
         })?;
-        let store = state.lock();
+        let mut store = state.lock();
+
+        // The volume a log group stores is METERED on the service's own cycle rather than
+        // counted off each write, so the figure this listing reports is owed by the clock:
+        // every pass the cycle has already made due is materialised here, before anything is
+        // read, so what is reported is the measurement that was owed whether or not anybody
+        // called ([`crate::state::LogGroupRecord::materialize_due_metering`]).
+        store.materialize_due_log_group_metering(crate::state::now_ms());
 
         let invalid = |message: &str| {
             DescribeLogGroupsError::from(DescribeLogGroupsErrorModeled::InvalidParameterException(
@@ -463,7 +473,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         arn: Some(group.arn.clone()),
                         retention_in_days: group.retention_in_days.filter(|_| !pattern_search),
                         metric_filter_count: Some(group.metric_filter_count()),
-                        stored_bytes: (!pattern_search).then_some(group.stored_bytes),
+                        // "The number of bytes stored": the figure the group's metering last
+                        // MEASURED, not the volume it holds at this instant — events ingested
+                        // since that pass are not counted until the next one falls due.
+                        stored_bytes: (!pattern_search).then_some(group.metered_bytes),
                         kms_key_id: group.kms_key_id.clone().filter(|_| !pattern_search),
                         data_protection_status: group
                             .data_protection_status()

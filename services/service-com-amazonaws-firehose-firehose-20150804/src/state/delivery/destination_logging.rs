@@ -197,7 +197,6 @@ pub fn report_delivery_errors<Eng: Send + Sync + 'static>(
             ingestion_seq: store.take_ingestion_seq(),
             ingest_kms_key_id,
         };
-        let added = event.stored_bytes();
         let group = store
             .log_groups
             .entry(report.logging.log_group.clone())
@@ -229,14 +228,9 @@ pub fn report_delivery_errors<Eng: Send + Sync + 'static>(
         // reader pages it in; only an event that predates what is already there needs the
         // sort, which this leaves to the owning service's own comparison.
         stream.events.sort_by_key(logs::StoredEvent::key);
-        let discarded = stream.enforce_storage_ceiling();
+        stream.enforce_storage_ceiling();
         stream.refresh_event_times();
         stream.last_ingestion_time = Some(now_ms);
-        group.stored_bytes = group
-            .stored_bytes
-            .saturating_add(added)
-            .saturating_sub(discarded)
-            .max(0);
     }
 }
 

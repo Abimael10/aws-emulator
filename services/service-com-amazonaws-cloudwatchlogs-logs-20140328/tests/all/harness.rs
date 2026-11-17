@@ -16,6 +16,7 @@ use service_com_amazonaws_cloudwatchlogs_logs_20140328::ops::types::{Anomaly, Lo
 use service_com_amazonaws_cloudwatchlogs_logs_20140328::state::{
     ComAmazonawsCloudwatchlogsLogs20140328State, ANOMALY_STATE_ACTIVE,
     EXPORT_TASK_COMPLETION_DELAY_MS, EXPORT_TASK_RUNNING_DELAY_MS,
+    LOG_GROUP_METERING_INTERVAL_MS,
 };
 
 /// The region the tests' SigV4 credential scope names, so an ARN built from the request
@@ -419,6 +420,42 @@ pub fn report_anomaly(logs: &Logs, arn: &str, anomaly: &str, pattern: &str) {
             ..Anomaly::default()
         },
     );
+}
+
+/// Bring every log group's next METERING pass due, so the next read reports the volume each
+/// group holds now.
+///
+/// `LogGroup$storedBytes` is the figure the service's metering last measured, on a cycle
+/// ([`LOG_GROUP_METERING_INTERVAL_MS`]) far longer than any test's run, so a suite whose
+/// subject is the ACCOUNTING — what an ingest adds, what a stream removal takes away, what
+/// the per-stream storage ceiling discards — moves the CLOCK that pass hangs off rather than
+/// waiting for it: each group's last-metered instant is pushed a whole cycle into the past,
+/// and the next read over the wire materialises the pass exactly as it would for any client.
+pub fn bring_metering_due(logs: &Logs) {
+    let state = logs
+        .engine()
+        .state::<ComAmazonawsCloudwatchlogsLogs20140328State>();
+    let mut store = state.lock();
+    for group in store.log_groups.values_mut() {
+        group.metered_through_ms = group
+            .metered_through_ms
+            .saturating_sub(LOG_GROUP_METERING_INTERVAL_MS);
+    }
+}
+
+/// The `storedBytes` `DescribeLogGroups` reports for the log group under `identifier`, read
+/// once that group's metering pass has come round ([`bring_metering_due`]) — so what it
+/// answers is the volume the group holds, as the service's next measurement of it.
+pub async fn metered_bytes(logs: &Logs, identifier: &str) -> i64 {
+    bring_metering_due(logs);
+    let group = logs
+        .describe_group(identifier)
+        .await
+        .unwrap_or_else(|| panic!("case {identifier}: the log group must exist"));
+    group
+        .get("storedBytes")
+        .and_then(Value::as_i64)
+        .unwrap_or_else(|| panic!("case {identifier}: a log group carries storedBytes, got {group}"))
 }
 
 /// A log group plus one stream, both created, with a retention in days when one is

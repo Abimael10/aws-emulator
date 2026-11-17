@@ -539,7 +539,6 @@ pub fn deliver<Eng: Send + Sync + 'static>(engine: &Eng, records: &[PublishedRec
             ingestion_seq: store.take_ingestion_seq(),
             ingest_kms_key_id,
         };
-        let added = stored.stored_bytes();
         let Some(group) = store
             .log_groups
             .get_mut(&record.log_group_name)
@@ -585,13 +584,8 @@ pub fn deliver<Eng: Send + Sync + 'static>(engine: &Eng, records: &[PublishedRec
         // in; records arrive in that order already, so only one predating what is there
         // moves.
         stream.events.sort_by_key(logs::StoredEvent::key);
-        let discarded = stream.enforce_storage_ceiling();
+        stream.enforce_storage_ceiling();
         stream.refresh_event_times();
         stream.last_ingestion_time = Some(ingested_at);
-        group.stored_bytes = group
-            .stored_bytes
-            .saturating_add(added)
-            .saturating_sub(discarded)
-            .max(0);
     }
 }

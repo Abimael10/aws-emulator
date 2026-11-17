@@ -184,17 +184,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(group) = store.log_groups.get_mut(&input.log_group_name) else {
             return Err(not_found("The specified log group does not exist."));
         };
-        let Some(stream) = group.streams.remove(&input.log_stream_name) else {
+        // "permanently deletes all the archived log events associated with the log stream":
+        // the events go with the stream, so the volume the group holds
+        // ([`crate::state::LogGroupRecord::held_bytes`]) no longer counts them, and the
+        // group's next metering pass measures what is left.
+        if group.streams.remove(&input.log_stream_name).is_none() {
             return Err(not_found("The specified log stream does not exist."));
-        };
-
-        // "permanently deletes all the archived log events associated with the log
-        // stream": the events go with the stream, so the group's `storedBytes` no longer
-        // counts them.
-        group.stored_bytes = group
-            .stored_bytes
-            .saturating_sub(stream.stored_bytes())
-            .max(0);
+        }
 
         Ok(DeleteLogStreamOutput)
     }

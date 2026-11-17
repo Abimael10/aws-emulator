@@ -12,7 +12,7 @@
 
 use serde_json::{json, Value};
 
-use crate::harness::{base_ms, batch, group_with_stream, messages, Logs, REGION};
+use crate::harness::{base_ms, batch, group_with_stream, messages, metered_bytes, Logs, REGION};
 
 /// A log group class the model declares. Source: the `LogGroupClass` enum, surfaced in
 /// the crate as `LOG_GROUP_CLASS_VALUES` ("DELIVERY", "INFREQUENT_ACCESS", "STANDARD").
@@ -334,17 +334,18 @@ async fn put_log_events_round_trips_through_get_log_events() {
             "case {case:?}: expected the log stream ARN, got {stream}"
         );
 
-        // The group's storedBytes grows by each message's UTF-8 size plus the
-        // documented 26 bytes of per-event overhead.
+        // The volume the group holds grows by each message's UTF-8 size plus the
+        // documented 26 bytes of per-event overhead, and its next metering pass is what
+        // reports it: `storedBytes` carries the measured figure, never the running total of
+        // what a request just wrote.
         let expected_bytes: i64 = events
             .iter()
             .map(|(_, message)| i64::try_from(message.len()).expect("a small message") + 26)
             .sum();
-        let groups = logs.ok("DescribeLogGroups", &json!({})).await;
         assert_eq!(
-            groups["logGroups"][0].get("storedBytes").and_then(Value::as_i64),
-            Some(expected_bytes),
-            "case {case:?}: expected {expected_bytes} stored bytes, got {groups}"
+            metered_bytes(&logs, "/aws/emulator/demo").await,
+            expected_bytes,
+            "case {case:?}: expected {expected_bytes} stored bytes"
         );
 
         // A second batch mints a different token, and both batches are readable.
@@ -535,11 +536,10 @@ async fn put_log_events_refuses_a_batch_outside_the_documented_constraints() {
         }),
     )
     .await;
-    let groups = logs.ok("DescribeLogGroups", &json!({})).await;
+    let stored = metered_bytes(&logs, "constraints").await;
     assert_eq!(
-        groups["logGroups"][0]["storedBytes"].as_i64(),
-        Some(1_048_576),
-        "the accepted batch's bytes must be counted, got {groups}"
+        stored, 1_048_576,
+        "the accepted batch's bytes must be counted, got {stored}"
     );
 }
 
@@ -632,15 +632,13 @@ async fn a_stream_keeps_only_what_fits_in_the_storage_ceiling() {
         "expected the stream to hold exactly the ceiling, got {held}"
     );
 
-    let groups = logs.ok("DescribeLogGroups", &json!({})).await;
-    let stored = groups["logGroups"][0]["storedBytes"].as_i64();
+    let stored = metered_bytes(&logs, "ceiling").await;
     let expected: i64 = (BATCH..3 * BATCH)
         .map(|ordinal| i64::try_from(format!("e{ordinal}").len()).expect("a small message") + 26)
         .sum();
     assert_eq!(
-        stored,
-        Some(expected),
-        "storedBytes must count the events still held, got {groups}"
+        stored, expected,
+        "storedBytes must count the events still held, got {stored}"
     );
 }
 

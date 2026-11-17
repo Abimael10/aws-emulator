@@ -185,10 +185,6 @@ pub fn deliver<Eng: Send + Sync + 'static>(engine: &Eng, region: &str, spans: &[
     if events.is_empty() {
         return 0;
     }
-    let added: i64 = events
-        .iter()
-        .map(logs::StoredEvent::stored_bytes)
-        .fold(0i64, i64::saturating_add);
     let delivered = events.len();
     let group = store
         .log_groups
@@ -205,13 +201,8 @@ pub fn deliver<Eng: Send + Sync + 'static>(engine: &Eng, region: &str, spans: &[
     // order its reader pages it in; a batch's spans may carry any instants, so
     // the sort is what keeps that order.
     stream.events.sort_by_key(logs::StoredEvent::key);
-    let discarded = stream.enforce_storage_ceiling();
+    stream.enforce_storage_ceiling();
     stream.refresh_event_times();
     stream.last_ingestion_time = Some(now_ms);
-    group.stored_bytes = group
-        .stored_bytes
-        .saturating_add(added)
-        .saturating_sub(discarded)
-        .max(0);
     delivered
 }

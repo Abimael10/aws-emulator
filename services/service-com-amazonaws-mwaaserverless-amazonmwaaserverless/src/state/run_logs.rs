@@ -214,10 +214,6 @@ pub fn publish<Eng: Send + Sync + 'static>(engine: &Eng, region: &str, lines: Ve
                 ingest_kms_key_id: ingest_kms_key_id.clone(),
             })
             .collect();
-        let added: i64 = events
-            .iter()
-            .map(logs::StoredEvent::stored_bytes)
-            .fold(0i64, i64::saturating_add);
         let group = store
             .log_groups
             .entry(log_group.clone())
@@ -249,14 +245,9 @@ pub fn publish<Eng: Send + Sync + 'static>(engine: &Eng, region: &str, lines: Ve
         // reader pages it in; a run's lines are produced in that order already, so only an
         // export that predates events already there needs the sort.
         stream.events.sort_by_key(logs::StoredEvent::key);
-        let discarded = stream.enforce_storage_ceiling();
+        stream.enforce_storage_ceiling();
         stream.refresh_event_times();
         stream.last_ingestion_time = Some(ingested_at);
-        group.stored_bytes = group
-            .stored_bytes
-            .saturating_add(added)
-            .saturating_sub(discarded)
-            .max(0);
     }
 }
 

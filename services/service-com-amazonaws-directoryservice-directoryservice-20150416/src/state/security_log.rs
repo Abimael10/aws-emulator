@@ -372,7 +372,6 @@ fn forward<Eng: Send + Sync + 'static>(engine: &Eng, event: &ForwardedEvent) {
         ingestion_seq: store.take_ingestion_seq(),
         ingest_kms_key_id,
     };
-    let added = stored.stored_bytes();
     let Some(group) = store.log_groups.get_mut(&event.log_group_name) else {
         return;
     };
@@ -405,14 +404,9 @@ fn forward<Eng: Send + Sync + 'static>(engine: &Eng, event: &ForwardedEvent) {
     // The stream is kept in the `(timestamp, ingestion_seq)` order its reader pages it in;
     // records arrive in that order already, so only one predating what is there moves.
     stream.events.sort_by_key(logs::StoredEvent::key);
-    let discarded = stream.enforce_storage_ceiling();
+    stream.enforce_storage_ceiling();
     stream.refresh_event_times();
     stream.last_ingestion_time = Some(ingested_at);
-    group.stored_bytes = group
-        .stored_bytes
-        .saturating_add(added)
-        .saturating_sub(discarded)
-        .max(0);
 }
 
 /// `at` in milliseconds since the Unix epoch, which is what every CloudWatch Logs timestamp

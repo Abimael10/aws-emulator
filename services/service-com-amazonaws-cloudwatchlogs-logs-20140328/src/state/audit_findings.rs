@@ -155,7 +155,7 @@ pub fn findings_stream_name(source_group_name: &str) -> String {
 /// `source_group_name` in.
 ///
 /// Written through the store's own records, so a finding is an ordinary log event of the
-/// destination group: it counts towards that group's `storedBytes`, moves its stream's event
+/// destination group: it counts towards the volume that group holds, moves its stream's event
 /// times and is subject to the same storage ceiling as any ingested event. A destination the
 /// account holds no log group under takes nothing: this service delivers only to a group that
 /// exists, and reports no finding it did not store.
@@ -198,10 +198,6 @@ pub fn deliver(
                 ingest_kms_key_id: destination_kms_key_id.clone(),
             })
             .collect();
-        let added_bytes: i64 = events
-            .iter()
-            .map(super::StoredEvent::stored_bytes)
-            .fold(0i64, i64::saturating_add);
         let Some(group) = store.log_groups.get_mut(destination) else {
             continue;
         };
@@ -220,14 +216,9 @@ pub fn deliver(
         if !appends_in_order {
             stream.events.sort_by_key(super::StoredEvent::key);
         }
-        let discarded_bytes = stream.enforce_storage_ceiling();
+        stream.enforce_storage_ceiling();
         stream.refresh_event_times();
         stream.last_ingestion_time = Some(audit_time_ms);
-        group.stored_bytes = group
-            .stored_bytes
-            .saturating_add(added_bytes)
-            .saturating_sub(discarded_bytes)
-            .max(0);
     }
 }
 
