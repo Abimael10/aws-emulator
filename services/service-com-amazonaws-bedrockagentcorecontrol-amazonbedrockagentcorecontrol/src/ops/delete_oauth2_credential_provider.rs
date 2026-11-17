@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteOauth2CredentialProvider
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteOauth2CredentialProvider`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteOauth2CredentialProvider::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +141,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteOauth2CredentialProvider` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteOauth2CredentialProviderErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Nothing of the request beyond its members decides this delete: whether the
+        // caller may perform the action at all is decided for every route of this
+        // plane in `crate::service::authorization`, before the framework's walk
+        // deserializes an input, which is where the modelled `UnauthorizedException`
+        // and `AccessDeniedException` come from. A provider is addressed by `name`
+        // rather than by a region-bearing ARN, so this handler reads no region off
+        // the request either.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteOauth2CredentialProviderErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the credential provider store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // The name is the identifier every credential-provider route addresses a
+        // provider by, so the removal is keyed by it; a name this account holds no
+        // provider under is the modelled 404, in the sentence this plane words a
+        // missing OAuth2 provider with. The delete answers 204 carrying no member
+        // and the model gives its answer no status to report, so the record goes
+        // NOW rather than after a span: the very next read and the very next listing
+        // resolve nothing under that name, and the name is free for a new provider.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteOauth2CredentialProvider"))
+        // The Secrets Manager secret the client secret lives in is NOT deleted here,
+        // on the same rule as the API key provider beside it
+        // (`DeleteApiKeyCredentialProvider`): for an `EXTERNAL` provider it is the
+        // CALLER's own secret, which this service never wrote to, and for a
+        // `MANAGED` one it is the secret named for the provider that a later create
+        // of that name writes ITS client secret into — so a provider always reports
+        // the secret its own create stored, and no stale secret is read through one.
+        let mut store = state.lock();
+        store
+            .oauth2_credential_providers
+            .remove(&input.name)
+            .ok_or_else(|| {
+                DeleteOauth2CredentialProviderErrorModeled::ResourceNotFoundException(
+                    crate::state::oauth2_credential_provider_not_found(&input.name),
+                )
+            })?;
+
+        Ok(DeleteOauth2CredentialProviderOutput {})
     }
 }

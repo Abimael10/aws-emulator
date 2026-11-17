@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end HTTP tests for `UpdateOauth2CredentialProvider`.
+//! End-to-end HTTP tests for the two operations that MUTATE an OAuth2 credential provider
+//! this account already holds: `UpdateOauth2CredentialProvider` and
+//! `DeleteOauth2CredentialProvider`.
 //!
-//! The rule under test: an update REPLACES the whole configuration of a provider this
+//! The update's rule under test: an update REPLACES the whole configuration of a provider this
 //! account already holds — the vendor, the `Oauth2ProviderConfigInput` member that vendor
 //! selects and the secret the client secret it authenticates with lives in are all
 //! `@required` on the request (`smithy_query(query="operation",
@@ -15,6 +17,20 @@
 //! this account is the modelled HTTP 404 (an update configures an existing provider, it
 //! never mints one), and a vendor and a configuration member that disagree are the modelled
 //! HTTP 400 — in both cases the account is left exactly as it was.
+//!
+//! The delete's rule under test, read off the same model
+//! (`smithy_query(query="operation",operation="DeleteOauth2CredentialProvider,\
+//! GetOauth2CredentialProvider,ListOauth2CredentialProviders")`): a delete of a resource
+//! this account holds RETIRES it, so the resource stops resolving. It answers HTTP 204
+//! carrying no member and its answer reports no status, so the removal is immediate: every
+//! later read of that `name` is the modelled `ResourceNotFoundException` (HTTP 404), worded
+//! as the read route words that same missing name, the listing stops reporting it, the name
+//! is free for a new provider, and the delete retires the ONE provider it names — the
+//! account's other providers, and the Secrets Manager secret behind each provider's client
+//! secret, are left exactly as they were. Its rows differ along what the rule generalises
+//! over: the vendor and the `Oauth2ProviderConfigInput` member it selects, where the client
+//! secret lives (`MANAGED`, `EXTERNAL`), the shape and length of the provider's name, and
+//! whether the request carried tags.
 //!
 //! Secrets Manager is mounted beside this service on ONE engine, the shape
 //! `core/router/src/lib.rs` mounts them in, because a provider's client secret is stored in
@@ -148,6 +164,21 @@ impl Emulator {
         .await
     }
 
+    async fn delete(&self, name: &str) -> (u16, Value) {
+        self.control_plane(
+            "/identities/DeleteOauth2CredentialProvider",
+            &json!({"name": name}),
+        )
+        .await
+    }
+
+    /// What `GetSecretValue` answers for `secret_id`, which is how a row observes that the
+    /// secret behind a provider's client secret is still the one Secrets Manager holds.
+    async fn get_secret_value(&self, secret_id: &str) -> (u16, Value) {
+        self.secrets_manager("GetSecretValue", &json!({"SecretId": secret_id}))
+            .await
+    }
+
     async fn list(&self) -> (u16, Value) {
         self.control_plane("/identities/ListOauth2CredentialProviders", &json!({}))
             .await
@@ -189,6 +220,29 @@ fn error_code(body: &Value) -> String {
 /// configuration declares.
 fn vendor_config(member: &str, client_id: &str, client_secret: &str) -> Value {
     json!({member: {"clientId": client_id, "clientSecret": client_secret}})
+}
+
+/// The token vault a request naming none addresses, which a managed secret's name carries.
+const VAULT: &str = "default";
+
+/// The name the secret holding a managed provider's client secret is created under. Spelled
+/// out here rather than read off the implementation, so a drift in either is a failing test.
+fn managed_secret_name(provider: &str) -> String {
+    format!("bedrock-agentcore-identity/{VAULT}/oauth2/{provider}")
+}
+
+/// The `message` an answer carries, as a plain string.
+///
+/// A delete's refusal of a name no provider resolves to is asserted against the READ
+/// route's refusal of that same name rather than against a sentence spelled out here: a
+/// missing provider is ONE fact of this plane, so the two routes word it the same way,
+/// whatever that wording is — and how this plane words it is the subject of its own open
+/// report, which pinning the sentence here would pin the wrong side of.
+fn message(envelope: &Value) -> String {
+    envelope["message"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// The single member an `Oauth2ProviderConfigOutput` union carries, and its name.
@@ -676,4 +730,387 @@ async fn an_update_with_a_discovery_url_outside_its_pattern_is_refused() {
              server, got {fetched}"
         );
     }
+}
+
+/// One row of the deletion table: the provider a delete retires, and how it was created.
+struct DeletionRow {
+    case: &'static str,
+    /// The provider's name — the identifier every provider route addresses it by.
+    name: String,
+    vendor: &'static str,
+    /// The `Oauth2ProviderConfigInput` the row's vendor selects.
+    configuration: Value,
+    /// A secret of the CALLER's own this row references, created before the provider is.
+    external_secret: Option<(&'static str, &'static str)>,
+    tags: Option<Value>,
+}
+
+/// The longest name `CredentialProviderName` admits: length 1..128, pattern
+/// `^[a-zA-Z0-9\-_]+$` (`smithy_query(query="shape",shape="CredentialProviderName")`).
+const MAX_PROVIDER_NAME_LEN: usize = 128;
+
+fn deletion_rows() -> Vec<DeletionRow> {
+    vec![
+        DeletionRow {
+            case: "a built-in vendor's own member, over a secret the service manages",
+            name: "orders-oauth2".to_string(),
+            vendor: "GoogleOauth2",
+            configuration: vendor_config(
+                "googleOauth2ProviderConfig",
+                "an-orders-client",
+                "an-orders-secret",
+            ),
+            external_secret: None,
+            tags: None,
+        },
+        DeletionRow {
+            case: "the shortest name the pattern admits, with tags",
+            name: "a".to_string(),
+            vendor: "SlackOauth2",
+            configuration: vendor_config("slackOauth2ProviderConfig", "a", "s"),
+            external_secret: None,
+            tags: Some(json!({"team": "identity"})),
+        },
+        DeletionRow {
+            case: "the custom member, with an authorization server of the caller's, under \
+                   the longest name the pattern admits",
+            name: format!("{:_>width$}", "Z", width = MAX_PROVIDER_NAME_LEN),
+            vendor: "CustomOauth2",
+            configuration: json!({"customOauth2ProviderConfig": {
+                "oauthDiscovery": {
+                    "discoveryUrl": format!("https://auth.example.com{OPENID_CONFIGURATION}"),
+                },
+                "clientId": "a-custom-client",
+                "clientSecret": "a-custom-secret",
+            }}),
+            external_secret: None,
+            tags: None,
+        },
+        DeletionRow {
+            case: "the included member of a vendor the union declares no member for, whose \
+                   client secret is the caller's own",
+            name: "search_OAuth2-provider_2".to_string(),
+            vendor: "OktaOauth2",
+            configuration: json!({"includedOauth2ProviderConfig": {
+                "clientId": "an-okta-client",
+                "issuer": "https://dev-7.okta.example.com/",
+                "clientSecretSource": SOURCE_EXTERNAL,
+                "clientSecretConfig": {
+                    "secretId": "my/own/okta-client",
+                    "jsonKey": "clientSecret",
+                },
+            }}),
+            external_secret: Some((
+                "my/own/okta-client",
+                r#"{"clientSecret":"the-partners-secret"}"#,
+            )),
+            tags: Some(json!({"owner": "search"})),
+        },
+    ]
+}
+
+impl DeletionRow {
+    /// The `CreateOauth2CredentialProvider` body this row sends, once any secret of the
+    /// caller's own it references has been created.
+    async fn create_body(&self, emulator: &Emulator) -> Value {
+        if let Some((secret_name, secret_value)) = self.external_secret {
+            emulator.create_secret(secret_name, secret_value).await;
+        }
+        let mut body = json!({
+            "name": self.name,
+            "credentialProviderVendor": self.vendor,
+            "oauth2ProviderConfigInput": self.configuration,
+        });
+        if let Some(tags) = &self.tags {
+            body["tags"] = tags.clone();
+        }
+        body
+    }
+}
+
+/// A deleted provider stops resolving at once: the delete answers 204 carrying no member,
+/// every later read of that name is the modelled 404 naming it, the listing stops reporting
+/// it, a repeat of the delete is that same 404, and the name is free for a new provider.
+#[tokio::test]
+async fn a_deleted_oauth2_credential_provider_stops_resolving() {
+    for row in deletion_rows() {
+        let emulator = Emulator::new();
+        let body = row.create_body(&emulator).await;
+        emulator.create_ok(&body, row.case).await;
+        let (status, readable) = emulator.get(&row.name).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: the created provider is readable before the delete, got {status} \
+             ({readable})",
+            row.case
+        );
+        assert_eq!(
+            listed_names(&emulator.list().await.1),
+            vec![row.name.clone()],
+            "case {:?}: the account holds the created provider before the delete",
+            row.case
+        );
+
+        let (status, deleted) = emulator.delete(&row.name).await;
+        let carries_no_member = match &deleted {
+            Value::Null => true,
+            Value::Object(members) => members.is_empty(),
+            _ => false,
+        };
+        assert!(
+            status == 204 && carries_no_member,
+            "case {:?}: the delete answers 204 carrying no member, got {status} ({deleted})",
+            row.case
+        );
+
+        let (status, gone) = emulator.get(&row.name).await;
+        assert_eq!(
+            (status, error_code(&gone)),
+            (404, "ResourceNotFoundException".to_string()),
+            "case {:?}: a deleted provider is the modelled 404, got {status} ({gone})",
+            row.case
+        );
+        // The sentence the read route words a missing provider with, which the delete of
+        // the same missing name has to word it with too.
+        let missing = message(&gone);
+        assert!(
+            !missing.is_empty(),
+            "case {:?}: the refusal of a deleted provider carries no message, got {gone}",
+            row.case
+        );
+        assert!(
+            listed_names(&emulator.list().await.1).is_empty(),
+            "case {:?}: the listing still reports the deleted provider",
+            row.case
+        );
+        // And it stays gone: a read again answers the same way, rather than the resource
+        // coming back.
+        let (status, still_gone) = emulator.get(&row.name).await;
+        assert_eq!(
+            (status, message(&still_gone)),
+            (404, missing.clone()),
+            "case {:?}: a retired provider does not come back, got {status} ({still_gone})",
+            row.case
+        );
+
+        let (status, repeated) = emulator.delete(&row.name).await;
+        assert_eq!(
+            (status, error_code(&repeated), message(&repeated)),
+            (
+                404,
+                "ResourceNotFoundException".to_string(),
+                missing.clone()
+            ),
+            "case {:?}: a delete of a retired provider is the modelled 404, worded as the \
+             read words that same missing name, got {status} ({repeated})",
+            row.case
+        );
+
+        // "The name must be unique within your account" held the name while the provider
+        // existed; a deleted provider holds it no longer.
+        let recreated = emulator.create_ok(&body, row.case).await;
+        let (status, read_back) = emulator.get(&row.name).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: the re-created provider is readable, got {status} ({read_back})",
+            row.case
+        );
+        assert_eq!(
+            read_back["credentialProviderArn"], recreated["credentialProviderArn"],
+            "case {:?}: the read disagrees with the re-create about the provider's ARN, got \
+             {read_back}",
+            row.case
+        );
+    }
+}
+
+/// A delete retires the ONE provider it names: the account's other providers stay readable,
+/// and the secret a provider's client secret lives in — the caller's own for an `EXTERNAL`
+/// provider, the one the service manages for a `MANAGED` one — is left exactly as it was,
+/// so a later create under the retired name reports the client secret its own create stored.
+#[tokio::test]
+async fn deleting_a_provider_leaves_the_other_providers_and_their_secrets_alone() {
+    let emulator = Emulator::new();
+
+    // A managed provider: the create put the client secret into a secret of the service's.
+    emulator
+        .create_ok(
+            &json!({
+                "name": "managed-oauth2",
+                "credentialProviderVendor": "GithubOauth2",
+                "oauth2ProviderConfigInput": vendor_config(
+                    "githubOauth2ProviderConfig", "a-github-client", "the-first-secret",
+                ),
+            }),
+            "the managed provider under test",
+        )
+        .await;
+    let managed_secret = managed_secret_name("managed-oauth2");
+    let (status, before) = emulator.get_secret_value(&managed_secret).await;
+    assert_eq!(
+        status, 200,
+        "setup: the managed secret holds the client secret before the delete, got {status} \
+         ({before})"
+    );
+
+    // An external provider beside it: its secret is the caller's own.
+    let external_secret = "my/own/retained-oauth2-client";
+    emulator
+        .create_secret(
+            external_secret,
+            &json!({"clientSecret": "the-callers-secret"}).to_string(),
+        )
+        .await;
+    emulator
+        .create_ok(
+            &json!({
+                "name": "external-oauth2",
+                "credentialProviderVendor": "OktaOauth2",
+                "oauth2ProviderConfigInput": {"includedOauth2ProviderConfig": {
+                    "clientId": "an-okta-client",
+                    "issuer": "https://dev-9.okta.example.com/",
+                    "clientSecretSource": SOURCE_EXTERNAL,
+                    "clientSecretConfig": {
+                        "secretId": external_secret,
+                        "jsonKey": "clientSecret",
+                    },
+                }},
+            }),
+            "the external provider beside it",
+        )
+        .await;
+
+    let (status, deleted) = emulator.delete("managed-oauth2").await;
+    assert_eq!(
+        status, 204,
+        "the managed provider's delete is served, got {status} ({deleted})"
+    );
+    let (status, gone) = emulator.get("managed-oauth2").await;
+    assert_eq!(
+        (status, error_code(&gone)),
+        (404, "ResourceNotFoundException".to_string()),
+        "the deleted provider resolves nothing, got {status} ({gone})"
+    );
+
+    // The other provider is untouched by that delete, and so is the secret it references.
+    let (status, other) = emulator.get("external-oauth2").await;
+    assert_eq!(
+        status, 200,
+        "deleting one provider leaves the account's other provider readable, got {status} \
+         ({other})"
+    );
+    assert_eq!(
+        listed_names(&emulator.list().await.1),
+        vec!["external-oauth2".to_string()],
+        "the listing reports exactly the provider the delete did not name"
+    );
+    let (status, caller_secret) = emulator.get_secret_value(external_secret).await;
+    assert_eq!(
+        status, 200,
+        "the secret an external provider references is the caller's own and is left alone, \
+         got {status} ({caller_secret})"
+    );
+
+    // A provider created again under the retired name reports the client secret ITS create
+    // stored, which is what makes the name reusable rather than haunted by the old
+    // provider's secret.
+    emulator
+        .create_ok(
+            &json!({
+                "name": "managed-oauth2",
+                "credentialProviderVendor": "LinkedinOauth2",
+                "oauth2ProviderConfigInput": vendor_config(
+                    "linkedinOauth2ProviderConfig", "a-linkedin-client", "the-second-secret",
+                ),
+            }),
+            "the provider created again under the retired name",
+        )
+        .await;
+    let (status, value) = emulator.get_secret_value(&managed_secret).await;
+    assert_eq!(
+        status, 200,
+        "the new provider's client secret is readable from the secret the service manages, \
+         got {status} ({value})"
+    );
+    assert_eq!(
+        value["SecretString"].as_str().unwrap_or_default(),
+        r#"{"clientSecret":"the-second-secret"}"#,
+        "the secret behind the re-created provider carries ITS client secret, got {value}"
+    );
+
+    let (status, external_deleted) = emulator.delete("external-oauth2").await;
+    assert_eq!(
+        status, 204,
+        "the external provider's delete is served, got {status} ({external_deleted})"
+    );
+    let (status, retained) = emulator.get_secret_value(external_secret).await;
+    assert_eq!(
+        status, 200,
+        "deleting an external provider does not delete the caller's secret, got {status} \
+         ({retained})"
+    );
+}
+
+/// A delete naming a provider this account does not hold is refused the modelled 404 —
+/// worded as the read route words that same missing name — and deletes nothing.
+#[tokio::test]
+async fn a_provider_delete_that_resolves_nothing_is_refused_and_deletes_nothing() {
+    let emulator = Emulator::new();
+    emulator
+        .create_ok(
+            &json!({
+                "name": "bystander-oauth2",
+                "credentialProviderVendor": "SalesforceOauth2",
+                "oauth2ProviderConfigInput": vendor_config(
+                    "salesforceOauth2ProviderConfig", "a-client", "a-secret",
+                ),
+            }),
+            "the one provider this account holds",
+        )
+        .await;
+
+    // Every name below satisfies `CredentialProviderName` (`^[a-zA-Z0-9\-_]+$`, 1..128), so
+    // the refusal is the handler's lookup and not the boundary constraint walk: the
+    // shortest name the pattern admits, one carrying both characters its pattern allows
+    // beside letters and digits, one at the top of the length range, and one that differs
+    // from the stored provider's name only in case.
+    let unknown = [
+        "x".to_string(),
+        "no_such-provider".to_string(),
+        format!("{:_>width$}", "Q", width = MAX_PROVIDER_NAME_LEN),
+        "Bystander-Oauth2".to_string(),
+    ];
+    for name in unknown {
+        let (_, read) = emulator.get(&name).await;
+        let refusal = message(&read);
+        assert!(
+            !refusal.is_empty(),
+            "case {name:?}: the read's refusal of an unheld name carries no message, got {read}"
+        );
+        let (status, refused) = emulator.delete(&name).await;
+        assert_eq!(
+            (status, error_code(&refused), message(&refused)),
+            (404, "ResourceNotFoundException".to_string(), refusal),
+            "case {name:?}: the delete refuses an unheld name as the read refuses it, got \
+             {status} ({refused})"
+        );
+    }
+
+    let (status, intact) = emulator.get("bystander-oauth2").await;
+    assert_eq!(
+        status, 200,
+        "a refused delete leaves the account's provider readable, got {status} ({intact})"
+    );
+    assert_eq!(
+        listed_names(&emulator.list().await.1),
+        vec!["bystander-oauth2".to_string()],
+        "a refused delete changed what the account holds"
+    );
+    let (status, secret) = emulator
+        .get_secret_value(&managed_secret_name("bystander-oauth2"))
+        .await;
+    assert_eq!(
+        status, 200,
+        "a refused delete leaves the secret behind the provider alone, got {status} ({secret})"
+    );
 }
