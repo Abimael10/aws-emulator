@@ -78,24 +78,24 @@ static COMMAND_RUN_PERMITS: ::std::sync::LazyLock<::std::sync::Arc<::tokio::sync
         ::std::sync::Arc::new(::tokio::sync::Semaphore::new(MAX_CONCURRENT_COMMAND_RUNS))
     });
 
-/// One command this service owes an answer: which step submitted it, what it is, and the role
-/// the calls it makes are signed as.
+/// One command this service owes an answer: which step submitted it, what it is, and the
+/// runtime role it carries of its own.
 #[derive(Debug, Clone)]
 struct StepCommandPlan {
     /// The step that submitted it.
     step_id: String,
     /// The command line the step's arguments are.
     command: StepCommand,
-    /// The role the command's own AWS calls are made as: the step's runtime role where it has
-    /// one ("the Amazon Resource Name (ARN) of the runtime role for a step on the cluster",
-    /// `Step$ExecutionRoleArn`), and otherwise the role the cluster's instances assume, which
-    /// is what runs a step with no runtime role of its own.
-    role_arn: String,
+    /// The step's own runtime role, where it carries one ("the Amazon Resource Name (ARN) of
+    /// the runtime role for a step on the cluster", `Step$ExecutionRoleArn`), which is what
+    /// its calls are then signed as. A step carrying none presents what the cluster's
+    /// instances obtain from their instance profile instead ([`cluster_step_credentials`]).
+    execution_role_arn: Option<String>,
 }
 
 impl ClusterRecord {
     /// Every command of this cluster that has no answer yet, in queue order: which step
-    /// submitted it, what it is, and the role it runs as.
+    /// submitted it, what it is, and the runtime role it carries of its own.
     ///
     /// A step is owed an answer once the cluster has STARTED it and nothing has answered for
     /// it yet ([`StepRecord::awaits_command`]); a step that has not started, has already been
@@ -108,11 +108,7 @@ impl ClusterRecord {
                 Some(StepCommandPlan {
                     step_id: step.id.clone(),
                     command: step.command.clone()?,
-                    role_arn: step
-                        .execution_role_arn
-                        .clone()
-                        .or_else(|| self.job_flow_role.clone())
-                        .unwrap_or_default(),
+                    execution_role_arn: step.execution_role_arn.clone(),
                 })
             })
             .collect()
@@ -154,20 +150,26 @@ pub async fn resolve_due_step_commands<Eng: Send + Sync + 'static>(
     let Some(state) = service_state(engine) else {
         return;
     };
-    let unanswered: Vec<StepCommandPlan> = {
+    let (unanswered, job_flow_role): (Vec<StepCommandPlan>, String) = {
         let mut store = state.lock();
         // The queue is run up to this instant first, so a step whose turn has come is
         // STARTED and its command is among the unanswered ones.
         run_due_steps(engine, &mut store, cluster_id, now);
-        store
-            .clusters
-            .get(cluster_id)
-            .map(ClusterRecord::unanswered_step_commands)
-            .unwrap_or_default()
+        match store.clusters.get(cluster_id) {
+            Some(cluster) => (
+                cluster.unanswered_step_commands(),
+                cluster.job_flow_role.clone().unwrap_or_default(),
+            ),
+            None => (Vec::new(), String::new()),
+        }
     };
     if unanswered.is_empty() {
         return;
     }
+    // What the cluster's Amazon EC2 instances obtain from their instance profile, resolved
+    // once for this call: the credential a step carrying no runtime role of its own presents,
+    // which is nothing at all where that profile carries no role those instances may assume.
+    let instance_credentials = cluster_step_credentials(ctx, region, &job_flow_role).await;
     // What this CALL may spend performing them: a further command is started only while a
     // whole one still fits, so the rest stay owed to the next call.
     let started = ::std::time::Instant::now();
@@ -175,9 +177,15 @@ pub async fn resolve_due_step_commands<Eng: Send + Sync + 'static>(
         if started.elapsed().saturating_add(TRANSFER_BUDGET) > COMMAND_CALL_CEILING {
             return;
         }
+        // A step's own runtime role is what its calls are signed as where it carries one;
+        // every other step presents what the cluster's instances obtained.
+        let credentials = match plan.execution_role_arn.as_deref() {
+            Some(role_arn) => StepCredentials::Role(role_arn.to_string()),
+            None => instance_credentials.clone(),
+        };
         // The CLI this command's environment provides, built per command so each gets its own
-        // transfer budget, and signing its calls as the role the step runs as.
-        let cli = step_object_cli(engine, ctx, region, &plan.role_arn, &plan.step_id);
+        // transfer budget, and presenting that credential on every call it makes.
+        let cli = step_object_cli(engine, ctx, region, &credentials, &plan.step_id);
         // One command is performed at a time, so a command another call is still performing —
         // including one that call has already given up waiting for — is not performed a second
         // time: its transfers are real effects on the object store, and a `mv` or an `rm`

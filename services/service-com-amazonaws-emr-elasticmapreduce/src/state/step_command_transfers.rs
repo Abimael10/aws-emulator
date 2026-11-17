@@ -37,6 +37,12 @@
 //! credential is held here and never reaches the command: it is not in the session's
 //! variables, in its tree, or in anything this program writes.
 //!
+//! WHICH credential that is, is [`super::instance_profile_credentials`]'s: a step with no
+//! runtime role of its own presents what the cluster's Amazon EC2 instances obtain from their
+//! instance profile. An environment that holds NO credential makes no call at all, and the
+//! transfer reports the CLI's own [`NO_CREDENTIAL_LOCATED`] — never a write made with a
+//! credential the cluster's instances do not hold.
+//!
 //! The local side of a transfer is the session's own TREE
 //! ([`::service_common::posix_shell_session::ProgramFiles`]): the file the commands around it
 //! wrote with a redirection is the file it uploads, and the file it downloads is the one they
@@ -113,6 +119,12 @@ pub const TRANSFER_BUDGET: Duration = Duration::from_secs(5);
 /// rather than any AWS credential source, and never travels on the wire.
 const STEP_CREDENTIAL_SOURCE: &str = "aws-emr-step-role";
 
+/// What the CLI reports for a command it has no credential to sign with: "Unable to locate
+/// credentials" (AWS CLI). It is the detail of the transfer's own failure line, so a command
+/// run on an instance that obtained no credential for its instance profile exits
+/// [`TRANSFER_FAILED`] and its step FAILS ([`super::instance_profile_credentials`]).
+const NO_CREDENTIAL_LOCATED: &str = "Unable to locate credentials";
+
 /// The AWS CLI as the environment of a step's command line provides it: the `aws s3`
 /// transfers of ONE command, made against this emulator's object store as the role the step
 /// runs as.
@@ -130,41 +142,62 @@ pub struct StepObjectCli {
     /// The Region the calls are made in, which is the one the request that performs the step
     /// was addressed to.
     region: String,
-    /// The credential every call is signed with: the session of the role the step runs as, or
-    /// `None` where no session could be minted for it, in which case the call is signed with
-    /// the credential the framework hands this emulator's handlers. Its debug form carries no
-    /// field.
-    identity: Option<CallerIdentity>,
+    /// What every call presents: the session of the role the step runs as, the credential the
+    /// framework hands this emulator's handlers where no session could be minted for that
+    /// role, or nothing at all where the environment holds no credential
+    /// ([`HeldCredential`]). Its debug form carries no field.
+    credential: HeldCredential,
     /// The instant this command's transfers have spent [`TRANSFER_BUDGET`].
     deadline: ::std::time::Instant,
 }
 
-/// The AWS CLI one command of the step `step_id` gets, signing its calls as `role_arn` —
-/// `None` where there is no async runtime to dispatch a call on, in which case the command
-/// reaches no object store at all and the session reports it as a command it could not run.
+/// What a step's calls PRESENT, as the environment that makes them holds it.
+#[derive(Debug, Clone)]
+enum HeldCredential {
+    /// The session minted for the role the step runs as. Its debug form carries no field.
+    Session(CallerIdentity),
+    /// No session could be minted for that role, so the call presents the credential the
+    /// framework hands this emulator's handlers, as every other in-process call between two
+    /// emulated services does.
+    Emulator,
+    /// The environment holds NO credential: the cluster's instances obtained none for their
+    /// instance profile, so no call is made at all
+    /// ([`super::instance_profile_credentials`]).
+    Absent,
+}
+
+/// The AWS CLI one command of the step `step_id` gets, presenting `credentials` on every call
+/// it makes — `None` where there is no async runtime to dispatch a call on, in which case the
+/// command reaches no object store at all and the session reports it as a command it could not
+/// run.
 #[must_use]
 pub fn step_object_cli<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
-    role_arn: &str,
+    credentials: &StepCredentials,
     step_id: &str,
 ) -> Option<StepObjectCli> {
     // The SESSION of the role the step runs as, through the one mint this workspace has for
-    // an execution role's session. `None` where nothing is known about the role, which is the
-    // position every in-process call between two emulated services is in.
-    let identity = execution_role_identity(
-        engine,
-        ctx.credential_store(),
-        role_arn,
-        step_id,
-        SystemTime::now(),
-    );
+    // an execution role's session. Nothing minted means nothing is known about the role,
+    // which is the position every in-process call between two emulated services is in; an
+    // environment that holds no credential at all mints none and presents none.
+    let credential = match credentials {
+        StepCredentials::Role(role_arn) => execution_role_identity(
+            engine,
+            ctx.credential_store(),
+            role_arn,
+            step_id,
+            SystemTime::now(),
+        )
+        .map_or(HeldCredential::Emulator, HeldCredential::Session),
+        StepCredentials::Absent => HeldCredential::Absent,
+    };
     Some(StepObjectCli {
         callback: ctx.callback().clone(),
         runtime: ::tokio::runtime::Handle::try_current().ok()?,
         region: region.to_string(),
-        identity,
+        credential,
         deadline: ::std::time::Instant::now() + TRANSFER_BUDGET,
     })
 }
@@ -395,20 +428,29 @@ impl StepObjectCli {
 
     /// The Amazon S3 client this command's calls are made with: the in-process transport,
     /// signed as the role the step runs as where a session for it was minted.
-    fn client(&self) -> ::aws_sdk_s3::Client {
-        match self.identity.as_ref() {
-            Some(identity) => ::service_common::s3_client::s3_client_signed_as(
+    ///
+    /// `Err` where the environment holds no credential: the CLI makes no call it has none for
+    /// and reports [`NO_CREDENTIAL_LOCATED`], which is the failure of the transfer.
+    fn client(&self) -> Result<::aws_sdk_s3::Client, String> {
+        match &self.credential {
+            HeldCredential::Session(identity) => {
+                Ok(::service_common::s3_client::s3_client_signed_as(
+                    &self.callback,
+                    &self.region,
+                    ::aws_sdk_s3::config::Credentials::new(
+                        identity.access_key_id.clone(),
+                        identity.secret_access_key.clone(),
+                        Some(identity.session_token.clone()),
+                        None,
+                        STEP_CREDENTIAL_SOURCE,
+                    ),
+                ))
+            }
+            HeldCredential::Emulator => Ok(::service_common::s3_client::s3_client(
                 &self.callback,
                 &self.region,
-                ::aws_sdk_s3::config::Credentials::new(
-                    identity.access_key_id.clone(),
-                    identity.secret_access_key.clone(),
-                    Some(identity.session_token.clone()),
-                    None,
-                    STEP_CREDENTIAL_SOURCE,
-                ),
-            ),
-            None => ::service_common::s3_client::s3_client(&self.callback, &self.region),
+            )),
+            HeldCredential::Absent => Err(NO_CREDENTIAL_LOCATED.to_string()),
         }
     }
 
@@ -441,7 +483,7 @@ impl StepObjectCli {
     fn get_object(&self, address: &S3Object) -> Result<String, String> {
         self.made(|| async {
             let read = self
-                .client()
+                .client()?
                 .get_object()
                 .bucket(&address.bucket)
                 .key(&address.key)
@@ -475,7 +517,7 @@ impl StepObjectCli {
             ));
         }
         self.made(|| async {
-            self.client()
+            self.client()?
                 .put_object()
                 .bucket(&address.bucket)
                 .key(&address.key)
@@ -496,7 +538,7 @@ impl StepObjectCli {
         destination: &S3Object,
     ) -> Result<(), String> {
         self.made(|| async {
-            self.client()
+            self.client()?
                 .copy_object()
                 .bucket(&destination.bucket)
                 .key(&destination.key)
@@ -511,7 +553,7 @@ impl StepObjectCli {
     /// Delete the object at `address`.
     fn delete_object(&self, address: &S3Object) -> Result<(), String> {
         self.made(|| async {
-            self.client()
+            self.client()?
                 .delete_object()
                 .bucket(&address.bucket)
                 .key(&address.key)

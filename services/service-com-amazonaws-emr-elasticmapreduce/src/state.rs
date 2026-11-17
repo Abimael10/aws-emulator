@@ -176,6 +176,12 @@ pub use step_command_transfers::*;
 mod command_step_run;
 pub use command_step_run::*;
 
+/// WHAT a step's work presents on the AWS calls it makes — the credential the cluster's
+/// Amazon EC2 instances obtain from the instance profile the launch named — split out and
+/// re-exported the same way.
+mod instance_profile_credentials;
+pub use instance_profile_credentials::*;
+
 /// The EventBridge events a step's state changes are published as, split out and
 /// re-exported the same way.
 mod step_events;
@@ -2326,14 +2332,6 @@ pub fn unauthorized_instance_profile_message(instance_profile_arn: &str) -> Stri
     format!("Failed to authorize instance profile {instance_profile_arn}")
 }
 
-/// The service principal the role an EC2 instance profile carries has to trust for the
-/// cluster's instances to assume it.
-///
-/// "The Amazon EC2 instances of the cluster assume this role"
-/// (`RunJobFlow$JobFlowRole` doc), and an instance assumes a role through its instance
-/// profile, so the role's trust policy has to admit Amazon EC2.
-const INSTANCE_PROFILE_PRINCIPAL: &str = "ec2.amazonaws.com";
-
 /// Why a cluster launch's `JobFlowRole` is one Amazon EMR will not launch with, and
 /// therefore WHICH refusal the launch is answered with.
 ///
@@ -2385,12 +2383,15 @@ fn instance_profile_name(job_flow_role: &str) -> Option<&str> {
 /// `Some(refusal)` is that refusal, classed and worded as AWS words it
 /// ([`JobFlowRoleRefusal`]). `None` means the launch may proceed.
 ///
-/// A profile is AUTHORIZED when it carries a role whose trust policy admits
-/// [`INSTANCE_PROFILE_PRINCIPAL`] — the one reading of a trust policy this tree has
-/// ([`service_common::iam_trust_policy::admits_service_principal`]) — because that is
-/// what lets the cluster's Amazon EC2 instances assume it. A profile carrying none, or
-/// one whose role trusts another principal, exists and cannot be authorized, which is a
-/// different refusal from a profile that does not exist at all.
+/// A profile is AUTHORIZED when IAM holds it carrying a role at all: "The Amazon EC2
+/// instances of the cluster assume this role" (`RunJobFlow$JobFlowRole` doc), so a
+/// profile carrying NO role has nothing for those instances to assume and cannot be
+/// authorized at all, which is a different refusal from a profile that does not exist.
+/// WHICH principal the role it carries trusts is NOT read here, and is no reason to
+/// refuse the launch: a launch naming a profile whose role trusts another service is
+/// accepted and the cluster starts, and that mismatch surfaces where it really happens —
+/// on the node, where an instance holding no credential for its profile's role fails the
+/// work that needs one ([`instance_profile_credentials`]) — rather than at this API.
 ///
 /// IAM is reached the way any emulated service reaches another: through the ONE
 /// in-process IAM client every service that resolves a caller-supplied IAM entity
@@ -2421,22 +2422,10 @@ pub async fn instance_profile_violation(
     match answer {
         Ok(held) => {
             let profile = held.instance_profile()?;
-            // A role whose trust document is absent or unreadable is no evidence either
-            // way, so it withholds the refusal rather than inventing one; a profile
-            // carrying NO role has nothing for an instance to assume, which is the
-            // refusal itself.
-            let trusts_instances = |role: &::aws_sdk_iam::types::Role| -> Option<bool> {
-                ::service_common::iam_trust_policy::admits_service_principal(
-                    role.assume_role_policy_document()?,
-                    INSTANCE_PROFILE_PRINCIPAL,
-                )
-            };
-            if profile
-                .roles()
-                .iter()
-                .map(trusts_instances)
-                .any(|verdict| verdict != Some(false))
-            {
+            // A profile carrying a role names something the cluster's instances assume, so
+            // the launch proceeds whatever that role trusts; a profile carrying NO role has
+            // nothing for them to assume at all, which is the refusal itself.
+            if !profile.roles().is_empty() {
                 return None;
             }
             Some(JobFlowRoleRefusal::Unauthorized(

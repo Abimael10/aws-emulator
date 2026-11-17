@@ -197,11 +197,12 @@ pub struct StepApplicationPlan {
     pub step_id: String,
     /// The application the step's command named.
     pub application: SparkApplication,
-    /// The role the application's own AWS calls are signed as: the step's runtime role where
-    /// it has one ("the Amazon Resource Name (ARN) of the runtime role for a step on the
-    /// cluster", `Step$ExecutionRoleArn`), and otherwise the role the cluster's instances
-    /// assume, which is what runs a step with no runtime role of its own.
-    pub role_arn: String,
+    /// The step's own runtime role, where it carries one ("the Amazon Resource Name (ARN) of
+    /// the runtime role for a step on the cluster", `Step$ExecutionRoleArn`), which is what
+    /// the application's calls are then signed as. A step carrying none presents what the
+    /// cluster's instances obtain from their instance profile instead
+    /// ([`cluster_step_credentials`]).
+    pub execution_role_arn: Option<String>,
     /// The version of Spark the cluster's release ships, which is what the application is
     /// told it runs on — `None` for a cluster whose release bundles no Spark.
     pub spark_version: Option<String>,
@@ -228,11 +229,7 @@ impl ClusterRecord {
                 Some(StepApplicationPlan {
                     step_id: step.id.clone(),
                     application: step.application.clone()?,
-                    role_arn: step
-                        .execution_role_arn
-                        .clone()
-                        .or_else(|| self.job_flow_role.clone())
-                        .unwrap_or_default(),
+                    execution_role_arn: step.execution_role_arn.clone(),
                     spark_version: spark_version.clone(),
                 })
             })
@@ -261,20 +258,27 @@ pub async fn run_due_step_applications<Eng: Send + Sync + 'static>(
     let Some(state) = service_state(engine) else {
         return;
     };
-    let owed: Vec<StepApplicationPlan> = {
+    let (owed, job_flow_role): (Vec<StepApplicationPlan>, String) = {
         let mut store = state.lock();
         // The queue is run up to this instant first, so a step whose turn has come is
         // STARTED and its application is among the owed ones.
         run_due_steps(engine, &mut store, cluster_id, now);
-        store
-            .clusters
-            .get(cluster_id)
-            .map(ClusterRecord::owed_step_applications)
-            .unwrap_or_default()
+        match store.clusters.get(cluster_id) {
+            Some(cluster) => (
+                cluster.owed_step_applications(),
+                cluster.job_flow_role.clone().unwrap_or_default(),
+            ),
+            None => (Vec::new(), String::new()),
+        }
     };
     if owed.is_empty() {
         return;
     }
+    // What the cluster's Amazon EC2 instances obtain from their instance profile, resolved
+    // once for this call: the credential an application whose step carries no runtime role of
+    // its own presents, which is nothing at all where that profile carries no role those
+    // instances may assume.
+    let instance_credentials = cluster_step_credentials(ctx, region, &job_flow_role).await;
     // What this CALL may spend performing them: a further application is started only while
     // a whole run still fits, so the rest stay owed to the next call.
     let started = ::std::time::Instant::now();
@@ -282,7 +286,14 @@ pub async fn run_due_step_applications<Eng: Send + Sync + 'static>(
         if started.elapsed().saturating_add(APPLICATION_RUN_CEILING) > APPLICATION_CALL_CEILING {
             return;
         }
-        let Some(outcome) = run_step_application(engine, ctx, region, &plan).await else {
+        // A step's own runtime role is what its application's calls are signed as where it
+        // carries one; every other step presents what the cluster's instances obtained.
+        let credentials = match plan.execution_role_arn.as_deref() {
+            Some(role_arn) => StepCredentials::Role(role_arn.to_string()),
+            None => instance_credentials.clone(),
+        };
+        let Some(outcome) = run_step_application(engine, ctx, region, &plan, &credentials).await
+        else {
             // Nothing ran: the step stays owed its application, so a later call performs it
             // rather than this one reporting an outcome nothing produced.
             continue;
@@ -308,6 +319,7 @@ async fn run_step_application<Eng: Send + Sync + 'static>(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     plan: &StepApplicationPlan,
+    credentials: &StepCredentials,
 ) -> Option<StepOutcome> {
     let source = match read_application(ctx, region, &plan.application).await {
         Ok(source) => source,
@@ -327,9 +339,16 @@ async fn run_step_application<Eng: Send + Sync + 'static>(
     .await
     .ok()?
     .ok()?;
-    // The calls the application itself makes are made as the role the step runs as, over the
-    // same in-process callback, and the application never sees the credential.
-    let access = function_sdk_access(engine, ctx, region, &plan.role_arn, &plan.step_id);
+    // The calls the application itself makes present what the step runs with, over the same
+    // in-process callback, and the application never sees the credential. An environment that
+    // holds NO credential is given no seam at all: a call the application makes is then made
+    // by nothing, rather than signed with a credential the cluster's instances do not hold.
+    let access = match credentials {
+        StepCredentials::Role(role_arn) => {
+            function_sdk_access(engine, ctx, region, role_arn, &plan.step_id)
+        }
+        StepCredentials::Absent => None,
+    };
     Some(run_application(plan, &source, access, permit).await)
 }
 

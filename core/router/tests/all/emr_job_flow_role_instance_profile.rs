@@ -12,12 +12,15 @@
 //!    carrying `<role> is required for creating cluster.`;
 //! 2. a `JobFlowRole` naming no instance profile this account holds is HTTP 400
 //!    `ValidationException` carrying `Invalid InstanceProfile: <value>.`;
-//! 3. a profile that EXISTS and carries no role Amazon EC2 may assume is HTTP 400
+//! 3. a profile that EXISTS and carries NO role at all is HTTP 400
 //!    `AccessDeniedException` carrying `Failed to authorize instance profile <arn>`,
 //!    whose variable part is the ARN IAM holds that profile under.
 //!
-//! A name IAM holds an EC2-assumable profile under is accepted and round-trips as the
-//! cluster's `Ec2InstanceAttributes.IamInstanceProfile`.
+//! A name IAM holds a profile under is accepted and round-trips as the cluster's
+//! `Ec2InstanceAttributes.IamInstanceProfile` — including a profile whose role trusts
+//! another service principal, which is no API-time authorization failure: that cluster
+//! launches and the mismatch surfaces on the node, where its instances obtain no credential
+//! for the role (the rule `emr_step_instance_profile_credentials.rs` pins).
 //!
 //! This suite needs TWO services on one engine — EMR reaches IAM through the
 //! in-process callback, so a single-service router has no IAM to ask — which is why
@@ -58,8 +61,9 @@ const ROLE_ONLY: &str = "EMR_EC2_RoleWithoutProfile";
 /// nothing in it for an Amazon EC2 instance to assume.
 const ROLELESS_PROFILE: &str = "EMR_EC2_RolelessProfile";
 
-/// An instance profile this account holds whose role trusts ANOTHER service principal:
-/// it exists, and Amazon EC2 may not assume what it carries.
+/// An instance profile this account holds whose role trusts ANOTHER service principal: it
+/// exists and resolves, so a launch naming it is accepted, and Amazon EC2 may not assume
+/// what it carries.
 const FOREIGN_TRUST_PROFILE: &str = "EMR_EC2_LambdaTrustedProfile";
 
 /// The service role every launch below names, which `RunJobFlow` requires too.
@@ -329,19 +333,20 @@ fn profile_cases() -> Vec<ProfileCase> {
             expected: Expected::Unauthorized(named_profile_arn(ROLELESS_PROFILE)),
         },
         ProfileCase {
-            // It exists and its role trusts another service principal, so Amazon EC2
-            // may not assume it.
+            // It exists and its role trusts another service principal: the profile resolves,
+            // so the launch is accepted and the mismatch surfaces on the node rather than
+            // here.
             case: "an instance profile whose role trusts another principal",
             cluster: "foreign-trust-profile",
             job_flow_role: Some(FOREIGN_TRUST_PROFILE.to_string()),
-            expected: Expected::Unauthorized(named_profile_arn(FOREIGN_TRUST_PROFILE)),
+            expected: Expected::Launched,
         },
         ProfileCase {
-            // Named by ARN, the refusal still reports the ARN IAM holds it under.
-            case: "the same unauthorizable profile named by ARN",
+            // The same profile named by ARN, which resolves to the same profile.
+            case: "the same foreign-trusting profile named by ARN",
             cluster: "foreign-trust-profile-arn",
             job_flow_role: Some(instance_profile_arn("/", FOREIGN_TRUST_PROFILE)),
-            expected: Expected::Unauthorized(named_profile_arn(FOREIGN_TRUST_PROFILE)),
+            expected: Expected::Launched,
         },
     ]
 }
