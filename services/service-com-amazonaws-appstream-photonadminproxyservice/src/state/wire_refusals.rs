@@ -65,32 +65,41 @@ static INVALID_PARAMETER_VALUE_SCHEMA: Schema = Schema::new_struct(
 );
 
 /// The `__type` of the modelled refusal for a resource this account holds nothing under
-/// (`ResourceNotFoundException`), named here because the status this service answers it
-/// with is decided below rather than by the shape's own trait.
+/// (`ResourceNotFoundException`), the one error shape of this model whose `@httpError`
+/// trait does not state the status this service serves that refusal over. Part of this
+/// crate's refusal vocabulary beside the sentence such a refusal carries
+/// (`crate::state::resource_not_found_message`), so an operation and a test name the code
+/// once rather than spelling the literal twice.
 pub const RESOURCE_NOT_FOUND_CODE: &str = "ResourceNotFoundException";
 
-/// The status this service answers a client-side refusal with: AppStream is a JSON RPC
-/// API whose refusals all leave over HTTP 400, which is the `@httpError` every error
-/// shape its model declares carries — except `ResourceNotFoundException`, whose trait
-/// says 404 while the wire says 400 ([`modelled_error_status`]).
+/// The status this service answers a not-found refusal with: AppStream is a JSON RPC API
+/// that serves this refusal over HTTP 400, which is the `@httpError` every error shape its
+/// model declares carries — except `ResourceNotFoundException`, whose trait says 404 while
+/// the wire says 400 ([`modelled_error_status`]).
 pub const CLIENT_REFUSAL_STATUS: u16 = 400;
 
-/// The HTTP status a modelled error of this service leaves with, given the `__type` it
-/// carries (`shape_name`) and the status its shape's `@httpError` trait declares.
+/// The status the not-found error shape's `@httpError` trait declares, which is the status
+/// this service does NOT serve that refusal over.
+const NOT_FOUND_DECLARED_STATUS: u16 = 404;
+
+/// The HTTP status a modelled error of this service leaves with, given the status its
+/// shape's `@httpError` trait declares.
 ///
-/// Every error shape this service's model declares is a CLIENT error, and on the wire
-/// this service answers each of them with [`CLIENT_REFUSAL_STATUS`]; the `@httpError` on
-/// `ResourceNotFoundException` ([`RESOURCE_NOT_FOUND_CODE`]) is the one that does not
-/// state that status, so that one refusal class is the one this mapping restates. The
-/// status is the only thing it decides: the `__type` and the message a refusal carries
-/// are the shape's own, and the status of every other error — a server fault, the
-/// scaffold's 501, a synthetic validation refusal — is passed through untouched.
+/// A refusal for a resource this account holds nothing under leaves over
+/// [`CLIENT_REFUSAL_STATUS`] rather than the [`NOT_FOUND_DECLARED_STATUS`] its shape's
+/// trait states — the one status of this model the wire restates, keyed on the refusal
+/// CLASS (the status the trait declares) rather than on the name of the one shape the
+/// recordings exercise, so another shape of that class follows the same rule. Every other
+/// status reaches the client as declared, so a refusal a client branches on structurally
+/// (a throttle, a conflict, an authorization failure) keeps its own status, and so does a
+/// server fault and the scaffold's 501. The status is the only thing this decides: the
+/// `__type` and the message a refusal carries are the shape's own.
 ///
 /// Applied once, in the error channel every operation of this service answers through
 /// (`crate::scaffolded::Scaffolded`), so no handler decides a status itself and two
 /// operations cannot answer one refusal class two ways.
-pub fn modelled_error_status(shape_name: &str, declared_status: u16) -> u16 {
-    if shape_name == RESOURCE_NOT_FOUND_CODE {
+pub fn modelled_error_status(declared_status: u16) -> u16 {
+    if declared_status == NOT_FOUND_DECLARED_STATUS {
         CLIENT_REFUSAL_STATUS
     } else {
         declared_status

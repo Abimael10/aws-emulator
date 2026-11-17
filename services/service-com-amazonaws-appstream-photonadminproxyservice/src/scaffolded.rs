@@ -293,9 +293,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
     fn http_status(&self) -> u16 {
         match self {
             Self::NotImplemented(_) => 501,
-            Self::Modeled(e) => {
-                crate::state::modelled_error_status(e.shape_name(), e.http_status())
-            }
+            Self::Modeled(e) => crate::state::modelled_error_status(e.http_status()),
             Self::ValidationException(_) => 400,
         }
     }

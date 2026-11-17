@@ -153,7 +153,10 @@ pub(crate) async fn start_and_await_running(emulator: &Emulator, case: &str, fle
 }
 
 /// A `CreateStreamingURL` request for the stack, fleet and user above, carrying `extra`.
-fn streaming_request(stack: &str, fleet: &str, user: &str, extra: &Value) -> Value {
+///
+/// Shared with the suite that reads the STATUS such a request is refused over
+/// (`tests/all/streaming_url_not_found_status.rs`), so both state the request shape once.
+pub(crate) fn streaming_request(stack: &str, fleet: &str, user: &str, extra: &Value) -> Value {
     let mut request = json!({ "StackName": stack, "FleetName": fleet, "UserId": user });
     for (member, value) in extra.as_object().expect("the row carries members") {
         request[member] = value.clone();
@@ -458,7 +461,15 @@ async fn describe_sessions(
 }
 
 /// Every session of one stack's fleet, in the order the read reports them.
-async fn sessions_of(emulator: &Emulator, case: &str, stack: &str, fleet: &str) -> Vec<Value> {
+///
+/// Shared with the suite that reads what a REFUSED call leaves behind
+/// (`tests/all/streaming_url_not_found_status.rs`), so both read the sessions the same way.
+pub(crate) async fn sessions_of(
+    emulator: &Emulator,
+    case: &str,
+    stack: &str,
+    fleet: &str,
+) -> Vec<Value> {
     let (sessions, next_token) = describe_sessions(
         emulator,
         case,
