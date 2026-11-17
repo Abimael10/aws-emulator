@@ -33,11 +33,23 @@
 //!
 //! Every assertion reads the record back through CloudWatch Logs' own reader
 //! (`FilterLogEvents`), so a record that did not reach that store cannot pass.
+//!
+//! The second test holds the SAME rule over every consumer of that path at once: the request
+//! is admitted and normalised ONCE, so the record's `$context.path` and the path members of
+//! the proxy event the backend is handed report the same value for the one request that
+//! produced both — as do the other values each derives from the front door (the endpoint host,
+//! the verb, the serving stage and the id of the request). A client joins a record to a
+//! request by exactly those values, so a consumer that read the socket-level target where
+//! another read the api-relative path would make that join match here what it does not match
+//! at AWS. Its event half is read off what the FUNCTION returned, and its rows span the
+//! payload format versions as well, whose path members are spelled differently.
 
 use serde_json::Value;
 
 use crate::http_api_access_logging::{create_log_group, delivered_to, emulator, log_group_arn};
-use crate::http_api_backend_dispatch::{given_api, given_function, lambda_integration};
+use crate::http_api_backend_dispatch::{
+    given_api, given_function, lambda_integration, ECHO_EVENT,
+};
 use crate::websocket_handshake_data_plane::send;
 
 /// The stage that serves an api's root, reached with no stage segment in the path at all.
@@ -234,12 +246,16 @@ fn rows() -> Vec<Row> {
     ]
 }
 
-/// The record a stage delivered for the request it just served: the one line in the
-/// destination group, parsed as the JSON the format is.
-async fn record(router: &smithy_server_runtime::MultiServiceRouter, case: &str) -> Value {
-    let records = delivered_to(router, GROUP)
+/// The record a stage delivered for the request it just served: the one line in `group`,
+/// parsed as the JSON the format is.
+async fn record_in(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    group: &str,
+    case: &str,
+) -> Value {
+    let records = delivered_to(router, group)
         .await
-        .unwrap_or_else(|| panic!("case {case:?}: no destination group {GROUP:?} at all"));
+        .unwrap_or_else(|| panic!("case {case:?}: no destination group {group:?} at all"));
     assert_eq!(
         records.len(),
         1,
@@ -247,7 +263,7 @@ async fn record(router: &smithy_server_runtime::MultiServiceRouter, case: &str) 
     );
     let line = records
         .last()
-        .unwrap_or_else(|| panic!("case {case:?}: no record in {GROUP:?}"));
+        .unwrap_or_else(|| panic!("case {case:?}: no record in {group:?}"));
     serde_json::from_str(line).unwrap_or_else(|error| {
         panic!("case {case:?}: the record {line:?} is not the JSON the format is: {error}")
     })
@@ -292,7 +308,7 @@ async fn a_record_reports_the_path_the_apis_own_endpoint_was_addressed_at() {
             .header(REQUEST_ID_HEADER)
             .unwrap_or_else(|| panic!("case {case:?}: the response named no request id"));
 
-        let rendered = record(&router, case).await;
+        let rendered = record_in(&router, GROUP, case).await;
         let expected = endpoint_path(row.stage, row.route_path);
         assert_eq!(
             rendered,
@@ -320,5 +336,255 @@ async fn a_record_reports_the_path_the_apis_own_endpoint_was_addressed_at() {
             "case {case:?}: expected the record's path to carry neither the local marker, the \
              api id, the root stage's name nor a route template, got {reported:?}"
         );
+    }
+}
+
+/// The destination the agreement rows below point their stages at: their own group, so the one
+/// record a row delivers is the only line in it.
+const AGREEMENT_GROUP: &str = "/apigwv2/access-path-agreement";
+
+/// The format the agreement rows render their records by: the four values an event states too,
+/// each under the member name the record carries it in.
+const AGREEMENT_FORMAT: &str = concat!(
+    r#"{"requestId":"$context.requestId","path":"$context.path","#,
+    r#""domainName":"$context.domainName","httpMethod":"$context.httpMethod","#,
+    r#""stage":"$context.stage"}"#
+);
+
+/// Where a payload format of the proxy event states each value the record above also reports,
+/// as `(the record's member, the event's JSON pointer)`: that format's two path members, the
+/// endpoint host, the verb, the serving stage and the request's own id.
+///
+/// The PATH members are the ones [`crate::http_api_event_path::path_members`] already owns,
+/// read through that helper so the two suites cannot disagree about their spelling. The rest
+/// are stated here: the `1.0` event keeps the verb on the request context itself (beside the
+/// copy on the event) while `2.0` keeps it under `http`.
+fn event_members(payload_format: &str) -> Vec<(&'static str, &'static str)> {
+    let mut members: Vec<(&'static str, &'static str)> = vec![
+        ("requestId", "/requestContext/requestId"),
+        ("domainName", "/requestContext/domainName"),
+        ("stage", "/requestContext/stage"),
+    ];
+    members.extend(
+        crate::http_api_event_path::path_members(payload_format)
+            .into_iter()
+            .map(|(_described, pointer)| ("path", pointer)),
+    );
+    if payload_format == "2.0" {
+        members.push(("httpMethod", "/requestContext/http/method"));
+    } else {
+        members.push(("httpMethod", "/httpMethod"));
+        members.push(("httpMethod", "/requestContext/httpMethod"));
+    }
+    members
+}
+
+/// The rows the agreement test spans, each with the verb it is asked with and the payload
+/// format version its integration builds the event in: the same dimensions as the rows above —
+/// the addressing, the stage, the shape of the route key and the number of path segments — plus
+/// the two payload formats and a verb per row.
+fn agreement_rows() -> Vec<(Row, &'static str, &'static str)> {
+    vec![
+        (
+            Row {
+                case: "the root stage on the api's own host, a path variable",
+                stage: ROOT_STAGE,
+                route_key: "GET /items/{item}",
+                route_path: "/items/one",
+                addressing: Addressing::ApiHost,
+            },
+            "GET",
+            "2.0",
+        ),
+        (
+            Row {
+                case: "the root stage behind the local endpoint marker, a path variable",
+                stage: ROOT_STAGE,
+                route_key: "GET /items/{item}",
+                route_path: "/items/one",
+                addressing: Addressing::LocalMarker,
+            },
+            "GET",
+            "2.0",
+        ),
+        (
+            Row {
+                case: "the root stage behind the marker, with its own name too, under 1.0",
+                stage: ROOT_STAGE,
+                route_key: "GET /items/{item}",
+                route_path: "/items/one",
+                addressing: Addressing::LocalMarkerNamingTheStage,
+            },
+            "GET",
+            "1.0",
+        ),
+        (
+            Row {
+                case: "the root stage behind the marker carrying the endpoint host, several \
+                       segments",
+                stage: ROOT_STAGE,
+                route_key: "GET /orders/{id}/items",
+                route_path: "/orders/7/items",
+                addressing: Addressing::LocalMarkerCarryingTheHost,
+            },
+            "GET",
+            "2.0",
+        ),
+        (
+            Row {
+                case: "the root stage with the api id as the first segment, the greedy remainder",
+                stage: ROOT_STAGE,
+                route_key: "ANY /files/{proxy+}",
+                route_path: "/files/a/b/c",
+                addressing: Addressing::ApiIdFirst,
+            },
+            "DELETE",
+            "2.0",
+        ),
+        (
+            Row {
+                case: "the root stage at the api's own root path, the catch-all route, under 1.0",
+                stage: ROOT_STAGE,
+                route_key: "$default",
+                route_path: "/",
+                addressing: Addressing::ApiHostNamingTheStage,
+            },
+            "GET",
+            "1.0",
+        ),
+        (
+            Row {
+                case: "a named stage on the api's own host, a literal path",
+                stage: "prod",
+                route_key: "GET /alpha",
+                route_path: "/alpha",
+                addressing: Addressing::ApiHost,
+            },
+            "GET",
+            "2.0",
+        ),
+        (
+            Row {
+                case: "a named stage behind the local endpoint marker, the catch-all route",
+                stage: "prod",
+                route_key: "$default",
+                route_path: "/anything/at/all",
+                addressing: Addressing::LocalMarker,
+            },
+            "POST",
+            "2.0",
+        ),
+        (
+            Row {
+                case: "a named stage named by its segment alone, the greedy remainder, under 1.0",
+                stage: "staging",
+                route_key: "ANY /files/{proxy+}",
+                route_path: "/files/a/b",
+                addressing: Addressing::StageOnly,
+            },
+            "GET",
+            "1.0",
+        ),
+    ]
+}
+
+/// One request is admitted once: the record the stage delivered and the event the function was
+/// handed report the SAME path — and the same endpoint host, verb, stage and request id.
+#[tokio::test]
+async fn the_record_and_the_event_report_one_admitted_request_path() {
+    for (row, method, payload_format) in agreement_rows() {
+        let case = row.case;
+        // One api per row, in a store of its own, for the reason the suite above states.
+        let (router, engine) = emulator();
+        create_log_group(&router, AGREEMENT_GROUP).await;
+        let function = given_function(&router, &engine, case, FUNCTION, ECHO_EVENT).await;
+        let (api_id, endpoint_host) = given_api(
+            &router,
+            case,
+            lambda_integration(&function, payload_format),
+            row.route_key,
+            serde_json::json!({
+                "stageName": row.stage,
+                "autoDeploy": true,
+                "accessLogSettings": {
+                    "destinationArn": log_group_arn(AGREEMENT_GROUP),
+                    "format": AGREEMENT_FORMAT,
+                },
+            }),
+        )
+        .await;
+
+        let (host, path) = addressed(&row, &api_id, &endpoint_host);
+        let answered = send(&router, &host, method, &path, &[]).await;
+        assert_eq!(
+            answered.status,
+            200,
+            "case {case:?}: expected the function's 200 for {method} {path:?}, got {}",
+            answered.summary()
+        );
+        let request_id = answered
+            .header(REQUEST_ID_HEADER)
+            .unwrap_or_else(|| panic!("case {case:?}: the response named no request id"));
+        let event: Value = serde_json::from_str(&answered.text).unwrap_or(Value::Null);
+
+        let rendered = record_in(&router, AGREEMENT_GROUP, case).await;
+        let expected = endpoint_path(row.stage, row.route_path);
+        assert_eq!(
+            rendered,
+            serde_json::json!({
+                "requestId": request_id,
+                "path": expected,
+                "domainName": endpoint_host,
+                "httpMethod": method,
+                "stage": row.stage,
+            }),
+            "case {case:?}: expected the record of {method} {path:?} to report the path \
+             {expected:?} asked for at the endpoint {endpoint_host:?}, got {rendered}"
+        );
+        for (member, pointer) in event_members(payload_format) {
+            let stated = event.pointer(pointer).cloned().unwrap_or(Value::Null);
+            let recorded = rendered.get(member).cloned().unwrap_or(Value::Null);
+            assert_eq!(
+                stated, recorded,
+                "case {case:?}: expected {pointer} of the event for {method} {path:?} to agree \
+                 with the record's {member:?} ({recorded}), got {stated}"
+            );
+        }
+        // Neither consumer reports what the addressing carried: every path either of them
+        // states is a path, and names neither the emulator's own marker, the api id, the root
+        // stage's reserved name nor the template of the route key that matched.
+        let mut reported: Vec<(String, String)> = Vec::new();
+        for (member, pointer) in event_members(payload_format) {
+            if member == "path" {
+                reported.push((
+                    pointer.to_string(),
+                    event
+                        .pointer(pointer)
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                ));
+            }
+        }
+        reported.push((
+            "the record's path".to_string(),
+            rendered
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        ));
+        for (reader, actual) in reported {
+            assert!(
+                actual.starts_with('/')
+                    && !actual.contains(LOCAL_MARKER_PREFIX)
+                    && !actual.contains(&api_id)
+                    && !actual.contains(ROOT_STAGE)
+                    && !actual.contains('{'),
+                "case {case:?}: expected {reader} for {method} {path:?} to be a path carrying \
+                 neither the local marker, the api id, the root stage's name nor a route \
+                 template, got {actual:?}"
+            );
+        }
     }
 }

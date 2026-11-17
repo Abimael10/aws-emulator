@@ -229,7 +229,12 @@ fn rows() -> Vec<Row> {
 }
 
 /// The two members of the event that carry the path, in the payload format's own spelling.
-fn path_members(payload_format: &str) -> [(&'static str, &'static str); 2] {
+///
+/// `pub(crate)` because the access-log suite
+/// ([`crate::http_api_access_log_request_path`]) reads the event's path through the SAME
+/// spelling when it holds the record and the event to one admitted path, rather than keeping a
+/// second copy of this mapping that could drift from it.
+pub(crate) fn path_members(payload_format: &str) -> [(&'static str, &'static str); 2] {
     if payload_format == "2.0" {
         [
             ("the raw path", "/rawPath"),
