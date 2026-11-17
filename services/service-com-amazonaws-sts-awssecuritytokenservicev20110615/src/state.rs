@@ -136,6 +136,19 @@ pub const EXTERNAL_ID_CONDITION_KEY: &str = "sts:ExternalId";
 /// ([`ResolvedRole::trust_policy_grant_turns_on`], [`SET_SOURCE_IDENTITY_ACTION`]).
 pub const SOURCE_IDENTITY_CONDITION_KEY: &str = "sts:SourceIdentity";
 
+/// The global condition key a policy tests whether MULTI-FACTOR AUTHENTICATION backed the
+/// request's credential through: "whether multi-factor authentication (MFA) was used to
+/// validate the temporary security credentials that made the request" (AWS General Reference,
+/// *Global condition context keys*).
+///
+/// A role trust policy conditions its grant on it to require MFA of whoever assumes the role,
+/// and an `AssumeRole` request answers it two ways: "specify this value if the trust policy of
+/// the role being assumed includes a condition that requires MFA authentication"
+/// (`AssumeRoleRequest$SerialNumber`, this service's model) — the challenge the request itself
+/// presents — and a credential whose own mint satisfied one
+/// ([`Caller::multi_factor_auth_present`]).
+pub const MULTI_FACTOR_AUTH_PRESENT_CONDITION_KEY: &str = "aws:MultiFactorAuthPresent";
+
 /// The `Principal` spelling that names a whole account: the account's root user.
 fn account_root_arn(account: &str) -> String {
     format!("arn:aws:iam::{account}:root")
@@ -1563,6 +1576,12 @@ pub const ASSUME_ROLE_PUBLISHED_CONDITION_KEYS: &[&str] = &[
     "aws:PrincipalType",
     "aws:userid",
     "aws:TagKeys",
+    // The MFA key is answered for EVERY request this operation decides — `true` or `false`
+    // for a credential that carries a value for it, and ABSENT for a long-term access key,
+    // which carries none (`Caller::multi_factor_auth_present`) — so publishing it is what
+    // lets a clause over it, including the `…IfExists` and `Null` spellings a "require MFA"
+    // trust policy is written in, decide rather than stay undecided.
+    MULTI_FACTOR_AUTH_PRESENT_CONDITION_KEY,
 ];
 
 /// The `aws:RequestTag/` family: every session tag THIS mint sets, which is exactly the
@@ -1633,6 +1652,10 @@ pub fn federated_claim_keys(claims: &[(String, String)]) -> Vec<&str> {
 /// [`::service_common::iam_authorization`] reads a multi-valued key. Nothing is invented:
 /// a key the request does not determine is left out, so a clause over it stays undecided
 /// and withholds the grant.
+///
+/// `mfa_challenge_satisfied` says whether THIS request presented an MFA challenge the
+/// caller's own device answered, which is what the global MFA key is answered from beside
+/// the calling credential's own value ([`assume_role_multi_factor_auth_present`]).
 pub fn assume_role_condition_context(
     caller: &Caller,
     role_session_name: &str,
@@ -1640,6 +1663,7 @@ pub fn assume_role_condition_context(
     source_identity: Option<&str>,
     tags: &[(String, String)],
     transitive_tag_keys: &[String],
+    mfa_challenge_satisfied: bool,
 ) -> Vec<(String, String)> {
     let mut context = vec![
         (
@@ -1689,7 +1713,47 @@ pub fn assume_role_condition_context(
     for key in transitive_tag_keys {
         context.push(("sts:TransitiveTagKeys".to_string(), key.clone()));
     }
+    // Whether MULTI-FACTOR AUTHENTICATION backs this request, which is what a trust policy
+    // requiring MFA of whoever assumes the role tests. A credential carrying no value for
+    // the key leaves it out, so the key is ABSENT rather than `false` there — the difference
+    // an `…IfExists` clause over it is written about.
+    if let Some(present) = assume_role_multi_factor_auth_present(caller, mfa_challenge_satisfied) {
+        context.push((
+            MULTI_FACTOR_AUTH_PRESENT_CONDITION_KEY.to_string(),
+            present.to_string(),
+        ));
+    }
     context
+}
+
+/// What the global MFA condition key ([`MULTI_FACTOR_AUTH_PRESENT_CONDITION_KEY`]) answers
+/// for an `AssumeRole` request, and what the role session it mints carries forward.
+///
+/// The key says "whether multi-factor authentication (MFA) was used to validate the temporary
+/// security credentials that made the request" (AWS General Reference, *Global condition
+/// context keys*), and such a request is validated with MFA in either of the two ways this
+/// operation documents:
+///
+/// * the request itself presents a challenge the caller's device answers — "specify this value
+///   if the trust policy of the role being assumed includes a condition that requires MFA
+///   authentication" (`AssumeRoleRequest$SerialNumber`, this service's model), which is
+///   `mfa_challenge_satisfied`: the challenge is decided before anything is minted, so a
+///   request still being decided here is one whose challenge was satisfied; or
+/// * the credential it is signed with was itself minted against a satisfied challenge
+///   ([`Caller::multi_factor_auth_present`]) — the `GetSessionToken`-with-MFA path.
+///
+/// `None` — the key ABSENT from the request context — only for a caller that carries no value
+/// for it and presents no challenge of its own: a long-term access key, for which "this key is
+/// present in the request context only when the principal uses temporary credentials".
+#[must_use]
+pub fn assume_role_multi_factor_auth_present(
+    caller: &Caller,
+    mfa_challenge_satisfied: bool,
+) -> Option<bool> {
+    if mfa_challenge_satisfied {
+        return Some(true);
+    }
+    caller.multi_factor_auth_present()
 }
 
 /// How `aws:PrincipalType` names the calling principal's kind.

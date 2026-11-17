@@ -492,6 +492,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 failed.message(),
             ));
         }
+        // Past that gate, a request still carrying both members presented a challenge the
+        // caller's own device ANSWERED, which is one of the two ways an assume is backed by
+        // multi-factor authentication; the other is the credential it is signed with (see
+        // `crate::state::assume_role_multi_factor_auth_present`).
+        let mfa_challenge_satisfied = input.serial_number.is_some() && input.token_code.is_some();
+        let multi_factor_auth_present =
+            crate::state::assume_role_multi_factor_auth_present(&caller, mfa_challenge_satisfied);
 
         // What this mint WOULD set on the new session, which is what the trust-policy
         // decision is made about: the tags the request names plus the transitive tags the
@@ -582,6 +589,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             source_identity.as_deref(),
             &tags,
             &transitive_tag_keys,
+            mfa_challenge_satisfied,
         );
         // The condition keys this mint ANSWERS for, which is what makes a clause over a
         // tag key the request does not carry decide rather than stay undecided; see
@@ -698,9 +706,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // SerialNumber and TokenCode name the caller's MFA device; the challenge they
-        // carry was decided above. A trust policy's MFA condition is not a string
-        // condition, so the shared evaluator leaves such a statement undecided and
-        // withholds the grant.
+        // carry was decided above, and whether this request is MFA-backed was published to
+        // the trust-policy decision as the global MFA condition key, so a trust policy that
+        // requires MFA of whoever assumes the role decided this assume rather than leaving
+        // its clause undecided.
         //
         // The duration ceiling is the lower of the role's own maximum and — when this
         // assume is itself made from a role session, which is role chaining — one hour.
@@ -760,11 +769,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // speaks for: a role deleted and created again under the same name is
                 // another principal behind the same ARN (see `Session::role_id`).
                 role_id: Some(role.role_id.clone()),
-                // Past the MFA challenge decided above, a request that PRESENTED one
-                // satisfied it, so the session it mints is MFA-authenticated — what the
-                // credential answers the global MFA condition key with on every later
-                // request it signs (`crate::state::Caller::multi_factor_auth_present`).
-                mfa_authenticated: input.serial_number.is_some() && input.token_code.is_some(),
+                // Past the MFA challenge decided above, what the global MFA condition key
+                // answers for THIS request is what the session it mints carries: the
+                // challenge this request presented, or the MFA that validated the
+                // credential it was signed with — "whether multi-factor authentication was
+                // used to validate the temporary security credentials that made the
+                // request" — which is what the credential answers that key with on every
+                // later request it signs
+                // (`crate::state::Caller::multi_factor_auth_present`).
+                mfa_authenticated: multi_factor_auth_present.unwrap_or(false),
                 ..NewSession::new(identity, SessionKind::AssumedRole, duration_seconds)
             },
         );

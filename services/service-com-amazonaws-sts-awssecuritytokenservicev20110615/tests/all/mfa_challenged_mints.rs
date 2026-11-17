@@ -23,6 +23,20 @@
 //! device emits, another step's, a code with no serial beside it), which serial it is presented
 //! against (the device's own, one the account holds no device under), whose device it is, and
 //! which mint is called.
+//!
+//! The second rule here is what that fact DECIDES: **`AssumeRole` answers the global condition
+//! key saying whether multi-factor authentication validated the credentials that made the
+//! request for every request it decides — `true` when the request presents a challenge the
+//! caller's device answers or is signed with a credential whose own mint satisfied one, `false`
+//! for any other temporary credential, and ABSENT for a long-term access key, which carries no
+//! value for it — so a trust-policy clause over that key decides the assume instead of staying
+//! undecided.** "Specify this value if the trust policy of the role being assumed includes a
+//! condition that requires MFA authentication" (`AssumeRoleRequest$SerialNumber`) is the first
+//! of those two ways, a session `GetSessionToken` minted against a validated code the second,
+//! and "this key is present in the request context only when the principal uses temporary
+//! credentials" (AWS General Reference, *Global condition context keys*) is why a long-term key
+//! carries no value rather than `false`. Those rows differ along the condition OPERATOR the
+//! clause is written with and along how the assume is backed.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -32,7 +46,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use sts::state::ComAmazonawsStsAwssecuritytokenservicev20110615State as StsState;
 
 use super::sts_sessions::{
-    call, element, emulator_account, emulator_with_iam, query, seed_demo_role,
+    call, element, emulator_account, emulator_with_iam, member, query, seed_demo_role, seed_role,
 };
 
 /// The IAM user whose device every row's challenge is decided against.
@@ -279,6 +293,270 @@ async fn a_challenge_the_device_does_not_answer_mints_nothing() {
             now_held, held,
             "case {case:?}: expected no session to be minted, got {now_held} where {held} were \
              held"
+        );
+    }
+}
+
+/// The condition key a trust policy below is written over, as a policy spells it (AWS General
+/// Reference, *Global condition context keys*).
+const MFA_KEY: &str = "aws:MultiFactorAuthPresent";
+
+/// The session name the assumes below name, so the ARN a success answers is predictable.
+const SESSION_NAME: &str = "operator";
+
+/// A role trust policy that admits `user_arn` to assume the role `when` `condition` holds,
+/// written as `iam:CreateRole` stores one.
+fn trust_policy_conditioned(user_arn: &str, condition: &str) -> String {
+    format!(
+        "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"Allow\",\
+         \"Principal\":{{\"AWS\":\"{user_arn}\"}},\"Action\":[\"sts:AssumeRole\"],\
+         \"Condition\":{condition}}}]}}"
+    )
+}
+
+/// How an `AssumeRole` request is — or is not — backed by multi-factor authentication: which
+/// credential signs it, and whether it presents a challenge of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Backing {
+    /// The user's own long-term access key, presenting no challenge: the credential that
+    /// carries no value for the key at all.
+    LongTermKey,
+    /// The same key, presenting a live code from the user's device.
+    LongTermKeyWithChallenge,
+    /// A `GetSessionToken` session minted against a live code from that device.
+    MfaSession,
+    /// A `GetSessionToken` session minted with no challenge at all.
+    PlainSession,
+}
+
+/// The credential a row signs its assume with, and the challenge parameters that assume itself
+/// carries.
+async fn backing_credential(
+    router: &MultiServiceRouter,
+    serial_number: &str,
+    seed: &str,
+    backing: Backing,
+) -> (String, Vec<(&'static str, String)>) {
+    let challenge = || {
+        vec![
+            ("SerialNumber", serial_number.to_string()),
+            ("TokenCode", pass_code(seed, current_step(SystemTime::now()))),
+        ]
+    };
+    match backing {
+        Backing::LongTermKey => (USER_KEY_ID.to_string(), Vec::new()),
+        Backing::LongTermKeyWithChallenge => (USER_KEY_ID.to_string(), challenge()),
+        Backing::MfaSession => (minted_session(router, &challenge()).await, Vec::new()),
+        Backing::PlainSession => (minted_session(router, &[]).await, Vec::new()),
+    }
+}
+
+/// The access key id of a `GetSessionToken` session minted for the user with `challenge`.
+async fn minted_session(router: &MultiServiceRouter, challenge: &[(&str, String)]) -> String {
+    let (status, body) = call(router, USER_KEY_ID, "GetSessionToken", challenge).await;
+    assert_eq!(
+        status, 200,
+        "the session a row signs with must be minted, got {status} {body}"
+    );
+    element(&body, "AccessKeyId")
+        .unwrap_or_else(|| panic!("the mint must answer a credential, got {body}"))
+}
+
+/// RULE: a trust-policy clause over the global MFA key is decided for every caller — the key
+/// answers `true` for an MFA-backed assume, `false` for another session, and is absent for a
+/// long-term access key — so such a role is assumable by exactly the callers the clause admits,
+/// and refused to the others with the authorization refusal AWS words for a withheld assume.
+#[tokio::test]
+async fn an_mfa_clause_in_a_trust_policy_decides_the_assume_for_every_caller() {
+    let (router, engine) = emulator_with_iam();
+    let user_arn = given_user(&engine);
+    let (serial_number, seed) = given_enabled_device(&router, USER, "operator-device").await;
+
+    let bool_true = format!("{{\"Bool\":{{\"{MFA_KEY}\":\"true\"}}}}");
+    let bool_false = format!("{{\"Bool\":{{\"{MFA_KEY}\":\"false\"}}}}");
+    let bool_if_exists_false = format!("{{\"BoolIfExists\":{{\"{MFA_KEY}\":\"false\"}}}}");
+    let null_present = format!("{{\"Null\":{{\"{MFA_KEY}\":\"true\"}}}}");
+
+    // Each row: the case, the `Condition` the role's trust policy carries, how the assume is
+    // backed, and whether that clause admits it.
+    let rows: &[(&str, &str, Backing, bool)] = &[
+        (
+            "MFA required, a long-term key presenting no challenge",
+            &bool_true,
+            Backing::LongTermKey,
+            false,
+        ),
+        (
+            "MFA required, a live code presented to the assume itself",
+            &bool_true,
+            Backing::LongTermKeyWithChallenge,
+            true,
+        ),
+        (
+            "MFA required, a session minted against a live code",
+            &bool_true,
+            Backing::MfaSession,
+            true,
+        ),
+        (
+            "MFA required, a session minted with no challenge",
+            &bool_true,
+            Backing::PlainSession,
+            false,
+        ),
+        (
+            "no MFA demanded of a long-term key, which carries no value for the key",
+            &bool_false,
+            Backing::LongTermKey,
+            false,
+        ),
+        (
+            "no MFA demanded of a session minted with no challenge",
+            &bool_false,
+            Backing::PlainSession,
+            true,
+        ),
+        (
+            "no MFA demanded of a session minted against a live code",
+            &bool_false,
+            Backing::MfaSession,
+            false,
+        ),
+        (
+            "the IfExists spelling, which a long-term key satisfies by carrying no value",
+            &bool_if_exists_false,
+            Backing::LongTermKey,
+            true,
+        ),
+        (
+            "the IfExists spelling against a session minted against a live code",
+            &bool_if_exists_false,
+            Backing::MfaSession,
+            false,
+        ),
+        (
+            "the presence test, which holds where the key is not in the context",
+            &null_present,
+            Backing::LongTermKey,
+            true,
+        ),
+        (
+            "the presence test against an assume presenting a live code",
+            &null_present,
+            Backing::LongTermKeyWithChallenge,
+            false,
+        ),
+    ];
+
+    for (index, (case, condition, backing, admitted)) in rows.iter().enumerate() {
+        let role_name = format!("mfa-gated-{index}");
+        let (role_arn, _role_id) = seed_role(
+            &engine,
+            &format!("AROAMFAGATEDROLE{index:05}"),
+            &role_name,
+            "/",
+            Some(&trust_policy_conditioned(&user_arn, condition)),
+            Some(43_200),
+        );
+        let (access_key_id, challenge) =
+            backing_credential(&router, &serial_number, &seed, *backing).await;
+        let mut params = vec![
+            ("RoleArn", role_arn.clone()),
+            ("RoleSessionName", SESSION_NAME.to_string()),
+        ];
+        params.extend(challenge);
+        let (status, body) = call(&router, &access_key_id, "AssumeRole", &params).await;
+        if *admitted {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the assume to be admitted, got {status} {body}"
+            );
+            let assumed = member(case, &body, "Arn");
+            let expected = format!(
+                "arn:aws:sts::{}:assumed-role/{role_name}/{SESSION_NAME}",
+                emulator_account()
+            );
+            assert_eq!(
+                assumed, expected,
+                "case {case:?}: expected the assumed-role ARN {expected:?}, got {assumed:?}"
+            );
+        } else {
+            assert_eq!(
+                status, 403,
+                "case {case:?}: expected HTTP 403, got {status} {body}"
+            );
+            let code = member(case, &body, "Code");
+            assert_eq!(
+                code, "AccessDenied",
+                "case {case:?}: expected AccessDenied, got {code:?} in {body}"
+            );
+            let message = member(case, &body, "Message");
+            let expected = format!(
+                "User: {user_arn} is not authorized to perform: sts:AssumeRole on resource: \
+                 {role_arn}"
+            );
+            assert_eq!(
+                message, expected,
+                "case {case:?}: expected {expected:?}, got {message:?}"
+            );
+        }
+    }
+}
+
+/// RULE: the role session an assume mints answers that same key the way the assume did — an
+/// MFA-backed assume mints an MFA-authenticated session, whichever of the two ways backed it,
+/// and one that is not MFA-backed mints a session that is not.
+#[tokio::test]
+async fn the_role_session_answers_the_mfa_key_the_way_the_assume_did() {
+    let (router, engine) = emulator_with_iam();
+    given_user(&engine);
+    let (role_arn, _role_id) = seed_demo_role(&engine);
+    let (serial_number, seed) = given_enabled_device(&router, USER, "operator-device").await;
+
+    // Each row: the case, how the assume is backed, and what the session it mints answers the
+    // global MFA key with afterwards.
+    let rows: &[(&str, Backing, Option<bool>)] = &[
+        (
+            "a long-term key presenting no challenge",
+            Backing::LongTermKey,
+            Some(false),
+        ),
+        (
+            "a live code presented to the assume itself",
+            Backing::LongTermKeyWithChallenge,
+            Some(true),
+        ),
+        (
+            "a session minted against a live code",
+            Backing::MfaSession,
+            Some(true),
+        ),
+        (
+            "a session minted with no challenge",
+            Backing::PlainSession,
+            Some(false),
+        ),
+    ];
+
+    for (case, backing, present) in rows {
+        let (access_key_id, challenge) =
+            backing_credential(&router, &serial_number, &seed, *backing).await;
+        let mut params = vec![
+            ("RoleArn", role_arn.clone()),
+            ("RoleSessionName", SESSION_NAME.to_string()),
+        ];
+        params.extend(challenge);
+        let (status, body) = call(&router, &access_key_id, "AssumeRole", &params).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the assume to succeed, got {status} {body}"
+        );
+        let minted = member(case, &body, "AccessKeyId");
+        let answered = mfa_present(&engine, &minted);
+        assert_eq!(
+            answered, *present,
+            "case {case:?}: expected the role session to answer the MFA key with {present:?}, \
+             got {answered:?}"
         );
     }
 }
