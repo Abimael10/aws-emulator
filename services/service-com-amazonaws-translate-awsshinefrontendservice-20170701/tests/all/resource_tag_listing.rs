@@ -17,7 +17,8 @@
 //! it may hold), the shape of a key and a value (empty value, both published
 //! length bounds, non-ASCII, keys differing only in case), and the sequence of
 //! calls that left the resource holding them (one call, several calls, a key
-//! restated, keys removed again).
+//! restated, keys removed again, and the import that created the resource
+//! carrying its tags itself or restating them on a re-import).
 //!
 //! The rows compare the reported list element by element ON PURPOSE: this
 //! service reports a resource's tags in one stable order — the order the record
@@ -26,6 +27,7 @@
 //! report of one stored tag set cannot drift from the other.
 
 use serde_json::{json, Value};
+use smithy_server_runtime::MultiServiceRouter;
 
 use crate::terminology_lifecycle::{
     call, error_code, expected_arn, import, listed_tags, message, router, tag_list, tag_pairs,
@@ -452,4 +454,270 @@ async fn list_tags_for_resource_refuses_an_arn_naming_no_resource() {
         vec![json!({"Key": "env", "Value": "prod"})],
         "a refused report changes no resource's tags, got {listed:?}"
     );
+}
+
+/// `MergeStrategy` is required on an import, and `OVERWRITE` is the only value
+/// the model declares (`smithy_query shape=MergeStrategy`).
+const OVERWRITE: &str = "OVERWRITE";
+
+/// A CSV terminology of the same languages but different content, so importing
+/// it under a name an earlier import used mints a different ARN: the ARN
+/// carries the imported file's revision.
+const EN_FR_CSV_OTHER: &[u8] = b"en,fr\nhello,salut\n";
+
+/// One `ImportTerminology` request, carrying `Tags` only when the row states a
+/// list: `ImportTerminologyRequest$Tags` is an optional `TagList`
+/// (`smithy_query query=operation operation=ImportTerminology`), so a request
+/// that omits the member is not the same request as one carrying an empty list.
+async fn import_with_tags(
+    router: &MultiServiceRouter,
+    name: &str,
+    file: &[u8],
+    tags: Option<&[(String, String)]>,
+) -> (u16, Value) {
+    let mut body = json!({
+        "Name": name,
+        "MergeStrategy": OVERWRITE,
+        "TerminologyData": {
+            "File": aws_smithy_types::base64::encode(file),
+            "Format": "CSV",
+            "Directionality": "UNI",
+        },
+    });
+    if let Some(tags) = tags {
+        body["Tags"] = tag_list(tags);
+    }
+    call(router, "ImportTerminology", &body).await
+}
+
+/// A second import under the same name: the file it carries, and the `Tags` it
+/// restates (`None` omits the member).
+struct Reimport {
+    file: &'static [u8],
+    tags: Option<Vec<(String, String)>>,
+}
+
+fn reimported_with(file: &'static [u8], tags: Option<Vec<(String, String)>>) -> Option<Reimport> {
+    Some(Reimport { file, tags })
+}
+
+/// One row of the create-time table: the calls that leave the resource holding
+/// a tag set — starting with the import that created it — and the set a report
+/// must then show.
+struct ImportRow {
+    case: &'static str,
+    /// `Tags` on the import that created the resource; `None` omits the member.
+    created_with: Option<Vec<(String, String)>>,
+    /// A second import under the same name, when the row makes one.
+    reimport: Option<Reimport>,
+    /// Tags a `TagResource` call adds afterwards.
+    tagged: Option<Vec<(String, String)>>,
+    /// Keys an `UntagResource` call removes afterwards.
+    removed: Vec<String>,
+    /// What the resource must report, in the order it holds its tags.
+    expected: Vec<(String, String)>,
+}
+
+fn import_rows() -> Vec<ImportRow> {
+    let at_the_limit: Vec<(String, String)> = (0..MAX_TAGS_PER_RESOURCE)
+        .map(|index| (format!("k{index:02}"), format!("v{index}")))
+        .collect();
+
+    vec![
+        ImportRow {
+            case: "tags the creating import carried",
+            created_with: Some(tag_pairs(&[("env", "prod"), ("owner", "platform")])),
+            reimport: None,
+            tagged: None,
+            removed: Vec::new(),
+            expected: tag_pairs(&[("env", "prod"), ("owner", "platform")]),
+        },
+        ImportRow {
+            case: "an import carrying an empty tag list",
+            created_with: Some(Vec::new()),
+            reimport: None,
+            tagged: None,
+            removed: Vec::new(),
+            expected: Vec::new(),
+        },
+        ImportRow {
+            case: "an import carrying no tag member at all",
+            created_with: None,
+            reimport: None,
+            tagged: None,
+            removed: Vec::new(),
+            expected: Vec::new(),
+        },
+        ImportRow {
+            case: "as many tags as one resource may hold, all from the import",
+            created_with: Some(at_the_limit.clone()),
+            reimport: None,
+            tagged: None,
+            removed: Vec::new(),
+            expected: at_the_limit,
+        },
+        ImportRow {
+            case: "a tagging call adding to the tags the import carried",
+            created_with: Some(tag_pairs(&[("env", "prod")])),
+            reimport: None,
+            tagged: Some(tag_pairs(&[("owner", "platform")])),
+            removed: Vec::new(),
+            expected: tag_pairs(&[("env", "prod"), ("owner", "platform")]),
+        },
+        ImportRow {
+            case: "a tagging call restating a key the import carried",
+            created_with: Some(tag_pairs(&[("env", "staging"), ("owner", "platform")])),
+            reimport: None,
+            tagged: Some(tag_pairs(&[("env", "prod")])),
+            removed: Vec::new(),
+            expected: tag_pairs(&[("env", "prod"), ("owner", "platform")]),
+        },
+        ImportRow {
+            case: "a key the import carried removed again",
+            created_with: Some(tag_pairs(&[("env", "prod"), ("owner", "platform")])),
+            reimport: None,
+            tagged: None,
+            removed: vec!["env".to_string()],
+            expected: tag_pairs(&[("owner", "platform")]),
+        },
+        ImportRow {
+            case: "a re-import of the same content restating no tags",
+            created_with: Some(tag_pairs(&[("env", "prod")])),
+            reimport: reimported_with(EN_FR_CSV, None),
+            tagged: None,
+            removed: Vec::new(),
+            expected: tag_pairs(&[("env", "prod")]),
+        },
+        ImportRow {
+            case: "a re-import of other content restating no tags",
+            created_with: Some(tag_pairs(&[("env", "prod"), ("owner", "platform")])),
+            reimport: reimported_with(EN_FR_CSV_OTHER, None),
+            tagged: None,
+            removed: Vec::new(),
+            expected: tag_pairs(&[("env", "prod"), ("owner", "platform")]),
+        },
+        ImportRow {
+            case: "a re-import restating the resource's tags",
+            created_with: Some(tag_pairs(&[("env", "prod"), ("owner", "platform")])),
+            reimport: reimported_with(EN_FR_CSV_OTHER, Some(tag_pairs(&[("team", "nlp")]))),
+            tagged: None,
+            removed: Vec::new(),
+            expected: tag_pairs(&[("team", "nlp")]),
+        },
+        ImportRow {
+            case: "a re-import carrying an empty tag list",
+            created_with: Some(tag_pairs(&[("env", "prod")])),
+            reimport: reimported_with(EN_FR_CSV_OTHER, Some(Vec::new())),
+            tagged: None,
+            removed: Vec::new(),
+            expected: Vec::new(),
+        },
+        ImportRow {
+            case: "a re-import restating no tags, then a tagging call",
+            created_with: Some(tag_pairs(&[("env", "prod")])),
+            reimport: reimported_with(EN_FR_CSV_OTHER, None),
+            tagged: Some(tag_pairs(&[("owner", "platform")])),
+            removed: Vec::new(),
+            expected: tag_pairs(&[("env", "prod"), ("owner", "platform")]),
+        },
+    ]
+}
+
+/// A report shows the tag set the resource is holding whichever call wrote it:
+/// the import that created the resource writes tags no less than a later
+/// tagging call does, and an import that restates none leaves the resource the
+/// tags it already carried. The resource is addressed by the ARN it carries at
+/// that moment, which a re-import of other content mints anew.
+#[tokio::test]
+async fn list_tags_for_resource_reports_tags_whichever_call_wrote_them() {
+    let router = router();
+
+    for (index, row) in import_rows().into_iter().enumerate() {
+        let name = format!("created-{index:02}-terms");
+        let (status, imported) =
+            import_with_tags(&router, &name, EN_FR_CSV, row.created_with.as_deref()).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: ImportTerminology answered {status} {imported}",
+            row.case
+        );
+
+        // The content the resource currently holds, which is what its ARN
+        // carries the revision of.
+        let mut current: &[u8] = EN_FR_CSV;
+        if let Some(again) = row.reimport.as_ref() {
+            let (status, reimported) =
+                import_with_tags(&router, &name, again.file, again.tags.as_deref()).await;
+            assert_eq!(
+                status, 200,
+                "case {:?}: the re-import answered {status} {reimported}",
+                row.case
+            );
+            if again.file != EN_FR_CSV {
+                // The first import's ARN is superseded, so it names no
+                // resource and is refused rather than reporting a tag list.
+                let superseded = expected_arn(&name, EN_FR_CSV);
+                let (status, answered) = call(
+                    &router,
+                    "ListTagsForResource",
+                    &json!({"ResourceArn": superseded}),
+                )
+                .await;
+                assert_eq!(
+                    status, 400,
+                    "case {:?}: expected the superseded ARN to be refused, got {status} {answered}",
+                    row.case
+                );
+                assert_eq!(
+                    error_code(&answered),
+                    "ResourceNotFoundException",
+                    "case {:?}: got {answered}",
+                    row.case
+                );
+            }
+            current = again.file;
+        }
+
+        let arn = expected_arn(&name, current);
+        if let Some(tags) = row.tagged.as_ref() {
+            let (status, answered) = call(
+                &router,
+                "TagResource",
+                &json!({"ResourceArn": arn, "Tags": tag_list(tags)}),
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {:?}: TagResource answered {status} {answered}",
+                row.case
+            );
+        }
+        if !row.removed.is_empty() {
+            let (status, answered) = call(
+                &router,
+                "UntagResource",
+                &json!({"ResourceArn": arn, "TagKeys": Value::Array(
+                    row.removed.iter().map(|key| json!(key)).collect()
+                )}),
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {:?}: UntagResource answered {status} {answered}",
+                row.case
+            );
+        }
+
+        let expected: Vec<Value> = row
+            .expected
+            .iter()
+            .map(|(key, value)| json!({"Key": key, "Value": value}))
+            .collect();
+        let listed = listed_tags(&router, row.case, &arn).await;
+        assert_eq!(
+            listed, expected,
+            "case {:?}: expected the reported tags {expected:?}, got {listed:?}",
+            row.case
+        );
+    }
 }
