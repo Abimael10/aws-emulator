@@ -23,9 +23,8 @@
 //! of those codes falls in. The `Proxy` field is the same for every row because every one of
 //! these calls is made directly, with no proxy between.
 
-use std::time::Duration;
-
-use crate::stack_lifecycle::{create_stack, ec2, resource_event_reason, router};
+use crate::harness::{failed_resource_reason, is_a_request_id, quoted_and_class, REGION};
+use crate::stack_lifecycle::{create_stack, ec2, router};
 
 /// The SDK's own name for Amazon EC2, as the exception its SDK raises states it.
 const EC2_SERVICE: &str = "Ec2";
@@ -38,15 +37,8 @@ const REFUSED_STATUS: u16 = 400;
 /// emulator makes in process is.
 const DIRECT_CALL_PROXY: &str = "Proxy: null";
 
-/// How long a row waits for the failed resource's event to be there before giving up.
-///
-/// Generous on purpose: the only thing being waited FOR is the deployment recording the
-/// resource's failure, which is on the stack's own clock, and the wait ends as soon as the
-/// event is readable rather than after a fixed time.
-const EVENT_DEADLINE: Duration = Duration::from_secs(60);
-
-/// How long one look-again waits before asking the event stream once more.
-const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(200);
+/// The status a resource its provider could not create records.
+const CREATE_FAILED: &str = "CREATE_FAILED";
 
 /// The AMI a launch template's data names. The id form is Amazon EC2's own (`ami-` plus 17
 /// hexadecimal characters), which is what that service reads an image id as.
@@ -178,25 +170,6 @@ const ROWS: &[Row] = &[
     },
 ];
 
-/// The quoted provider message and the reported `HandlerErrorCode` of one
-/// `ResourceStatusReason`.
-fn quoted_and_class(case: &str, reason: &str) -> (String, String) {
-    const OPENS: &str = "Resource handler returned message: \"";
-    const TOKEN: &str = "\" (RequestToken: ";
-    const CLASS: &str = "HandlerErrorCode: ";
-    let rest = reason.strip_prefix(OPENS).unwrap_or_else(|| {
-        panic!("case {case:?}: expected the reason to open with {OPENS:?}, got {reason:?}")
-    });
-    let (quoted, tail) = rest.split_once(TOKEN).unwrap_or_else(|| {
-        panic!("case {case:?}: expected a quoted message and a RequestToken, got {reason:?}")
-    });
-    let class = tail
-        .split_once(CLASS)
-        .and_then(|(_, class)| class.strip_suffix(')'))
-        .unwrap_or_else(|| panic!("case {case:?}: expected a HandlerErrorCode, got {reason:?}"));
-    (quoted.to_string(), class.to_string())
-}
-
 /// The owning service's own sentence and the diagnostic its SDK appended, split apart.
 fn sentence_and_diagnostic(case: &str, quoted: &str) -> (String, String) {
     const OPENS: &str = " (Service: ";
@@ -256,18 +229,6 @@ fn assert_diagnostic(case: &str, envelope: &str, code: &str) -> String {
     request_id.to_string()
 }
 
-/// Whether `value` has the 8-4-4-4-12 lowercase-hexadecimal form an AWS request id carries.
-fn is_a_request_id(value: &str) -> bool {
-    let groups: Vec<&str> = value.split('-').collect();
-    groups.len() == 5
-        && groups.iter().map(|group| group.len()).eq([8, 4, 4, 4, 12])
-        && groups.iter().all(|group| {
-            group
-                .chars()
-                .all(|held| held.is_ascii_hexdigit() && !held.is_ascii_uppercase())
-        })
-}
-
 /// Register one launch template in Amazon EC2 directly, so a stack that declares the same name
 /// meets a name that service really holds.
 async fn register_launch_template(
@@ -291,28 +252,6 @@ async fn register_launch_template(
     );
 }
 
-/// The `ResourceStatusReason` of `logical_id`'s `CREATE_FAILED` event, looked for again until
-/// the deployment has recorded it or [`EVENT_DEADLINE`] passes.
-async fn failure_reason(
-    router: &smithy_server_runtime::MultiServiceRouter,
-    case: &str,
-    stack: &str,
-    logical_id: &str,
-) -> String {
-    let deadline = tokio::time::Instant::now() + EVENT_DEADLINE;
-    loop {
-        let reason = resource_event_reason(router, stack, logical_id, "CREATE_FAILED").await;
-        if !reason.is_empty() {
-            return reason;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "case {case:?}: {logical_id} never recorded a CREATE_FAILED reason"
-        );
-        tokio::time::sleep(EVENT_POLL_INTERVAL).await;
-    }
-}
-
 /// Deploy one row's stack and answer the quoted message and the class its failed resource
 /// reports.
 async fn refusal_of(
@@ -326,7 +265,15 @@ async fn refusal_of(
         "case {:?}: CreateStack must answer 200, got {status_code} {created}",
         row.case
     );
-    let reason = failure_reason(router, row.case, stack, row.logical_id).await;
+    let reason = failed_resource_reason(
+        row.case,
+        router,
+        REGION,
+        stack,
+        row.logical_id,
+        CREATE_FAILED,
+    )
+    .await;
     quoted_and_class(row.case, &reason)
 }
 

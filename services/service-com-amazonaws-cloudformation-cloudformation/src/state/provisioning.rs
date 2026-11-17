@@ -4336,6 +4336,25 @@ const SDK_SERVICE_NAMES: &[(&str, &str, SdkDiagnostic)] = &[
     ("es", "OpenSearch", SdkDiagnostic::Attempts),
     ("iam", "Iam", SdkDiagnostic::Attempts),
     ("lambda", "Lambda", SdkDiagnostic::Attempts),
+    // Amazon CloudWatch Logs's SDK names it by that model's own `sdkId` (`CloudWatch Logs`,
+    // `smithy_query(query="service_info")` on that service's model) written as one word,
+    // exactly as Application Auto Scaling's above is. Its diagnostic is worded for a refusal
+    // of the REQUEST and for no other class ([`SdkDiagnostic::EnvelopeOnRefusedRequest`]),
+    // which is what the recorded `ResourceStatusReason` of each class of failure of its types
+    // reports: an `AWS::Logs::MetricFilter` whose declared pattern that service cannot read,
+    // and an `AWS::Logs::SubscriptionFilter` whose declared Lambda destination may not be
+    // invoked, each carry `"… (Service: CloudWatchLogs, Status Code: 400, Request ID: …)"`
+    // (in the behavioral corpus `simparity-behavioral-aws-v1`, checks
+    // `cloudformation__lambda__logs.cfn-logs-subscription-filter-missing-permission-rejected-at-create`
+    // among them), where a log group whose name is already taken and a filter whose declared
+    // group is not there carry that service's own sentence alone. The four resource types
+    // this emulator provisions over this signing name are all that service's
+    // ([`provisioning::logs_resources`]).
+    (
+        "logs",
+        "CloudWatchLogs",
+        SdkDiagnostic::EnvelopeOnRefusedRequest,
+    ),
     // Neptune Analytics' SDK names it `NeptuneGraph` — that model's own `sdkId`
     // (`Neptune Graph`) written as one word, exactly as Application Auto Scaling's above is —
     // and words the ATTEMPT-counting shape, as the recorded `ResourceStatusReason` of an
@@ -4409,6 +4428,12 @@ enum SdkDiagnostic {
     /// comma-separated envelope [`SdkDiagnostic::Attempts`] opens with, and NOTHING after it:
     /// the SDK of such a service words no attempt count at all.
     Envelope,
+    /// [`SdkDiagnostic::Envelope`] for a refusal of the REQUEST, and NOTHING AT ALL for one of
+    /// any other class ([`handler_error_code`]): the providers of such a service's types pass
+    /// the SDK's own exception on for the invalid-request class — where the diagnostic is part
+    /// of the message that exception carries — and report every other class as the owning
+    /// service's own sentence alone.
+    EnvelopeOnRefusedRequest,
     /// `(Service: <service>; Status Code: <status>; Error Code: <code>; Request ID: <id>;
     /// Proxy: null)` — semicolon-separated like [`SdkDiagnostic::Operation`], naming the error
     /// code the call was refused with but not the call, and closing with the PROXY the SDK made
@@ -4461,8 +4486,10 @@ fn sdk_request_ids(signing_name: &str) -> String {
 /// call and how many attempts the SDK made at it.
 ///
 /// `None` for a service [`SDK_SERVICE_NAMES`] does not name, which leaves the message as
-/// that service worded it — and for a diagnostic that NAMES the operation when the caller
-/// named none, since an operation is not something to invent.
+/// that service worded it — for a diagnostic that NAMES the operation when the caller
+/// named none, since an operation is not something to invent, and for a service whose
+/// providers report one only on a refusal of the REQUEST
+/// ([`SdkDiagnostic::EnvelopeOnRefusedRequest`]) when the refusal falls in another class.
 ///
 /// `operation` is the called operation as its own model names it, which only a caller that
 /// knows which operation it is making can state ([`call_rest_json_named`]).
@@ -4476,10 +4503,18 @@ fn sdk_diagnostic(
         .iter()
         .find(|(name, _, _)| *name == signing_name)
         .map(|(_, service, shape)| (*service, *shape))?;
+    // The envelope the two comma-separated shapes open with, written once so the two cannot
+    // state the service, the status and the call's id differently.
+    let envelope = || {
+        format!(
+            "(Service: {service}, Status Code: {status}, {})",
+            sdk_request_ids(signing_name),
+        )
+    };
     match shape {
         SdkDiagnostic::Attempts => Some(format!(
-            "(Service: {service}, Status Code: {status}, {}) (SDK Attempt Count: {})",
-            sdk_request_ids(signing_name),
+            "{} (SDK Attempt Count: {})",
+            envelope(),
             sdk_attempt_count(code),
         )),
         SdkDiagnostic::Operation => operation.map(|operation| {
@@ -4489,10 +4524,10 @@ fn sdk_diagnostic(
                 sdk_request_ids(signing_name),
             )
         }),
-        SdkDiagnostic::Envelope => Some(format!(
-            "(Service: {service}, Status Code: {status}, {})",
-            sdk_request_ids(signing_name),
-        )),
+        SdkDiagnostic::Envelope => Some(envelope()),
+        SdkDiagnostic::EnvelopeOnRefusedRequest => {
+            (handler_error_code(code) == HANDLER_ERROR_INVALID_REQUEST).then(envelope)
+        }
         SdkDiagnostic::Proxied => Some(format!(
             "(Service: {service}; Status Code: {status}; Error Code: {code}; {}; \
              Proxy: {SDK_DIRECT_CALL_PROXY})",

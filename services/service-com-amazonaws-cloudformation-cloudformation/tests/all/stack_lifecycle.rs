@@ -392,32 +392,18 @@ pub(crate) async fn autoscaling(
 /// `StackEvent$ResourceStatusReason` is the "success/failure message associated with the
 /// resource", so this is the PER-RESOURCE field a failing resource's own diagnosis — the
 /// refusal the service that owns it answered — is reported on, beside the stack-level
-/// summary of which logical resources failed. Shared so every suite that reads one asks
-/// for it the same way.
+/// summary of which logical resources failed. Answered from the harness's own reader of
+/// that field ([`crate::harness::resource_event_reason_in`]) under the Region these suites
+/// deploy in, so this suite, the waiter the refusal suites poll and every other caller read
+/// it the same way.
 pub(crate) async fn resource_event_reason(
     router: &MultiServiceRouter,
     stack: &str,
     logical_id: &str,
     resource_status: &str,
 ) -> String {
-    let (code, body) = call(
-        router,
-        "DescribeStackEvents",
-        &[member("StackName", stack)],
-    )
-    .await;
-    assert_eq!(
-        code, 200,
-        "DescribeStackEvents({stack}) must answer 200, got {code} {body}"
-    );
-    xml_blocks(&body, "member")
-        .iter()
-        .find(|entry| {
-            xml_text(entry, "LogicalResourceId").as_deref() == Some(logical_id)
-                && xml_text(entry, "ResourceStatus").as_deref() == Some(resource_status)
-        })
-        .and_then(|entry| xml_text(entry, "ResourceStatusReason"))
-        .unwrap_or_default()
+    crate::harness::resource_event_reason_in(router, REGION, stack, logical_id, resource_status)
+        .await
 }
 
 /// Every `ResourceStatus` the stack's event stream carries for `logical_id`, newest first —

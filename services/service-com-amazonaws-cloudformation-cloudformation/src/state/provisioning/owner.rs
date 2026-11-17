@@ -1271,7 +1271,11 @@ impl Owner {
             | Self::LambdaVersion => message.to_string(),
             // Amazon DynamoDB's does the same.
             Self::DynamodbTable => message.to_string(),
-            // Amazon CloudWatch Logs's and AWS IoT's do the same.
+            // AWS IoT's does the same. Amazon CloudWatch Logs's providers word the plugin's
+            // invalid-request exception around the SDK exception they wrapped, and that
+            // wording is applied where the refusal is READ — at the call, which is where the
+            // type whose provider made it is known ([`logs_resources::provider_exception`]) —
+            // so nothing of it is added a second time here.
             Self::LogsResource(_) | Self::IotAuthorizer => message.to_string(),
             // Amazon CloudFront's does the same.
             Self::CloudFrontResource(_) => message.to_string(),

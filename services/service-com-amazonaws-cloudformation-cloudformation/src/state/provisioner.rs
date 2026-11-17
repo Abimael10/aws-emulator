@@ -628,7 +628,11 @@ const NOT_IMPLEMENTED: &str = "NotImplemented";
 /// refusal it classifies as that plugin's invalid-request failure: the class's own sentence
 /// opener, with the owning service's message after it
 /// ([`Provisioner::handler_message`]).
-const INVALID_REQUEST_PROVIDED: &str = "Invalid request provided: ";
+///
+/// Read by the per-type half of provisioning too, for a provider whose invalid-request
+/// exception is raised around the TYPE it manages as well as the message
+/// ([`super::provisioning::logs_resources`]), so there is one spelling of that opener.
+pub(in crate::state) const INVALID_REQUEST_PROVIDED: &str = "Invalid request provided: ";
 
 /// The services whose resources this emulator creates. One variant per resource type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

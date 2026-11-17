@@ -739,6 +739,170 @@ pub async fn settled_stack(
     }
 }
 
+/// The quoted provider message and the reported `HandlerErrorCode` of one
+/// `ResourceStatusReason`.
+///
+/// CloudFormation reports a failed resource's cause in one envelope — `Resource handler
+/// returned message: "<the provider's message>" (RequestToken: <token>, HandlerErrorCode:
+/// <class>)` — so the ONE reader of that envelope lives here and every suite that asks what a
+/// provider reported splits it the same way.
+pub fn quoted_and_class(case: &str, reason: &str) -> (String, String) {
+    const OPENS: &str = "Resource handler returned message: \"";
+    const TOKEN: &str = "\" (RequestToken: ";
+    const CLASS: &str = "HandlerErrorCode: ";
+    let rest = reason.strip_prefix(OPENS).unwrap_or_else(|| {
+        panic!("case {case:?}: expected the reason to open with {OPENS:?}, got {reason:?}")
+    });
+    let (quoted, tail) = rest.split_once(TOKEN).unwrap_or_else(|| {
+        panic!("case {case:?}: expected a quoted message and a RequestToken, got {reason:?}")
+    });
+    let class = tail
+        .split_once(CLASS)
+        .and_then(|(_, class)| class.strip_suffix(')'))
+        .unwrap_or_else(|| panic!("case {case:?}: expected a HandlerErrorCode, got {reason:?}"));
+    (quoted.to_string(), class.to_string())
+}
+
+/// Hold one quoted exception to the diagnostic the owning service's SDK appends: the sentence
+/// that service worded, then `service` as its SDK names it, the `status` it answered and the id
+/// of the call — and nothing beyond the call itself.
+///
+/// Shared, because the shape is the SDK's rather than any one service's: a suite about another
+/// service's refusals asks the same question with another name and status.
+pub fn assert_sdk_diagnostic(case: &str, quoted: &str, service: &str, status: u16) {
+    const OPENS: &str = " (Service: ";
+    let (sentence, diagnostic) = quoted.rsplit_once(OPENS).unwrap_or_else(|| {
+        panic!(
+            "case {case:?}: expected the SDK diagnostic after the service's own sentence, got \
+             {quoted:?}"
+        )
+    });
+    assert!(
+        !sentence.trim().is_empty(),
+        "case {case:?}: expected the service's own sentence ahead of the diagnostic, got \
+         {quoted:?}"
+    );
+    let envelope = diagnostic.strip_suffix(')').unwrap_or_else(|| {
+        panic!("case {case:?}: expected the diagnostic to close, got {quoted:?}")
+    });
+    let fields: Vec<&str> = envelope.split(", ").collect();
+    assert_eq!(
+        fields.len(),
+        3,
+        "case {case:?}: expected the service, the status and the call's id and nothing else, \
+         got {envelope:?}"
+    );
+    assert_eq!(
+        fields[0], service,
+        "case {case:?}: expected the SDK's own name for the service, got {:?}",
+        fields[0]
+    );
+    assert_eq!(
+        fields[1],
+        format!("Status Code: {status}"),
+        "case {case:?}: expected the status the owning service answered, got {:?}",
+        fields[1]
+    );
+    let request_id = fields[2]
+        .strip_prefix("Request ID: ")
+        .unwrap_or_else(|| panic!("case {case:?}: expected a Request ID, got {:?}", fields[2]));
+    assert!(
+        is_a_request_id(request_id),
+        "case {case:?}: expected the id of the call in the form that service's answers carry, \
+         got {request_id:?}"
+    );
+}
+
+/// Whether `value` has the 8-4-4-4-12 lowercase-hexadecimal form an AWS request id carries.
+pub fn is_a_request_id(value: &str) -> bool {
+    let groups: Vec<&str> = value.split('-').collect();
+    groups.len() == 5
+        && groups.iter().map(|group| group.len()).eq([8, 4, 4, 4, 12])
+        && groups.iter().all(|group| {
+            group
+                .chars()
+                .all(|held| held.is_ascii_hexdigit() && !held.is_ascii_uppercase())
+        })
+}
+
+/// How long [`failed_resource_reason`] waits for a failed resource's own event to be recorded,
+/// and how often it looks again.
+///
+/// Generous on purpose, exactly as [`SETTLE_DEADLINE`] is: what is waited FOR is the event
+/// appearing, which is on the stack's own clock, and the wait ends as soon as it is readable.
+pub const EVENT_DEADLINE: Duration = Duration::from_secs(60);
+/// See [`EVENT_DEADLINE`].
+pub const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// The `ResourceStatusReason` `logical_id` recorded on its event in `resource_status`, or the
+/// empty string where the stack has recorded none.
+///
+/// `StackEvent$ResourceStatusReason` is the "success/failure message associated with the
+/// resource", so this is the PER-RESOURCE field a failing resource's own diagnosis — the
+/// refusal the service that owns it answered — is reported on. The ONE reader of it, which
+/// [`failed_resource_reason`] polls and which [`crate::stack_lifecycle::resource_event_reason`]
+/// answers from, so every suite that asks reads the same field the same way.
+pub async fn resource_event_reason_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    stack: &str,
+    logical_id: &str,
+    resource_status: &str,
+) -> String {
+    let (code, body) = call_in(
+        router,
+        region,
+        "DescribeStackEvents",
+        &[member("StackName", stack)],
+    )
+    .await;
+    assert_eq!(
+        code, 200,
+        "DescribeStackEvents({stack}) must answer 200, got {code} {body}"
+    );
+    xml_blocks(&body, "member")
+        .iter()
+        .find(|entry| {
+            xml_text(entry, "LogicalResourceId").as_deref() == Some(logical_id)
+                && xml_text(entry, "ResourceStatus").as_deref() == Some(resource_status)
+        })
+        .and_then(|entry| xml_text(entry, "ResourceStatusReason"))
+        .unwrap_or_default()
+}
+
+/// The `ResourceStatusReason` of `logical_id`'s event in `resource_status`, looked for again
+/// until the stack has recorded it or [`EVENT_DEADLINE`] passes.
+///
+/// The shared waiter for the suites that read what a provider reported: a resource's failure is
+/// recorded at an INSTANT the deployment reaches, so what a caller waits for is that event
+/// appearing. A wait that runs out names every reason the stack DID record, so a case whose
+/// resource failed somewhere else says where.
+pub async fn failed_resource_reason(
+    case: &str,
+    router: &MultiServiceRouter,
+    region: &str,
+    stack: &str,
+    logical_id: &str,
+    resource_status: &str,
+) -> String {
+    let deadline = tokio::time::Instant::now() + EVENT_DEADLINE;
+    loop {
+        let reason =
+            resource_event_reason_in(router, region, stack, logical_id, resource_status).await;
+        if !reason.is_empty() {
+            return reason;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let recorded = stack_event_reasons(router, region, stack).await;
+            panic!(
+                "case {case:?}: {logical_id} never recorded a {resource_status} reason; the \
+                 stack recorded {recorded:?}"
+            );
+        }
+        tokio::time::sleep(EVENT_POLL_INTERVAL).await;
+    }
+}
+
 /// The `ResourceStatusReason` of every event a stack recorded — the deployment's own account
 /// of itself, which is what a failed assertion names and what a case expecting a REFUSAL
 /// reads the owning service's report out of.

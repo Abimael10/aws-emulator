@@ -239,7 +239,14 @@ async fn create_log_group(
             ),
         );
     }
-    call_logs(ctx, region, "CreateLogGroup", &Value::Object(request)).await?;
+    call_logs(
+        ctx,
+        region,
+        Kind::LogGroup,
+        "CreateLogGroup",
+        &Value::Object(request),
+    )
+    .await?;
     if let Err(refusal) = group_settings(ctx, region, &name, &resource.properties).await {
         // Nothing half-configured is left behind for the rollback to find: the group this
         // call created is taken away again before the resource is reported failed.
@@ -272,21 +279,28 @@ async fn group_settings(
             "logGroupName": name,
             "retentionInDays": days,
         });
-        call_logs(ctx, region, "PutRetentionPolicy", &request).await?;
+        call_logs(ctx, region, Kind::LogGroup, "PutRetentionPolicy", &request).await?;
     }
     if let Some(policy) = properties.get("DataProtectionPolicy") {
         let request = serde_json::json!({
             "logGroupIdentifier": name,
             "policyDocument": policy_document(policy),
         });
-        call_logs(ctx, region, "PutDataProtectionPolicy", &request).await?;
+        call_logs(
+            ctx,
+            region,
+            Kind::LogGroup,
+            "PutDataProtectionPolicy",
+            &request,
+        )
+        .await?;
     }
     for policy in field_index_policies(properties) {
         let request = serde_json::json!({
             "logGroupIdentifier": name,
             "policyDocument": policy_document(&policy),
         });
-        call_logs(ctx, region, "PutIndexPolicy", &request).await?;
+        call_logs(ctx, region, Kind::LogGroup, "PutIndexPolicy", &request).await?;
     }
     Ok(())
 }
@@ -337,7 +351,7 @@ async fn create_log_stream(
         "logGroupName": declared_log_group(declared).ok_or_else(|| missing(resource, LOG_GROUP_NAME))?,
         "logStreamName": resource.physical_resource_id.clone(),
     });
-    call_logs(ctx, region, "CreateLogStream", &request).await?;
+    call_logs(ctx, region, Kind::LogStream, "CreateLogStream", &request).await?;
     Ok(Created::attributes(BTreeMap::new()))
 }
 
@@ -391,7 +405,14 @@ async fn put_subscription_filter(
     if let Some(flag) = declared.get("ApplyOnTransformedLogs").and_then(declared_flag) {
         request.insert("applyOnTransformedLogs".to_string(), Value::Bool(flag));
     }
-    call_logs(ctx, region, "PutSubscriptionFilter", &Value::Object(request)).await?;
+    call_logs(
+        ctx,
+        region,
+        Kind::SubscriptionFilter,
+        "PutSubscriptionFilter",
+        &Value::Object(request),
+    )
+    .await?;
     Ok(Created::attributes(BTreeMap::new()))
 }
 
@@ -429,7 +450,14 @@ async fn put_metric_filter(
     if let Some(flag) = declared.get("ApplyOnTransformedLogs").and_then(declared_flag) {
         request.insert("applyOnTransformedLogs".to_string(), Value::Bool(flag));
     }
-    call_logs(ctx, region, "PutMetricFilter", &Value::Object(request)).await?;
+    call_logs(
+        ctx,
+        region,
+        Kind::MetricFilter,
+        "PutMetricFilter",
+        &Value::Object(request),
+    )
+    .await?;
     Ok(Created::attributes(BTreeMap::new()))
 }
 
@@ -656,11 +684,19 @@ async fn update_log_group(
                     "logGroupName": name,
                     "retentionInDays": days,
                 });
-                call_logs(ctx, region, "PutRetentionPolicy", &request).await?;
+                call_logs(ctx, region, Kind::LogGroup, "PutRetentionPolicy", &request)
+                    .await?;
             }
             _ => {
                 let request = serde_json::json!({"logGroupName": name});
-                call_logs(ctx, region, "DeleteRetentionPolicy", &request).await?;
+                call_logs(
+                    ctx,
+                    region,
+                    Kind::LogGroup,
+                    "DeleteRetentionPolicy",
+                    &request,
+                )
+                .await?;
             }
         }
     }
@@ -671,11 +707,25 @@ async fn update_log_group(
                     "logGroupIdentifier": name,
                     "policyDocument": policy_document(policy),
                 });
-                call_logs(ctx, region, "PutDataProtectionPolicy", &request).await?;
+                call_logs(
+                    ctx,
+                    region,
+                    Kind::LogGroup,
+                    "PutDataProtectionPolicy",
+                    &request,
+                )
+                .await?;
             }
             _ => {
                 let request = serde_json::json!({"logGroupIdentifier": name});
-                call_logs(ctx, region, "DeleteDataProtectionPolicy", &request).await?;
+                call_logs(
+                    ctx,
+                    region,
+                    Kind::LogGroup,
+                    "DeleteDataProtectionPolicy",
+                    &request,
+                )
+                .await?;
             }
         }
     }
@@ -683,14 +733,14 @@ async fn update_log_group(
         let policies = field_index_policies(after);
         if policies.is_empty() {
             let request = serde_json::json!({"logGroupIdentifier": name});
-            call_logs(ctx, region, "DeleteIndexPolicy", &request).await?;
+            call_logs(ctx, region, Kind::LogGroup, "DeleteIndexPolicy", &request).await?;
         }
         for policy in policies {
             let request = serde_json::json!({
                 "logGroupIdentifier": name,
                 "policyDocument": policy_document(&policy),
             });
-            call_logs(ctx, region, "PutIndexPolicy", &request).await?;
+            call_logs(ctx, region, Kind::LogGroup, "PutIndexPolicy", &request).await?;
         }
     }
     let key_before = declared_text(before, "KmsKeyId");
@@ -702,11 +752,11 @@ async fn update_log_group(
                     "logGroupName": name,
                     "kmsKeyId": key,
                 });
-                call_logs(ctx, region, "AssociateKmsKey", &request).await?;
+                call_logs(ctx, region, Kind::LogGroup, "AssociateKmsKey", &request).await?;
             }
             None => {
                 let request = serde_json::json!({"logGroupName": name});
-                call_logs(ctx, region, "DisassociateKmsKey", &request).await?;
+                call_logs(ctx, region, Kind::LogGroup, "DisassociateKmsKey", &request).await?;
             }
         }
     }
@@ -755,7 +805,7 @@ pub(super) async fn delete(
             }),
         ),
     };
-    match call_logs(ctx, region, operation, &request).await {
+    match call_logs(ctx, region, kind, operation, &request).await {
         Ok(_) => Ok(()),
         Err(refusal) if refusal.code == NOT_FOUND => Ok(()),
         Err(refusal) => Err(refusal),
@@ -769,7 +819,7 @@ async fn delete_log_group(
     name: &str,
 ) -> Result<(), Refusal> {
     let request = serde_json::json!({"logGroupName": name});
-    call_logs(ctx, region, "DeleteLogGroup", &request)
+    call_logs(ctx, region, Kind::LogGroup, "DeleteLogGroup", &request)
         .await
         .map(|_| ())
 }
@@ -792,7 +842,15 @@ pub(super) async fn actual_configuration(
     match kind {
         Kind::LogGroup => {
             let request = serde_json::json!({"logGroupNamePrefix": name.clone()});
-            let answer = match call_logs(ctx, region, "DescribeLogGroups", &request).await {
+            let answer = match call_logs(
+                ctx,
+                region,
+                Kind::LogGroup,
+                "DescribeLogGroups",
+                &request,
+            )
+            .await
+            {
                 Ok(answer) => answer,
                 Err(refusal) if refusal.code == NOT_FOUND => return Ok(None),
                 Err(refusal) => return Err(refusal),
@@ -827,7 +885,15 @@ pub(super) async fn actual_configuration(
                 "logGroupName": required_log_group(resource)?,
                 "filterNamePrefix": name.clone(),
             });
-            let answer = match call_logs(ctx, region, "DescribeMetricFilters", &request).await {
+            let answer = match call_logs(
+                ctx,
+                region,
+                Kind::MetricFilter,
+                "DescribeMetricFilters",
+                &request,
+            )
+            .await
+            {
                 Ok(answer) => answer,
                 Err(refusal) if refusal.code == NOT_FOUND => return Ok(None),
                 Err(refusal) => return Err(refusal),
@@ -861,7 +927,15 @@ pub(super) async fn actual_configuration(
                 "filterNamePrefix": name.clone(),
             });
             let answer =
-                match call_logs(ctx, region, "DescribeSubscriptionFilters", &request).await {
+                match call_logs(
+                    ctx,
+                    region,
+                    Kind::SubscriptionFilter,
+                    "DescribeSubscriptionFilters",
+                    &request,
+                )
+                .await
+                {
                     Ok(answer) => answer,
                     Err(refusal) if refusal.code == NOT_FOUND => return Ok(None),
                     Err(refusal) => return Err(refusal),
@@ -985,10 +1059,58 @@ fn refuse_unapplied_properties(
     Ok(())
 }
 
+/// The type `kind` names, as a template declares it — the inverse of [`kind_of`], and the
+/// type one of these providers names as the type it manages ([`provider_exception`]).
+fn type_name(kind: Kind) -> &'static str {
+    match kind {
+        Kind::LogGroup => LOGS_LOG_GROUP,
+        Kind::LogStream => LOGS_LOG_STREAM,
+        Kind::MetricFilter => LOGS_METRIC_FILTER,
+        Kind::SubscriptionFilter => LOGS_SUBSCRIPTION_FILTER,
+    }
+}
+
+/// One refusal Amazon CloudWatch Logs answered, as the EXCEPTION the provider of `kind`
+/// raises for it — which is what CloudFormation quotes on the failed resource's event
+/// ([`super::handler_failure_reason`]).
+///
+/// These providers are written against the CloudFormation resource-provider plugin, so a
+/// refusal of the REQUEST is re-raised as that plugin's invalid-request exception: its
+/// wording names the TYPE the handler manages and carries the SDK exception it wrapped —
+/// that service's own sentence plus its SDK's diagnostic of the call ([`super::sdk_message`])
+/// — so the reason reads `Invalid request provided: AWS::Logs::MetricFilter. <the SDK
+/// exception>`. A refusal of any OTHER class is passed on as that service worded it: a group
+/// whose name is already taken, or a group a declaration names that is not there, reaches the
+/// event as that service's sentence alone.
+///
+/// The class is the one CloudFormation reports the failure under
+/// ([`super::handler_error_code`]) — decided by the error CODE that service answered, never by
+/// message text a request can influence — so this wording and the `HandlerErrorCode` the event
+/// carries cannot disagree.
+fn provider_exception(kind: Kind, refusal: Refusal) -> Refusal {
+    if super::handler_error_code(&refusal.code) != super::HANDLER_ERROR_INVALID_REQUEST {
+        return refusal;
+    }
+    Refusal {
+        message: format!(
+            "{}{}. {}",
+            crate::state::provisioner::INVALID_REQUEST_PROVIDED,
+            type_name(kind),
+            refusal.message,
+        ),
+        code: refusal.code,
+    }
+}
+
 /// Call one Amazon CloudWatch Logs operation on the awsJson1_1 wire its model declares.
+///
+/// `kind` is the type whose provider is making the call, because a refusal that service
+/// answers is reported as the exception THAT provider raises for it
+/// ([`provider_exception`]).
 async fn call_logs(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
+    kind: Kind,
     operation: &str,
     request: &Value,
 ) -> Result<Value, Refusal> {
@@ -1001,6 +1123,7 @@ async fn call_logs(
         request,
     )
     .await
+    .map_err(|refusal| provider_exception(kind, refusal))
 }
 
 #[cfg(test)]
@@ -1025,6 +1148,34 @@ mod tests {
             assert_eq!(
                 actual, *expected,
                 "case {resource_type:?}: expected kind_of {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// Each kind names the type whose provider makes its calls, and that name resolves back to
+    /// the same kind: the exception a refused call is reported as names the type from here
+    /// ([`provider_exception`]), so a kind mapped to another type's name would report the wrong
+    /// type on a failed resource of every kind this module owns.
+    #[test]
+    fn each_kind_names_the_type_it_provisions() {
+        let cases: &[(Kind, &str)] = &[
+            (Kind::LogGroup, LOGS_LOG_GROUP),
+            (Kind::LogStream, LOGS_LOG_STREAM),
+            (Kind::MetricFilter, LOGS_METRIC_FILTER),
+            (Kind::SubscriptionFilter, LOGS_SUBSCRIPTION_FILTER),
+        ];
+        for (kind, expected) in cases {
+            let named = type_name(*kind);
+            assert_eq!(
+                named, *expected,
+                "case {kind:?}: expected the type name {expected:?}, got {named:?}"
+            );
+            let round_tripped = kind_of(named);
+            assert_eq!(
+                round_tripped,
+                Some(*kind),
+                "case {kind:?}: expected {named:?} to name this kind again, got \
+                 {round_tripped:?}"
             );
         }
     }

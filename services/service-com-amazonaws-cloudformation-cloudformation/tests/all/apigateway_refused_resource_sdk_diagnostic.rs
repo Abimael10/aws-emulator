@@ -23,23 +23,15 @@
 //! 400 and `NotFoundException` is 404) — which is also what puts the two refusals in
 //! different `HandlerErrorCode` classes.
 
-use std::time::Duration;
-
-use crate::stack_lifecycle::{create_stack, resource_event_reason, router, wait_for_the_transition};
+use crate::harness::{assert_sdk_diagnostic, failed_resource_reason, quoted_and_class, REGION};
+use crate::stack_lifecycle::{create_stack, router, wait_for_the_transition};
 
 /// The SDK's own name for Amazon API Gateway, as the exception its SDK raises states it:
 /// that model's `awsService.cloudFormationName`.
 const API_GATEWAY_SERVICE: &str = "ApiGateway";
 
-/// How long a row waits for the failed resource's event to be there before giving up.
-///
-/// Generous on purpose: the only thing being waited FOR is the stack reaching its terminal
-/// status, which is on the stack's own clock, and the wait ends as soon as the event is
-/// readable rather than after a fixed time.
-const EVENT_DEADLINE: Duration = Duration::from_secs(60);
-
-/// How long one look-again waits before asking the event stream once more.
-const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(200);
+/// The status a resource its provider could not create records.
+const CREATE_FAILED: &str = "CREATE_FAILED";
 
 /// One row: the stack to deploy, the resource the owning service refuses, and what its reason
 /// must report.
@@ -102,106 +94,6 @@ const ROWS: &[Row] = &[
     },
 ];
 
-/// The quoted provider message and the reported `HandlerErrorCode` of one
-/// `ResourceStatusReason`.
-fn quoted_and_class(case: &str, reason: &str) -> (String, String) {
-    const OPENS: &str = "Resource handler returned message: \"";
-    const TOKEN: &str = "\" (RequestToken: ";
-    const CLASS: &str = "HandlerErrorCode: ";
-    let rest = reason.strip_prefix(OPENS).unwrap_or_else(|| {
-        panic!("case {case:?}: expected the reason to open with {OPENS:?}, got {reason:?}")
-    });
-    let (quoted, tail) = rest.split_once(TOKEN).unwrap_or_else(|| {
-        panic!("case {case:?}: expected a quoted message and a RequestToken, got {reason:?}")
-    });
-    let class = tail
-        .split_once(CLASS)
-        .and_then(|(_, class)| class.strip_suffix(')'))
-        .unwrap_or_else(|| panic!("case {case:?}: expected a HandlerErrorCode, got {reason:?}"));
-    (quoted.to_string(), class.to_string())
-}
-
-/// Hold one quoted exception to the diagnostic API Gateway's SDK appends: the sentence that
-/// service worded, then the service, the status and the id of the call — and nothing beyond
-/// the call itself.
-fn assert_diagnostic(case: &str, quoted: &str, status: u16) {
-    const OPENS: &str = " (Service: ";
-    let (sentence, diagnostic) = quoted.rsplit_once(OPENS).unwrap_or_else(|| {
-        panic!(
-            "case {case:?}: expected the SDK diagnostic after the service's own sentence, got \
-             {quoted:?}"
-        )
-    });
-    assert!(
-        !sentence.trim().is_empty(),
-        "case {case:?}: expected the service's own sentence ahead of the diagnostic, got \
-         {quoted:?}"
-    );
-    let envelope = diagnostic.strip_suffix(')').unwrap_or_else(|| {
-        panic!("case {case:?}: expected the diagnostic to close, got {quoted:?}")
-    });
-    let fields: Vec<&str> = envelope.split(", ").collect();
-    assert_eq!(
-        fields.len(),
-        3,
-        "case {case:?}: expected the service, the status and the call's id and nothing else, \
-         got {envelope:?}"
-    );
-    assert_eq!(
-        fields[0], API_GATEWAY_SERVICE,
-        "case {case:?}: expected the SDK's own name for the service, got {:?}",
-        fields[0]
-    );
-    assert_eq!(
-        fields[1],
-        format!("Status Code: {status}"),
-        "case {case:?}: expected the status the owning service answered, got {:?}",
-        fields[1]
-    );
-    let request_id = fields[2]
-        .strip_prefix("Request ID: ")
-        .unwrap_or_else(|| panic!("case {case:?}: expected a Request ID, got {:?}", fields[2]));
-    assert!(
-        is_a_request_id(request_id),
-        "case {case:?}: expected the id of the call in the form that service's answers carry, \
-         got {request_id:?}"
-    );
-}
-
-/// Whether `value` has the 8-4-4-4-12 lowercase-hexadecimal form an AWS request id carries.
-fn is_a_request_id(value: &str) -> bool {
-    let groups: Vec<&str> = value.split('-').collect();
-    groups.len() == 5
-        && groups.iter().map(|group| group.len()).eq([8, 4, 4, 4, 12])
-        && groups.iter().all(|group| {
-            group
-                .chars()
-                .all(|held| held.is_ascii_hexdigit() && !held.is_ascii_uppercase())
-        })
-}
-
-/// The `ResourceStatusReason` of `logical_id`'s `CREATE_FAILED` event, looked for again until
-/// the stack's own clock has recorded it or [`EVENT_DEADLINE`] passes.
-async fn failure_reason(
-    router: &smithy_server_runtime::MultiServiceRouter,
-    case: &str,
-    stack: &str,
-    logical_id: &str,
-) -> String {
-    let deadline = tokio::time::Instant::now() + EVENT_DEADLINE;
-    loop {
-        let reason = resource_event_reason(router, stack, logical_id, "CREATE_FAILED").await;
-        if !reason.is_empty() {
-            return reason;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "case {case:?}: {logical_id} never recorded a CREATE_FAILED reason"
-        );
-        tokio::time::sleep(EVENT_POLL_INTERVAL).await;
-    }
-}
-
 #[tokio::test]
 async fn a_refused_api_gateway_resource_is_attributed_to_api_gateway() {
     for row in ROWS {
@@ -216,7 +108,15 @@ async fn a_refused_api_gateway_resource_is_attributed_to_api_gateway() {
         wait_for_the_transition().await;
         wait_for_the_transition().await;
 
-        let reason = failure_reason(&router, row.case, row.stack, row.logical_id).await;
+        let reason = failed_resource_reason(
+            row.case,
+            &router,
+            REGION,
+            row.stack,
+            row.logical_id,
+            CREATE_FAILED,
+        )
+        .await;
         let (quoted, class) = quoted_and_class(row.case, &reason);
         assert!(
             quoted.contains(row.sentence),
@@ -229,6 +129,6 @@ async fn a_refused_api_gateway_resource_is_attributed_to_api_gateway() {
             "case {:?}: expected the {} class, got {class:?} in {reason:?}",
             row.case, row.class
         );
-        assert_diagnostic(row.case, &quoted, row.status);
+        assert_sdk_diagnostic(row.case, &quoted, API_GATEWAY_SERVICE, row.status);
     }
 }
