@@ -311,13 +311,13 @@ pub(crate) async fn run_statement(
         let mut parser = ::sqlparser::parser::Parser::new(&dialect)
             .with_recursion_limit(MAX_PARSE_DEPTH)
             .try_with_sql(statement)
-            .map_err(|error| invalid_request(format!("Invalid query statement: {error}")))?;
+            .map_err(|_| unreadable_statement(statement))?;
         // The parser itself is dropped here, before anything is awaited: it
         // borrows the dialect and is not `Send`, and the parsed statements are
         // all the rest of this run needs.
         parser
             .parse_statements()
-            .map_err(|error| invalid_request(format!("Invalid query statement: {error}")))?
+            .map_err(|_| unreadable_statement(statement))?
     };
     if statements.len() != 1 {
         return Err(invalid_request(format!(
@@ -640,7 +640,7 @@ fn parse_nesting(
     use ::sqlparser::tokenizer::{Token, Tokenizer};
     let tokens = Tokenizer::new(dialect, statement)
         .tokenize()
-        .map_err(|error| invalid_request(format!("Invalid query statement: {error}")))?;
+        .map_err(|_| unreadable_statement(statement))?;
     let mut measured = Nesting {
         nesting: 0,
         prefix_forms: 0,
@@ -4437,6 +4437,28 @@ fn row_count(
 fn invalid_request(message: String) -> ExecuteQueryError {
     ExecuteQueryError::Modeled(ExecuteQueryErrorModeled::InvalidRequestException(
         InvalidRequestException { message },
+    ))
+}
+
+/// HTTP 400 `InvalidRequestException` for a statement the query language this
+/// service answers cannot be READ as: a syntax error.
+///
+/// The message is the service's own diagnosis of the statement it was handed —
+/// the query language it names, and the input it had no reading for, quoted — and
+/// carries nothing of HOW this engine reads a statement: the lexer and parser this
+/// crate runs are an implementation detail, so their diagnostic text, their token
+/// names and their line/column scheme never reach a caller. The offending input is
+/// the statement the request carried, less the whitespace around it, which is the
+/// span the reading had no alternative for; it is bounded by `queryStatement`'s own
+/// modelled `@length` maximum.
+///
+/// Every reading failure — the lexer's and the parser's alike — goes through here,
+/// so one statement cannot be refused in two dialects, and so does every operation
+/// that reads a statement through [`run_statement`].
+fn unreadable_statement(statement: &str) -> ExecuteQueryError {
+    invalid_request(format!(
+        "Invalid SiteWiseQL Query statement: no viable alternative at input '{}'",
+        statement.trim()
     ))
 }
 

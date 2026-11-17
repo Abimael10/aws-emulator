@@ -245,7 +245,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             _ => {
                 return Err(invalid_request(
-                    "Specify either alias, or assetId and propertyId.".to_string(),
+                    crate::state::IDENTIFY_TIME_SERIES_MESSAGE.to_string(),
                 ))
             }
         };

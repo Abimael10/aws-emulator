@@ -239,29 +239,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // One platform device hosts at most one gateway, so a create naming a device
         // some gateway already runs on is refused. The collision is NOT this gateway's
         // identity — the caller supplied no gateway id and the id a create would mint
-        // is free — but a request ATTRIBUTE already in use by another resource, so it is
-        // the terminal request error `InvalidRequestException` (400) naming the member
-        // the caller actually sent and its value, and not
+        // is free — but a device already claimed by another resource, so it is the
+        // terminal request error `InvalidRequestException` (400) and not
         // `ResourceAlreadyExistsException`, which this service uses when the resource
         // the request would create is itself already there.
         //
+        // The sentence names the EXTERNALLY OWNED thing that holds the claim — the
+        // Core Device, the IoT Core thing, the Greengrass group — rather than the
+        // request member that carried its name, because that thing is what a caller
+        // has to free before this create can succeed. The wording is
+        // [`crate::state::gateway_device_taken_message`]'s, so no other operation can
+        // word the same collision differently.
+        //
         // The check is on `device` — the key the index is actually keyed by — and is
-        // never gated on whether the message can name the platform member: a
+        // never gated on whether the message can name the platform's dimension: a
         // platform whose dimension this service cannot name still occupies its
         // device, and skipping the check for it would let this create OVERWRITE the
         // index entry of the gateway that already holds that device.
         if store.gateway_devices.contains_key(&device) {
-            let message =
-                match crate::state::gateway_device_dimension(&input.gateway_platform) {
-                    Some((member, value)) => format!(
-                        "The {member} {value} is already registered to another gateway."
-                    ),
-                    None => format!(
-                        "The device {device} that gatewayPlatform names is already \
-                         registered to another gateway."
-                    ),
-                };
-            return Err(invalid_request(message));
+            return Err(invalid_request(crate::state::gateway_device_taken_message(
+                &input.gateway_platform,
+                &device,
+            )));
         }
 
         // `gatewayName` is "A unique name for the gateway", so a second gateway may

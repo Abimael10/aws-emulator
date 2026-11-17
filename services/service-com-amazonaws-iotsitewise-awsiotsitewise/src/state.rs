@@ -999,6 +999,55 @@ pub fn gateway_device_dimension(platform: &GatewayPlatform) -> Option<(&'static 
     })
 }
 
+/// The subject a refusal about a gateway's platform device names when the device
+/// is an IoT Core thing: a Greengrass V2 Core Device and a Siemens Industrial Edge
+/// gateway are both addressed by the name of the IoT Core thing that stands for
+/// them, so the service names the two together.
+const CORE_DEVICE_SUBJECT: &str = "Core Device/IoT Core Thing";
+
+/// The subject a refusal about a Greengrass V1 platform's device names: that
+/// platform addresses a Greengrass group rather than an IoT Core thing.
+const GREENGRASS_GROUP_SUBJECT: &str = "Greengrass Group";
+
+/// The same device as the EXTERNALLY OWNED thing that holds the claim on it and
+/// that thing's identifier: the IoT Core thing a Greengrass V2 Core Device or a
+/// Siemens Industrial Edge gateway is addressed by, or the Greengrass group a V1
+/// platform names.
+///
+/// A refusal about a device in use is about the thing IoT SiteWise does not own —
+/// the Core Device, the IoT Core thing, the Greengrass group — rather than about
+/// the request member that carried its name, so what a message states is read from
+/// here and [`gateway_device_dimension`] stays what the INDEX is keyed by.
+pub fn gateway_device_subject(platform: &GatewayPlatform) -> Option<(&'static str, String)> {
+    if let Some(greengrass) = platform.greengrass.as_ref() {
+        return Some((GREENGRASS_GROUP_SUBJECT, greengrass.group_arn.clone()));
+    }
+    if let Some(greengrass_v2) = platform.greengrass_v2.as_ref() {
+        return Some((
+            CORE_DEVICE_SUBJECT,
+            greengrass_v2.core_device_thing_name.clone(),
+        ));
+    }
+    platform
+        .siemens_ie
+        .as_ref()
+        .map(|siemens| (CORE_DEVICE_SUBJECT, siemens.iot_core_thing_name.clone()))
+}
+
+/// The message a create whose platform names a device another gateway already runs
+/// on is refused with: the device that holds the claim, and that a SiteWise gateway
+/// is already associated with it.
+///
+/// `device` is the index key the collision was found under
+/// ([`gateway_device_key`]), which stands in as the identifier for a platform
+/// dimension this service cannot name — such a platform still occupies its device,
+/// so the refusal is never gated on being able to name it.
+pub fn gateway_device_taken_message(platform: &GatewayPlatform, device: &str) -> String {
+    let (subject, held) = gateway_device_subject(platform)
+        .unwrap_or((CORE_DEVICE_SUBJECT, device.to_string()));
+    format!("{subject}: {held} is already associated with a SiteWise Gateway.")
+}
+
 /// How many platform types `platform` names. Exactly one is valid; see
 /// [`gateway_device_key`].
 pub fn gateway_platform_count(platform: &GatewayPlatform) -> usize {
@@ -2394,6 +2443,19 @@ pub fn alias_not_found_message(alias: &str) -> String {
          alias PropertyAlias(super=PropertyAlias{{value={alias}}}) not found"
     )
 }
+
+/// The message a request that identifies NO time series is refused with.
+///
+/// A time series is addressed either by its `alias` or by the
+/// `(assetId, propertyId)` pair, so a call carrying neither form — or only half of
+/// the pair, or both forms at once — names no one series. The sentence is entirely
+/// fixed: it names the three members the model declares for the two forms and
+/// nothing of the request.
+///
+/// One place, so every operation that addresses a time series by that trio — the
+/// read and the delete — words the rule identically.
+pub const IDENTIFY_TIME_SERIES_MESSAGE: &str =
+    "Please provide either alias or assetId and propertyId";
 
 /// The message a READ of an absent gateway is refused with: the id that resolved
 /// to nothing, and the service's guidance to check it.

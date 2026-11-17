@@ -209,7 +209,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .filter(|key| !tags.contains_key(*key))
                 .count();
         if resulting > crate::state::MAX_TAGS_PER_RESOURCE {
-            return Err(limit_exceeded(resulting));
+            return Err(limit_exceeded());
         }
 
         for (key, value) in input.tags {
@@ -236,11 +236,14 @@ fn not_found(resource_arn: &str) -> TagResourceError {
 
 /// HTTP 410 `LimitExceededException`: the call would carry the target resource past
 /// the per-resource tag ceiling, so none of its tags is stored.
-fn limit_exceeded(resulting: usize) -> TagResourceError {
+///
+/// The sentence states the QUOTA and nothing about the request that met it: the
+/// ceiling is this service's own constant, so the only variable part is that
+/// constant and neither the resulting count nor the resource is named.
+fn limit_exceeded() -> TagResourceError {
     TagResourceErrorModeled::LimitExceededException(LimitExceededException {
         message: format!(
-            "The request would leave {resulting} tags on the resource; a resource holds at \
-             most {} tags.",
+            "Only {} user tags are allowed on the resource",
             crate::state::MAX_TAGS_PER_RESOURCE
         ),
     })

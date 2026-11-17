@@ -143,7 +143,16 @@ async fn tagged_gateway(router: &MultiServiceRouter, name: &str, tags: Option<Va
 }
 
 /// A fresh resource of `kind` (`"asset-model"`, `"asset"` or `"gateway"`), by its ARN.
-async fn create_resource(router: &MultiServiceRouter, kind: &str, name: &str) -> String {
+///
+/// `pub(crate)` for the reason `tag_resource` already is: the sibling
+/// `refusal_message_rule` suite fills a resource to the per-resource tag quota
+/// through exactly these steps, so one definition of them is what keeps the two
+/// suites from drifting on how a taggable resource is created.
+pub(crate) async fn create_resource(
+    router: &MultiServiceRouter,
+    kind: &str,
+    name: &str,
+) -> String {
     match kind {
         "asset-model" => tagged_model(router, name, None).await,
         "asset" => tagged_asset(router, name, None).await,
