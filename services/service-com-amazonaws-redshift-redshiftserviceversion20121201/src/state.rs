@@ -1517,37 +1517,56 @@ pub const MAX_SORTING_ENTITIES: usize = 3;
 /// released by `DeleteUsageLimit`.
 pub const USAGE_LIMIT_QUOTA: usize = 10_000;
 
-/// How many Query Editor (QEV2) IAM Identity Center applications the store
-/// holds before `CreateQev2IdcApplication` refuses with the modelled
-/// `LimitExceededFault`.
+/// Why a `CreateQev2IdcApplication` is refused while the account already holds a
+/// Query Editor (QEV2) IAM Identity Center application.
 ///
-/// The same reasoning as [`USAGE_LIMIT_QUOTA`]: the emulator's own bound on
-/// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::qev2_idc_applications`],
-/// not a claim about an account's published limit. An application's identity is
-/// its name, and names are unlimited in number, so this bound is what stops the
-/// collection growing without end; it is set far above any workflow an emulator
-/// serves, and every record it holds is released by
-/// `DeleteQev2IdcApplication`.
-pub const QEV2_IDC_APPLICATION_QUOTA: usize = 10_000;
+/// Query Editor v2's IAM Identity Center integration is ONE application per
+/// account: `smithy_query(query="doc", shape="Qev2IdcApplication")` describes
+/// "the Amazon Redshift Query Editor V2 IAM Identity Center application" of the
+/// account, and the account's applications are reached by ARN rather than
+/// searched by name. So the refusal is about the one that EXISTS, not about the
+/// name a second create asked for: its sentence carries no variable part, and a
+/// create with a wholly fresh name is refused exactly as a repeat of the
+/// registered name is. `DeleteQev2IdcApplication` frees the account, after which
+/// a create is served again.
+pub const QEV2_IDC_APPLICATION_ALREADY_EXISTS: &str = "You already have a Qev2IdcApplication.";
 
-/// How many HSM configurations the store holds before `CreateHsmConfiguration`
-/// refuses with the modelled `HsmConfigurationQuotaExceededFault`.
+/// How many HSM configurations one account holds in one Region before
+/// `CreateHsmConfiguration` refuses with the modelled
+/// `HsmConfigurationQuotaExceededFault`.
 ///
-/// The same reasoning as [`QEV2_IDC_APPLICATION_QUOTA`]: the emulator's own
-/// bound on
-/// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::hsm_configurations`],
-/// not a claim about an account's published limit. An HSM configuration's
-/// identity is the identifier its create names, and identifiers are unlimited in
-/// number, so this bound is what stops the collection growing without end; it is
-/// set far above any workflow an emulator serves, and every record it holds is
-/// released by `DeleteHsmConfiguration`.
-pub const HSM_CONFIGURATION_QUOTA: usize = 10_000;
+/// Unlike the store bounds around it, this is the account's PUBLISHED quota, not
+/// a bound chosen to keep a collection finite: the Amazon Redshift Cluster
+/// Management Guide's "Quotas and limits in Amazon Redshift" publishes 20 AWS
+/// CloudHSM HSM connections per account per Region, and an HSM configuration IS
+/// that connection (see [`ARN_SEGMENT_HSM_CONFIGURATION`], whose published
+/// resource-type name is "HSM connection"). Being the published number is what
+/// makes the quota reachable: a client that handles the fault — catch, delete,
+/// retry — exercises the same path here as in production. Every record it counts
+/// is released by `DeleteHsmConfiguration`, so a create is served again after a
+/// delete.
+pub const HSM_CONFIGURATION_QUOTA: usize = 20;
+
+/// Why a `CreateHsmConfiguration` past [`HSM_CONFIGURATION_QUOTA`] is refused,
+/// naming how many configurations the account holds at the moment of the
+/// refusal.
+///
+/// The fixed text states the bound the request ran into and the resource it
+/// bounds; the count is the one variable part, read off the store rather than
+/// restated, so an account that is at its quota reads its own number. An account
+/// that reached the bound through the API holds exactly
+/// [`HSM_CONFIGURATION_QUOTA`] configurations at that moment, so `held` is
+/// normally that number — it is passed rather than restated because it is a fact
+/// about the store, not a second bound to configure.
+pub fn hsm_configuration_quota_exceeded_message(held: usize) -> String {
+    format!("Cannot create more than {held} HSM configurations.")
+}
 
 /// How many snapshot copy grants the store holds before
 /// `CreateSnapshotCopyGrant` refuses with the modelled
 /// `SnapshotCopyGrantQuotaExceededFault`.
 ///
-/// The same reasoning as [`HSM_CONFIGURATION_QUOTA`]: the emulator's own bound
+/// The same reasoning as [`USAGE_LIMIT_QUOTA`]: the emulator's own bound
 /// on
 /// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::snapshot_copy_grants`],
 /// not a claim about an account's published limit. A grant's identity is the
@@ -2131,7 +2150,7 @@ pub fn idc_managed_application_arn(idc_instance_arn: &str, application_name: &st
 /// `CreateRedshiftIdcApplication` refuses with the modelled
 /// `RedshiftIdcApplicationQuotaExceededFault`.
 ///
-/// The same reasoning as [`QEV2_IDC_APPLICATION_QUOTA`]: the emulator's own
+/// The same reasoning as [`USAGE_LIMIT_QUOTA`]: the emulator's own
 /// bound on a collection whose records are identified by a NAME, of which there
 /// are unboundedly many, so the bound is what keeps
 /// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::redshift_idc_applications`]
@@ -3597,7 +3616,7 @@ pub fn cluster_custom_domain_not_found_message(cluster_identifier: &str) -> Stri
 /// How many partner integrations the store holds before `AddPartner` refuses.
 ///
 /// The emulator's own bound on a collection keyed by names, of which there are
-/// unboundedly many — the same reasoning as [`QEV2_IDC_APPLICATION_QUOTA`].
+/// unboundedly many — the same reasoning as [`USAGE_LIMIT_QUOTA`].
 pub const PARTNER_INTEGRATION_QUOTA: usize = 10_000;
 
 /// The `PartnerIntegrationStatus` a partner integration starts in.
@@ -3640,9 +3659,13 @@ pub fn partner_not_found_message(partner_name: &str, database_name: &str) -> Str
 /// `CreateHsmClientCertificate` refuses with the modelled
 /// `HsmClientCertificateQuotaExceededFault`.
 ///
-/// The same reasoning as [`HSM_CONFIGURATION_QUOTA`]: the emulator's own bound
+/// The same reasoning as [`USAGE_LIMIT_QUOTA`]: the emulator's own bound
 /// on a collection keyed by an identifier, and the modelled fault is the
-/// service's own way of saying the bound was reached.
+/// service's own way of saying the bound was reached. Unlike
+/// [`HSM_CONFIGURATION_QUOTA`] this is no published number: the guide's quota
+/// row for HSM CONNECTIONS is what that constant carries, and no recorded
+/// refusal of this operation says what the certificate quota is or how its
+/// message reads.
 pub const HSM_CLIENT_CERTIFICATE_QUOTA: usize = 10_000;
 
 /// The public key of an HSM client certificate, in the PEM text Redshift

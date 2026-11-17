@@ -268,6 +268,11 @@ fn seed_ds2(emulator: &Emulator, cluster_identifier: &str) -> String {
 /// parameter VALUE, on every exchange operation and every member that carries
 /// one — and before any lookup, which the next test's 404s are the other half
 /// of.
+///
+/// The refusal's sentence is the service's own parameter-format one: it names
+/// the MEMBER the value arrived on and states the form a valid value takes, and
+/// carries no part of the value — so every malformed value of one member earns
+/// the same sentence.
 #[tokio::test]
 async fn a_malformed_identifier_is_refused_before_any_lookup() {
     let emulator = Emulator::new();
@@ -297,10 +302,15 @@ async fn a_malformed_identifier_is_refused_before_any_lookup() {
     );
 
     for (form, value) in MALFORMED {
-        let rows: [(&str, Vec<(&str, &str)>); 5] = [
+        // One row: where the value is sent (operation, and the member when the
+        // operation takes more than one), the request's parameters, and the member
+        // the refusal must name.
+        type MemberRow<'a> = (&'a str, Vec<(&'a str, &'a str)>, &'a str);
+        let rows: [MemberRow; 5] = [
             (
                 "GetReservedNodeExchangeOfferings",
                 vec![("ReservedNodeId", value)],
+                "ReservedNodeId",
             ),
             (
                 "AcceptReservedNodeExchange on ReservedNodeId",
@@ -308,6 +318,7 @@ async fn a_malformed_identifier_is_refused_before_any_lookup() {
                     ("ReservedNodeId", value),
                     ("TargetReservedNodeOfferingId", a_published_offering.as_str()),
                 ],
+                "ReservedNodeId",
             ),
             (
                 "AcceptReservedNodeExchange on TargetReservedNodeOfferingId",
@@ -315,23 +326,33 @@ async fn a_malformed_identifier_is_refused_before_any_lookup() {
                     ("ReservedNodeId", held.as_str()),
                     ("TargetReservedNodeOfferingId", value),
                 ],
+                "TargetReservedNodeOfferingId",
             ),
             (
                 "DescribeReservedNodeExchangeStatus on ReservedNodeId",
                 vec![("ReservedNodeId", value)],
+                "ReservedNodeId",
             ),
             (
                 "DescribeReservedNodeExchangeStatus on ReservedNodeExchangeRequestId",
                 vec![("ReservedNodeExchangeRequestId", value)],
+                "ReservedNodeExchangeRequestId",
             ),
         ];
-        for (where_, params) in rows {
+        for (where_, params, member) in rows {
             let action = where_
                 .split_once(' ')
                 .map_or(where_, |(operation, _)| operation);
             let case = format!("{form} on {where_}");
             let answer = emulator.call(action, &params).await;
             assert_refused(&case, &answer, 400, "InvalidParameterValue");
+            let expected = state::malformed_identifier_message(member);
+            assert_eq!(
+                answer.text("Message").as_deref(),
+                Some(expected.as_str()),
+                "case {case}: expected the format sentence {expected:?}, got {:?}",
+                answer.text("Message")
+            );
         }
     }
 }

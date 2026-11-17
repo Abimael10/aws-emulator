@@ -727,9 +727,18 @@ async fn refused_tags_store_no_grant() {
             refusal: Some("TagLimitExceededFault"),
         },
         TagCase {
-            case: "a reserved tag key",
+            case: "a reserved tag key, which is a system tag the caller may not write",
             name: "grant-tags-reserved-key",
             tags: vec![("aws:owner".to_string(), "admin".to_string())],
+            refusal: Some("InvalidParameterValue"),
+        },
+        TagCase {
+            case: "the same tag key twice",
+            name: "grant-tags-duplicate-key",
+            tags: vec![
+                ("env".to_string(), "a".to_string()),
+                ("env".to_string(), "b".to_string()),
+            ],
             refusal: Some("InvalidTagFault"),
         },
         TagCase {

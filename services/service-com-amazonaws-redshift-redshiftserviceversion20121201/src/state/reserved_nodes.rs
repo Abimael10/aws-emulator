@@ -446,10 +446,20 @@ pub fn is_minted_identifier(value: &str) -> bool {
 }
 
 /// What an exchange operation answers an identifier whose FORM it ruled out
-/// before any lookup: the member it was given on and the value that member
-/// cannot take.
-pub fn malformed_identifier_message(member: &str, value: &str) -> String {
-    format!("Invalid value for {member}: '{value}'. {member} must be a universally unique identifier.")
+/// before any lookup: Amazon Redshift's own parameter-format sentence for a
+/// member whose values are the identifiers this service mints
+/// ([`is_minted_identifier`]) — the member the value arrived on, then the form a
+/// valid value takes, spelt out character class and all.
+///
+/// The offending VALUE is no part of it: the sentence states the rule the member
+/// is held to rather than echoing what the request sent, so every value of the
+/// wrong form earns one sentence per member.
+pub fn malformed_identifier_message(member: &str) -> String {
+    format!(
+        "The parameter {member} is not a valid identifier. Identifiers must be valid UUID \
+         strings of the form 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx' where 'x' is an ASCII \
+         character a-f or 0-9."
+    )
 }
 
 /// The `State` a reservation reports while it is being exchanged for another.

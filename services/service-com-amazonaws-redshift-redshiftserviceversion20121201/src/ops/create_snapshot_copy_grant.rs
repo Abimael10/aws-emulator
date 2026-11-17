@@ -177,10 +177,17 @@ enum KeyLookup {
 /// network client is configured here and this crate names no other service's crate.
 /// `region` is the request's own signing region, so the key is resolved where the
 /// grant this call would create lives.
+///
+/// That region is CALLER-SUPPLIED text and it ends up in the endpoint URL's
+/// AUTHORITY, so it is read as a Region LABEL first, through the workspace's one
+/// reader of that grammar (`::service_common::arn::region_label`), rather than
+/// interpolated as given: `None` for a value that would name an authority the
+/// caller chose, in which case no lookup is made at all.
 fn kms_client(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
-) -> ::aws_sdk_kms::Client {
+) -> Option<::aws_sdk_kms::Client> {
+    let region = ::service_common::arn::region_label(region)?;
     let config = ::aws_sdk_kms::Config::builder()
         .behavior_version(::aws_sdk_kms::config::BehaviorVersion::latest())
         .region(::aws_sdk_kms::config::Region::new(region.to_string()))
@@ -198,7 +205,7 @@ fn kms_client(
             ::aws_sdk_kms::config::StalledStreamProtectionConfig::disabled(),
         )
         .build();
-    ::aws_sdk_kms::Client::from_conf(config)
+    Some(::aws_sdk_kms::Client::from_conf(config))
 }
 
 /// Ask Key Management Service about `kms_key_id`.
@@ -214,18 +221,19 @@ fn kms_client(
 /// create proceeds rather than refusing a key nothing said was bad — a server fault,
 /// a throttle or another key-agnostic condition, a reply carrying no KMS error code
 /// at all (a routing failure rather than a KMS answer, as when KMS is not mounted
-/// beside this service), or a lookup that never reached KMS.
+/// beside this service), a region that is no Region label to address KMS in, or a
+/// lookup that never reached KMS.
 async fn describe_kms_key(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     kms_key_id: &str,
 ) -> KeyLookup {
-    let err = match kms_client(ctx, region)
-        .describe_key()
-        .key_id(kms_key_id)
-        .send()
-        .await
-    {
+    let Some(client) = kms_client(ctx, region) else {
+        return KeyLookup::Indeterminate(format!(
+            "the request named no Region to address Key Management Service in: {region:?}"
+        ));
+    };
+    let err = match client.describe_key().key_id(kms_key_id).send().await {
         Ok(_) => return KeyLookup::Resolved,
         Err(err) => err,
     };
@@ -358,13 +366,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        if let Err(message) = st::check_tags(&tags) {
-            return Err(CreateSnapshotCopyGrantErrorModeled::InvalidTagFault(
-                InvalidTagFault {
-                    message: Some(message),
-                },
-            )
-            .into());
+        // The two classes of tag refusal the shared validator tells apart (see
+        // `state::TagRefusal`): a tag set this API will not store is the modelled
+        // `InvalidTagFault`, while a key in the reserved namespace is a system tag
+        // the caller does not own — a bad parameter value, with the service's own
+        // fixed sentence.
+        if let Err(refusal) = st::check_tags(&tags) {
+            return Err(match refusal {
+                st::TagRefusal::InvalidTag(message) => {
+                    CreateSnapshotCopyGrantErrorModeled::InvalidTagFault(InvalidTagFault {
+                        message: Some(message),
+                    })
+                    .into()
+                }
+                st::TagRefusal::SystemTag => crate::scaffolded::Scaffolded::invalid_parameter_value(
+                    st::SYSTEM_TAG_REFUSAL.to_string(),
+                ),
+            });
         }
 
         // The refusals the STORE dictates, decided under a lock that is released

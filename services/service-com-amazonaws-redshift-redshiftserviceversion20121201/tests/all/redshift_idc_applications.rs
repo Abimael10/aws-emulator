@@ -1195,18 +1195,51 @@ async fn the_documented_tag_limit_and_restrictions_bound_a_created_application()
     }
 
     // A tag the published restrictions refuse is refused whichever side of the
-    // pair breaks them: an empty key, a key or value longer than its bound, and
-    // the prefix AWS reserves for its own tags.
+    // pair breaks them: an empty key, a key or value longer than its bound, a key
+    // named twice in one call, and the prefix AWS reserves for its own tags —
+    // which is a SYSTEM tag the caller may not write, so it earns the service's
+    // own `InvalidParameterValue` rather than the modelled malformed-tag fault.
     let long_key = "k".repeat(state::TAG_KEY_MAX_LEN + 1);
     let long_value = "v".repeat(state::TAG_VALUE_MAX_LEN + 1);
-    for (case, key, value) in [
-        ("an empty key", "", "v"),
-        ("a key past its bound", long_key.as_str(), "v"),
-        ("a value past its bound", "k", long_value.as_str()),
-        ("a reserved key prefix", "aws:owner", "v"),
-        ("a reserved value prefix", "owner", "aws:alice"),
+    for (case, pairs, code, message) in [
+        (
+            "an empty key",
+            vec![("", "v")],
+            "InvalidTagFault",
+            None,
+        ),
+        (
+            "a key past its bound",
+            vec![(long_key.as_str(), "v")],
+            "InvalidTagFault",
+            None,
+        ),
+        (
+            "a value past its bound",
+            vec![("k", long_value.as_str())],
+            "InvalidTagFault",
+            None,
+        ),
+        (
+            "the same key twice",
+            vec![("env", "a"), ("env", "b")],
+            "InvalidTagFault",
+            Some(state::duplicate_tag_key_message("env")),
+        ),
+        (
+            "a reserved key prefix",
+            vec![("aws:owner", "v")],
+            "InvalidParameterValue",
+            Some(state::SYSTEM_TAG_REFUSAL.to_string()),
+        ),
+        (
+            "a reserved value prefix",
+            vec![("owner", "aws:alice")],
+            "InvalidTagFault",
+            None,
+        ),
     ] {
-        let params = vec![
+        let mut params = vec![
             ("IdcInstanceArn".to_string(), IDC_INSTANCE_ARN.to_string()),
             (
                 "RedshiftIdcApplicationName".to_string(),
@@ -1214,11 +1247,27 @@ async fn the_documented_tag_limit_and_restrictions_bound_a_created_application()
             ),
             ("IdcDisplayName".to_string(), "InvalidTag".to_string()),
             ("IamRoleArn".to_string(), IAM_ROLE_ARN.to_string()),
-            ("Tags.Tag.1.Key".to_string(), key.to_string()),
-            ("Tags.Tag.1.Value".to_string(), value.to_string()),
         ];
+        for (position, (key, value)) in pairs.iter().enumerate() {
+            params.push((
+                format!("Tags.Tag.{}.Key", position + 1),
+                (*key).to_string(),
+            ));
+            params.push((
+                format!("Tags.Tag.{}.Value", position + 1),
+                (*value).to_string(),
+            ));
+        }
         let answer = call_owned(&emulator, "CreateRedshiftIdcApplication", &params).await;
-        assert_refused(case, &answer, 400, "InvalidTagFault");
+        assert_refused(case, &answer, 400, code);
+        if let Some(message) = message {
+            assert_eq!(
+                answer.text("Message").as_deref(),
+                Some(message.as_str()),
+                "case {case}: expected the sentence {message:?}, got {:?}",
+                answer.text("Message")
+            );
+        }
     }
 
     // The refused creates stored nothing: the name each was refused under is

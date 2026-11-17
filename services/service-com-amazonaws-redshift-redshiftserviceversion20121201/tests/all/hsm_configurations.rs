@@ -17,9 +17,11 @@
 //! create under one identifier is refused and overwrites nothing; an identifier
 //! that names no configuration being refused by the read; the creation order,
 //! the `TagKeys` / `TagValues` filter, the service's `MaxRecords` window and its
-//! `Marker` cursor; and the documented tag limit and the reserved tag prefix
-//! being refused with nothing stored.
+//! `Marker` cursor; the documented tag limit, a tag key named twice in one call
+//! and the reserved tag prefix being refused with nothing stored; and the
+//! account's published quota on configurations.
 
+use service_com_amazonaws_redshift_redshiftserviceversion20121201::ops::types::HsmConfiguration;
 use service_com_amazonaws_redshift_redshiftserviceversion20121201::state;
 
 use crate::cluster_lifecycle::{all_text, Answer, Emulator};
@@ -115,6 +117,31 @@ fn simple_case(case: &'static str, identifier: &str) -> CreateCase {
         password: "partition-secret",
         tags: Vec::new(),
     }
+}
+
+/// Put one registered configuration straight into the shared store the handlers
+/// read.
+///
+/// An account holds no more configurations than its published quota
+/// ([`state::HSM_CONFIGURATION_QUOTA`]), so a case that needs MORE records than
+/// that — a page of them — seeds them here instead of creating them over the
+/// wire.
+fn seed_configuration(emulator: &Emulator, identifier: &str) {
+    let store = state::service_state(&*emulator.engine).expect("the Redshift store");
+    store
+        .lock()
+        .hsm_configurations
+        .push(state::StoredHsmConfiguration {
+            configuration: HsmConfiguration {
+                hsm_configuration_identifier: Some(identifier.to_string()),
+                description: Some(format!("HSM connection {identifier}")),
+                hsm_ip_address: Some("192.0.2.10".to_string()),
+                hsm_partition_name: Some("redshift-partition".to_string()),
+                tags: Some(Vec::new()),
+            },
+            hsm_server_public_certificate: "QUJD".to_string(),
+            hsm_partition_password: "partition-secret".to_string(),
+        });
 }
 
 /// Assert one refusal row: the answer's status and `<Code>`.
@@ -576,6 +603,11 @@ async fn the_tag_filter_selects_whole_configurations() {
 /// The window is the one every paginated `Describe*` of this service shares
 /// (`state::MAX_RECORDS_MIN` ..= `state::MAX_RECORDS_MAX`, applied by
 /// `state::page_bounds`), tested on each bound and one past it.
+///
+/// A page is a property of the COLLECTION, and the smallest page the window
+/// admits is already the account's whole published quota of configurations, so
+/// the records the pages are walked over are seeded straight into the shared
+/// store ([`seed_configuration`]).
 #[tokio::test]
 async fn configurations_are_paginated_over_the_documented_window() {
     let emulator = Emulator::new();
@@ -584,13 +616,7 @@ async fn configurations_are_paginated_over_the_documented_window() {
     let maximum = state::MAX_RECORDS_MAX;
     let total = minimum as usize + 1;
     for ordinal in 0..total {
-        let identifier = format!("hsm-page-{ordinal:03}");
-        let row = simple_case("a paged configuration", &identifier);
-        assert_eq!(
-            create_configuration(&emulator, &row).await.status,
-            200,
-            "case {identifier}: the create must be served"
-        );
+        seed_configuration(&emulator, &format!("hsm-page-{ordinal:03}"));
     }
 
     for (case, max_records, accepted) in [
@@ -749,7 +775,25 @@ async fn refused_tags_store_no_configuration() {
             case: "a reserved tag key",
             identifier: "hsm-tags-reserved-key",
             tags: vec![("aws:owner".to_string(), "admin".to_string())],
+            refusal: Some("InvalidParameterValue"),
+        },
+        TagCase {
+            case: "the same tag key twice",
+            identifier: "hsm-tags-duplicate-key",
+            tags: vec![
+                ("env".to_string(), "a".to_string()),
+                ("env".to_string(), "b".to_string()),
+            ],
             refusal: Some("InvalidTagFault"),
+        },
+        TagCase {
+            case: "two keys that differ only in case, which are two keys",
+            identifier: "hsm-tags-case-distinct-keys",
+            tags: vec![
+                ("env".to_string(), "a".to_string()),
+                ("Env".to_string(), "b".to_string()),
+            ],
+            refusal: None,
         },
         TagCase {
             case: "a reserved tag value",
@@ -1082,4 +1126,257 @@ async fn a_configuration_a_cluster_uses_cannot_be_deleted() {
             "case {case}: the refused delete dropped the stored certificate and password"
         );
     }
+}
+
+/// One API call carries ONE tag set, so a create naming the same tag key twice
+/// is refused with the modelled `InvalidTagFault` naming the key that repeats,
+/// and no configuration is left behind for a later read to find.
+///
+/// The rows differ along what the rule generalises over: where the repeat sits
+/// in the list, how many times the key appears, how many other tags the call
+/// carries, and the spelling of the key that repeats.
+#[tokio::test]
+async fn a_create_naming_one_tag_key_twice_is_refused_and_stores_nothing() {
+    let emulator = Emulator::new();
+
+    // The longest key the published restrictions admit (`state::TAG_KEY_MAX_LEN`),
+    // so one row repeats a key AT that bound.
+    let longest_key = "k".repeat(state::TAG_KEY_MAX_LEN);
+    // One row: the case, the identifier the create names, the tags it carries, and
+    // the key the refusal must name.
+    type DuplicateRow<'a> = (&'a str, &'a str, Vec<(&'a str, &'a str)>, &'a str);
+    let rows: Vec<DuplicateRow> = vec![
+        (
+            "the same key twice, nothing else",
+            "hsm-dup-pair",
+            vec![("env", "a"), ("env", "b")],
+            "env",
+        ),
+        (
+            "a repeat after another tag",
+            "hsm-dup-after-one",
+            vec![("owner", "alice"), ("env", "a"), ("env", "b")],
+            "env",
+        ),
+        (
+            "a repeat separated by other tags",
+            "hsm-dup-separated",
+            vec![("env", "a"), ("owner", "alice"), ("team", "x"), ("env", "b")],
+            "env",
+        ),
+        (
+            "the same key three times",
+            "hsm-dup-thrice",
+            vec![("env", "a"), ("env", "b"), ("env", "c")],
+            "env",
+        ),
+        (
+            "a repeat of the same key AND value",
+            "hsm-dup-same-value",
+            vec![("cost-center", "42"), ("cost-center", "42")],
+            "cost-center",
+        ),
+        (
+            "a repeat of a key carrying punctuation",
+            "hsm-dup-punctuated",
+            vec![("cost.center/sub-team", "x"), ("cost.center/sub-team", "y")],
+            "cost.center/sub-team",
+        ),
+        (
+            "a repeat of the longest key the restrictions admit",
+            "hsm-dup-longest-key",
+            vec![(longest_key.as_str(), "a"), (longest_key.as_str(), "b")],
+            longest_key.as_str(),
+        ),
+    ];
+
+    for (case, identifier, tags, repeated) in rows {
+        let mut params: Vec<(String, String)> = vec![
+            (
+                "HsmConfigurationIdentifier".to_string(),
+                identifier.to_string(),
+            ),
+            ("Description".to_string(), format!("duplicate tags {case}")),
+            ("HsmIpAddress".to_string(), "192.0.2.14".to_string()),
+            (
+                "HsmPartitionName".to_string(),
+                "redshift-partition".to_string(),
+            ),
+            ("HsmPartitionPassword".to_string(), "secret".to_string()),
+            ("HsmServerPublicCertificate".to_string(), "QUJD".to_string()),
+        ];
+        for (position, (key, value)) in tags.iter().enumerate() {
+            params.push((
+                format!("Tags.Tag.{}.Key", position + 1),
+                (*key).to_string(),
+            ));
+            params.push((
+                format!("Tags.Tag.{}.Value", position + 1),
+                (*value).to_string(),
+            ));
+        }
+        let answer = call_with(&emulator, "CreateHsmConfiguration", &params).await;
+        assert_refused(case, &answer, 400, "InvalidTagFault");
+        assert_eq!(
+            answer.text("Message"),
+            Some(state::duplicate_tag_key_message(repeated)),
+            "case {case}: expected the duplicate-key sentence {:?}, got {:?}",
+            state::duplicate_tag_key_message(repeated),
+            answer.text("Message")
+        );
+
+        // Nothing was created: the identifier the refused call named is one the
+        // read answers its own not-found fault for.
+        let read = describe_one(&emulator, identifier).await;
+        assert_refused(case, &read, 400, "HsmConfigurationNotFoundFault");
+        let listed = emulator.call("DescribeHsmConfigurations", &[]).await;
+        assert!(
+            listed_configurations(&listed.body).is_empty(),
+            "case {case}: expected the account to hold no configuration, got {:?}",
+            listed_configurations(&listed.body)
+        );
+    }
+}
+
+/// A tag key under the prefix the service reserves for itself is a SYSTEM tag:
+/// the caller may not write one, so the create is refused as a bad parameter
+/// value — a different refusal from the malformed tag set above — and stores
+/// nothing.
+///
+/// The rows differ along the case of the prefix (tag keys are compared
+/// case-insensitively for it), what follows it, and whether the reserved key
+/// arrives alone or beside tags the restrictions admit.
+#[tokio::test]
+async fn a_create_naming_a_system_tag_key_is_refused_as_a_bad_parameter_value() {
+    let emulator = Emulator::new();
+
+    for (case, identifier, tags) in [
+        (
+            "a reserved key alone",
+            "hsm-sys-alone",
+            vec![("aws:reserved-key", "x")],
+        ),
+        (
+            "the prefix in upper case",
+            "hsm-sys-upper",
+            vec![("AWS:Owner", "x")],
+        ),
+        (
+            "the prefix in mixed case",
+            "hsm-sys-mixed",
+            vec![("Aws:cloudformation:stack-name", "x")],
+        ),
+        (
+            "a reserved key beside an admitted tag",
+            "hsm-sys-beside",
+            vec![("owner", "alice"), ("aws:createdBy", "x")],
+        ),
+        (
+            "the prefix alone as the whole key",
+            "hsm-sys-bare-prefix",
+            vec![("aws:", "x")],
+        ),
+    ] {
+        let mut row = simple_case("a system tag key", identifier);
+        row.tags = tags;
+        let answer = create_configuration(&emulator, &row).await;
+        assert_refused(case, &answer, 400, "InvalidParameterValue");
+        assert_eq!(
+            answer.text("Message").as_deref(),
+            Some(state::SYSTEM_TAG_REFUSAL),
+            "case {case}: expected the system-tag sentence {:?}, got {:?}",
+            state::SYSTEM_TAG_REFUSAL,
+            answer.text("Message")
+        );
+
+        let read = describe_one(&emulator, identifier).await;
+        assert_refused(case, &read, 400, "HsmConfigurationNotFoundFault");
+    }
+}
+
+/// An account holds no more HSM configurations than its published quota
+/// (`state::HSM_CONFIGURATION_QUOTA`): the create at the quota is served, the
+/// one past it is refused with the modelled fault naming how many the account
+/// holds, the refused identifier is absent from every read, and a delete makes
+/// room for the next create.
+#[tokio::test]
+async fn a_create_past_the_published_quota_is_refused_and_a_delete_makes_room() {
+    let emulator = Emulator::new();
+    let quota = state::HSM_CONFIGURATION_QUOTA;
+
+    // Fill the account to its quota over the wire, so the bound is reached by
+    // the same path a client reaches it by.
+    let identifiers: Vec<String> = (0..quota).map(|index| format!("hsm-quota-{index:03}")).collect();
+    for (index, identifier) in identifiers.iter().enumerate() {
+        let answer = create_configuration(&emulator, &simple_case("filling the quota", identifier))
+            .await;
+        assert_eq!(
+            answer.status, 200,
+            "case create {} of {quota}: expected 200, got {} with body {}",
+            index + 1,
+            answer.status,
+            answer.body
+        );
+    }
+
+    // One past the quota: refused, naming the number the account holds.
+    let over = "hsm-quota-one-too-many";
+    let refused =
+        create_configuration(&emulator, &simple_case("one past the quota", over)).await;
+    assert_refused(
+        "one past the quota",
+        &refused,
+        400,
+        "HsmConfigurationQuotaExceededFault",
+    );
+    assert_eq!(
+        refused.text("Message"),
+        Some(state::hsm_configuration_quota_exceeded_message(quota)),
+        "case one past the quota: expected {:?}, got {:?}",
+        state::hsm_configuration_quota_exceeded_message(quota),
+        refused.text("Message")
+    );
+
+    // The refused create stored nothing: the account still holds exactly the
+    // configurations it was filled with, and the refused identifier names none.
+    let listed = emulator.call("DescribeHsmConfigurations", &[]).await;
+    assert_eq!(
+        listed_configurations(&listed.body),
+        identifiers,
+        "case after the refusal: expected the {quota} filled configurations, got {:?}",
+        listed_configurations(&listed.body)
+    );
+    assert_refused(
+        "reading the refused identifier",
+        &describe_one(&emulator, over).await,
+        400,
+        "HsmConfigurationNotFoundFault",
+    );
+
+    // A delete makes room: the same create is served now, and the account is
+    // back at its quota.
+    let deleted = delete_one(&emulator, &identifiers[0]).await;
+    assert_eq!(
+        deleted.status, 200,
+        "case freeing one configuration: expected 200, got {} with body {}",
+        deleted.status, deleted.body
+    );
+    let admitted =
+        create_configuration(&emulator, &simple_case("after the delete", over)).await;
+    assert_eq!(
+        admitted.status, 200,
+        "case after the delete: expected the create served, got {} with body {}",
+        admitted.status, admitted.body
+    );
+    let again = create_configuration(
+        &emulator,
+        &simple_case("at the quota again", "hsm-quota-one-more"),
+    )
+    .await;
+    assert_refused(
+        "at the quota again",
+        &again,
+        400,
+        "HsmConfigurationQuotaExceededFault",
+    );
 }

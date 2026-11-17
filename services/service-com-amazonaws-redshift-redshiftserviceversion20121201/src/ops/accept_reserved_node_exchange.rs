@@ -199,7 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ] {
             if !st::is_minted_identifier(value) {
                 return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
-                    st::malformed_identifier_message(member, value),
+                    st::malformed_identifier_message(member),
                 ));
             }
         }

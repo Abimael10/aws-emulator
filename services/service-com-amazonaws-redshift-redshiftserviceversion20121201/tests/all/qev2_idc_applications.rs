@@ -12,15 +12,16 @@
 //! request: a created application is stored exactly as the request configured
 //! it, with a stable `Qev2IdcApplicationArn` later calls reach it by and the
 //! `IdcManagedApplicationArn` of the IAM Identity Center instance it names; the
-//! application NAME being what one account's applications are unique on, and a
-//! delete freeing it; an ARN that names no application being refused by every
+//! account holding at most ONE application, so while one is registered every
+//! create is refused whatever name it asks for, and a delete freeing the
+//! account; an ARN that names no application being refused by every
 //! operation that takes one, with one fixed sentence stating the precondition
 //! that operation enforces — existence for the read and the delete, existence
 //! and finished onboarding for the modify; a modify changing only the display name; a delete
 //! making the application absent from every later read; the service's
 //! `MaxRecords` window and `Marker` cursor; an `IdcInstanceArn` that is not an
 //! ARN (or is longer than one can be) being refused with nothing stored; and the
-//! documented tag limit and the store's own bound on the collection.
+//! documented tag limit.
 
 use std::collections::BTreeSet;
 
@@ -130,6 +131,45 @@ fn listed_tags(body: &str) -> Vec<(String, String)> {
         .into_iter()
         .zip(all_text(body, "Value"))
         .collect()
+}
+
+/// Delete the application `arn` names, so the account holds none again — the
+/// precondition every create has, since an account holds at most one
+/// application.
+async fn delete_application(emulator: &Emulator, case: &str, arn: &str) {
+    let deleted = emulator
+        .call("DeleteQev2IdcApplication", &[("Qev2IdcApplicationArn", arn)])
+        .await;
+    assert_eq!(
+        deleted.status, 200,
+        "case {case}: expected the delete served with 200, got {} with body {}",
+        deleted.status, deleted.body
+    );
+}
+
+/// Put one registered application straight into the shared store the handlers
+/// read, and report the ARN it is reached by.
+///
+/// The account registers at most one application through the API, so a case that
+/// needs SEVERAL records — the delete leaving its neighbours alone, a page of
+/// them — seeds them here instead, exactly as the onboarding case seeds a record
+/// no implemented operation mints.
+fn seed_application(emulator: &Emulator, name: &str) -> String {
+    let arn = state::qev2_idc_application_arn(name, "us-west-2");
+    let store = state::service_state(&*emulator.engine).expect("the Redshift store");
+    store.lock().qev2_idc_applications.push(Qev2IdcApplication {
+        idc_instance_arn: Some(IDC_INSTANCE_ARN.to_string()),
+        qev2_idc_application_name: Some(name.to_string()),
+        qev2_idc_application_arn: Some(arn.clone()),
+        idc_managed_application_arn: Some(state::idc_managed_application_arn(
+            IDC_INSTANCE_ARN,
+            name,
+        )),
+        idc_onboard_status: Some(state::QEV2_IDC_ONBOARD_STATUS.to_string()),
+        idc_display_name: Some("Seeded".to_string()),
+        tags: Some(Vec::new()),
+    });
+    arn
 }
 
 /// A name of `len` characters that satisfies `Qev2IdcApplicationName`'s pattern
@@ -323,88 +363,86 @@ async fn every_created_application_is_stored_exactly_as_the_request_configured_i
             "case {case}: expected the requested tags, got {:?}",
             listed_tags(&described.body)
         );
+
+        // The account holds at most one application, so the row releases it
+        // before the next row registers its own.
+        delete_application(&emulator, case, &arn).await;
     }
 }
 
-/// An application NAME is what one account's applications are unique on — "use a
-/// different application name or describe existing applications to find the
-/// ARN" — and a delete frees the name for a new application.
+/// An account holds at most ONE Query Editor (QEV2) IAM Identity Center
+/// application: while one is registered every create is refused — whatever name
+/// it asks for — and a delete frees the account for the next one.
 #[tokio::test]
-async fn an_application_name_is_unique_and_a_delete_frees_it() {
+async fn an_account_holds_one_application_and_a_delete_frees_it() {
     let emulator = Emulator::new();
+    let registered = create_application(&emulator, "the-one-app", "First", IDC_INSTANCE_ARN, &[])
+        .await;
+    assert_eq!(
+        registered.status, 200,
+        "case the first create: expected 200, got {} with body {}",
+        registered.status, registered.body
+    );
+    let arn = registered
+        .text("Qev2IdcApplicationArn")
+        .expect("case the first create: a created application carries an ARN");
 
-    // The rows differ along the spelling and the length of the name a second
-    // create re-uses, and each is followed by a name one character off it, which
-    // must be admitted: the refusal is keyed on the whole name, not a prefix.
-    for (case, name) in [
-        ("a plain name", "unique-app".to_string()),
-        ("the shortest name", name_of_length(1)),
-        ("the longest name", name_of_length(63)),
-        ("a name of digits and hyphens", "app-2-0".to_string()),
+    // The rows differ along how far the second create's name is from the
+    // registered one — the same name, one character off it, a wholly different
+    // name, each modelled length bound — and along the instance and display name
+    // it carries: NONE of them is what the refusal is about, so every row is
+    // refused alike.
+    for (case, name, display_name, instance_arn) in [
+        ("the registered name", "the-one-app".to_string(), "Second", IDC_INSTANCE_ARN),
+        ("a name one character off it", "the-one-appx".to_string(), "Second", IDC_INSTANCE_ARN),
+        ("a wholly different name", "a-fresh-name".to_string(), "Third", IDC_INSTANCE_ARN),
+        ("the shortest name", name_of_length(1), "Fourth", IDC_INSTANCE_ARN),
+        ("the longest name", name_of_length(63), "Fifth", IDC_INSTANCE_ARN),
+        (
+            "another instance the account holds",
+            "other-instance-app".to_string(),
+            "Sixth",
+            OTHER_IDC_INSTANCE_ARN,
+        ),
     ] {
-        let first = create_application(&emulator, &name, "First", IDC_INSTANCE_ARN, &[]).await;
-        assert_eq!(
-            first.status, 200,
-            "case {case}: expected the first create served with 200, got {} with body {}",
-            first.status, first.body
-        );
-        let arn = first
-            .text("Qev2IdcApplicationArn")
-            .unwrap_or_else(|| panic!("case {case}: a created application carries an ARN"));
-
-        // A second create of the SAME name registers nothing, whatever else it
-        // carries: a different display name does not make it a new application.
-        let again = create_application(&emulator, &name, "Second", IDC_INSTANCE_ARN, &[]).await;
+        let again = create_application(&emulator, &name, display_name, instance_arn, &[]).await;
         assert_refused(case, &again, 400, "Qev2IdcApplicationAlreadyExists");
-        let described = emulator
-            .call(
-                "DescribeQev2IdcApplications",
-                &[("Qev2IdcApplicationArn", arn.as_str())],
-            )
-            .await;
         assert_eq!(
-            described.text("IdcDisplayName").as_deref(),
+            again.text("Message").as_deref(),
+            Some(state::QEV2_IDC_APPLICATION_ALREADY_EXISTS),
+            "case {case}: expected the account-singleton sentence {:?}, got {:?}",
+            state::QEV2_IDC_APPLICATION_ALREADY_EXISTS,
+            again.text("Message")
+        );
+
+        // The refused create registered nothing and changed nothing: the one
+        // application is still the one the first create made.
+        let listed = emulator.call("DescribeQev2IdcApplications", &[]).await;
+        assert_eq!(
+            listed_applications(&listed.body),
+            vec!["the-one-app".to_string()],
+            "case {case}: expected only the registered application, got {:?}",
+            listed_applications(&listed.body)
+        );
+        assert_eq!(
+            listed.text("IdcDisplayName").as_deref(),
             Some("First"),
-            "case {case}: expected the refused create to change nothing, got {:?}",
-            described.text("IdcDisplayName")
-        );
-
-        // A name one character longer is a different application. The longest
-        // row is already at the modelled maximum, so its neighbour is built to
-        // stay inside the bound rather than past it.
-        let neighbour = if name.len() + 2 > 63 {
-            format!("{}-x", &name[..61])
-        } else {
-            format!("{name}-x")
-        };
-        let other =
-            create_application(&emulator, &neighbour, "Neighbour", IDC_INSTANCE_ARN, &[]).await;
-        assert_eq!(
-            other.status, 200,
-            "case {case}: expected the name {neighbour:?} admitted, got {} with body {}",
-            other.status, other.body
-        );
-
-        // The delete frees the name: the same create now succeeds again.
-        let deleted = emulator
-            .call(
-                "DeleteQev2IdcApplication",
-                &[("Qev2IdcApplicationArn", arn.as_str())],
-            )
-            .await;
-        assert_eq!(
-            deleted.status, 200,
-            "case {case}: expected the delete served with 200, got {} with body {}",
-            deleted.status, deleted.body
-        );
-        let recreated =
-            create_application(&emulator, &name, "Third", IDC_INSTANCE_ARN, &[]).await;
-        assert_eq!(
-            recreated.status, 200,
-            "case {case}: expected the freed name re-usable, got {} with body {}",
-            recreated.status, recreated.body
+            "case {case}: expected the registered display name unchanged, got {:?}",
+            listed.text("IdcDisplayName")
         );
     }
+
+    // The delete frees the account: a create with a FRESH name now succeeds,
+    // which is what makes the refusal above about the account rather than the
+    // name.
+    delete_application(&emulator, "freeing the account", &arn).await;
+    let recreated =
+        create_application(&emulator, "a-fresh-name", "Seventh", IDC_INSTANCE_ARN, &[]).await;
+    assert_eq!(
+        recreated.status, 200,
+        "case after the delete: expected the fresh name admitted, got {} with body {}",
+        recreated.status, recreated.body
+    );
 }
 
 /// An ARN that names no application is refused with the modelled 404 fault by
@@ -759,24 +797,17 @@ async fn a_modify_changes_only_the_display_name() {
 /// `DeleteQev2IdcApplication` makes the application absent from every later
 /// read, leaves every other application where it was, and a second delete of the
 /// same ARN names nothing.
+///
+/// An account registers at most ONE application through the API, so the
+/// neighbours a delete must leave alone are seeded straight into the shared
+/// store ([`seed_application`]).
 #[tokio::test]
 async fn a_delete_makes_the_application_absent_from_every_later_read() {
     let emulator = Emulator::new();
-    let mut arns: Vec<(String, String)> = Vec::new();
-    for name in ["first-app", "second-app", "third-app"] {
-        let created = create_application(&emulator, name, "Listed", IDC_INSTANCE_ARN, &[]).await;
-        assert_eq!(
-            created.status, 200,
-            "case seed {name}: expected 200, got {} with body {}",
-            created.status, created.body
-        );
-        arns.push((
-            name.to_string(),
-            created
-                .text("Qev2IdcApplicationArn")
-                .unwrap_or_else(|| panic!("case seed {name}: a created application carries an ARN")),
-        ));
-    }
+    let arns: Vec<(String, String)> = ["first-app", "second-app", "third-app"]
+        .into_iter()
+        .map(|name| (name.to_string(), seed_application(&emulator, name)))
+        .collect();
 
     // Delete the MIDDLE record, so the case cannot pass by truncating the
     // collection.
@@ -826,6 +857,10 @@ async fn a_delete_makes_the_application_absent_from_every_later_read() {
 /// The window is the one every paginated `Describe*` of this service shares
 /// (`state::MAX_RECORDS_MIN` ..= `state::MAX_RECORDS_MAX`, applied by
 /// `state::page_bounds`), tested on each bound and one past it.
+///
+/// An account registers at most ONE application through the API, and a page is a
+/// property of the COLLECTION, so the records the pages are walked over are
+/// seeded straight into the shared store ([`seed_application`]).
 #[tokio::test]
 async fn applications_are_paginated_over_the_documented_window() {
     let emulator = Emulator::new();
@@ -833,13 +868,7 @@ async fn applications_are_paginated_over_the_documented_window() {
     // of that size leaves a cursor.
     let total = state::MAX_RECORDS_MIN as usize + 1;
     for index in 0..total {
-        let name = format!("paged-app-{index}");
-        let created = create_application(&emulator, &name, "Paged", IDC_INSTANCE_ARN, &[]).await;
-        assert_eq!(
-            created.status, 200,
-            "case seed {name}: expected 200, got {} with body {}",
-            created.status, created.body
-        );
+        seed_application(&emulator, &format!("paged-app-{index}"));
     }
 
     let minimum = state::MAX_RECORDS_MIN;
@@ -1072,20 +1101,18 @@ async fn an_idc_instance_arn_that_is_not_an_arn_is_refused_and_stores_nothing() 
     );
 }
 
-/// The documented tag limit and the store's own bound on the collection: a
-/// create past either is refused with the modelled fault and registers nothing,
-/// and a delete makes room again.
+/// The documented tag limit: a create past it is refused with the modelled fault
+/// and registers nothing, while a create at it is served and carries every tag.
 ///
 /// Tag bound source: `smithy_query(query="doc", operation="CreateTags")` — "A
-/// resource can have up to 50 tags" (`state::MAX_TAGS_PER_RESOURCE`). The store
-/// bound is this emulator's own (`state::QEV2_IDC_APPLICATION_QUOTA`).
+/// resource can have up to 50 tags" (`state::MAX_TAGS_PER_RESOURCE`).
 #[tokio::test]
-async fn a_create_past_the_tag_limit_or_the_store_bound_is_refused() {
+async fn a_create_past_the_tag_limit_is_refused() {
     let emulator = Emulator::new();
 
     // The rows differ along the number of tags: none, one, the documented bound
-    // and one past it.
-    let mut tagged_names: Vec<String> = Vec::new();
+    // and one past it. An account holds at most one application, so an admitted
+    // row releases it before the next row runs.
     for (case, count, admitted) in [
         ("no tags", 0usize, true),
         ("one tag", 1, true),
@@ -1118,86 +1145,22 @@ async fn a_create_past_the_tag_limit_or_the_store_bound_is_refused() {
                 "case {case}: expected {count} tags on the created application, got {:?}",
                 listed_tags(&answer.body)
             );
-            tagged_names.push(name);
+            let arn = answer
+                .text("Qev2IdcApplicationArn")
+                .unwrap_or_else(|| panic!("case {case}: a created application carries an ARN"));
+            delete_application(&emulator, case, &arn).await;
         } else {
             assert_refused(case, &answer, 400, "TagLimitExceededFault");
         }
+
+        // Whatever the row, the account holds no application once it is done:
+        // the refused create registered nothing and the admitted one was
+        // released.
+        let listed = emulator.call("DescribeQev2IdcApplications", &[]).await;
+        assert!(
+            listed_applications(&listed.body).is_empty(),
+            "case {case}: expected no application left, got {:?}",
+            listed_applications(&listed.body)
+        );
     }
-
-    // The refused create registered nothing: only the admitted rows are stored.
-    let listed = emulator.call("DescribeQev2IdcApplications", &[]).await;
-    assert_eq!(
-        listed_applications(&listed.body),
-        tagged_names,
-        "case after the tag rows: expected only the admitted applications, got {:?}",
-        listed_applications(&listed.body)
-    );
-
-    // The store bound is thousands of records past what a suite can reasonably
-    // create over the wire, and the bound is a property of the COLLECTION, so
-    // the records it is filled with are seeded straight into the same shared
-    // store the handlers read.
-    let seeded_arn = {
-        let store = state::service_state(&*emulator.engine).expect("the Redshift store");
-        let mut store = store.lock();
-        while store.qev2_idc_applications.len() < state::QEV2_IDC_APPLICATION_QUOTA {
-            let index = store.qev2_idc_applications.len();
-            store.qev2_idc_applications.push(Qev2IdcApplication {
-                idc_instance_arn: Some(IDC_INSTANCE_ARN.to_string()),
-                qev2_idc_application_name: Some(format!("seeded-{index:06}")),
-                qev2_idc_application_arn: Some(state::qev2_idc_application_arn(
-                    &format!("seeded-{index:06}"),
-                    "us-west-2",
-                )),
-                idc_managed_application_arn: Some(state::idc_managed_application_arn(
-                    IDC_INSTANCE_ARN,
-                    &format!("seeded-{index:06}"),
-                )),
-                idc_onboard_status: Some(state::QEV2_IDC_ONBOARD_STATUS.to_string()),
-                idc_display_name: Some("Seeded".to_string()),
-                tags: Some(Vec::new()),
-            });
-        }
-        store
-            .qev2_idc_applications
-            .last()
-            .and_then(|application| application.qev2_idc_application_arn.clone())
-            .expect("the seeded applications carry ARNs")
-    };
-
-    let full = create_application(
-        &emulator,
-        "one-too-many",
-        "OneTooMany",
-        IDC_INSTANCE_ARN,
-        &[],
-    )
-    .await;
-    assert_refused("one application past the store bound", &full, 400, "LimitExceededFault");
-
-    // A delete makes room again: the same create now succeeds.
-    let deleted = emulator
-        .call(
-            "DeleteQev2IdcApplication",
-            &[("Qev2IdcApplicationArn", seeded_arn.as_str())],
-        )
-        .await;
-    assert_eq!(
-        deleted.status, 200,
-        "case freeing one record: expected 200, got {} with body {}",
-        deleted.status, deleted.body
-    );
-    let admitted = create_application(
-        &emulator,
-        "one-too-many",
-        "OneTooMany",
-        IDC_INSTANCE_ARN,
-        &[],
-    )
-    .await;
-    assert_eq!(
-        admitted.status, 200,
-        "case after freeing one record: expected 200, got {} with body {}",
-        admitted.status, admitted.body
-    );
 }

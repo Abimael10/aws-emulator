@@ -408,8 +408,10 @@ async fn a_key_the_resource_already_carries_is_updated_in_place() {
 
     // Each row writes ONE request and states the pairs the resource must carry
     // afterwards, in order: an existing key keeps its position and takes the new
-    // value, a new key is appended, and a key repeated inside one request lands
-    // once with the later value.
+    // value, and a new key is appended. A key repeated INSIDE one request is a
+    // different matter — one call carries one tag set, so it is refused rather
+    // than merged (see
+    // [`a_tag_outside_the_published_restrictions_is_refused_and_persists_nothing`]).
     type UpsertCase<'a> = (&'a str, Vec<(&'a str, &'a str)>, Vec<(&'a str, &'a str)>);
     let cases: Vec<UpsertCase> = vec![
         (
@@ -427,8 +429,8 @@ async fn a_key_the_resource_already_carries_is_updated_in_place() {
             ],
         ),
         (
-            "a key repeated in one request lands once",
-            vec![("owner", "third"), ("owner", "fourth")],
+            "an existing key takes an updated value again",
+            vec![("owner", "fourth")],
             vec![
                 ("owner", "fourth"),
                 ("environment", "test"),
@@ -467,73 +469,82 @@ async fn a_tag_outside_the_published_restrictions_is_refused_and_persists_nothin
     let emulator = Emulator::new();
     let arn = seeded_cluster(&emulator, CLUSTER).await;
 
-    // Each row is a tag and whether the published restrictions admit it: a key
+    // Each row is a tag and the answer the published restrictions earn it: a key
     // of 1..=128 characters, a value of 0..=256, and neither starting with the
     // reserved `aws:` prefix. Every bound is tested AT the bound and one past
-    // it.
+    // it. `None` is an admitted row; otherwise the row carries the error code,
+    // since a key in the RESERVED namespace is a system tag the caller may not
+    // write — the service's own `InvalidParameterValue` — while a tag set this
+    // API will not store is the modelled `InvalidTagFault`.
     let too_long_key: String = "k".repeat(state::TAG_KEY_MAX_LEN + 1);
     let longest_key: String = "j".repeat(state::TAG_KEY_MAX_LEN);
     let too_long_value: String = "v".repeat(state::TAG_VALUE_MAX_LEN + 1);
     let longest_value: String = "w".repeat(state::TAG_VALUE_MAX_LEN);
-    let cases: Vec<(&str, String, String, bool)> = vec![
-        ("an empty key", String::new(), "x".to_string(), false),
+    let cases: Vec<(&str, String, String, Option<&str>)> = vec![
+        (
+            "an empty key",
+            String::new(),
+            "x".to_string(),
+            Some("InvalidTagFault"),
+        ),
         (
             "a key one past the bound",
             too_long_key,
             "x".to_string(),
-            false,
+            Some("InvalidTagFault"),
         ),
-        ("a key at the bound", longest_key, "x".to_string(), true),
+        ("a key at the bound", longest_key, "x".to_string(), None),
         (
             "a value one past the bound",
             "over".to_string(),
             too_long_value,
-            false,
+            Some("InvalidTagFault"),
         ),
         (
             "a value at the bound",
             "at-bound".to_string(),
             longest_value,
-            true,
+            None,
         ),
         (
             "the reserved prefix on the key",
             format!("{}owner", state::RESERVED_TAG_PREFIX),
             "x".to_string(),
-            false,
+            Some("InvalidParameterValue"),
         ),
         (
             "the reserved prefix on the value",
             "reserved-value".to_string(),
             format!("{}managed", state::RESERVED_TAG_PREFIX),
-            false,
+            Some("InvalidTagFault"),
         ),
         (
             "the reserved prefix in any case",
             "AWS:Owner".to_string(),
             "x".to_string(),
-            false,
+            Some("InvalidParameterValue"),
         ),
     ];
 
     let mut accepted: Vec<(String, String)> = Vec::new();
-    for (case, key, value, admitted) in &cases {
+    for (case, key, value, refusal) in &cases {
         let answer = create_tags(&emulator, &arn, &[(key.as_str(), value.as_str())]).await;
-        if *admitted {
-            assert_eq!(
-                answer.status, 200,
-                "case {case}: expected 200, got {} with body {}",
-                answer.status, answer.body
-            );
-            accepted.push((key.clone(), value.clone()));
-        } else {
-            assert_eq!(
+        match refusal {
+            None => {
+                assert_eq!(
+                    answer.status, 200,
+                    "case {case}: expected 200, got {} with body {}",
+                    answer.status, answer.body
+                );
+                accepted.push((key.clone(), value.clone()));
+            }
+            Some(code) => assert_eq!(
                 (answer.status, answer.error_code()),
-                (400, Some("InvalidTagFault".to_string())),
-                "case {case}: expected 400 InvalidTagFault, got {} / {:?}",
+                (400, Some((*code).to_string())),
+                "case {case}: expected 400 {code}, got {} / {:?}",
                 answer.status,
                 answer.error_code()
-            );
+            ),
         }
     }
 
@@ -542,6 +553,50 @@ async fn a_tag_outside_the_published_restrictions_is_refused_and_persists_nothin
         persisted, accepted,
         "case refused tags persist nothing: expected only {accepted:?}, got {persisted:?}"
     );
+
+    // One API call carries ONE tag set, so a call naming the same key twice is
+    // refused with the modelled fault naming that key, and persists nothing —
+    // whatever position the repeat sits in and however many other keys the call
+    // carries.
+    for (case, pairs, repeated) in [
+        ("the same key twice", vec![("dup", "a"), ("dup", "b")], "dup"),
+        (
+            "a repeat after another tag",
+            vec![("solo", "x"), ("dup", "a"), ("dup", "b")],
+            "dup",
+        ),
+        (
+            "a repeat separated by other tags",
+            vec![("dup", "a"), ("solo", "x"), ("other", "y"), ("dup", "b")],
+            "dup",
+        ),
+        (
+            "the same key and value twice",
+            vec![("same", "v"), ("same", "v")],
+            "same",
+        ),
+    ] {
+        let answer = create_tags(&emulator, &arn, &pairs).await;
+        assert_eq!(
+            (answer.status, answer.error_code()),
+            (400, Some("InvalidTagFault".to_string())),
+            "case {case}: expected 400 InvalidTagFault, got {} / {:?}",
+            answer.status,
+            answer.error_code()
+        );
+        assert_eq!(
+            answer.text("Message"),
+            Some(state::duplicate_tag_key_message(repeated)),
+            "case {case}: expected the duplicate-key sentence {:?}, got {:?}",
+            state::duplicate_tag_key_message(repeated),
+            answer.text("Message")
+        );
+        let after = tags_in(&describe_tags_of(&emulator, &arn).await.body);
+        assert_eq!(
+            after, accepted,
+            "case {case}: expected the refused call to persist nothing, got {after:?}"
+        );
+    }
 }
 
 #[tokio::test]

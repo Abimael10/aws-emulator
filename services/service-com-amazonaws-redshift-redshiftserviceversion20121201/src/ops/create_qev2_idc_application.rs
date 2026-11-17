@@ -4,6 +4,12 @@
 //! IMPLEMENTED: registers one Query Editor (QEV2) IAM Identity Center application. This is
 //! the ONLY file to touch for this operation.
 //!
+//! An account holds at most ONE such application, so while one is registered every
+//! create — under the registered name or a fresh one — is refused with
+//! `Qev2IdcApplicationAlreadyExistsFault` and the fixed sentence
+//! `crate::state::QEV2_IDC_APPLICATION_ALREADY_EXISTS`, and a
+//! `DeleteQev2IdcApplication` is what makes the account able to register one again.
+//!
 //! The managed application it registers is a resource of the IAM Identity Center
 //! instance `IdcInstanceArn` names, so the create performs `sso:CreateApplication` in
 //! that instance on the caller's behalf: an instance the account's IAM Identity Center
@@ -97,14 +103,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `CreateQev2IdcApplicationError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-// `LimitExceededFault` and `TagLimitExceededFault` are widened in: the model does
-// not list them for this operation, but the service declares both shapes, and they
-// are the modelled ways to say "the store already holds as many applications as it
-// may" (see `crate::state::QEV2_IDC_APPLICATION_QUOTA`) and "the request carries
-// more tags than a resource may" (see `crate::state::MAX_TAGS_PER_RESOURCE`).
+// `TagLimitExceededFault` is widened in: the model does not list it for this
+// operation, but the service declares the shape, and it is the modelled way to
+// say "the request carries more tags than a resource may" (see
+// `crate::state::MAX_TAGS_PER_RESOURCE`).
 #[smithy_macros::operation_error(
     "com.amazonaws.redshift#CreateQev2IdcApplication",
-    extra_errors = ["LimitExceededFault", "TagLimitExceededFault"]
+    extra_errors = ["TagLimitExceededFault"]
 )]
 #[derive(Debug)]
 pub enum CreateQev2IdcApplicationErrorModeled {
@@ -112,7 +117,6 @@ pub enum CreateQev2IdcApplicationErrorModeled {
     DependentServiceUnavailableFault(DependentServiceUnavailableFault),
     Qev2IdcApplicationAlreadyExistsFault(Qev2IdcApplicationAlreadyExistsFault),
     UnsupportedOperationFault(UnsupportedOperationFault),
-    LimitExceededFault(LimitExceededFault),
     TagLimitExceededFault(TagLimitExceededFault),
 }
 
@@ -227,43 +231,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
-        // "Use a different application name or describe existing applications to
-        // find the ARN": the NAME is what an account's applications are unique
-        // on, so a second create of a registered name registers nothing.
-        if store
-            .qev2_idc_application_named(&input.qev2_idc_application_name)
-            .is_some()
-        {
+        // Query Editor v2's IAM Identity Center integration is ONE application
+        // per account, so what this create is refused on is the EXISTENCE of an
+        // application rather than the name the request asked for: while the
+        // account holds one, a create under a fresh name registers nothing just
+        // as a repeat of the registered name does, and the refusal's sentence
+        // carries no part of the request. The delete frees the account, and the
+        // bound also keeps the collection finite, so no store quota sits behind
+        // it.
+        if store.qev2_idc_application_of_account().is_some() {
             return Err(
                 CreateQev2IdcApplicationErrorModeled::Qev2IdcApplicationAlreadyExistsFault(
                     Qev2IdcApplicationAlreadyExistsFault {
-                        message: Some(format!(
-                            "Amazon Redshift Query Editor (QEV2) IAM Identity Center application already exists: {}",
-                            input.qev2_idc_application_name
-                        )),
+                        message: Some(st::QEV2_IDC_APPLICATION_ALREADY_EXISTS.to_string()),
                     },
                 )
                 .into(),
             );
-        }
-
-        // Identity before capacity: a request that would register nothing keeps
-        // the more specific fault even when the store is at its bound. Past that
-        // bound the collection may not grow: a name is all an application's
-        // identity is, and names are unlimited in number, so this bound is what
-        // keeps the collection finite. `LimitExceededFault` is the modelled
-        // capacity refusal this crate already answers its other store bounds
-        // with (see `create_usage_limit.rs`).
-        if store.qev2_idc_applications.len() >= st::QEV2_IDC_APPLICATION_QUOTA {
-            return Err(CreateQev2IdcApplicationErrorModeled::LimitExceededFault(
-                LimitExceededFault {
-                    message: Some(format!(
-                        "The request would exceed the allowed number of Amazon Redshift Query Editor (QEV2) IAM Identity Center applications ({}).",
-                        st::QEV2_IDC_APPLICATION_QUOTA
-                    )),
-                },
-            )
-            .into());
         }
 
         // The dependent service denied the registration, so there is no managed

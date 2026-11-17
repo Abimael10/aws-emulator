@@ -194,10 +194,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(request_id) = input.reserved_node_exchange_request_id.as_deref() {
             if !st::is_minted_identifier(request_id) {
                 return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
-                    st::malformed_identifier_message(
-                        st::MEMBER_RESERVED_NODE_EXCHANGE_REQUEST_ID,
-                        request_id,
-                    ),
+                    st::malformed_identifier_message(st::MEMBER_RESERVED_NODE_EXCHANGE_REQUEST_ID),
                 ));
             }
             if store.reserved_node_exchange(request_id).is_none() {

@@ -403,7 +403,7 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
     ) -> Result<&StoredReservedNode, ExchangeRefusal> {
         if !is_minted_identifier(reserved_node_id) {
             return Err(ExchangeRefusal::InvalidParameterValue(
-                malformed_identifier_message("ReservedNodeId", reserved_node_id),
+                malformed_identifier_message(MEMBER_RESERVED_NODE_ID),
             ));
         }
         self.reserved_node(reserved_node_id).ok_or_else(|| {
@@ -1168,14 +1168,17 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
             })
     }
 
-    /// The registered QEV2 IAM Identity Center application with this
-    /// `Qev2IdcApplicationName`, if any — the name uniqueness is decided on,
-    /// since the modelled fault tells a caller to "use a different application
-    /// name".
-    pub fn qev2_idc_application_named(&self, name: &str) -> Option<&Qev2IdcApplication> {
-        self.qev2_idc_applications
-            .iter()
-            .find(|application| application.qev2_idc_application_name.as_deref() == Some(name))
+    /// The QEV2 IAM Identity Center application this account holds, if it holds
+    /// one.
+    ///
+    /// Query Editor v2's IAM Identity Center integration is ONE application per
+    /// account: the collection holds at most one record, whatever name each
+    /// create asks for, so this is the existence check
+    /// `CreateQev2IdcApplication` refuses a second registration on — not a
+    /// lookup by name. The ARN-keyed accessors above are what the read, the
+    /// modify and the delete reach that one record by.
+    pub fn qev2_idc_application_of_account(&self) -> Option<&Qev2IdcApplication> {
+        self.qev2_idc_applications.first()
     }
 
     /// The position of the Redshift IAM Identity Center application with this

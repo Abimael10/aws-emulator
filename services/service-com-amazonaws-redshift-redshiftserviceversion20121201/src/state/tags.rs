@@ -195,38 +195,94 @@ pub const TAG_VALUE_MAX_LEN: usize = 256;
 /// The key prefix AWS reserves for its own tags. See [`TAG_KEY_MAX_LEN`].
 pub const RESERVED_TAG_PREFIX: &str = "aws:";
 
-/// Check one request's tags against the published restrictions, naming the tag
-/// and the restriction it breaks. An `Err` is an `InvalidTagFault`.
+/// Why a request's tag set is refused, classified so each operation answers the
+/// class on the channel Amazon Redshift answers it on.
 ///
-/// Length is counted in CHARACTERS, not bytes: the guide bounds a key at 128 and
-/// a value at 256 Unicode characters, so a multi-byte value is bounded by what
-/// it spells and not by how UTF-8 encodes it.
-pub fn check_tags(tags: &[crate::ops::types::Tag]) -> Result<(), String> {
+/// The two classes are DIFFERENT refusals of the same member: one says the tag
+/// set the request carries is not one this API will store, the other says the
+/// caller may not write the tag at all. A client that branches on the refusal —
+/// sanitize the tag and retry, or drop the key — needs them told apart, so the
+/// shared validator reports which it is and no handler has to re-derive it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TagRefusal {
+    /// The tag set breaks one of the published tag restrictions, or names one key
+    /// twice: the modelled `InvalidTagFault` ("The tag is invalid"), with the
+    /// restriction it breaks and the tag it breaks it on.
+    InvalidTag(String),
+    /// A key under [`RESERVED_TAG_PREFIX`]: that namespace belongs to the SYSTEM,
+    /// so the request is not a malformed tag set but one asking to write a tag
+    /// its caller does not own. Amazon Redshift refuses it as a bad parameter
+    /// value with [`SYSTEM_TAG_REFUSAL`]'s wholly fixed sentence.
+    SystemTag,
+}
+
+/// What a request that would write a tag under [`RESERVED_TAG_PREFIX`] is refused
+/// with.
+///
+/// The sentence carries NO variable part — it names neither the key nor the
+/// resource: it states WHO the caller is and that a system tag is not theirs to
+/// mutate, which is the whole of the refusal.
+pub const SYSTEM_TAG_REFUSAL: &str = "Caller is an end user and not allowed to mutate system tags";
+
+/// Why a request that names the same tag key more than once is refused, naming
+/// the key that repeats.
+///
+/// One API call carries ONE tag set, and a set has one entry per key — so a
+/// repeated key makes the request ambiguous about the value it asks for rather
+/// than describing a tag to store. The key the request repeated is the one
+/// variable part; the rest states the rule the whole call is held to.
+pub fn duplicate_tag_key_message(key: &str) -> String {
+    format!(
+        "Tag key: '{key}' has been used more than once. \
+         You must use a unique set of keys per api call."
+    )
+}
+
+/// Check one request's tags against the published restrictions, reporting which
+/// class of refusal the first offending tag earns ([`TagRefusal`]).
+///
+/// The restrictions: a key is present, no longer than [`TAG_KEY_MAX_LEN`] and
+/// outside the reserved namespace; a value is no longer than
+/// [`TAG_VALUE_MAX_LEN`] and outside it too; and no key appears twice in one
+/// call. Length is counted in CHARACTERS, not bytes: the guide bounds a key at
+/// 128 and a value at 256 Unicode characters, so a multi-byte value is bounded
+/// by what it spells and not by how UTF-8 encodes it.
+///
+/// ONE validator for every operation of this service that takes a `TagList`, so
+/// the same tag set is admitted — or refused on the same class — whichever
+/// operation carries it.
+pub fn check_tags(tags: &[crate::ops::types::Tag]) -> Result<(), TagRefusal> {
+    // The keys this call has already named, so one repeated key is found in one
+    // pass over the request rather than by comparing every pair of its tags.
+    let mut named: BTreeSet<&str> = BTreeSet::new();
     for tag in tags {
         let key = tag.key.as_deref().unwrap_or_default();
         if key.is_empty() {
-            return Err("Invalid tag: a tag key cannot be null, empty, or blank.".to_string());
+            return Err(TagRefusal::InvalidTag(
+                "Invalid tag: a tag key cannot be null, empty, or blank.".to_string(),
+            ));
         }
         if key.chars().count() > TAG_KEY_MAX_LEN {
-            return Err(format!(
+            return Err(TagRefusal::InvalidTag(format!(
                 "Invalid tag key '{key}': a tag key cannot be longer than {TAG_KEY_MAX_LEN} characters."
-            ));
+            )));
         }
         if key.to_lowercase().starts_with(RESERVED_TAG_PREFIX) {
-            return Err(format!(
-                "Invalid tag key '{key}': the prefix '{RESERVED_TAG_PREFIX}' is reserved for Amazon Web Services."
-            ));
+            return Err(TagRefusal::SystemTag);
         }
         let value = tag.value.as_deref().unwrap_or_default();
         if value.chars().count() > TAG_VALUE_MAX_LEN {
-            return Err(format!(
+            return Err(TagRefusal::InvalidTag(format!(
                 "Invalid tag value for key '{key}': a tag value cannot be longer than {TAG_VALUE_MAX_LEN} characters."
-            ));
+            )));
         }
         if value.to_lowercase().starts_with(RESERVED_TAG_PREFIX) {
-            return Err(format!(
+            return Err(TagRefusal::InvalidTag(format!(
                 "Invalid tag value for key '{key}': the prefix '{RESERVED_TAG_PREFIX}' is reserved for Amazon Web Services."
-            ));
+            )));
+        }
+        if !named.insert(key) {
+            return Err(TagRefusal::InvalidTag(duplicate_tag_key_message(key)));
         }
     }
     Ok(())
@@ -238,11 +294,11 @@ pub fn check_tags(tags: &[crate::ops::types::Tag]) -> Result<(), String> {
 /// A key already on the resource keeps its position and takes the new value —
 /// `smithy_query(query="doc", operation="CreateTags")`: "If you specify a key
 /// that already exists for the resource, the value for that key will be updated
-/// with the new value" — which is also what a key repeated WITHIN one request
-/// does, the later pair winning. A key the resource does not carry is appended.
-/// Computed into a new list rather than applied in place because the attempt
-/// must "fail" as a whole when it would exceed [`TAGS_PER_RESOURCE_QUOTA`]:
-/// nothing is persisted on the error path.
+/// with the new value". A key repeated WITHIN one request never reaches here:
+/// one call carries one tag set, so [`check_tags`] refuses it first. A key the
+/// resource does not carry is appended. Computed into a new list rather than
+/// applied in place because the attempt must "fail" as a whole when it would
+/// exceed [`TAGS_PER_RESOURCE_QUOTA`]: nothing is persisted on the error path.
 ///
 /// A tag whose `Value` the request omits is stored as the EMPTY value, which is
 /// the value such a tag reports: the member is modelled optional but a stored

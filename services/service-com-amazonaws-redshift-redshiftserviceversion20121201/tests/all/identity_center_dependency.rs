@@ -274,6 +274,34 @@ impl Registration {
             Self::Qev2 => create_qev2_application(emulator, name, instance_arn, extra).await,
         }
     }
+
+    /// The element a created application carries its own ARN in, which every later
+    /// call reaches it by.
+    fn arn_member(self) -> &'static str {
+        match self {
+            Self::Redshift => "RedshiftIdcApplicationArn",
+            Self::Qev2 => "Qev2IdcApplicationArn",
+        }
+    }
+
+    /// Delete the application a create registered, so a case that registers one per
+    /// row leaves the account as it found it — which is what a row needs when the
+    /// account holds at most ONE application of that kind (the QEV2 one).
+    async fn release(self, emulator: &Emulator, case: &str, created: &Answer) {
+        let arn = created
+            .text(self.arn_member())
+            .unwrap_or_else(|| panic!("case {case:?}: a created application carries an ARN"));
+        let action = match self {
+            Self::Redshift => "DeleteRedshiftIdcApplication",
+            Self::Qev2 => "DeleteQev2IdcApplication",
+        };
+        let deleted = emulator.call(action, &[(self.arn_member(), arn.as_str())]).await;
+        assert_eq!(
+            deleted.status, 200,
+            "case {case:?}: expected {action} served with 200, got {} with body {}",
+            deleted.status, deleted.body
+        );
+    }
 }
 
 /// The names of the applications this registration's own read lists.
@@ -451,6 +479,11 @@ async fn a_registration_naming_an_instance_the_account_holds_is_served() {
                 listed.contains(&name),
                 "case {case:?}: expected the read to list {name:?}, got {listed:?}"
             );
+
+            // The row releases what it registered: an account holds at most one QEV2
+            // application, so the next instance's row starts from an account that
+            // holds none.
+            registration.release(&emulator, &case, &created).await;
         }
     }
 }

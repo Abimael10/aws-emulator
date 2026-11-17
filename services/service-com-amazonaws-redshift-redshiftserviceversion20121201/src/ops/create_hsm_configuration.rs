@@ -6,7 +6,11 @@
 //! back: the identifier as given, the description, the HSM's IP address and the
 //! partition the cluster's encryption keys live in, plus the tags the request
 //! carried. A second create under the same identifier is refused with
-//! `HsmConfigurationAlreadyExistsFault`.
+//! `HsmConfigurationAlreadyExistsFault`, a tag set the shared validator refuses
+//! (`crate::state::check_tags`) is refused before anything is stored, and a
+//! create past the account's published quota
+//! (`crate::state::HSM_CONFIGURATION_QUOTA`) is refused with
+//! `HsmConfigurationQuotaExceededFault`.
 //!
 //! The two secret-bearing request members — the HSM's public certificate file
 //! and the partition password — are kept on the stored record (see
@@ -199,13 +203,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        if let Err(message) = st::check_tags(&tags) {
-            return Err(CreateHsmConfigurationErrorModeled::InvalidTagFault(
-                InvalidTagFault {
-                    message: Some(message),
-                },
-            )
-            .into());
+        // The two classes of tag refusal the shared validator tells apart (see
+        // `state::TagRefusal`): a tag set this API will not store — a key twice in
+        // one call among them — is the modelled `InvalidTagFault`, while a key in
+        // the reserved namespace is a system tag the caller does not own, a bad
+        // parameter value with the service's own fixed sentence. Either way
+        // nothing is stored, so a later read of the identifier finds no
+        // configuration.
+        if let Err(refusal) = st::check_tags(&tags) {
+            return Err(match refusal {
+                st::TagRefusal::InvalidTag(message) => {
+                    CreateHsmConfigurationErrorModeled::InvalidTagFault(InvalidTagFault {
+                        message: Some(message),
+                    })
+                    .into()
+                }
+                st::TagRefusal::SystemTag => crate::scaffolded::Scaffolded::invalid_parameter_value(
+                    st::SYSTEM_TAG_REFUSAL.to_string(),
+                ),
+            });
         }
 
         let mut store = state.lock();
@@ -230,13 +246,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
+        // The account's published quota on HSM connections: past it nothing is
+        // stored, so the refused identifier names no configuration a later read
+        // reports, and a `DeleteHsmConfiguration` makes room for the next create.
         if store.hsm_configurations.len() >= st::HSM_CONFIGURATION_QUOTA {
             return Err(
                 CreateHsmConfigurationErrorModeled::HsmConfigurationQuotaExceededFault(
                     HsmConfigurationQuotaExceededFault {
-                        message: Some(format!(
-                            "The request would exceed the allowed number of HSM configurations ({}).",
-                            st::HSM_CONFIGURATION_QUOTA
+                        message: Some(st::hsm_configuration_quota_exceeded_message(
+                            store.hsm_configurations.len(),
                         )),
                     },
                 )

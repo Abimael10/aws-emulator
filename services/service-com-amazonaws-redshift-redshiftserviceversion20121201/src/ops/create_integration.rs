@@ -255,13 +255,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        if let Err(message) = st::check_tags(&tags) {
-            return Err(CreateIntegrationErrorModeled::InvalidTagFault(
-                InvalidTagFault {
-                    message: Some(message),
-                },
-            )
-            .into());
+        // The two classes of tag refusal the shared validator tells apart (see
+        // `state::TagRefusal`): a tag set this API will not store is the modelled
+        // `InvalidTagFault`, while a key in the reserved namespace is a system tag
+        // the caller does not own — a bad parameter value, with the service's own
+        // fixed sentence.
+        if let Err(refusal) = st::check_tags(&tags) {
+            return Err(match refusal {
+                st::TagRefusal::InvalidTag(message) => {
+                    CreateIntegrationErrorModeled::InvalidTagFault(InvalidTagFault {
+                        message: Some(message),
+                    })
+                    .into()
+                }
+                st::TagRefusal::SystemTag => crate::scaffolded::Scaffolded::invalid_parameter_value(
+                    st::SYSTEM_TAG_REFUSAL.to_string(),
+                ),
+            });
         }
 
         // The SOURCE is a resource of ANOTHER service — the modelled `SourceArn`
