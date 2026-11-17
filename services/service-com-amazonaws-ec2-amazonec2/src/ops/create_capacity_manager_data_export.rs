@@ -21,9 +21,14 @@
 //! rules, the key prefix against the length an S3 object key has, each catalog word, and the
 //! tag payload — then the account's state (a replayed `ClientToken`, and the store's
 //! ceilings), then `DryRun`, which answers "whether you have the required permissions for the
-//! action, WITHOUT ACTUALLY MAKING THE REQUEST", and only then the write. So a probe of a
-//! request that would have been refused is refused with THAT reason, a probe of one that
-//! would have succeeded stores nothing, and a replayed `ClientToken` answers the one
+//! action, WITHOUT ACTUALLY MAKING THE REQUEST", and only then the DESTINATION: "the bucket
+//! must exist and you must have write permissions to it"
+//! (`CreateCapacityManagerDataExportRequest$S3BucketName`), so a bucket the account's object
+//! store does not hold is refused before anything is written
+//! ([`crate::state::capacity_manager_export_bucket_is_not_valid`]) rather than left as a
+//! configuration whose scheduled deliveries have nowhere to go. So a probe of a request that
+//! would have been refused on its own parameters is refused with THAT reason, a probe of one
+//! that would have succeeded stores nothing, and a replayed `ClientToken` answers the one
 //! configuration it created instead of a second one.
 //!
 //! ## Shape of an operation
@@ -173,21 +178,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::scaffolded::Scaffolded;
         use crate::state::{
             CAPACITY_MANAGER_DATA_EXPORT_TAGGABLE_RESOURCE, CapacityManagerDataExportSpec,
-            MAX_CLIENT_TOKEN_CHARS, MAX_S3_KEY_PREFIX_CHARS, MAX_STORED_BYTES,
-            capacity_manager_data_export_limit_exceeded,
-            capacity_manager_data_export_payload_bytes, dry_run_operation,
-            idempotent_parameter_mismatch, invalid_s3_bucket_name, missing_parameter,
-            modelled_catalog_word, require_service_state,
-            s3_bucket_name_is_well_formed, same_capacity_manager_data_export_request,
-            tags_from_specifications,
+            MAX_CLIENT_TOKEN_CHARS, MAX_S3_KEY_PREFIX_CHARS,
+            capacity_manager_data_export_payload_bytes,
+            capacity_manager_export_bucket_is_not_valid, dry_run_operation, invalid_s3_bucket_name,
+            missing_parameter, modelled_catalog_word, request_region, require_service_state,
+            s3_bucket_name_is_well_formed, tags_from_specifications,
         };
 
         // A data export configuration carries no Region member of its own — it is a
         // configuration of the account's Capacity Manager, which is how
-        // `DescribeCapacityManagerDataExports` reads one back too — so nothing here depends
-        // on the Region the request was signed for; `ctx` carries request metadata only, and
-        // the store is reached through the engine held on `self`.
-        let _ = ctx;
+        // `DescribeCapacityManagerDataExports` reads one back too. The Region the request was
+        // signed for is read for ONE thing: it is which Amazon S3 the destination bucket is
+        // resolved against below.
+        let region = request_region(ctx.parts());
 
         // "Unique, case-sensitive identifier that you provide to ensure the idempotency of
         // the request" (`$ClientToken`): the token map keeps whatever it is given for the
@@ -299,66 +302,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             capacity_manager_data_export_payload_bytes(&asked, input.client_token.as_deref());
 
         let state = require_service_state(&*self.engine)?;
-        let mut store = state.lock();
 
-        // Idempotency: one token names the one configuration it created, so a replay reports
-        // that configuration and creates nothing. Read here, answered below the DryRun check,
-        // because a replay stores nothing and so passes the ceilings a fresh create has to
-        // clear.
-        let replayed = input.client_token.as_deref().and_then(|token| {
-            store
-                .capacity_manager_data_export_client_tokens
-                .get(token)
-                .cloned()
-        });
+        // What the account's own state says about this request, read in a scope of its own, so
+        // the guard is released before the destination below is resolved against the service
+        // that owns it: a lock is never held across an await.
+        let replayed = {
+            let store = state.lock();
 
-        // A token is only idempotent for the REQUEST it was first given with: replayed with a
-        // different request it names a configuration the caller did not ask for, which EC2
-        // refuses rather than answers. Checked before the DryRun flag, so a dry run of such a
-        // request is refused with this reason too.
-        if let Some(export_id) = replayed.as_deref() {
-            let stored = store
-                .capacity_manager_data_exports
-                .get(export_id)
-                .ok_or_else(|| {
-                    Scaffolded::internal_error(format!(
-                        "a client token names Capacity Manager data export configuration \
-                         '{export_id}', which is not stored"
-                    ))
-                })?;
-            if !same_capacity_manager_data_export_request(stored, &asked) {
-                return Err(idempotent_parameter_mismatch());
-            }
-        }
+            // Idempotency: one token names the one configuration it created, so a replay
+            // reports that configuration and creates nothing. Read here, answered below the
+            // DryRun check, because a replay stores nothing and so passes the ceilings a
+            // fresh create has to clear.
+            let replayed = replayed_export(&store, input.client_token.as_deref(), &asked)?;
 
-        if replayed.is_none() {
-            if !store.has_capacity_manager_data_export_capacity() {
-                return Err(capacity_manager_data_export_limit_exceeded(
-                    store.capacity_manager_data_exports.len(),
-                ));
+            if replayed.is_none() {
+                store_admits_export(&store, payload_bytes)?;
             }
-            if store.would_exceed_stored_bytes(payload_bytes) {
-                return Err(Scaffolded::request_limit_exceeded(format!(
-                    "This emulator holds {} of at most {MAX_STORED_BYTES} bytes of \
-                     caller-supplied data, so it cannot store {payload_bytes} more",
-                    store.stored_bytes()
-                )));
-            }
-        }
+
+            replayed
+        };
 
         // DryRun sits AFTER every parameter has been read and the account's own state asked,
         // and BEFORE the first write: the flag asks whether the request WOULD have worked, so
         // one that would have been refused is refused with that reason instead, and one that
-        // would have succeeded leaves state untouched.
+        // would have succeeded leaves state untouched. It asks "whether you have the required
+        // PERMISSIONS for the action, without actually making the request" (`$DryRun`), which
+        // is a question about the caller and not about another service's resources — RECORDED:
+        // a probe of this create is answered `DryRunOperation` where the real call naming a
+        // destination the object store does not hold is refused, so the destination is resolved
+        // below this flag rather than above it.
         if input.dry_run == Some(true) {
             return Err(dry_run_operation());
         }
 
+        // A replay reports the configuration its token already created, so it resolves nothing
+        // and stores nothing.
         if let Some(export_id) = replayed {
             return Ok(CreateCapacityManagerDataExportOutput {
                 capacity_manager_data_export_id: Some(export_id),
             });
         }
+
+        // "The bucket must exist and you must have write permissions to it"
+        // (`$S3BucketName`): a configuration is a standing instruction to write export files
+        // into that bucket on every run of its schedule, so a bucket the account's object
+        // store does not hold is a destination each of those deliveries would be written into
+        // nothing. The question is put to the service that OWNS the bucket, through the tree's
+        // one reading of it, and only that service ANSWERING that it holds no such bucket
+        // refuses the create — an emulator assembled with no object store to ask establishes
+        // nothing and so refuses nothing, the rule every cross-service pre-condition of this
+        // crate follows ([`crate::state::flow_log_destination_existence`]). Asked with no
+        // guard of this service's store held, because it awaits.
+        if ::service_common::s3_client::bucket_is_absent(ctx, &region, &input.s3_bucket_name)
+            .await
+        {
+            return Err(capacity_manager_export_bucket_is_not_valid());
+        }
+
+        // The write, in a scope of its own. The store's own conditions are asked AGAIN under
+        // the guard that performs it: the destination above was resolved with no guard held, so
+        // another create carrying this token may have stored its configuration, or another one
+        // taken the room this one needs, in the meantime. Asking inside the writing scope is
+        // what makes both answers facts of the store rather than of an instant before it.
+        let mut store = state.lock();
+        if let Some(export_id) = replayed_export(&store, input.client_token.as_deref(), &asked)? {
+            return Ok(CreateCapacityManagerDataExportOutput {
+                capacity_manager_data_export_id: Some(export_id),
+            });
+        }
+        store_admits_export(&store, payload_bytes)?;
 
         // The store mints the id and reads the creation instant off the clock
         // (`crate::state::capacity_manager_data_exports`), so this handler decides neither
@@ -396,4 +408,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ))
             })
     }
+}
+
+/// The data export configuration a `ClientToken` has ALREADY created, when it names one — and
+/// `None` for a request carrying no token, or one no create has used yet.
+///
+/// `Err` when the token names a configuration asking for something other than `asked`: "unique,
+/// case-sensitive identifier that you provide to ensure the idempotency of the request"
+/// (`$ClientToken`) holds for a retry of the SAME request, so a token reused for a different one
+/// names a configuration the caller did not ask for, which EC2 refuses rather than answers.
+///
+/// Asked twice by the handler above — once with the request's own parameters, before the DryRun
+/// probe, so a probe of a replayed-and-changed request is refused with that reason too, and
+/// again under the guard that performs the write, where another create carrying the same token
+/// may have stored its configuration while the destination was being resolved with no guard
+/// held. One token therefore names one configuration however the two calls interleave.
+fn replayed_export<E>(
+    store: &crate::state::ComAmazonawsEc2Amazonec2State,
+    client_token: Option<&str>,
+    asked: &CapacityManagerDataExportResponse,
+) -> Result<Option<String>, crate::scaffolded::Scaffolded<E>> {
+    use crate::scaffolded::Scaffolded;
+    use crate::state::{
+        idempotent_parameter_mismatch, same_capacity_manager_data_export_request,
+    };
+
+    let Some(export_id) = client_token.and_then(|token| {
+        store
+            .capacity_manager_data_export_client_tokens
+            .get(token)
+            .cloned()
+    }) else {
+        return Ok(None);
+    };
+    let stored = store
+        .capacity_manager_data_exports
+        .get(&export_id)
+        .ok_or_else(|| {
+            Scaffolded::internal_error(format!(
+                "a client token names Capacity Manager data export configuration \
+                 '{export_id}', which is not stored"
+            ))
+        })?;
+    if !same_capacity_manager_data_export_request(stored, asked) {
+        return Err(idempotent_parameter_mismatch());
+    }
+    Ok(Some(export_id))
+}
+
+/// Whether this store has room for one more data export configuration carrying
+/// `payload_bytes` of caller-chosen text: the COUNT ceiling
+/// ([`crate::state::MAX_CAPACITY_MANAGER_DATA_EXPORTS`]) and then the byte budget, because a
+/// record count on its own admits megabytes — the record holds strings the caller chose the
+/// length of.
+///
+/// Asked twice by the handler above — once with the request's own parameters, and again under
+/// the guard that performs the write — so the two askings cannot state the ceiling differently.
+fn store_admits_export<E>(
+    store: &crate::state::ComAmazonawsEc2Amazonec2State,
+    payload_bytes: usize,
+) -> Result<(), crate::scaffolded::Scaffolded<E>> {
+    use crate::scaffolded::Scaffolded;
+    use crate::state::{MAX_STORED_BYTES, capacity_manager_data_export_limit_exceeded};
+
+    if !store.has_capacity_manager_data_export_capacity() {
+        return Err(capacity_manager_data_export_limit_exceeded(
+            store.capacity_manager_data_exports.len(),
+        ));
+    }
+    if store.would_exceed_stored_bytes(payload_bytes) {
+        return Err(Scaffolded::request_limit_exceeded(format!(
+            "This emulator holds {} of at most {MAX_STORED_BYTES} bytes of caller-supplied \
+             data, so it cannot store {payload_bytes} more",
+            store.stored_bytes()
+        )));
+    }
+    Ok(())
 }

@@ -80,6 +80,20 @@ pub fn output_format_refusal_message(value: &str) -> String {
     )
 }
 
+/// How EC2 states a destination bucket a data export cannot be delivered into: HTTP 400
+/// `InvalidParameterValue`, `The S3 Bucket Name isn't valid.`
+///
+/// RECORDED: that whole sentence is the fixed text of this error class — it names neither the
+/// bucket nor what is wrong with it, so nothing of the request is interpolated into it. The
+/// destination is the one thing a create cannot make up for later: "the bucket must exist and
+/// you must have write permissions to it"
+/// (`CreateCapacityManagerDataExportRequest$S3BucketName`), so a name the account's object
+/// store holds no bucket under is a destination every scheduled delivery would be written
+/// into the void, which is what this refuses.
+pub fn capacity_manager_export_bucket_is_not_valid<E>() -> Scaffolded<E> {
+    super::invalid_parameter_value("The S3 Bucket Name isn't valid.")
+}
+
 /// How many data export configurations this store holds before a create is refused.
 ///
 /// CHOSEN: AWS publishes no quota for this resource, and a store that grows without bound is
