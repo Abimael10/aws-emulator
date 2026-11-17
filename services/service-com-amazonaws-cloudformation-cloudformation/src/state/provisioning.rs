@@ -1656,6 +1656,11 @@ pub async fn advance_stabilisations_in(
     // can do ([`super::stack_notifications`]) — and last, so the events this call has just
     // made due are among the ones it publishes.
     super::stack_notifications::deliver(ctx, state, region).await;
+    // ...and the status-change events those same stack events owe the account's default
+    // EventBridge bus, for the same reason and in the same place: the publication was due the
+    // instant the event was recorded, and it reaches another service
+    // ([`super::stack_status_events`]).
+    super::stack_status_events::deliver(ctx, state, region).await;
 }
 
 /// The properties the resource `logical_id` of `stack` was DECLARED with, or `None` where

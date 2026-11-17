@@ -487,6 +487,11 @@ pub mod stack_set_instance_outcomes;
 /// default EventBridge bus: one per status a drift detection reaches ([`drift_events`]).
 pub mod drift_events;
 
+/// The STACK and RESOURCE status-change events this service publishes onto the account's
+/// default EventBridge bus: one per status change recorded on a stack
+/// ([`stack_status_events`]).
+pub mod stack_status_events;
+
 /// The rule a CALLER's `Tags` are held to: the tag keys AWS reserves for itself, which no
 /// operation that takes a `Tags` list admits from a request.
 pub mod stack_tags;
@@ -1881,6 +1886,11 @@ pub struct StoredEvent {
     /// is caller text whose length the model does not bound, so what the event log retains
     /// per event is eight bytes.
     pub owed_notification: Option<u64>,
+    /// Whether this event still owes the account's default EventBridge bus a status-change
+    /// event ([`stack_status_events`]), taken off the event as that publication is claimed.
+    /// `false` is "nothing owed" — the event reports no transition, or it has been published
+    /// already — so no event is ever published twice.
+    pub owed_bus_event: bool,
 }
 
 /// The `DetailedStatus` of an event that reports a PRE-DEPLOYMENT validation failure, from

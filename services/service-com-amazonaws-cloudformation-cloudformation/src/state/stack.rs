@@ -1119,6 +1119,9 @@ impl StoredStack {
             failed_validation: false,
             // Filled by [`Self::push_event`], from the topics the stack carries now.
             owed_notification: None,
+            // ...and the status-change event this transition owes the account's default
+            // EventBridge bus, marked there too ([`super::stack_status_events`]).
+            owed_bus_event: false,
         });
     }
 
@@ -1158,6 +1161,7 @@ impl StoredStack {
             // ([`super::detailed_status_of`]), so nothing else marks it.
             failed_validation: false,
             owed_notification: None,
+            owed_bus_event: false,
         });
     }
 
@@ -1178,6 +1182,12 @@ impl StoredStack {
         // the event carries is the DIGEST of that list and not the list itself
         // ([`super::stack_notifications`]).
         event.owed_notification = super::stack_notifications::owed_by(&self.notification_arns);
+        // CloudFormation is an event SOURCE for its stacks as well: every status change it
+        // records is published onto the account's default EventBridge bus, and recording the
+        // event is what owes that publication ([`super::stack_status_events`]). Marked here,
+        // where the change is recorded; the call that publishes it holds no lock of this
+        // store.
+        event.owed_bus_event = super::stack_status_events::owed_by(&event);
         if event
             .resource_properties
             .as_ref()
