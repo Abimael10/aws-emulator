@@ -13342,6 +13342,7 @@ dependencies = [
 name = "service-com-amazonaws-dynamodb-dynamodb-20120810"
 version = "0.1.0"
 dependencies = [
+ "automod",
  "aws-emulator-build-support",
  "aws-emulator-emulator-telemetry",
  "aws-emulator-engine",
@@ -13364,6 +13365,7 @@ dependencies = [
  "percent-encoding",
  "rand 0.9.5",
  "ruzstd",
+ "serde",
  "serde_json",
  "service-com-amazonaws-account-account",
  "service-com-amazonaws-cloudwatch-graniteserviceversion20100801",

@@ -25,6 +25,11 @@ http = { workspace = true }
 # what lets a document this service reads and reports back (a resource-based policy) keep
 # the member order it was written in (`state::policies`).
 serde_json = { workspace = true, features = ["preserve_order"] }
+# The deserialization layer asks the maintained JSON reader for ONE value of a request body
+# at one path, so the diagnosis a body it cannot read is refused with — the class found, the
+# type expected and the line and column it stopped at — is that reader's own rather than a
+# sentence written here (`service::request_layer`).
+serde = { workspace = true }
 tracing = { workspace = true }
 # Linear-time substring search over BYTES: `contains(path, :operand)` over a binary
 # attribute searches one caller-sized value for another, so the search has to cost the
@@ -112,6 +117,7 @@ service-com-amazonaws-account-account = { workspace = true }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+automod = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 # The objects an export writes are asserted where Amazon S3 holds them, through that

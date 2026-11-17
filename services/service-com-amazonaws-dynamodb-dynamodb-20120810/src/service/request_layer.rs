@@ -1,10 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! This service's request-DESERIALIZATION layer: how a body value whose JSON class the
-//! modelled member it is bound to cannot be read from is refused.
+//! This service's request-DESERIALIZATION layer: how a body no input can be read from, and
+//! a body value whose JSON class the modelled member it is bound to cannot be read from, are
+//! refused.
 //!
-//! Two refusals happen before a handler runs, and they are NOT the same error class:
+//! Three refusals happen before a handler runs, and the first two are NOT the same error
+//! class as the third:
 //!
+//! * bytes that are not ONE complete JSON object are no body of this protocol at all. The
+//!   protocol carries an operation's input as a single JSON object, so bytes that do not
+//!   parse, bytes carrying anything after that object, and a document that is not an object
+//!   are a defect of the BODY rather than of one value in it: there is no value whose class
+//!   could be named, so the refusal is [`SERIALIZATION_EXCEPTION`] and no prose at all
+//!   ([`body_reading`]);
 //! * a value whose JSON class the modelled type of its member admits no reading of — a
 //!   number where the model declares a string, a string where it declares a long, a scalar
 //!   where it declares a list — never becomes a value at all. That is a failure of the
@@ -18,7 +26,7 @@
 //!   this service answers as its `ValidationException`
 //!   ([`super::EmulatedService::override_refusal`]).
 //!
-//! The framework renders both in the constraint-violation envelope
+//! The framework renders a marshalling failure in the constraint-violation envelope
 //! (`vendor/smithy-server-runtime/src/pre_dispatch.rs`, where every `ProtocolError::Serde`
 //! takes that code and the lowercase member name), so a client branching on the error class
 //! to decide whether to fix its serializer or fix a value takes the wrong branch, and a tool
@@ -30,35 +38,49 @@
 //! `services/service-com-amazonaws-xray-awsxray` and
 //! `services/service-com-amazonaws-kinesis-kinesis-20131202` do for their own services.
 //!
-//! Nothing about the model is written down here. WHETHER a body can be read is decided by
-//! running the framework's OWN deserializer over it ([`probe`]): the same protocol, the same
-//! input schema and the same generated `DeserializableStruct` the dispatch sequence uses, so
-//! this layer cannot disagree with the walk that follows it. [`Probe`] wraps that
-//! deserializer only to learn WHICH read failed — the modelled type that read was for, and
-//! the path in the body it stood at, neither of which the codec's error carries — and leaves
-//! the error itself untouched. Because the real codec descends the whole body, a value
-//! nested in a structure, a list or a map is reached exactly as a top-level member is.
+//! # What an explicit `null` states
+//!
+//! ABSENCE: a member a body carries as `null` is a member that body does not state, so the
+//! request is served exactly as the same request without it — which is what lets a client
+//! marshal an unset optional as `null`, and is the same forward-compatibility the codec
+//! already gives an UNKNOWN member by skipping it. The one `null` that is not an absence a
+//! caller may send is one standing for a member the input REQUIRES: there is then no value to
+//! build the input from, so the body fails to deserialize and is refused as the body-level
+//! failure it is, with the reader's own diagnosis of it ([`BodyReading`], [`Prose`]).
+//!
+//! Nothing about the model is written down here. WHETHER a body can be read, which members
+//! the input REQUIRES and what type each member is read as are all decided by running the
+//! framework's OWN deserializer over the body ([`probe`], [`absent_member`]): the same
+//! protocol, the same input schema and the same generated `DeserializableStruct` the dispatch
+//! sequence uses, so this layer cannot disagree with the walk that follows it. [`Probe`]
+//! wraps that deserializer only to learn WHICH read failed — the modelled type that read was
+//! for, which the codec's error does not carry — and leaves the error itself untouched.
+//! Because the real codec descends the whole body, a value nested in a structure, a list or a
+//! map is reached exactly as a top-level member is.
 //!
 //! # What is left to another layer, deliberately
 //!
-//! * bytes that are not a body of this protocol at all: there is then no value whose class
-//!   could be named, and such a body is a defect of the BODY rather than of one value in it;
-//! * an explicit `null`: absence is what a `null` states on this protocol, so what it earns
-//!   is decided by whether the member it stands for is required, which is the constraint
-//!   layer's question rather than this one's ([`value_class`] names no class for it);
+//! * a `null` ELEMENT of a list: no member stands there for it to state the absence of, and
+//!   dropping it would renumber the elements beside it, so the codec answers it as it stands;
 //! * a read that failed for a reason that is not a value's JSON class — text that is not a
-//!   timestamp, an absent `@required` member — which the framework and this service's own
-//!   constraint wording answer, unchanged;
-//! * a target type this layer states no name for ([`named_type`]): the sentence's two halves
-//!   are the rule, so a half this service is not known to state is never invented.
+//!   timestamp, an absent `@required` member the body never carried at all — which the
+//!   framework and this service's own constraint wording answer, unchanged;
+//! * a target type this layer states no name for ([`named_type`]) or no expectation for
+//!   ([`Expected::of`] — a structure, a union, a timestamp or a blob, none of which is read
+//!   into one value the reader has an expectation for): the sentence's two halves are the
+//!   rule, so a half this service is not known to state is never invented.
 
 use std::cell::RefCell;
 
 use aws_smithy_runtime_api::http::Request as RtRequest;
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeDeserializer, ShapeSerializer};
 use aws_smithy_schema::{Schema, ShapeId, ShapeType};
+use aws_smithy_schema_server::constraints::path;
+use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::{BigDecimal, BigInteger, Blob, DateTime, Document};
-use service_common::json_wire_values::{ARRAY_VALUE, OBJECT_VALUE};
+use serde::de::{Deserialize, DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess};
+use serde_json::{json, Value};
+use service_common::json_wire_values::{ARRAY_VALUE, NULL_VALUE, OBJECT_VALUE};
 use smithy_server_runtime::{DeserializableStruct, Operation, ServerHttpProtocol, Service};
 
 /// The error code a value the body could not be read from is refused with, as this
@@ -74,6 +96,12 @@ pub const SERIALIZATION_EXCEPTION: &str = "com.amazon.coral.service#Serializatio
 /// rendered by the framework, untouched by this layer.
 pub const MESSAGE_MEMBER: &str = "Message";
 
+/// The body member the DESERIALIZER's own diagnosis of a body is carried in: the lowercase
+/// `message`. The sentence stated there is the reader's rather than this service's — it names
+/// the position in the request the read stopped at — and it is the only prose of this error
+/// class that does ([`Prose`]).
+pub const DIAGNOSIS_MEMBER: &str = "message";
+
 /// The HTTP status a body this service could not read is refused with: the caller sent
 /// something no operation could be given, so it is a client error.
 const SERIALIZATION_EXCEPTION_STATUS: u16 = 400;
@@ -85,18 +113,19 @@ const SERIALIZATION_EXCEPTION_STATUS: u16 = 400;
 /// naming neither a class nor a type.
 const UNEXPECTED_FIELD_TYPE: &str = "Unexpected field type";
 
-/// Dispatch [`probe`] on the routing key, one line per modelled operation.
+/// Dispatch one reader of a request's body on the routing key, one line per modelled
+/// operation.
 ///
 /// The arm's key is the operation type's own name, because this service's protocol
 /// (`smithy_query(query="service_info")`: awsJson1_0) resolves its routing key to the
 /// operation shape name, which is also the name of the generated operation type: there is no
 /// second spelling of the surface to drift from the first.
-macro_rules! probe_by_key {
-    ($key:expr, $protocol:expr, $req:expr, $($module:ident :: $operation:ident),+ $(,)?) => {
+macro_rules! keyed {
+    ($run:ident, $key:expr, $protocol:expr, $req:expr, $($module:ident :: $operation:ident),+ $(,)?) => {
         match $key {
             $(
                 stringify!($operation) => {
-                    probe::<crate::ops::$module::$operation<Eng>>($protocol, $req)
+                    $run::<crate::ops::$module::$operation<Eng>>($protocol, $req)
                 }
             )+
             _ => None,
@@ -104,82 +133,898 @@ macro_rules! probe_by_key {
     };
 }
 
+/// Run `$run` for the input of the operation `$key` names: the one list of this service's
+/// modelled operations, so every reader of a body dispatches over the same surface.
+macro_rules! for_served_input {
+    ($run:ident, $key:expr, $protocol:expr, $req:expr) => {
+        keyed!(
+            $run,
+            $key,
+            $protocol,
+            $req,
+            batch_execute_statement::BatchExecuteStatement,
+            batch_get_item::BatchGetItem,
+            batch_write_item::BatchWriteItem,
+            create_backup::CreateBackup,
+            create_global_table::CreateGlobalTable,
+            create_table::CreateTable,
+            delete_backup::DeleteBackup,
+            delete_item::DeleteItem,
+            delete_resource_policy::DeleteResourcePolicy,
+            delete_table::DeleteTable,
+            describe_backup::DescribeBackup,
+            describe_continuous_backups::DescribeContinuousBackups,
+            describe_contributor_insights::DescribeContributorInsights,
+            describe_endpoints::DescribeEndpoints,
+            describe_export::DescribeExport,
+            describe_global_table::DescribeGlobalTable,
+            describe_global_table_settings::DescribeGlobalTableSettings,
+            describe_import::DescribeImport,
+            describe_kinesis_streaming_destination::DescribeKinesisStreamingDestination,
+            describe_limits::DescribeLimits,
+            describe_table::DescribeTable,
+            describe_table_replica_auto_scaling::DescribeTableReplicaAutoScaling,
+            describe_time_to_live::DescribeTimeToLive,
+            disable_kinesis_streaming_destination::DisableKinesisStreamingDestination,
+            enable_kinesis_streaming_destination::EnableKinesisStreamingDestination,
+            execute_statement::ExecuteStatement,
+            execute_transaction::ExecuteTransaction,
+            export_table_to_point_in_time::ExportTableToPointInTime,
+            get_item::GetItem,
+            get_resource_policy::GetResourcePolicy,
+            import_table::ImportTable,
+            list_backups::ListBackups,
+            list_contributor_insights::ListContributorInsights,
+            list_exports::ListExports,
+            list_global_tables::ListGlobalTables,
+            list_imports::ListImports,
+            list_tables::ListTables,
+            list_tags_of_resource::ListTagsOfResource,
+            put_item::PutItem,
+            put_resource_policy::PutResourcePolicy,
+            query::Query,
+            restore_table_from_backup::RestoreTableFromBackup,
+            restore_table_to_point_in_time::RestoreTableToPointInTime,
+            scan::Scan,
+            search_vectors::SearchVectors,
+            tag_resource::TagResource,
+            transact_get_items::TransactGetItems,
+            transact_write_items::TransactWriteItems,
+            untag_resource::UntagResource,
+            update_continuous_backups::UpdateContinuousBackups,
+            update_contributor_insights::UpdateContributorInsights,
+            update_global_table::UpdateGlobalTable,
+            update_global_table_settings::UpdateGlobalTableSettings,
+            update_item::UpdateItem,
+            update_kinesis_streaming_destination::UpdateKinesisStreamingDestination,
+            update_table::UpdateTable,
+            update_table_replica_auto_scaling::UpdateTableReplicaAutoScaling,
+            update_time_to_live::UpdateTimeToLive,
+        )
+    };
+}
+
 /// The sentence refusing `req`'s body, when a value it carries cannot be read into the
 /// modelled type of the member it is bound to, for the operation `key` names.
 ///
-/// `None` is "nothing for THIS layer to refuse", which covers four different outcomes
+/// `None` is "nothing for THIS layer to refuse", which covers five different outcomes
 /// deliberately: the body read cleanly; the body could not be reached at all (there is no
 /// value to describe, so the framework's own rendering stands); the read failed for a reason
-/// that is NOT a value's JSON class; and a key naming no modelled operation, which is left
-/// to the routing table's own refusal.
+/// that is NOT a value's JSON class; the read stopped at an explicit `null`, which states a
+/// member's ABSENCE rather than a value of the wrong class ([`BodyReading`]); and a key
+/// naming no modelled operation, which is left to the routing table's own refusal.
 pub fn coercion_refusal<Eng: Send + Sync + 'static>(
     key: &str,
     protocol: &dyn ServerHttpProtocol,
     req: &RtRequest,
 ) -> Option<String> {
-    probe_by_key!(
-        key,
-        protocol,
-        req,
-        batch_execute_statement::BatchExecuteStatement,
-        batch_get_item::BatchGetItem,
-        batch_write_item::BatchWriteItem,
-        create_backup::CreateBackup,
-        create_global_table::CreateGlobalTable,
-        create_table::CreateTable,
-        delete_backup::DeleteBackup,
-        delete_item::DeleteItem,
-        delete_resource_policy::DeleteResourcePolicy,
-        delete_table::DeleteTable,
-        describe_backup::DescribeBackup,
-        describe_continuous_backups::DescribeContinuousBackups,
-        describe_contributor_insights::DescribeContributorInsights,
-        describe_endpoints::DescribeEndpoints,
-        describe_export::DescribeExport,
-        describe_global_table::DescribeGlobalTable,
-        describe_global_table_settings::DescribeGlobalTableSettings,
-        describe_import::DescribeImport,
-        describe_kinesis_streaming_destination::DescribeKinesisStreamingDestination,
-        describe_limits::DescribeLimits,
-        describe_table::DescribeTable,
-        describe_table_replica_auto_scaling::DescribeTableReplicaAutoScaling,
-        describe_time_to_live::DescribeTimeToLive,
-        disable_kinesis_streaming_destination::DisableKinesisStreamingDestination,
-        enable_kinesis_streaming_destination::EnableKinesisStreamingDestination,
-        execute_statement::ExecuteStatement,
-        execute_transaction::ExecuteTransaction,
-        export_table_to_point_in_time::ExportTableToPointInTime,
-        get_item::GetItem,
-        get_resource_policy::GetResourcePolicy,
-        import_table::ImportTable,
-        list_backups::ListBackups,
-        list_contributor_insights::ListContributorInsights,
-        list_exports::ListExports,
-        list_global_tables::ListGlobalTables,
-        list_imports::ListImports,
-        list_tables::ListTables,
-        list_tags_of_resource::ListTagsOfResource,
-        put_item::PutItem,
-        put_resource_policy::PutResourcePolicy,
-        query::Query,
-        restore_table_from_backup::RestoreTableFromBackup,
-        restore_table_to_point_in_time::RestoreTableToPointInTime,
-        scan::Scan,
-        search_vectors::SearchVectors,
-        tag_resource::TagResource,
-        transact_get_items::TransactGetItems,
-        transact_write_items::TransactWriteItems,
-        untag_resource::UntagResource,
-        update_continuous_backups::UpdateContinuousBackups,
-        update_contributor_insights::UpdateContributorInsights,
-        update_global_table::UpdateGlobalTable,
-        update_global_table_settings::UpdateGlobalTableSettings,
-        update_item::UpdateItem,
-        update_kinesis_streaming_destination::UpdateKinesisStreamingDestination,
-        update_table::UpdateTable,
-        update_table_replica_auto_scaling::UpdateTableReplicaAutoScaling,
-        update_time_to_live::UpdateTimeToLive,
+    let unreadable = unreadable_value::<Eng>(key, protocol, req)?;
+    sentence(unreadable.class, unreadable.target)
+}
+
+/// The value the framework's own deserializer for the operation `key` names stopped at in
+/// `req`'s body, with the modelled type that read was for — or `None` when the body reads,
+/// when it cannot be reached at all, and when the read failed for a reason that is about
+/// neither a value's JSON class nor an explicit `null`.
+fn unreadable_value<Eng: Send + Sync + 'static>(
+    key: &str,
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+) -> Option<Unreadable> {
+    for_served_input!(probe, key, protocol, req)
+}
+
+/// The member the input of the operation `key` names REQUIRES and `req`'s body does not
+/// carry, as the generated deserializer spells it — a dotted, lowerCamel member path
+/// ([`path`]).
+///
+/// `None` when the body satisfies every member the input requires, and when it fails to read
+/// for any other reason: the question asked here is only ever which member is MISSING.
+fn absent_member<Eng: Send + Sync + 'static>(
+    key: &str,
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+) -> Option<String> {
+    for_served_input!(unsatisfied_member, key, protocol, req)
+}
+
+/// The modelled type the read that one explicit `null` in `req`'s body answered was FOR, as
+/// the framework's own deserializer reports it — the half of a diagnosis that says what was
+/// expected where the body stated an absence.
+///
+/// A scalar read ANSWERS that question by failing, naming the type it read for; a structure,
+/// a list and a map each read a `null` without failing, because they already take one as
+/// absence, so the type those answer with is recorded as the read happens
+/// ([`Probe::note_accepted`]). `None` when neither says — the walk stopped earlier, at a
+/// value of the wrong class.
+fn null_target<Eng: Send + Sync + 'static>(
+    key: &str,
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+) -> Option<ShapeType> {
+    for_served_input!(null_read_target, key, protocol, req)
+}
+
+/// The top-level members of the input of the operation `key` names, each as the generated
+/// input SCHEMA declares it — which is where codegen states a member's Smithy name, the name
+/// this protocol carries it under, and the modelled type it is read as.
+fn declared_input_members<Eng: Send + Sync + 'static>(
+    key: &str,
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+) -> Option<Vec<DeclaredMember>> {
+    for_served_input!(input_members, key, protocol, req)
+}
+
+/// One member of an operation's input, as its schema declares it.
+#[derive(Debug, Clone, Copy)]
+struct DeclaredMember {
+    /// The member's Smithy name, which is what the deserializer spells its absence from
+    /// ([`path::member`]).
+    name: &'static str,
+    /// The name this protocol carries the member under — its `@jsonName` where the model
+    /// gives one, else its Smithy name, which is the lookup the JSON codec performs.
+    wire: &'static str,
+    /// The modelled type the member is read as.
+    target: ShapeType,
+}
+
+/// Read `O`'s input schema. The protocol and the request are not read: a member list is a
+/// fact of the model, fixed per operation, and nothing about it is per-request — the two
+/// parameters are the shape of the one dispatcher every reader of a body goes through
+/// ([`for_served_input`]).
+fn input_members<O: Operation>(
+    _protocol: &dyn ServerHttpProtocol,
+    _req: &RtRequest,
+) -> Option<Vec<DeclaredMember>> {
+    Some(
+        O::INPUT_SCHEMA
+            .members()
+            .iter()
+            .filter_map(|member| {
+                let name = member.member_name()?;
+                Some(DeclaredMember {
+                    name,
+                    wire: member
+                        .json_name()
+                        .map(|given| given.value())
+                        .unwrap_or(name),
+                    target: member.shape_type(),
+                })
+            })
+            .collect(),
     )
+}
+
+// =============================================================================
+// THE BODY, AHEAD OF EVERY VALUE IN IT
+//
+// Two facts about a request's BODY are settled before any value it carries is read into a
+// member: whether the bytes are a document an input could be read from at all, and what the
+// explicit `null`s in it state.
+//
+// A body that is not ONE complete JSON object is no body of this protocol: the protocol
+// carries an operation's input as a single JSON object, so bytes that do not parse, bytes
+// that carry something after the object, and a document that is not an object are all a
+// defect of the BODY rather than of one value in it. No value's class can be named for it,
+// so the refusal is the error class alone, with no prose at all.
+//
+// An explicit `null` states ABSENCE on this protocol: a member the body carries as `null` is
+// a member the body does not state, so the request is served exactly as the same request
+// without it — which is also what makes an unknown member harmless, since the codec already
+// skips one. A `null` standing for a member the input REQUIRES is the one case that is not
+// absence a caller may send: there is no value to build the input from, so the body fails to
+// deserialize, and the sentence is the deserializer's own — the class found, the type
+// expected and the position in the body it stopped at.
+//
+// WHICH members the input requires is not transcribed here: it is asked of the generated
+// deserializer, which is the only thing that knows ([`absent_member`]).
+// =============================================================================
+
+/// What this layer makes of a request's BODY, ahead of every value in it.
+#[derive(Debug)]
+pub enum BodyReading {
+    /// A document of this protocol that states no member's absence: the request is served
+    /// exactly as it arrived.
+    AsSent,
+    /// The body states the absence of one or more members with an explicit `null`: the same
+    /// request with those members absent, which is what the operation is served. BOXED
+    /// because a whole request dwarfs the other two answers and only this one carries it.
+    Absences(Box<RtRequest>),
+    /// The body is not one an input of this protocol can be read from, with the prose this
+    /// service states for that defect where it states any.
+    Unreadable(Option<Prose>),
+}
+
+/// The prose a protocol-level refusal of this service states, and which body member it
+/// states it in.
+///
+/// The two are different refusals of the same class, and a client reads them in different
+/// slots: the sentence about one VALUE is this service's own wording for a conversion, while
+/// the diagnosis of the BODY is the deserializer's, and is the only one of the two that
+/// names a position in the request.
+#[derive(Debug, Clone)]
+pub enum Prose {
+    /// A value whose JSON class the modelled type of its member admits no reading of, stated
+    /// in the capitalized [`MESSAGE_MEMBER`].
+    Conversion(String),
+    /// The DESERIALIZER's own diagnosis of a body it could not read an input from, stated in
+    /// the lowercase [`DIAGNOSIS_MEMBER`].
+    Diagnosis(String),
+}
+
+impl Prose {
+    /// The member schema this prose is written under.
+    fn member(&self) -> &'static Schema {
+        match self {
+            Self::Conversion(_) => &SERIALIZATION_EXCEPTION_MESSAGE,
+            Self::Diagnosis(_) => &SERIALIZATION_EXCEPTION_DIAGNOSIS,
+        }
+    }
+
+    /// The sentence itself.
+    fn stated(&self) -> &str {
+        match self {
+            Self::Conversion(stated) | Self::Diagnosis(stated) => stated,
+        }
+    }
+}
+
+/// What `req`'s body is, for the operation `key` names: a document that is served as it
+/// arrived, the same request with the members it states as `null` absent, or a body no input
+/// can be read from.
+pub fn body_reading<Eng: Send + Sync + 'static>(
+    key: &str,
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+) -> BodyReading {
+    // A body the transport could not buffer is not read here at all: there is nothing to
+    // decide about, and the request is served exactly as it arrived.
+    let Some(body) = req.body().bytes() else {
+        return BodyReading::AsSent;
+    };
+    // ONE complete JSON object, which is what this protocol carries an input as. The reader
+    // is the maintained JSON parser, so what counts as complete is its answer rather than a
+    // second parser's: bytes it leaves over are bytes that are not part of the document.
+    let document = match ::serde_json::from_slice::<Value>(body) {
+        Ok(document) => document,
+        // Except for the one refusal that is not about the body's FORM: a document nesting
+        // deeper than the reader descends is a document, and how deep a value a request
+        // carries may nest is a documented bound on that value, answered where every other
+        // bound on it is ([`crate::state`]).
+        Err(stated) if nests_too_deep(&stated) => return BodyReading::AsSent,
+        Err(_) => return BodyReading::Unreadable(None),
+    };
+    if !document.is_object() {
+        return BodyReading::Unreadable(None);
+    }
+    let stated = StatedAbsences::of::<Eng>(key, protocol, req, body, document);
+    stated.reading::<Eng>()
+}
+
+/// Whether the JSON reader stopped because the document nests deeper than it descends,
+/// rather than because the bytes are not a document.
+///
+/// Read off the reader's own wording, which is the only place it is stated — its refusals
+/// carry no code a caller of the crate can branch on. PINNED by
+/// [`tests::the_reader_wording_this_layer_reads`], so a change to it fails loudly here
+/// instead of silently turning a deeply nested value into a body-level refusal.
+fn nests_too_deep(stated: &::serde_json::Error) -> bool {
+    stated.to_string().contains("recursion limit exceeded")
+}
+
+/// How much JSON this layer may read to ASK what a body's stated absences earn.
+///
+/// Two costs, and only one of them is a caller's to grow. APPLYING the absences is one pass
+/// over the body ([`StatedAbsences::rewritten`]), whatever their number, so it needs no bound
+/// beyond the body's own size. ASKING is where a caller's choices multiply: one absence costs
+/// a probe for the modelled type its member is read as, and then up to one round per member of
+/// the input to isolate that member from any other the body does not carry, and EACH of those
+/// is a read of the whole body. So the bound is on the product of all three factors — the
+/// number of `null`s, the rounds one of them may take, and the body's own size — rather than
+/// on any one of them ([`StatedAbsences::of`]). It is applied BEFORE anything per-absence is
+/// built, so neither a path nor a probe is materialised past it.
+///
+/// Past the cap the absences are still applied; what is skipped is the asking, which leaves
+/// such a request the framework's own refusal of an absent required member.
+const MOST_JSON_READ_FOR_ABSENCES: usize = 4 << 20;
+
+/// One step from a body's root to a value it carries: a member of an object, or an element
+/// of an array. The path a `null` stands at, which is what makes that value reachable in the
+/// document and in the bytes the body arrived as.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Step {
+    Member(String),
+    Element(usize),
+}
+
+/// What one stated absence becomes in a document this layer rebuilds.
+#[derive(Debug, Clone)]
+enum Applied {
+    /// Gone, which is what the member's absence means.
+    Dropped,
+    /// Left as the `null` the body wrote, so the reader answers it.
+    Stated,
+    /// Carrying a value of the member's own modelled type, so the reader's answer is about
+    /// another member ([`stands_in`]).
+    StoodIn(Value),
+}
+
+/// One body, the members its explicit `null`s state the absence of, and the modelled type
+/// each of those members is read as.
+struct StatedAbsences<'r> {
+    /// The routing key of the operation the body is being read for.
+    key: &'r str,
+    /// The protocol the body is carried in, which owns the deserializer every question here
+    /// is asked of.
+    protocol: &'r dyn ServerHttpProtocol,
+    /// The request as it arrived, which every probe is a rebuilt copy of.
+    req: &'r RtRequest,
+    /// The body as it arrived: the bytes a diagnosis reads its position from.
+    body: &'r [u8],
+    /// The body read as a document.
+    document: Value,
+    /// How many absences the body states, counted whether or not any is asked about.
+    stated: usize,
+    /// Where each absence this layer ASKS about stands, in the order the body carries them —
+    /// empty for a body past [`MOST_JSON_READ_FOR_ABSENCES`], which is applied and not asked
+    /// about.
+    at: Vec<Vec<Step>>,
+    /// The modelled type the codec reads each of those members as, and `None` for a member
+    /// whose read stopped at something else first.
+    targets: Vec<Option<ShapeType>>,
+    /// The input's own members, read off its schema once: how many there are bounds the rounds
+    /// one absence may take to isolate ([`Self::required`]), which is a factor of the bound
+    /// above, and each round reads the list rather than the schema again.
+    declared: Vec<DeclaredMember>,
+}
+
+impl<'r> StatedAbsences<'r> {
+    /// Read `document`'s explicit `null`s, each with the modelled type its member is read
+    /// as.
+    ///
+    /// How many there are is counted first, over the document alone, and the rounds one of them
+    /// may take is the input's own member count, so the bound on how much JSON a request may
+    /// have read for them ([`MOST_JSON_READ_FOR_ABSENCES`]) is applied before a single path is
+    /// recorded or a single probe built.
+    fn of<Eng: Send + Sync + 'static>(
+        key: &'r str,
+        protocol: &'r dyn ServerHttpProtocol,
+        req: &'r RtRequest,
+        body: &'r [u8],
+        document: Value,
+    ) -> Self {
+        let stated = absences_stated(&document);
+        let declared = declared_input_members::<Eng>(key, protocol, req).unwrap_or_default();
+        // The reads one absence costs: one for the type its member is read as, one per round
+        // that isolates it, and one for the diagnosis it may earn.
+        let each = declared.len().saturating_add(2);
+        let asking = stated
+            .saturating_mul(each)
+            .saturating_mul(body.len())
+            <= MOST_JSON_READ_FOR_ABSENCES;
+        let at = if asking {
+            absences(&document)
+        } else {
+            Vec::new()
+        };
+        let mut held = Self {
+            key,
+            protocol,
+            req,
+            body,
+            document,
+            stated,
+            at,
+            targets: Vec::new(),
+            declared,
+        };
+        held.targets = (0..held.at.len())
+            .map(|which| held.target::<Eng>(which))
+            .collect();
+        held
+    }
+
+    /// What the body states.
+    fn reading<Eng: Send + Sync + 'static>(&self) -> BodyReading {
+        if self.stated == 0 {
+            return BodyReading::AsSent;
+        }
+        // In the order the BODY carries them, which is the order the deserializer reads them
+        // in: the first `null` the input cannot do without is the one the caller has to fix.
+        for which in 0..self.at.len() {
+            let Some(expected) = self.targets[which].and_then(Expected::of) else {
+                continue;
+            };
+            if !self.required::<Eng>(which) {
+                continue;
+            }
+            if let Some(diagnosis) = expected.diagnosis(self.body, &self.at[which]) {
+                return BodyReading::Unreadable(Some(Prose::Diagnosis(diagnosis)));
+            }
+        }
+        match rebuilt(self.req, &self.without_absences()) {
+            Some(served) => BodyReading::Absences(Box::new(served)),
+            // A request that cannot be rebuilt is served exactly as it arrived, which is the
+            // framework's own answer to the `null` it then reads.
+            None => BodyReading::AsSent,
+        }
+    }
+
+    /// The modelled type the member whose absence the `which`th `null` states is read as, as
+    /// the framework's own deserializer reports it.
+    ///
+    /// Asked of a body in which every OTHER stated absence is gone, so the `null` that read
+    /// answers is this one. `None` when the read it answered cannot be told — a value of the
+    /// wrong class earlier in the body stopped the walk first, which is a defect of its own
+    /// ([`coercion_refusal`]).
+    fn target<Eng: Send + Sync + 'static>(&self, which: usize) -> Option<ShapeType> {
+        let probe = rebuilt(self.req, &self.only(which))?;
+        null_target::<Eng>(self.key, self.protocol, &probe)
+    }
+
+    /// Whether the input REQUIRES the member whose absence the `which`th `null` states.
+    ///
+    /// Asked of the generated deserializer, which is the only thing that knows: the member is
+    /// dropped from a document in which every OTHER stated absence carries a value the codec
+    /// reads, so the member that reader then reports absent is this one.
+    ///
+    /// A member the body never carried AT ALL is a different defect, and one the reader may
+    /// report first because it reports the absences of a body in the order the input declares
+    /// its members, while a body is READ in the order it carries them: a `null` standing for a
+    /// member the input requires stops the read before any member's absence is noticed at all.
+    /// So a member reported absent that this `null` does not stand for is filled in turn and
+    /// the reader asked again, until it reports this one or reports one that cannot be filled.
+    fn required<Eng: Send + Sync + 'static>(&self, which: usize) -> bool {
+        let mut document = self.filled(which);
+        // Bounded by the input's own member count: each round fills a member the round before
+        // reported absent, and a filled member is never reported absent again. That count is
+        // also a factor of the bound on how much JSON one request may have read here
+        // ([`MOST_JSON_READ_FOR_ABSENCES`]).
+        for _ in 0..=self.declared.len() {
+            let Some(probe) = rebuilt(self.req, &document) else {
+                return false;
+            };
+            let Some(absent) = absent_member::<Eng>(self.key, self.protocol, &probe) else {
+                return false;
+            };
+            if names(&self.at[which], &absent) {
+                return true;
+            }
+            let filled = self
+                .declared
+                .iter()
+                .find(|member| path::member(member.name) == absent)
+                .and_then(|member| stands_in(member.target).map(|value| (member.wire, value)));
+            let Some((wire, value)) = filled else {
+                return false;
+            };
+            match document.as_object_mut() {
+                Some(members) => members.insert(wire.to_string(), value),
+                None => return false,
+            };
+        }
+        false
+    }
+
+    /// The document with every member a `null` states the absence of gone — the body the
+    /// operation is served.
+    fn without_absences(&self) -> Value {
+        self.rewritten(&|_| Applied::Dropped)
+    }
+
+    /// The document with every `null` but the `which`th gone.
+    fn only(&self, which: usize) -> Value {
+        self.rewritten(&|held| {
+            if held == which {
+                Applied::Stated
+            } else {
+                Applied::Dropped
+            }
+        })
+    }
+
+    /// The document with the `which`th member gone and every other stated absence carrying a
+    /// value of its own modelled type, so the reader's answer is about this member alone.
+    fn filled(&self, which: usize) -> Value {
+        self.rewritten(&|held| {
+            let stands = (held != which)
+                .then(|| self.targets.get(held).copied().flatten())
+                .flatten()
+                .and_then(stands_in);
+            match stands {
+                Some(value) => Applied::StoodIn(value),
+                None => Applied::Dropped,
+            }
+        })
+    }
+
+    /// The document with each absence rewritten as `how` says, in ONE pass over it: the
+    /// absences are visited in the order the body carries them, which is the order they were
+    /// counted and recorded in, so `how` is handed the same index everything else here uses.
+    ///
+    /// One pass whatever the number of absences, so applying them costs a copy of the body
+    /// rather than a copy per absence.
+    fn rewritten(&self, how: &dyn Fn(usize) -> Applied) -> Value {
+        let mut visited = 0;
+        rewrite(&self.document, &mut visited, how)
+    }
+}
+
+/// How many absences `document` states — the cheap count the bound on asking about them is
+/// applied to, which allocates nothing and visits the document once.
+fn absences_stated(document: &Value) -> usize {
+    match document {
+        Value::Object(members) => members
+            .iter()
+            .map(|(_, held)| usize::from(held.is_null()) + absences_stated(held))
+            .sum(),
+        Value::Array(elements) => elements.iter().map(absences_stated).sum(),
+        _ => 0,
+    }
+}
+
+/// Where `document` states a member's absence with an explicit `null`, in the order the body
+/// carries them — which is the order [`absences_stated`] counted them and the order
+/// [`rewrite`] visits them.
+///
+/// A member of an object only: a `null` ELEMENT of an array states no member's absence —
+/// there is no member for it to be about, and dropping it would renumber the elements beside
+/// it — so it is left to the codec, exactly as it stands. Built only for a body inside
+/// [`MOST_JSON_READ_FOR_ABSENCES`], which is what bounds what these paths cost to hold.
+fn absences(document: &Value) -> Vec<Vec<Step>> {
+    let mut found = Vec::new();
+    descend(document, &mut Vec::new(), &mut found);
+    found
+}
+
+/// Collect `value`'s stated absences, `at` being the path it stands at.
+///
+/// The recursion is as deep as the document, which is as deep as the reader that produced it
+/// descended — a bound that reader holds, not one a request chooses ([`nests_too_deep`]).
+fn descend(value: &Value, at: &mut Vec<Step>, found: &mut Vec<Vec<Step>>) {
+    match value {
+        Value::Object(members) => {
+            for (name, held) in members {
+                at.push(Step::Member(name.clone()));
+                if held.is_null() {
+                    found.push(at.clone());
+                } else {
+                    descend(held, at, found);
+                }
+                at.pop();
+            }
+        }
+        Value::Array(elements) => {
+            for (index, held) in elements.iter().enumerate() {
+                at.push(Step::Element(index));
+                descend(held, at, found);
+                at.pop();
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `value` with each absence rewritten as `how` says, visiting them in the order the body
+/// carries them — `visited` is how many have been reached so far, which is the index `how` is
+/// handed.
+///
+/// ONE pass, which is what makes applying the absences cost a copy of the body rather than a
+/// copy per absence: the members beside an absence are moved into the rebuilt object in order,
+/// so the document keeps the member order the body was written in. The recursion is as deep as
+/// the document, which is as deep as the reader that produced it descended
+/// ([`nests_too_deep`]).
+fn rewrite(value: &Value, visited: &mut usize, how: &dyn Fn(usize) -> Applied) -> Value {
+    match value {
+        Value::Object(members) => {
+            let mut kept = ::serde_json::Map::with_capacity(members.len());
+            for (name, held) in members {
+                if !held.is_null() {
+                    kept.insert(name.clone(), rewrite(held, visited, how));
+                    continue;
+                }
+                let which = *visited;
+                *visited += 1;
+                match how(which) {
+                    Applied::Dropped => {}
+                    Applied::Stated => {
+                        kept.insert(name.clone(), Value::Null);
+                    }
+                    Applied::StoodIn(stands) => {
+                        kept.insert(name.clone(), stands);
+                    }
+                }
+            }
+            Value::Object(kept)
+        }
+        Value::Array(elements) => Value::Array(
+            elements
+                .iter()
+                .map(|held| rewrite(held, visited, how))
+                .collect(),
+        ),
+        held => held.clone(),
+    }
+}
+
+/// A value of the modelled type `target` that the codec reads.
+///
+/// For ONE purpose: asking the generated deserializer which members the input requires. A
+/// member standing in a body is a member that reader cannot report absent, so a probe that
+/// fills every OTHER stated absence isolates the one being asked about. Such a value stands
+/// in a document this layer builds, reads once and drops — it reaches no handler, no response
+/// and no store. `None` for a type no single value stands for, which leaves that absence
+/// stated as the absence it is.
+fn stands_in(target: ShapeType) -> Option<Value> {
+    Some(match target {
+        // A blob is carried as base64 text, of which the empty string is the empty blob.
+        ShapeType::String | ShapeType::Blob => json!(""),
+        ShapeType::Boolean => json!(false),
+        ShapeType::Byte
+        | ShapeType::Short
+        | ShapeType::Integer
+        | ShapeType::Long
+        | ShapeType::Float
+        | ShapeType::Double
+        | ShapeType::BigInteger
+        | ShapeType::BigDecimal
+        // The protocol's default timestamp form is a number of seconds since the epoch.
+        | ShapeType::Timestamp => json!(0),
+        ShapeType::List => json!([]),
+        ShapeType::Map | ShapeType::Structure | ShapeType::Document => json!({}),
+        // A union states exactly one of its members, so no empty value stands for one.
+        _ => return None,
+    })
+}
+
+/// Whether `stated` — a dotted member path as the framework's deserializer spells one — names
+/// the value at `at`.
+///
+/// The spelling is the framework's own ([`path`]), not a second transcription of it: a member
+/// of a structure names itself in lowerCamel, while an entry of a map and an element of a
+/// list name the key or the 1-based position and then the collection step. A path step that
+/// is a JSON object member can be either of the first two, because the document alone does
+/// not say whether the object is a structure or a map, so both spellings are admitted.
+fn names(at: &[Step], stated: &str) -> bool {
+    let segments: Vec<&str> = stated.split('.').collect();
+    named_by(at, &segments)
+}
+
+/// [`names`], over the remaining steps and the remaining segments.
+fn named_by(at: &[Step], segments: &[&str]) -> bool {
+    let Some((step, rest)) = at.split_first() else {
+        return segments.is_empty();
+    };
+    let two = || (segments.len() >= 2).then(|| segments[..2].join("."));
+    match step {
+        Step::Member(name) => {
+            if segments.first() == Some(&path::member(name).as_str())
+                && named_by(rest, &segments[1..])
+            {
+                return true;
+            }
+            two().is_some_and(|joined| joined == path::entry(name)) && named_by(rest, &segments[2..])
+        }
+        Step::Element(index) => {
+            two().is_some_and(|joined| joined == path::element(index + 1))
+                && named_by(rest, &segments[2..])
+        }
+    }
+}
+
+/// `req` with `document` as its body: the request this layer hands on, and the request every
+/// probe above reads.
+///
+/// `None` when the request cannot be rebuilt — a body the transport could not replay — which
+/// leaves the request to be served exactly as it arrived.
+fn rebuilt(req: &RtRequest, document: &Value) -> Option<RtRequest> {
+    let body = ::serde_json::to_vec(document).ok()?;
+    let mut rebuilt = req.try_clone()?;
+    let length = body.len();
+    *rebuilt.body_mut() = SdkBody::from(body);
+    // A request that declared its length declares the length of the body it now carries.
+    if rebuilt.headers().get(CONTENT_LENGTH).is_some() {
+        let _ = rebuilt
+            .headers_mut()
+            .try_insert(CONTENT_LENGTH, length.to_string());
+    }
+    Some(rebuilt)
+}
+
+/// The header a request declares the size of its body in.
+const CONTENT_LENGTH: &str = "content-length";
+
+/// The value the deserializer expected where a body stated a member's absence, as the ONE
+/// reader that states it: each is the Rust type the framework's generated reader reads that
+/// modelled type into (`watched_reads!` below and the generated `crate::ops::types` are where
+/// this tree states that mapping — a string into a `String`, an integer into an `i32`, a list
+/// into a `Vec`, a map into a `HashMap`), and the sentence is that reader's own for it — the
+/// class found, the value expected and the position in the body, which is read from the bytes
+/// the caller sent rather than fixed.
+///
+/// How the reader names each is ITS vocabulary, not a choice made here: a kind of value it
+/// names in words ("a string", "a sequence", "a map", "a boolean") and a numeric primitive it
+/// names by the type ("i32") are both what the recorded refusals of this service carry, so
+/// asking the reader is what gets each right.
+#[derive(Debug, Clone, Copy)]
+enum Expected {
+    Text,
+    Flag,
+    Byte,
+    Short,
+    Integer,
+    Long,
+    Float,
+    Double,
+    Sequence,
+    Mapping,
+}
+
+impl Expected {
+    /// What a member the model types as `target` is read into, or `None` for a modelled type
+    /// this service states no expectation for — which leaves the absence stated as the
+    /// absence it is, rather than inventing a half of the sentence.
+    fn of(target: ShapeType) -> Option<Self> {
+        Some(match target {
+            ShapeType::String => Self::Text,
+            ShapeType::Boolean => Self::Flag,
+            ShapeType::Byte => Self::Byte,
+            ShapeType::Short => Self::Short,
+            ShapeType::Integer => Self::Integer,
+            ShapeType::Long => Self::Long,
+            ShapeType::Float => Self::Float,
+            ShapeType::Double => Self::Double,
+            ShapeType::List => Self::Sequence,
+            ShapeType::Map => Self::Mapping,
+            _ => return None,
+        })
+    }
+
+    /// The deserializer's own diagnosis of `body`, read at `at`.
+    ///
+    /// The sentence is not written here: the maintained JSON reader is asked for this value
+    /// at this position, and what it answers — the class it found, the value it expected and
+    /// the line and column of the body it stopped at — is the sentence. `None` when the value
+    /// reads after all, which is no diagnosis to state.
+    fn diagnosis(self, body: &[u8], at: &[Step]) -> Option<String> {
+        let mut reader = ::serde_json::Deserializer::from_slice(body);
+        let read = ValueAt { at, expected: self }.deserialize(&mut reader);
+        read.err().map(|stated| stated.to_string())
+    }
+
+    /// Read one value as the type the framework reads that member into, so the reader's own
+    /// expectation of it is what a refusal states.
+    fn read<'de, D: Deserializer<'de>>(self, reader: D) -> Result<(), D::Error> {
+        match self {
+            Self::Text => String::deserialize(reader).map(drop),
+            Self::Flag => bool::deserialize(reader).map(drop),
+            Self::Byte => i8::deserialize(reader).map(drop),
+            Self::Short => i16::deserialize(reader).map(drop),
+            Self::Integer => i32::deserialize(reader).map(drop),
+            Self::Long => i64::deserialize(reader).map(drop),
+            Self::Float => f32::deserialize(reader).map(drop),
+            Self::Double => f64::deserialize(reader).map(drop),
+            // The ELEMENTS and the ENTRIES are not read: the question is about the collection
+            // itself, and a value that is no collection is refused before one is reached.
+            Self::Sequence => Vec::<IgnoredAny>::deserialize(reader).map(drop),
+            Self::Mapping => {
+                ::std::collections::HashMap::<String, IgnoredAny>::deserialize(reader).map(drop)
+            }
+        }
+    }
+}
+
+/// Read the value at one path of a body, as the type the member there is read into — the
+/// seed that walks the maintained reader down to the value a refusal is about, so the
+/// position the refusal names is that reader's own count of the bytes the caller sent.
+///
+/// Every value beside the path is skipped rather than read: the question is about one value,
+/// and nothing else in the body decides it.
+struct ValueAt<'a> {
+    at: &'a [Step],
+    expected: Expected,
+}
+
+impl<'de> DeserializeSeed<'de> for ValueAt<'_> {
+    type Value = ();
+
+    fn deserialize<D: Deserializer<'de>>(self, reader: D) -> Result<(), D::Error> {
+        match self.at.split_first() {
+            None => self.expected.read(reader),
+            Some((Step::Member(name), rest)) => reader.deserialize_map(MemberAt {
+                name,
+                rest,
+                expected: self.expected,
+            }),
+            Some((Step::Element(index), rest)) => reader.deserialize_seq(ElementAt {
+                index: *index,
+                rest,
+                expected: self.expected,
+            }),
+        }
+    }
+}
+
+/// Descend into the member `name` of an object, skipping the members beside it.
+struct MemberAt<'a> {
+    name: &'a str,
+    rest: &'a [Step],
+    expected: Expected,
+}
+
+impl<'de> ::serde::de::Visitor<'de> for MemberAt<'_> {
+    type Value = ();
+
+    fn expecting(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        f.write_str("an object")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut entries: A) -> Result<(), A::Error> {
+        while let Some(key) = entries.next_key::<String>()? {
+            if key == self.name {
+                entries.next_value_seed(ValueAt {
+                    at: self.rest,
+                    expected: self.expected,
+                })?;
+            } else {
+                entries.next_value::<IgnoredAny>()?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Descend into the element at `index` of an array, skipping the elements beside it.
+struct ElementAt<'a> {
+    index: usize,
+    rest: &'a [Step],
+    expected: Expected,
+}
+
+impl<'de> ::serde::de::Visitor<'de> for ElementAt<'_> {
+    type Value = ();
+
+    fn expecting(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        f.write_str("an array")
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut elements: A) -> Result<(), A::Error> {
+        for position in 0.. {
+            let read = if position == self.index {
+                elements.next_element_seed(ValueAt {
+                    at: self.rest,
+                    expected: self.expected,
+                })?
+            } else {
+                elements.next_element::<IgnoredAny>()?.map(drop)
+            };
+            if read.is_none() {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
 }
 
 /// `message` as the PROTOCOL's own refusal of a body that could not be read answers it, in
@@ -189,17 +1034,21 @@ pub fn coercion_refusal<Eng: Send + Sync + 'static>(
 /// The shape is synthetic because no model declares it: the request never became an input,
 /// so no operation ran to answer with one of its own errors. `None` when the body cannot be
 /// encoded at all, which leaves the framework's own rendering to answer.
+///
+/// `None` for `prose` is a refusal that states NONE: a body that is not a document of this
+/// protocol at all carries no value whose class could be named, so the refusal is the class
+/// alone (see [`BodyReading::Unreadable`]).
 pub fn serialization_refusal(
     svc: &dyn Service,
     req: &RtRequest,
-    message: &str,
+    prose: Option<&Prose>,
 ) -> Option<aws_smithy_runtime_api::http::Response> {
     svc.definition()
         .wire_protocol(req)
         .protocol()
         .serialize_error(
             &SerializationException {
-                message: message.to_string(),
+                prose: prose.cloned(),
             },
             &SERIALIZATION_EXCEPTION_SCHEMA,
             SERIALIZATION_EXCEPTION,
@@ -215,25 +1064,67 @@ pub fn serialization_refusal(
 /// constraints then say about its values is a constraint refusal, which the walk that
 /// follows answers.
 ///
-/// The CLASS the sentence names is the one the codec's own complaint named the value under,
-/// which is read off the vendored codec's wording ([`value_class`]); the path the probe
-/// recorded is what makes the submitted value itself reachable, and is where a class that
-/// the codec states as a framing token rather than a value is recovered from.
-fn probe<O: Operation>(protocol: &dyn ServerHttpProtocol, req: &RtRequest) -> Option<String> {
+/// The CLASS recorded is the one the codec's own complaint named the value under, which is
+/// read off the vendored codec's wording ([`value_class`]).
+fn probe<O: Operation>(protocol: &dyn ServerHttpProtocol, req: &RtRequest) -> Option<Unreadable> {
     let mut deserializer = protocol.deserialize_input(req, O::INPUT_SCHEMA).ok()?;
     let found: RefCell<Option<Unreadable>> = RefCell::new(None);
     let read = {
         let mut probe = Probe {
             inner: &mut *deserializer,
             found: &found,
+            accepted: None,
         };
         <O::Input as DeserializableStruct>::deserialize(&mut probe)
     };
     if read.is_ok() {
         return None;
     }
-    let unreadable = found.into_inner()?;
-    sentence(unreadable.class, unreadable.target)
+    found.into_inner()
+}
+
+/// Run the framework's own deserializer for `O` over the request and report the modelled type
+/// the read one explicit `null` in it answered was FOR, however the read answered: by failing
+/// (a scalar, which names the type in its refusal) or by taking the `null` as absence (a
+/// structure, a list or a map, each recorded as the read happens).
+///
+/// The body this is asked of carries ONE stated absence ([`StatedAbsences::only`]), so the
+/// read reported is that one's.
+fn null_read_target<O: Operation>(
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+) -> Option<ShapeType> {
+    let mut deserializer = protocol.deserialize_input(req, O::INPUT_SCHEMA).ok()?;
+    let found: RefCell<Option<Unreadable>> = RefCell::new(None);
+    let accepted: RefCell<Option<ShapeType>> = RefCell::new(None);
+    {
+        let mut probe = Probe {
+            inner: &mut *deserializer,
+            found: &found,
+            accepted: Some(&accepted),
+        };
+        let _ = <O::Input as DeserializableStruct>::deserialize(&mut probe);
+    }
+    let failed = found
+        .into_inner()
+        .filter(|unreadable| unreadable.class == NULL_VALUE)
+        .map(|unreadable| unreadable.target);
+    failed.or_else(|| accepted.into_inner())
+}
+
+/// Read `req`'s body into `O`'s input with the framework's own deserializer and report the
+/// member that read found MISSING, if that is what stopped it
+/// ([`SerdeError::MissingMember`], which the generated reader raises for a member the input
+/// requires and the body does not carry).
+fn unsatisfied_member<O: Operation>(
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+) -> Option<String> {
+    let mut deserializer = protocol.deserialize_input(req, O::INPUT_SCHEMA).ok()?;
+    match <O::Input as DeserializableStruct>::deserialize(&mut *deserializer) {
+        Err(SerdeError::MissingMember { member_name }) => Some(member_name),
+        _ => None,
+    }
 }
 
 /// The sentence one unreadable value is refused with, or `None` when this service states no
@@ -246,7 +1137,13 @@ fn probe<O: Operation>(protocol: &dyn ServerHttpProtocol, req: &RtRequest) -> Op
 /// the model declares a list, a structure or a map, or a collection where it declares one
 /// value — is not a conversion at all but a field of the wrong TYPE
 /// ([`UNEXPECTED_FIELD_TYPE`]).
+///
+/// An explicit `null` is no sentence of this class at all: nothing was converted, because
+/// `null` states that the member is ABSENT, which is what [`BodyReading`] answers.
 fn sentence(class: &str, target: ShapeType) -> Option<String> {
+    if class == NULL_VALUE {
+        return None;
+    }
     if is_aggregate(target) || class == ARRAY_VALUE || class == OBJECT_VALUE {
         return Some(UNEXPECTED_FIELD_TYPE.to_string());
     }
@@ -301,6 +1198,31 @@ struct Unreadable {
 struct Probe<'d, 'f> {
     inner: &'d mut (dyn ShapeDeserializer + 'd),
     found: &'f RefCell<Option<Unreadable>>,
+    /// Where a `null` the codec reads WITHOUT failing is recorded, as the modelled type that
+    /// read was for: a structure, a list and a map each take a `null` as absence, so the type
+    /// expected where a body stated one is otherwise unstated. `None` leaves those reads
+    /// unwatched, which is what the coercion probe wants: a `null` is no value of the wrong
+    /// class, and recording one would hide the value that IS.
+    accepted: Option<&'f RefCell<Option<ShapeType>>>,
+}
+
+impl Probe<'_, '_> {
+    /// Record the modelled type of a container read the next value is a `null` for.
+    ///
+    /// The first record wins, like a failing read's: the body this is watched over carries one
+    /// stated absence ([`null_read_target`]).
+    fn note_accepted(&self, schema: &Schema) {
+        let Some(slot) = self.accepted else {
+            return;
+        };
+        if !self.inner.is_null() {
+            return;
+        }
+        let mut held = slot.borrow_mut();
+        if held.is_none() {
+            *held = Some(schema.shape_type());
+        }
+    }
 }
 
 /// Record `error` as a coercion failure into `target`, when that is what it is, and return
@@ -341,8 +1263,11 @@ fn note_in(
 /// absent member, text that is not a timestamp, a truncated body — says nothing about a JSON
 /// type and is left to the framework.
 ///
-/// JSON `null` is deliberately NOT a class: a null is absence, not a type error, and what an
-/// absent member earns is the constraint layer's answer.
+/// JSON `null` IS one of the names, and is the one that is not a value of the wrong class: a
+/// `null` states that the member is absent, so what it earns is decided by whether the input
+/// requires that member ([`BodyReading`]) rather than by a conversion ([`sentence`] states no
+/// conversion for it). It is recorded here because the modelled type the read was FOR is the
+/// only place the type a `null` stood where is stated.
 ///
 /// The wordings this reads are PINNED by [`tests::the_codec_wordings_this_layer_reads`]
 /// below, so a change to them in the vendored codec fails loudly here instead of silently
@@ -360,8 +1285,9 @@ fn value_class(error: &SerdeError) -> Option<&'static str> {
         "boolean" => Some(classes::BOOLEAN_VALUE),
         "array start" => Some(classes::ARRAY_VALUE),
         "object start" => Some(classes::OBJECT_VALUE),
-        // "null", and the framing tokens ("object key", "array end", …), which describe
-        // where the parser is rather than a value a caller sent.
+        "null" => Some(classes::NULL_VALUE),
+        // The framing tokens ("object key", "array end", …), which describe where the parser
+        // is rather than a value a caller sent.
         _ => None,
     }
 }
@@ -391,9 +1317,15 @@ impl ShapeDeserializer for Probe<'_, '_> {
         schema: &Schema,
         consumer: &mut dyn FnMut(&Schema, &mut dyn ShapeDeserializer) -> Result<(), SerdeError>,
     ) -> Result<(), SerdeError> {
+        self.note_accepted(schema);
         let found = self.found;
+        let accepted = self.accepted;
         let mut watched = |member: &Schema, inner: &mut dyn ShapeDeserializer| {
-            let mut probe = Probe { inner, found };
+            let mut probe = Probe {
+                inner,
+                found,
+                accepted,
+            };
             consumer(member, &mut probe)
         };
         self.inner
@@ -406,9 +1338,15 @@ impl ShapeDeserializer for Probe<'_, '_> {
         schema: &Schema,
         consumer: &mut dyn FnMut(&mut dyn ShapeDeserializer) -> Result<(), SerdeError>,
     ) -> Result<(), SerdeError> {
+        self.note_accepted(schema);
         let found = self.found;
+        let accepted = self.accepted;
         let mut watched = |inner: &mut dyn ShapeDeserializer| {
-            let mut probe = Probe { inner, found };
+            let mut probe = Probe {
+                inner,
+                found,
+                accepted,
+            };
             consumer(&mut probe)
         };
         self.inner
@@ -421,9 +1359,15 @@ impl ShapeDeserializer for Probe<'_, '_> {
         schema: &Schema,
         consumer: &mut dyn FnMut(String, &mut dyn ShapeDeserializer) -> Result<(), SerdeError>,
     ) -> Result<(), SerdeError> {
+        self.note_accepted(schema);
         let found = self.found;
+        let accepted = self.accepted;
         let mut watched = |key: String, inner: &mut dyn ShapeDeserializer| {
-            let mut probe = Probe { inner, found };
+            let mut probe = Probe {
+                inner,
+                found,
+                accepted,
+            };
             consumer(key, &mut probe)
         };
         self.inner
@@ -474,6 +1418,19 @@ static SERIALIZATION_EXCEPTION_MESSAGE: Schema = Schema::new_member(
     0,
 );
 
+/// The `message` member of that same shape: the slot the DESERIALIZER's own diagnosis of a
+/// body is stated in ([`Prose::Diagnosis`]).
+static SERIALIZATION_EXCEPTION_DIAGNOSIS: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#SerializationException$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    DIAGNOSIS_MEMBER,
+    1,
+);
+
 /// The synthetic shape of a protocol-level serialization refusal: no model declares it and
 /// no operation lists it, because it is the PROTOCOL's own error rather than one of this
 /// service's.
@@ -484,18 +1441,26 @@ static SERIALIZATION_EXCEPTION_SCHEMA: Schema = Schema::new_struct(
         "SerializationException",
     ),
     ShapeType::Structure,
-    &[&SERIALIZATION_EXCEPTION_MESSAGE],
+    &[
+        &SERIALIZATION_EXCEPTION_MESSAGE,
+        &SERIALIZATION_EXCEPTION_DIAGNOSIS,
+    ],
 );
 
-/// The payload of a serialization refusal: what the request could not be read as.
+/// The payload of a serialization refusal: what the request could not be read as, in the
+/// member that class of refusal states it in — and nothing at all for a body no value of
+/// which could be named.
 #[derive(Debug, Clone)]
 struct SerializationException {
-    message: String,
+    prose: Option<Prose>,
 }
 
 impl SerializableStruct for SerializationException {
     fn serialize_members(&self, serializer: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
-        serializer.write_string(&SERIALIZATION_EXCEPTION_MESSAGE, self.message.as_str())
+        let Some(prose) = self.prose.as_ref() else {
+            return Ok(());
+        };
+        serializer.write_string(prose.member(), prose.stated())
     }
 }
 
@@ -516,6 +1481,7 @@ mod tests {
             let mut probe = Probe {
                 inner: &mut deserializer,
                 found: &found,
+                accepted: None,
             };
             if T::deserialize(&mut probe).is_ok() {
                 return None;
@@ -611,6 +1577,42 @@ mod tests {
             assert_eq!(
                 stated, None,
                 "case {body:?}: nothing here is about a value's JSON class, got {stated:?}"
+            );
+        }
+    }
+
+    /// RULE: a body is read as one complete JSON document, and the ONE refusal of the
+    /// maintained reader that is not about the body's form — a document nesting deeper than
+    /// that reader descends — is told apart from every other by the reader's own wording.
+    ///
+    /// The wording is the only place the reader states which refusal this is, so this case is
+    /// what makes a change to it fail loudly instead of quietly turning a deeply nested value
+    /// into a body-level refusal. The rows span the defects of a body's FORM against the
+    /// nesting depth, on both sides of the reader's own bound.
+    #[test]
+    fn the_reader_wording_this_layer_reads() {
+        // (case, the body, whether the reader stopped on the nesting alone)
+        let deep = |levels: usize| format!("{}{}", "[".repeat(levels), "]".repeat(levels));
+        let rows: Vec<(&str, String, bool)> = vec![
+            ("bytes that are not JSON at all", "not json".to_string(), false),
+            ("a truncated object", r#"{"Limit":"#.to_string(), false),
+            (
+                "content after a complete object",
+                r#"{"Limit":1} and more"#.to_string(),
+                false,
+            ),
+            ("nesting the reader descends", deep(32), false),
+            ("nesting past what the reader descends", deep(200), true),
+        ];
+        for (case, body, expected) in rows {
+            let stated = ::serde_json::from_slice::<Value>(body.as_bytes())
+                .err()
+                .as_ref()
+                .map(nests_too_deep);
+            assert_eq!(
+                stated.unwrap_or(false),
+                expected,
+                "case {case:?}: expected nests_too_deep = {expected}, got {stated:?}"
             );
         }
     }
