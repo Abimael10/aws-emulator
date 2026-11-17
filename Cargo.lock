@@ -10651,6 +10651,7 @@ dependencies = [
  "service-com-amazonaws-opensearchserverless-opensearchserverless",
  "service-com-amazonaws-s3-amazons3",
  "service-com-amazonaws-s3vectors-s3vectors",
+ "service-com-amazonaws-sts-awssecuritytokenservicev20110615",
  "service-common",
  "sha2 0.10.9",
  "tokio",

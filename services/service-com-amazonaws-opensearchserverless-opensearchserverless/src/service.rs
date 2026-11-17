@@ -19,10 +19,13 @@
 //! - `can_handle` — which requests this service claims. The default matches the
 //!   request's resolved route key against this service's signing name; EDITED HERE to
 //!   claim a COLLECTION's own data-plane traffic too (see [`collection_rest`]).
-//! - `override_operation` — EDITED HERE for the operations whose input carries a
-//!   `CollectionName`: the key and the handler stay the generated table's, but the
-//!   operation is served through [`CollectionNameRefusal`] so a `@pattern` refusal of a
-//!   collection name reports the class this service's own name validator reports. See
+//! - `override_operation` — EDITED HERE so EVERY modelled operation is served behind
+//!   [`authorization::Gated`]: the key and the handler stay the generated table's, but IAM's
+//!   decision about the action the request names is taken before the operation reads or
+//!   writes anything. The three operations whose input carries a
+//!   `CollectionName` are then served through [`CollectionNameRefusal`] so a `@pattern`
+//!   refusal of a collection name reports the class this service's own name validator
+//!   reports. See
 //!   "How this service reports a @pattern".
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. This service restates one thing there: a `@pattern`
@@ -87,6 +90,12 @@ use smithy_server_runtime::{
     OperationRoutingTable, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+
+/// Whether IAM lets the caller of a CONTROL-PLANE request perform the action it asks for:
+/// the decision every modelled operation of this service is served behind
+/// ([`authorization::Gated`], wired in [`Service::override_operation`]), as AWS takes it
+/// ahead of the service.
+pub mod authorization;
 
 /// The COLLECTION's own OpenSearch REST data plane: the surface served at the host a
 /// collection publishes as its `collectionEndpoint`, which this service's model does not
@@ -316,11 +325,15 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// Held in a field, built once, because `override_operation` hands back a reference
     /// borrowed from `&self`.
     credentialed_data_plane: CredentialedDataPlane<Eng>,
-    /// The operations named in [`COLLECTION_NAME_MEMBERS`], each the generated table's own
-    /// operation wrapped in [`CollectionNameRefusal`] and built from the SAME shared
-    /// engine, so a wrapped operation reads and writes the one store. Keyed by the routing
-    /// key the protocol resolves, which is the key the generated table uses.
-    collection_name_refusals: OperationRoutingTable,
+    /// EVERY modelled operation of this service behind [`authorization::Gated`], so IAM's
+    /// decision about the action is taken before the operation reads or writes anything.
+    /// The three operations named in [`COLLECTION_NAME_MEMBERS`] are served, once IAM
+    /// permits the call, through [`CollectionNameRefusal`] — the wrapper the request would
+    /// have reached without the gate — and every other one through the generated table's own
+    /// operation. Keyed by the routing key the protocol resolves, which is the key the
+    /// generated table uses, and built from the SAME shared engine, so a wrapped operation
+    /// reads and writes the one store.
+    gated: OperationRoutingTable,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -328,34 +341,116 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
-        let mut collection_name_refusals = OperationRoutingTable::new();
-        collection_name_refusals.add_operation(
-            <crate::ops::batch_get_collection::BatchGetCollection<Eng> as Operation>::NAME,
-            Box::new(CollectionNameRefusal::new(
-                crate::ops::batch_get_collection::BatchGetCollection::new(Arc::clone(&engine)),
-            )) as Box<dyn ErasedOperation>,
-        );
-        collection_name_refusals.add_operation(
-            <crate::ops::create_collection::CreateCollection<Eng> as Operation>::NAME,
-            Box::new(CollectionNameRefusal::new(
-                crate::ops::create_collection::CreateCollection::new(Arc::clone(&engine)),
-            )) as Box<dyn ErasedOperation>,
-        );
-        collection_name_refusals.add_operation(
-            <crate::ops::list_collections::ListCollections<Eng> as Operation>::NAME,
-            Box::new(CollectionNameRefusal::new(
-                crate::ops::list_collections::ListCollections::new(Arc::clone(&engine)),
-            )) as Box<dyn ErasedOperation>,
-        );
         Self {
             entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
             credentialed_data_plane: CredentialedDataPlane {
                 engine: Arc::clone(&engine),
             },
+            gated: gated_table::<Eng>(&engine),
             engine,
-            collection_name_refusals,
         }
     }
+}
+
+/// Every operation this service publishes (`smithy_query(query="list_operations")`, all 46
+/// of them) behind [`authorization::Gated`].
+///
+/// Authorization is a property of the request's identity, the action it names and the
+/// resource it addresses rather than of what a handler goes on to do, so it is taken here
+/// for all of them at once — implemented or still scaffolded, and whatever error set the
+/// operation itself declares. A stub answers 501 for a request whose caller IAM permits and
+/// the refusal otherwise, which is the order the real service evaluates them in; leaving an
+/// operation out would serve an unauthorized caller the very resources the policy withholds.
+fn gated_table<Eng: Send + Sync + 'static>(engine: &Arc<Eng>) -> OperationRoutingTable {
+    let mut table = OperationRoutingTable::new();
+    /// Judge one operation per line, served from the generated routing table once IAM
+    /// permits the call, and keyed by its operation shape name — the routing key
+    /// `ServerHttpProtocol::routing_key` resolves and the generated table is keyed by.
+    macro_rules! gated {
+        ($($module:ident :: $operation:ident),+ $(,)?) => {
+            $(
+                table.add_operation(
+                    <crate::ops::$module::$operation<Eng> as Operation>::NAME,
+                    Box::new(authorization::Gated::<
+                        crate::ops::$module::$operation<Eng>,
+                        Eng,
+                    >::new(Arc::clone(engine))) as Box<dyn ErasedOperation>,
+                );
+            )+
+        };
+    }
+    /// The same, for the operations whose input carries a `CollectionName`: a permitted
+    /// request is served through [`CollectionNameRefusal`], so a `@pattern` refusal of a
+    /// collection name still reports the class this service's own name validator reports.
+    macro_rules! gated_stating_a_collection_name {
+        ($($module:ident :: $operation:ident),+ $(,)?) => {
+            $(
+                table.add_operation(
+                    <crate::ops::$module::$operation<Eng> as Operation>::NAME,
+                    Box::new(authorization::Gated::<
+                        crate::ops::$module::$operation<Eng>,
+                        Eng,
+                    >::serving(
+                        Arc::clone(engine),
+                        Box::new(CollectionNameRefusal::new(
+                            crate::ops::$module::$operation::new(Arc::clone(engine)),
+                        )) as Box<dyn ErasedOperation>,
+                    )) as Box<dyn ErasedOperation>,
+                );
+            )+
+        };
+    }
+    gated!(
+        batch_get_collection_group::BatchGetCollectionGroup,
+        batch_get_effective_lifecycle_policy::BatchGetEffectiveLifecyclePolicy,
+        batch_get_lifecycle_policy::BatchGetLifecyclePolicy,
+        batch_get_vpc_endpoint::BatchGetVpcEndpoint,
+        create_access_policy::CreateAccessPolicy,
+        create_collection_group::CreateCollectionGroup,
+        create_index::CreateIndex,
+        create_lifecycle_policy::CreateLifecyclePolicy,
+        create_security_config::CreateSecurityConfig,
+        create_security_policy::CreateSecurityPolicy,
+        create_vpc_endpoint::CreateVpcEndpoint,
+        delete_access_policy::DeleteAccessPolicy,
+        delete_collection::DeleteCollection,
+        delete_collection_group::DeleteCollectionGroup,
+        delete_index::DeleteIndex,
+        delete_lifecycle_policy::DeleteLifecyclePolicy,
+        delete_security_config::DeleteSecurityConfig,
+        delete_security_policy::DeleteSecurityPolicy,
+        delete_vpc_endpoint::DeleteVpcEndpoint,
+        get_access_policy::GetAccessPolicy,
+        get_account_settings::GetAccountSettings,
+        get_index::GetIndex,
+        get_policies_stats::GetPoliciesStats,
+        get_security_config::GetSecurityConfig,
+        get_security_policy::GetSecurityPolicy,
+        list_access_policies::ListAccessPolicies,
+        list_collection_groups::ListCollectionGroups,
+        list_lifecycle_policies::ListLifecyclePolicies,
+        list_security_configs::ListSecurityConfigs,
+        list_security_policies::ListSecurityPolicies,
+        list_tags_for_resource::ListTagsForResource,
+        list_vpc_endpoints::ListVpcEndpoints,
+        tag_resource::TagResource,
+        untag_resource::UntagResource,
+        update_access_policy::UpdateAccessPolicy,
+        update_account_settings::UpdateAccountSettings,
+        update_collection::UpdateCollection,
+        update_collection_group::UpdateCollectionGroup,
+        update_index::UpdateIndex,
+        update_lifecycle_policy::UpdateLifecyclePolicy,
+        update_security_config::UpdateSecurityConfig,
+        update_security_policy::UpdateSecurityPolicy,
+        update_vpc_endpoint::UpdateVpcEndpoint,
+    );
+    gated_stating_a_collection_name!(
+        batch_get_collection::BatchGetCollection,
+        create_collection::CreateCollection,
+        list_collections::ListCollections,
+    );
+    table
 }
 
 /// The auth schemes a credentialed data-plane request is verified under.
@@ -439,11 +534,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     ) -> Option<&dyn ErasedOperation> {
         // NOT a re-route: the key is the one the generated table's own protocol resolves,
         // and the operation it names is the one served — wrapped in
+        // [`authorization::Gated`], so IAM's decision about the action is taken BEFORE the
+        // handler runs as AWS takes it ahead of the service, and then in
         // [`CollectionNameRefusal`] for the operations whose input carries a
         // `CollectionName`, so a `@pattern` refusal of a collection name reports the class
-        // this service's name validator reports rather than the member's trait. A key that
-        // names no wrapped operation answers `None` here, exactly as it does for a key the
-        // model does not name, and the generated table serves it unchanged.
+        // this service's name validator reports rather than the member's trait. Every
+        // operation this service publishes is in that table; a key the model does not name
+        // resolves to `None` here, so the router's routing-error path is untouched.
         //
         // A data-plane request that PRESENTS a SigV4 credential is named as an operation
         // first, so the router verifies that credential's signature before anything is
@@ -456,7 +553,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             return Some(&self.credentialed_data_plane);
         }
         let key = self.entry.protocol().routing_key(req).ok()?;
-        self.collection_name_refusals.get(key)
+        self.gated.get(key)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

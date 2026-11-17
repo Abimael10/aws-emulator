@@ -873,6 +873,27 @@ pub const APIS: &[Api] = &[
         protocol: Protocol::RestJson(&BEDROCK_AGENT_RUNTIME),
         answer_model: Some(&BEDROCK_AGENT_RUNTIME_ANSWERS),
     },
+    // `services/service-com-amazonaws-bedrockagent-amazonbedrockagentbuildtimelambda/
+    // smithy-model/com-amazonaws-bedrockagent-amazonbedrockagentbuildtimelambda.json`:
+    // restJson1, sigv4Name `bedrock`, endpointPrefix `bedrock-agent`, sdkId `Bedrock Agent`.
+    // Its requests are bound per operation out of that same model ([`BEDROCK_AGENT`]).
+    //
+    // THE BUILD-TIME PLANE of an agent, beside the runtime plane above: the agent, its
+    // aliases and action groups, and the knowledge base its passages come from are created,
+    // read and listed here, so a function that stands an agent up — or that reports the one
+    // it was told to use — reaches this service and not the runtime one. The token is the one
+    // the AWS SDK for Python builds a client for it with (`boto3.client("bedrock-agent")`),
+    // which is its endpoint prefix, and it names a different service from
+    // `bedrock-agent-runtime` under the comparison a client's token is matched by
+    // ([`same_service_token`]).
+    Api {
+        sdk_token: "bedrock-agent",
+        signing_name: "bedrock",
+        endpoint_prefix: "bedrock-agent",
+        model: Some(BEDROCK_AGENT_MODEL),
+        protocol: Protocol::RestJson(&BEDROCK_AGENT),
+        answer_model: Some(&BEDROCK_AGENT_ANSWERS),
+    },
     // `services/service-com-amazonaws-opensearchserverless-opensearchserverless/smithy-model/
     // com-amazonaws-opensearchserverless-opensearchserverless.json`: awsJson1_0, sigv4Name
     // `aoss`, endpointPrefix `aoss`, sdkId `OpenSearchServerless`, service shape
@@ -1174,6 +1195,11 @@ pub(super) const BEDROCK_AGENT_RUNTIME_MODEL: &str = include_str!(
      smithy-model/\
      com-amazonaws-bedrockagentruntime-amazonbedrockagentruntimeservice.json"
 );
+pub(super) const BEDROCK_AGENT_MODEL: &str = include_str!(
+    "../../../../service-com-amazonaws-bedrockagent-amazonbedrockagentbuildtimelambda/\
+     smithy-model/\
+     com-amazonaws-bedrockagent-amazonbedrockagentbuildtimelambda.json"
+);
 pub(super) const OPENSEARCHSERVERLESS_MODEL: &str = include_str!(
     "../../../../service-com-amazonaws-opensearchserverless-opensearchserverless/smithy-model/\
      com-amazonaws-opensearchserverless-opensearchserverless.json"
@@ -1338,6 +1364,11 @@ static OPENSEARCHSERVERLESS_ANSWERS: super::blob_members::ServiceModel =
         source: OPENSEARCHSERVERLESS_MODEL,
         plan: ::std::sync::OnceLock::new(),
     };
+static BEDROCK_AGENT_ANSWERS: super::blob_members::ServiceModel =
+    super::blob_members::ServiceModel {
+        source: BEDROCK_AGENT_MODEL,
+        plan: ::std::sync::OnceLock::new(),
+    };
 static KINESIS: super::blob_members::ServiceModel = super::blob_members::ServiceModel {
     source: KINESIS_MODEL,
     plan: ::std::sync::OnceLock::new(),
@@ -1361,6 +1392,15 @@ static TRANSFER: super::blob_members::ServiceModel = super::blob_members::Servic
 static BEDROCK_AGENT_RUNTIME: super::rest_json::RestApi = super::rest_json::RestApi {
     model: BEDROCK_AGENT_RUNTIME_MODEL,
     namespace: "com.amazonaws.bedrockagentruntime",
+    parsed: ::std::sync::OnceLock::new(),
+};
+
+/// The Bedrock Agent BUILD-TIME plane's own model, which a call to it is bound by — embedded
+/// exactly as [`BEDROCK_AGENT_RUNTIME`] is, and for the same reason: the wire facts of each
+/// operation are that model's, so this seam states none of them.
+static BEDROCK_AGENT: super::rest_json::RestApi = super::rest_json::RestApi {
+    model: BEDROCK_AGENT_MODEL,
+    namespace: "com.amazonaws.bedrockagent",
     parsed: ::std::sync::OnceLock::new(),
 };
 

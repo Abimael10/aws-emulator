@@ -43,6 +43,11 @@ service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 # collection's own data access policies, in the service that owns them
 # (`src/state/opensearch_serverless_store.rs`).
 service-com-amazonaws-opensearchserverless-opensearchserverless = { workspace = true }
+# The role SESSION a request's credential speaks for: the IAM-layer gate in front of every
+# operation (`src/service/authorization.rs`) resolves the access key id a request signed
+# with through the token service's own accessors, so it sees exactly what
+# `sts:GetCallerIdentity` would answer.
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

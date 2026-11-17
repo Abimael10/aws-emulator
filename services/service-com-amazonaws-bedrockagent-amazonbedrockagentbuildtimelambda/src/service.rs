@@ -20,9 +20,10 @@
 //!   request's resolved route key against this service's signing name. Edit it
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
-//! - `override_operation` — serve a request the model's routing key cannot name
-//!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
+//! - `override_operation` — EDITED HERE so EVERY modelled operation is served behind
+//!   [`authorization::Gated`]: the key and the handler stay the generated table's, but IAM's
+//!   decision about the action the request names is taken before the operation reads or
+//!   writes anything.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. This service states them AWS's way: the framework's
 //!   envelope and clauses, with the value dropped from a clause about a `@sensitive`
@@ -44,8 +45,15 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
-use smithy_server_runtime::{http, ErasedOperation, Refusal, Refused, Service};
+use smithy_server_runtime::{
+    http, ErasedOperation, Operation, OperationRoutingTable, Refusal, Refused, Service,
+};
 use std::sync::{Arc, LazyLock};
+
+/// Whether IAM lets the caller of a request perform the action it asks for: the decision
+/// every modelled operation of this service is served behind ([`authorization::Gated`],
+/// wired in [`Service::override_operation`]), as AWS takes it ahead of the service.
+pub mod authorization;
 
 /// This service's Smithy model: the one source for which of its members are
 /// `@sensitive`, and so for which values a refusal does not echo.
@@ -69,6 +77,12 @@ static WITHHELD_MEMBERS: LazyLock<service_common::sensitive_members::WithheldMem
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// EVERY modelled operation of this service behind [`authorization::Gated`], keyed by
+    /// the routing key the protocol resolves — the key the generated routing table uses.
+    /// Built once here, never per request; each entry carries the operation's TYPE and a
+    /// handle on the one shared engine, so this is a table of names rather than a second set
+    /// of operations.
+    gated: OperationRoutingTable,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -77,9 +91,127 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
+            gated: gated_table::<Eng>(&engine),
             entry: crate::ServiceDefinition::new(engine),
         }
     }
+}
+
+/// Every operation this service publishes (`smithy_query(query="list_operations")`, all 86
+/// of them) behind [`authorization::Gated`].
+///
+/// Authorization is a property of the request's identity, the action it names and the
+/// resource it addresses rather than of what a handler goes on to do, so it is taken here
+/// for all of them at once — implemented or still scaffolded, and whatever error set the
+/// operation itself declares. A stub answers 501 for a request whose caller IAM permits and
+/// the refusal otherwise, which is the order the real service evaluates them in; leaving an
+/// operation out would serve an unauthorized caller the very resources the policy withholds.
+fn gated_table<Eng: Send + Sync + 'static>(engine: &Arc<Eng>) -> OperationRoutingTable {
+    let mut table = OperationRoutingTable::new();
+    /// Judge one `crate::ops::<module>::<Operation>` per line, keyed by its operation shape
+    /// name — the routing key the protocol resolves and the generated table is keyed by.
+    macro_rules! gated {
+        ($($module:ident :: $operation:ident),+ $(,)?) => {
+            $(
+                table.add_operation(
+                    <crate::ops::$module::$operation<Eng> as Operation>::NAME,
+                    Box::new(authorization::Gated::<
+                        crate::ops::$module::$operation<Eng>,
+                        Eng,
+                    >::new(Arc::clone(engine))) as Box<dyn ErasedOperation>,
+                );
+            )+
+        };
+    }
+    gated!(
+        associate_agent_collaborator::AssociateAgentCollaborator,
+        associate_agent_knowledge_base::AssociateAgentKnowledgeBase,
+        create_agent::CreateAgent,
+        create_agent_action_group::CreateAgentActionGroup,
+        create_agent_alias::CreateAgentAlias,
+        create_data_source::CreateDataSource,
+        create_flow::CreateFlow,
+        create_flow_alias::CreateFlowAlias,
+        create_flow_version::CreateFlowVersion,
+        create_knowledge_base::CreateKnowledgeBase,
+        create_prompt::CreatePrompt,
+        create_prompt_version::CreatePromptVersion,
+        create_retrieval_instruction::CreateRetrievalInstruction,
+        create_retrieval_instruction_version::CreateRetrievalInstructionVersion,
+        create_vpc_configuration::CreateVpcConfiguration,
+        delete_agent::DeleteAgent,
+        delete_agent_action_group::DeleteAgentActionGroup,
+        delete_agent_alias::DeleteAgentAlias,
+        delete_agent_version::DeleteAgentVersion,
+        delete_data_source::DeleteDataSource,
+        delete_flow::DeleteFlow,
+        delete_flow_alias::DeleteFlowAlias,
+        delete_flow_version::DeleteFlowVersion,
+        delete_knowledge_base::DeleteKnowledgeBase,
+        delete_knowledge_base_documents::DeleteKnowledgeBaseDocuments,
+        delete_prompt::DeletePrompt,
+        delete_resource_policy::DeleteResourcePolicy,
+        delete_retrieval_instruction::DeleteRetrievalInstruction,
+        delete_vpc_configuration::DeleteVpcConfiguration,
+        disassociate_agent_collaborator::DisassociateAgentCollaborator,
+        disassociate_agent_knowledge_base::DisassociateAgentKnowledgeBase,
+        get_agent::GetAgent,
+        get_agent_action_group::GetAgentActionGroup,
+        get_agent_alias::GetAgentAlias,
+        get_agent_collaborator::GetAgentCollaborator,
+        get_agent_knowledge_base::GetAgentKnowledgeBase,
+        get_agent_version::GetAgentVersion,
+        get_data_source::GetDataSource,
+        get_flow::GetFlow,
+        get_flow_alias::GetFlowAlias,
+        get_flow_version::GetFlowVersion,
+        get_ingestion_job::GetIngestionJob,
+        get_knowledge_base::GetKnowledgeBase,
+        get_knowledge_base_documents::GetKnowledgeBaseDocuments,
+        get_prompt::GetPrompt,
+        get_resource_policy::GetResourcePolicy,
+        get_retrieval_instruction::GetRetrievalInstruction,
+        get_vpc_configuration::GetVpcConfiguration,
+        ingest_knowledge_base_documents::IngestKnowledgeBaseDocuments,
+        list_agent_action_groups::ListAgentActionGroups,
+        list_agent_aliases::ListAgentAliases,
+        list_agent_collaborators::ListAgentCollaborators,
+        list_agent_knowledge_bases::ListAgentKnowledgeBases,
+        list_agent_versions::ListAgentVersions,
+        list_agents::ListAgents,
+        list_data_sources::ListDataSources,
+        list_flow_aliases::ListFlowAliases,
+        list_flow_versions::ListFlowVersions,
+        list_flows::ListFlows,
+        list_ingestion_jobs::ListIngestionJobs,
+        list_knowledge_base_documents::ListKnowledgeBaseDocuments,
+        list_knowledge_bases::ListKnowledgeBases,
+        list_prompts::ListPrompts,
+        list_retrieval_instruction_versions::ListRetrievalInstructionVersions,
+        list_retrieval_instructions::ListRetrievalInstructions,
+        list_tags_for_resource::ListTagsForResource,
+        list_vpc_configurations::ListVpcConfigurations,
+        prepare_agent::PrepareAgent,
+        prepare_flow::PrepareFlow,
+        put_resource_policy::PutResourcePolicy,
+        start_ingestion_job::StartIngestionJob,
+        stop_ingestion_job::StopIngestionJob,
+        tag_resource::TagResource,
+        untag_resource::UntagResource,
+        update_agent::UpdateAgent,
+        update_agent_action_group::UpdateAgentActionGroup,
+        update_agent_alias::UpdateAgentAlias,
+        update_agent_collaborator::UpdateAgentCollaborator,
+        update_agent_knowledge_base::UpdateAgentKnowledgeBase,
+        update_data_source::UpdateDataSource,
+        update_flow::UpdateFlow,
+        update_flow_alias::UpdateFlowAlias,
+        update_knowledge_base::UpdateKnowledgeBase,
+        update_prompt::UpdatePrompt,
+        update_retrieval_instruction::UpdateRetrievalInstruction,
+        validate_flow_definition::ValidateFlowDefinition,
+    );
+    table
 }
 
 impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
@@ -122,12 +254,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // NOT a re-route: the key is the one the generated table's own protocol resolves,
+        // and the operation it names is the one served — wrapped in
+        // [`authorization::Gated`] so IAM's decision about the action is taken BEFORE the
+        // handler runs, as AWS takes it ahead of the service. Every operation this service
+        // publishes is in that table; a key the model does not name resolves to `None`
+        // here, so the router's routing-error path is untouched.
+        let key = self.entry.protocol().routing_key(req).ok()?;
+        self.gated.get(key)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
