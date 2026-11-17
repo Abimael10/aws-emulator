@@ -182,7 +182,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The bucket's OWN ARN, as the store holds it, rather than the one
             // the request carried.
             table_bucket_arn: bucket.arn.clone(),
-            id: Some(configuration.id.clone()),
+            // The configuration covers the whole bucket, and the service names
+            // that one configuration with a fixed identifier: the same text on
+            // every read, whatever bucket it is read on and however many times
+            // metrics were turned off and on again.
+            id: Some(configuration.id().to_string()),
         })
     }
 }

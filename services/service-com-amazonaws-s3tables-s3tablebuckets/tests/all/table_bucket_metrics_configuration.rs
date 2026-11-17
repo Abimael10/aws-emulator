@@ -5,12 +5,13 @@
 //!
 //! The rule under test: a table bucket has a metrics configuration only once a
 //! put sets one on it, so a read of a bucket that has none is refused with the
-//! modeled not-found; a put persists a configuration under an id the service
-//! mints (never a value taken from the request) and, being `@idempotent` and
-//! carrying no settings, leaves an existing configuration and its id untouched;
-//! a read reports the stored id for the bucket it addresses and changes nothing
-//! a later caller sees; and a configuration belongs to its bucket, so it is
-//! neither visible on another bucket nor outlives the bucket it was set on.
+//! modeled not-found; a put persists the single whole-bucket configuration,
+//! which the service names with its own FIXED identifier (never a value taken
+//! from the request and never one minted per call), so a repeated put leaves
+//! the id a read reports exactly as it was; a read reports that id for the
+//! bucket it addresses and changes nothing a later caller sees; and a
+//! configuration belongs to its bucket, so it is neither visible on another
+//! bucket nor outlives the bucket it was set on.
 //!
 //! Every case drives the real wire path through the harness, so what is
 //! asserted is what an AWS SDK client would see. The table spans what the rule
@@ -32,6 +33,14 @@ const NO_METRICS_CONFIGURATION: &str = "No such metric configuration exists";
 /// The fixed sentence this service states a table bucket the store does not
 /// hold with.
 const NO_BUCKET: &str = "The specified bucket does not exist.";
+
+/// The identifier S3 Tables reports for the one metrics configuration a table
+/// bucket can have: it covers the WHOLE bucket, so the id is this fixed text,
+/// the same for every bucket and every read. The model constrains the `id`
+/// member only to `String`
+/// (`smithy_query(query="operation",operation="GetTableBucketMetricsConfiguration")`),
+/// so the value is recorded behaviour.
+const WHOLE_BUCKET_ID: &str = "EntireBucket";
 
 /// One row: a table bucket created the way the row says, with the put repeated
 /// as many times as the row names.
@@ -124,9 +133,9 @@ fn reported_id(reply: &super::harness::Reply, arn: &str, case: &str) -> String {
         "case {case:?}: expected tableBucketARN {arn:?}, got {reported_arn:?}"
     );
     let id = reply.text("id");
-    assert!(
-        !id.is_empty(),
-        "case {case:?}: expected a non-empty id, got {id:?}"
+    assert_eq!(
+        id, WHOLE_BUCKET_ID,
+        "case {case:?}: expected the fixed whole-bucket id {WHOLE_BUCKET_ID:?}, got {id:?}"
     );
     id
 }
@@ -222,7 +231,7 @@ async fn a_put_turns_metrics_on_and_the_read_reports_what_it_persisted() {
 
         let id = first_id.expect("every row calls the put at least once");
 
-        // The id is minted by the service: it carries nothing a caller sent.
+        // The id is the service's own: it carries nothing a caller sent.
         for sent in [case.name, case.region, arn.as_str()] {
             assert!(
                 !id.contains(sent),
@@ -240,7 +249,10 @@ async fn a_put_turns_metrics_on_and_the_read_reports_what_it_persisted() {
             let bucket = store.table_buckets.get(&arn).unwrap_or_else(|| {
                 panic!("case {label:?}: the bucket is resident", label = case.label)
             });
-            let persisted = bucket.metrics.as_ref().map(|metrics| metrics.id.clone());
+            let persisted = bucket
+                .metrics
+                .as_ref()
+                .map(|metrics| metrics.id().to_string());
             assert_eq!(
                 persisted.as_deref(),
                 Some(id.as_str()),
@@ -261,15 +273,13 @@ async fn a_put_turns_metrics_on_and_the_read_reports_what_it_persisted() {
         minted.push((case.label.to_string(), id));
     }
 
-    // Each bucket's configuration is its own: no two rows report the same id.
-    for (index, (label, id)) in minted.iter().enumerate() {
-        for (other_label, other_id) in &minted[index + 1..] {
-            assert_ne!(
-                id, other_id,
-                "case {label:?}: its id {id:?} must differ from the one case \
-                 {other_label:?} reports"
-            );
-        }
+    // The id names the whole-bucket configuration, not the bucket: it is
+    // bucket-independent, so every row reports the same fixed text.
+    for (label, id) in &minted {
+        assert_eq!(
+            id, WHOLE_BUCKET_ID,
+            "case {label:?}: expected the fixed whole-bucket id {WHOLE_BUCKET_ID:?}, got {id:?}"
+        );
     }
 }
 
@@ -366,8 +376,9 @@ async fn a_configuration_belongs_to_the_bucket_it_was_set_on() {
         actual = read.message()
     );
 
-    // And the id the one configured bucket reported was not reused by anything
-    // above: it is still the id its own read answers after a fresh put.
+    // And a bucket recreated under the same name reports the same fixed id
+    // once its own put turns metrics on: the id names the whole-bucket
+    // configuration, so it is not a handle on one incarnation of the bucket.
     let put = emulator
         .put_table_bucket_metrics_configuration("us-east-1", &recreated.text("arn"))
         .await;
@@ -381,10 +392,9 @@ async fn a_configuration_belongs_to_the_bucket_it_was_set_on() {
         .get_table_bucket_metrics_configuration("us-east-1", &recreated.text("arn"))
         .await;
     let fresh_id = reported_id(&read, &recreated.text("arn"), "the recreated bucket");
-    assert_ne!(
+    assert_eq!(
         fresh_id, id,
-        "case \"the recreated bucket\": a fresh configuration must carry a fresh id, got \
-         {fresh_id:?}"
+        "case \"the recreated bucket\": expected the same fixed id {id:?}, got {fresh_id:?}"
     );
 }
 
@@ -479,7 +489,7 @@ async fn a_delete_turns_metrics_off_again() {
             let persisted = store
                 .table_buckets
                 .get(&arn)
-                .and_then(|bucket| bucket.metrics.clone());
+                .and_then(|bucket| bucket.metrics);
             assert_eq!(
                 persisted, None,
                 "case {label:?}: the delete must remove the configuration from the store, got \
@@ -487,7 +497,8 @@ async fn a_delete_turns_metrics_off_again() {
             );
         }
 
-        // And a later put turns metrics on again, under a fresh id.
+        // And a later put turns metrics on again, under the same fixed id
+        // (`reported_id` asserts it).
         let put = emulator
             .put_table_bucket_metrics_configuration(region, &arn)
             .await;
@@ -647,4 +658,203 @@ async fn a_call_against_a_bucket_the_store_does_not_hold_is_refused() {
         status = read.status,
         body = read.body
     );
+}
+
+/// One row of the toggle table below: how the bucket is addressed, and how often
+/// the caller turns metrics off and on again.
+#[derive(Debug)]
+struct Toggle {
+    label: &'static str,
+    region: &'static str,
+    name: &'static str,
+    /// How many put/read/delete/read cycles the row performs. More than one is
+    /// what shows the id to be a property of the configuration rather than of
+    /// the put that set it.
+    cycles: usize,
+    /// Whether the row deletes before its first put, so a configuration that
+    /// was never set is removed first.
+    delete_first: bool,
+}
+
+/// The id a read reports is the service's FIXED whole-bucket identifier: the same
+/// text on every read, for every bucket whatever its region or name, and unchanged
+/// by any number of delete/re-put cycles — so a client that cached it after turning
+/// metrics off and on again still recognises the configuration.
+#[tokio::test]
+async fn the_reported_id_is_the_fixed_whole_bucket_identifier() {
+    // The rows differ along what the rule generalises over: the region, the shape
+    // and length of the bucket name, how many times metrics are toggled, and
+    // whether a delete precedes the first put.
+    let toggles = [
+        Toggle {
+            label: "one cycle, a plain bucket",
+            region: "us-east-1",
+            name: "metrics-id-once",
+            cycles: 1,
+            delete_first: false,
+        },
+        Toggle {
+            label: "three cycles, as the recorded client drives it",
+            region: "us-west-2",
+            name: "metrics-id-thrice",
+            cycles: 3,
+            delete_first: false,
+        },
+        Toggle {
+            // `TableBucketName` is `@length(3, 63)`, so this is the shortest
+            // name a bucket can carry.
+            label: "two cycles, the shortest name, a delete first",
+            region: "ap-south-1",
+            name: "mid",
+            cycles: 2,
+            delete_first: true,
+        },
+        Toggle {
+            label: "four cycles, a long hyphenated name in another region",
+            region: "eu-west-1",
+            name: "metrics-id-on-a-rather-long-table-bucket-name-here-0123456789",
+            cycles: 4,
+            delete_first: true,
+        },
+    ];
+
+    // One emulator for every row, so the ids below are compared across buckets
+    // that coexist in one store.
+    let emulator = Emulator::new();
+    let mut observed: Vec<(&str, usize, String)> = Vec::new();
+
+    for toggle in &toggles {
+        let created = emulator
+            .create_table_bucket(toggle.region, &json!({ "name": toggle.name }))
+            .await;
+        assert_eq!(
+            created.status,
+            200,
+            "case {label:?}: the create must succeed, got {status} {body}",
+            label = toggle.label,
+            status = created.status,
+            body = created.body
+        );
+        let arn = created.text("arn");
+
+        if toggle.delete_first {
+            let deleted = emulator
+                .delete_table_bucket_metrics_configuration(toggle.region, &arn)
+                .await;
+            assert_eq!(
+                deleted.status,
+                204,
+                "case {label:?}: the delete before any put must answer 204, got {status} {body}",
+                label = toggle.label,
+                status = deleted.status,
+                body = deleted.body
+            );
+        }
+
+        for cycle in 1..=toggle.cycles {
+            let put = emulator
+                .put_table_bucket_metrics_configuration(toggle.region, &arn)
+                .await;
+            assert_eq!(
+                put.status,
+                204,
+                "case {label:?}: cycle {cycle}'s put must answer 204, got {status} {body}",
+                label = toggle.label,
+                status = put.status,
+                body = put.body
+            );
+
+            let read = emulator
+                .get_table_bucket_metrics_configuration(toggle.region, &arn)
+                .await;
+            assert_eq!(
+                read.status,
+                200,
+                "case {label:?}: cycle {cycle}'s read must succeed, got {status} {body}",
+                label = toggle.label,
+                status = read.status,
+                body = read.body
+            );
+            let reported_arn = read.text("tableBucketARN");
+            assert_eq!(
+                reported_arn, arn,
+                "case {label:?}: cycle {cycle} expected tableBucketARN {arn:?}, got \
+                 {reported_arn:?}",
+                label = toggle.label
+            );
+            let id = read.text("id");
+            assert_eq!(
+                id, WHOLE_BUCKET_ID,
+                "case {label:?}: cycle {cycle} expected the fixed whole-bucket id \
+                 {WHOLE_BUCKET_ID:?}, got {id:?}",
+                label = toggle.label
+            );
+            observed.push((toggle.label, cycle, id));
+
+            let deleted = emulator
+                .delete_table_bucket_metrics_configuration(toggle.region, &arn)
+                .await;
+            assert_eq!(
+                deleted.status,
+                204,
+                "case {label:?}: cycle {cycle}'s delete must answer 204, got {status} {body}",
+                label = toggle.label,
+                status = deleted.status,
+                body = deleted.body
+            );
+            let off = emulator
+                .get_table_bucket_metrics_configuration(toggle.region, &arn)
+                .await;
+            assert_eq!(
+                off.status,
+                404,
+                "case {label:?}: cycle {cycle}'s read after the delete must refuse 404, got \
+                 {status} {body}",
+                label = toggle.label,
+                status = off.status,
+                body = off.body
+            );
+            assert_eq!(
+                off.message(),
+                NO_METRICS_CONFIGURATION,
+                "case {label:?}: cycle {cycle} expected the fixed not-configured sentence, got \
+                 {actual:?}",
+                label = toggle.label,
+                actual = off.message()
+            );
+        }
+
+        // Metrics back on one last time: the read after the final delete and
+        // re-put reports the very same id the first cycle did.
+        let put = emulator
+            .put_table_bucket_metrics_configuration(toggle.region, &arn)
+            .await;
+        assert_eq!(
+            put.status,
+            204,
+            "case {label:?}: the re-enabling put must answer 204, got {status} {body}",
+            label = toggle.label,
+            status = put.status,
+            body = put.body
+        );
+        let final_read = emulator
+            .get_table_bucket_metrics_configuration(toggle.region, &arn)
+            .await;
+        let final_id = reported_id(&final_read, &arn, toggle.label);
+        observed.push((toggle.label, toggle.cycles + 1, final_id));
+    }
+
+    // Every read, of every bucket, in every cycle, reported one and the same
+    // identifier: it belongs to the whole-bucket configuration, not to a call.
+    let (first_label, first_cycle, first_id) = observed
+        .first()
+        .cloned()
+        .expect("every row performs at least one read");
+    for (label, cycle, id) in &observed {
+        assert_eq!(
+            id, &first_id,
+            "case {label:?}: read {cycle} reported {id:?}, but case {first_label:?} read \
+             {first_cycle} reported {first_id:?}"
+        );
+    }
 }

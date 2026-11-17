@@ -18,14 +18,17 @@
 //! asserted here are the ones no other suite pins to that form:
 //!
 //! * a `ListNamespaces` row's `namespaceId`;
-//! * the `id` of a table bucket's metrics configuration
-//!   (`GetTableBucketMetricsConfiguration`), which must be the SAME id on every read;
 //! * the `versionToken` of a table bucket's replication configuration, both the one the
 //!   first `PutTableBucketReplication` mints and the one a conditional re-put advances it
 //!   to;
 //! * the table id the table's `warehouseLocation` is named for, and the metadata-file id
 //!   inside its `metadataLocation`, as `GetTable` and `GetTableMetadataLocation` report
 //!   them.
+//!
+//! The `id` of a table bucket's metrics configuration is NOT one of them: that
+//! configuration covers the whole bucket and the service names it with a fixed
+//! identifier, which `table_bucket_metrics_configuration.rs` and
+//! `metrics_configuration_fixed_id.rs` pin.
 //!
 //! Both rules are asserted over a TABLE of fixtures spanning the region, the bucket-name
 //! length and form, one, two and three namespaces per bucket, a table created with and
@@ -322,9 +325,11 @@ async fn a_table_s_locations_carry_canonical_uuid_ids() {
     }
 }
 
-/// RULE 2: the `id` a metrics configuration carries and the `versionToken` a table
-/// bucket's replication configuration carries are canonical UUIDs; the id is the same on
-/// every read, and a conditional re-put advances the token to another canonical UUID.
+/// RULE 2: the `versionToken` a table bucket's replication configuration carries is a
+/// canonical UUID, the read reports the one the put minted, and a conditional re-put
+/// advances the token to another canonical UUID. The metrics puts each row performs are
+/// driven too, so the id they settle is observed to be stable across them — its VALUE is
+/// the fixed whole-bucket id the metrics suites pin, not a minted one.
 #[tokio::test]
 async fn a_configuration_read_reports_canonical_uuid_identifiers() {
     for fixture in FIXTURES {
@@ -356,7 +361,6 @@ async fn a_configuration_read_reports_canonical_uuid_identifiers() {
                 "case {case:?}: the read after put {put}: {after_put:?}"
             );
             let id = after_put.text("id");
-            assert_canonical_uuid(&id, "a metrics configuration's id", case);
             match &first_id {
                 None => first_id = Some(id),
                 Some(settled) => assert_eq!(
@@ -373,7 +377,6 @@ async fn a_configuration_read_reports_canonical_uuid_identifiers() {
             "case {case:?}: GetTableBucketMetricsConfiguration: {metrics:?}"
         );
         let metrics_id = metrics.text("id");
-        assert_canonical_uuid(&metrics_id, "a metrics configuration's id", case);
         let again = emulator
             .get_table_bucket_metrics_configuration(fixture.region, &bucket_arn)
             .await;

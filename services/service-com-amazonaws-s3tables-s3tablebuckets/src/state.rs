@@ -303,18 +303,30 @@ pub fn effective_table_encryption(
     effective_bucket_encryption(table.or(table_bucket))
 }
 
+/// The identifier of the single metrics configuration a table bucket can have.
+///
+/// A table bucket has exactly ONE metrics configuration and it covers the whole
+/// bucket, so the service names it with this FIXED identifier rather than with
+/// a per-bucket or per-call value: it carries nothing from the request and
+/// nothing from state, and it is therefore the same text for every bucket, on
+/// every read, and across any number of put/delete cycles.
+pub const WHOLE_BUCKET_METRICS_CONFIGURATION_ID: &str = "EntireBucket";
+
 /// The stored form of a table bucket's metrics configuration.
 ///
 /// `PutTableBucketMetricsConfiguration` carries no settings — its whole input is
-/// the table bucket's ARN — so what a put persists is that the bucket HAS a
-/// metrics configuration, under the id the service minted for it, and that id is
-/// what a read reports.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MetricsConfiguration {
-    /// The configuration's unique identifier, minted by this service: it
-    /// carries nothing from the request, so a caller can neither choose it nor
-    /// read a bucket's name out of it.
-    pub id: String,
+/// the table bucket's ARN — so what a put persists is only that the bucket HAS
+/// the whole-bucket metrics configuration. There is nothing per-call to hold:
+/// the id a read reports is a property of that one configuration
+/// ([`WHOLE_BUCKET_METRICS_CONFIGURATION_ID`]), not of the call that set it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MetricsConfiguration;
+
+impl MetricsConfiguration {
+    /// The identifier a read reports for this configuration.
+    pub fn id(&self) -> &'static str {
+        WHOLE_BUCKET_METRICS_CONFIGURATION_ID
+    }
 }
 
 /// `TableRecordExpirationStatus` — whether the records of a table expire.
@@ -1152,22 +1164,6 @@ impl ComAmazonawsS3tablesS3tablebucketsState {
             let candidate = self.mint_id("table");
             let suffix = format!("/table/{candidate}");
             if !self.tables_by_arn.keys().any(|arn| arn.ends_with(&suffix)) {
-                return candidate;
-            }
-        }
-    }
-
-    /// A fresh id for a metrics configuration, retried against the store so an
-    /// id is never reused while another configuration carries it.
-    pub fn mint_metrics_configuration_id(&mut self) -> String {
-        loop {
-            let candidate = self.mint_id("metrics-configuration");
-            if !self.table_buckets.values().any(|bucket| {
-                bucket
-                    .metrics
-                    .as_ref()
-                    .is_some_and(|metrics| metrics.id == candidate)
-            }) {
                 return candidate;
             }
         }

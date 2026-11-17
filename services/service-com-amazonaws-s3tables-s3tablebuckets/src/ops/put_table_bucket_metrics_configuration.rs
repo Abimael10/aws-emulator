@@ -188,28 +188,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the store holds no bucket for is the modeled not-found.
         let configured = match store.table_buckets.get(&input.table_bucket_arn) {
             None => return Err(bucket_not_found()),
-            Some(bucket) => bucket.metrics.clone(),
+            Some(bucket) => bucket.metrics,
         };
 
         // The operation is `@idempotent` and carries no settings: metrics are
-        // either on or off for a table bucket. So a put on a bucket whose
-        // metrics are already on leaves the configuration — and therefore the
-        // id a read reports — exactly as it was, and only a bucket that has
-        // none gets a configuration minted for it.
-        let (configuration_id, outcome) = match configured {
-            Some(configuration) => (configuration.id, "unchanged"),
+        // either on or off for a table bucket. The single configuration a put
+        // sets covers the whole bucket and is named by the service's fixed
+        // identifier for it, so there is nothing per-call to persist and
+        // nothing for a repeated put — or a put after a delete — to change
+        // about the id a read reports.
+        let configuration = MetricsConfiguration;
+        let outcome = match configured {
+            Some(_) => "unchanged",
             None => {
-                let id = store.mint_metrics_configuration_id();
                 match store.table_buckets.get_mut(&input.table_bucket_arn) {
-                    Some(bucket) => bucket.metrics = Some(MetricsConfiguration { id: id.clone() }),
+                    Some(bucket) => bucket.metrics = Some(configuration),
                     // Unreachable while this call holds the store's lock: the
                     // bucket was resident a few lines above and nothing else
                     // can have removed it in between.
                     None => return Err(bucket_not_found()),
                 }
-                (id, "enabled")
+                "enabled"
             }
         };
+        let configuration_id = configuration.id();
         // The lock covers the state change only; everything below is owned.
         drop(store);
 
