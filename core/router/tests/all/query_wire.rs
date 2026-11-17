@@ -76,14 +76,48 @@ pub(crate) fn element(body: &str, name: &str) -> String {
 /// `<Name>` in the whole document". The tag matches only where the NAME ends, so
 /// `<MetadataEntry>` is not this element.
 pub(crate) fn block_of<'a>(body: &'a str, name: &str) -> Option<&'a str> {
+    // ONE tag scanner for both readings, stopped at the first block: dozens of suites call
+    // this, so it allocates nothing and reads no further than it has to.
     let (open, close) = (format!("<{name}"), format!("</{name}>"));
+    next_block(body, &open, &close).map(|(block, _)| block)
+}
+
+/// EVERY `<name …>…</name>` block of an XML answer, in document order — the repeated-element
+/// counterpart of [`block_of`].
+///
+/// For a document that repeats a CONTAINER (`<Version>`, `<DeleteMarker>`, `<Deleted>`): a
+/// suite reading one member out of each entry has to scope the read to that entry, or every
+/// read finds the first entry's member. Here, once, for the reason this module exists — a
+/// suite that writes its own scan drifts from the others. The tag matches only where the NAME
+/// ends, so `<VersionId>` is not `<Version>`, and the blocks read through this carry no block
+/// of the same name inside one.
+pub(crate) fn blocks_of<'a>(body: &'a str, name: &str) -> Vec<&'a str> {
+    let (open, close) = (format!("<{name}"), format!("</{name}>"));
+    let mut found = Vec::new();
     let mut rest = body;
-    while let Some(at) = rest.find(&open) {
+    while let Some((block, tail)) = next_block(rest, &open, &close) {
+        found.push(block);
+        rest = tail;
+    }
+    found
+}
+
+/// The next `<name …>…</name>` block of `body` and what follows it, or `None` when `body`
+/// carries no further one.
+///
+/// The ONE tag scan [`block_of`] and [`blocks_of`] both read through, so the two cannot drift:
+/// `open` is `<name` and `close` is `</name>`. A tag is this element's only where the NAME ends
+/// — at the tag's closing bracket, a `/`, or whitespace before an attribute — so `<VersionId>`
+/// is not `<Version>`, and the block runs from the tag's own closing bracket to the matching
+/// closing tag.
+fn next_block<'a>(body: &'a str, open: &str, close: &str) -> Option<(&'a str, &'a str)> {
+    let mut rest = body;
+    while let Some(at) = rest.find(open) {
         let after = &rest[at + open.len()..];
         match after.chars().next() {
             Some(next) if next == '>' || next == '/' || next.is_whitespace() => {
                 let (_, inner) = after.split_once('>')?;
-                return inner.split_once(close.as_str()).map(|(text, _)| text);
+                return inner.split_once(close);
             }
             _ => rest = after,
         }
@@ -281,6 +315,52 @@ mod tests {
 
         for (case, body, tag, expected) in rows {
             let read = block_of(body, tag);
+            assert_eq!(
+                read, expected,
+                "case {case:?}: expected {expected:?}, got {read:?}"
+            );
+        }
+    }
+
+    /// The repeated-block reader scopes each read to ONE entry, over the container forms a
+    /// repeated XML list arrives in: bare tags, a tag carrying a namespace attribute, a tag
+    /// whose name is a prefix of the one asked for, and a name the document does not carry.
+    #[test]
+    fn the_repeated_block_reader_finds_every_entry() {
+        // (case, the answer, the container read, the blocks it carries)
+        let rows: [(&str, &str, &str, &[&str]); 4] = [
+            (
+                "two entries of a container",
+                "<R><Version><Key>a</Key><VersionId>v1</VersionId></Version>\
+                 <Version><Key>b</Key><VersionId>v2</VersionId></Version></R>",
+                "Version",
+                &[
+                    "<Key>a</Key><VersionId>v1</VersionId>",
+                    "<Key>b</Key><VersionId>v2</VersionId>",
+                ],
+            ),
+            (
+                "an entry whose tag carries an attribute",
+                "<R><Version xmlns=\"http://x/doc/\"><Key>a</Key></Version></R>",
+                "Version",
+                &["<Key>a</Key>"],
+            ),
+            (
+                "a container whose name is a prefix of another tag",
+                "<R><VersionId>v1</VersionId><Version><Key>a</Key></Version></R>",
+                "Version",
+                &["<Key>a</Key>"],
+            ),
+            (
+                "a container the answer does not carry",
+                "<R><Version><Key>a</Key></Version></R>",
+                "DeleteMarker",
+                &[],
+            ),
+        ];
+
+        for (case, body, container, expected) in rows {
+            let read = blocks_of(body, container);
             assert_eq!(
                 read, expected,
                 "case {case:?}: expected {expected:?}, got {read:?}"
