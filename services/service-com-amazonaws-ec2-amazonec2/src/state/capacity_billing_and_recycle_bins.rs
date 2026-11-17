@@ -402,25 +402,48 @@ pub fn invalid_s3_bucket_name<E>() -> Scaffolded<E> {
 
 /// The bucket and the key of a storage location a request named.
 ///
-/// `member` names the request member the location came from, so the message says which one
-/// was wrong. `StorageLocation` declares neither member required, so a location that names
-/// no bucket, or names a bucket and no key, names no object at all and is EC2's
-/// `MissingParameter` — a fact of the request, answered before anything is read.
+/// `member` names the request member the location came from, as the MODEL declares it, so the
+/// sentence names the member a caller has to repair. `StorageLocation` declares neither of its
+/// own members required, so a location that names no bucket, or names a bucket and no key,
+/// names no object at all — which EC2 answers as the VALUE of that member being unusable
+/// ([`INVALID_PARAMETER_VALUE`]) and not as a parameter the request left out: the member the
+/// request carried IS the structure, and `MissingParameter` is what EC2 answers for a
+/// top-level parameter that is absent altogether. ONE sentence for both halves of the
+/// location, because the member is what has to be given again either way. Answered before
+/// anything is read, because it is a fact of the request.
 pub fn storage_location_object<'a, E>(
     location: &'a StorageLocation,
     member: &str,
 ) -> Result<(&'a str, &'a str), Scaffolded<E>> {
+    let incomplete = || {
+        invalid_parameter_value(format!(
+            "{member} is mandatory. Its bucket and key cannot be null or of length zero."
+        ))
+    };
     let bucket = location
         .bucket
         .as_deref()
         .filter(|bucket| !bucket.is_empty())
-        .ok_or_else(|| missing_parameter(format!("{member} must name an S3 bucket")))?;
+        .ok_or_else(incomplete)?;
     let key = location
         .key
         .as_deref()
         .filter(|key| !key.is_empty())
-        .ok_or_else(|| missing_parameter(format!("{member} must name an S3 object key")))?;
+        .ok_or_else(incomplete)?;
     Ok((bucket, key))
+}
+
+/// Refuse a request whose work was to read the Amazon S3 object at `bucket`/`key`, which
+/// this service could not access, under the code the IMAGE-TASK surface answers for that
+/// class: HTTP 400 [`INVALID_REQUEST`], with the sentence
+/// [`inaccessible_s3_resource`] carries.
+///
+/// One class, two recorded codes: `CreateFpgaImage` was recorded answering
+/// [`INACCESSIBLE_STORAGE_LOCATION`] for a location it could not read, while the AMI restore
+/// task was recorded answering `InvalidRequest` — so WHICH an operation answers is a fact of
+/// that operation, recorded by its caller, and the sentence stays one definition for both.
+pub fn s3_resource_request_invalid<E>(bucket: &str, key: &str) -> Scaffolded<E> {
+    invalid_request(inaccessible_s3_resource_message(bucket, key))
 }
 
 /// Refuse a request whose work was to read the Amazon S3 object at `bucket`/`key`, which
@@ -431,10 +454,16 @@ pub fn storage_location_object<'a, E>(
 /// the caller is told the location that failed and what to check about it, which is what EC2
 /// answers with for this error class.
 pub fn inaccessible_s3_resource<E>(bucket: &str, key: &str) -> Scaffolded<E> {
-    inaccessible_storage_location(format!(
+    inaccessible_storage_location(inaccessible_s3_resource_message(bucket, key))
+}
+
+/// The sentence both refusals of an unreadable Amazon S3 location carry, so the two codes
+/// cannot word one class two ways.
+pub fn inaccessible_s3_resource_message(bucket: &str, key: &str) -> String {
+    format!(
         "Error accessing resource in S3. Check permissions, naming, and ensure the bucket \
          is within the same region as the API endpoint. Bucket: {bucket}, Key: {key}."
-    ))
+    )
 }
 
 // =============================================================================

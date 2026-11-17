@@ -333,11 +333,11 @@ async fn instance_types_the_catalog_does_not_hold_are_reported_as_nonexistent() 
 async fn a_page_size_outside_the_published_range_names_the_bound_it_missed() {
     let (router, _engine) = emulator();
 
-    // Rows: the two operations whose own wording EC2 was recorded with, one past each of
-    // their published bounds, and two further paged describes that answer the wording every
-    // operation with no recorded sentence of its own does — one of them with a DIFFERENT
-    // published ceiling, so the bound in the sentence is read from the model rather than
-    // copied from another operation.
+    // Rows: the operations whose own wording EC2 was recorded with, one past each of
+    // their published bounds, and a further paged describe that answers the wording every
+    // operation with no recorded sentence of its own does — with a DIFFERENT published
+    // ceiling, so the bound in the sentence is read from the model rather than copied from
+    // another operation.
     //
     // (case, action, the page size, the code, the sentence)
     let rows: Vec<(&str, &str, &str, &str, String)> = vec![
@@ -419,13 +419,16 @@ async fn a_page_size_outside_the_published_range_names_the_bound_it_missed() {
                 .to_string(),
         ),
         (
-            "above the ceiling an operation with no recorded wording publishes",
+            // `DescribeTransitGatewayRouteTables` is refused by the PARAMETER layer, whose
+            // clause states no reason after the separating space, and answers the code EC2
+            // uses for a parameter value it cannot use past its ceiling.
+            "above the ceiling DescribeTransitGatewayRouteTables publishes",
             "DescribeTransitGatewayRouteTables",
             "1001",
-            ec2::state::INVALID_MAX_RESULTS,
-            "Value ( 1001 ) for parameter maxResults is invalid. Expecting a value smaller \
-             than or equal to 1000."
-                .to_string(),
+            ec2::state::INVALID_PARAMETER_VALUE,
+            // The sentence that comes with the parameter-layer code; the suite that drives
+            // every page-size refusal of this service pins it.
+            "Value (1001) for parameter MaxResults is invalid. ".to_string(),
         ),
         (
             // `DITMaxResults` publishes `range 5..100`, so the bound in the sentence is this

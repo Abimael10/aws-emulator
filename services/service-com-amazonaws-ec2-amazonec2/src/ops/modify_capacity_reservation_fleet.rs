@@ -152,16 +152,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
         use crate::state::{
-            capacity_reservation_fleet_id_is_well_formed, incorrect_state_of,
+            capacity_reservation_fleet_id_is_well_formed,
             invalid_capacity_reservation_fleet_id_malformed,
-            invalid_capacity_reservation_fleet_id_not_found, require_service_state,
+            invalid_capacity_reservation_fleet_id_not_found,
+            invalid_capacity_reservation_fleet_state_transition, require_service_state,
             system_time_to_date_time, CapacityReservationFleetEndDate,
             CapacityReservationFleetModification,
         };
-
-        /// How this operation names the resource it refuses for, as EC2's `IncorrectState`
-        /// wording spells it.
-        const FLEET: &str = "Capacity Reservation Fleet";
 
         // `ctx` carries request metadata only; this operation reads none of it — a Fleet is
         // modified by its id, and the store holds Fleets per account. The store is reached
@@ -255,9 +252,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // A Fleet that is being cancelled, is cancelled, has expired or has failed is not one
         // a modification runs from, so the request is refused rather than answered a success
-        // that changed nothing.
+        // that changed nothing. The code is the Fleet surface's own for a state that cannot
+        // make the move asked for, which is what a caller's state-transition retry branches
+        // on; the sentence is the one every refusal solely about a resource's state carries.
         if !record.is_modifiable() {
-            return Err(incorrect_state_of(FLEET, &fleet_id, record.state()));
+            return Err(invalid_capacity_reservation_fleet_state_transition());
         }
 
         // DryRun sits AFTER every parameter has been validated and the Fleet resolved, and

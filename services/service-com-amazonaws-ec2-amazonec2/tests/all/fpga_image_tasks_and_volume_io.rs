@@ -703,8 +703,18 @@ async fn attach_image_watermark_refuses_an_ami_it_cannot_watermark() {
             "InvalidAMIID.Malformed",
         ),
         (
-            "a well-formed id the account can see no image for",
+            // A long-form id the mint never handed out: EC2 decodes a long id before it
+            // resolves anything, so this one is no AMI id at all rather than an image the
+            // account cannot see.
+            "a long-form id this service never issued",
             UNKNOWN_IMAGE_ID.to_string(),
+            "InvalidAMIID.Malformed",
+        ),
+        (
+            // The retired SHORT form carries no identifier to decode, so an id in it that
+            // names nothing IS reported absent.
+            "a short-form id the account can see no image for",
+            "ami-0abc1234".to_string(),
             "InvalidAMIID.NotFound",
         ),
         (
@@ -733,9 +743,170 @@ async fn attach_image_watermark_refuses_an_ami_it_cannot_watermark() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// AMI usage reports
-// ---------------------------------------------------------------------------
+/// `DetachImageWatermark` takes exactly the watermark its `WatermarkKey` names off the AMI,
+/// which a later `DescribeImages` reports; it is idempotent, so a key the image does not
+/// carry answers `true` and leaves the list exactly as it was; and it refuses the AMIs it
+/// cannot act on the way the attach does.
+///
+/// The rows differ along what the rule generalises over: which of the attached keys is
+/// detached, a key the image never carried, and each class of `ImageId` the detach cannot
+/// resolve.
+#[tokio::test]
+async fn a_detached_watermark_is_gone_from_the_ami_and_the_detach_is_idempotent() {
+    let (router, engine) = emulator();
+    let image_id = seed_private_image(&engine, "detachable-ami");
+    let account = engine::emulator_account_id().to_string();
+    let key_of = |name: &str| format!("{account}:{name}");
+
+    /// Every watermark key `DescribeImages` reports for the AMI under test, sorted.
+    async fn reported_keys(router: &MultiServiceRouter, case: &str, image_id: &str) -> Vec<String> {
+        let (status, body) = op(router, "DescribeImages", &indexed("ImageId", &[image_id])).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from DescribeImages, got {status} with body {body}"
+        );
+        let mut keys: Vec<String> = elements(&body, "watermarkKey")
+            .iter()
+            .map(|key| unescaped(key))
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    // Three watermarks to take apart one at a time, so each detach is a verdict about the
+    // key it named rather than about the list.
+    for name in ["approved-ami", "audited.ami", "release/2026"] {
+        let (status, body) = op(
+            &router,
+            "AttachImageWatermark",
+            &[p("ImageId", &image_id), p("WatermarkName", name)],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "attaching {name:?}: expected HTTP 200, got {status} with body {body}"
+        );
+    }
+    let mut remaining: Vec<String> = ["approved-ami", "audited.ami", "release/2026"]
+        .iter()
+        .map(|name| key_of(name))
+        .collect();
+    remaining.sort();
+    assert_eq!(
+        reported_keys(&router, "the attached watermarks", &image_id).await,
+        remaining,
+        "the AMI must carry the three watermarks the attaches stored"
+    );
+
+    for name in ["audited.ami", "approved-ami", "release/2026"] {
+        let case = format!("detaching {name:?}");
+        let (status, body) = op(
+            &router,
+            "DetachImageWatermark",
+            &[p("ImageId", &image_id), p("WatermarkKey", key_of(name))],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200, got {status} with body {body}"
+        );
+        assert_eq!(
+            element(&body, "return").as_deref(),
+            Some("true"),
+            "case {case:?}: the detach must report the success it performed, got {body}"
+        );
+        remaining.retain(|key| *key != key_of(name));
+        assert_eq!(
+            reported_keys(&router, &case, &image_id).await,
+            remaining,
+            "case {case:?}: exactly the detached watermark must be gone"
+        );
+    }
+
+    // "This is an idempotent operation. It succeeds even if the watermark does not exist on
+    // the image": a key the AMI does not carry — one already detached, one never attached,
+    // and one of another account — answers the same success and writes nothing.
+    for (case, key) in [
+        ("a key already detached", key_of("approved-ami")),
+        ("a key never attached", key_of("never-attached")),
+        ("a key of another account", "210987654321:approved-ami".to_string()),
+    ] {
+        let (status, body) = op(
+            &router,
+            "DetachImageWatermark",
+            &[p("ImageId", &image_id), p("WatermarkKey", key)],
+        )
+        .await;
+        assert_eq!(
+            (status, element(&body, "return").as_deref()),
+            (200, Some("true")),
+            "case {case:?}: an idempotent detach must succeed, got {status} with body {body}"
+        );
+        assert!(
+            reported_keys(&router, case, &image_id).await.is_empty(),
+            "case {case:?}: an idempotent detach must write nothing"
+        );
+    }
+}
+
+/// An AMI this call cannot act on is refused the way the attach refuses it: the detach and the
+/// attach resolve the same `ImageId` through the same reading, so no class of id is answered
+/// one way by one and another way by the other.
+#[tokio::test]
+async fn detach_image_watermark_refuses_an_ami_it_cannot_resolve() {
+    let (router, engine) = emulator();
+    let public_image = public_image_id(&engine);
+
+    let rows: Vec<(&str, String, &str)> = vec![
+        (
+            "a value that is not an AMI id at all",
+            "not-an-ami".to_string(),
+            "InvalidAMIID.Malformed",
+        ),
+        (
+            "another resource's prefix",
+            UNKNOWN_VOLUME_ID.to_string(),
+            "InvalidAMIID.Malformed",
+        ),
+        (
+            "a long-form id this service never issued",
+            UNKNOWN_IMAGE_ID.to_string(),
+            "InvalidAMIID.Malformed",
+        ),
+        (
+            "a short-form id the account can see no image for",
+            "ami-0abc1234".to_string(),
+            "InvalidAMIID.NotFound",
+        ),
+        (
+            // "Only the AMI owner can detach watermarks" (`DetachImageWatermark`).
+            "a public AMI of the published catalog, which this account does not own",
+            public_image,
+            "OperationNotPermitted",
+        ),
+    ];
+
+    for (case, image_id, expected_code) in rows {
+        let (status, body) = op(
+            &router,
+            "DetachImageWatermark",
+            &[
+                p("ImageId", &image_id),
+                p("WatermarkKey", "123456789012:approvedAmi"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            expected_code,
+            "case {case:?}: expected {expected_code}, got {body}"
+        );
+    }
+}
 
 /// Store one AMI usage report, and answer its `ReportId`. Shared with
 /// [`super::malformed_before_lookup`], which plants a copy of the record it stores under a

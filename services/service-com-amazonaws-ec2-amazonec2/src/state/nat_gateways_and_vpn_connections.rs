@@ -1269,6 +1269,35 @@ pub const INVALID_CAPACITY_RESERVATION_FLEET_ID_MALFORMED: &str =
 pub const INVALID_CAPACITY_RESERVATION_FLEET_ID_NOT_FOUND: &str =
     "InvalidCapacityReservationFleetId.NotFound";
 
+/// The code EC2 answers for a Fleet whose STATE does not admit the change asked for: the
+/// Fleet exists and the request is well formed, but the state it is in cannot move the way
+/// the request would take it.
+///
+/// The Fleet surface's own code for that class, where the resources whose refusal was
+/// recorded as EC2's generic state code answer [`INCORRECT_STATE`]: a state-transition retry
+/// keyed on this code is what a caller programs against.
+pub const INVALID_CAPACITY_RESERVATION_FLEET_STATE_TRANSITION: &str =
+    "InvalidCapacityReservationFleetStateTransition";
+
+/// The sentence EC2 answers [`INVALID_CAPACITY_RESERVATION_FLEET_STATE_TRANSITION`] with.
+///
+/// FIXED text: it states the condition — the Fleet is past the states a modification runs
+/// from — and names neither the Fleet nor the state it is in, so it is the whole message
+/// rather than one run's sample of a varying one.
+pub const CAPACITY_RESERVATION_FLEET_STATE_TRANSITION_MESSAGE: &str =
+    "Capacity Reservation Fleet cannot be modified as it has already cancelled or expired.";
+
+/// Refuse a Capacity Reservation Fleet whose state does not admit the change asked for: HTTP
+/// 400 [`INVALID_CAPACITY_RESERVATION_FLEET_STATE_TRANSITION`], with the sentence EC2 answers
+/// that code with ([`CAPACITY_RESERVATION_FLEET_STATE_TRANSITION_MESSAGE`]).
+pub fn invalid_capacity_reservation_fleet_state_transition<E>() -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_CAPACITY_RESERVATION_FLEET_STATE_TRANSITION,
+        400,
+        CAPACITY_RESERVATION_FLEET_STATE_TRANSITION_MESSAGE,
+    )
+}
+
 /// Whether `id` is a well-formed Capacity Reservation Fleet id — one EC2 could have ISSUED.
 ///
 /// The long-form rule ([`issued_long_id_is_well_formed`]) under this resource's own `crf`

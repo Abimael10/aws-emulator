@@ -575,6 +575,20 @@ pub fn ipam_resource_arn(resource_type: &str, id: &str) -> String {
     ::engine::emulator_arn("ec2", "", &format!("{resource_type}/{id}"))
 }
 
+/// The id an IPAM-family ARN names: the segment after its last `/`, or `None` for a value
+/// that carries none.
+///
+/// The reverse reading of [`ipam_resource_arn`], which writes
+/// `arn:aws:ec2::<account>:<resource type>/<id>`. The ONE place that reading lives, because
+/// the describes whose `Filters` document an id their reported shape carries only as an ARN —
+/// `DescribeIpamScopes`' `ipam-id`, `DescribeIpamPools`' source-resource ids — each have to
+/// make it, and a value that is no ARN at all names no id rather than naming itself.
+pub fn ipam_arn_resource_id(arn: &str) -> Option<&str> {
+    arn.rsplit_once('/')
+        .map(|(_, id)| id)
+        .filter(|id| !id.is_empty())
+}
+
 /// An IPAM, scope or resource discovery AWS is still creating: the `create-in-progress`
 /// member shared by `IpamState`, `IpamScopeState` and `IpamResourceDiscoveryState`.
 pub const IPAM_STATE_CREATE_IN_PROGRESS: &str = "create-in-progress";
@@ -665,6 +679,24 @@ pub fn invalid_ipam_id_not_found<E>(ipam_id: &str) -> Scaffolded<E> {
         400,
         format!("The IPAM ({ipam_id}) does not exist."),
     )
+}
+
+/// How the BYOASN operations name the IPAM in their not-found sentence — the kind
+/// [`id_not_found_message`] interpolates, which makes `The ipam ID '<id>' does not exist`.
+pub const IPAM_ID_KIND: &str = "ipam ID";
+
+/// Refuse an IPAM id the BYOASN surface cannot resolve: HTTP 400 `InvalidIpamId.NotFound`
+/// with the QUOTED sentence [`id_not_found_message`] words.
+///
+/// One code, two recorded sentences: the operations that act on the IPAM itself and on its
+/// scopes answer the parenthesised [`invalid_ipam_id_not_found`], while the BYOASN surface
+/// was recorded answering the quoted template every other resource of this crate reports an
+/// absent id with. WHICH an operation answers is a fact of that operation recorded by its
+/// caller, the way the two sentences of a page-size refusal are
+/// ([`RECORDED_PAGE_SIZE_WORDINGS`]) — so it is kept beside the other rather than replacing
+/// it.
+pub fn ipam_id_not_found<E>(ipam_id: &str) -> Scaffolded<E> {
+    id_not_found(INVALID_IPAM_ID_NOT_FOUND, IPAM_ID_KIND, ipam_id)
 }
 
 /// The Region names one operating-Region list of a request carries, validated and as a SET.

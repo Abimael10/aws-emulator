@@ -604,6 +604,41 @@ pub fn volume_payload_bytes(
 /// refusal names the form it expected.
 pub const VOLUME_ID_PREFIX: &str = "vol";
 
+/// How the wire spells the member that names ONE volume: the parameter the operations whose
+/// validator reads a volume id AS A PARAMETER name in their refusal
+/// ([`invalid_id_parameter_value`]).
+pub const VOLUME_ID_PARAMETER: &str = "volumeId";
+
+/// How `ModifyVolume`'s own validator names that member in the clause it refuses an
+/// unreadable id with: upper case, as its recorded refusal spells it.
+///
+/// WHICH spelling an operation uses is a fact of that operation, recorded by its caller — the
+/// same way the two sentences of a page-size refusal differ — so the modify's is named beside
+/// the wire's rather than replacing it.
+pub const MODIFY_VOLUME_ID_PARAMETER: &str = "VOLUME";
+
+/// Refuse a volume id `ModifyVolume` cannot READ: HTTP 400 [`INVALID_VOLUME_ID_MALFORMED`] —
+/// the kind's own code — with the clause that operation's validator words, `Value ( <the
+/// value sent> ) for parameter VOLUME is invalid. `
+///
+/// The parameter layer's clause: the value in SPACED parentheses, the member as that
+/// validator names it ([`MODIFY_VOLUME_ID_PARAMETER`]), and no reason after the separating
+/// space. One of the two sentences this crate answers that code with — the operations whose
+/// subject is the volume itself answer [`malformed_volume_id_message`] — and which one an
+/// operation answers is a fact of that operation, recorded by its caller. What it is answered
+/// FOR is the volume surface's one reading either way ([`volume_id_is_readable`]), so no two
+/// operations disagree about which values are refused.
+pub fn modify_volume_unreadable_id<E>(volume_id: &str) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_VOLUME_ID_MALFORMED,
+        400,
+        format!(
+            "Value ( {} ) for parameter {MODIFY_VOLUME_ID_PARAMETER} is invalid. ",
+            echoed_resource_id(volume_id)
+        ),
+    )
+}
+
 /// One EBS volume as a writer OTHER THAN `CreateVolume` asks for it: the members a creator
 /// chooses.
 ///

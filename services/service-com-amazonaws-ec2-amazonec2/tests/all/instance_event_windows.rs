@@ -416,6 +416,9 @@ async fn the_clock_moves_a_created_window_to_active() {
 fn schedule_refusals() -> Vec<RefusalRow> {
     let min_range = MIN_EVENT_WINDOW_RANGE_HOURS;
     let min_total = MIN_EVENT_WINDOW_TOTAL_HOURS;
+    // The member's own code, answered for every way its expression can break the rules
+    // `CreateInstanceEventWindowRequest$CronExpression` documents.
+    const CRON: &str = "InvalidInstanceEventWindowCronExpression";
     vec![
         (
             "neither a cron expression nor a time range",
@@ -429,37 +432,37 @@ fn schedule_refusals() -> Vec<RefusalRow> {
                 params.extend(time_ranges(&[(1, 2, 3, 8)]));
                 params
             },
-            "InvalidParameterCombination",
+            "InvalidParameterValue",
         ),
         (
             "a cron expression of four fields",
             vec![p("CronExpression", "* 0-4 * *")],
-            "InvalidParameterValue",
+            CRON,
         ),
         (
             "a cron expression of six fields",
             vec![p("CronExpression", "* 0-4 * * 1 *")],
-            "InvalidParameterValue",
+            CRON,
         ),
         (
             "a cron expression whose minute is not a wildcard",
             vec![p("CronExpression", "0 0-4 * * 1")],
-            "InvalidParameterValue",
+            CRON,
         ),
         (
             "a cron expression whose day of the month is not a wildcard",
             vec![p("CronExpression", "* 0-4 1 * 1")],
-            "InvalidParameterValue",
+            CRON,
         ),
         (
             "a cron expression whose month is not a wildcard",
             vec![p("CronExpression", "* 0-4 * 6 1")],
-            "InvalidParameterValue",
+            CRON,
         ),
         (
             "a cron hour that is a single hour rather than a range",
             vec![p("CronExpression", "* 5 * * 1")],
-            "InvalidParameterValue",
+            CRON,
         ),
         (
             "a cron hour range of one hour, one short of the smallest",
@@ -467,7 +470,7 @@ fn schedule_refusals() -> Vec<RefusalRow> {
                 "CronExpression",
                 format!("* 0-{} * * 1", min_range - 1),
             )],
-            "InvalidParameterValue",
+            CRON,
         ),
         (
             "cron hour ranges one hour short of the smallest total",
@@ -475,32 +478,32 @@ fn schedule_refusals() -> Vec<RefusalRow> {
                 "CronExpression",
                 format!("* 0-{} * * 1", min_total - 1),
             )],
-            "InvalidParameterValue",
+            CRON,
         ),
         (
             "a cron hour past the last hour of the day",
             vec![p("CronExpression", "* 0-24 * * 1")],
-            "InvalidParameterValue",
+            CRON,
         ),
         (
             "a cron hour that is not a number",
             vec![p("CronExpression", "* a-b * * 1")],
-            "InvalidParameterValue",
+            CRON,
         ),
         (
             "a cron day of the week past the last day",
             vec![p("CronExpression", "* 0-4 * * 7")],
-            "InvalidParameterValue",
+            CRON,
         ),
         (
             "a cron day of the week that is no day",
             vec![p("CronExpression", "* 0-4 * * FUNDAY")],
-            "InvalidParameterValue",
+            CRON,
         ),
         (
             "a cron hour range that runs backwards",
             vec![p("CronExpression", "* 20-4 * * 1")],
-            "InvalidParameterValue",
+            CRON,
         ),
         (
             "a cron expression longer than the service reads",
@@ -508,7 +511,7 @@ fn schedule_refusals() -> Vec<RefusalRow> {
                 "CronExpression",
                 format!("* 0-4 * * {}", "1,".repeat(MAX_EVENT_WINDOW_CRON_BYTES)),
             )],
-            "InvalidParameterValue",
+            CRON,
         ),
         (
             "a time range one hour short of the smallest span",
@@ -732,7 +735,7 @@ async fn a_dry_run_create_reports_what_it_would_have_done_and_stores_nothing() {
             "a request that would have been refused",
             vec![p("CronExpression", "* 5 * * 1"), p("DryRun", "true")],
             400,
-            "InvalidParameterValue",
+            "InvalidInstanceEventWindowCronExpression",
         ),
     ];
     for (case, params, status, code) in rows {
@@ -920,7 +923,7 @@ async fn the_describe_resolves_every_id_it_is_given() {
             "a well-formed id no window has",
             vec!["iew-0123456789abcdef0"],
             400,
-            "InvalidInstanceEventWindowId.NotFound",
+            "InvalidInstanceEventWindowIDNotFound",
         ),
         (
             "an id that is not an event window id at all",
@@ -932,7 +935,7 @@ async fn the_describe_resolves_every_id_it_is_given() {
             "one known id beside one unknown one",
             vec![ids[0].as_str(), "iew-0123456789abcdef0"],
             400,
-            "InvalidInstanceEventWindowId.NotFound",
+            "InvalidInstanceEventWindowIDNotFound",
         ),
     ];
     for (case, named, status, code) in rows {
@@ -1069,4 +1072,181 @@ async fn the_account_creates_as_many_windows_as_the_quota_allows() {
         "InstanceEventWindowLimitExceeded",
         "expected InstanceEventWindowLimitExceeded, got body {body}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// RULE 5: a delete takes exactly the window it names out of the store
+// ---------------------------------------------------------------------------
+
+/// One `DeleteInstanceEventWindow` call carrying `params`.
+async fn delete(router: &MultiServiceRouter, params: &[(String, String)]) -> (u16, String) {
+    call(router, REGION, "DeleteInstanceEventWindow", params).await
+}
+
+/// The code the event-window family answers for an id the account holds no window for: ONE
+/// word, where the rest of this service answers the dotted `Invalid<Resource>Id.NotFound`.
+const WINDOW_NOT_FOUND: &str = "InvalidInstanceEventWindowIDNotFound";
+
+/// RULE 5: "deletes the specified event window" — the delete reports the `deleting` state of
+/// the window it took away, that window is gone for every later caller (the describe by id
+/// refuses it with the family's not-found code, and the unfiltered describe stops listing
+/// it), and every OTHER window of the account is left exactly where it was.
+///
+/// The rows differ along the form the deleted window's schedule took, which is what the rule
+/// generalises over: a delete is about the window its request names and not about how that
+/// window says when it opens.
+#[tokio::test]
+async fn deleting_a_window_takes_exactly_it_out_of_the_store() {
+    for (case, schedule) in [
+        (
+            "a window defined by a cron expression",
+            vec![p("CronExpression", "* 0-4 * * 1")],
+        ),
+        (
+            "a window defined by time ranges",
+            time_ranges(&[(1, 2, 1, 8)]),
+        ),
+    ] {
+        let router = emulator();
+        let mut doomed_params = vec![p("Name", "doomed")];
+        doomed_params.extend(schedule.clone());
+        let doomed = create_window(&router, case, &doomed_params).await;
+        let kept = create_window(
+            &router,
+            case,
+            &[p("Name", "kept"), p("CronExpression", "* 0-4 * * 2")],
+        )
+        .await;
+
+        let (status, body) = delete(&router, &[p("InstanceEventWindowId", doomed.clone())]).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from DeleteInstanceEventWindow, got {status} \
+             with body {body}"
+        );
+        assert_eq!(
+            element(&body, "instanceEventWindowId").as_deref(),
+            Some(doomed.as_str()),
+            "case {case:?}: the delete must name the window it took away, got body {body}"
+        );
+        assert_eq!(
+            element(&body, "state").as_deref(),
+            Some("deleting"),
+            "case {case:?}: the delete must report the state it left the window in, got \
+             body {body}"
+        );
+
+        // The write is observable: the window the delete named resolves for nobody, while
+        // the other window of the account is still reported.
+        let (status, body) = describe(&router, &[p("InstanceEventWindowId.1", doomed.clone())]).await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, WINDOW_NOT_FOUND),
+            "case {case:?}: a deleted window must stop resolving, got {status} with body {body}"
+        );
+        let held = described_ids(&router, case, &[]).await;
+        assert_eq!(
+            held,
+            vec![kept.clone()],
+            "case {case:?}: the delete must leave every other window where it was, got {held:?}"
+        );
+
+        // Deleting it again has nothing to delete: the same not-found code, and the window
+        // that WAS kept is still untouched.
+        let (status, body) = delete(&router, &[p("InstanceEventWindowId", doomed.clone())]).await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, WINDOW_NOT_FOUND),
+            "case {case:?}: a second delete must be refused, got {status} with body {body}"
+        );
+        assert_eq!(
+            described_ids(&router, case, &[]).await,
+            vec![kept],
+            "case {case:?}: a refused delete must write nothing"
+        );
+    }
+}
+
+/// RULE 5, the other half: "specify `true` to force delete the event window. Use the force
+/// delete parameter if the event window is currently associated with targets"
+/// (`ForceDelete`) — a window that still carries targets is refused for the state it is in
+/// and left where it was; the same request with the flag takes it away.
+///
+/// The rows differ along the KIND of target the window carries, which is what the rule
+/// generalises over: the three lists an `AssociationTarget` holds.
+#[tokio::test]
+async fn a_window_that_carries_targets_is_deleted_only_with_the_force_flag() {
+    use super::instance_event_window_associations::{
+        allocate_hosts, associate, launch_instances, Target,
+    };
+
+    // (case, how the target under test is built out of the account's own resources)
+    type TargetFor = fn(&[String], &[String]) -> Target;
+    let rows: [(&str, TargetFor); 3] = [
+        (
+            "a window associated with an instance",
+            |instances, _hosts| Target::of_instances(instances),
+        ),
+        ("a window associated with an instance tag", |_, _| {
+            Target::of_tags(&[("Owner", "platform")])
+        }),
+        (
+            "a window associated with a Dedicated Host",
+            |_instances, hosts| Target::of_hosts(hosts),
+        ),
+    ];
+
+    for (case, target_for) in rows {
+        let router = emulator();
+        let instances = launch_instances(&router, 1).await;
+        let hosts = allocate_hosts(&router, 1).await;
+        let target = target_for(&instances, &hosts);
+        let window = create_window(
+            &router,
+            case,
+            &[p("Name", "associated"), p("CronExpression", "* 0-4 * * 1")],
+        )
+        .await;
+        let (status, body) = associate(&router, &window, &target).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the association must succeed, got {status} with body {body}"
+        );
+
+        let (status, body) = delete(&router, &[p("InstanceEventWindowId", window.clone())]).await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, "IncorrectState"),
+            "case {case:?}: a window with targets must not be deleted without the flag, got \
+             {status} with body {body}"
+        );
+        assert_eq!(
+            described_ids(&router, case, &[]).await,
+            vec![window.clone()],
+            "case {case:?}: the refused delete must leave the window where it was"
+        );
+
+        let (status, body) = delete(
+            &router,
+            &[
+                p("InstanceEventWindowId", window.clone()),
+                p("ForceDelete", "true"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the forced delete must succeed, got {status} with body {body}"
+        );
+        assert_eq!(
+            element(&body, "state").as_deref(),
+            Some("deleting"),
+            "case {case:?}: the forced delete reports the state it left the window in, got \
+             body {body}"
+        );
+        assert!(
+            described_ids(&router, case, &[]).await.is_empty(),
+            "case {case:?}: the forced delete must take the window away"
+        );
+    }
 }

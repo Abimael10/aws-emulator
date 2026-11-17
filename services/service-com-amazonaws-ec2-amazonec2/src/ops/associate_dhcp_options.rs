@@ -169,9 +169,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // dhcp-options id" from "no such options set".
         let associating_default = input.dhcp_options_id == state::DHCP_OPTIONS_DEFAULT;
         if !associating_default && !state::dhcp_options_id_is_well_formed(&input.dhcp_options_id) {
-            return Err(state::invalid_dhcp_options_id_malformed(
-                &input.dhcp_options_id,
-            ));
+            // THIS operation's wording for that code is the shared quoted template
+            // ([`crate::state::unreadable_dhcp_options_id`]); the delete of an options set
+            // answers the resource's own sentence for the same class.
+            return Err(state::unreadable_dhcp_options_id(&input.dhcp_options_id));
         }
 
         let state_handle = state::require_service_state(&*self.engine)?;

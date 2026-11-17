@@ -1410,6 +1410,35 @@ pub const TRANSIT_GATEWAY_LIMIT_EXCEEDED: &str = "TransitGatewayLimitExceeded";
 /// transit gateway for.
 pub const INVALID_TRANSIT_GATEWAY_ID_NOT_FOUND: &str = "InvalidTransitGatewayID.NotFound";
 
+/// EC2's error code for a value that is no transit gateway id AT ALL: the `.Malformed` half
+/// of the pair [`INVALID_TRANSIT_GATEWAY_ID_NOT_FOUND`] is the not-found half of, spelled
+/// `ID` as that code is.
+///
+/// Answered BEFORE the id is looked up, so a caller can tell "not an id of this kind" from
+/// "no such transit gateway" — the ordering every resource named by one id keeps
+/// ([`prefixed_id_is_well_formed`] and the not-found half beside it).
+pub const INVALID_TRANSIT_GATEWAY_ID_MALFORMED: &str = "InvalidTransitGatewayID.Malformed";
+
+/// The id prefix every transit gateway is minted with
+/// ([`ComAmazonawsEc2Amazonec2State::insert_transit_gateway`]).
+///
+/// The route table, the attachment and the other `tgw-…` resources EXTEND this prefix
+/// ([`TRANSIT_GATEWAY_ROUTE_TABLE_ID_PREFIX`], [`TRANSIT_GATEWAY_ATTACHMENT_ID_PREFIX`]), so
+/// the prefix alone cannot separate them; it is the hexadecimal suffix
+/// [`prefixed_id_is_well_formed`] requires that does.
+pub const TRANSIT_GATEWAY_ID_PREFIX: &str = "tgw";
+
+/// Whether `id` is shaped like a transit gateway id: `tgw-` and one of the two published
+/// digit forms ([`prefixed_id_is_well_formed`]).
+///
+/// The form question the operations whose SUBJECT is the gateway that id names ask before
+/// they look it up, so an id of another kind — another resource's prefix, or a `tgw-…` id of
+/// one of the resources that extend this prefix — is
+/// [`INVALID_TRANSIT_GATEWAY_ID_MALFORMED`] rather than a gateway the account does not have.
+pub fn transit_gateway_id_is_well_formed(id: &str) -> bool {
+    prefixed_id_is_well_formed(TRANSIT_GATEWAY_ID_PREFIX, id)
+}
+
 /// Everything [`ComAmazonawsEc2Amazonec2State::insert_transit_gateway`] needs that it does
 /// not derive itself: what the REQUEST said, and the Region it was signed for.
 #[derive(Debug, Clone)]
@@ -1839,6 +1868,25 @@ pub fn invalid_transit_gateway_id_not_found<E>(transit_gateway_id: &str) -> Scaf
         INVALID_TRANSIT_GATEWAY_ID_NOT_FOUND,
         400,
         format!("Transit Gateway {transit_gateway_id} was deleted or does not exist."),
+    )
+}
+
+/// Refuse a value that is no transit gateway id at all: HTTP 400
+/// `InvalidTransitGatewayID.Malformed`, in the sentence EC2 words for this resource —
+/// `Invalid Transit Gateway id <the value sent>.`
+///
+/// The transit gateway is one of the kinds AWS words with a sentence of its OWN rather than
+/// with the quoted [`invalid_id_message`] template: it names the resource in the same words
+/// its attachment's refusal does ([`INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_MESSAGE`]) and then
+/// the value the REQUEST sent, bounded the way every echoed id of this crate is.
+pub fn invalid_transit_gateway_id_malformed<E>(transit_gateway_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_TRANSIT_GATEWAY_ID_MALFORMED,
+        400,
+        format!(
+            "Invalid Transit Gateway id {}.",
+            echoed_resource_id(transit_gateway_id)
+        ),
     )
 }
 

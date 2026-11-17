@@ -51,6 +51,10 @@ const MALFORMED: &str = "InvalidVolumeID.Malformed";
 /// The class for an id inside the issued form that names no volume of the account.
 const NOT_FOUND: &str = "InvalidVolume.NotFound";
 
+/// EC2's code for a parameter whose value the operation cannot take: the code the operations
+/// that read a volume id AS A PARAMETER answer for a value they cannot read.
+const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValue";
+
 /// Which refusal class a row is due.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Class {
@@ -259,8 +263,11 @@ async fn modify_volume_attribute_splits_the_two_volume_id_refusal_classes() {
 
 /// The SAME split for the other operations that act on one named volume: the reading belongs
 /// to the service, so an id class cannot be answered one way by one handler and another way
-/// by the next. Only the REFUSAL rows are asked here — what each of these operations does
-/// with a volume it resolves is its own suite's business.
+/// by the next. WHICH code states the unreadable class is a fact of each operation
+/// (`DescribeVolumeAttribute` reads its `volumeId` as a parameter and answers EC2's
+/// parameter-value code for it), so each row carries the code its operation answers. Only the
+/// REFUSAL rows are asked here — what each of these operations does with a volume it resolves
+/// is its own suite's business.
 #[tokio::test]
 async fn every_operation_on_one_named_volume_splits_the_same_two_classes() {
     let (router, _engine) = super::ec2_query::emulator();
@@ -268,40 +275,54 @@ async fn every_operation_on_one_named_volume_splits_the_same_two_classes() {
 
     // (the operation, how it names the volume — a scalar `VolumeId` member for the three
     // that act on ONE volume, an indexed `VolumeId.N` list for the describe that takes
-    // several)
-    let operations: [(&str, VolumeParams); 4] = [
-        ("DescribeVolumeAttribute", |volume_id| {
-            vec![
-                param("VolumeId", volume_id),
-                param("Attribute", ec2::state::VOLUME_ATTRIBUTE_AUTO_ENABLE_IO),
-            ]
-        }),
-        ("EnableVolumeIO", |volume_id| {
-            vec![param("VolumeId", volume_id)]
-        }),
-        ("DescribeVolumesModifications", |volume_id| {
-            super::ec2_query::indexed("VolumeId", &[volume_id])
-        }),
-        ("DeleteVolume", |volume_id| {
-            vec![param("VolumeId", volume_id)]
-        }),
+    // several — and the code it answers for a value it cannot read)
+    let operations: [(&str, VolumeParams, &str); 4] = [
+        (
+            "DescribeVolumeAttribute",
+            |volume_id| {
+                vec![
+                    param("VolumeId", volume_id),
+                    param("Attribute", ec2::state::VOLUME_ATTRIBUTE_AUTO_ENABLE_IO),
+                ]
+            },
+            INVALID_PARAMETER_VALUE,
+        ),
+        (
+            "EnableVolumeIO",
+            |volume_id| vec![param("VolumeId", volume_id)],
+            MALFORMED,
+        ),
+        (
+            "DescribeVolumesModifications",
+            |volume_id| super::ec2_query::indexed("VolumeId", &[volume_id]),
+            MALFORMED,
+        ),
+        (
+            "DeleteVolume",
+            |volume_id| vec![param("VolumeId", volume_id)],
+            MALFORMED,
+        ),
     ];
 
-    for (action, params_for) in &operations {
+    for (action, params_for, malformed_code) in &operations {
         for row in rows(&held) {
             let case = row.case;
             if row.class == Class::Served {
                 continue;
             }
+            let expected = if row.class == Class::Malformed {
+                *malformed_code
+            } else {
+                NOT_FOUND
+            };
             let params = params_for(&row.volume_id);
             let (status, body) = call(&router, REGION, action, &params).await;
             assert_eq!(
                 (status, error_code(&body).as_str()),
-                (REFUSAL, row.class.code()),
-                "case {case:?} ({action} of {}): expected {REFUSAL} {}, got {status} with \
-                 body {body}",
+                (REFUSAL, expected),
+                "case {case:?} ({action} of {}): expected {REFUSAL} {expected}, got {status} \
+                 with body {body}",
                 row.volume_id,
-                row.class.code()
             );
         }
     }

@@ -154,8 +154,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::scaffolded::Scaffolded;
         use crate::state::{
             MAX_STORED_BYTES, MAX_WATERMARKS_PER_IMAGE, WATERMARK_NAME_PUNCTUATION,
-            dry_run_operation, image_creation_time, image_id_is_well_formed, image_is_visible,
-            image_watermark_key, invalid_ami_id_malformed, invalid_ami_id_not_found,
+            dry_run_operation, image_creation_time, image_id_is_readable,
+            image_id_is_well_formed, image_is_visible, image_watermark_key,
+            invalid_ami_id_not_found, unresolvable_image_id,
             request_region, require_service_state, resource_limit_exceeded,
             system_time_to_date_time, watermark_name_is_well_formed,
         };
@@ -165,8 +166,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the Region its SigV4 credential scope names.
         let region = request_region(ctx.parts());
 
+        // A value that is no AMI id at all, in the wording THIS operation's validator answers
+        // it with ([`crate::state::unresolvable_image_id`], `The image ID '<id>' is
+        // malformed`) rather than the shared quoted template the describes of the account's
+        // images answer.
         if !image_id_is_well_formed(&input.image_id) {
-            return Err(invalid_ami_id_malformed(&input.image_id));
+            return Err(unresolvable_image_id(&input.image_id));
         }
         // The LENGTH of a watermark name is modelled and already refused; its character set
         // is documented on the member but not modelled, so this is the only place it can be
@@ -186,6 +191,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let state = require_service_state(&*self.engine)?;
         let mut store = state.lock();
+
+        // The rest of the FORM question, which only the store can answer: EC2 decodes a
+        // long-form id before it resolves anything, and the identifiers this service ever
+        // issued are the ones its mint has counted ([`crate::state::image_id_is_readable`]),
+        // so a value it could never have issued is no AMI id at all rather than an image the
+        // account cannot see — the same ordering `GetImageAncestry` keeps.
+        if !image_id_is_readable(&store, &input.image_id) {
+            return Err(unresolvable_image_id(&input.image_id));
+        }
+
         let account = ::engine::emulator_account_id().to_string();
 
         let watermark_key = image_watermark_key(&account, &input.watermark_name);

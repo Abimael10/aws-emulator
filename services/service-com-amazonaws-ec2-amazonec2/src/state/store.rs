@@ -1296,16 +1296,24 @@ pub const DHCP_OPTION_IPV6_ADDRESS_PREFERRED_LEASE_TIME: &str =
 /// ordering [`require_well_formed_id`] keeps for every other resource of this module.
 pub const INVALID_DHCP_OPTIONS_ID_MALFORMED: &str = "InvalidDhcpOptionsId.Malformed";
 
-/// Whether `id` is a well-formed DHCP options set id.
+/// Whether `id` is a DHCP options set id EC2 could have ISSUED.
 ///
-/// [`DHCP_OPTIONS_ID_PREFIX`] followed by 8 or 17 lowercase hexadecimal digits — the short
-/// and the long EC2 resource id forms, as [`prefixed_id_is_well_formed`] reads them.
+/// [`DHCP_OPTIONS_ID_PREFIX`] followed by one of the two published EC2 resource id forms, 8 or
+/// 17 lowercase hexadecimal digits, with the clauses that separate an id the service could have
+/// handed out from one merely in that printed form ([`issued_id_is_well_formed`]): it is not the
+/// all-zero placeholder every client reaches for, and a long-form suffix reads under a leading
+/// `0`, because that form carries 68 bits for a 64-bit identifier.
+///
 /// `DhcpOptionsId` and `DefaultingDhcpOptionsId` are bare strings in the model
 /// (`smithy_query(query="shape",shape="DefaultingDhcpOptionsId")`), so this is what
 /// separates "not a dhcp-options id at all" from "no such options set", and what bounds the
-/// bytes of an id a VPC can be made to carry.
+/// bytes of an id a VPC can be made to carry. The SHORT form is read as an id the service
+/// could have issued, which is why a short id naming nothing is reported absent rather than
+/// unreadable; the strictest reading of the same question, which also holds the value to the
+/// identifiers the mint has counted, is [`ComAmazonawsEc2Amazonec2State::id_was_issued`], and
+/// `DeleteDhcpOptions` answers through that one.
 pub fn dhcp_options_id_is_well_formed(id: &str) -> bool {
-    prefixed_id_is_well_formed(DHCP_OPTIONS_ID_PREFIX, id)
+    issued_id_is_well_formed(DHCP_OPTIONS_ID_PREFIX, id)
 }
 
 /// Refuse a request that named something that is not a DHCP options set id at all: HTTP
@@ -1318,6 +1326,23 @@ pub fn invalid_dhcp_options_id_malformed<E>(
         INVALID_DHCP_OPTIONS_ID_MALFORMED,
         400,
         format!("The dhcp-options ID '{dhcp_options_id}' is malformed"),
+    )
+}
+
+/// The SAME code for the SAME class, in the shared [`invalid_id_message`] template — `Invalid
+/// id: "<the value sent>"`.
+///
+/// EC2's per-operation validators do not agree about how they WORD a value they cannot read
+/// as a dhcp-options id: the DELETE answers the resource's own sentence
+/// ([`invalid_dhcp_options_id_malformed`]) and the ASSOCIATION answers this quoted template,
+/// each recorded by its own caller — the same split the AMI id's two wordings carry
+/// ([`unresolvable_image_id`] beside [`invalid_ami_id_malformed`]). What they are answered FOR
+/// is one reading either way ([`dhcp_options_id_is_well_formed`]).
+pub fn unreadable_dhcp_options_id<E>(dhcp_options_id: &str) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_DHCP_OPTIONS_ID_MALFORMED,
+        400,
+        invalid_id_message(dhcp_options_id),
     )
 }
 

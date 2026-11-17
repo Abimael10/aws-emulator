@@ -155,6 +155,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Deletes the specified transit gateway": an id this account holds no gateway for is a
         // refusal, not a no-op — a caller that deletes twice has to be able to tell the
         // deletion it performed from one it did not.
+        // The FORM question first: a value that is no transit gateway id at all names no
+        // gateway in any account, so it is refused before anything is looked up, where an id
+        // of the right form that names nothing is reported absent.
+        if !state::transit_gateway_id_is_well_formed(transit_gateway_id) {
+            return Err(state::invalid_transit_gateway_id_malformed(
+                transit_gateway_id,
+            ));
+        }
         if !store.transit_gateways.contains_key(transit_gateway_id) {
             return Err(state::invalid_transit_gateway_id_not_found(
                 transit_gateway_id,

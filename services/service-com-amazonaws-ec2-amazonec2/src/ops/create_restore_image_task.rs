@@ -9,7 +9,9 @@
 //! restore, not something this call creates. This emulator stores no Amazon S3 objects —
 //! `CreateStoreImageTask` records the store task EC2 tracks but writes no object — so the
 //! object a request names can only be one that cannot be read, and the task is refused at
-//! the start call with `InaccessibleStorageLocation` naming it. No AMI is minted: an AMI
+//! the start call with EC2's `InvalidRequest` naming it — the code this operation was
+//! recorded answering for a location it cannot read, where the FPGA-image create answers
+//! `InaccessibleStorageLocation` for the same class. No AMI is minted: an AMI
 //! restored from an object nothing read would be an image this emulator invented.
 //!
 //! The bucket name is read as a REQUEST PARAMETER before any object is looked for: a value
@@ -160,8 +162,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
         use crate::state::{
-            IMAGE_TAGGABLE_RESOURCES, dry_run_operation, inaccessible_s3_resource,
-            invalid_s3_bucket_name, s3_bucket_name_is_well_formed, validate_tag_size,
+            IMAGE_TAGGABLE_RESOURCES, dry_run_operation, invalid_s3_bucket_name,
+            s3_bucket_name_is_well_formed, s3_resource_request_invalid, validate_tag_size,
         };
 
         // The restore is refused below for a reason that does not depend on the Region the
@@ -216,8 +218,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The object the restore reads is one `CreateStoreImageTask` wrote, and this
         // emulator stores no Amazon S3 objects at all, so there is nothing to restore from
         // and no AMI is minted (see the module docs). The location that could not be read is
-        // reported with the crate's one answer for that class, naming the bucket and the key
-        // the request gave.
-        Err(inaccessible_s3_resource(&input.bucket, &input.object_key))
+        // reported with the code THIS operation answers for that class — EC2's
+        // `InvalidRequest` ([`crate::state::s3_resource_request_invalid`]) — naming the bucket
+        // and the key the request gave.
+        Err(s3_resource_request_invalid(
+            &input.bucket,
+            &input.object_key,
+        ))
     }
 }

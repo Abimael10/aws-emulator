@@ -1314,7 +1314,17 @@ pub fn incorrect_state<E>(message: impl Into<String>) -> Scaffolded<E> {
 /// request, or whose resource is named by more than one id, keeps its own wording rather
 /// than dropping what that message carries.
 pub fn incorrect_state_of<E>(kind: &str, id: &str, state: &str) -> Scaffolded<E> {
-    incorrect_state(format!("{kind} '{id}' is in the '{state}' state."))
+    incorrect_state(resource_state_message(kind, id, state))
+}
+
+/// The sentence [`incorrect_state_of`] carries: `<Kind> '<id>' is in the '<state>' state.`
+///
+/// Named on its own for the surfaces whose recorded CODE for that refusal is their own rather
+/// than [`INCORRECT_STATE`] ([`invalid_capacity_reservation_fleet_state_transition`]): the
+/// sentence states what the caller has to change, so it is one definition whichever code
+/// carries it.
+pub fn resource_state_message(kind: &str, id: &str, state: &str) -> String {
+    format!("{kind} '{id}' is in the '{state}' state.")
 }
 
 /// What the clock owes a stored Windows fast launch configuration next.
@@ -2103,8 +2113,10 @@ pub const INVALID_ALLOCATION_ID_MALFORMED: &str = "InvalidAllocationID.Malformed
 /// ([`crate::scaffolded::Scaffolded::instance_id_is_malformed`]), so WHICH one an operation
 /// answers is a fact of that operation, recorded by its caller:
 /// `ModifyAddressAttribute` is recorded answering THIS one for a well-formed allocation id the
-/// account holds no address for, while the release, the transfer and the attribute RESET of an
-/// address keep [`INVALID_ALLOCATION_ID_NOT_FOUND`]. It is therefore not generalised to them.
+/// account holds no address for, and so are the two halves of the address TRANSFER surface
+/// (`EnableAddressTransfer`, `DisableAddressTransfer`), while the release of an address and its
+/// attribute RESET keep [`INVALID_ALLOCATION_ID_NOT_FOUND`]. It is therefore not generalised to
+/// them.
 pub const INVALID_ELASTIC_IP_ID_NOT_FOUND: &str = "InvalidElasticIpID.NotFound";
 
 /// `Resource.AlreadyAssociated` (HTTP 400): the request asked for an association the

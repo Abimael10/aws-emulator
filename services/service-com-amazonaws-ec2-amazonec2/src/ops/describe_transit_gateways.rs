@@ -250,6 +250,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // narrowing below costs one lookup per gateway rather than a scan of the asked-for
         // list — a repeated id cannot multiply the work either.
         let wanted: HashSet<&str> = requested.iter().map(String::as_str).collect();
+        // The FORM question first: a value that is no transit gateway id at all names no
+        // gateway in any account, so it is refused before anything is looked up, where an id
+        // of the right form that names nothing is reported absent.
+        if let Some(malformed) = requested
+            .iter()
+            .find(|id| !crate::state::transit_gateway_id_is_well_formed(id))
+        {
+            return Err(crate::state::invalid_transit_gateway_id_malformed(malformed));
+        }
         if let Some(unknown) = requested
             .iter()
             .find(|id| !store.transit_gateways.contains_key(id.as_str()))

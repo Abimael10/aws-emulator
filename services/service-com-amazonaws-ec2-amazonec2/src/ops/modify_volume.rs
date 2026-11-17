@@ -216,8 +216,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             DEFAULT_GP3_IOPS, DEFAULT_GP3_THROUGHPUT, DEFAULT_VOLUME_TYPE, GP3_THROUGHPUT_RANGE,
             PROVISIONED_IOPS_VOLUME_TYPES, THROUGHPUT_VOLUME_TYPE,
             VOLUME_MODIFICATION_STATE_COMPLETED, VolumeModificationRecord,
-            require_known_volume, require_service_state, system_time_to_date_time,
-            volume_iops_range, volume_size_range,
+            invalid_volume_id_not_found, modify_volume_unreadable_id, require_service_state,
+            system_time_to_date_time, volume_id_is_readable, volume_iops_range,
+            volume_size_range,
         };
 
         // `ctx` carries request metadata only; this operation reads none of it. The store
@@ -229,18 +230,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The ID of the volume" (`ModifyVolumeRequest$VolumeId`): an id that names no
         // volume of the account is an error rather than a modification of nothing — a
-        // malformed id before an unknown one, the way the service orders the two.
-        require_known_volume(&store, &input.volume_id)?;
+        // malformed id before an unknown one, the way the service orders the two. The FORM
+        // question is answered in the words THIS operation's validator words it with
+        // ([`crate::state::modify_volume_unreadable_id`]), which names the member as a
+        // parameter; what counts as unreadable is the volume surface's own reading
+        // ([`crate::state::volume_id_is_readable`]), so no operation reads an id differently.
+        if !volume_id_is_readable(&store, &input.volume_id) {
+            return Err(modify_volume_unreadable_id(&input.volume_id));
+        }
         let volume_id = input.volume_id.clone();
+        let now = ::std::time::Instant::now();
         let current = store
             .volumes
             .get(&volume_id)
+            .filter(|record| !record.is_withdrawn_at(now))
             .map(|record| record.view.clone())
-            .ok_or_else(|| {
-                Scaffolded::internal_error(format!(
-                    "the volume '{volume_id}' resolved and then could not be read"
-                ))
-            })?;
+            .ok_or_else(|| invalid_volume_id_not_found(&volume_id))?;
 
         // "Default: The existing value is retained" on every target member
         // (`ModifyVolumeRequest$Size`, `$Iops`, `$Throughput`, `$VolumeType`): the request

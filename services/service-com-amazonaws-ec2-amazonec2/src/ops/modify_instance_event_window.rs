@@ -181,8 +181,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the event window, but not both" (`ModifyInstanceEventWindow`), and whichever form
         // the request names has to satisfy the same constraints it does on a create — one
         // reading of both rules ([`crate::state::event_window_schedule_named`]), so the two
-        // calls cannot admit different schedules. What THIS one answers a request that named
-        // both forms with is its own ([`both_schedule_forms_named`]).
+        // calls cannot admit different schedules, and one definition of what a request that
+        // named BOTH forms is answered with
+        // ([`crate::state::both_event_window_schedule_forms_named`]).
         //
         // A request that names NEITHER form leaves the window opening when it already did:
         // this call "modifies the specified event window", so a member it does not carry is
@@ -190,7 +191,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let schedule = event_window_schedule_named(
             input.cron_expression.as_deref(),
             input.time_ranges.as_deref().unwrap_or_default(),
-            both_schedule_forms_named(),
+            crate::state::both_event_window_schedule_forms_named(),
         )?;
         let change = InstanceEventWindowChange {
             name: input.name.clone(),
@@ -262,18 +263,3 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// `InvalidParameterValue` (HTTP 400): the request said when its window opens in BOTH of the
-/// two ways — "you can define either a set of time ranges or a cron expression when
-/// modifying the event window, but not both" (`ModifyInstanceEventWindow`).
-///
-/// The class and the sentence THIS operation is recorded answering for that rule, kept here
-/// rather than beside the rule's one reading in [`crate::state`], because which refusal an
-/// operation answers is a fact of that operation: the create of a window answers an
-/// inadmissible COMBINATION of parameters for the same rule, in its own words. The sentence
-/// has no variable part — it names the two members of the request and nothing the caller
-/// sent.
-fn both_schedule_forms_named() -> ModifyInstanceEventWindowError {
-    crate::scaffolded::Scaffolded::invalid_parameter_value(
-        "The parameter cronExpression cannot be used with the timeRangesSet.",
-    )
-}

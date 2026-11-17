@@ -82,7 +82,7 @@ const UNHELD_ASSOCIATION_STATES: &[&str] = &["disassociated", "failed-associatio
 const CIDR_NOT_FOUND: &str = "InvalidCidr.NotFound";
 
 /// EC2's code for an ASN the account has not brought to IPAM.
-const BYOASN_NOT_FOUND: &str = "InvalidByoasn.NotFound";
+const BYOASN_NOT_FOUND: &str = "InvalidAsn.NotFound";
 
 /// EC2's code for a resource that exists but is not in a state admitting the request.
 const INCORRECT_STATE: &str = "IncorrectState";
@@ -494,8 +494,8 @@ async fn an_asn_the_account_has_not_brought_to_ipam_is_refused_as_not_found() {
         let message = element(&body, "Message").map(|text| unescaped(&text));
         assert_eq!(
             message.as_deref(),
-            Some(format!("The ASN '{asn}' does not exist").as_str()),
-            "case {case:?}: expected the message to name {asn}, got {message:?}"
+            Some("The requested ASN could not be found."),
+            "case {case:?}: expected AWS's sentence for that code, got {message:?}"
         );
         let held = stored_associations(&engine, &cidr);
         assert!(

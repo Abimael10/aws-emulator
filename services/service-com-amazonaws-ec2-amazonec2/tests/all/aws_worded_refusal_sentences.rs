@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The WORDING of nine families of EC2 refusal, driven over the wire the service actually
+//! The WORDING of eleven families of EC2 refusal, driven over the wire the service actually
 //! speaks: `ec2Query` — an `application/x-www-form-urlencoded` POST carrying
 //! `Action=<operation>`, answered with XML (README.md / OPERATIONS.md "Wire protocol").
 //!
@@ -90,9 +90,9 @@ async fn assert_refusal(
 // Family 1: a BYOIP address range that is not a CIDR block at all
 // ---------------------------------------------------------------------------
 
-/// Every operation that takes a BYOIP address range refuses a `Cidr` it cannot read as one
-/// with the BYOIP surface's own sentence — `The CIDR (<value>) is not valid.` — whichever
-/// operation was called and whichever way the value is not a range.
+/// Every operation that takes a BYOIP address range AND reads it before anything else refuses
+/// a `Cidr` it cannot read as one with the BYOIP surface's own sentence — `The CIDR (<value>)
+/// is not valid.` — whichever operation was called and whichever way the value is not a range.
 ///
 /// The rows span the operations bound to that member and the ways a value is no address
 /// range: free text, a dotted quad whose octets are out of range, an IPv4 prefix length
@@ -103,18 +103,17 @@ async fn every_byoip_range_operation_words_an_unreadable_cidr_the_same_way() {
     let router = emulator();
 
     // (the operation, the members it needs beside `Cidr`)
-    let operations: [(&str, &[(&str, &str)]); 6] = [
+    //
+    // `MoveByoipCidrToIpam` is NOT one of them: it resolves the IPAM pool its request names
+    // before it reads the range, so a request carrying an unreadable `Cidr` beside a pool
+    // this account does not hold is answered for the POOL — that operation's own suite
+    // ([`super::vpc_endpoints_and_byoip`]) drives its refusals against a pool the store
+    // holds.
+    let operations: [(&str, &[(&str, &str)]); 5] = [
         ("AdvertiseByoipCidr", &[]),
         ("ProvisionByoipCidr", &[]),
         ("WithdrawByoipCidr", &[]),
         ("DeprovisionByoipCidr", &[]),
-        (
-            "MoveByoipCidrToIpam",
-            &[
-                ("IpamPoolId", "ipam-pool-0123456789abcdef0"),
-                ("IpamPoolOwner", "123456789012"),
-            ],
-        ),
         // The ASN member is read before the range, so it carries a well-formed value from
         // the block RFC 5398 sets aside for documentation.
         ("AssociateIpamByoasn", &[("Asn", "64496")]),
@@ -704,4 +703,273 @@ async fn each_plane_words_an_unknown_vpc_its_own_way() {
         !reported.contains("<groupId>"),
         "a refused request must leave {held_vpc} readable with no stale group, got {reported}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Family 10: the two CLASSES an unresolvable resource id falls into
+// ---------------------------------------------------------------------------
+
+/// A resource id a request names is classified by whether this service can READ it as an id of
+/// that resource at all: a value outside the id space the resource is issued ids from — another
+/// resource's prefix, free text, the all-zero placeholder, or a long-form identifier the
+/// service never issued — is refused BEFORE any lookup as the MALFORMED class, and only a
+/// value inside that space which names nothing is reported as the NOT-FOUND class. Each class
+/// carries the code and the sentence the answering operation words it with.
+///
+/// The rows span what that generalises over: the resource (transit gateway, DHCP options set,
+/// AMI, volume), the way the value falls outside the id space, the operation answering, and
+/// both classes of the same resource — so no single recorded id is the specification. The two
+/// classes mean different things to a caller: the first is a permanent input bug, the second a
+/// resource that may yet appear, so a client that retries on not-found would spin forever on
+/// an id EC2 could never have issued.
+#[tokio::test]
+async fn an_unresolvable_id_is_classified_before_it_is_looked_up() {
+    let router = emulator();
+
+    // A VPC to associate DHCP options with, so the rows below are verdicts about the
+    // options-set id rather than about the VPC.
+    let created = ok(
+        "the association's vpc",
+        &router,
+        "CreateVpc",
+        &[param("CidrBlock", "10.20.0.0/16")],
+    )
+    .await;
+    let vpc_id = element(&created, "vpcId")
+        .unwrap_or_else(|| panic!("CreateVpc answered no vpcId: {created}"));
+
+    // (case, action, the parameters, the code, the sentence)
+    let rows: Vec<(&str, &str, Vec<Param>, &str, String)> = vec![
+        (
+            "a transit gateway read given another resource's id",
+            "DescribeTransitGateways",
+            vec![param("TransitGatewayIds.1", "vpc-00000000000000000")],
+            "InvalidTransitGatewayID.Malformed",
+            "Invalid Transit Gateway id vpc-00000000000000000.".to_string(),
+        ),
+        (
+            "a transit gateway read given an id of a resource that extends its prefix",
+            "DescribeTransitGateways",
+            vec![param("TransitGatewayIds.1", "tgw-attach-0123456789abcdef0")],
+            "InvalidTransitGatewayID.Malformed",
+            "Invalid Transit Gateway id tgw-attach-0123456789abcdef0.".to_string(),
+        ),
+        (
+            "a transit gateway delete given free text",
+            "DeleteTransitGateway",
+            vec![param("TransitGatewayId", "not-a-transit-gateway")],
+            "InvalidTransitGatewayID.Malformed",
+            "Invalid Transit Gateway id not-a-transit-gateway.".to_string(),
+        ),
+        (
+            "a transit gateway modify given a readable id nothing holds",
+            "ModifyTransitGateway",
+            vec![
+                param("TransitGatewayId", "tgw-0123456789abcdef0"),
+                param("Description", "renamed"),
+            ],
+            "InvalidTransitGatewayID.NotFound",
+            "Transit Gateway tgw-0123456789abcdef0 was deleted or does not exist.".to_string(),
+        ),
+        (
+            "an association given a long-form options-set id outside the issued form",
+            "AssociateDhcpOptions",
+            vec![
+                param("DhcpOptionsId", "dopt-427f3db16597971e7"),
+                param("VpcId", &vpc_id),
+            ],
+            "InvalidDhcpOptionsId.Malformed",
+            "Invalid id: \"dopt-427f3db16597971e7\"".to_string(),
+        ),
+        (
+            "an association given the all-zero options-set placeholder",
+            "AssociateDhcpOptions",
+            vec![
+                param("DhcpOptionsId", "dopt-00000000000000000"),
+                param("VpcId", &vpc_id),
+            ],
+            "InvalidDhcpOptionsId.Malformed",
+            "Invalid id: \"dopt-00000000000000000\"".to_string(),
+        ),
+        (
+            "an association given an issued-form options-set id nothing holds",
+            "AssociateDhcpOptions",
+            vec![
+                param("DhcpOptionsId", "dopt-0000000000000beef"),
+                param("VpcId", &vpc_id),
+            ],
+            "InvalidDhcpOptionID.NotFound",
+            "The dhcpOptions ID 'dopt-0000000000000beef' does not exist".to_string(),
+        ),
+        (
+            "a watermark attach given a long-form AMI id this service never issued",
+            "AttachImageWatermark",
+            vec![
+                param("ImageId", "ami-0123456789abcdef0"),
+                param("WatermarkName", "approvedAmi"),
+            ],
+            "InvalidAMIID.Malformed",
+            "The image ID 'ami-0123456789abcdef0' is malformed".to_string(),
+        ),
+        (
+            "a watermark attach given a short-form AMI id nothing holds",
+            "AttachImageWatermark",
+            vec![
+                param("ImageId", "ami-0abc1234"),
+                param("WatermarkName", "approvedAmi"),
+            ],
+            "InvalidAMIID.NotFound",
+            "The image id '[ami-0abc1234]' does not exist".to_string(),
+        ),
+        (
+            "a volume attribute read given an id outside the issued form",
+            "DescribeVolumeAttribute",
+            vec![
+                param("VolumeId", "vol-1234567890abcdef0"),
+                param("Attribute", "autoEnableIO"),
+            ],
+            INVALID_PARAMETER_VALUE,
+            "Value (vol-1234567890abcdef0) for parameter volumeId is invalid. \
+             Expected: 'vol-...'."
+                .to_string(),
+        ),
+        (
+            "a volume modify given an id outside the issued form",
+            "ModifyVolume",
+            vec![param("VolumeId", "vol-1234567890abcdef0"), param("Size", "16")],
+            "InvalidVolumeID.Malformed",
+            "Value ( vol-1234567890abcdef0 ) for parameter VOLUME is invalid. ".to_string(),
+        ),
+    ];
+
+    for (case, action, params, code, message) in rows {
+        assert_refusal(case, &router, action, &params, code, &message).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Family 11: the page size a paged operation will not serve
+// ---------------------------------------------------------------------------
+
+/// A `MaxResults` outside the range an operation publishes is refused with THAT operation's
+/// own EC2 code and sentence, carrying the bound from the member's own `@range` — never with a
+/// generic model-constraint code, which no EC2 client branches on.
+///
+/// The rows span what that generalises over: which operation answers, which bound of its
+/// published range the value missed, how far outside it is, and the operations whose own
+/// wording differs from the one every other paged read answers. A page size INSIDE the range
+/// is served, so each refusal is about the bound and not about naming a page size at all.
+#[tokio::test]
+async fn a_page_size_outside_the_published_range_is_refused_in_aws_words() {
+    let router = emulator();
+    /// The IPAM discovery a page-size row of that surface names: the request's own members are
+    /// read for their form before anything is resolved, so no discovery has to exist.
+    const A_RESOURCE_DISCOVERY: &str = "ipam-res-disco-0123456789abcdef0";
+
+    // (case, action, the parameters, the code, the sentence)
+    let rows: Vec<(&str, &str, Vec<Param>, &str, String)> = vec![
+        (
+            "one page past the managed prefix list ceiling",
+            "DescribeManagedPrefixLists",
+            vec![param("MaxResults", "101")],
+            "InvalidMaxResults",
+            "The requested max results (101) is larger than limit (100).".to_string(),
+        ),
+        (
+            "far past the managed prefix list ceiling",
+            "DescribeManagedPrefixLists",
+            vec![param("MaxResults", "1000")],
+            "InvalidMaxResults",
+            "The requested max results (1000) is larger than limit (100).".to_string(),
+        ),
+        (
+            "past the Reachability Analyzer ceiling, which states its whole range",
+            "DescribeNetworkInsightsPaths",
+            vec![param("MaxResults", "1000")],
+            "InvalidMaxResults",
+            "MaxResults must be between 1 and 100".to_string(),
+        ),
+        (
+            "past the transit gateway route table ceiling, refused by the parameter layer",
+            "DescribeTransitGatewayRouteTables",
+            vec![param("MaxResults", "100000")],
+            INVALID_PARAMETER_VALUE,
+            "Value (100000) for parameter MaxResults is invalid. ".to_string(),
+        ),
+        (
+            "below the transit gateway route table floor, in the same wording",
+            "DescribeTransitGatewayRouteTables",
+            vec![param("MaxResults", "4")],
+            "InvalidMaxResults",
+            "Value (4) for parameter MaxResults is invalid. ".to_string(),
+        ),
+        (
+            "below the VPN device type floor, which names the bound it missed",
+            "GetVpnConnectionDeviceTypes",
+            vec![param("MaxResults", "1")],
+            "InvalidMaxResults",
+            "MaxResults must be greater than 200.".to_string(),
+        ),
+        (
+            "below the IPAM discovery floor, stated of the count of results",
+            "GetIpamDiscoveredAccounts",
+            vec![
+                param("IpamResourceDiscoveryId", A_RESOURCE_DISCOVERY),
+                param("DiscoveryRegion", REGION),
+                param("MaxResults", "1"),
+            ],
+            "InvalidMaxResults",
+            "The number of requested max results must be between 100 and 1000.".to_string(),
+        ),
+        (
+            "past the BYOIP ceiling, in the sentence every paged read whose own wording is \
+             not recorded answers",
+            "DescribeByoipCidrs",
+            vec![param("MaxResults", "101")],
+            "InvalidMaxResults",
+            "Value ( 101 ) for parameter maxResults is invalid. Expecting a value smaller \
+             than or equal to 100."
+                .to_string(),
+        ),
+        (
+            "past the security group ceiling, whose own sentence excludes the bound",
+            "DescribeSecurityGroups",
+            vec![param("MaxResults", "1001")],
+            INVALID_PARAMETER_VALUE,
+            "Value ( 1001 ) for parameter maxResults is invalid. Expecting a value smaller \
+             than 1000."
+                .to_string(),
+        ),
+    ];
+
+    for (case, action, params, code, message) in rows {
+        assert_refusal(case, &router, action, &params, code, &message).await;
+    }
+
+    // A page size inside the published range is SERVED, so the refusals above are about the
+    // bound rather than about asking for a page size at all.
+    for (case, action, params) in [
+        (
+            "the managed prefix list ceiling itself",
+            "DescribeManagedPrefixLists",
+            vec![param("MaxResults", "100")],
+        ),
+        (
+            "a page inside the Reachability Analyzer range",
+            "DescribeNetworkInsightsPaths",
+            vec![param("MaxResults", "50")],
+        ),
+        (
+            "the BYOIP ceiling itself",
+            "DescribeByoipCidrs",
+            vec![param("MaxResults", "100")],
+        ),
+        (
+            "the transit gateway route table floor itself",
+            "DescribeTransitGatewayRouteTables",
+            vec![param("MaxResults", "5")],
+        ),
+    ] {
+        ok(case, &router, action, &params).await;
+    }
 }

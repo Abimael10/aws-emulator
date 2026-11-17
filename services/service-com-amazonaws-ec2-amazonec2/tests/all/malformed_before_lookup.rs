@@ -92,8 +92,10 @@ const CODE_IMAGE_USAGE_REPORT_NOT_FOUND: &str = "InvalidImageUsageReportId.NotFo
 const CODE_SECONDARY_NETWORK_NOT_FOUND: &str = "InvalidSecondaryNetworkId.NotFound";
 
 /// What a bucket name that COULD be a bucket is answered, there being no Amazon S3 object for
-/// any location to name: the location could not be read.
-const CODE_INACCESSIBLE_LOCATION: &str = "InaccessibleStorageLocation";
+/// any location to name: the location could not be read, which this operation was recorded
+/// answering `InvalidRequest` for — the same code a malformed bucket name carries, the two
+/// being told apart by the message their own suite asserts.
+const CODE_INACCESSIBLE_LOCATION: &str = CODE_BUCKET_MALFORMED;
 
 /// An export task that is still running: the `ExportTaskState` value
 /// (`smithy_query(query="shape",shape="ExportTaskState")`) a task a cancel may be asked for

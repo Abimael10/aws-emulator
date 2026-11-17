@@ -190,9 +190,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The IPAM ID" (`DeprovisionIpamByoasnRequest$IpamId`): an IPAM this account holds
         // none of is refused with the IPAM's own `NotFound` code, whatever the ASN turns out
-        // to be — there is no IPAM to give an ASN back from.
+        // to be — there is no IPAM to give an ASN back from. The BYOASN surface words that
+        // refusal with the quoted sentence rather than the parenthesised one the IPAM's own
+        // operations answer ([`crate::state::ipam_id_not_found`] carries why).
         if !store.ipams.contains_key(ipam_id) {
-            return Err(state::invalid_ipam_id_not_found(ipam_id));
+            return Err(state::ipam_id_not_found(ipam_id));
         }
 
         // "Provisions your Autonomous System Number (ASN) for use in your Amazon Web Services
@@ -205,7 +207,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(asn)
             .filter(|record| record.byoasn.ipam_id.as_deref() == Some(ipam_id))
         else {
-            return Err(state::byoasn_not_found(asn));
+            return Err(state::byoasn_not_found());
         };
         // "The provisioning state of the BYOASN" (`Byoasn$State`): an ASN part way through a
         // move the clock has not finished, and one already given back, is not an ASN this

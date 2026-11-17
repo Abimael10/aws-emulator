@@ -10,7 +10,8 @@
 //!    is refused 400 `InvalidRequest` — a permanent fault of the request — with the one
 //!    message EC2 answers such a name with, and nothing is looked for;
 //! 2. A NAME THAT COULD BE A BUCKET IS REFUSED FOR THE OBJECT IT NAMES: 400
-//!    `InaccessibleStorageLocation`, whose message names the bucket and the key the request
+//!    `InvalidRequest` — the code this operation was recorded answering for a location it
+//!    cannot read — whose message names the bucket and the key the request
 //!    gave. "Restores an AMI from an Amazon S3 object that was previously created by using
 //!    CreateStoreImageTask" (`CreateRestoreImageTask`): the object is the INPUT of the
 //!    restore, and this emulator holds no Amazon S3 object for any location to name;
@@ -43,8 +44,11 @@ type Params = Vec<(String, String)>;
 /// own covers — what a malformed bucket name is reported as.
 const INVALID_REQUEST: &str = "InvalidRequest";
 
-/// The code EC2 answers when it cannot read the Amazon S3 location a request named.
-const INACCESSIBLE: &str = "InaccessibleStorageLocation";
+/// The code EC2 answers when it cannot read the Amazon S3 location THIS operation named: the
+/// same `InvalidRequest` a malformed bucket name carries, the two being told apart by the
+/// message. `CreateFpgaImage` answers `InaccessibleStorageLocation` for that class instead,
+/// which is that operation's own recorded behaviour.
+const INACCESSIBLE: &str = INVALID_REQUEST;
 
 /// The message EC2 answers a bucket name that is no bucket name with, spelled out here as the
 /// recorded response gives it rather than read back out of the handler, so a wording
@@ -71,7 +75,7 @@ fn restore_params(bucket: &str, key: &str) -> Params {
     vec![p("Bucket", bucket), p("ObjectKey", key)]
 }
 
-/// The message EC2 answers `InaccessibleStorageLocation` with: its fixed text, with the bucket
+/// The message EC2 answers an unreadable storage location with: its fixed text, with the bucket
 /// and the key taken from the request that could not be served.
 fn inaccessible_message(bucket: &str, key: &str) -> String {
     format!(
@@ -101,10 +105,10 @@ fn assert_no_image(case: &str, body: &str) {
 // RULE 1: the bucket name is a request parameter, read before anything else
 // ---------------------------------------------------------------------------
 
-/// A bucket name outside Amazon S3's naming rules is a malformed parameter (`InvalidRequest`),
-/// while one inside them gets as far as the object and is refused for the location
-/// (`InaccessibleStorageLocation`): the two refusals are what a caller branches on, so which
-/// one a name gets follows only from whether it is a bucket name at all.
+/// A bucket name outside Amazon S3's naming rules is a malformed parameter, while one inside
+/// them gets as far as the object and is refused for the location: both carry
+/// `InvalidRequest`, and the MESSAGE is what a caller branches on — so which of the two a name
+/// gets follows only from whether it is a bucket name at all.
 #[tokio::test]
 async fn a_bucket_name_outside_the_naming_rules_is_a_malformed_parameter() {
     let (router, engine) = emulator();

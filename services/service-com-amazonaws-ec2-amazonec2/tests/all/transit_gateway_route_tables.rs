@@ -898,9 +898,10 @@ async fn the_answer_pages_in_id_order_with_a_token_that_advances() {
 
 /// A `MaxResults` outside the range the model publishes (`TransitGatewayMaxResults`,
 /// `range 5..1000`) is refused at the boundary, one past each published bound, while each
-/// bound itself is served. A page size the operation will not page with carries EC2's own
-/// `InvalidMaxResults` on EITHER side of the published range. Either way the message names the
-/// member it rejected — asserted, so a 400 for some other reason could not pass for it.
+/// bound itself is served. A page size BELOW the range carries EC2's own `InvalidMaxResults`
+/// and one ABOVE it the parameter-value code this operation answers for a value it cannot
+/// use. Either way the message names the member it rejected — asserted, so a 400 for some
+/// other reason could not pass for it.
 #[tokio::test]
 async fn a_page_size_outside_the_published_range_is_refused() {
     let (router, _engine, _ids) = seeded();
@@ -918,7 +919,7 @@ async fn a_page_size_outside_the_published_range_is_refused() {
             "one above the published maximum",
             1001,
             400,
-            INVALID_MAX_RESULTS,
+            "InvalidParameterValue",
         ),
     ] {
         let (status, body) = describe(&router, &[param("MaxResults", &page_size.to_string())]).await;
@@ -934,7 +935,7 @@ async fn a_page_size_outside_the_published_range_is_refused() {
             );
             let message = unescaped(&element(&body, "Message").unwrap_or_default());
             assert!(
-                message.contains("maxResults"),
+                message.contains("MaxResults"),
                 "case {case:?}: the refusal must name the member it rejected, got {message:?}"
             );
         }

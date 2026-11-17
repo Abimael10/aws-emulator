@@ -345,11 +345,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// accepts. `ExternalAuthorityConfiguration` is a STRUCTURE, which has no single value to
 /// compare a filter value against, so its own two members are named instead. Every entry must
 /// be answered by [`filter_values`].
-const IPAM_SCOPE_FILTERS: [&str; 14] = [
+///
+/// `ipam-id` is the one entry no member of the shape carries: the IPAM a scope belongs to is
+/// reported as its ARN (`IpamScope$IpamArn`) and EC2 documents the filter on the ID, so the
+/// value compared is the id that ARN names
+/// ([`crate::state::ipam_arn_resource_id`], the one reading of that in this crate).
+const IPAM_SCOPE_FILTERS: [&str; 15] = [
     "description",
     "external-authority-external-resource-identifier",
     "external-authority-type",
     "ipam-arn",
+    "ipam-id",
     "ipam-region",
     "ipam-scope-arn",
     "ipam-scope-id",
@@ -413,6 +419,12 @@ fn filter_values<'a>(scope: &'a IpamScope, name: &str) -> Vec<::std::borrow::Cow
                 .and_then(|configuration| configuration.r#type.as_deref()),
         ),
         "ipam-arn" => text(scope.ipam_arn.as_deref()),
+        "ipam-id" => text(
+            scope
+                .ipam_arn
+                .as_deref()
+                .and_then(crate::state::ipam_arn_resource_id),
+        ),
         "ipam-region" => text(scope.ipam_region.as_deref()),
         "ipam-scope-arn" => text(scope.ipam_scope_arn.as_deref()),
         "ipam-scope-id" => text(scope.ipam_scope_id.as_deref()),

@@ -160,12 +160,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             Err(state::CidrProblem::PrefixLength) => {
                 // A block of a size the resource does not permit is refused with the
-                // sentence this service words that class with — the block from the request
-                // and the verdict, with the published size (`Ipv4CidrBlock`'s own
-                // documentation) not restated in the message.
-                return Err(state::invalid_parameter_value(format!(
-                    "The CIDR '{requested_cidr}' is invalid."
-                )))
+                // resource's own RANGE code, in the sentence the member states that rule in
+                // ([`crate::state::invalid_secondary_network_range`]). A value that is no
+                // block at all keeps the parameter-value code above: the two are different
+                // repairs, so a caller can tell "widen the block" from "that is not a block".
+                return Err(state::invalid_secondary_network_range())
             }
         };
 

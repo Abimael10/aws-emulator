@@ -143,8 +143,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
         use crate::state::{
-            aws_account_id_is_well_formed, internal_error, require_known_address,
-            require_service_state, AWS_ACCOUNT_ID_DIGITS,
+            aws_account_id_is_well_formed, internal_error, require_service_state,
+            AWS_ACCOUNT_ID_DIGITS,
         };
 
         // `ctx` carries request metadata only; this operation reads none of it. The store
@@ -176,13 +176,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.materialize_due_transitions();
 
         // "The allocation ID of an Elastic IP address"
-        // (`EnableAddressTransferRequest$AllocationId`): an id that names no address of the
-        // account cannot be transferred. `require_known_address` answers
-        // `InvalidAllocationID.Malformed` for a value that is not an allocation id at all
-        // before `InvalidAllocationID.NotFound` for a well-formed one the account has no
-        // address for, the way the service orders the two.
+        // (`EnableAddressTransferRequest$AllocationId`): an id that is not an allocation id at
+        // all is `InvalidAllocationID.Malformed` before anything is looked up, the way the
+        // service orders the two questions — and a well-formed one the account holds no
+        // address for is answered under the OTHER of the two codes EC2 publishes for that
+        // failure, `InvalidElasticIpID.NotFound`, which is the one a recorded refusal of THIS
+        // operation pins, exactly as `DisableAddressTransfer`'s does
+        // ([`crate::state::INVALID_ELASTIC_IP_ID_NOT_FOUND`] carries why which code an
+        // operation answers is a fact of the operation).
         let allocation_id = input.allocation_id.clone();
-        require_known_address(&store, &allocation_id)?;
+        if !crate::state::allocation_id_is_well_formed(&allocation_id) {
+            return Err(crate::state::invalid_allocation_id_malformed(
+                &allocation_id,
+            ));
+        }
+        if !store.addresses.contains_key(&allocation_id) {
+            return Err(Scaffolded::service_error(
+                crate::state::INVALID_ELASTIC_IP_ID_NOT_FOUND,
+                400,
+                // The code is this operation's; the SENTENCE is the one every refusal of an
+                // unresolvable allocation id of this service carries, naming the member the
+                // request sent ([`crate::state::allocation_id_not_found_message`]).
+                crate::state::allocation_id_not_found_message(&allocation_id),
+            ));
+        }
 
         // DryRun sits AFTER every parameter has been validated and BEFORE the first write:
         // the flag asks whether the request WOULD have worked, so one that would have been

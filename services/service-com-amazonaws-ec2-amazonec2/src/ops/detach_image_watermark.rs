@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DetachImageWatermark
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DetachImageWatermark`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes the watermark the request names from one of the account's own AMIs in
+//! [`crate::state`] and answers `true`. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DetachImageWatermark::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The watermark lives ON the image, in the modelled `Image$ImageWatermarks` list
+//! `DescribeImages` reports ([`crate::ops::attach_image_watermark`] puts it there), so the
+//! detach takes exactly the row whose `WatermarkKey` the request names out of that list and
+//! gives the bytes it held back to the store's budget.
+//!
+//! "This is an idempotent operation. It succeeds even if the watermark does not exist on the
+//! image" (`DetachImageWatermark`), so a key the image does not carry is answered `true` and
+//! nothing is written. "Removing a watermark from an image does not affect derivative images
+//! that already carry the watermark": the list is the image's own, so no other image is
+//! touched.
+//!
+//! The refusals are the ATTACH's, because the same image is resolved: a value that is no AMI
+//! id is `InvalidAMIID.Malformed`, an id the account can see no image for is
+//! `InvalidAMIID.NotFound`, a `DryRun` request is `DryRunOperation`, and "only the AMI owner
+//! can detach watermarks" is `OperationNotPermitted`.
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +148,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DetachImageWatermark` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DetachImageWatermarkErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DetachImageWatermark"))
+        // `ctx` carries request metadata only; nothing about this detach depends on the
+        // Region the call was signed for — the image and the watermark are each named in the
+        // request. The store is reached through the engine held on `self`.
+        let _ = ctx;
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            dry_run_operation, image_id_is_readable, image_id_is_well_formed, image_is_visible,
+            invalid_ami_id_not_found, require_service_state, unresolvable_image_id,
+        };
+
+        // The FORM question first, in the wording this image family's strict validator words
+        // it with — the same reading and the same sentence `AttachImageWatermark` answers, so
+        // the two halves of one watermark's life cannot read an id differently.
+        if !image_id_is_well_formed(&input.image_id) {
+            return Err(unresolvable_image_id(&input.image_id));
+        }
+
+        // The permission question, answered before the resource one and before the write.
+        if input.dry_run == Some(true) {
+            return Err(dry_run_operation());
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // The rest of the FORM question, which only the store can answer: a long-form id this
+        // service never issued names no image it could ever have held.
+        if !image_id_is_readable(&store, &input.image_id) {
+            return Err(unresolvable_image_id(&input.image_id));
+        }
+
+        let account = ::engine::emulator_account_id().to_string();
+        {
+            let image = store
+                .images
+                .get(&input.image_id)
+                .filter(|image| image_is_visible(image, &account))
+                .ok_or_else(|| invalid_ami_id_not_found(&input.image_id))?;
+            // "Only the AMI owner can detach watermarks" (`DetachImageWatermark`).
+            if image.owner_id.as_deref() != Some(account.as_str()) {
+                return Err(Scaffolded::operation_not_permitted(format!(
+                    "Only the owner of AMI '{}' can detach a watermark from it",
+                    input.image_id
+                )));
+            }
+        }
+
+        // The one write: the row whose key the request names comes out of the image's own
+        // list, and the bytes it held go back to the store's budget — the charge
+        // `AttachImageWatermark` made when it stored the key. A key the image does not carry
+        // takes nothing out and gives nothing back, which is what makes the call idempotent.
+        let released = store
+            .images
+            .get_mut(&input.image_id)
+            .and_then(|image| image.image_watermarks.as_mut())
+            .map_or(0, |watermarks| {
+                let before = watermarks.len();
+                watermarks.retain(|watermark| {
+                    watermark.watermark_key.as_deref() != Some(input.watermark_key.as_str())
+                });
+                (before - watermarks.len()) * input.watermark_key.len()
+            });
+        store.release_stored_bytes(released);
+
+        // "Returns `true` if the request succeeds; otherwise, it returns an error"
+        // (`$Return`): the image no longer carries that watermark, which a later
+        // `DescribeImages` reports from the same place.
+        Ok(DetachImageWatermarkOutput {
+            r#return: Some(true),
+        })
     }
 }

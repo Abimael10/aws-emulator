@@ -178,11 +178,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let schedule = event_window_schedule_named(
             input.cron_expression.as_deref(),
             input.time_ranges.as_deref().unwrap_or_default(),
-            // The refusal THIS call answers a request that said when its window opens in
-            // both of the two ways with.
-            Scaffolded::invalid_parameter_combination(
-                "Either cronExpression or timeRanges may be specified, not both",
-            ),
+            // The refusal a request that said when its window opens in both of the two ways
+            // earns, in the one wording the family answers it with
+            // ([`crate::state::both_event_window_schedule_forms_named`]).
+            crate::state::both_event_window_schedule_forms_named(),
         )?
         .ok_or_else(|| {
             Scaffolded::missing_parameter("Either cronExpression or timeRanges must be specified")

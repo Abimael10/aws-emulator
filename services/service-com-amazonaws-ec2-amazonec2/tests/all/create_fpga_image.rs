@@ -12,7 +12,8 @@
 //!    it cannot read — whichever side of Amazon S3's bucket naming rules the name falls, and
 //!    whatever shape the key takes.
 //! 2. A FACT OF THE REQUEST IS ANSWERED AHEAD OF THAT READ: a storage location that names no
-//!    bucket or no key names no object at all (`MissingParameter`), a tag specification may
+//!    bucket or no key names no object at all, so the member's VALUE is unusable
+//!    (`InvalidParameterValue`), a tag specification may
 //!    only name the resource this call would create and a tag and a client token have
 //!    published maximums (`InvalidParameterValue`), and `DryRun` asks whether the CALLER MAY
 //!    make the request (412 `DryRunOperation`).
@@ -234,13 +235,13 @@ async fn a_fact_of_the_request_is_answered_before_the_checkpoint_is_read() {
             "an input location that names a key but no bucket",
             vec![p("InputStorageLocation.Key", CHECKPOINT_KEY)],
             400,
-            "MissingParameter",
+            "InvalidParameterValue",
         ),
         (
             "an input location that names a bucket but no key",
             vec![p("InputStorageLocation.Bucket", WELL_FORMED_BUCKET)],
             400,
-            "MissingParameter",
+            "InvalidParameterValue",
         ),
         (
             "an input location whose bucket is empty",
@@ -249,7 +250,7 @@ async fn a_fact_of_the_request_is_answered_before_the_checkpoint_is_read() {
                 p("InputStorageLocation.Key", CHECKPOINT_KEY),
             ],
             400,
-            "MissingParameter",
+            "InvalidParameterValue",
         ),
         (
             "a logs location that names a bucket but no key",
@@ -259,7 +260,7 @@ async fn a_fact_of_the_request_is_answered_before_the_checkpoint_is_read() {
                 params
             },
             400,
-            "MissingParameter",
+            "InvalidParameterValue",
         ),
         (
             "a tag specification naming a volume, which this call does not create",

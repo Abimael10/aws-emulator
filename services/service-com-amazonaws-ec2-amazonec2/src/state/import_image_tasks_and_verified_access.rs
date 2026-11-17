@@ -910,6 +910,37 @@ pub const INVALID_SECONDARY_NETWORK_ID_NOT_FOUND: &str = "InvalidSecondaryNetwor
 /// (`secnet-00000000000000000` -> `InvalidSecondaryNetworkId.Malformed`).
 pub const INVALID_SECONDARY_NETWORK_ID_MALFORMED: &str = "InvalidSecondaryNetworkId.Malformed";
 
+/// The error code EC2 answers for an IPv4 CIDR block a secondary network create named that is
+/// a BLOCK, but of a size outside the one this resource publishes
+/// ([`MIN_SECONDARY_NETWORK_IPV4_PREFIX`]..=[`MAX_SECONDARY_NETWORK_IPV4_PREFIX`]).
+///
+/// The resource's own code for the RANGE class, where a value that is no address block at all
+/// stays [`INVALID_PARAMETER_VALUE`]: a caller that widens the block it asks for branches on
+/// this code, so the two refusals of an `Ipv4CidrBlock` are told apart the way a resource's
+/// `.Malformed` and `.NotFound` are.
+pub const INVALID_SECONDARY_NETWORK_RANGE: &str = "InvalidSecondaryNetwork.Range";
+
+/// Refuse an IPv4 CIDR block of a size the secondary network resource does not permit: HTTP
+/// 400 [`INVALID_SECONDARY_NETWORK_RANGE`], in the sentence the member states that rule in —
+/// "The CIDR block size must be between /12 and /28"
+/// (`CreateSecondaryNetworkRequest$Ipv4CidrBlock`).
+///
+/// FIXED text apart from the two published sizes, which are the member's own
+/// ([`MIN_SECONDARY_NETWORK_IPV4_PREFIX`], [`MAX_SECONDARY_NETWORK_IPV4_PREFIX`]): the refusal
+/// states the rule the request has to satisfy rather than echoing the block it sent, so an
+/// operation whose published sizes differ states its own.
+pub fn invalid_secondary_network_range<E>() -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_SECONDARY_NETWORK_RANGE,
+        400,
+        format!(
+            "The CIDR block size must be between /{min} and /{max}",
+            min = MIN_SECONDARY_NETWORK_IPV4_PREFIX,
+            max = MAX_SECONDARY_NETWORK_IPV4_PREFIX,
+        ),
+    )
+}
+
 /// One stored secondary network: the modelled [`SecondaryNetwork`] every operation that
 /// reports one answers with, plus the instant the clock owes it its `create-in-progress`
 /// -> `create-complete` move.

@@ -99,7 +99,7 @@ const IPAM_ID_NOT_FOUND: &str = "InvalidIpamId.NotFound";
 const IPAM_ID_MALFORMED: &str = "InvalidIpamId.Malformed";
 
 /// EC2's code for an ASN the IPAM has not brought to the account.
-const BYOASN_NOT_FOUND: &str = "InvalidByoasn.NotFound";
+const BYOASN_NOT_FOUND: &str = "InvalidAsn.NotFound";
 
 /// EC2's code for a resource that exists but is not in a state admitting the request.
 const INCORRECT_STATE: &str = "IncorrectState";
@@ -412,9 +412,9 @@ async fn an_asn_the_named_ipam_does_not_hold_is_refused() {
             "case {case:?}: expected {BYOASN_NOT_FOUND}, got {code:?} with body {body}"
         );
         let message = error_message(&body);
-        assert!(
-            message.contains(asn),
-            "case {case:?}: the refusal names the ASN the request sent, got {message:?}"
+        assert_eq!(
+            message, "The requested ASN could not be found.",
+            "case {case:?}: expected AWS's sentence for that code, got {message:?}"
         );
         let expected_state = brought_elsewhere.then(|| PROVISIONED.to_string());
         assert_eq!(

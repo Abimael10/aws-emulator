@@ -221,9 +221,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ACTUALLY in rather than the one it was left in.
         store.materialize_due_transitions();
 
-        // "The ID of the transit gateway" (`TransitGatewayId`): an id this account holds no
-        // gateway for has nothing to modify. The one refusal every reader of a
-        // `TransitGatewayId` in this crate answers, so the family reads one way.
+        // "The ID of the transit gateway" (`TransitGatewayId`): a value that is no transit
+        // gateway id at all names no gateway in any account, so it is refused before anything
+        // is looked up; an id this account holds no gateway for has nothing to modify. The one
+        // pair of refusals every reader of a `TransitGatewayId` in this crate answers, so the
+        // family reads one way.
+        if !state::transit_gateway_id_is_well_formed(&modification.transit_gateway_id) {
+            return Err(state::invalid_transit_gateway_id_malformed(
+                &modification.transit_gateway_id,
+            ));
+        }
         let Some(current) = store
             .transit_gateways
             .get(&modification.transit_gateway_id)

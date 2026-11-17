@@ -182,9 +182,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // before anything else, so a location that names none is answered as the request
         // fault it is rather than as a location that could not be read.
         let (input_bucket, input_key) =
-            storage_location_object(&input.input_storage_location, "inputStorageLocation")?;
+            storage_location_object(&input.input_storage_location, "InputStorageLocation")?;
         if let Some(logs_location) = input.logs_storage_location.as_ref() {
-            storage_location_object(logs_location, "logsStorageLocation")?;
+            storage_location_object(logs_location, "LogsStorageLocation")?;
         }
 
         // "The tags to apply to the FPGA image during creation"

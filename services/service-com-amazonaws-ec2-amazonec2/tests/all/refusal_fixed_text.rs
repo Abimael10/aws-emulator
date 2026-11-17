@@ -142,8 +142,9 @@ fn block_size_withheld() -> Vec<String> {
 
 /// Class 1 once more, on the resource whose own block size the model states in prose rather
 /// than as a code of its own: `CreateSecondaryNetwork` refuses a block outside
-/// `Ipv4CidrBlock`'s published size with the same sentence, under the parameter-value code it
-/// answers for that member.
+/// `Ipv4CidrBlock`'s published size under that resource's own RANGE code, with the sentence
+/// the member states that rule in — which names the two published sizes and nothing the
+/// request sent, so every row withholds the block it asked for.
 fn secondary_network_block_size_rows() -> Vec<Row> {
     // The modelled `SecondaryNetworkType` enum's first value: the member is `@required`, so
     // every row carries one, and the block is what each row varies.
@@ -156,9 +157,9 @@ fn secondary_network_block_size_rows() -> Vec<Row> {
             case: format!("CreateSecondaryNetwork asking for the block {block}"),
             action: "CreateSecondaryNetwork",
             params: vec![p("Ipv4CidrBlock", block), p("NetworkType", *network_type)],
-            code: INVALID_PARAMETER_VALUE,
-            message: format!("The CIDR '{block}' is invalid."),
-            withheld: block_size_withheld(),
+            code: "InvalidSecondaryNetwork.Range",
+            message: "The CIDR block size must be between /12 and /28".to_string(),
+            withheld: vec!["netmask".to_string(), block.to_string()],
         })
         .collect()
 }

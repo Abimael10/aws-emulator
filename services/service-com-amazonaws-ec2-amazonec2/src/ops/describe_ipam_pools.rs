@@ -463,10 +463,12 @@ fn filter_values<'a>(pool: &'a IpamPool, name: &str) -> Vec<::std::borrow::Cow<'
     };
     // The id of a container the pool reports only by ARN: every ARN this service mints for an
     // IPAM resource is `<arn prefix>:<resource type>/<id>`
-    // ([`crate::state::ipam_resource_arn`]), so the id is the segment after the last `/`.
+    // ([`crate::state::ipam_resource_arn`]), so the id is the segment after the last `/` —
+    // read through the one reading of that in this crate
+    // ([`crate::state::ipam_arn_resource_id`]).
     let arn_resource_id = |arn: Option<&'a str>| -> Vec<Cow<'a, str>> {
-        arn.and_then(|arn| arn.rsplit_once('/'))
-            .map(|(_, id)| Cow::Borrowed(id))
+        arn.and_then(crate::state::ipam_arn_resource_id)
+            .map(Cow::Borrowed)
             .into_iter()
             .collect()
     };

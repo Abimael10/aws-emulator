@@ -576,17 +576,27 @@ async fn the_published_block_size_is_the_rule() {
         );
     }
 
-    let refused: Vec<String> = vec![
-        format!("10.0.0.0/{}", MIN_SECONDARY_NETWORK_IPV4_PREFIX - 1),
-        format!("10.0.0.0/{}", MAX_SECONDARY_NETWORK_IPV4_PREFIX + 1),
-        "10.0.0.0/0".to_string(),
-        "10.0.0.0/33".to_string(),
-        "10.0.0.0".to_string(),
-        "not-a-cidr-block/16".to_string(),
-        "10.0.0.0/sixteen".to_string(),
-        String::new(),
+    // Rows: each way a block can be refused, with the code that class carries — a block of a
+    // size outside the published range is the resource's own RANGE class, where a value that
+    // is no IPv4 block at all is a parameter whose value the service cannot read.
+    let refused: Vec<(String, &str)> = vec![
+        (
+            format!("10.0.0.0/{}", MIN_SECONDARY_NETWORK_IPV4_PREFIX - 1),
+            "InvalidSecondaryNetwork.Range",
+        ),
+        (
+            format!("10.0.0.0/{}", MAX_SECONDARY_NETWORK_IPV4_PREFIX + 1),
+            "InvalidSecondaryNetwork.Range",
+        ),
+        ("10.0.0.0/0".to_string(), "InvalidSecondaryNetwork.Range"),
+        // No IPv4 block has a prefix longer than its address, so this is not a block at all.
+        ("10.0.0.0/33".to_string(), "InvalidParameterValue"),
+        ("10.0.0.0".to_string(), "InvalidParameterValue"),
+        ("not-a-cidr-block/16".to_string(), "InvalidParameterValue"),
+        ("10.0.0.0/sixteen".to_string(), "InvalidParameterValue"),
+        (String::new(), "InvalidParameterValue"),
     ];
-    for cidr_block in refused {
+    for (cidr_block, expected) in refused {
         let router = emulator();
         let (status, body) = create_network(&router, &cidr_block, a_network_type(), Params::new()).await;
         assert_eq!(
@@ -595,8 +605,8 @@ async fn the_published_block_size_is_the_rule() {
         );
         assert_eq!(
             error_code(&body),
-            "InvalidParameterValue",
-            "case {cidr_block:?}: expected InvalidParameterValue, got {body}"
+            expected,
+            "case {cidr_block:?}: expected {expected}, got {body}"
         );
         let reported = described_ids(&router, &cidr_block, &[]).await;
         assert!(
@@ -1194,8 +1204,8 @@ async fn dry_run_reports_the_permitted_outcome_without_doing_the_work() {
     );
     assert_eq!(
         error_code(&body),
-        "InvalidParameterValue",
-        "create DryRun=true with a bad block: expected InvalidParameterValue, got {body}"
+        "InvalidSecondaryNetwork.Range",
+        "create DryRun=true with a bad block: expected the range code, got {body}"
     );
 
     let (status, body) = create_network(

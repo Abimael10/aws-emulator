@@ -151,9 +151,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Something that is not a volume id at all is refused before anything else looks
-        // at it, the way `EnableVolumeIO` orders the same rule.
+        // at it, the way `EnableVolumeIO` orders the same rule — but under the code THIS
+        // operation's validator answers: it reads `volumeId` as a parameter, so the refusal
+        // is EC2's parameter-value code naming the member and the id form it expected
+        // ([`crate::state::invalid_id_parameter_value`] carries why which of the two codes an
+        // operation answers is a fact of that operation), where the operations whose subject
+        // is the volume itself answer `InvalidVolumeID.Malformed`. What counts as unreadable
+        // is the volume surface's own reading either way, asked in two halves because the
+        // second needs the store — so the refusal itself is written once.
+        let unreadable_volume_id = || {
+            state::invalid_id_parameter_value(
+                state::VOLUME_ID_PARAMETER,
+                &input.volume_id,
+                state::VOLUME_ID_PREFIX,
+            )
+        };
         if !state::volume_id_is_well_formed(&input.volume_id) {
-            return Err(state::invalid_volume_id_malformed(&input.volume_id));
+            return Err(unreadable_volume_id());
         }
 
         // `DryRun` asks the PERMISSION question, so it is answered between the two halves
@@ -167,6 +181,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state::require_service_state(&*self.engine)?;
         let store = store.lock();
+        // The rest of the FORM question, which only the store can answer: a long-form id is
+        // an obfuscated identifier this service decodes before it resolves anything, so one
+        // it never issued is no volume id at all ([`crate::state::volume_id_is_readable`]) —
+        // answered under this operation's own parameter code, so every value it cannot read
+        // carries one code rather than two.
+        if !state::volume_id_is_readable(&store, &input.volume_id) {
+            return Err(unreadable_volume_id());
+        }
         // "Describes the specified attribute of the specified volume": the second half of
         // the rule, through the one definition of how this service resolves a volume id,
         // which hands back the volume it resolved.

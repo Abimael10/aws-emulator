@@ -68,7 +68,7 @@
 //!   `InvalidParameterValue` (an empty one: `MissingParameter`);
 //! * an address range IPAM does not manage, whether the account never brought it or never
 //!   moved it to IPAM: `InvalidCidr.NotFound`;
-//! * an ASN the account has not brought to IPAM: `InvalidByoasn.NotFound` — which is every
+//! * an ASN the account has not brought to IPAM: `InvalidAsn.NotFound` — which is every
 //!   ASN until `ProvisionIpamByoasn` is written, exactly as the real service answers for an
 //!   ASN that was never provisioned;
 //! * an ASN whose own provision has not finished: `IncorrectState`;
@@ -206,7 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Services account" (`ProvisionIpamByoasn`) is what brings an ASN to IPAM, and only
         // an ASN the account has brought is its own to associate.
         let Some(byoasn) = store.byoasns.get(asn) else {
-            return Err(state::byoasn_not_found(asn));
+            return Err(state::byoasn_not_found());
         };
         // "The provisioning state of the BYOASN" (`Byoasn$State`): an ASN part way through
         // its provision, or one whose provision failed or has been given back, is not an ASN

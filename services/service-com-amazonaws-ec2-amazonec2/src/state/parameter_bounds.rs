@@ -175,13 +175,94 @@ pub fn absent_required_member_message(input_shape: Option<&str>, path: &str) -> 
     missing_required_parameter_message(&declared_member_name(path))
 }
 
+/// The SENTENCE one API surface of EC2 words a page size outside its published range with.
+///
+/// One refusal class, several wordings: the surfaces of the original EC2 and VPC objects state
+/// the value, the parameter and the bound, where the surfaces added later state the limit or the
+/// whole published range. Each variant interpolates only the value the REQUEST sent and the
+/// bound the member's own `@range` publishes, so an operation whose range differs is refused
+/// with its own numbers; the variants that state the whole range carry it, because the
+/// constraint walk reports only the bound that was missed.
+#[derive(Debug, Clone, Copy)]
+pub enum PageSizeWording {
+    /// `Value ( <value> ) for parameter <parameter> is invalid. Expecting a value smaller
+    /// <clause> <bound>.` — the sentence EC2's core parameter validator words, which names the
+    /// member the way that surface spells it and either admits the bound or excludes it.
+    ValueForParameter {
+        /// How this surface spells the member: `maxResults` on the wire, or `MaxResults` as the
+        /// model declares it.
+        parameter: &'static str,
+        /// `than` where the sentence excludes the bound, `than or equal to` where it admits it.
+        clause: &'static str,
+    },
+    /// `The requested max results (<value>) is larger than limit (<bound>).` — the sentence
+    /// that states the limit the request overshot rather than the member that carried it.
+    AgainstLimit,
+    /// `MaxResults must be between <minimum> and <maximum>` — the sentence that states the whole
+    /// published range, whichever end the value fell outside.
+    WithinRange {
+        /// The `(minimum, maximum)` of the member's own `@range`
+        /// (`smithy_query(query="operation", …)` reports it on `MaxResults`).
+        published: (i32, i32),
+    },
+    /// `The number of requested max results must be between <minimum> and <maximum>.` — the
+    /// same rule stated of the COUNT of results, which is how the IPAM surface words it.
+    CountWithinRange {
+        /// The `(minimum, maximum)` this sentence states, as AWS states them for that surface.
+        published: (i32, i32),
+    },
+    /// `MaxResults must be greater than <bound>.` — the sentence that names the member and the
+    /// one bound that was missed.
+    ComparedWithBound,
+    /// `Value (<value>) for parameter <parameter> is invalid. ` — the PARAMETER layer's own
+    /// clause, which names the member and the value and states no reason after the separating
+    /// space, exactly as that layer refuses a filter name
+    /// ([`invalid_filter_parameter_value`]).
+    ParameterLayer {
+        /// The member as that layer names it.
+        parameter: &'static str,
+    },
+}
+
+impl PageSizeWording {
+    /// This surface's sentence for `value`, refused against `bound` — the bound the constraint
+    /// walk reports — on the `outside` end of the published range.
+    pub fn message(self, value: &str, bound: &str, outside: PageSizeBound) -> String {
+        match self {
+            Self::ValueForParameter { parameter, clause } => {
+                page_size_message(parameter, clause, value, bound, outside)
+            }
+            Self::AgainstLimit => format!(
+                "The requested max results ({value}) is {relation} than limit ({bound}).",
+                relation = outside.relation(),
+            ),
+            Self::WithinRange {
+                published: (minimum, maximum),
+            } => format!("MaxResults must be between {minimum} and {maximum}"),
+            Self::CountWithinRange {
+                published: (minimum, maximum),
+            } => format!(
+                "The number of requested max results must be between {minimum} and {maximum}."
+            ),
+            Self::ComparedWithBound => format!(
+                "MaxResults must be {comparison} than {bound}.",
+                comparison = outside.comparison(),
+            ),
+            Self::ParameterLayer { parameter } => {
+                format!("Value ({value}) for parameter {parameter} is invalid. ")
+            }
+        }
+    }
+}
+
 /// How EC2's own refusal of a page size OUTSIDE the range ONE operation publishes reads, for
 /// the operations whose refusal its callers recorded.
 ///
 /// One refusal class, several recorded answers. `DescribeSubnets` names the member as the model
 /// declares it and admits the bound itself ("smaller than or equal to 1000"), while
-/// `DescribeSecurityGroups` names it in lowerCamel and excludes it ("smaller than 1000"), and
-/// the code differs per operation and per BOUND: the paged describes whose refusal was recorded
+/// `DescribeSecurityGroups` names it in lowerCamel and excludes it ("smaller than 1000"), the
+/// surfaces added later state the limit or the whole published range instead, and the code
+/// differs per operation and per BOUND: the paged describes whose refusal was recorded
 /// elsewhere answer EC2's own [`INVALID_MAX_RESULTS`]. WHICH an operation answers is a fact of
 /// that operation recorded by its caller and not of the bound, exactly as the two sentences for
 /// a page size below the minimum differ ([`max_results_below_bound_message`]) — so it is keyed
@@ -194,11 +275,8 @@ pub struct RecordedPageSizeRefusal {
     pub below_smallest_code: &'static str,
     /// The code EC2 answers a page size ABOVE the largest page it serves with.
     pub above_largest_code: &'static str,
-    /// How its sentence spells the parameter that carried the page size.
-    pub parameter: &'static str,
-    /// How that sentence compares the value with the bound — whether the bound itself is
-    /// admitted.
-    pub clause: &'static str,
+    /// The sentence this operation's surface words that refusal with.
+    pub wording: PageSizeWording,
 }
 
 /// The recorded refusals themselves, one per operation.
@@ -211,24 +289,99 @@ pub const RECORDED_PAGE_SIZE_WORDINGS: &[RecordedPageSizeRefusal] = &[
         input_shape: "DescribeSecurityGroupsRequest",
         below_smallest_code: INVALID_MAX_RESULTS,
         above_largest_code: INVALID_PARAMETER_VALUE,
-        parameter: "maxResults",
-        clause: "than",
+        wording: PageSizeWording::ValueForParameter {
+            parameter: "maxResults",
+            clause: "than",
+        },
     },
     RecordedPageSizeRefusal {
         input_shape: "DescribeSubnetsRequest",
         below_smallest_code: INVALID_MAX_RESULTS,
         above_largest_code: INVALID_PARAMETER_VALUE,
-        parameter: "MaxResults",
-        clause: "than or equal to",
+        wording: PageSizeWording::ValueForParameter {
+            parameter: "MaxResults",
+            clause: "than or equal to",
+        },
     },
     RecordedPageSizeRefusal {
         input_shape: "DescribeVpcsRequest",
         below_smallest_code: INVALID_PARAMETER_VALUE,
         above_largest_code: INVALID_PARAMETER_VALUE,
-        parameter: "MaxResults",
-        clause: "than or equal to",
+        wording: PageSizeWording::ValueForParameter {
+            parameter: "MaxResults",
+            clause: "than or equal to",
+        },
+    },
+    // `DescribeTransitGatewayRouteTables` publishes a maximum of 1000 (`MaxResults`
+    // `@range` 5..1000) and is refused by the PARAMETER layer, which states no reason after
+    // the separating space and names the member as the model declares it; a page size past
+    // the ceiling carries the code EC2 uses for a parameter value it cannot use.
+    RecordedPageSizeRefusal {
+        input_shape: "DescribeTransitGatewayRouteTablesRequest",
+        below_smallest_code: INVALID_MAX_RESULTS,
+        above_largest_code: INVALID_PARAMETER_VALUE,
+        wording: PageSizeWording::ParameterLayer {
+            parameter: "MaxResults",
+        },
+    },
+    // The managed prefix list describe states the limit the request overshot.
+    RecordedPageSizeRefusal {
+        input_shape: "DescribeManagedPrefixListsRequest",
+        below_smallest_code: INVALID_MAX_RESULTS,
+        above_largest_code: INVALID_MAX_RESULTS,
+        wording: PageSizeWording::AgainstLimit,
+    },
+    // `DescribeByoipCidrs` is NOT named here: its recorded refusal of a page size past its
+    // ceiling carries [`INVALID_MAX_RESULTS`], which is what the default already answers, so
+    // it keeps the code and the sentence every paged operation whose own wording is not
+    // recorded answers.
+    //
+    // The Reachability Analyzer describes state the whole range their `MaxResults`
+    // publishes (`NetworkInsightsMaxResults`, `@range` 1..100).
+    RecordedPageSizeRefusal {
+        input_shape: "DescribeNetworkInsightsPathsRequest",
+        below_smallest_code: INVALID_MAX_RESULTS,
+        above_largest_code: INVALID_MAX_RESULTS,
+        wording: PageSizeWording::WithinRange {
+            published: NETWORK_INSIGHTS_PAGE_SIZE_RANGE,
+        },
+    },
+    // The IPAM discovery reads state the same rule of the COUNT of results, with the bounds
+    // AWS states in that sentence.
+    RecordedPageSizeRefusal {
+        input_shape: "GetIpamDiscoveredAccountsRequest",
+        below_smallest_code: INVALID_MAX_RESULTS,
+        above_largest_code: INVALID_MAX_RESULTS,
+        wording: PageSizeWording::CountWithinRange {
+            published: IPAM_DISCOVERY_STATED_PAGE_SIZE_RANGE,
+        },
+    },
+    // `GetVpnConnectionDeviceTypes` names the member and the one bound that was missed
+    // (`GVCDMaxResults`, `@range` 200..1000).
+    RecordedPageSizeRefusal {
+        input_shape: "GetVpnConnectionDeviceTypesRequest",
+        below_smallest_code: INVALID_MAX_RESULTS,
+        above_largest_code: INVALID_MAX_RESULTS,
+        wording: PageSizeWording::ComparedWithBound,
     },
 ];
+
+/// The `(minimum, maximum)` page size the Reachability Analyzer describes publish: the
+/// `@range` of `NetworkInsightsMaxResults`, the shape their `MaxResults` targets
+/// (`smithy_query(query="operation",operation="DescribeNetworkInsightsPaths")`).
+///
+/// Named here because the sentence those operations word states the whole range while the
+/// constraint walk reports only the bound a value missed, and read by the handlers that cap
+/// their own page size, so the bound enforced and the bound stated cannot drift apart.
+pub const NETWORK_INSIGHTS_PAGE_SIZE_RANGE: (i32, i32) = (1, 100);
+
+/// The `(minimum, maximum)` the IPAM discovery reads STATE in their page-size sentence.
+///
+/// AWS words that sentence with these bounds, which are not the ones the member's own `@range`
+/// publishes (`IpamMaxResults`, 5..1000): the range a request is held to is the model's, and
+/// this pair is only what the sentence says. Kept beside the wording it belongs to so the two
+/// cannot drift apart.
+pub const IPAM_DISCOVERY_STATED_PAGE_SIZE_RANGE: (i32, i32) = (100, 1000);
 
 /// The `(parameter spelling, comparison clause)` a paged operation whose own wording is not
 /// recorded answers: the member in the lowerCamel the rest of this service's `maxResults`
@@ -257,6 +410,15 @@ impl PageSizeBound {
             Self::Largest => "smaller",
         }
     }
+
+    /// The word the sentences that state the LIMIT rather than the member put the value in
+    /// relation to it with ([`PageSizeWording::AgainstLimit`]).
+    fn relation(self) -> &'static str {
+        match self {
+            Self::Smallest => "smaller",
+            Self::Largest => "larger",
+        }
+    }
 }
 
 /// Whether EC2's own refusal of a page size outside `input_shape`'s published range is
@@ -283,6 +445,19 @@ fn recorded_page_size_refusal(input_shape: Option<&str>) -> Option<&'static Reco
         .find(|recorded| Some(recorded.input_shape) == input_shape)
 }
 
+/// The sentence EC2 words a page size outside `input_shape`'s published range with: that
+/// operation's own recorded wording, or the one every paged operation whose wording is not
+/// recorded answers ([`DEFAULT_PAGE_SIZE_WORDING`]).
+pub fn page_size_wording(input_shape: Option<&str>) -> PageSizeWording {
+    recorded_page_size_refusal(input_shape).map_or(
+        PageSizeWording::ValueForParameter {
+            parameter: DEFAULT_PAGE_SIZE_WORDING.0,
+            clause: DEFAULT_PAGE_SIZE_WORDING.1,
+        },
+        |recorded| recorded.wording,
+    )
+}
+
 /// How EC2 states a page size outside the range an operation publishes: the value the request
 /// sent, in spaced parentheses, the parameter that carried it and the bound it has to stay
 /// inside — "Value ( `<value>` ) for parameter `<parameter>` is invalid. Expecting a value
@@ -301,11 +476,7 @@ pub fn page_size_outside_range_message(
     bound: &str,
     outside: PageSizeBound,
 ) -> String {
-    let (parameter, clause) = recorded_page_size_refusal(input_shape).map_or(
-        DEFAULT_PAGE_SIZE_WORDING,
-        |recorded| (recorded.parameter, recorded.clause),
-    );
-    page_size_message(parameter, clause, value, bound, outside)
+    page_size_wording(input_shape).message(value, bound, outside)
 }
 
 /// The ONE template every page-size sentence of this service is built from, so no two of them

@@ -89,7 +89,7 @@ const KINDS: [Kind; 5] = [
         resource_type: "instance-event-window",
         describe: ("DescribeInstanceEventWindows", "InstanceEventWindowId.1"),
         absent_id: "iew-00000000000000999",
-        absent_code: "InvalidInstanceEventWindowId.NotFound",
+        absent_code: "InvalidInstanceEventWindowIDNotFound",
     },
     Kind {
         name: "security-group-rule",

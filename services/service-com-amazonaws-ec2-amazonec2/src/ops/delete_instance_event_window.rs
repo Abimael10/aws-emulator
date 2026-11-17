@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteInstanceEventWindow
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteInstanceEventWindow`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: starts the deletion of the event window the request names and answers the
+//! state that leaves it in. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteInstanceEventWindow::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Deletes the specified event window": the window is TAKEN OUT of the account's windows,
+//! so every later read of it answers the family's not-found code, and the call reports the
+//! [`crate::state::INSTANCE_EVENT_WINDOW_STATE_DELETING`] state the model's
+//! `InstanceEventWindowState` catalog gives a window a delete has acted on
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::delete_instance_event_window`]).
+//!
+//! "Specify `true` to force delete the event window. Use the force delete parameter if the
+//! event window is currently associated with targets" (`ForceDelete`): a window that still
+//! carries targets is refused without that flag — the targets are the caller's to take away
+//! with `DisassociateInstanceEventWindow` — and deleted with it.
+//!
+//! The refusals: a request carrying no id is `MissingParameter`; a value that is no event
+//! window id at all is `InvalidInstanceEventWindowId.Malformed` before anything is looked up;
+//! an id the account holds no window for is the family's own
+//! `InvalidInstanceEventWindowIDNotFound`; and a `DryRun` request that would have succeeded is
+//! `DryRunOperation`.
 //!
 //! ## Shape of an operation
 //!
@@ -174,44 +184,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // anybody called, so those moves are applied before this call reads it.
         store.materialize_due_transitions();
 
-        // An id this account holds no event window for has nothing to delete. THIS
-        // operation's code for that refusal is the one its recorded answer carries —
-        // `InvalidInstanceEventWindowIDNotFound`, written as one word, where the rest of the
-        // event-window surface answers the dotted `Invalid<Resource>Id.NotFound` form — and
-        // the sentence is the template this service refuses a missing resource id with.
-        if !store
+        // An id this account holds no event window for has nothing to delete. The code is the
+        // event-window family's own — `InvalidInstanceEventWindowIDNotFound`, written as one
+        // word, where the rest of this service answers the dotted
+        // `Invalid<Resource>Id.NotFound` form — and the sentence is the one the operations
+        // that act on ONE window answer, naming that id
+        // ([`crate::state::invalid_instance_event_window_id`]) where a describe reports the
+        // list of ids it could not resolve.
+        let Some(record) = store
             .instance_event_windows
-            .contains_key(&input.instance_event_window_id)
-        {
-            return Err(event_window_not_found(&input.instance_event_window_id));
+            .get(&input.instance_event_window_id)
+        else {
+            return Err(state::invalid_instance_event_window_id(
+                &input.instance_event_window_id,
+            ));
+        };
+
+        // "Specify `true` to force delete the event window. Use the force delete parameter if
+        // the event window is currently associated with targets" (`ForceDelete`): without the
+        // flag, a window that still carries targets is not one this call takes away — the
+        // targets are the caller's to disassociate first — so the request is refused for the
+        // state the window is in rather than answered a deletion it did not perform.
+        let force_delete = input.force_delete.unwrap_or(false);
+        if !force_delete && state::event_window_holds_targets(&record.view) {
+            return Err(state::instance_event_window_holds_targets(
+                &input.instance_event_window_id,
+            ));
         }
 
-        // Taking the event window down — and what that does to the instances and the tags
-        // associated with it, which `ForceDelete` is about — is still unwritten, so the
-        // operation answers the scaffold's 501 rather than a success it cannot back with
-        // state. Every refusal the request earns is minted above, before this point, so a
-        // client learns that its input is wrong from the code the real service answers
-        // rather than from this.
-        Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME))
+        // The deletion itself, and the state it leaves the window in, read back OUT of the
+        // store: the caller is told the id and the state of the window the store has just
+        // taken away rather than one held only in this stack frame.
+        let deleted = store
+            .delete_instance_event_window(&input.instance_event_window_id)
+            .ok_or_else(|| {
+                state::internal_error(format!(
+                    "the event window '{}' could not be deleted after it was resolved",
+                    input.instance_event_window_id
+                ))
+            })?;
+        Ok(DeleteInstanceEventWindowOutput {
+            instance_event_window_state: Some(InstanceEventWindowStateChange {
+                instance_event_window_id: deleted.instance_event_window_id,
+                state: deleted.state,
+            }),
+        })
     }
-}
-
-/// `InvalidInstanceEventWindowIDNotFound` (HTTP 400): the request named an event window id
-/// this account holds no event window for.
-///
-/// The code THIS operation is recorded answering — one word, with neither the `Id.NotFound`
-/// dot the rest of this service's id refusals carry nor the `ID` casing of the resource's own
-/// prefix — kept as a named function rather than a literal at the call site, because which of
-/// the two an operation answers is a fact of that operation. The sentence is the one
-/// [`crate::state::invalid_instance_event_window_id_not_found`] words, naming the id from the
-/// REQUEST.
-fn event_window_not_found(instance_event_window_id: &str) -> DeleteInstanceEventWindowError {
-    crate::scaffolded::Scaffolded::service_error(
-        "InvalidInstanceEventWindowIDNotFound",
-        400,
-        format!(
-            "The {resource} ID '{instance_event_window_id}' does not exist",
-            resource = crate::state::RESOURCE_TYPE_INSTANCE_EVENT_WINDOW,
-        ),
-    )
 }

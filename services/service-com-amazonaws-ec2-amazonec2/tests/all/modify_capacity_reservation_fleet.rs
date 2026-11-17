@@ -747,8 +747,8 @@ async fn a_modification_that_cannot_be_served_is_refused_and_changes_nothing() {
 }
 
 /// RULE 3: a Fleet that is being cancelled, or has been, is not one a modification runs from —
-/// the request is refused with `IncorrectState` rather than answered a success that changed
-/// nothing.
+/// the request is refused with the Fleet surface's own state-transition code rather than
+/// answered a success that changed nothing.
 #[tokio::test]
 async fn a_fleet_that_is_no_longer_reserving_cannot_be_modified() {
     let (router, _engine) = super::ec2_query::emulator();
@@ -796,7 +796,7 @@ async fn a_fleet_that_is_no_longer_reserving_cannot_be_modified() {
         );
         assert_eq!(
             error_code(&body),
-            "IncorrectState",
+            "InvalidCapacityReservationFleetStateTransition",
             "case {case:?}: expected the wrong-state code, got body {body}"
         );
         let untouched = described(case, &router, &fleet.id).await;

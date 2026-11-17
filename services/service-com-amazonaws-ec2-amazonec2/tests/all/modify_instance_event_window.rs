@@ -486,6 +486,9 @@ type RefusalRow = (&'static str, Names, Params, &'static str);
 fn refusals() -> Vec<RefusalRow> {
     let min_range = MIN_EVENT_WINDOW_RANGE_HOURS;
     let min_total = MIN_EVENT_WINDOW_TOTAL_HOURS;
+    // The member's own code, answered for every way its expression can break the documented
+    // rules — the create of a window answers the same one.
+    const CRON: &str = "InvalidInstanceEventWindowCronExpression";
     vec![
         (
             "an id the account holds no window for",
@@ -528,43 +531,43 @@ fn refusals() -> Vec<RefusalRow> {
             "a cron expression of four fields",
             Names::TheWindow,
             vec![p("CronExpression", "* 0-4 * *")],
-            "InvalidParameterValue",
+            CRON,
         ),
         (
             "a cron expression whose minute is not a wildcard",
             Names::TheWindow,
             vec![p("CronExpression", "0 0-4 * * 1")],
-            "InvalidParameterValue",
+            CRON,
         ),
         (
             "a cron hour that is a single hour rather than a range",
             Names::TheWindow,
             vec![p("CronExpression", "* 5 * * 1")],
-            "InvalidParameterValue",
+            CRON,
         ),
         (
             "a cron hour range one hour short of the smallest span",
             Names::TheWindow,
             vec![p("CronExpression", format!("* 0-{} * * 1", min_range - 1))],
-            "InvalidParameterValue",
+            CRON,
         ),
         (
             "cron hour ranges one hour short of the smallest total",
             Names::TheWindow,
             vec![p("CronExpression", format!("* 0-{} * * 1", min_total - 1))],
-            "InvalidParameterValue",
+            CRON,
         ),
         (
             "a cron hour past the last hour of the day",
             Names::TheWindow,
             vec![p("CronExpression", "* 0-24 * * 1")],
-            "InvalidParameterValue",
+            CRON,
         ),
         (
             "a cron day of the week past the last day",
             Names::TheWindow,
             vec![p("CronExpression", "* 0-4 * * 7")],
-            "InvalidParameterValue",
+            CRON,
         ),
         (
             "a cron expression longer than the service reads",
@@ -573,7 +576,7 @@ fn refusals() -> Vec<RefusalRow> {
                 "CronExpression",
                 format!("* 0-4 * * {}", "1,".repeat(MAX_EVENT_WINDOW_CRON_BYTES)),
             )],
-            "InvalidParameterValue",
+            CRON,
         ),
         (
             "a time range one hour short of the smallest span",
@@ -709,7 +712,7 @@ async fn a_dry_run_modify_reports_what_it_would_have_done_and_writes_nothing() {
             "a modify that would have been refused for its schedule",
             vec![p("CronExpression", "* 5 * * 1"), p("DryRun", "true")],
             400,
-            "InvalidParameterValue",
+            "InvalidInstanceEventWindowCronExpression",
         ),
     ];
     for (case, rest, status, code) in rows {

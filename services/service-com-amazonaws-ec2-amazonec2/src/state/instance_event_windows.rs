@@ -78,6 +78,11 @@ pub const INSTANCE_EVENT_WINDOW_STATE_ASSOCIATING: &str = "associating";
 /// by `DisassociateInstanceEventWindow` until the clock has finished the work.
 pub const INSTANCE_EVENT_WINDOW_STATE_DISASSOCIATING: &str = "disassociating";
 
+/// The state a window a delete has acted on reports: the `InstanceEventWindowState` member
+/// `deleting` (`smithy_query(query="shape",shape="InstanceEventWindowState")`), which is what
+/// `DeleteInstanceEventWindow` answers with for the window it has just taken away.
+pub const INSTANCE_EVENT_WINDOW_STATE_DELETING: &str = "deleting";
+
 /// `instance-event-window`, the `ResourceType` member that names an event window — the one
 /// resource `CreateInstanceEventWindow`'s `TagSpecifications` may tag.
 pub const RESOURCE_TYPE_INSTANCE_EVENT_WINDOW: &str = "instance-event-window";
@@ -92,12 +97,64 @@ pub const MAX_INSTANCE_EVENT_WINDOWS: usize = 200;
 pub const INSTANCE_EVENT_WINDOW_LIMIT_EXCEEDED: &str = "InstanceEventWindowLimitExceeded";
 
 /// EC2's code for a request that named an event window id the account holds no window for.
+///
+/// ONE WORD, with neither the dot the rest of this service's `Invalid<Kind>Id.NotFound`
+/// codes carry nor the lower-case `Id` of the resource's own prefix: the event-window family
+/// spells this code `InvalidInstanceEventWindowIDNotFound`, which is what its recorded
+/// refusals answer — a caller catching the code by name sees it from every operation of the
+/// family, the describe included. The `.Malformed` half keeps the dotted spelling
+/// ([`INVALID_INSTANCE_EVENT_WINDOW_ID_MALFORMED`]), each half being recorded on its own.
 pub const INVALID_INSTANCE_EVENT_WINDOW_ID_NOT_FOUND: &str =
-    "InvalidInstanceEventWindowId.NotFound";
+    "InvalidInstanceEventWindowIDNotFound";
 
 /// EC2's code for a request that named something that is not an event window id at all.
 pub const INVALID_INSTANCE_EVENT_WINDOW_ID_MALFORMED: &str =
     "InvalidInstanceEventWindowId.Malformed";
+
+/// EC2's code for a `CronExpression` an event window cannot be defined by: the member's own
+/// code, which names the member rather than reporting it as just another bad parameter value.
+///
+/// Answered for EVERY way that expression can fail the rules the member documents — its
+/// length, its field count, a field that must be the wildcard and is not, an hour value that
+/// is no range, a range outside the hours of a day or shorter than the published minimum,
+/// ranges that cover less than the published total, and a day of the week that is no day —
+/// because what the caller has to repair in each case is the same member, and a client
+/// catching this code by name sees it whichever clause the expression broke.
+pub const INVALID_INSTANCE_EVENT_WINDOW_CRON_EXPRESSION: &str =
+    "InvalidInstanceEventWindowCronExpression";
+
+/// Refuse a `CronExpression` an event window cannot be defined by: HTTP 400
+/// [`INVALID_INSTANCE_EVENT_WINDOW_CRON_EXPRESSION`], in the ONE sentence EC2 words for it —
+/// `Invalid Cron Expression <the expression as sent>.`
+///
+/// Fixed text around the one variable part, the expression the REQUEST carried, bounded the
+/// way every echoed caller-chosen value of this crate is ([`echoed_resource_id`]). It states
+/// no clause: the member documents its own rules, and the refusal says which member to repair
+/// — so every way an expression can break those rules reads the same, which is what the
+/// recorded refusals of this member carry.
+pub fn invalid_event_window_cron_expression<E>(expression: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_INSTANCE_EVENT_WINDOW_CRON_EXPRESSION,
+        400,
+        format!(
+            "Invalid Cron Expression {}.",
+            echoed_resource_id(expression)
+        ),
+    )
+}
+
+/// Refuse a request that said when its event window opens in BOTH of the two ways: HTTP 400
+/// [`INVALID_PARAMETER_VALUE`], `The parameter cronExpression cannot be used with the
+/// timeRangesSet.`
+///
+/// "You can define either a set of time ranges or a cron expression …, but not both"
+/// (`CreateInstanceEventWindow`, `ModifyInstanceEventWindow`). ONE definition for the family:
+/// the sentence has no variable part — it names the two members of the request and nothing the
+/// caller sent — and the class is the VALUE of the member being unusable beside the other,
+/// which is what the recorded refusals of both operations carry.
+pub fn both_event_window_schedule_forms_named<E>() -> Scaffolded<E> {
+    invalid_parameter_value("The parameter cronExpression cannot be used with the timeRangesSet.")
+}
 
 /// The days of the week in CALENDAR order, each as the model's `WeekDay` enum spells it
 /// (`crate::ops::types::WEEK_DAY_VALUES`, which lists the same seven members
@@ -356,6 +413,35 @@ impl ComAmazonawsEc2Amazonec2State {
         self.add_stored_bytes(charge);
         true
     }
+
+    /// Delete the event window `instance_event_window_id` names, and answer it as the deletion
+    /// leaves it — `None` when the account holds no such window.
+    ///
+    /// The window is TAKEN OUT of the store, so every later read of it answers the family's
+    /// not-found code: "deletes the specified event window"
+    /// (`DeleteInstanceEventWindow`), and a window the account no longer holds is one a
+    /// describe cannot report, which is what the recorded describe of a deleted window
+    /// answers. The caller-chosen bytes the record held are given back to the store's budget
+    /// by the one definition of that charge
+    /// ([`instance_event_window_payload_bytes`]), the way every other removal path of this
+    /// store gives them back.
+    ///
+    /// The view it answers carries [`INSTANCE_EVENT_WINDOW_STATE_DELETING`] — the state the
+    /// `InstanceEventWindowState` catalog gives a window a delete has acted on, which is what
+    /// EC2 reports for the deletion it has just performed — and the window's id, which is all
+    /// `InstanceEventWindowStateChange` carries.
+    pub fn delete_instance_event_window(
+        &mut self,
+        instance_event_window_id: &str,
+    ) -> Option<InstanceEventWindow> {
+        let record = self
+            .instance_event_windows
+            .remove(instance_event_window_id)?;
+        self.release_stored_bytes(instance_event_window_payload_bytes(&record.view));
+        let mut view = record.view;
+        view.state = Some(INSTANCE_EVENT_WINDOW_STATE_DELETING.to_string());
+        Some(view)
+    }
 }
 
 /// What one `ModifyInstanceEventWindow` changes about a stored window.
@@ -557,20 +643,40 @@ pub fn instance_event_window_id_is_well_formed(id: &str) -> bool {
 }
 
 /// Refuse a request that named an event window id the account holds no such window for:
-/// HTTP 400 `InvalidInstanceEventWindowId.NotFound`.
+/// HTTP 400 [`INVALID_INSTANCE_EVENT_WINDOW_ID_NOT_FOUND`], in the sentence EC2 words for
+/// this family — `Invalid Instance Event Window IDs [<the ids it could not resolve>].`
 ///
-/// Worded by [`id_not_found`], the one template this service refuses an id it holds no
-/// resource for with, and naming the resource the way EC2's own `ResourceType` member for it
-/// does ([`RESOURCE_TYPE_INSTANCE_EVENT_WINDOW`]) — the spelling the refusals of the other
-/// resource families whose ids carry a type token take
-/// ([`invalid_capacity_reservation_id_not_found`]).
+/// The refusal is made over the ids the REQUEST supplied, which is why the sentence carries a
+/// BRACKETED list: a describe that names several windows reports every one it could not
+/// resolve. A refusal here names the one id at fault.
 pub fn invalid_instance_event_window_id_not_found<E>(
     instance_event_window_id: &str,
 ) -> Scaffolded<E> {
-    id_not_found(
+    Scaffolded::service_error(
         INVALID_INSTANCE_EVENT_WINDOW_ID_NOT_FOUND,
-        &format!("{RESOURCE_TYPE_INSTANCE_EVENT_WINDOW} ID"),
-        instance_event_window_id,
+        400,
+        format!(
+            "Invalid Instance Event Window IDs [{}].",
+            echoed_resource_id(instance_event_window_id)
+        ),
+    )
+}
+
+/// The SAME code for the SAME class, in the wording the operations that act on ONE window
+/// answer: `Invalid Instance Event Window ID <the id sent>.` — singular, and naming the id
+/// without the brackets a LIST of them is reported in.
+///
+/// Which of the two an operation answers follows from what it was asked: a describe resolves a
+/// LIST of ids and reports the ones it could not resolve as a list, while a delete acts on one
+/// window and names that one. Both are recorded, each by its own caller.
+pub fn invalid_instance_event_window_id<E>(instance_event_window_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_INSTANCE_EVENT_WINDOW_ID_NOT_FOUND,
+        400,
+        format!(
+            "Invalid Instance Event Window ID {}.",
+            echoed_resource_id(instance_event_window_id)
+        ),
     )
 }
 
@@ -740,6 +846,40 @@ pub fn require_event_window_target_id_count<E>(
         )));
     }
     Ok(())
+}
+
+/// Whether `window` still carries a target of any of the three kinds a window can be
+/// associated with: instance ids, Dedicated Host ids or instance tags.
+///
+/// The ONE reading of "this window is associated with targets" — the condition
+/// `DeleteInstanceEventWindow`'s `ForceDelete` is about ("use the force delete parameter if
+/// the event window is currently associated with targets") — read off the stored window
+/// rather than from a count kept beside it, so it cannot disagree with what the describe
+/// reports.
+pub fn event_window_holds_targets(window: &InstanceEventWindow) -> bool {
+    window.association_target.as_ref().is_some_and(|target| {
+        let held = |list: Option<&Vec<String>>| list.is_some_and(|held| !held.is_empty());
+        held(target.instance_ids.as_ref())
+            || held(target.dedicated_host_ids.as_ref())
+            || target.tags.as_ref().is_some_and(|tags| !tags.is_empty())
+    })
+}
+
+/// Refuse a delete of an event window that still carries targets and did not ask to force
+/// one: HTTP 400 [`INCORRECT_STATE`], naming the window and what has to be taken off it.
+///
+/// The resource exists and the request is well formed; what stands in the way is the state
+/// the window is in — it is associated with targets — which is the class EC2 answers
+/// [`INCORRECT_STATE`] for. The message names the id the REQUEST sent and the member that
+/// deletes such a window anyway.
+pub fn instance_event_window_holds_targets<E>(
+    instance_event_window_id: &str,
+) -> Scaffolded<E> {
+    incorrect_state(format!(
+        "The event window '{}' is associated with targets. Disassociate them, or specify \
+         ForceDelete, and try again",
+        echoed_resource_id(instance_event_window_id)
+    ))
 }
 
 /// Refuse a target this store will not HOLD: more ids than [`MAX_RESOURCE_IDS`] or more
@@ -993,35 +1133,41 @@ pub fn validate_event_window_time_ranges<E>(
 /// week being "either integers 0 through 6, or alternative single values SUN through SAT"
 /// (`CreateInstanceEventWindowRequest$CronExpression`).
 ///
+/// Every clause answers the member's own code
+/// ([`invalid_event_window_cron_expression`]), so a caller repairs the expression under one
+/// code whichever rule it broke.
+///
 /// Shared by the create and the modify of a window, which validate the same member the same
 /// way.
 pub fn validate_event_window_cron_expression<E>(expression: &str) -> Result<(), Scaffolded<E>> {
-    // Refused BEFORE the expression is split, so the pointer vector below is never sized
+    if event_window_cron_expression_is_well_formed(expression) {
+        return Ok(());
+    }
+    Err(invalid_event_window_cron_expression(expression))
+}
+
+/// Whether `expression` satisfies every rule
+/// `CreateInstanceEventWindowRequest$CronExpression` documents — the reading
+/// [`validate_event_window_cron_expression`] refuses an expression on.
+///
+/// Separate from the refusal because EC2 answers ONE sentence for every way an expression can
+/// break those rules ([`invalid_event_window_cron_expression`]), so which clause failed is a
+/// question about the value and not about the message.
+fn event_window_cron_expression_is_well_formed(expression: &str) -> bool {
+    // Asked BEFORE the expression is split, so the pointer vector below is never sized
     // from a length the caller chose freely.
     if expression.len() > MAX_EVENT_WINDOW_CRON_BYTES {
-        return Err(invalid_parameter_value(format!(
-            "cronExpression carries {} bytes, above the maximum of \
-             {MAX_EVENT_WINDOW_CRON_BYTES}",
-            expression.len()
-        )));
+        return false;
     }
     let fields: Vec<&str> = expression.split_whitespace().collect();
     if fields.len() != CRON_FIELDS {
-        return Err(invalid_parameter_value(format!(
-            "Invalid value '{expression}' for cronExpression. A cron expression carries \
-             {CRON_FIELDS} fields, not {}",
-            fields.len()
-        )));
+        return false;
     }
     // Only the hour (the second field) and the day of the week (the fifth) carry values;
     // the minute, the day of the month and the month must each be `*`.
-    for (position, name) in [(0, "minute"), (2, "day of the month"), (3, "month")] {
-        let field = fields.get(position).copied().unwrap_or_default();
-        if field != CRON_WILDCARD {
-            return Err(invalid_parameter_value(format!(
-                "Invalid value '{field}' for the {name} field of cronExpression. \
-                 It must be '{CRON_WILDCARD}'"
-            )));
+    for position in [0, 2, 3] {
+        if fields.get(position).copied().unwrap_or_default() != CRON_WILDCARD {
+            return false;
         }
     }
 
@@ -1031,47 +1177,28 @@ pub fn validate_event_window_cron_expression<E>(expression: &str) -> Result<(), 
         // "The hour value must be one or a multiple range" — a bare hour names no range, so
         // it is refused along with anything that is not two hours around one `-`.
         let Some((start, end)) = element.split_once('-') else {
-            return Err(invalid_parameter_value(format!(
-                "Invalid value '{element}' for the hour field of cronExpression. \
-                 An hour value is one or more ranges, for example 0-4 or 0-4,20-23"
-            )));
+            return false;
         };
         let (Ok(start), Ok(end)) = (start.parse::<i64>(), end.parse::<i64>()) else {
-            return Err(invalid_parameter_value(format!(
-                "Invalid value '{element}' for the hour field of cronExpression. \
-                 An hour range runs between two hours, for example 0-4"
-            )));
+            return false;
         };
         if !(0..HOURS_PER_DAY).contains(&start) || !(0..HOURS_PER_DAY).contains(&end) {
-            return Err(invalid_parameter_value(format!(
-                "Invalid value '{element}' for the hour field of cronExpression. \
-                 An hour is from 0 to {last}",
-                last = HOURS_PER_DAY - 1
-            )));
+            return false;
         }
         // A cron hour range does not wrap within a day — the day-of-the-week field is what
-        // carries a window across days — so a reversed range is refused as reversed rather
-        // than reported as covering a negative number of hours.
+        // carries a window across days — so a reversed range is refused rather than read as
+        // covering a negative number of hours.
         if end <= start {
-            return Err(invalid_parameter_value(format!(
-                "Invalid value '{element}' for the hour field of cronExpression. \
-                 An hour range runs forwards, from its earlier hour to its later one"
-            )));
+            return false;
         }
         let hours = end - start;
         if hours < MIN_EVENT_WINDOW_RANGE_HOURS {
-            return Err(invalid_parameter_value(format!(
-                "The hour range '{element}' of cronExpression covers {hours} hours; \
-                 each hour range must cover at least {MIN_EVENT_WINDOW_RANGE_HOURS} hours"
-            )));
+            return false;
         }
         total_hours = total_hours.saturating_add(hours);
     }
     if total_hours < MIN_EVENT_WINDOW_TOTAL_HOURS {
-        return Err(invalid_parameter_value(format!(
-            "The hour ranges of cronExpression cover {total_hours} hours between them; \
-             the combined total must be at least {MIN_EVENT_WINDOW_TOTAL_HOURS} hours"
-        )));
+        return false;
     }
 
     let day_field = fields.get(4).copied().unwrap_or_default();
@@ -1080,22 +1207,9 @@ pub fn validate_event_window_cron_expression<E>(expression: &str) -> Result<(), 
     // multiple range" names no wildcard, and a window open every hour of every day would
     // not be a window. The asymmetry is the member's, not an oversight here.
     if day_field != CRON_WILDCARD {
-        for element in day_field.split(',') {
-            if !cron_day_of_week_is_known(element) {
-                return Err(invalid_parameter_value(format!(
-                    "Invalid value '{element}' for the day of the week field of \
-                     cronExpression. A day of the week is an integer from 0 to 6, or one \
-                     of {days}",
-                    days = WEEK_DAYS_IN_ORDER
-                        .iter()
-                        .map(|(_, alternative)| *alternative)
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                )));
-            }
-        }
+        return day_field.split(',').all(cron_day_of_week_is_known);
     }
-    Ok(())
+    true
 }
 
 /// The cron field that names every value of its position: "the minute, month, and year must

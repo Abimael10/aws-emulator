@@ -470,7 +470,9 @@ async fn a_bad_request_is_refused_with_the_ec2_error_code_for_it() {
                 param("Attribute", AUTO_ENABLE_IO),
             ],
             400,
-            ec2::state::INVALID_VOLUME_ID_MALFORMED,
+            // This describe reads its `volumeId` as a PARAMETER, so a value it cannot read is
+            // EC2's parameter-value code rather than the volume's own `.Malformed`.
+            ec2::state::INVALID_PARAMETER_VALUE,
         ),
         (
             "a describe of a volume that does not exist",
@@ -536,7 +538,7 @@ async fn a_bad_request_is_refused_with_the_ec2_error_code_for_it() {
                 param("DryRun", "true"),
             ],
             400,
-            ec2::state::INVALID_VOLUME_ID_MALFORMED,
+            ec2::state::INVALID_PARAMETER_VALUE,
         ),
         (
             "a dry run of a describe of a volume that does not exist",

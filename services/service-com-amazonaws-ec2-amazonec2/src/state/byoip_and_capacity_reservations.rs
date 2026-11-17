@@ -853,18 +853,28 @@ pub fn asn_association_is_held(state: &str) -> bool {
     !UNHELD_ASN_ASSOCIATION_STATES.contains(&state)
 }
 
-/// `InvalidByoasn.NotFound` (HTTP 400): the request named an ASN this account has not
+/// `InvalidAsn.NotFound` (HTTP 400): the request named an ASN this account has not
 /// brought to IPAM, so there is no ASN to act on.
 ///
 /// EC2's `Invalid<Kind>.NotFound` convention for a resource the model publishes no error
-/// shape for, the way [`INVALID_IPAM_POOL_ID_NOT_FOUND`] is for an IPAM pool: the ASN is the
-/// whole name of a BYOASN (`Byoasn$Asn`), so there is no id form to refuse separately.
-pub const INVALID_BYOASN_NOT_FOUND: &str = "InvalidByoasn.NotFound";
+/// shape for, the way [`INVALID_IPAM_POOL_ID_NOT_FOUND`] is for an IPAM pool: the kind is the
+/// ASN itself, which is the whole name of a BYOASN (`Byoasn$Asn`), so there is no id form to
+/// refuse separately.
+pub const INVALID_BYOASN_NOT_FOUND: &str = "InvalidAsn.NotFound";
+
+/// The sentence EC2 answers [`INVALID_BYOASN_NOT_FOUND`] with.
+///
+/// FIXED text: it says that the ASN the request asked about could not be found and repeats no
+/// part of the request — the caller sent the ASN, so the message names the condition rather
+/// than echoing the value.
+pub const BYOASN_NOT_FOUND_MESSAGE: &str = "The requested ASN could not be found.";
 
 /// Refuse a request that named an ASN this account has not brought to IPAM: HTTP 400
-/// [`INVALID_BYOASN_NOT_FOUND`], naming the ASN the request sent.
-pub fn byoasn_not_found<E>(asn: &str) -> Scaffolded<E> {
-    id_not_found(INVALID_BYOASN_NOT_FOUND, "ASN", asn)
+/// [`INVALID_BYOASN_NOT_FOUND`], with EC2's own sentence for that code
+/// ([`BYOASN_NOT_FOUND_MESSAGE`]), which states the condition and names no part of the
+/// request.
+pub fn byoasn_not_found<E>() -> Scaffolded<E> {
+    Scaffolded::service_error(INVALID_BYOASN_NOT_FOUND, 400, BYOASN_NOT_FOUND_MESSAGE)
 }
 
 /// Refuse a request that named an address range IPAM does not manage: HTTP 400
@@ -1104,7 +1114,7 @@ impl ComAmazonawsEc2Amazonec2State {
     /// cannot take the store past [`MAX_STORED_BYTES`] uncharged.
     pub fn begin_byoasn_release<E>(&mut self, asn: &str) -> Result<Byoasn, Scaffolded<E>> {
         let Some(mut record) = self.byoasns.get(asn).cloned() else {
-            return Err(byoasn_not_found(asn));
+            return Err(byoasn_not_found());
         };
         record.byoasn.state = Some(ASN_STATE_PENDING_DEPROVISION.to_string());
         // Whatever an earlier move had to report about the ASN says nothing about this

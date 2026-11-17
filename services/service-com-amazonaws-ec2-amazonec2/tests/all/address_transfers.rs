@@ -624,7 +624,9 @@ async fn enable_refuses_what_it_cannot_transfer_and_stores_nothing() {
                 p("TransferAccountId", TRANSFER_ACCOUNTS[0]),
             ],
             400,
-            "InvalidAllocationID.NotFound",
+            // The transfer surface answers the Elastic IP address id code for this failure,
+            // as `DisableAddressTransfer` does.
+            "InvalidElasticIpID.NotFound",
         ),
         (
             "an allocation id of another resource kind",

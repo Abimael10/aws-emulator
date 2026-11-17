@@ -772,18 +772,9 @@ async fn moving_a_range_to_ipam_is_checked_and_then_visible() {
     let ipv4 = seed_byoip_cidr(&engine, "192.0.2.0/24", BYOIP_CIDR_STATE_PROVISIONED);
     let ipv6 = seed_byoip_cidr(&engine, "2001:db8::/56", BYOIP_CIDR_STATE_PROVISIONED);
 
-    // Rows: an owner that does not own the pool, a pool of the other address family, and
-    // an IPv6 range (which "cannot" be moved at all) — each a value of the request the pool
-    // or the range does not admit.
+    // Rows: a pool of the other address family, and an IPv6 range (which "cannot" be moved
+    // at all) — each a value of the request the pool or the range does not admit.
     let refusals: Vec<(&str, Vec<(String, String)>)> = vec![
-        (
-            "an owner that does not own the pool",
-            vec![
-                member("Cidr", &ipv4),
-                member("IpamPoolId", &ipv4_pool),
-                member("IpamPoolOwner", OTHER_ACCOUNT),
-            ],
-        ),
         (
             "a pool of the other address family",
             vec![
@@ -821,6 +812,29 @@ async fn moving_a_range_to_ipam_is_checked_and_then_visible() {
             "case {case:?}: expected InvalidParameterValue, got {body}"
         );
     }
+
+    // The pool is named by its id AND its owner, so an owner that does not own the pool
+    // names no pool at all: the request is refused with the pool's own not-found code, the
+    // way an id nothing holds is, rather than for the value of a member.
+    let (status, body) = invoke(
+        &router,
+        "MoveByoipCidrToIpam",
+        &[
+            member("Cidr", &ipv4),
+            member("IpamPoolId", &ipv4_pool),
+            member("IpamPoolOwner", OTHER_ACCOUNT),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "an owner that does not own the pool: expected HTTP 400, got {status} with body {body}"
+    );
+    assert_eq!(
+        error_code(&body),
+        ec2::state::INVALID_IPAM_POOL_ID_NOT_FOUND,
+        "an owner that does not own the pool: expected InvalidIpamPoolId.NotFound, got {body}"
+    );
 
     // A range nothing provisioned is not a value the request got wrong — it is a range this
     // account does not hold, which is the store's own `InvalidCidr.NotFound`.

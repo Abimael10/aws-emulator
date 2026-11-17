@@ -140,24 +140,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         use crate::state;
 
-        // "The BYOIP CIDR" (`Cidr`): a value that is not a CIDR block names no range. The
-        // range is canonicalised so one range cannot be named two ways.
-        let cidr = state::canonical_byoip_cidr(&input.cidr)
-            .map_err(|_| state::invalid_byoip_cidr(&input.cidr))?;
-        // "The Amazon Web Services account ID of the owner of the IPAM pool"
-        // (`IpamPoolOwner`) — an account id is twelve digits, so anything else names no
-        // account.
-        if !state::aws_account_id_is_well_formed(&input.ipam_pool_owner) {
-            return Err(state::invalid_parameter_value(format!(
-                "Invalid value '{owner}' for IpamPoolOwner. It must be a 12-digit Amazon Web \
-                 Services account ID",
-                owner = input.ipam_pool_owner,
-            )));
-        }
-
-        // The pool id's own form next, for the same reason: "not an IPAM pool id" is a
-        // malformed request rather than an unknown pool, and is never answered by the
-        // DryRun arm below either.
+        // The pool id's own form first: "not an IPAM pool id" is a malformed request rather
+        // than an unknown pool, and is never answered by the DryRun arm below either.
         let pool_id = input.ipam_pool_id.as_str();
         state::require_well_formed_id(
             state::IPAM_POOL_ID_PREFIX,
@@ -178,26 +162,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state_handle = state::require_service_state(&*self.engine)?;
         let mut store = state_handle.lock();
 
-        // The DESTINATION of the move is resolved first: a pool id this account holds no
-        // pool for is refused with the pool's own `NotFound` code, whatever the range turns
-        // out to be, so a client can tell "no such pool" from every other reason the move
-        // could fail.
-        let pool = store.ipam_pools.get(pool_id).cloned().ok_or_else(|| {
-            state::id_not_found(
-                state::INVALID_IPAM_POOL_ID_NOT_FOUND,
-                state::IPAM_POOL_ID_KIND,
-                pool_id,
-            )
-        })?;
-        // "The Amazon Web Services account ID of the OWNER of the IPAM pool": an account
-        // that does not own the pool names a pool it cannot move a range into.
-        let owner = pool.owner_id.as_deref().unwrap_or_default();
-        if owner != input.ipam_pool_owner {
-            return Err(state::invalid_parameter_value(format!(
-                "The IPAM pool '{pool_id}' is owned by '{owner}', not by '{requested}'",
-                requested = input.ipam_pool_owner,
-            )));
+        // The DESTINATION of the move is resolved BEFORE the range is read, and it is named
+        // by BOTH members: "the Amazon Web Services account ID of the OWNER of the IPAM pool"
+        // (`IpamPoolOwner`) says whose pool `IpamPoolId` names, so the pair resolves a pool
+        // of that account or nothing at all. An id no pool of the named owner has — one
+        // nothing holds, and one held by a DIFFERENT account, which the named owner can no
+        // more see than a pool that was never created — is refused with the pool's own
+        // `NotFound` code, whatever the range turns out to be, so a client can tell "no such
+        // pool" from every other reason the move could fail.
+        let pool = store
+            .ipam_pools
+            .get(pool_id)
+            .filter(|pool| pool.owner_id.as_deref() == Some(input.ipam_pool_owner.as_str()))
+            .cloned()
+            .ok_or_else(|| {
+                state::id_not_found(
+                    state::INVALID_IPAM_POOL_ID_NOT_FOUND,
+                    state::IPAM_POOL_ID_KIND,
+                    pool_id,
+                )
+            })?;
+
+        // "The BYOIP CIDR" (`Cidr`): a value that is not a CIDR block names no range. The
+        // range is canonicalised so one range cannot be named two ways.
+        let cidr = state::canonical_byoip_cidr(&input.cidr)
+            .map_err(|_| state::invalid_byoip_cidr(&input.cidr))?;
+        // "If you ALREADY HAVE a BYOIPv4 CIDR with Amazon Web Services, you can move the
+        // CIDR to IPAM from a public IPv4 pool": a range this account has not brought to AWS
+        // is no range of its own to move, which is EC2's `InvalidCidr.NotFound` — asked
+        // BEFORE the pool is held to what it may take, because a range that does not exist is
+        // not a range any pool could have accepted.
+        if !store.byoip_cidrs.contains_key(&cidr) {
+            return Err(state::invalid_cidr_not_found(&cidr));
         }
+
         // "Move a BYOIPv4 CIDR to IPAM FROM A PUBLIC IPv4 POOL", and a pool's public IP
         // source is "only used for provisioning IP address CIDRs to pools in the PUBLIC
         // scope" (`IpamPool$PublicIpSource`): a pool in the private scope holds the
@@ -229,9 +227,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // "If you ALREADY HAVE a BYOIPv4 CIDR with Amazon Web Services, you can move the
-        // CIDR to IPAM from a public IPv4 pool": a range this account has not brought to AWS
-        // is no range of its own to move, which is EC2's `InvalidCidr.NotFound`.
         let record = store
             .byoip_cidrs
             .get_mut(&cidr)
