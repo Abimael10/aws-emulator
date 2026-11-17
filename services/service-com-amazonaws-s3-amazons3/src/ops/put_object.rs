@@ -516,11 +516,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutObject<Eng> {
         // Which algorithm this write's checksum is computed under: the one an individual
         // `Checksum*` member named, else the `ChecksumAlgorithm` member — "if you provide an
         // individual checksum, Amazon S3 ignores any provided ChecksumAlgorithm parameter"
-        // (`PutObjectRequest$ChecksumAlgorithm`).
+        // (`PutObjectRequest$ChecksumAlgorithm`) — else the one the write's TRAILER declares:
+        // a framed body sends its checksum in the trailing header `x-amz-trailer` names
+        // ([`crate::service::chunked_upload::trailer_checksum_algorithm`]), which says the
+        // same thing about the object as the up-front member does, so the object is stored
+        // under that algorithm and every read of it reports that checksum.
         let algorithm = declared_checksums
             .named_algorithm()
             .map(str::to_string)
-            .or_else(|| input.checksum_algorithm.clone());
+            .or_else(|| input.checksum_algorithm.clone())
+            .or_else(|| {
+                crate::service::chunked_upload::trailer_checksum_algorithm(ctx.parts())
+            });
 
         // "The tag-set for the object. The tag-set must be encoded as URL Query
         // parameters. (For example, "Key1=Value1")" (`PutObjectRequest$Tagging`) — so the
@@ -856,6 +863,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutObject<Eng> {
             server_side_encryption: input.server_side_encryption.as_deref(),
             kms_key_id: input.ssekms_key_id.as_deref(),
             sse_customer_algorithm: input.sse_customer_algorithm.as_deref(),
+            // The conditional-write preconditions this request carried, which a policy that
+            // makes overwrite protection mandatory is written over: such a clause is decided
+            // by whether THIS request carried the header, so a write naming neither answers
+            // both keys as absent.
+            if_match: input.if_match.as_deref(),
+            if_none_match: input.if_none_match.as_deref(),
             ..crate::service::authorization::ObjectWriteContext::default()
         };
         if let Some(message) = crate::service::request_authorization::denial(
@@ -1242,7 +1255,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutObject<Eng> {
             // the bucket default it inherited — never a configuration nothing applied.
             server_side_encryption: encryption.sse_algorithm.clone(),
             ssekms_key_id: encryption.kms_key_id.clone(),
-            ssekms_encryption_context: encryption.kms_encryption_context.clone(),
+            // The encryption context the object's data key is BOUND to, which is the entry
+            // S3 adds naming what it encrypted beside the pairs the write supplied
+            // ([`crate::state::sse_kms::reported_encryption_context`]) — the same context
+            // every read of the object is decrypted under, so a caller reproducing it out of
+            // band computes what S3 used rather than its own half of it.
+            ssekms_encryption_context: crate::state::sse_kms::reported_encryption_context(
+                &input.bucket,
+                &input.key,
+                &encryption,
+            ),
             bucket_key_enabled: encryption.reported_bucket_key_enabled(),
             // And for a write that supplied its OWN key: the algorithm it named and the
             // digest of that key — "the response headers … include the encryption algorithm

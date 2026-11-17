@@ -401,12 +401,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
         };
 
         // Members whose semantics this emulator cannot carry out faithfully — the same
-        // list `PutObject` refuses a write for, plus the copy-source half of SSE-C:
+        // list `PutObject` refuses a write for, minus the destination preconditions:
         //
-        // * `If-Match` / `If-None-Match` make the DESTINATION write conditional, and the
-        //   documented answers when the condition fails are HTTP 412 `PreconditionFailed`
-        //   and 409 `ConditionalRequestConflict` on a key this operation does not read
-        //   before writing it.
         // * the SSE-C members carry a customer-provided KEY. S3 "doesn't store the
         //   encryption key you provide", so an object written under one could not be read
         //   back here, and no object this store holds was encrypted with one — which is
@@ -415,16 +411,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
         // * the Object Lock EVENT hold members decide when a period starts running from an
         //   event nothing here raises, so no stored version can carry one.
         //
-        // The copy-source PRECONDITIONS are not in this list: they are judged below
-        // against the stored source object, and a condition that does not hold is answered
-        // with the 412 S3 documents for them.
+        // Neither the copy-source PRECONDITIONS nor the DESTINATION's are in this list: both
+        // are judged below — the source's against the stored source object, the destination's
+        // against what the destination key holds — and a condition that does not hold is
+        // answered with the 412 S3 documents for them.
         //
         // The Object Lock MODE, RETAIN-UNTIL DATE and LEGAL HOLD are not in this list
         // either: they are the lock the destination version is stored with, recorded on it
         // below exactly as `PutObject` records its own.
         for (member, present) in [
-            ("If-Match", input.if_match.is_some()),
-            ("If-None-Match", input.if_none_match.is_some()),
             (
                 "x-amz-server-side-encryption-customer-algorithm",
                 input.sse_customer_algorithm.is_some(),
@@ -693,6 +688,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
             // A copy supplying a customer-provided key is refused above, so this request
             // carries no value for that key.
             sse_customer_algorithm: None,
+            // The conditional-write preconditions on the DESTINATION this request carried,
+            // which a policy that makes overwrite protection mandatory is written over.
+            if_match: input.if_match.as_deref(),
+            if_none_match: input.if_none_match.as_deref(),
         };
         if let Some(message) = crate::service::request_authorization::denial(
             &caller,
@@ -1055,6 +1054,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
             source_object.tags.clone()
         };
 
+        // The DESTINATION's conditional members, judged against what the destination key
+        // holds NOW — the copy's write is what they make conditional, so they are judged
+        // here, immediately before it, through the one rule every conditional write in this
+        // service is judged by ([`crate::state::unmet_write_precondition`]). A refused copy
+        // writes nothing, so the object the destination key holds is left exactly as it was
+        // and the caller can read its tag and retry; an `If-Match` at a key holding no live
+        // object names the tag of nothing at all, so what the caller is told is that the key
+        // is not there.
+        if let Some(unmet) = crate::state::unmet_write_precondition(
+            store
+                .bucket(&input.bucket)
+                .and_then(|bucket| bucket.object(&input.key))
+                .map(|object| object.etag.as_str()),
+            input.if_match.as_deref(),
+            input.if_none_match.as_deref(),
+        ) {
+            return Err(match unmet {
+                crate::state::UnmetWriteCondition::NoSuchKey => {
+                    crate::scaffolded::Scaffolded::no_such_key()
+                }
+                crate::state::UnmetWriteCondition::Condition(condition) => {
+                    crate::scaffolded::Scaffolded::precondition_failed(condition)
+                }
+            });
+        }
+
         // The destination object. Its bytes are the source's, so its entity tag is the
         // digest of those bytes, computed the one way every object's is
         // ([`crate::state::object_etag`]) — except where the DESTINATION's own encryption
@@ -1331,7 +1356,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
             // bucket's default when it named none.
             server_side_encryption: encryption.sse_algorithm.clone(),
             ssekms_key_id: encryption.kms_key_id.clone(),
-            ssekms_encryption_context: encryption.kms_encryption_context.clone(),
+            // The context the destination object's data key is BOUND to, reported the one
+            // way every write of this service reports it
+            // ([`crate::state::sse_kms::reported_encryption_context`]): the entry naming
+            // what S3 encrypted beside the pairs the request supplied.
+            ssekms_encryption_context: crate::state::sse_kms::reported_encryption_context(
+                &input.bucket,
+                &input.key,
+                &encryption,
+            ),
             bucket_key_enabled: encryption.reported_bucket_key_enabled(),
             // "If the object expiration is configured, the response includes this header"
             // (`CopyObjectOutput$Expiration`): the DESTINATION bucket's lifecycle

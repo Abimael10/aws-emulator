@@ -417,7 +417,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteObject<Eng>
                     input.version_id.as_deref(),
                 ),
                 &crate::state::object_arn(&input.bucket, &input.key),
-                &crate::service::authorization::read_conditions(),
+                // The condition context is this request's own: a delete carries the
+                // conditional precondition a policy making compare-and-delete mandatory is
+                // written over ([`crate::service::authorization::ObjectWriteContext`]), and
+                // none of the write-header members a delete cannot name.
+                &crate::service::authorization::ObjectWriteContext {
+                    if_match: input.if_match.as_deref(),
+                    ..crate::service::authorization::ObjectWriteContext::default()
+                }
+                .conditions(),
             )
         });
         if let Some(message) = delete_denial {

@@ -465,13 +465,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `Checksum*` member named — "if you provide an individual checksum, Amazon S3
         // ignores any provided ChecksumAlgorithm parameter"
         // (`UploadPartRequest$ChecksumAlgorithm`) — else the `ChecksumAlgorithm` member
-        // itself, else the algorithm the INITIATION settled, because "this checksum
-        // algorithm must be the same for all parts" and the parts of such an upload each
-        // carry one.
+        // itself, else the one this part's TRAILER declares (a framed body sends its checksum
+        // in the trailing header `x-amz-trailer` names,
+        // [`crate::service::chunked_upload::trailer_checksum_algorithm`]), else the algorithm
+        // the INITIATION settled, because "this checksum algorithm must be the same for all
+        // parts" and the parts of such an upload each carry one.
         let algorithm = declared
             .named_algorithm()
             .map(str::to_string)
             .or_else(|| input.checksum_algorithm.clone())
+            .or_else(|| crate::service::chunked_upload::trailer_checksum_algorithm(ctx.parts()))
             .or(initiated_algorithm);
         // Computed over THIS part's bytes, never over the object the parts will assemble
         // into: "the Base64 encoded, … checksum of the part" (`UploadPartOutput`'s

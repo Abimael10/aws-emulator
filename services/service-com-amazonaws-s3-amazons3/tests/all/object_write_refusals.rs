@@ -36,6 +36,12 @@
 //!   does offer answers the status the operation documents for a retrieval it INITIATED:
 //!   "if the object is not previously restored, then Amazon S3 returns `202 Accepted` in the
 //!   response."
+//! * A write is refused for the FRAMING its body arrives in: a body sent in the `aws-chunked`
+//!   transfer encoding states the length of the object it carries in
+//!   `x-amz-decoded-content-length` and nowhere else, so a framed write that leaves it off is
+//!   refused `MissingContentLength` (411) and stores nothing. The same rule's other half: a
+//!   framed write that states it is served and stores its object under the checksum algorithm
+//!   its `x-amz-trailer` names, which every later read of the object reports.
 
 use service_com_amazonaws_s3_amazons3::ops::types::{STORAGE_CLASS_VALUES, TIER_VALUES};
 use service_com_amazonaws_s3_amazons3::service::object_write::{
@@ -78,6 +84,240 @@ const INVALID_TIER: &str = "InvalidTier";
 /// See [`INVALID_TIER`].
 const RETRIEVAL_OPTION_UNSUPPORTED: &str =
     "Retrieval option is not supported by this storage class.";
+
+/// The code and sentence S3 answers a write that does not say how long its payload is
+/// (Amazon S3 "Error responses": "MissingContentLength — You must provide the Content-Length
+/// HTTP header", HTTP 411). Spelled out here rather than imported, so a wording regression
+/// fails this suite.
+const MISSING_CONTENT_LENGTH: &str = "MissingContentLength";
+/// See [`MISSING_CONTENT_LENGTH`].
+const MISSING_CONTENT_LENGTH_MESSAGE: &str = "You must provide the Content-Length HTTP header.";
+
+/// The `x-amz-content-sha256` marker an SDK streaming a payload with a trailing checksum
+/// declares, which is what makes the body a framed one rather than a payload.
+const STREAMING_TRAILER_MARKER: &str = "STREAMING-UNSIGNED-PAYLOAD-TRAILER";
+
+/// `payload` in the `aws-chunked` transfer encoding: one chunk of its own length, the
+/// zero-length chunk that terminates the stream, and the trailing header `trailer` names
+/// carrying `value`.
+fn framed(payload: &[u8], trailer: &str, value: &str) -> Vec<u8> {
+    let mut body = format!("{:x}\r\n", payload.len()).into_bytes();
+    body.extend_from_slice(payload);
+    body.extend_from_slice(b"\r\n0\r\n");
+    body.extend_from_slice(format!("{trailer}:{value}\r\n\r\n").as_bytes());
+    body
+}
+
+/// The Base64 digest of `data` under the `ChecksumAlgorithm` value `algorithm`, computed by
+/// the AWS SDK's own checksum crate rather than read back from the crate under test.
+fn digest_of(algorithm: &str, data: &[u8]) -> String {
+    let parsed: aws_smithy_checksums::ChecksumAlgorithm = algorithm
+        .to_ascii_lowercase()
+        .parse()
+        .unwrap_or_else(|error| {
+            panic!("{algorithm} must be a checksum this crate computes: {error}")
+        });
+    let mut checksum = parsed.into_impl();
+    checksum.update(data);
+    aws_smithy_types::base64::encode(checksum.finalize())
+}
+
+/// One row of the framing table: the case, the key written, the `content-encoding` the write
+/// declares, whether it states its decoded payload length, the algorithm its trailer names,
+/// and whether the write must be refused.
+struct FramingRow {
+    case: &'static str,
+    key: &'static str,
+    content_encoding: Option<&'static str>,
+    states_payload_length: bool,
+    trailer_algorithm: &'static str,
+    refused: bool,
+}
+
+/// A body sent in the `aws-chunked` transfer encoding states the length of the object it
+/// carries in `x-amz-decoded-content-length` and nowhere else, so a framed write that leaves
+/// it off is refused `MissingContentLength` (411) and stores nothing — while one that states
+/// it is served and stores its object under the checksum algorithm its `x-amz-trailer`
+/// names, which every later read of the object then reports.
+///
+/// The rows differ along what the rule generalises over: whether the body declares the framing
+/// at all (and whether it declares it beside another encoding), whether the decoded length is
+/// stated, and WHICH algorithm the trailer names.
+#[tokio::test]
+async fn a_framed_write_must_state_its_payload_length_and_stores_the_checksum_it_trails() {
+    let router = router();
+    framing_bucket(&router).await;
+
+    let rows: [FramingRow; 5] = [
+        FramingRow {
+            case: "a framed body that states no payload length",
+            key: "framed/unstated.bin",
+            content_encoding: Some("aws-chunked"),
+            states_payload_length: false,
+            trailer_algorithm: "CRC32",
+            refused: true,
+        },
+        FramingRow {
+            case: "a framed body declared beside another encoding, stating no payload length",
+            key: "framed/unstated-gzip.bin",
+            content_encoding: Some("aws-chunked, gzip"),
+            states_payload_length: false,
+            trailer_algorithm: "CRC32",
+            refused: true,
+        },
+        FramingRow {
+            case: "a framed body stating its payload length, trailing a CRC32",
+            key: "framed/crc32.bin",
+            content_encoding: Some("aws-chunked"),
+            states_payload_length: true,
+            trailer_algorithm: "CRC32",
+            refused: false,
+        },
+        FramingRow {
+            case: "a framed body trailing a SHA256 instead",
+            key: "framed/sha256.bin",
+            content_encoding: Some("aws-chunked"),
+            states_payload_length: true,
+            trailer_algorithm: "SHA256",
+            refused: false,
+        },
+        FramingRow {
+            // The boundary of the rule: the refusal is about the FRAMING, so a plain payload
+            // that states no decoded length is not one.
+            case: "an unframed payload, which states no decoded length either",
+            key: "framed/unframed.bin",
+            content_encoding: None,
+            states_payload_length: false,
+            trailer_algorithm: "CRC32",
+            refused: false,
+        },
+    ];
+
+    for row in &rows {
+        let FramingRow {
+            case,
+            key,
+            content_encoding,
+            states_payload_length,
+            trailer_algorithm,
+            refused,
+        } = row;
+        let payload = format!("the payload of {case}\n").into_bytes();
+        let trailer = format!(
+            "x-amz-checksum-{}",
+            trailer_algorithm.to_ascii_lowercase()
+        );
+        let digest = digest_of(trailer_algorithm, &payload);
+        let length = payload.len().to_string();
+        let body = match content_encoding {
+            Some(_) => framed(&payload, &trailer, &digest),
+            None => payload.clone(),
+        };
+        let mut headers: Vec<(&str, &str)> = vec![
+            ("x-amz-content-sha256", STREAMING_TRAILER_MARKER),
+            ("x-amz-trailer", trailer.as_str()),
+        ];
+        if let Some(encoding) = content_encoding {
+            headers.push(("content-encoding", encoding));
+        }
+        if *states_payload_length {
+            headers.push(("x-amz-decoded-content-length", length.as_str()));
+        }
+        let written = send_bytes(
+            &router,
+            "PUT",
+            &format!("/{FRAMING_BUCKET}/{key}"),
+            &headers,
+            &body,
+        )
+        .await;
+
+        if *refused {
+            assert_eq!(
+                written.status, 411,
+                "case {case:?}: expected HTTP 411, got {} with body {:?}",
+                written.status,
+                text(&written)
+            );
+            assert_eq!(
+                written.error_code(),
+                MISSING_CONTENT_LENGTH,
+                "case {case:?}: expected the {MISSING_CONTENT_LENGTH} code, got {:?}",
+                written.error_code()
+            );
+            assert_eq!(
+                written.error_message(),
+                MISSING_CONTENT_LENGTH_MESSAGE,
+                "case {case:?}: expected the published sentence, got {:?}",
+                written.error_message()
+            );
+            // A refused write stores nothing: the key it addressed is still empty.
+            let read = read_back(&router, key).await;
+            assert_eq!(
+                read.status, 404,
+                "case {case:?}: a refused write must store nothing, got {} with body {:?}",
+                read.status,
+                text(&read)
+            );
+            continue;
+        }
+
+        assert_eq!(
+            written.status, 200,
+            "case {case:?}: expected HTTP 200, got {} with body {:?}",
+            written.status,
+            text(&written)
+        );
+        let read = read_back(&router, key).await;
+        assert_eq!(
+            read.status, 200,
+            "case {case:?}: the stored object must read back, got {} with body {:?}",
+            read.status,
+            text(&read)
+        );
+        assert_eq!(
+            read.body.as_ref(),
+            payload.as_slice(),
+            "case {case:?}: the stored bytes must be the decoded payload, got {} of them",
+            read.body.len()
+        );
+        // The object carries the checksum its trailer named, so every later read of it
+        // reports that one — which is what a caller verifying integrity reads back. A write
+        // that declared a framing but trailed nothing the store could name would report the
+        // default algorithm instead.
+        let header = format!(
+            "x-amz-checksum-{}",
+            trailer_algorithm.to_ascii_lowercase()
+        );
+        assert_eq!(
+            read.header(&header).as_deref(),
+            Some(digest.as_str()),
+            "case {case:?}: expected {header} as {digest:?}, got {:?}",
+            read.header(&header)
+        );
+    }
+}
+
+/// The bucket the framing rows write into.
+const FRAMING_BUCKET: &str = "write-framing";
+
+/// Create [`FRAMING_BUCKET`].
+async fn framing_bucket(router: &MultiServiceRouter) {
+    bucket(router, FRAMING_BUCKET).await;
+}
+
+/// Read `key` back out of [`FRAMING_BUCKET`] with the checksum mode enabled: "to retrieve the
+/// checksum, this mode must be enabled" (`GetObjectRequest$ChecksumMode`).
+async fn read_back(router: &MultiServiceRouter, key: &str) -> Answer {
+    send_bytes(
+        router,
+        "GET",
+        &format!("/{FRAMING_BUCKET}/{key}"),
+        &[("x-amz-checksum-mode", "ENABLED")],
+        b"",
+    )
+    .await
+}
 
 #[tokio::test]
 async fn a_write_is_refused_a_storage_class_the_bucket_cannot_host() {

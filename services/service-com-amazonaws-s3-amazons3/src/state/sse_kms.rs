@@ -590,6 +590,39 @@ fn encryption_context(object: &EncryptedObject<'_>) -> HashMap<String, String> {
     context
 }
 
+/// The encryption context an answer REPORTS for `object`, as
+/// `x-amz-server-side-encryption-context` carries it, or `None` for an object whose write
+/// supplied none.
+///
+/// The header reports the context the object's data key is actually bound to, which is the
+/// entry S3 itself adds naming the encrypted resource ([`ARN_CONTEXT_KEY`]) beside the pairs
+/// the write supplied — the very context [`encryption_context`] decrypts under, so a caller
+/// reproducing the context out of band, or a key policy written over
+/// `kms:EncryptionContext:aws:s3:arn`, reads the context S3 used rather than half of it.
+///
+/// A write that supplied no context of its own is reported no context at all: the member is
+/// the encoding of "the encryption context as key-value pairs"
+/// (`PutObjectOutput$SSEKMSEncryptionContext`) a request named, and an object inheriting a
+/// bucket's default encryption names none.
+///
+/// The pairs are serialized in key order, so every answer about one object reports the same
+/// string.
+pub fn reported_encryption_context(
+    bucket: &str,
+    key: &str,
+    encryption: &super::ObjectEncryption,
+) -> Option<String> {
+    encryption.kms_encryption_context.as_ref()?;
+    let context = encryption_context(&EncryptedObject {
+        bucket,
+        key,
+        encryption,
+    });
+    let ordered: ::std::collections::BTreeMap<String, String> = context.into_iter().collect();
+    let document = ::serde_json::to_vec(&ordered).ok()?;
+    Some(::aws_smithy_types::base64::encode(&document))
+}
+
 /// The pairs an object's stored `SSEKMSEncryptionContext` names: "a Base64-encoded string
 /// holding a UTF-8 encoded JSON of additional encryption context key-value pairs"
 /// (`PutObjectRequest$SSEKMSEncryptionContext`), decoded.

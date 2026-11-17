@@ -81,6 +81,18 @@ const SSE_CUSTOMER_ALGORITHM_KEY: &str = "s3:x-amz-server-side-encryption-custom
 /// same published list).
 const COPY_SOURCE_KEY: &str = "s3:x-amz-copy-source";
 
+/// The condition keys a CONDITIONAL WRITE's entity-tag preconditions answer (`s3:if-match`
+/// and `s3:if-none-match`, same published list) — the keys a policy that makes overwrite
+/// protection mandatory is written over.
+///
+/// Each names the request header of the same name as the request sent it, so a clause asking
+/// whether the key is PRESENT is decided by whether the write carried that precondition at
+/// all: a `Deny` of a write "unless" it carries `If-None-Match` is a statement about the
+/// request's own head, exactly like the encryption-header clauses above.
+const IF_MATCH_KEY: &str = "s3:if-match";
+/// See [`IF_MATCH_KEY`].
+const IF_NONE_MATCH_KEY: &str = "s3:if-none-match";
+
 /// The condition key a copy's `x-amz-metadata-directive` header answers
 /// (`s3:x-amz-metadata-directive`, same published list).
 const METADATA_DIRECTIVE_KEY: &str = "s3:x-amz-metadata-directive";
@@ -236,6 +248,8 @@ pub const PUBLISHED_CONDITION_KEYS: &[&str] = &[
     SSE_CUSTOMER_ALGORITHM_KEY,
     COPY_SOURCE_KEY,
     METADATA_DIRECTIVE_KEY,
+    IF_MATCH_KEY,
+    IF_NONE_MATCH_KEY,
     MAX_KEYS_KEY,
     PREFIX_KEY,
     DELIMITER_KEY,
@@ -268,6 +282,8 @@ pub const CALLER_FREE_CONDITION_KEYS: &[&str] = &[
     SSE_CUSTOMER_ALGORITHM_KEY,
     COPY_SOURCE_KEY,
     METADATA_DIRECTIVE_KEY,
+    IF_MATCH_KEY,
+    IF_NONE_MATCH_KEY,
     MAX_KEYS_KEY,
     PREFIX_KEY,
     DELIMITER_KEY,
@@ -478,6 +494,11 @@ pub struct ObjectWriteContext<'a> {
     pub copy_source: Option<&'a str>,
     /// `x-amz-metadata-directive` — whether a copy keeps or replaces the source's metadata.
     pub metadata_directive: Option<&'a str>,
+    /// `If-Match` — the entity tag the write requires the addressed key to hold.
+    pub if_match: Option<&'a str>,
+    /// `If-None-Match` — the entity tag the write requires the addressed key NOT to hold,
+    /// which is `*` for the write that must not overwrite anything.
+    pub if_none_match: Option<&'a str>,
 }
 
 impl ObjectWriteContext<'_> {
@@ -496,6 +517,8 @@ impl ObjectWriteContext<'_> {
             (SSE_CUSTOMER_ALGORITHM_KEY, self.sse_customer_algorithm),
             (COPY_SOURCE_KEY, self.copy_source),
             (METADATA_DIRECTIVE_KEY, self.metadata_directive),
+            (IF_MATCH_KEY, self.if_match),
+            (IF_NONE_MATCH_KEY, self.if_none_match),
         ] {
             if let Some(value) = value {
                 context.push((key.to_string(), value.to_string()));

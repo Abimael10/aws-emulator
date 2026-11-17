@@ -64,6 +64,15 @@ const DESTINATION_KEY_ALIAS: &str = "alias/destination-cmk";
 /// additional encryption context key-value pairs" — here `{"stage":"copy"}`.
 const ENCRYPTION_CONTEXT: &str = "eyJzdGFnZSI6ImNvcHkifQ==";
 
+/// The encryption context `answer` reports, decoded — `None` when it reports none. The pairs
+/// are read through the encryption suite's own decoder
+/// ([`super::object_encryption::decoded_pairs`]), so both suites read one encoding.
+fn decoded_context(answer: &Answer) -> Option<::std::collections::BTreeMap<String, String>> {
+    answer
+        .header("x-amz-server-side-encryption-context")
+        .map(|value| super::object_encryption::decoded_pairs(&value))
+}
+
 /// A time before every object this suite writes, and one after all of them, for the
 /// `x-amz-copy-source-if-*-since` members.
 ///
@@ -318,10 +327,14 @@ struct Reported {
     algorithm: Option<&'static str>,
     key_id: Option<&'static str>,
     bucket_key: Option<&'static str>,
-    /// The `SSEKMSEncryptionContext` the COPY's own answer must report. `GetObject` and
-    /// `HeadObject` are not asserted against it: their output shapes declare no such
-    /// member (`smithy_query(query="operation",operation="GetObject")`), so a read of any
-    /// object reports none.
+    /// The `SSEKMSEncryptionContext` the COPY request SUPPLIED, when it supplied one.
+    /// `GetObject` and `HeadObject` are not asserted against it: their output shapes declare
+    /// no such member (`smithy_query(query="operation",operation="GetObject")`), so a read of
+    /// any object reports none.
+    ///
+    /// What the ANSWER must report is the whole context S3 bound the data key to, which is
+    /// the caller's pairs plus the `aws:s3:arn` entry naming what was encrypted — asserted on
+    /// the decoded pairs rather than on one encoding of them.
     context: Option<&'static str>,
 }
 
@@ -517,14 +530,28 @@ async fn a_copy_is_encrypted_under_the_destination_rule_not_the_source_one() {
             text(&copied)
         );
         assert_reported(case, "CopyObject", &copied, expected);
+        // S3 adds the ARN of what it encrypted to the encryption context under
+        // `aws:s3:arn` — the bucket's ARN where an S3 Bucket Key binds the data key to the
+        // bucket, the object's otherwise — and the answer reports the WHOLE context, so a
+        // caller reproducing it computes what S3 used. The assertion is over the decoded
+        // pairs: the encoding of a JSON object is not unique.
+        let encrypted_arn = match expected.bucket_key {
+            Some("true") => format!("arn:aws:s3:::{target}"),
+            _ => format!("arn:aws:s3:::{target}/{key}"),
+        };
+        let reported_context = decoded_context(&copied);
+        let expected_context = expected.context.map(|supplied| {
+            let mut pairs = super::object_encryption::decoded_pairs(supplied);
+            pairs.insert(
+                super::object_encryption::ARN_CONTEXT_KEY.to_string(),
+                encrypted_arn,
+            );
+            pairs
+        });
         assert_eq!(
-            copied
-                .header("x-amz-server-side-encryption-context")
-                .as_deref(),
-            expected.context,
-            "case {case:?}: CopyObject must report the encryption context as {:?}, got {:?}",
-            expected.context,
-            copied.header("x-amz-server-side-encryption-context")
+            reported_context, expected_context,
+            "case {case:?}: CopyObject must report the encryption context as \
+             {expected_context:?}, got {reported_context:?}"
         );
 
         // Every later reader of the copy reports the configuration it was STORED under.

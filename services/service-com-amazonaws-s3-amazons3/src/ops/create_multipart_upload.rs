@@ -948,7 +948,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // under.
             server_side_encryption: encryption.sse_algorithm.clone(),
             ssekms_key_id: encryption.kms_key_id.clone(),
-            ssekms_encryption_context: encryption.kms_encryption_context.clone(),
+            // The context the object this upload completes into will be bound to, reported
+            // the one way every write of this service reports it
+            // ([`crate::state::sse_kms::reported_encryption_context`]): the entry naming
+            // what S3 will encrypt beside the pairs the initiation supplied.
+            ssekms_encryption_context: crate::state::sse_kms::reported_encryption_context(
+                &input.bucket,
+                &input.key,
+                &encryption,
+            ),
             bucket_key_enabled: encryption.reported_bucket_key_enabled(),
             // And, for an initiation that supplied its OWN key: the algorithm it named and
             // the digest of that key, which is what every later part of this upload has to

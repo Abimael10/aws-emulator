@@ -455,6 +455,230 @@ async fn a_bucket_policy_decides_whether_a_write_is_stored() {
     }
 }
 
+/// Which call a conditional-header row makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConditionalCall {
+    /// A one-shot write of the object.
+    Write,
+    /// A copy INTO the row's bucket, which is the same `s3:PutObject` on the destination.
+    Copy,
+    /// A delete of the object the row's bucket already holds.
+    Delete,
+}
+
+/// One row of the conditional-header table: the call, the bucket it is made against, the
+/// action the policy denies, the condition key the policy is written over, and the
+/// conditional header the request carries (none for the row that leaves it off).
+struct ConditionalRow {
+    case: &'static str,
+    call: ConditionalCall,
+    bucket: &'static str,
+    action: &'static str,
+    condition_key: &'static str,
+    header: Option<&'static str>,
+    refused: bool,
+}
+
+/// A policy that makes the conditional header `condition_key` names MANDATORY for `action`:
+/// every request that does NOT carry it is denied, which is the `Null` clause IAM reads as
+/// "the key is absent from the request context".
+fn unless_conditional_header(action: &str, bucket: &str, condition_key: &str) -> String {
+    policy_document(&statement(
+        "Deny",
+        action,
+        &format!("arn:aws:s3:::{bucket}/*"),
+        Some(&format!("{{\"Null\":{{\"{condition_key}\":\"true\"}}}}")),
+    ))
+}
+
+/// A request's `If-Match` / `If-None-Match` headers answer the `s3:if-match` /
+/// `s3:if-none-match` condition keys of the policy decision for that write (Amazon S3 User
+/// Guide, *Actions, resources, and condition keys for Amazon S3*), so a policy that makes a
+/// conditional write mandatory refuses the call that carries no such header and admits the
+/// one that does.
+///
+/// The rows differ along what the rule generalises over: WHICH key the policy is written over
+/// (`s3:if-match`, `s3:if-none-match`), WHICH write the condition governs (the one-shot write,
+/// a copy's destination write, a delete), and whether the request carries the header the clause
+/// names.
+#[tokio::test]
+async fn the_conditional_write_headers_answer_their_policy_condition_keys() {
+    let router = router();
+    // The source a copy row reads, in a bucket of its own so no row's policy decides it.
+    bucket(&router, "conditional-authz-source").await;
+    let staged = put_object(&router, "conditional-authz-source", KEY, BODY, &[]).await;
+    assert_eq!(
+        staged.status, 200,
+        "the copy source must be written first, got {} with body {:?}",
+        staged.status,
+        text(&staged)
+    );
+
+    let rows: [ConditionalRow; 6] = [
+        ConditionalRow {
+            case: "a write that must carry If-None-Match, and carries none",
+            call: ConditionalCall::Write,
+            bucket: "conditional-authz-write-absent",
+            action: "s3:PutObject",
+            condition_key: "s3:if-none-match",
+            header: None,
+            refused: true,
+        },
+        ConditionalRow {
+            case: "a write that must carry If-None-Match, and carries it",
+            call: ConditionalCall::Write,
+            bucket: "conditional-authz-write-present",
+            action: "s3:PutObject",
+            condition_key: "s3:if-none-match",
+            header: Some("*"),
+            refused: false,
+        },
+        ConditionalRow {
+            case: "a copy whose destination must carry If-None-Match, and carries none",
+            call: ConditionalCall::Copy,
+            bucket: "conditional-authz-copy-absent",
+            action: "s3:PutObject",
+            condition_key: "s3:if-none-match",
+            header: None,
+            refused: true,
+        },
+        ConditionalRow {
+            case: "a copy whose destination must carry If-None-Match, and carries it",
+            call: ConditionalCall::Copy,
+            bucket: "conditional-authz-copy-present",
+            action: "s3:PutObject",
+            condition_key: "s3:if-none-match",
+            header: Some("*"),
+            refused: false,
+        },
+        ConditionalRow {
+            case: "a delete that must carry If-Match, and carries none",
+            call: ConditionalCall::Delete,
+            bucket: "conditional-authz-delete-absent",
+            action: "s3:DeleteObject",
+            condition_key: "s3:if-match",
+            header: None,
+            refused: true,
+        },
+        ConditionalRow {
+            case: "a delete that must carry If-Match, and carries it",
+            call: ConditionalCall::Delete,
+            bucket: "conditional-authz-delete-present",
+            action: "s3:DeleteObject",
+            condition_key: "s3:if-match",
+            header: Some("*"),
+            refused: false,
+        },
+    ];
+
+    for row in &rows {
+        let ConditionalRow {
+            case,
+            call,
+            bucket: name,
+            action,
+            condition_key,
+            header,
+            refused,
+        } = row;
+        bucket(&router, name).await;
+        // A delete needs something to delete, written BEFORE the policy is attached so the
+        // policy decides only the call under test.
+        if *call == ConditionalCall::Delete {
+            let written = put_object(&router, name, KEY, BODY, &[]).await;
+            assert_eq!(
+                written.status, 200,
+                "case {case:?}: the object to delete must be written first, got {} with body \
+                 {:?}",
+                written.status,
+                text(&written)
+            );
+        }
+        let attached = put_bucket_policy(
+            &router,
+            name,
+            &unless_conditional_header(action, name, condition_key),
+        )
+        .await;
+        assert_eq!(
+            attached.status, 204,
+            "case {case:?}: the policy must be attached, got {} with body {:?}",
+            attached.status,
+            text(&attached)
+        );
+
+        let carried: Vec<(&str, &str)> = header
+            .map(|value| {
+                let name = match *condition_key {
+                    "s3:if-match" => "if-match",
+                    _ => "if-none-match",
+                };
+                vec![(name, value)]
+            })
+            .unwrap_or_default();
+        let answered = match call {
+            ConditionalCall::Write => put_object(&router, name, KEY, BODY, &carried).await,
+            ConditionalCall::Copy => {
+                let mut headers: Vec<(&str, &str)> = vec![(
+                    "x-amz-copy-source",
+                    "conditional-authz-source/reports/written.csv",
+                )];
+                headers.extend_from_slice(&carried);
+                send_bytes(&router, "PUT", &format!("/{name}/{KEY}"), &headers, b"").await
+            }
+            ConditionalCall::Delete => {
+                send_bytes(&router, "DELETE", &format!("/{name}/{KEY}"), &carried, b"").await
+            }
+        };
+
+        let expected = match (refused, call) {
+            (true, _) => 403,
+            (false, ConditionalCall::Delete) => 204,
+            (false, _) => 200,
+        };
+        assert_eq!(
+            answered.status, expected,
+            "case {case:?}: expected HTTP {expected}, got {} with body {:?}",
+            answered.status,
+            text(&answered)
+        );
+        if *refused {
+            assert_eq!(
+                answered.error_code(),
+                ACCESS_DENIED,
+                "case {case:?}: expected the {ACCESS_DENIED:?} code, got {:?}",
+                answered.error_code()
+            );
+            assert_eq!(
+                answered.error_message(),
+                explicit_deny_message(action, &format!("arn:aws:s3:::{name}/{KEY}")),
+                "case {case:?}: expected the explicit-deny sentence, got {:?}",
+                answered.error_message()
+            );
+        }
+        // What the refusal has to be worth: the call the policy barred changed nothing, and
+        // the one it admitted did.
+        let read = get_object(&router, name, KEY, "", &[]).await;
+        let holds_the_object = match (refused, call) {
+            // A refused delete leaves what it would have removed; a refused write leaves the
+            // key as empty as it was.
+            (true, ConditionalCall::Delete) => true,
+            (true, _) => false,
+            // An admitted delete removed it; an admitted write or copy created it.
+            (false, ConditionalCall::Delete) => false,
+            (false, _) => true,
+        };
+        assert_eq!(
+            read.status == 200,
+            holds_the_object,
+            "case {case:?}: expected the key to hold the object: {holds_the_object}, got \
+             GetObject {} with body {:?}",
+            read.status,
+            text(&read)
+        );
+    }
+}
+
 /// `PUT /<bucket>/<key>` with `x-amz-copy-source` — `CopyObject`.
 async fn copy_object(
     router: &MultiServiceRouter,

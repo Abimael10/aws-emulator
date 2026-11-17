@@ -69,6 +69,13 @@ pub mod announced_url;
 // the request carries, and the account the request says owns the bucket — see
 // `service/authorization.rs`.
 pub mod authorization;
+// What this service answers the CORS PREFLIGHT — the `OPTIONS` a browser sends before a
+// cross-origin call — from the bucket's own cors configuration; see
+// `service/cors_preflight.rs`.
+pub mod cors_preflight;
+// How the body of a write ARRIVED — the `aws-chunked` framing an SDK streams an object's
+// bytes in, and the checksum trailer it declares — see `service/chunked_upload.rs`.
+pub mod chunked_upload;
 // The calls on the CONTENTS of an object, which CloudTrail delivers as DATA events into the
 // bucket of every trail whose event selectors admit them — see `service/data_events.rs`.
 pub mod data_events;
@@ -1349,6 +1356,14 @@ fn front_door<Eng: Send + Sync + 'static>(
         invalid_bucket_name::REFUSE_INVALID_BUCKET_NAME,
         Box::new(invalid_bucket_name::RefuseInvalidBucketName::new()),
     );
+    // And the refusal a write earns for the FRAMING of its body: a body sent in the
+    // `aws-chunked` transfer encoding that states no payload length says nothing about how
+    // long the object it carries is ([`chunked_upload`]). Held here for the same reason and
+    // under a key of the same kind: it stands in front of every write of this service.
+    table.add_operation(
+        chunked_upload::REFUSE_UNFRAMED_CHUNKED_BODY,
+        Box::new(chunked_upload::RefuseUnframedChunkedBody::new()),
+    );
     // And the refusal a request earns for the CREDENTIAL it presents — a session whose
     // principal no longer exists — held here for the same reason and under a key of the same
     // kind ([`withdrawn_credential`]): it stands in front of every operation of this service,
@@ -2017,6 +2032,12 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
+        // How the body of this request was FRAMED, recorded before anything of this service
+        // reads it: the `aws-chunked` transfer encoding is stripped from the request before
+        // any operation is reached, and this is the one seam handed the request as it arrived
+        // (see [`chunked_upload`]). Recorded for EVERY request this service is offered, so
+        // the note can never be read as a previous request's.
+        chunked_upload::remember(parts);
         // The WEBSITE ENDPOINT is this service's before anything about a credential is read:
         // such a request is addressed to a bucket's website host ([`website_endpoint`]), which
         // no other service of this emulator is reached under, and it is ANONYMOUS by design —
@@ -2116,6 +2137,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // never addressed it. See [`website_endpoint`].
         if website_endpoint::addressed_bucket_of(req).is_some() {
             return self.door.get(website_endpoint::WEBSITE_ENDPOINT);
+        }
+        // A write whose body arrived in the `aws-chunked` transfer encoding without saying how
+        // long its payload is states the length of the object it carries nowhere, so it is
+        // refused for the FRAMING, whichever operation its address names and before anything
+        // is stored. See [`chunked_upload`].
+        if chunked_upload::body_states_no_payload_length() {
+            if let Some(refusal) = self
+                .door
+                .get(chunked_upload::REFUSE_UNFRAMED_CHUNKED_BODY)
+            {
+                return Some(refusal);
+            }
         }
         // A request whose CREDENTIAL resolves to no principal at all — a session of a role the
         // account no longer holds — is refused for the credential, whichever operation its
@@ -2263,7 +2296,26 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_routing_error(&self, req: &RtRequest) -> Option<RtResponse> {
         // The router calls this when a request reached this service but named no
         // modeled operation — neither `override_operation` nor the generated
-        // routing table resolved it. Returning `None` renders the protocol-correct
+        // routing table resolved it.
+        //
+        // The CORS PREFLIGHT is one such request, and is this service's to answer: no
+        // operation of this model is bound to `OPTIONS`, and what S3 answers one is read off
+        // the addressed bucket's own cors configuration rather than from any routing table
+        // (see [`cors_preflight`]). It is answered HERE rather than as an operation because a
+        // preflight is the one request of this service a browser cannot sign — it carries no
+        // credential at all — and this seam is reached before anything about a caller is
+        // asked. The address is read in the PATH-STYLE form every route of this service is
+        // bound in ([`Self::path_style_path`]), so a virtual-hosted-style preflight is
+        // answered from the same bucket's configuration a path-style one is.
+        if let Some(answer) = cors_preflight::answer(
+            &*self.engine,
+            &self.protocol,
+            req,
+            &self.path_style_path(req),
+        ) {
+            return Some(answer);
+        }
+        // Returning `None` renders the protocol-correct
         // default for this service's envelope (query -> 400 InvalidAction text/xml,
         // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501), which is what every one of them
         // keeps: an operation that really is merely unwritten answers the 501 that counts it
@@ -2275,7 +2327,6 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // each needs the store and the calling principal to be answered, which only an
         // operation is given (see [`select_object_content`] for the one this seam used to
         // word).
-        let _ = req;
         None
     }
 

@@ -25,7 +25,8 @@
 //! whether the key holds an object at all, whether the tag names the object the key holds,
 //! how the tag is QUOTED (a client may send it with or without the double quotes HTTP's
 //! quoted-string syntax wraps it in), and which write the condition is on — the one-shot
-//! write and the completion of a multipart upload are judged by the same rule.
+//! write, the completion of a multipart upload and the destination of a COPY are judged by
+//! the same rule.
 
 use service_com_amazonaws_s3_amazons3::state::{
     NO_SUCH_KEY_CODE, NO_SUCH_KEY_MESSAGE, PRECONDITION_FAILED_CODE, PRECONDITION_FAILED_MESSAGE,
@@ -424,6 +425,182 @@ async fn the_completion_of_a_multipart_upload_is_judged_by_the_same_rule() {
         read.body.as_ref(),
         assembled.as_slice(),
         "the completed object must hold the assembled bytes, got {} of them",
+        read.body.len()
+    );
+}
+
+/// `PUT /<bucket>/<key>` carrying `x-amz-copy-source` — `CopyObject`, whose own `If-Match` /
+/// `If-None-Match` make the DESTINATION write conditional ("`CopyObject` … `IfMatch`: copies
+/// the object if its entity tag (ETag) matches the specified tag", bound to `If-Match`).
+async fn copy_object(
+    router: &MultiServiceRouter,
+    bucket_name: &str,
+    key: &str,
+    copy_source: &str,
+    headers: &[(&str, &str)],
+) -> Answer {
+    let mut all: Vec<(&str, &str)> = vec![("x-amz-copy-source", copy_source)];
+    all.extend_from_slice(headers);
+    super::bucket_lifecycle::send_bytes(
+        router,
+        "PUT",
+        &format!("/{bucket_name}/{key}"),
+        &all,
+        b"",
+    )
+    .await
+}
+
+/// RULE, over the third write that carries the pair: a COPY's conditional members are judged
+/// against what the DESTINATION key holds, by the same rule and with the same answers as the
+/// one-shot write and the completion above — which is what lets a caller protect a
+/// destination from a concurrent overwrite.
+///
+/// The copy-source preconditions are a different question (they are about the object being
+/// READ) and are pinned in [`super::object_copy`]; what this exercises is the destination's.
+#[tokio::test]
+async fn the_copy_of_an_object_is_judged_by_the_same_rule() {
+    let router = router();
+    bucket(&router, "conditional-copy-origin").await;
+    bucket(&router, "conditional-copy-target").await;
+    let source = sized_payload(3, 512);
+    let staged = put_object(
+        &router,
+        "conditional-copy-origin",
+        "source.bin",
+        &source,
+        &[],
+    )
+    .await;
+    assert_eq!(
+        staged.status, 200,
+        "the source object must be stored first, got {} with body {:?}",
+        staged.status,
+        text(&staged)
+    );
+
+    // A destination key holding nothing has no entity tag to match, so `If-Match` is refused
+    // `NoSuchKey` — the same answer the one-shot write gives.
+    let absent = copy_object(
+        &router,
+        "conditional-copy-target",
+        "copied.bin",
+        "conditional-copy-origin/source.bin",
+        &[("if-match", "\"00000000000000000000000000000000\"")],
+    )
+    .await;
+    assert_eq!(
+        absent.status, 404,
+        "case \"If-Match onto a destination holding nothing\": expected HTTP 404, got {} with \
+         body {:?}",
+        absent.status,
+        text(&absent)
+    );
+    assert_eq!(
+        absent.error_code(),
+        NO_SUCH_KEY_CODE,
+        "case \"If-Match onto a destination holding nothing\": expected the \
+         {NO_SUCH_KEY_CODE} code, got {:?}",
+        absent.error_code()
+    );
+    assert_eq!(
+        absent.error_message(),
+        NO_SUCH_KEY_MESSAGE,
+        "case \"If-Match onto a destination holding nothing\": expected the published \
+         sentence, got {:?}",
+        absent.error_message()
+    );
+    let nothing = get_object(&router, "conditional-copy-target", "copied.bin", "", &[]).await;
+    assert_eq!(
+        nothing.status, 404,
+        "case \"If-Match onto a destination holding nothing\": a refused copy must write \
+         nothing, got {}",
+        nothing.status
+    );
+
+    // `If-None-Match: *` holds while the destination holds nothing, so the copy lands.
+    let created = copy_object(
+        &router,
+        "conditional-copy-target",
+        "copied.bin",
+        "conditional-copy-origin/source.bin",
+        &[("if-none-match", "*")],
+    )
+    .await;
+    assert_eq!(
+        created.status, 200,
+        "the copy must be served while the destination holds nothing, got {} with body {:?}",
+        created.status,
+        text(&created)
+    );
+    let held = held_etag(&router, "conditional-copy-target", "copied.bin")
+        .await
+        .expect("the copied object must report an ETag");
+
+    // The rows the destination now refuses, each the same condition the other two writes are
+    // refused for: a tag that is not the destination's, and `If-None-Match` against a key
+    // that holds an object.
+    for (case, member, value) in [
+        (
+            "If-None-Match on a destination that holds an object",
+            "if-none-match",
+            String::from("*"),
+        ),
+        (
+            "If-Match naming a stale destination tag",
+            "if-match",
+            String::from("\"00000000000000000000000000000000\""),
+        ),
+    ] {
+        let refused = copy_object(
+            &router,
+            "conditional-copy-target",
+            "copied.bin",
+            "conditional-copy-origin/source.bin",
+            &[(member, value.as_str())],
+        )
+        .await;
+        assert_eq!(
+            refused.status, 412,
+            "case {case:?}: expected HTTP 412, got {} with body {:?}",
+            refused.status,
+            text(&refused)
+        );
+        assert_eq!(
+            refused.error_code(),
+            PRECONDITION_FAILED_CODE,
+            "case {case:?}: expected the {PRECONDITION_FAILED_CODE} code, got {:?}",
+            refused.error_code()
+        );
+        assert_eq!(
+            refused.error_message(),
+            PRECONDITION_FAILED_MESSAGE,
+            "case {case:?}: expected the published sentence, got {:?}",
+            refused.error_message()
+        );
+    }
+
+    // And the condition that HOLDS is served: `If-Match` naming the tag the destination
+    // holds, sent unquoted, which is the same tag by value.
+    let replaced = copy_object(
+        &router,
+        "conditional-copy-target",
+        "copied.bin",
+        "conditional-copy-origin/source.bin",
+        &[("if-match", held.trim_matches('"'))],
+    )
+    .await;
+    assert_eq!(
+        replaced.status, 200,
+        "the copy against the tag the destination holds must be served, got {} with body {:?}",
+        replaced.status,
+        text(&replaced)
+    );
+    let read = get_object(&router, "conditional-copy-target", "copied.bin", "", &[]).await;
+    assert_eq!(
+        read.body.as_ref(),
+        source.as_slice(),
+        "the destination must hold the source's bytes, got {} of them",
         read.body.len()
     );
 }

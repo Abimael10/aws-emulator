@@ -506,6 +506,144 @@ async fn a_replacing_write_replaces_the_encryption_the_key_was_stored_under() {
     }
 }
 
+/// The encryption-context ENTRY NAME S3 binds a data key to (Amazon S3 User Guide, *Using
+/// server-side encryption with KMS keys*, "Encryption context": S3 "uses the object or bucket
+/// Amazon Resource Name (ARN) as the encryption context pair").
+///
+/// `pub(crate)`, like [`decoded_pairs`] below it: the copy suite
+/// ([`super::object_copy`]) asserts the same entry on the copy's own answer.
+pub(crate) const ARN_CONTEXT_KEY: &str = "aws:s3:arn";
+
+/// The pairs a `SSEKMSEncryptionContext` value carries: the Base64 of a JSON object, decoded.
+pub(crate) fn decoded_pairs(value: &str) -> ::std::collections::BTreeMap<String, String> {
+    let document = ::aws_smithy_types::base64::decode(value)
+        .unwrap_or_else(|error| panic!("{value:?} must be Base64: {error}"));
+    ::serde_json::from_slice(&document)
+        .unwrap_or_else(|error| panic!("{value:?} must decode to a JSON object: {error}"))
+}
+
+/// One row of [`a_write_is_answered_the_whole_encryption_context_its_data_key_was_bound_to`]:
+/// the case, the key written, the context the write supplies, whether an S3 Bucket Key is on,
+/// and the pairs the answer's context must decode to beside the ARN entry.
+type ContextRow<'a> = (&'a str, &'a str, Option<&'a str>, bool, &'a [(&'a str, &'a str)]);
+
+/// The encryption context a write is ANSWERED is the whole context S3 bound the object's data
+/// key to: the pairs the request supplied PLUS the entry naming what was encrypted, which is
+/// the object's own ARN — or the bucket's, where an S3 Bucket Key binds the data key to the
+/// bucket rather than to each object under it.
+///
+/// A caller that reproduces the context to decrypt out of band, or whose key policy is written
+/// over `kms:EncryptionContext:aws:s3:arn`, computes the context S3 really used only if the
+/// answer carries that entry.
+///
+/// The rows differ along what the rule generalises over: how many pairs the write supplied
+/// (none, one, several), whether an S3 Bucket Key binds the key to the bucket, and the KEY the
+/// object is addressed by (a plain name and one with `/` separators), each of which changes
+/// the ARN the entry names.
+#[tokio::test]
+async fn a_write_is_answered_the_whole_encryption_context_its_data_key_was_bound_to() {
+    let router = super::kms_key_references::router_with_kms();
+    let (_, key_arn) =
+        super::kms_key_references::created_key(&router, "the key these writes name").await;
+    bucket(&router, "encryption-context").await;
+
+    // (case, the key written, the context the write supplies, whether a Bucket Key is on, the
+    // pairs the answer's context must decode to beside the ARN entry)
+    let one = ::aws_smithy_types::base64::encode(br#"{"team":"payments"}"#);
+    let several =
+        ::aws_smithy_types::base64::encode(br#"{"team":"payments","zone":"a","tier":"gold"}"#);
+    let rows: [ContextRow; 5] = [
+        (
+            "one supplied pair",
+            "context-echo.txt",
+            Some(one.as_str()),
+            false,
+            &[("team", "payments")],
+        ),
+        (
+            "several supplied pairs",
+            "context-echo-many.txt",
+            Some(several.as_str()),
+            false,
+            &[("team", "payments"), ("zone", "a"), ("tier", "gold")],
+        ),
+        (
+            "a key carrying / separators",
+            "nested/dir/context-echo.txt",
+            Some(one.as_str()),
+            false,
+            &[("team", "payments")],
+        ),
+        (
+            "an S3 Bucket Key, which binds the data key to the bucket",
+            "bucket-key/context-echo.txt",
+            Some(one.as_str()),
+            true,
+            &[("team", "payments")],
+        ),
+        (
+            "no context supplied at all",
+            "no-context.txt",
+            None,
+            false,
+            &[],
+        ),
+    ];
+
+    for (case, key, supplied, bucket_key, pairs) in rows {
+        let mut headers: Vec<(&str, &str)> = vec![
+            ("x-amz-server-side-encryption", "aws:kms"),
+            ("x-amz-server-side-encryption-aws-kms-key-id", &key_arn),
+        ];
+        if let Some(supplied) = supplied {
+            headers.push(("x-amz-server-side-encryption-context", supplied));
+        }
+        if bucket_key {
+            headers.push((
+                "x-amz-server-side-encryption-bucket-key-enabled",
+                "true",
+            ));
+        }
+        let written = put_object(
+            &router,
+            "encryption-context",
+            key,
+            format!("the payload of {case}\n").as_bytes(),
+            &headers,
+        )
+        .await;
+        assert_eq!(
+            written.status, 200,
+            "case {case:?}: the write must answer 200, got {} with body {:?}",
+            written.status,
+            text(&written)
+        );
+        let reported = written
+            .header("x-amz-server-side-encryption-context")
+            .map(|value| decoded_pairs(&value));
+        // A write that supplied no context of its own is reported no context at all: there
+        // is nothing of the caller's to report back.
+        let expected = supplied.map(|_| {
+            let mut expected: ::std::collections::BTreeMap<String, String> = pairs
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect();
+            let encrypted = if bucket_key {
+                "arn:aws:s3:::encryption-context".to_string()
+            } else {
+                format!("arn:aws:s3:::encryption-context/{key}")
+            };
+            expected.insert(ARN_CONTEXT_KEY.to_string(), encrypted);
+            expected
+        });
+        assert_eq!(
+            reported, expected,
+            "case {case:?}: PutObject must report the encryption context as {expected:?}, got \
+             {reported:?}"
+        );
+    }
+}
+
 /// Assert that `answer` carries exactly the `(header, value)` expectations of a row:
 /// `Some(value)` must be reported with that value, `None` must be absent.
 fn assert_header_set(

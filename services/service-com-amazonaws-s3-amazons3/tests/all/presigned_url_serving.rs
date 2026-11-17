@@ -549,3 +549,165 @@ fn iso8601(instant: SystemTime) -> String {
         .fmt(::aws_smithy_types::date_time::Format::DateTime)
         .expect("an instant from the clock must render")
 }
+
+/// The element a multipart initiation answers the upload's id in.
+const UPLOAD_ID_ELEMENT: &str = "UploadId";
+
+/// The text `element` wraps in `document`, or `None` when the document names none.
+fn element_text(document: &str, element: &str) -> Option<String> {
+    let (_, rest) = document.split_once(&format!("<{element}>"))?;
+    let (text, _) = rest.split_once(&format!("</{element}>"))?;
+    Some(text.to_string())
+}
+
+/// One row of [`a_presigned_url_serves_an_object_assembled_from_parts`]: the case, the key
+/// the upload completes into, and its parts in the order they are uploaded, each as
+/// `(part number, byte count)`.
+type AssembledRow<'a> = (&'a str, &'a str, &'a [(i32, usize)]);
+
+/// RULE 1, over an object the store ASSEMBLED rather than took in one write: an object
+/// `CompleteMultipartUpload` composed the parts of is served through a presigned URL exactly
+/// as a one-shot write is, because what a presigned fetch resolves is the read of whatever
+/// the key holds.
+///
+/// The rows differ along what the upload's PARTS were: how many of them, which part numbers
+/// they were uploaded under (consecutive, and sparse ones that leave gaps) and in which order
+/// they were sent (forward, reverse, and the one-part upload at the highest number a part may
+/// carry) — none of which changes the bytes the key holds, which are the parts concatenated in
+/// PART-NUMBER order.
+#[tokio::test]
+async fn a_presigned_url_serves_an_object_assembled_from_parts() {
+    let mut emulator = Emulator::new();
+    emulator.enforce_signatures(false);
+    let created = staged(&emulator, "PUT", &format!("/{BUCKET}"), b"").await;
+    assert_eq!(
+        created.status, 200,
+        "the bucket must be created first, got {} with body {:?}",
+        created.status,
+        String::from_utf8_lossy(&created.body)
+    );
+
+    // (case, key, the parts in the order they are uploaded, each as `(part number, bytes)`) —
+    // "part numbers can be any number from 1 to 10,000, inclusive" and "a part number
+    // uniquely identifies a part" (`UploadPartRequest$PartNumber`). Every part but the one
+    // with the highest number is at the published minimum part size ("each part must be at
+    // least 5 MB in size, except the last part").
+    const MINIMUM: usize = 5 * 1024 * 1024;
+    let rows: [AssembledRow; 3] = [
+        (
+            "consecutive parts in order",
+            "assembled/in-order.bin",
+            &[(1, MINIMUM), (2, 97)],
+        ),
+        (
+            "sparse part numbers uploaded in reverse",
+            "assembled/reverse.bin",
+            &[(7, 61), (4, MINIMUM), (1, MINIMUM)],
+        ),
+        (
+            "one part at the highest number a part may carry",
+            "assembled/last.bin",
+            &[(10_000, 321)],
+        ),
+    ];
+
+    let mut assembled: Vec<(&str, &str, Vec<u8>)> = Vec::new();
+    for (index, (case, key, numbers)) in rows.into_iter().enumerate() {
+        let initiated = staged(
+            &emulator,
+            "POST",
+            &format!("/{BUCKET}/{key}?uploads"),
+            b"",
+        )
+        .await;
+        assert_eq!(
+            initiated.status, 200,
+            "case {case:?}: the upload must be initiated, got {} with body {:?}",
+            initiated.status,
+            String::from_utf8_lossy(&initiated.body)
+        );
+        let document = String::from_utf8_lossy(&initiated.body).to_string();
+        let upload_id = element_text(&document, UPLOAD_ID_ELEMENT).unwrap_or_else(|| {
+            panic!("case {case:?}: the initiation must answer an upload id, got {document:?}")
+        });
+
+        // Each part's bytes depend on its number, so a completion that concatenated them in
+        // another order could not pass by accident.
+        let mut parts: Vec<(i32, String, Vec<u8>)> = Vec::new();
+        for (number, size) in numbers {
+            let bytes = payload((index as u8).wrapping_add(*number as u8), *size);
+            let uploaded = staged(
+                &emulator,
+                "PUT",
+                &format!("/{BUCKET}/{key}?partNumber={number}&uploadId={upload_id}"),
+                &bytes,
+            )
+            .await;
+            assert_eq!(
+                uploaded.status, 200,
+                "case {case:?}: part {number} must upload, got {} with body {:?}",
+                uploaded.status,
+                String::from_utf8_lossy(&uploaded.body)
+            );
+            let etag = uploaded.header("etag").unwrap_or_else(|| {
+                panic!("case {case:?}: part {number} must answer an ETag")
+            });
+            parts.push((*number, etag, bytes));
+        }
+        // The completion names the parts in ascending part-number order, which is the order
+        // "you must specify the parts" in, whatever order they were uploaded in.
+        parts.sort_by_key(|(number, _, _)| *number);
+        let document: String = parts
+            .iter()
+            .map(|(number, etag, _)| {
+                format!("<Part><PartNumber>{number}</PartNumber><ETag>{etag}</ETag></Part>")
+            })
+            .collect();
+        let completed = staged(
+            &emulator,
+            "POST",
+            &format!("/{BUCKET}/{key}?uploadId={upload_id}"),
+            format!("<CompleteMultipartUpload>{document}</CompleteMultipartUpload>").as_bytes(),
+        )
+        .await;
+        assert_eq!(
+            completed.status, 200,
+            "case {case:?}: the upload must complete, got {} with body {:?}",
+            completed.status,
+            String::from_utf8_lossy(&completed.body)
+        );
+        let whole: Vec<u8> = parts
+            .iter()
+            .flat_map(|(_, _, bytes)| bytes.clone())
+            .collect();
+        assembled.push((case, key, whole));
+    }
+
+    emulator.enforce_signatures(true);
+    let now = SystemTime::now();
+    for (case, key, whole) in &assembled {
+        let url = presigned(
+            &emulator,
+            "GET",
+            &format!("/{BUCKET}/{key}"),
+            &[],
+            now,
+            Duration::from_secs(900),
+        );
+        let served = fetch(&emulator, "GET", &url, b"").await;
+        assert_eq!(
+            served.status, 200,
+            "case {case:?}: a presigned GET of an assembled object must serve it, got {} with \
+             body {:?}",
+            served.status,
+            String::from_utf8_lossy(&served.body)
+        );
+        assert_eq!(
+            served.body.as_ref(),
+            whole.as_slice(),
+            "case {case:?}: expected the {} bytes the parts concatenate to, got {}",
+            whole.len(),
+            served.body.len()
+        );
+    }
+}

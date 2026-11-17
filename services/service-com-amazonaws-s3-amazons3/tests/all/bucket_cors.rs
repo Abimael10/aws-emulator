@@ -25,6 +25,13 @@
 //!   the stored configuration untouched.
 //! * A cors call naming a bucket this emulator does not hold answers the service's
 //!   `NoSuchBucket` (HTTP 404), the shape both handlers widen in.
+//! * The configuration is what a CORS PREFLIGHT — the `OPTIONS` a browser sends before a
+//!   cross-origin call — is answered from: a rule that admits the origin, the intended method
+//!   and every intended header makes it HTTP 200 carrying that rule's `Access-Control-*`
+//!   headers, and a combination no rule admits is refused 403 `AccessForbidden`. A bucket
+//!   carrying no cors configuration at all (and one whose configuration `DeleteBucketCors` has
+//!   removed) shares nothing cross-origin, which is the same code with the sentence S3 states
+//!   for exactly that condition.
 //!
 //! What a round-trip row asserts is the ROUND TRIP, not one hand-written document: the
 //! request payload and the reported document are compared leaf by leaf (the website suite's
@@ -36,7 +43,7 @@ use service_com_amazonaws_s3_amazons3::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::bucket_lifecycle::{create_bucket, router, send, Answer};
+use super::bucket_lifecycle::{create_bucket, router, send, send_bytes, Answer};
 use super::bucket_website::{content, reported};
 
 /// The XML namespace botocore puts on an S3 request payload.
@@ -608,4 +615,433 @@ async fn a_cors_call_on_a_bucket_that_does_not_exist_is_no_such_bucket() {
             read.error_code()
         );
     }
+}
+
+/// The endpoint a preflight below is addressed to, which carries no bucket — so the request
+/// is PATH-STYLE, the form a browser sends for an endpoint addressed without the bucket.
+const PREFLIGHT_HOST: &str = "s3.us-east-1.amazonaws.com";
+
+/// The error code S3 refuses a cors request with, and the two sentences that tell its
+/// refusals apart. Spelled here rather than imported, so a wording regression fails this
+/// suite.
+const CORS_REFUSAL_CODE: &str = "AccessForbidden";
+/// See [`CORS_REFUSAL_CODE`] — the sentence S3 refuses a preflight no rule admits with,
+/// which names each of the three things a rule is matched on.
+const NOT_ALLOWED_MESSAGE: &str =
+    "CORSResponse: This CORS request is not allowed. This is usually because the evalution of \
+     Origin, request method / Access-Control-Request-Method or Access-Control-Request-Headers \
+     are not whitelisted by the resource's CORS spec.";
+/// See [`CORS_REFUSAL_CODE`].
+const NOT_ENABLED_MESSAGE: &str = "CORSResponse: CORS is not enabled for this bucket.";
+
+/// Send one CORS PREFLIGHT: the `OPTIONS` a browser sends before a cross-origin call, which
+/// carries NO credential at all — a browser cannot sign one — and asks its question in the
+/// three `Origin` / `Access-Control-Request-*` headers `headers` spells.
+async fn preflight(router: &MultiServiceRouter, uri: &str, headers: &[(&str, &str)]) -> Answer {
+    super::bucket_lifecycle::send_bytes_signed(
+        router,
+        "",
+        "OPTIONS",
+        PREFLIGHT_HOST,
+        uri,
+        headers,
+        b"",
+    )
+    .await
+}
+
+/// The cors configuration the preflight rows below are judged against: one rule for a named
+/// origin and one for a wildcard origin, so a row can vary the origin as well as the method
+/// and the headers it asks about.
+fn preflight_configuration() -> String {
+    let named = rule(&format!(
+        "{}{}{}{}<MaxAgeSeconds>3000</MaxAgeSeconds>",
+        entries("AllowedOrigin", &["https://app.example.com"]),
+        entries("AllowedMethod", &["PUT", "GET"]),
+        entries("AllowedHeader", &["content-type", "x-amz-meta-*"]),
+        entries("ExposeHeader", &["ETag"]),
+    ));
+    let wildcard = rule(&format!(
+        "{}{}",
+        entries("AllowedOrigin", &["https://*.cdn.example.net"]),
+        entries("AllowedMethod", &["HEAD"]),
+    ));
+    format!("{named}{wildcard}")
+}
+
+/// One preflight row: the case, the path addressed, the headers the preflight asks with, the
+/// status it must earn, and the `(header, value)` pairs the answer must report — a header
+/// named with `None` must be ABSENT.
+type PreflightRow<'a> = (
+    &'a str,
+    &'a str,
+    &'a [(&'a str, &'a str)],
+    u16,
+    &'a [(&'a str, Option<&'a str>)],
+);
+
+/// A preflight is answered from the bucket's own cors rules: a rule that admits the origin,
+/// the intended method and every intended header makes it a 200 carrying that rule, and a
+/// combination no rule admits is refused 403.
+///
+/// The rows differ along what the rule generalises over: the ORIGIN (one the configuration
+/// names, one it does not, one its wildcard covers), the intended METHOD (each of the ones a
+/// rule states, and one it does not), the HEADERS asked about (none, several, one no rule
+/// allows, one a wildcard allows), and whether the address names an object or the bucket
+/// itself.
+#[tokio::test]
+async fn a_preflight_is_answered_from_the_buckets_cors_rules() {
+    let router = router();
+    create_bucket(&router, "cors-preflight", None, None).await;
+    let configured = put_cors(&router, "cors-preflight", &preflight_configuration()).await;
+    assert_eq!(
+        configured.status, 200,
+        "the bucket must take its cors configuration first, got {} with body {:?}",
+        configured.status,
+        String::from_utf8_lossy(&configured.body)
+    );
+
+    let rows: &[PreflightRow] = &[
+        (
+            "an allowed origin, an allowed method and the headers the rule allows",
+            "/cors-preflight/spa/assets/data.json",
+            &[
+                ("origin", "https://app.example.com"),
+                ("access-control-request-method", "PUT"),
+                ("access-control-request-headers", "content-type,x-amz-meta-note"),
+            ],
+            200,
+            &[
+                (
+                    "access-control-allow-origin",
+                    Some("https://app.example.com"),
+                ),
+                ("access-control-allow-methods", Some("PUT, GET")),
+                (
+                    "access-control-allow-headers",
+                    Some("content-type, x-amz-meta-note"),
+                ),
+                ("access-control-max-age", Some("3000")),
+                ("access-control-expose-headers", Some("ETag")),
+            ],
+        ),
+        (
+            "the other method the same rule allows, asking about no headers",
+            "/cors-preflight/spa/assets/data.json",
+            &[
+                ("origin", "https://app.example.com"),
+                ("access-control-request-method", "GET"),
+            ],
+            200,
+            &[
+                (
+                    "access-control-allow-origin",
+                    Some("https://app.example.com"),
+                ),
+                ("access-control-allow-methods", Some("PUT, GET")),
+                ("access-control-allow-headers", None),
+            ],
+        ),
+        (
+            "the BUCKET itself rather than an object under it",
+            "/cors-preflight",
+            &[
+                ("origin", "https://app.example.com"),
+                ("access-control-request-method", "GET"),
+            ],
+            200,
+            &[(
+                "access-control-allow-origin",
+                Some("https://app.example.com"),
+            )],
+        ),
+        (
+            "an origin the wildcard rule covers",
+            "/cors-preflight/spa/assets/data.json",
+            &[
+                ("origin", "https://assets.cdn.example.net"),
+                ("access-control-request-method", "HEAD"),
+            ],
+            200,
+            &[
+                (
+                    "access-control-allow-origin",
+                    Some("https://assets.cdn.example.net"),
+                ),
+                ("access-control-allow-methods", Some("HEAD")),
+                ("access-control-max-age", None),
+            ],
+        ),
+        (
+            "a method no rule of the configuration allows",
+            "/cors-preflight/spa/assets/data.json",
+            &[
+                ("origin", "https://app.example.com"),
+                ("access-control-request-method", "DELETE"),
+            ],
+            403,
+            &[("access-control-allow-origin", None)],
+        ),
+        (
+            "an origin no rule of the configuration names",
+            "/cors-preflight/spa/assets/data.json",
+            &[
+                ("origin", "https://attacker.example.org"),
+                ("access-control-request-method", "PUT"),
+            ],
+            403,
+            &[("access-control-allow-origin", None)],
+        ),
+        (
+            "a header no rule of the configuration allows",
+            "/cors-preflight/spa/assets/data.json",
+            &[
+                ("origin", "https://app.example.com"),
+                ("access-control-request-method", "PUT"),
+                ("access-control-request-headers", "x-custom-field"),
+            ],
+            403,
+            &[("access-control-allow-origin", None)],
+        ),
+        (
+            "an origin outside the wildcard rule's suffix",
+            "/cors-preflight/spa/assets/data.json",
+            &[
+                ("origin", "https://assets.cdn.example.org"),
+                ("access-control-request-method", "HEAD"),
+            ],
+            403,
+            &[("access-control-allow-origin", None)],
+        ),
+    ];
+
+    for (case, uri, headers, status, reported) in rows {
+        let answered = preflight(&router, uri, headers).await;
+        assert_eq!(
+            answered.status, *status,
+            "case {case:?}: expected HTTP {status}, got {} with body {:?}",
+            answered.status,
+            String::from_utf8_lossy(&answered.body)
+        );
+        for (header, value) in *reported {
+            assert_eq!(
+                answered.header(header).as_deref(),
+                *value,
+                "case {case:?}: expected {header} as {value:?}, got {:?}",
+                answered.header(header)
+            );
+        }
+        if *status == 403 {
+            assert_eq!(
+                answered.error_code(),
+                CORS_REFUSAL_CODE,
+                "case {case:?}: expected the {CORS_REFUSAL_CODE} code, got {:?}",
+                answered.error_code()
+            );
+            assert_eq!(
+                answered.error_message(),
+                NOT_ALLOWED_MESSAGE,
+                "case {case:?}: expected the sentence S3 refuses a disallowed cors request \
+                 with, got {:?}",
+                answered.error_message()
+            );
+            // The refusal names the method the preflight said it intended to use and the
+            // kind of resource the configuration was consulted for — the only members
+            // beside the sentence that say what was refused.
+            let intended = headers
+                .iter()
+                .find(|(name, _)| *name == "access-control-request-method")
+                .map(|(_, value)| value.to_string());
+            assert_eq!(
+                answered.element("Method"),
+                intended,
+                "case {case:?}: expected the refusal to name the intended method {intended:?}, \
+                 got {:?}",
+                answered.element("Method")
+            );
+            let addressed = if uri.trim_start_matches('/').contains('/') {
+                "OBJECT"
+            } else {
+                "BUCKET"
+            };
+            assert_eq!(
+                answered.element("ResourceType").as_deref(),
+                Some(addressed),
+                "case {case:?}: expected the refusal to name {addressed}, got {:?}",
+                answered.element("ResourceType")
+            );
+        }
+    }
+
+    // A rule that shares with EVERY origin reports the wildcard back rather than the one
+    // origin that asked, which is what lets a browser cache one answer for such a resource.
+    let replaced = put_cors(&router, "cors-preflight", &simple_rule("GET", "*")).await;
+    assert_eq!(
+        replaced.status, 200,
+        "the bucket must take the wildcard configuration, got {} with body {:?}",
+        replaced.status,
+        String::from_utf8_lossy(&replaced.body)
+    );
+    let answered = preflight(
+        &router,
+        "/cors-preflight/spa/assets/data.json",
+        &[
+            ("origin", "https://anything.example.org"),
+            ("access-control-request-method", "GET"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        answered.header("access-control-allow-origin").as_deref(),
+        Some("*"),
+        "case \"a rule sharing with every origin\": expected the wildcard back, got {:?}",
+        answered.header("access-control-allow-origin")
+    );
+
+    // And a preflight that names no origin asks nothing a rule could be matched against.
+    let no_origin = preflight(
+        &router,
+        "/cors-preflight/spa/assets/data.json",
+        &[("access-control-request-method", "GET")],
+    )
+    .await;
+    assert_eq!(
+        no_origin.status, 400,
+        "case \"a preflight naming no origin\": expected HTTP 400, got {} with body {:?}",
+        no_origin.status,
+        String::from_utf8_lossy(&no_origin.body)
+    );
+    assert_eq!(
+        no_origin.error_code(),
+        "BadRequest",
+        "case \"a preflight naming no origin\": expected the BadRequest code, got {:?}",
+        no_origin.error_code()
+    );
+}
+
+/// A bucket with NO cors configuration shares nothing cross-origin: every preflight against
+/// it is refused with the sentence S3 states for exactly that condition — before the
+/// configuration is put, and again once `DeleteBucketCors` has removed it.
+#[tokio::test]
+async fn a_preflight_against_a_bucket_sharing_nothing_is_refused() {
+    let router = router();
+    create_bucket(&router, "cors-unconfigured", None, None).await;
+
+    let asked = &[
+        ("origin", "https://app.example.com"),
+        ("access-control-request-method", "GET"),
+    ];
+    let case = "before any cors configuration is put";
+    let refused = preflight(&router, "/cors-unconfigured/spa/index.html", asked).await;
+    assert_eq!(
+        refused.status, 403,
+        "case {case:?}: expected HTTP 403, got {} with body {:?}",
+        refused.status,
+        String::from_utf8_lossy(&refused.body)
+    );
+    assert_eq!(
+        refused.error_code(),
+        CORS_REFUSAL_CODE,
+        "case {case:?}: expected the {CORS_REFUSAL_CODE} code, got {:?}",
+        refused.error_code()
+    );
+    assert_eq!(
+        refused.error_message(),
+        NOT_ENABLED_MESSAGE,
+        "case {case:?}: expected the sentence S3 refuses a bucket sharing nothing with, got \
+         {:?}",
+        refused.error_message()
+    );
+    // A bucket that shares nothing at all is refused ABOUT THE BUCKET, whatever the request
+    // addressed under it: the decision is about the configuration the bucket does not carry.
+    assert_eq!(
+        refused.element("ResourceType").as_deref(),
+        Some("BUCKET"),
+        "case {case:?}: expected the refusal to name BUCKET, got {:?}",
+        refused.element("ResourceType")
+    );
+    assert_eq!(
+        refused.element("Method").as_deref(),
+        Some("GET"),
+        "case {case:?}: expected the refusal to name the intended method, got {:?}",
+        refused.element("Method")
+    );
+
+    // With a configuration in place the same preflight is answered.
+    let configured = put_cors(
+        &router,
+        "cors-unconfigured",
+        &simple_rule("GET", "https://app.example.com"),
+    )
+    .await;
+    assert_eq!(
+        configured.status, 200,
+        "the bucket must take its cors configuration, got {} with body {:?}",
+        configured.status,
+        String::from_utf8_lossy(&configured.body)
+    );
+    let answered = preflight(&router, "/cors-unconfigured/spa/index.html", asked).await;
+    assert_eq!(
+        answered.status, 200,
+        "case \"with a cors configuration in place\": expected HTTP 200, got {} with body {:?}",
+        answered.status,
+        String::from_utf8_lossy(&answered.body)
+    );
+    assert_eq!(
+        answered
+            .header("access-control-allow-credentials")
+            .as_deref(),
+        Some("true"),
+        "case \"with a cors configuration in place\": an admitted preflight says the call may \
+         carry its credentials, got {:?}",
+        answered.header("access-control-allow-credentials")
+    );
+
+    // And once the configuration is deleted the bucket shares nothing again.
+    let deleted = send(&router, "DELETE", "/cors-unconfigured?cors", &[], "").await;
+    assert_eq!(
+        deleted.status, 204,
+        "DeleteBucketCors must answer 204, got {} with body {:?}",
+        deleted.status,
+        String::from_utf8_lossy(&deleted.body)
+    );
+    let refused = preflight(&router, "/cors-unconfigured/spa/index.html", asked).await;
+    assert_eq!(
+        refused.status, 403,
+        "case \"after DeleteBucketCors\": expected HTTP 403, got {} with body {:?}",
+        refused.status,
+        String::from_utf8_lossy(&refused.body)
+    );
+    assert_eq!(
+        refused.error_message(),
+        NOT_ENABLED_MESSAGE,
+        "case \"after DeleteBucketCors\": expected the sentence S3 refuses a bucket sharing \
+         nothing with, got {:?}",
+        refused.error_message()
+    );
+
+    // The boundary of that answer: a name this emulator holds no bucket under is not a bucket
+    // sharing nothing, it is no bucket at all, and the preflight says so. Such a request is
+    // dispatched with a credential scope, because an anonymous request naming a bucket this
+    // emulator does not hold is not this service's to claim in the first place.
+    let case = "a bucket this emulator holds none under";
+    let absent = send_bytes(&router, "OPTIONS", "/cors-absent/spa/index.html", asked, b"").await;
+    assert_eq!(
+        absent.status, 404,
+        "case {case:?}: expected HTTP 404, got {} with body {:?}",
+        absent.status,
+        String::from_utf8_lossy(&absent.body)
+    );
+    assert_eq!(
+        absent.error_code(),
+        "NoSuchBucket",
+        "case {case:?}: expected the NoSuchBucket code, got {:?}",
+        absent.error_code()
+    );
+    assert_eq!(
+        absent.element("BucketName").as_deref(),
+        Some("cors-absent"),
+        "case {case:?}: expected the refusal to name the bucket, got {:?}",
+        absent.element("BucketName")
+    );
 }
