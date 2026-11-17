@@ -464,12 +464,13 @@ async fn an_error_states_the_services_own_sentence() {
 }
 
 /// RULE 2 for `ConflictException`: a `clientToken` reused inside its window with
-/// changed parameters is refused with the sentence the service publishes for that
-/// error, and the token the caller chose is not echoed back.
+/// changed parameters is refused with the sentence AWS words an idempotency-token
+/// mismatch with, and the token the caller chose is not echoed back.
 #[tokio::test]
 async fn a_client_token_reused_with_changed_parameters_states_the_published_sentence() {
-    // Source: `smithy_query(query="shape",shape="ConflictException")`.
-    let conflict = "Indicates a conflict with one or more parameters of the request.";
+    // The sentence this operation's recorded behaviour answers a reused token whose
+    // parameters changed with.
+    let conflict = "Idempotent request failed due to parameter mismatch.";
     let router = emulator_with_domains(&["conflicting", "conflicting-other"]);
     let token = "caller-chosen-idempotency-token";
 

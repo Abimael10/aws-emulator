@@ -106,15 +106,16 @@ pub fn parameter_only_provided_when(member: &str, condition: &str) -> String {
 /// specified next token is not valid."
 pub const INVALID_NEXT_TOKEN_MESSAGE: &str = "The specified next token is not valid.";
 
-/// The `message` every `ConflictException` this service raises carries — source:
-/// `smithy_query(query="shape",shape="ConflictException")` → doc "Indicates a conflict
-/// with one or more parameters of the request."
+/// The `message` the `ConflictException` this service raises carries: the sentence AWS
+/// words an IDEMPOTENCY-TOKEN mismatch with, which is the one conflict this service's
+/// operations can report — a `clientToken` reused inside its window with parameters that
+/// changed — and the wording this operation's recorded behaviour answers it with.
 ///
-/// The shape's documentation is the only wording the service publishes for this error,
-/// and the `clientToken` the conflict is about came from the caller, so it is stated
-/// without it.
-pub const CONFLICT_MESSAGE: &str =
-    "Indicates a conflict with one or more parameters of the request.";
+/// Fixed text with no variable part: the `clientToken` the conflict is about came from the
+/// caller, so it is stated without it. The error SHAPE's documentation ("Indicates a
+/// conflict with one or more parameters of the request.") describes the error class rather
+/// than the sentence the service states for an occurrence of it.
+pub const CONFLICT_MESSAGE: &str = "Idempotent request failed due to parameter mismatch.";
 
 /// The `message` every `NumberExportsLimitExceeded` this service raises carries —
 /// source: `smithy_query(query="shape",shape="NumberExportsLimitExceeded")` → doc

@@ -1305,3 +1305,88 @@ async fn the_two_apis_on_this_endpoint_stay_apart() {
          routing refusal, got {status} with {body}"
     );
 }
+
+/// One row of [`a_request_that_names_this_endpoint_reaches_this_api`]: what the request
+/// states, and the answer this API owes it.
+struct StatedCase<'a> {
+    case: &'a str,
+    parameters: Vec<(&'a str, &'a str)>,
+    status: u16,
+    code: &'a str,
+}
+
+/// A request whose routing key NAMES this endpoint is this endpoint's however it spells its
+/// action: this endpoint carries this API beside the modelled `/v2/*` operations, so an
+/// action neither of them has is this API's own `InvalidAction` to state, and a version no
+/// Amazon SimpleDB API declares is its own `NoSuchVersion` — never the framework's refusal
+/// of a route the model does not bind.
+///
+/// One row per way such a request can state an action and a version. (Which requests this
+/// API claims when NOTHING in them names a service — where the wire form is shared with
+/// every other AWS Query API, so this API has to be stated positively — is a rule about the
+/// ASSEMBLED router, pinned in `core/router/tests/all/sdb_query_api_claims_its_own_requests.rs`:
+/// a router holding this service alone cannot tell a peer's claim from no claim at all.)
+#[tokio::test]
+async fn a_request_that_names_this_endpoint_reaches_this_api() {
+    let router = emulator();
+    create_domain(&router, "stated").await;
+
+    let rows: Vec<StatedCase<'_>> = vec![
+        StatedCase {
+            case: "this API's version, with an action it does not publish",
+            parameters: vec![("Action", "ConjureDomain"), ("Version", API_VERSION)],
+            status: 400,
+            code: "InvalidAction",
+        },
+        StatedCase {
+            case: "no version at all, with an action this API does not publish",
+            parameters: vec![("Action", "ConjureDomain")],
+            status: 400,
+            code: "InvalidAction",
+        },
+        StatedCase {
+            case: "a version no Amazon SimpleDB API declares, with one of this API's actions",
+            parameters: vec![("Action", "DomainMetadata"), ("Version", "2007-11-07")],
+            status: 400,
+            code: "NoSuchVersion",
+        },
+        StatedCase {
+            // Another AWS Query API's action, under that API's version, addressed to THIS
+            // endpoint: the version decides, and this endpoint declares none such.
+            case: "another API's action under that API's version",
+            parameters: vec![
+                ("Action", "AssumeRoleWithWebIdentity"),
+                ("Version", "2011-06-15"),
+            ],
+            status: 400,
+            code: "NoSuchVersion",
+        },
+        StatedCase {
+            case: "an action of this API this emulator does not serve, under no version",
+            parameters: vec![("Action", "Select")],
+            status: 501,
+            code: "NotImplemented",
+        },
+    ];
+
+    for row in rows {
+        let (status, code, message) = refused(&router, &row.parameters).await;
+        assert_eq!(
+            (status, code.as_str()),
+            (row.status, row.code),
+            "case {}: expected ({}, {}) from this API's own envelope, got ({status}, {code}, \
+             {message})",
+            row.case,
+            row.status,
+            row.code
+        );
+    }
+
+    // A request this endpoint names and this API serves is still served, and nothing above
+    // created or removed a domain: a refused call writes nothing.
+    assert_eq!(
+        texts_of(&served(&router, "ListDomains", &[]).await, "DomainName"),
+        vec!["stated".to_string()],
+        "case after every row: no row may have changed what the account holds"
+    );
+}

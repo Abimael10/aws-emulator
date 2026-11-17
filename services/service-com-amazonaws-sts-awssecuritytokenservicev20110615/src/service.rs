@@ -75,6 +75,15 @@ use aws_smithy_schema_server::{
     ProtocolError, QueryServerProtocol, QueryShapeDeserializer, ServerProtocol,
 };
 
+// The claim on a request that names NO service: this service's own wire form, read through
+// the tree's one copy of that rule (whose module docs state it). This service's
+// `AssumeRoleWithWebIdentity` and `AssumeRoleWithSAML` are modelled anonymous, so a
+// conforming client sends them UNSIGNED — no SigV4 credential scope to resolve a routing key
+// from — and a client pointed at this emulator's own endpoint (a loopback address) leaves
+// the host tier nothing to resolve either, so claiming by the signing name alone would leave
+// them to the router's `UnknownService` in an envelope an `awsQuery` client cannot parse.
+use ::service_common::query_wire_form::addresses_unattributed_query_request;
+
 /// The `awsQuery` field naming the operation a request is for.
 ///
 /// The protocol carries it in the form-encoded body. A call signed under SigV4's
@@ -229,10 +238,6 @@ const SIGNATURE_MISMATCH_CODE: &str = "SignatureDoesNotMatch";
 const SIGNATURE_MISMATCH_MESSAGE: &str =
     ::service_common::authentication_refusal::SIGNATURE_MISMATCH_MESSAGE;
 
-/// The media type an `awsQuery` request carries its form-encoded body in, which is the
-/// only body this service's protocol reads.
-const QUERY_CONTENT_TYPE: &str = "application/x-www-form-urlencoded";
-
 thread_local! {
     /// The access key id the request this service is serving presented, for the length of
     /// that one request.
@@ -263,51 +268,6 @@ fn remember_presented_access_key_id(parts: &http::request::Parts) {
 /// then reads no credential at all rather than the previous request's.
 fn presented_access_key_id() -> Option<String> {
     PRESENTED_ACCESS_KEY_ID.with(|presented| presented.borrow_mut().take())
-}
-
-/// Whether `parts` addresses this service's own wire form while naming NO service at all.
-///
-/// Every `awsQuery` operation is a `POST` of an `application/x-www-form-urlencoded` body
-/// to the ROOT path, with the operation in the body's `Action` field — the protocol
-/// publishes no `smithy.api#http` binding and no `X-Amz-Target`, so that is the whole
-/// signature such a request has.
-///
-/// It is the signature a request has to be claimed by when nothing else in it names a
-/// service: this service's `AssumeRoleWithWebIdentity` and `AssumeRoleWithSAML` are
-/// modelled anonymous (`auth: []`, `optionalAuth`), so a conforming client sends them
-/// UNSIGNED — no SigV4 credential scope to resolve a routing key from — and a client
-/// pointed at this emulator's own endpoint (a loopback address, which names no service)
-/// leaves the host tier nothing to resolve either. Claiming by the signing name alone
-/// therefore serves every signed call and leaves the anonymous ones unclaimed, which the
-/// router answers `UnknownService` in a JSON envelope an `awsQuery` client cannot even
-/// parse.
-///
-/// Nothing weaker is claimed: a request that resolves to SOME service's routing key is
-/// that service's however it is addressed, and a request on any other path or method, or
-/// carrying any other body type, reaches nobody exactly as before.
-fn addresses_unattributed_query_request(parts: &http::request::Parts) -> bool {
-    if ::emulator_server::resolve_route_key(parts).is_some() {
-        // SOMETHING in the request names a service — a SigV4 credential scope, an
-        // `X-Amz-Target`, or an endpoint host — and it is not this service's name (the
-        // claim's first conjunct asked that already). That request is its own service's,
-        // however it is addressed.
-        return false;
-    }
-    let form_encoded = parts
-        .headers
-        .get(http::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| {
-            value
-                .split(';')
-                .next()
-                .unwrap_or(value)
-                .trim()
-                .eq_ignore_ascii_case(QUERY_CONTENT_TYPE)
-        });
-    parts.method == http::Method::POST
-        && parts.uri.path().trim_matches('/').is_empty()
-        && form_encoded
 }
 
 /// One modelled operation, served so that a refused request is stated the way AWS states
@@ -669,9 +629,12 @@ mod tests {
 
     use super::{
         addresses_unattributed_query_request, remember_presented_access_key_id, EmulatedService,
-        QUERY_CONTENT_TYPE, SIGNATURE_MISMATCH_CODE, SIGNATURE_MISMATCH_MESSAGE,
-        UNRESOLVED_CREDENTIAL_CODE, UNRESOLVED_CREDENTIAL_MESSAGE,
+        SIGNATURE_MISMATCH_CODE, SIGNATURE_MISMATCH_MESSAGE, UNRESOLVED_CREDENTIAL_CODE,
+        UNRESOLVED_CREDENTIAL_MESSAGE,
     };
+    /// The media type an `awsQuery` request carries its form-encoded body in, stated by the
+    /// module that owns the claim these rows drive.
+    use ::service_common::query_wire_form::QUERY_CONTENT_TYPE;
     use crate::state::{Identity, Session, SessionKind};
     use std::sync::Arc;
     use std::time::{Duration, SystemTime};

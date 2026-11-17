@@ -635,6 +635,10 @@ pub mod query_decimal_floats;
 /// the framework's own form reader takes two literals and reports its own parser diagnostic.
 pub mod query_boolean_values;
 pub mod query_error_envelope;
+/// The ONE reading of the wire form every AWS Query API request arrives in, and of the
+/// claim a service makes on one that names no service at all — an unsigned call, a
+/// Signature Version 2 one, or a client pointed at this emulator's own address.
+pub mod query_wire_form;
 /// A refusal whose clause QUOTES the value the request carried, where the framework's own
 /// walk elides a long one into a prefix AWS never emits.
 pub mod quoted_refusals;

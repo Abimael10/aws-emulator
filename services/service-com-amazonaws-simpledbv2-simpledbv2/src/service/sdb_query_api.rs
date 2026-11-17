@@ -12,15 +12,24 @@
 //! `Action=<action>&Version=2009-04-15` plus that action's parameters. Both are addressed
 //! with the same `aws.api#service` endpoint prefix and the same `aws.auth#sigv4` signing
 //! name (`sdb`), so one service claims both and the request's own shape decides which API
-//! it is: a request on `"/"` naming an `Action` is this one.
+//! it is: a request on `"/"` naming an `Action` of this API is this one.
 //!
 //! Nothing in the generated routing table can name such a request — the table is keyed by
 //! the modelled `method + URI`, and `POST /` matches none of the three — so it is routed
 //! through [`smithy_server_runtime::Service::override_operation`], the one seam that sees
-//! the request BODY before the model's routing key is resolved. That seam names it an
-//! operation, which is what makes the router verify the caller's signature before
-//! anything is served: this is an AWS API, reached with AWS credentials, and it is
-//! authenticated exactly as the modelled operations are.
+//! the request BODY before the model's routing key is resolved.
+//!
+//! The 2009-04-15 API is signed with Signature Version 2, which carries the caller's
+//! credential among the form fields rather than in an `Authorization` header, so one of
+//! its requests names no service in any tier the framework resolves a routing key from —
+//! and a client pointed at this emulator reaches it on a loopback address, which names
+//! none either. Such a request is claimed by the query wire form it addresses
+//! ([`::service_common::query_wire_form`]) and then decided here: the form is shared by
+//! every AWS Query API, so [`addresses_query_api`] admits only a request whose `Action`
+//! and `Version` state THIS API. A request to this surface is verified under the one scheme
+//! this router can verify, SigV4, as the modelled operations are — see
+//! [`QUERY_API_AUTH_SCHEMES`] for what that means for a client signing with the Signature
+//! Version 2 this API publishes.
 //!
 //! # What is served
 //!
@@ -89,37 +98,82 @@ pub const ITEM_NAME_PARAMETER: &str = "ItemName";
 /// each is a `501` rather than a success or an `InvalidAction`.
 pub const UNSERVED_ACTIONS: &[&str] = &["BatchDeleteAttributes", "BatchPutAttributes", "Select"];
 
-/// The auth schemes a request to this surface is verified under.
+/// The auth schemes the router verifies a request to this surface under: SigV4, the one
+/// scheme this router holds an authenticator for, exactly as every modelled operation of
+/// this service is verified. This surface is NOT a modelled operation, so there is no
+/// modelled operation for the router to read schemes off; without this the router would
+/// find no scheme for such a request and could not verify the credential it carries.
 ///
-/// SigV4 is the only scheme this service's model declares, and this surface is reached
-/// with the same AWS credentials the modelled operations are. It is NOT a modelled
-/// operation, so there is no modelled operation for the router to read schemes off:
-/// without this the router would find no scheme for such a request and could not verify
-/// the credential it carries.
+/// Amazon SimpleDB 2009-04-15 is itself signed with Signature Version 2, which carries the
+/// caller's credential among the request's own parameters — `AWSAccessKeyId`,
+/// `SignatureVersion=2`, `SignatureMethod`, `Timestamp` and `Signature` — and sends no
+/// `Authorization` header at all. With request authentication on, a client signing that way
+/// is refused by the router before any handler runs: `vendor/server/src/request_authentication.rs`
+/// implements SigV4 alone, an authenticator is registered on the router rather than
+/// declared by a service, and the credential store hands a service no secret to check one
+/// with, so nothing inside this crate can verify that scheme. Serving such a request would
+/// mean declaring this surface unsigned, which is not a service's choice to make. The gap
+/// is the core's to close — see this change's submission notes — and it is the only thing
+/// between a conforming Signature Version 2 client and the surface below.
 const QUERY_API_AUTH_SCHEMES: &[&str] = &[::emulator_server::aws_credentials::SIGV4_SCHEME];
 
-/// Whether `req` addresses this API: a form-encoded request naming an `Action`, either on
-/// the endpoint's root path or naming this API's own `Version`.
+/// Whether `req` addresses this API: a form-encoded request naming an `Action` of this
+/// API, either on the endpoint's root path or naming this API's own `Version`.
 ///
-/// Two signals, because this endpoint carries two APIs and a client of either may address
-/// it in more than one way. The ROOT PATH is where the AWS Query API lives, and the
-/// modelled operations are bound under `/v2/`, so an `Action` on `"/"` is this API's.
-/// `Version=2009-04-15` is the API's own identifier, which its requests carry whatever
-/// path they reach the endpoint on, so a request stating it is this API's too. A modelled
-/// request can match neither: its body is a JSON document, which carries no form field at
-/// all.
+/// Two signals for WHERE, because this endpoint carries two APIs and a client of either
+/// may address it in more than one way. The ROOT PATH is where the AWS Query API lives,
+/// and the modelled operations are bound under `/v2/`, so an `Action` on `"/"` is this
+/// API's. `Version=2009-04-15` is the API's own identifier, which its requests carry
+/// whatever path they reach the endpoint on, so a request stating it is this API's too. A
+/// modelled request can match neither: its body is a JSON document, which carries no form
+/// field at all.
+///
+/// One signal for WHOSE, and only where it is needed. A request whose routing key NAMES
+/// this endpoint is this endpoint's however it spells its action: this endpoint carries this
+/// API beside the modelled operations, so an action neither of them has is this API's own
+/// `InvalidAction` to state. A request that names NO service is claimed by the query wire
+/// form alone (see [`crate::service::EmulatedService::can_handle`]), and that form is shared
+/// by every AWS Query API, so such a request is this API's only when it states this API
+/// POSITIVELY: its own `Version`, or an `Action` this API publishes ([`published_action`]).
+/// Another API's request is therefore never taken from it, whatever form it shares with this
+/// one.
 pub fn addresses_query_api(req: &RtRequest) -> bool {
     let parameters = QueryParameters::of(req);
-    let names_action = parameters
-        .value(ACTION_PARAMETER)
-        .is_some_and(|action| !action.trim().is_empty());
-    if !names_action {
+    let Some(action) = named_action(&parameters) else {
+        return false;
+    };
+    let version = parameters.value(VERSION_PARAMETER);
+    let path = ::service_common::uri_path(req.uri());
+    let addressed_here = path.is_empty() || path == "/" || version == Some(API_VERSION);
+    if !addressed_here {
         return false;
     }
-    let path = ::service_common::uri_path(req.uri());
-    path.is_empty()
-        || path == "/"
-        || parameters.value(VERSION_PARAMETER) == Some(API_VERSION)
+    if !::service_common::query_wire_form::names_no_service(req) {
+        return true;
+    }
+    version == Some(API_VERSION) || published_action(action).is_some()
+}
+
+/// The `Action` the request names, trimmed, or `None` when it names none.
+fn named_action(parameters: &QueryParameters) -> Option<&str> {
+    parameters
+        .value(ACTION_PARAMETER)
+        .map(str::trim)
+        .filter(|action| !action.is_empty())
+}
+
+/// The action of THIS API that `action` names, in this crate's own spelling, or `None`
+/// when this API publishes no such action.
+///
+/// The one membership test over the two lists this API publishes — the actions it serves
+/// and the actions it answers `501` for — so what counts as "an action of this API" cannot
+/// be read two ways by the claim and by the audit record.
+pub fn published_action(action: &str) -> Option<&'static str> {
+    SERVED_ACTIONS
+        .iter()
+        .chain(UNSERVED_ACTIONS)
+        .find(|known| **known == action)
+        .copied()
 }
 
 /// The Amazon SimpleDB 2009-04-15 API, as the one [`ErasedOperation`] the service holds
@@ -322,14 +376,7 @@ pub fn write_refusal(refusal: crate::state::simpledb_domains::WriteRefusal) -> Q
 /// forge a line of this record.
 fn audit(ctx: &OperationContext<'_>, action: &str, outcome: &str) {
     let action = if action.is_empty() { "<none>" } else { action };
-    let action = match SERVED_ACTIONS
-        .iter()
-        .chain(UNSERVED_ACTIONS)
-        .find(|known| **known == action)
-    {
-        Some(known) => *known,
-        None => "<unknown>",
-    };
+    let action = published_action(action).unwrap_or("<unknown>");
     ::tracing::info!(
         audit = true,
         operation = "SimpleDB2009-04-15",

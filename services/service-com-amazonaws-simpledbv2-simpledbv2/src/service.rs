@@ -16,10 +16,10 @@
 //! Five opt-in seams are yours to change; every one defaults to the framework's
 //! own behaviour, so an unedited service still routes and answers correctly:
 //!
-//! - `can_handle` — which requests this service claims. The default matches the
-//!   request's resolved route key against this service's signing name. Edit it
-//!   for anything the model does not express: a signing name shared by several
-//!   services, or routing that keys on the access-key id.
+//! - `can_handle` — which requests this service claims. EDITED HERE: beside a request
+//!   whose resolved route key is this service's signing name, it claims one that names NO
+//!   service and arrives in the AWS Query API's wire form, which is how the 2009-04-15
+//!   API below reaches this endpoint.
 //! - `override_operation` — serve a request the model's routing key cannot name
 //!   correctly. The default returns `None`, so every request resolves through the
 //!   generated routing table. Return `Some(op)` to route one yourself.
@@ -47,6 +47,14 @@
 //! model for. The generated routing table can name only the first, so the second is
 //! served through `override_operation` below — the one seam that sees a request's BODY,
 //! where that API's `Action` field is. [`sdb_query_api`] is that surface.
+//!
+//! Its requests also have to be CLAIMED before they can be served, and a conforming
+//! client of that API gives the framework's routing tiers nothing to claim it by: the
+//! 2009-04-15 API is signed with Signature Version 2, which puts the caller's credential
+//! in the form-encoded body rather than in an `Authorization` header, and a client pointed
+//! at this emulator reaches it on a loopback address. `can_handle` below therefore claims
+//! the query wire form itself when a request names no service, and `override_operation`
+//! decides from the body whether the request is this API's.
 
 /// The Amazon SimpleDB 2009-04-15 AWS Query API this endpoint serves beside the
 /// modelled export operations.
@@ -92,13 +100,22 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
-        }
+        // Claim a request whose resolved route key is this service's signing name — and,
+        // when NOTHING in the request names a service, one addressed in the AWS Query
+        // API's own wire form, which is how the 2009-04-15 API on this endpoint arrives.
+        // That API is signed with Signature Version 2, which carries the caller's
+        // credential in the form-encoded body instead of in an `Authorization` header, so
+        // its requests bring no SigV4 credential scope; and a client pointed at this
+        // emulator reaches it on a loopback address, which names no service in the host
+        // either. Without this claim such a request resolves to no service here and is
+        // swallowed by whichever peer claims the shared wire form.
+        //
+        // The wire form is shared by every query API, so claiming it is not deciding: the
+        // router keeps the claimants that name an operation for the request, and
+        // `override_operation` below names one only for a request that states THIS API
+        // (see [`sdb_query_api::addresses_query_api`]).
+        ::service_common::routes_to(parts, self.entry.identity().signing_name())
+            || ::service_common::query_wire_form::addresses_unattributed_query_request(parts)
     }
 
     fn override_operation(
@@ -113,9 +130,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // The Amazon SimpleDB 2009-04-15 AWS Query API is exactly that case: it is
         // served on this endpoint's ROOT path as a form-encoded request naming an
         // `Action`, which no modelled route can match (the three modelled operations are
-        // bound under `/v2/`) and no routing key can name. Naming it an operation here is
-        // also what has the router verify the caller's SigV4 signature before anything is
-        // served, exactly as it does for the modelled operations.
+        // bound under `/v2/`) and no routing key can name.
+        //
+        // It is ALSO what decides between this service and a peer when a request names no
+        // service at all and both claimed its shared wire form (see `can_handle`): this
+        // seam sees the `Action` and `Version` fields, which are where such a request
+        // states the API it is for.
+        //
+        // Naming it an operation is also what has the router verify the caller's
+        // credential before anything is served, under the scheme
+        // `sdb_query_api::QUERY_API_AUTH_SCHEMES` states.
         if sdb_query_api::addresses_query_api(req) {
             return Some(&self.sdb_query_api);
         }
