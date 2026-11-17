@@ -41,6 +41,12 @@
 //!   sends a request with `urllib3.PoolManager()` — which is how AWS's own documented
 //!   custom-resource response code answers CloudFormation — reaches this emulator over the
 //!   same seam the standard library's own client rides.
+//! * A state one of the service's resources reaches has the waiter the SDK's own client
+//!   answers with: `client.get_waiter(...)` polls the operation that state's own waiter
+//!   definition names until an acceptor of it decides the wait ([`waiter`]), which is how a
+//!   handler that has just asked for a resource waits for it to be usable; a state the service
+//!   publishes no waiter for has none, which is what `waiter_names` reports and the
+//!   `ValueError` a lookup of it raises says.
 //! * A paginated operation has the paginator the SDK's own client answers with:
 //!   `client.get_paginator(...)` pages it through by driving the members its model states
 //!   ([`paginator`]), and an operation the model does not mark as paginated has none, which
@@ -80,6 +86,9 @@ mod dynamodb;
 /// The paginator a client answers with for a paginated operation.
 mod paginator;
 
+/// The waiter a client answers with for a state one of the service's resources reaches.
+mod waiter;
+
 /// The HTTP client the SDK is built on, which a managed runtime ships beside it.
 mod urllib3;
 
@@ -105,6 +114,7 @@ pub fn runtime_modules() -> Vec<PackageModule> {
     ]
     .into_iter()
     .chain(paginator::modules())
+    .chain(waiter::modules())
     .chain(dynamodb::modules())
     .chain(urllib3::modules())
     .map(|(path, source)| PackageModule {
@@ -142,6 +152,11 @@ pub fn pagination_config(service: &str, operation: &str) -> String {
 /// `xform_name` lives here because that is where the SDK keeps it: it is the one rule that
 /// turns a model's own member or operation name into the Python one an SDK reports it under
 /// (`TableName` -> `table_name`, `LatestStreamARN` -> `latest_stream_arn`).
+///
+/// `search_path` lives here for the same reason: reading the value a path of member names
+/// reaches in one answer is what the SDK's own data-driven interfaces are written over — the
+/// paginator's continuation and result members ([`paginator`]) and a waiter's acceptors
+/// ([`waiter`]) — so the two drive ONE reader rather than a reading each.
 const BOTOCORE_SOURCE: &str = r#"
 """The AWS SDK for Python's lower half, as this runtime supplies it."""
 
@@ -166,6 +181,37 @@ def xform_name(name, sep="_"):
     first = _first_cap_regex.sub(r"\1" + sep + r"\2", name)
     numbered = _number_cap_regex.sub(r"\1" + sep + r"\2", first)
     return _end_cap_regex.sub(r"\1" + sep + r"\2", numbered).lower()
+
+
+def _resolve(held, steps):
+    """The value the remaining `steps` of a path reach in `held`."""
+    if not steps:
+        return held
+    step = steps[0]
+    rest = steps[1:]
+    each = step.endswith("[]")
+    name = step[:-2] if each else step
+    if name:
+        if not isinstance(held, dict):
+            return None
+        held = held.get(name)
+    if not each:
+        return _resolve(held, rest)
+    if not isinstance(held, list):
+        return None
+    return [_resolve(element, rest) for element in held]
+
+
+def search_path(document, expression):
+    """The value `expression` names in `document`, or `None` where it holds none.
+
+    An expression is the member names from the root of an answer, separated by dots, so a
+    member of a nested structure is reached the way the model states it; `[]` after a list
+    member means every element of it, which is how the SDK's own data names a member of each
+    structure of a list. A path the answer does not carry reaches nothing.
+    """
+    return _resolve(document, [step for step in str(expression).split(".") if step])
+
 "#;
 
 /// `botocore.exceptions`: the exception types a handler catches.
@@ -211,6 +257,20 @@ class PaginationError(BotoCoreError):
 
 class OperationNotPageableError(BotoCoreError):
     fmt = "Operation cannot be paginated: {operation_name}"
+
+
+class WaiterError(BotoCoreError):
+    """A wait ended without the state it was waiting for, and why.
+
+    `last_response` is the answer the wait ended on, which is where a handler reads what the
+    resource's state really was.
+    """
+
+    fmt = "Waiter {name} failed: {reason}"
+
+    def __init__(self, name, reason, last_response):
+        BotoCoreError.__init__(self, name=name, reason=reason)
+        self.last_response = last_response
 
 
 class ReadTimeoutError(BotoCoreError):
@@ -950,6 +1010,26 @@ class Client:
         return Paginator(
             getattr(self, operation_name), _operation_name(operation_name), config
         )
+
+    def get_waiter(self, waiter_name):
+        """The waiter of that name, which polls this client until the state it waits for.
+
+        WHICH operation it polls, what it accepts and how long it waits are the service's own
+        waiter definition's; a state this service publishes no waiter for does not exist,
+        which is what the SDK says rather than polling something else.
+        """
+        # Imported here rather than at module scope, like the paginator above: a handler that
+        # waits for nothing pays nothing for the waiter interface's own module.
+        from botocore.waiter import waiter_for
+
+        return waiter_for(self, self._service_name, waiter_name)
+
+    @property
+    def waiter_names(self):
+        """The waiters this client has, under the names the SDK reports them by."""
+        from botocore.waiter import waiter_names
+
+        return waiter_names(self._service_name)
 
     def _pagination(self, operation_name):
         """How the named operation is paged through, as its own model states it."""

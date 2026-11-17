@@ -25,7 +25,9 @@
 //!   uses merged into the request's own `ExpressionAttributeNames`/`ExpressionAttributeValues`;
 //! * a `Table`'s own attributes are the ones `DescribeTable` reports for it, read when
 //!   first asked for, so nothing about a table is held here that the service did not
-//!   answer.
+//!   answer;
+//! * a `Table`'s own waits (`wait_until_exists`, `wait_until_not_exists`) are the client's
+//!   waiters of those states ([`super::waiter`]), carrying this table's name.
 //!
 //! Nothing here is the containment, and nothing here makes a call of its own: every request
 //! is the client's, signed and dispatched by host code, and a service's answer is the
@@ -953,6 +955,13 @@ class DocumentClient:
     def get_paginator(self, operation_name):
         return self._client.get_paginator(operation_name)
 
+    def get_waiter(self, waiter_name):
+        return self._client.get_waiter(waiter_name)
+
+    @property
+    def waiter_names(self):
+        return self._client.waiter_names
+
     def close(self):
         return self._client.close()
 "##;
@@ -1113,6 +1122,16 @@ class Table:
         answered = self.meta.client.update_table(TableName=self.name, **kwargs)
         self.meta.data = None
         return answered
+
+    def wait_until_exists(self, **kwargs):
+        """Wait until this table exists, which is the table waiter of that state."""
+        self.meta.client.get_waiter("table_exists").wait(TableName=self.name, **kwargs)
+
+    def wait_until_not_exists(self, **kwargs):
+        """Wait until this table is gone, which is the table waiter of that state."""
+        self.meta.client.get_waiter("table_not_exists").wait(
+            TableName=self.name, **kwargs
+        )
 
     def batch_writer(self, overwrite_by_pkeys=None, flush_amount=25):
         """A writer that sends this table's writes in batches."""

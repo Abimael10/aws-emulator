@@ -29,6 +29,8 @@
 //! * `build_full_result` joins the pages' own result members into one document, and names the
 //!   resume token under `NextToken` when the iteration stopped early, which is the document a
 //!   caller passes back as the next `StartingToken`.
+//! * The member path a driven member is named by is read by the one reader of a path this SDK
+//!   has, the `botocore.search_path` a waiter's acceptors read theirs with ([`super`]).
 
 /// The modules of the paginator interface, in the order they are put on the import path.
 #[must_use]
@@ -43,6 +45,7 @@ const PAGINATE_SOURCE: &str = r#"
 import base64
 import json
 
+from botocore import search_path as _search
 from botocore.exceptions import PaginationError
 
 
@@ -74,22 +77,6 @@ def _as_list(value):
     if isinstance(value, (list, tuple)):
         return list(value)
     return [value]
-
-
-def _search(document, path):
-    """The value `path` names in `document`, or `None` when it holds none.
-
-    A path is the member names from the root of the answer, so a member of a nested
-    structure is reached the way the model states it.
-    """
-    held = document
-    for step in str(path).split("."):
-        if not isinstance(held, dict):
-            return None
-        held = held.get(step)
-        if held is None:
-            return None
-    return held
 
 
 class Paginator:
