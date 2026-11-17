@@ -36,6 +36,12 @@
 //!   `CSE_KMS` (`smithy_query(query="shape",shape="EncryptionOption")`), that is `CSE_KMS`,
 //!   `SSE_KMS`, `SSE_S3`.
 //!
+//! One kind of broken bound is NOT stated in that envelope at all: a bound the service also
+//! states as a RULE of its own is reported as that rule, in the service's own sentence for it
+//! ([`own_sentence`]). A client is told what it must do differently, and it is told the same
+//! thing whether the framework measured the value against the model's bound or a handler
+//! measured it against the rule.
+//!
 //! # Why two seams
 //!
 //! The framework refuses the request before any handler runs, and asks this service for the
@@ -86,6 +92,13 @@ const ATHENA_ERROR_CODE_MEMBER: &str = "AthenaErrorCode";
 /// [`crate::scaffolded::AthenaRefusal`]).
 const ERROR_CODE_MEMBER: &str = "ErrorCode";
 
+/// The member every operation that requests provisioned capacity declares the amount under,
+/// as a violation's path spells it: the lowerCamel of `TargetDpus`
+/// (`aws_smithy_schema_server::constraints::path::member`), which both
+/// `CreateCapacityReservation` and `UpdateCapacityReservation` target at `TargetDpusInteger`
+/// and its `@range`.
+const TARGET_DPUS_MEMBER: &str = "targetDpus";
+
 /// The wrapper this service hands back from `Service::override_operation`: it serves the
 /// operation the routing table names and then completes what that walk rendered
 /// ([`with_refusal_body`]).
@@ -98,7 +111,9 @@ pub static REFUSAL_BODY: RestatedRefusalOperation = RestatedRefusalOperation::ne
 /// `Service::override_refusal` body.
 ///
 /// A constraint refusal is this service's `InvalidRequestException`, worded as AWS words a
-/// validation failure, with the renderings the module header states. Anything else —
+/// validation failure, with the renderings the module header states — except where the
+/// service states the broken rule in a sentence of its OWN ([`own_sentence`]), which is then
+/// the sentence, since that is the rule the request broke. Anything else —
 /// a caller request authentication refused — keeps the framework's own code and wording, so
 /// a 403 is not restated as a bad request.
 #[must_use]
@@ -108,6 +123,17 @@ pub fn stated_refusal(refusal: &Refusal) -> Option<Refused> {
         // framework's own 403 code and wording.
         return None;
     };
+    // A request that broke ONE constraint the service states itself is answered with that
+    // statement. One that also broke another is answered in the validation envelope, which
+    // names every clause rather than dropping the ones this service has no sentence for.
+    if let [only] = violations.as_slice() {
+        if let Some(stated) = own_sentence(only) {
+            return Some(Refused {
+                code: INVALID_REQUEST_EXCEPTION.to_string(),
+                message: stated,
+            });
+        }
+    }
     // Only the ORDER of an enumerated type's value set moves, and it moves before the
     // envelope is rendered; every clause, its member path and its requirement stay the
     // framework's.
@@ -124,6 +150,27 @@ pub fn stated_refusal(refusal: &Refusal) -> Option<Refused> {
         code: INVALID_REQUEST_EXCEPTION.to_string(),
         message: stated.message,
     })
+}
+
+/// The sentence this service states `violation` in ITSELF, where it has one, and `None`
+/// where the refusal is stated in AWS's validation wording.
+///
+/// A modelled bound the service also states as a rule of its own is reported as that rule:
+/// the amount of provisioned capacity a reservation asks for is allocated in blocks, and the
+/// `@range` minimum on `TargetDpusInteger` — the only bound that shape declares — is the size
+/// of one block, so an amount below it is refused with the service's own sentence for an
+/// amount it cannot allocate ([`crate::state::capacity_dpus_error`]) rather than with a clause
+/// about a numeric bound. That is also what keeps the refusal of such an amount one sentence
+/// whether the framework measured it against the model's bound or the handler against the
+/// rule.
+fn own_sentence(violation: &Violation) -> Option<String> {
+    let member = violation.path.split('.').next_back()?;
+    match (member, &violation.kind) {
+        (TARGET_DPUS_MEMBER, ViolationKind::MinValue(_)) => {
+            Some(crate::state::capacity_dpus_not_in_increments())
+        }
+        _ => None,
+    }
 }
 
 /// Whether the clause for `violation` states no value at all.
@@ -340,6 +387,58 @@ mod tests {
             stated_refusal(&Refusal::Unauthenticated),
             None,
             "expected the framework's own wording for a refusal of another class"
+        );
+    }
+
+    /// RULE: a bound the service states as a rule of its own is reported as that rule, in the
+    /// service's sentence for it, wherever the request broke that bound alone.
+    #[test]
+    fn a_bound_the_service_states_itself_is_reported_as_that_rule() {
+        // (case, the amount the request carried) — `TargetDpusInteger` declares one bound, the
+        // minimum of its `@range`, so every row breaks that one.
+        let rows: Vec<(&str, &str)> = vec![
+            ("an amount inside the first block", "1"),
+            ("no capacity at all", "0"),
+            ("a negative amount", "-4"),
+        ];
+        for (case, amount) in rows {
+            let stated = stated_refusal(&Refusal::Invalid(vec![violation(
+                "targetDpus",
+                ViolationKind::MinValue("4".to_string()),
+                Some(amount),
+            )]))
+            .unwrap_or_else(|| panic!("case {case:?}: expected the refusal to be stated"));
+            assert_eq!(
+                stated.code, INVALID_REQUEST_EXCEPTION,
+                "case {case:?}: expected this service's own refusal shape"
+            );
+            assert_eq!(
+                stated.message,
+                crate::state::capacity_dpus_not_in_increments(),
+                "case {case:?}: expected the sentence that states the rule, got {:?}",
+                stated.message
+            );
+        }
+
+        // A request that broke that bound AND another constraint is stated in the envelope,
+        // which names every clause rather than dropping the one it has no sentence for.
+        let stated = stated_refusal(&Refusal::Invalid(vec![
+            violation(
+                "targetDpus",
+                ViolationKind::MinValue("4".to_string()),
+                Some("1"),
+            ),
+            violation(
+                "name",
+                ViolationKind::Pattern("^[a-zA-Z0-9._-]+$".to_string()),
+                Some("not a name!"),
+            ),
+        ]))
+        .expect("expected the refusal to be stated");
+        assert!(
+            stated.message.starts_with("2 validation errors detected: "),
+            "expected the envelope to count both clauses, got {:?}",
+            stated.message
         );
     }
 

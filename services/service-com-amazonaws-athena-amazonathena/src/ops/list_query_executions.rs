@@ -2,7 +2,11 @@
 
 //! @op ListQueryExecutions
 //! IMPLEMENTED: lists the ids of the executions this account holds for one workgroup,
-//! newest first, a page at a time.
+//! newest first, a page at a time. The id list is reported on EVERY answer, empty where the
+//! page carries none: the recorded response of a workgroup whose history holds nothing
+//! carries the member as an empty list, so the `@length` minimum of 1 the `## Output`
+//! contract below quotes for `QueryExecutionIdList` is a bound on a list that HAS ids rather
+//! than a reason to leave the member out — the same shape `ListWorkGroups` answers with.
 //!
 //! ## Shape of an operation
 //!
@@ -214,9 +218,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // caller following tokens always makes progress.
         let more = !page.is_empty() && end < ids.len();
         Ok(ListQueryExecutionsOutput {
-            // `QueryExecutionIdList` holds at least one id, so a page with none reports
-            // the member as absent rather than as an empty list.
-            query_execution_ids: (!page.is_empty()).then_some(page),
+            // The member a listing reports is always reported: a workgroup whose history
+            // holds no execution has an empty history, which is a list of no ids rather
+            // than an unknown one, so a client reads the member on every answer (see the
+            // note on this file's header line).
+            query_execution_ids: Some(page),
             next_token: more.then(|| store.executions_page_token(&work_group, end)),
         })
     }

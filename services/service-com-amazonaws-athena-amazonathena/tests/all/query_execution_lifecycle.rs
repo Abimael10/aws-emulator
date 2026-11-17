@@ -836,12 +836,14 @@ async fn list_query_executions_reports_the_persisted_ids_newest_first_per_work_g
             "case {case:?}: expected {expected:?}, got {reported:?}"
         );
         if expected.is_empty() {
-            // `QueryExecutionIdList` holds at least one id, so an empty page reports no
-            // member rather than an empty array.
+            // Every listing of this service reports its collection member on every
+            // answer, as `ListWorkGroups` does: a workgroup no query ran in has an empty
+            // history rather than an unknown one.
             assert_eq!(
                 body["QueryExecutionIds"],
-                Value::Null,
-                "case {case:?}: an empty page must omit QueryExecutionIds, got {body:?}"
+                json!([]),
+                "case {case:?}: an empty page must report the member as an empty list, got \
+                 {body:?}"
             );
         }
         assert_eq!(
@@ -901,8 +903,9 @@ async fn list_query_executions_reports_the_persisted_ids_newest_first_per_work_g
     assert_eq!(status, 200, "MaxResults 0 must answer 200: {none:?}");
     assert_eq!(
         none["QueryExecutionIds"],
-        Value::Null,
-        "MaxResults 0 asks for no ids, got {none:?}"
+        json!([]),
+        "MaxResults 0 asks for no ids, so the member is reported as an empty list, got \
+         {none:?}"
     );
     assert_eq!(
         none["NextToken"],

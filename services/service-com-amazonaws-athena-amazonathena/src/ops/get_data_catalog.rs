@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDataCatalog
-//! IMPLEMENTED: answers with the data catalog `CreateDataCatalog` registered under this
-//! name, and refuses a name the registry does not hold.
+//! IMPLEMENTED: answers with the data catalog this account holds under this name — one
+//! `CreateDataCatalog` registered, or the account's own Glue Data Catalog, which no create
+//! registered and which `ListDataCatalogs` reports from the same projection — and refuses a
+//! name the account holds none under.
 //!
 //! ## Shape of an operation
 //!
@@ -152,7 +154,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `WorkGroup` is "required if making an IAM Identity Center request"; this
         // emulator creates no Identity Center application and the catalog registry is
         // account-wide, so the member selects nothing and is not read here.
-        let Some(record) = store.data_catalogs.get(&input.name) else {
+        let Some(record) = store.data_catalog(&input.name) else {
             // Athena models no not-found error for this operation; naming a catalog that
             // does not exist is "something wrong with the input to the request", which
             // is what `InvalidRequestException` (HTTP 400) reports, under the code for a

@@ -132,6 +132,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The amount asked for is measured before any lock is taken, by the one rule both
+        // operations that request capacity ask: capacity is allocated in blocks, so an
+        // amount that is not a positive multiple of one block cannot be allocated.
+        if let Some(message) = crate::state::capacity_dpus_error(input.target_dpus) {
+            return Err(invalid_request(message));
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 UpdateCapacityReservationErrorModeled::InternalServerException(

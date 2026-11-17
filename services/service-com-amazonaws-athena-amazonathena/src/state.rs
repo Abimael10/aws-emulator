@@ -142,7 +142,7 @@ use ::service_com_amazonaws_glue_awsglue::ops::types::Column as GlueColumn;
 use ::service_com_amazonaws_glue_awsglue::state as glue_state;
 
 use crate::ops::types::{
-    Column, DataCatalog, EngineVersion, ManagedQueryResultsConfiguration,
+    Column, DataCatalog, DataCatalogSummary, EngineVersion, ManagedQueryResultsConfiguration,
     ManagedQueryResultsTimeToLive, QueryExecution, QueryExecutionContext, QueryExecutionDetail,
     QueryExecutionDetailStats, QueryExecutionDetailStatus, QueryExecutionStatistics,
     QueryExecutionStatus, ResultConfiguration, ResultReuseConfiguration, ResultReuseInformation,
@@ -932,6 +932,22 @@ impl DataCatalogRecord {
         }
     }
 
+    /// The record as the modelled `DataCatalogSummary` shape a LISTING reports it as, as of
+    /// `now`: the three members a summary shares with the full projection
+    /// ([`Self::to_data_catalog`]) — the name, the type and the status — plus a federated
+    /// catalog's connection type, every one read off the record rather than recomputed.
+    pub fn to_summary(&self, now: SystemTime) -> DataCatalogSummary {
+        DataCatalogSummary {
+            catalog_name: Some(self.name.clone()),
+            r#type: Some(self.catalog_type.clone()),
+            status: Some(self.status_at(now).to_string()),
+            connection_type: self.connection_type.clone(),
+            // `DataCatalogSummary$Error` is the "text of the error that occurred during
+            // data catalog creation or deletion"; nothing here fails, so there is none.
+            error: None,
+        }
+    }
+
     /// The record as the modelled `DataCatalog` shape a read answers with, as of `now`.
     pub fn to_data_catalog(&self, now: SystemTime) -> DataCatalog {
         self.to_data_catalog_in_status(self.status_at(now))
@@ -971,6 +987,30 @@ impl DataCatalogRecord {
             // catalog creation or deletion"; nothing here fails, so there is none.
             error: None,
         }
+    }
+}
+
+/// The account's Glue Data Catalog as a record of the same kind a registered catalog has,
+/// opened with the account's registries at `opened_at`.
+///
+/// Every account has this catalog and no `CreateDataCatalog` registered it, so the registry
+/// holds no record for it — the position the account's default workgroup is in
+/// ([`default_work_group_record`]). Athena addresses it by [`GLUE_DATA_CATALOG_NAME`] and
+/// this emulator serves its metadata out of the Glue store the metadata operations read
+/// ([`metadata_source`]), so a read of it and a listing of catalogs both answer from this one
+/// projection rather than one of them reporting a catalog the other does not. Its type is
+/// created synchronously, as `DataCatalog$Status` documents, so no part of its creation is
+/// still owed and it carries no description, parameters, connection or tags: no request gave
+/// it any.
+fn glue_data_catalog_record(opened_at: SystemTime) -> DataCatalogRecord {
+    DataCatalogRecord {
+        name: GLUE_DATA_CATALOG_NAME.to_string(),
+        catalog_type: DATA_CATALOG_TYPE_GLUE.to_string(),
+        description: None,
+        parameters: BTreeMap::new(),
+        connection_type: None,
+        create_complete_at: opened_at,
+        tags: Vec::new(),
     }
 }
 
@@ -2094,6 +2134,13 @@ fn work_groups_cursor(position: usize) -> String {
     format!("workgroups{CURSOR_SEPARATOR}{ACCOUNT_SCOPE}{CURSOR_SEPARATOR}{position}")
 }
 
+/// The cursor a `ListDataCatalogs` page hands back. Account-wide too: the operation's
+/// `WorkGroup` member narrows nothing in this emulator (see `ListDataCatalogs`), so the
+/// listing walks every catalog the account holds.
+fn data_catalogs_cursor(position: usize) -> String {
+    format!("datacatalogs{CURSOR_SEPARATOR}{ACCOUNT_SCOPE}{CURSOR_SEPARATOR}{position}")
+}
+
 /// The scope of a listing that walks everything this account holds, carried in that
 /// listing's cursors where a filtered listing carries what it filtered on.
 const ACCOUNT_SCOPE: &str = "account";
@@ -2387,6 +2434,57 @@ impl ComAmazonawsAthenaAmazonathenaState {
     pub fn work_groups_page_position(&self, token: &str) -> Option<usize> {
         let cursor = self.page_cursor(token)?;
         cursor_position(&cursor, "workgroups", ACCOUNT_SCOPE)
+    }
+
+    /// The `NextToken` a `ListDataCatalogs` page resumed at `position` hands back.
+    pub fn data_catalogs_page_token(&self, position: usize) -> String {
+        ::hex::encode(self.page_token_key.mint(&data_catalogs_cursor(position)))
+    }
+
+    /// The position `token` resumes a data-catalog listing at, or `None` for a token this
+    /// store did not mint for THAT listing.
+    pub fn data_catalogs_page_position(&self, token: &str) -> Option<usize> {
+        let cursor = self.page_cursor(token)?;
+        cursor_position(&cursor, "datacatalogs", ACCOUNT_SCOPE)
+    }
+
+    /// The data catalog `name` addresses, or `None` where this account holds none under
+    /// that name.
+    ///
+    /// That is the record a `CreateDataCatalog` call registered and no delete removed, or
+    /// the account's Glue Data Catalog ([`glue_data_catalog_record`]), which every account
+    /// has and which no create registered. The ONE place a catalog name is resolved, so a
+    /// read of a catalog and a listing of them report the same set — neither names a
+    /// catalog the other does not.
+    pub fn data_catalog(&self, name: &str) -> Option<DataCatalogRecord> {
+        if let Some(record) = self.data_catalogs.get(name) {
+            return Some(record.clone());
+        }
+        // Matched by the ONE predicate this crate resolves that catalog's name with
+        // ([`is_glue_data_catalog`]), so the control plane and the metadata operations
+        // answer for the same set of spellings.
+        is_glue_data_catalog(name).then(|| glue_data_catalog_record(self.opened_at))
+    }
+
+    /// Every data catalog this account holds, as the summaries a listing reports, in name
+    /// order.
+    ///
+    /// That is each one a `CreateDataCatalog` call registered and has not been deleted,
+    /// plus the account's Glue Data Catalog ([`GLUE_DATA_CATALOG_NAME`]), which every
+    /// account has and which therefore has no record of its own — the same shape as
+    /// [`Self::work_group_summaries`] beside the account's default workgroup, and the same
+    /// set [`Self::data_catalog`] resolves a name against. A record registered under that
+    /// catalog's own name is reported from that record, so no catalog is reported twice.
+    pub fn data_catalog_summaries(&self, now: SystemTime) -> Vec<DataCatalogSummary> {
+        let mut by_name: BTreeMap<&str, DataCatalogSummary> = self
+            .data_catalogs
+            .iter()
+            .map(|(name, record)| (name.as_str(), record.to_summary(now)))
+            .collect();
+        by_name
+            .entry(GLUE_DATA_CATALOG_NAME)
+            .or_insert_with(|| glue_data_catalog_record(self.opened_at).to_summary(now));
+        by_name.into_values().collect()
     }
 
     /// The cursor `token` carries, or `None` for any value this store did not mint.

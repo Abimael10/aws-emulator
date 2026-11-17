@@ -166,6 +166,41 @@ pub fn request_token(seed: &str) -> String {
     format!("{seed:-<32}")
 }
 
+/// How long a wait for a transition a capacity reservation's clock owes may take.
+///
+/// Generous: what a caller asserts is the state the transition reaches, never how fast the
+/// host reaches it, so the deadline is only there to fail a wait that will never end.
+const RESERVATION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How often such a wait looks again.
+const RESERVATION_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Poll the capacity reservation `name` until it reports `status`, and answer with the
+/// `CapacityReservation` that reported it.
+///
+/// A reservation's status follows from the instants its record holds, so a test waits for
+/// the CONDITION — looking again until it holds — rather than sleeping out the span the
+/// transition is due after.
+pub async fn await_reservation_status(
+    router: &MultiServiceRouter,
+    name: &str,
+    status: &str,
+) -> Value {
+    let deadline = tokio::time::Instant::now() + RESERVATION_DEADLINE;
+    loop {
+        let (code, body) = call(router, "GetCapacityReservation", &json!({ "Name": name })).await;
+        let reservation = body["CapacityReservation"].clone();
+        if code == 200 && reservation["Status"] == json!(status) {
+            return reservation;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the reservation {name} must reach {status}, last read {body:?}"
+        );
+        tokio::time::sleep(RESERVATION_POLL).await;
+    }
+}
+
 /// The wire error code (`__type`) of an error body, with the shape-id prefix the awsJson
 /// protocols may carry stripped.
 pub fn error_code(body: &Value) -> String {

@@ -83,6 +83,38 @@ pub const CAPACITY_RESERVATION_CANCELLATION: Duration = Duration::from_secs(3);
 pub const CANCELLED_CAPACITY_RESERVATION_RETENTION: Duration =
     Duration::from_secs(45 * 24 * 60 * 60);
 
+/// The block size the data processing units of a capacity reservation are requested in.
+///
+/// Both operations that request capacity — `CreateCapacityReservation` and
+/// `UpdateCapacityReservation` — declare `TargetDpus` against `TargetDpusInteger`, whose
+/// `@range` has this value as its minimum and no maximum
+/// (`smithy_query(query="operation",operation="CreateCapacityReservation,UpdateCapacityReservation")`),
+/// and Athena allocates capacity in blocks of that size: an amount that is not a positive
+/// multiple of it is not an amount the service can allocate.
+pub const CAPACITY_DPUS_INCREMENT: i32 = 4;
+
+/// The sentence a request for an amount of data processing units that cannot be allocated is
+/// refused with.
+///
+/// Wholly fixed text — it states the rule and interpolates nothing from the request — and the
+/// block size is the one constant above, so the sentence cannot state a rule the service does
+/// not enforce.
+pub fn capacity_dpus_not_in_increments() -> String {
+    format!("Capacity must be requested in increments of {CAPACITY_DPUS_INCREMENT}.")
+}
+
+/// Why `target_dpus` is not an amount of data processing units this service can allocate, if
+/// it is not: anything that is not a positive multiple of [`CAPACITY_DPUS_INCREMENT`] — zero,
+/// a negative amount, an amount below one block, or one between two blocks.
+///
+/// Asked by every operation that requests capacity, so a create and an update refuse the
+/// same amount with the same sentence.
+pub fn capacity_dpus_error(target_dpus: i32) -> Option<String> {
+    let allocatable =
+        target_dpus >= CAPACITY_DPUS_INCREMENT && target_dpus % CAPACITY_DPUS_INCREMENT == 0;
+    (!allocatable).then(capacity_dpus_not_in_increments)
+}
+
 /// How many capacity reservations one account holds in this emulator.
 ///
 /// The EMULATOR's own bound, with no counterpart in the model: Athena publishes no limit
@@ -396,12 +428,12 @@ fn due(now: SystemTime, span: Duration) -> SystemTime {
 /// The refusal message for an operation whose named capacity reservation this account does
 /// not hold.
 ///
-/// The template every Athena resource miss in this crate follows — the kind of entity, the
-/// name the request addressed, and "was not found" (see [`data_catalog_not_found`]) — so
-/// the same absent reservation reads the same way whichever operation of this slice was
-/// called.
+/// AWS's own wording for that miss — "Reservation with name " + the `Name` the request
+/// addressed + " not found." — with the name the CALLER supplied as its one variable part.
+/// One sentence for the class, so the same absent reservation reads the same way whichever
+/// operation of this slice was called.
 pub fn capacity_reservation_not_found(name: &str) -> String {
-    format!("CapacityReservation {name} was not found.")
+    format!("Reservation with name {name} not found.")
 }
 
 /// The refusal message a create under a name this account already holds a reservation

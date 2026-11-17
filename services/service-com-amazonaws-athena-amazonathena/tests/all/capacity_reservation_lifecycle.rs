@@ -25,14 +25,17 @@ use service_com_amazonaws_athena_amazonathena::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{call, engine_and_router, error_code, message, router};
+use crate::harness::{
+    await_reservation_status, call, engine_and_router, error_code, message, router,
+};
 
 /// The wire error code every refusal of this slice must carry: the client error each of
 /// its operations models (HTTP 400).
 const INVALID_REQUEST: &str = "InvalidRequestException";
 
 /// The smallest number of data processing units a request may ask for: the floor of the
-/// modelled `TargetDpusInteger` range (4..), which the boundary validator enforces.
+/// modelled `TargetDpusInteger` range (4..), which the boundary validator enforces, and the
+/// size of one block of capacity, which every requested amount is a multiple of.
 const MODELLED_FLOOR_TARGET_DPUS: i32 = 4;
 
 /// The amount every test that is not about the amount itself asks for: inside the modelled
@@ -264,26 +267,28 @@ async fn a_created_reservation_is_read_back_by_get_capacity_reservation() {
     }
 }
 
-/// Every requested amount the modelled `TargetDpusInteger` range admits is accepted and
-/// round-trips; one below its floor is refused, on the create and the update alike, and
-/// changes nothing.
+/// Capacity is requested in whole blocks: an amount that is a positive multiple of the
+/// block size is accepted and round-trips, and any other amount is refused — on the create
+/// and the update alike — and changes nothing.
 #[tokio::test]
-async fn the_requested_amount_is_bounded_by_the_modelled_floor() {
+async fn the_requested_amount_is_allocated_in_whole_blocks() {
     let (engine, router) = engine_and_router();
 
     // The reservation the update rows address, allocated so an update is not refused for
-    // its status instead of its amount.
+    // its status instead of its amount. Polled for, never slept through: the wait looks
+    // again until the allocation the clock owes has arrived.
     create(&router, "updatable", SOME_TARGET_DPUS).await;
-    wait_out(CAPACITY_ALLOCATION);
+    await_reservation_status(&router, "updatable", CAPACITY_RESERVATION_STATUS_ACTIVE).await;
 
-    // (case, TargetDpus, whether the request is inside the modelled range)
-    let amounts: [(&str, i32, bool); 7] = [
+    // (case, TargetDpus, whether the amount can be allocated)
+    let amounts: [(&str, i32, bool); 8] = [
         ("a negative amount", -4, false),
         ("no capacity at all", 0, false),
-        ("one below the modelled floor", MODELLED_FLOOR_TARGET_DPUS - 1, false),
-        ("the modelled floor", MODELLED_FLOOR_TARGET_DPUS, true),
-        ("one above the modelled floor", MODELLED_FLOOR_TARGET_DPUS + 1, true),
-        ("an amount well above the floor", SOME_TARGET_DPUS, true),
+        ("one below the block size", MODELLED_FLOOR_TARGET_DPUS - 1, false),
+        ("one block", MODELLED_FLOOR_TARGET_DPUS, true),
+        ("one past a whole block", MODELLED_FLOOR_TARGET_DPUS + 1, false),
+        ("two blocks", MODELLED_FLOOR_TARGET_DPUS * 2, true),
+        ("an amount well above one block", SOME_TARGET_DPUS, true),
         ("a far larger amount", 10_000, true),
     ];
 
@@ -1067,7 +1072,7 @@ async fn each_refusal_class_states_its_own_sentence() {
     .await;
     assert_eq!(
         message(&body),
-        "CapacityReservation never-created was not found.",
+        "Reservation with name never-created not found.",
         "the miss must name the reservation the request addressed, got {:?}",
         message(&body)
     );

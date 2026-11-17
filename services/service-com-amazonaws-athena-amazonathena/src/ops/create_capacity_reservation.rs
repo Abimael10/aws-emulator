@@ -137,6 +137,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Check the request on its own terms FIRST, before any lock is taken: a request
         // that is going to be refused never walks the registry, and no other Athena
         // request waits behind the work of measuring it.
+        //
+        // Capacity is allocated in blocks, so an amount that is not a positive multiple of
+        // one block is not an amount this service can allocate; the rule and its sentence
+        // are stated once in `crate::state` for both operations that request capacity.
+        if let Some(message) = crate::state::capacity_dpus_error(input.target_dpus) {
+            return Err(invalid_request(message));
+        }
         let tags = input.tags.unwrap_or_default();
         // The rules a `TagList` carries, stated once for every operation that takes one.
         if let Some(message) = crate::state::tag_list_error(&tags) {

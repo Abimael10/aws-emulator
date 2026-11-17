@@ -11,6 +11,8 @@
 // points it into `tests/all/`.
 #[path = "all/boundary_validation_refusal.rs"]
 mod boundary_validation_refusal;
+#[path = "all/capacity_dpu_increments.rs"]
+mod capacity_dpu_increments;
 #[path = "all/capacity_reservation_lifecycle.rs"]
 mod capacity_reservation_lifecycle;
 #[path = "all/capacity_reservation_listing.rs"]
@@ -21,6 +23,8 @@ mod catalog_statements;
 mod data_catalog_delete;
 #[path = "all/data_catalog_lifecycle.rs"]
 mod data_catalog_lifecycle;
+#[path = "all/data_catalog_listing.rs"]
+mod data_catalog_listing;
 #[path = "all/data_catalog_parameter_sets.rs"]
 mod data_catalog_parameter_sets;
 #[path = "all/data_catalog_update.rs"]
@@ -39,6 +43,8 @@ mod hive_location_recording;
 mod hive_table_registration;
 #[path = "all/lake_formation_table_reads.rs"]
 mod lake_formation_table_reads;
+#[path = "all/named_query_batch.rs"]
+mod named_query_batch;
 #[path = "all/named_query_work_group_state.rs"]
 mod named_query_work_group_state;
 #[path = "all/notebook_create.rs"]

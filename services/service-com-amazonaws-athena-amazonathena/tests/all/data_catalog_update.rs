@@ -16,7 +16,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use service_com_amazonaws_athena_amazonathena::state::{
     DATA_CATALOG_STATUS_CREATE_COMPLETE, DATA_CATALOG_TYPE_FEDERATED, DATA_CATALOG_TYPE_GLUE,
-    DATA_CATALOG_TYPE_HIVE, DATA_CATALOG_TYPE_LAMBDA,
+    DATA_CATALOG_TYPE_HIVE, DATA_CATALOG_TYPE_LAMBDA, GLUE_DATA_CATALOG_NAME,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -440,6 +440,30 @@ async fn an_update_naming_no_registered_catalog_is_refused_and_writes_nothing() 
         // never registered still resolves to nothing.
         let read_name = case.update["Name"].as_str().expect("the row names a catalog");
         let (status, read) = read_catalog(&router, read_name).await;
+        if read_name == GLUE_DATA_CATALOG_NAME {
+            // The account holds this one catalog without any create having registered it,
+            // so what shows that the refused update wrote nothing is the read reporting it
+            // exactly as it was: its own type, and none of the parameters the update named.
+            assert_eq!(
+                status, 200,
+                "case {:?}: the account's own Glue Data Catalog must still be readable, got \
+                 {status} with {read:?}",
+                case.case
+            );
+            assert_eq!(
+                read["Type"].as_str(),
+                Some(DATA_CATALOG_TYPE_GLUE),
+                "case {:?}: the refused update must have changed no type, got {read:?}",
+                case.case
+            );
+            assert_eq!(
+                read["Parameters"],
+                Value::Null,
+                "case {:?}: the refused update must have written no parameter, got {read:?}",
+                case.case
+            );
+            continue;
+        }
         assert_eq!(
             status, 400,
             "case {:?}: the refused update must have registered nothing, got {status} \
