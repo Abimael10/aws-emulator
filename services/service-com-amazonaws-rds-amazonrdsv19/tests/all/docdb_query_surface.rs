@@ -639,11 +639,13 @@ async fn an_orderable_option_of_another_control_planes_engine_is_a_cluster_membe
         for option in &options {
             let class = text(option, "DBInstanceClass");
             let supports_clusters = text(option, "SupportsClusters");
-            // An instance of an engine this door serves for another control plane
-            // (DocumentDB, Neptune) is only ever a member of its cluster, whatever its
-            // class; on the RDS DB instance engines the Multi-AZ DB cluster deployment is
-            // offered on MySQL and PostgreSQL and never on a burstable (`db.t*`) class.
-            let expected = ENGINES_OF_ANOTHER_CONTROL_PLANE.contains(&engine.as_str())
+            // An instance of a CLUSTER engine — the Aurora engines, and the DocumentDB and
+            // Neptune engines this door serves for another control plane — is only ever a
+            // member of its cluster, whatever its class, which recorded behaviour reports
+            // this member true for; on the RDS DB instance engines the Multi-AZ DB cluster
+            // deployment is offered on MySQL and PostgreSQL and never on a burstable
+            // (`db.t*`) class.
+            let expected = is_cluster_engine(&engine)
                 || (matches!(engine.as_str(), "mysql" | "postgres")
                     && !class.starts_with("db.t"));
             assert_eq!(

@@ -306,14 +306,29 @@ async fn a_modified_parameter_is_reported_from_persisted_state() {
         "every parameter type"
     );
 
-    // 6. This emulator sets no service-sourced parameter, and a value naming no source at
-    //    all selects nothing.
-    for source in [PARAMETER_SOURCE_SYSTEM, "service", "not-a-source"] {
+    // 6. This emulator sets no service-sourced parameter, so the one remaining published
+    //    source selects nothing — and a value outside the three the member publishes is
+    //    refused rather than selecting nothing.
+    let case = format!("Source {PARAMETER_SOURCE_SYSTEM:?}");
+    assert_eq!(
+        reported_for(&router, &case, &group, Some(PARAMETER_SOURCE_SYSTEM)).await,
+        Vec::new(),
+        "case {case:?}: expected no parameter reported"
+    );
+    for source in ["service", "not-a-source"] {
         let case = format!("Source {source:?}");
-        assert_eq!(
-            reported_for(&router, &case, &group, Some(source)).await,
-            Vec::new(),
-            "case {case:?}: expected no parameter reported"
+        let refused = expect_error(
+            &case,
+            describe(&router, &group, &[("Source", source.to_string())]).await,
+            400,
+            "InvalidParameterValue",
+        );
+        assert!(
+            refused.contains(&format!(
+                "Invalid Source: {source}. Allowed values are: engine-default, system, user"
+            )),
+            "case {case:?}: expected the refusal naming the value and the allowed ones, got \
+             {refused}"
         );
     }
 

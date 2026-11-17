@@ -82,6 +82,45 @@ pub fn db_parameter_group_not_found_message(named: &str) -> String {
 /// whose own sentence nothing recorded here states otherwise.
 pub const PARAMETER_GROUP_DOES_NOT_EXIST_MESSAGE: &str = "Parameter group does not exist";
 
+/// The values a parameter report's `Source` may name, in the order the member's own
+/// documentation writes them (`DescribeDBClusterParametersMessage$Source` and
+/// `DescribeDBParametersMessage$Source`, "Valid Values: engine-default | system | user" —
+/// `smithy_query(query="doc", shape="DescribeDBClusterParametersMessage", member="Source")`).
+///
+/// They are the three sources a reported `Parameter$Source` names
+/// ([`PARAMETER_SOURCE_ENGINE_DEFAULT`], [`PARAMETER_SOURCE_SYSTEM`],
+/// [`PARAMETER_SOURCE_USER`]), so the request vocabulary and the response vocabulary of this
+/// front door are the one list.
+pub const PARAMETER_SOURCES: [&str; 3] = [
+    PARAMETER_SOURCE_ENGINE_DEFAULT,
+    PARAMETER_SOURCE_SYSTEM,
+    PARAMETER_SOURCE_USER,
+];
+
+/// Refuse a `Source` outside the values the member publishes ([`PARAMETER_SOURCES`]).
+///
+/// A member that publishes a closed value list is a CONSTRAINT on the request, not a filter
+/// that selects nothing for a value it does not know: a parameter report answers a `Source`
+/// naming none of its sources with `InvalidParameterValue`, carrying the rejected value and
+/// the values it could have named. Checked before the group the request names is resolved,
+/// the way every other value of a request is.
+///
+/// The value is matched WITHOUT case, the way every other published name this service
+/// resolves is (`parameter_source_filter`, which selects what the admitted value reports);
+/// the refusal echoes the caller's own spelling back.
+pub fn check_parameter_source(value: &str) -> Result<(), String> {
+    if PARAMETER_SOURCES
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(value))
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "Invalid Source: {value}. Allowed values are: {}",
+        PARAMETER_SOURCES.join(", ")
+    ))
+}
+
 /// Refuse a `DBParameterGroupFamily` that is not a parameter group family at all.
 ///
 /// A family is one engine's major-version line, and a group "can be associated with one and

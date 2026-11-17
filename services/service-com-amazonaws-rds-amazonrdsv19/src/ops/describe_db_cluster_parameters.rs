@@ -168,37 +168,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "Filters is not currently supported by DescribeDBClusterParameters",
             ));
         }
-        // `Source`: a filter over the sources this API names, not a constraint — so a value
-        // naming none of them selects nothing instead of refusing the request, and a
-        // describe of a group that is not there still answers the modelled 404. It is read
-        // below, where what the filter selects is decided.
+        // `Source`: "Valid Values: engine-default | system | user" — a closed value list, so
+        // a value naming none of the three is refused rather than selecting nothing
+        // (`crate::state::check_parameter_source`). It is a value of the REQUEST, so it is
+        // checked here, before the group it names is resolved; which parameters the source it
+        // names selects is decided below.
+        if let Some(source) = input.source.as_deref() {
+            crate::state::check_parameter_source(source)
+                .map_err(DescribeDBClusterParametersError::invalid_parameter_value)?;
+        }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
         };
         let store = state.lock();
 
-        let name = input.db_cluster_parameter_group_name.to_ascii_lowercase();
-        let Some(group) = store.db_cluster_parameter_groups.get(&(region, name)) else {
+        // The group is looked up by the lowercased name in the region the request was signed
+        // for; a name that matches none is the modelled 404, not an empty page. The default
+        // group of a family resolves as well — the account holds one per cluster-capable
+        // family without any request having created it
+        // (`crate::state::visible_cluster_parameter_groups`).
+        let Some(group) = store
+            .resolve_visible_cluster_parameter_group(&region, &input.db_cluster_parameter_group_name)
+        else {
             return Err(
                 DescribeDBClusterParametersErrorModeled::DBParameterGroupNotFoundFault(
                     DBParameterGroupNotFoundFault {
-                        message: Some(format!(
-                            "DBClusterParameterGroup not found: {}",
-                            input.db_cluster_parameter_group_name
+                        message: Some(crate::state::db_cluster_parameter_group_not_found_message(
+                            &input.db_cluster_parameter_group_name,
                         )),
                     },
                 )
                 .into(),
             );
         };
+        let group = &group;
 
         // Which source the caller asked for decides what is reported: the group's own
-        // parameters (`customer`/`user`), the family's published defaults
-        // (`engine`/`engine-default`), nothing — for `service`/`system`, because this
-        // emulator sets no service-sourced parameter, and for a value naming no source at
-        // all — or, where the caller names no source, EVERY parameter of the group at once,
-        // which is the detailed parameter list this operation reports for a group.
+        // parameters (`user`), the family's published defaults (`engine-default`), nothing
+        // for `system` — because this emulator sets no service-sourced parameter — or, where
+        // the caller names no source, EVERY parameter of the group at once, which is the
+        // detailed parameter list this operation reports for a group. A value outside the
+        // three was refused above, so the `Unknown` arm is unreachable here and answers the
+        // same nothing it would select.
         let parameters: Vec<(String, Parameter)> = match input.source.as_deref() {
             None => group.every_parameter().into_iter().collect(),
             Some(source) => match crate::state::parameter_source_filter(Some(source)) {

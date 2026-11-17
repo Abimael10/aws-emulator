@@ -94,6 +94,10 @@ const LICENSE_MODEL: &str = "amazon-license";
 /// the storage, so the instance orders no size or IOPS of its own.
 const STORAGE_TYPE: &str = "standard";
 
+/// The network types an option of this engine is offered for: the values `NetworkType`
+/// publishes for a DB cluster of this front door, in the order an option reports them.
+const NETWORK_TYPES: [&str; 2] = ["DUAL", "IPV4"];
+
 /// Read one engine-version entry's scalar members, with the `<ValidUpgradeTarget>`
 /// subtrees removed: a target carries its own `<Engine>` and `<EngineVersion>`, so the
 /// entry's own members can only be read off the entry with its targets stripped.
@@ -358,9 +362,12 @@ async fn the_graph_engine_is_orderable_for_every_version_it_publishes() {
             );
             assert_eq!(
                 texts(&network_types[0], "member"),
-                vec!["IPV4".to_string()],
-                "case {case:?}: expected the network types this emulator's subnets offer, \
-                 got {option}"
+                NETWORK_TYPES
+                    .iter()
+                    .map(|network_type| (*network_type).to_string())
+                    .collect::<Vec<String>>(),
+                "case {case:?}: expected the network types a cluster of this engine can be \
+                 placed on, got {option}"
             );
         }
     }

@@ -553,6 +553,15 @@ const STORAGE_RULES: &[StorageRule] = &[
         max_iops_per_gib: None,
         min_storage_throughput: None,
     },
+    // Aurora I/O-Optimized, the second value `CreateDBCluster$StorageType` publishes for an
+    // Aurora cluster ("Aurora DB clusters - aurora | aurora-iopt1"): the same
+    // cluster-managed storage, so the same absence of per-instance bounds.
+    StorageRule {
+        storage_type: "aurora-iopt1",
+        min_storage_size: None,
+        max_iops_per_gib: None,
+        min_storage_throughput: None,
+    },
     // The DocumentDB and Neptune models' `CreateDBCluster$StorageType`: "Valid values for
     // storage type - standard | iopt1 … Default value is standard" — carried by the
     // cluster, so the instance option reports no bounds either.
@@ -625,12 +634,15 @@ async fn a_class_is_offered_once_per_storage_type_it_can_be_ordered_with() {
         ("sqlserver-ee", "db.r5d.8xlarge", EVERY_TYPE, Some(16_384)),
         ("db2-se", "db.c6gd.12xlarge", EVERY_TYPE, Some(64_000)),
         ("oracle-se2", "db.r5.large", EVERY_TYPE, Some(65_536)),
-        // Aurora storage is managed by the cluster, so it is reported as one type with
-        // no bounds at all.
-        ("aurora-mysql", "db.serverless", &["aurora"], None),
-        ("aurora-postgresql", "db.r6g.2xlarge", &["aurora"], None),
+        // Aurora storage is managed by the cluster, so it is reported with no bounds at
+        // all — once per type the CLUSTER's own `StorageType` publishes ("Aurora DB
+        // clusters - aurora | aurora-iopt1"), which is what an order picks between.
+        ("aurora-mysql", "db.serverless", &["aurora", "aurora-iopt1"], None),
+        ("aurora-postgresql", "db.r6g.2xlarge", &["aurora", "aurora-iopt1"], None),
         // The DocumentDB and Neptune control planes this same front door serves are
-        // cluster engines too, and report their own cluster-managed type.
+        // cluster engines too, and report their own cluster-managed type — one type, because
+        // this door's view of another control plane's option catalogue must agree with that
+        // service's own view of it.
         ("docdb", "db.r5.2xlarge", &["standard"], None),
         ("neptune", "db.serverless", &["standard"], None),
     ];
@@ -758,10 +770,11 @@ async fn an_options_capabilities_follow_its_engine_and_its_class() {
         /// processor feature: configuring cores is published for the core-licensed
         /// engines (Oracle, SQL Server) on multithreaded Intel classes only.
         core_count: Option<(&'static str, &'static str)>,
-        /// `SupportsClusters` — a Multi-AZ DB cluster, offered on the MySQL and
-        /// PostgreSQL engines and never on a burstable class; an engine of another control
-        /// plane this door serves (DocumentDB, Neptune) reports it for every option, since
-        /// such an instance is only ever a member of its cluster.
+        /// `SupportsClusters` — reported for every option of a CLUSTER engine, whose
+        /// instance is only ever a member of its cluster (recorded behaviour reports it true
+        /// for the Aurora engines and for the engines of another control plane this door
+        /// serves alike), and for the MySQL and PostgreSQL engines, which can back a
+        /// Multi-AZ DB cluster, on a class that is not burstable.
         supports_clusters: bool,
         /// `SupportsDedicatedLogVolume` — a volume ordered with the instance, which
         /// Aurora's cluster-managed storage does not take.
@@ -774,7 +787,7 @@ async fn an_options_capabilities_follow_its_engine_and_its_class() {
             db_instance_class: "db.r5.xlarge",
             activity_stream_modes: &["sync", "async"],
             core_count: None,
-            supports_clusters: false,
+            supports_clusters: true,
             supports_dedicated_log_volume: false,
         },
         CapabilityCase {
@@ -782,7 +795,7 @@ async fn an_options_capabilities_follow_its_engine_and_its_class() {
             db_instance_class: "db.r5.xlarge",
             activity_stream_modes: &["async"],
             core_count: None,
-            supports_clusters: false,
+            supports_clusters: true,
             supports_dedicated_log_volume: false,
         },
         CapabilityCase {

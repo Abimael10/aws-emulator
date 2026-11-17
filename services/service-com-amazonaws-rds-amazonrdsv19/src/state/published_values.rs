@@ -1115,13 +1115,33 @@ pub fn db_cluster_storage_types(engine: &str) -> &'static [&'static str] {
     } else if is_multi_az_db_cluster(engine) {
         &["io1", "io2", "gp3"]
     } else {
-        &[AURORA_DEFAULT_STORAGE_TYPE, "aurora-iopt1"]
+        &[AURORA_DEFAULT_STORAGE_TYPE, AURORA_IO_OPTIMIZED_STORAGE_TYPE]
     }
 }
 
 /// The storage types a cluster of a sibling control plane's engine may be created with;
 /// see [`db_cluster_storage_types`]. The first is that engine's default.
-pub(super) const SIBLING_CLUSTER_STORAGE_TYPES: &[&str] = &["standard", "iopt1"];
+pub(super) const SIBLING_CLUSTER_STORAGE_TYPES: &[&str] = &[
+    SIBLING_CLUSTER_DEFAULT_STORAGE_TYPE,
+    SIBLING_CLUSTER_IO_OPTIMIZED_STORAGE_TYPE,
+];
+
+/// Aurora I/O-Optimized storage, the second value `CreateDBClusterMessage$StorageType`
+/// publishes for an Aurora cluster; [`AURORA_DEFAULT_STORAGE_TYPE`] is the first.
+///
+/// `pub` because the orderable-option catalogue offers one option per storage type a cluster
+/// can be created with, so that report and this value list are the one list
+/// (`crate::ops::describe_orderable_db_instance_options`).
+pub const AURORA_IO_OPTIMIZED_STORAGE_TYPE: &str = "aurora-iopt1";
+
+/// The storage type a cluster of a SIBLING control plane's engine gets when the request names
+/// none, and the first of the two values that engine's own `StorageType` publishes
+/// ([`SIBLING_CLUSTER_STORAGE_TYPES`]); `pub` for the reason
+/// [`AURORA_IO_OPTIMIZED_STORAGE_TYPE`] is.
+pub const SIBLING_CLUSTER_DEFAULT_STORAGE_TYPE: &str = "standard";
+
+/// The second of them; see [`SIBLING_CLUSTER_DEFAULT_STORAGE_TYPE`].
+pub const SIBLING_CLUSTER_IO_OPTIMIZED_STORAGE_TYPE: &str = "iopt1";
 
 /// The `AllocatedStorage` a cluster whose storage size is NOT fixed reports; see
 /// [`DbClusterRecord::reported_allocated_storage`]. One gibibyte is the unit the member is
@@ -1188,12 +1208,13 @@ pub const LOCAL_WRITE_FORWARDING_DISABLED: &str = "disabled";
 pub const DB_CLUSTER_ROLE_STATUS_ACTIVE: &str = "ACTIVE";
 
 /// Refuse a `MasterUsername` outside the constraints its member documents: "Must be 1 to
-/// 16 letters or numbers. First character must be a letter."
+/// 16 letters or numbers. First character must be a letter" and "Can't be a reserved word
+/// for the chosen database engine".
 ///
-/// The third documented constraint — "Can't be a reserved word for the chosen database
-/// engine" — is NOT enforced: the reserved words are each engine's own SQL keyword list,
-/// which this service does not hold, and refusing a name no published list carries would
-/// refuse names AWS accepts.
+/// The reserved-word half is read over [`RESERVED_MASTER_USERNAMES`]: the accounts Amazon
+/// RDS keeps for ITSELF on the engines this front door serves. The engines' own SQL keyword
+/// lists are not enforced — that list is each engine's, which this service does not hold, and
+/// refusing a name no published list carries would refuse names AWS accepts.
 pub fn check_master_username(value: &str) -> Result<(), String> {
     if !value.chars().all(|c| c.is_ascii_alphanumeric()) {
         return Err(format!(
@@ -1216,7 +1237,33 @@ pub fn check_master_username(value: &str) -> Result<(), String> {
             "the first character of MasterUsername must be a letter; got '{value}'"
         ));
     }
+    if RESERVED_MASTER_USERNAMES
+        .iter()
+        .any(|reserved| reserved.eq_ignore_ascii_case(value))
+    {
+        return Err(master_username_is_reserved_message(value));
+    }
     Ok(())
+}
+
+/// The master usernames no request may take, whichever engine it names: the accounts Amazon
+/// RDS creates for ITSELF on the database it provisions, so the engine already has them and
+/// the account the request asks for cannot be one of them.
+///
+/// Source: the RDS-created accounts those engines run with — `rdsadmin`, the superuser RDS
+/// keeps on every engine, which this emulator's own engine data plane publishes as a
+/// predefined role (`crate::state::data_plane::pg_server`'s role catalogue), beside the
+/// replication and monitoring accounts the PostgreSQL engines' published role list names next
+/// to it. Only names that could be a `MasterUsername` at all are listed — the roles RDS names
+/// with an underscore or a dot (`rds_superuser`, `mysql.sys`) are outside the letters and
+/// numbers [`check_master_username`] admits, so nothing is refused twice.
+pub const RESERVED_MASTER_USERNAMES: [&str; 3] = ["rdsadmin", "rdsrepladmin", "rdstopmgr"];
+
+/// How Amazon RDS refuses a `MasterUsername` that names one of its own engine accounts
+/// ([`RESERVED_MASTER_USERNAMES`]): the sentence naming the member, the username the request
+/// carried and why it cannot be used.
+pub fn master_username_is_reserved_message(value: &str) -> String {
+    format!("MasterUsername {value} cannot be used as it is a reserved word used by the engine")
 }
 
 /// The longest `MasterUsername` a DB cluster accepts ("Must be 1 to 16 letters or

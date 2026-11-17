@@ -159,6 +159,10 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# `automod::dir!` is what declares this crate's integration-test suites: `tests/all/main.rs`
+# is the one target root, and every `tests/all/<name>.rs` beside it is a module of it, so a
+# suite is compiled by existing rather than by a hand-kept list.
+automod = { workspace = true }
 # The EC2 service, mounted beside this one in the test harness: that a DB subnet group
 # reports the zones of the subnets a client minted with `ec2:CreateSubnet` can only be
 # driven end to end with the owner of subnets on the same engine. DEV-ONLY: this crate

@@ -274,8 +274,8 @@ struct Row {
 /// `src/ops/describe_orderable_db_instance_options.rs`, which carry the "Amazon RDS DB
 /// instance storage" section of the Amazon RDS User Guide (General Purpose SSD `gp2`/`gp3`
 /// and Provisioned IOPS SSD `io1`/`io2`, with the per-engine storage caps), plus the
-/// cluster engines whose storage the cluster manages (`aurora`, and the `standard` type
-/// the Amazon DocumentDB and Amazon Neptune front doors publish).
+/// cluster engines whose storage the cluster manages (`aurora`/`aurora-iopt1`, and the
+/// `standard` type the Amazon DocumentDB and Amazon Neptune front doors publish).
 ///
 /// The rows differ along everything the rule generalises over: burstable versus standard
 /// class, all three engine storage caps (65,536 / 16,384 / 64,000 GiB), a class the
@@ -353,7 +353,7 @@ const ROWS: &[Row] = &[
     Row {
         engine: "aurora-mysql",
         class: "db.r5.large",
-        storage_types: &["aurora"],
+        storage_types: &["aurora", "aurora-iopt1"],
         max_storage_size: None,
         processor_features: false,
         dedicated_log_volume: false,

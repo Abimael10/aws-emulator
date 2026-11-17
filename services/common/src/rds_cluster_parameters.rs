@@ -80,16 +80,29 @@ pub enum ParameterSourceFilter {
 /// The source a describe's `Source` names, by either of that source's two names, defaulting
 /// to the group's own parameters when the caller names none; see [`PARAMETER_SOURCE_USER`]
 /// for where the two vocabularies come from.
+///
+/// The value is read WITHOUT case, the way every other published name these front doors
+/// resolve is: AWS publishes each source lowercase, so a differently-cased value still names
+/// the one source it can only have meant.
 pub fn parameter_source_filter(source: Option<&str>) -> ParameterSourceFilter {
     match source {
         None => ParameterSourceFilter::Customer,
-        Some(value) if value == "customer" || value == PARAMETER_SOURCE_USER => {
+        Some(value)
+            if value.eq_ignore_ascii_case("customer")
+                || value.eq_ignore_ascii_case(PARAMETER_SOURCE_USER) =>
+        {
             ParameterSourceFilter::Customer
         }
-        Some(value) if value == "engine" || value == PARAMETER_SOURCE_ENGINE_DEFAULT => {
+        Some(value)
+            if value.eq_ignore_ascii_case("engine")
+                || value.eq_ignore_ascii_case(PARAMETER_SOURCE_ENGINE_DEFAULT) =>
+        {
             ParameterSourceFilter::Engine
         }
-        Some(value) if value == "service" || value == PARAMETER_SOURCE_SYSTEM => {
+        Some(value)
+            if value.eq_ignore_ascii_case("service")
+                || value.eq_ignore_ascii_case(PARAMETER_SOURCE_SYSTEM) =>
+        {
             ParameterSourceFilter::Service
         }
         Some(_) => ParameterSourceFilter::Unknown,

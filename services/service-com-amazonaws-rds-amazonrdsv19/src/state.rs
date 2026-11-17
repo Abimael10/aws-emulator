@@ -1275,6 +1275,49 @@ impl ComAmazonawsRdsAmazonrdsv19State {
             .find(|record| record.arn() == named)
     }
 
+    /// Every DB CLUSTER parameter group a request signed for `region` can SEE, in name
+    /// order: the groups a request created there plus the default group RDS provides for
+    /// each engine-version family with a cluster form
+    /// ([`default_db_cluster_parameter_groups`]).
+    ///
+    /// The cluster-level counterpart of [`Self::visible_db_parameter_groups`], and for the
+    /// same reason: the real service's account has those groups from the moment it exists,
+    /// and no request creates or changes one.
+    pub fn visible_cluster_parameter_groups(
+        &self,
+        region: &str,
+    ) -> Vec<DbClusterParameterGroupRecord> {
+        let mut groups: Vec<DbClusterParameterGroupRecord> = self
+            .cluster_parameter_groups_in(region)
+            .into_iter()
+            .cloned()
+            .chain(default_db_cluster_parameter_groups(region))
+            .collect();
+        groups.sort_by(|left, right| left.name.cmp(&right.name));
+        groups
+    }
+
+    /// The DB CLUSTER parameter group `named` resolves to in `region` — a group a request
+    /// created or one of RDS's own defaults — or `None` when nothing of that name exists;
+    /// the cluster-level counterpart of [`Self::resolve_visible_db_parameter_group`].
+    ///
+    /// `DBClusterParameterGroupName` "is stored as a lowercase string", so the name is
+    /// folded the way every create stores it.
+    pub fn resolve_visible_cluster_parameter_group(
+        &self,
+        region: &str,
+        named: &str,
+    ) -> Option<DbClusterParameterGroupRecord> {
+        let folded = named.to_ascii_lowercase();
+        if let Some(stored) = self
+            .db_cluster_parameter_groups
+            .get(&(region.to_string(), folded.clone()))
+        {
+            return Some(stored.clone());
+        }
+        default_db_cluster_parameter_group(region, &folded)
+    }
+
     /// The DB (instance) parameter groups stored in `region`, in name order.
     pub fn parameter_groups_in(&self, region: &str) -> Vec<&DbParameterGroupRecord> {
         range_in(&self.db_parameter_groups, region)
@@ -2660,6 +2703,20 @@ impl GlobalClusterRecord {
         self.member_cluster_arns
             .iter()
             .any(|arn| arn_region(arn) == Some(region))
+    }
+
+    /// Whether any member cluster of this global cluster is the DB cluster `named`, which is
+    /// what the `db-cluster-id` filter of `DescribeGlobalClusters` selects on: the member
+    /// clusters are held by ARN, and such a value "accepts DB cluster identifiers and DB
+    /// cluster Amazon Resource Names (ARNs)", so both forms are folded to the identifier a DB
+    /// cluster is keyed by ([`db_cluster_identifier_of`]).
+    ///
+    /// A `DBClusterIdentifier` "isn't case-sensitive", so the comparison is not either.
+    pub fn has_member_cluster(&self, named: &str) -> bool {
+        let wanted = db_cluster_identifier_of(named);
+        self.member_cluster_arns
+            .iter()
+            .any(|arn| db_cluster_identifier_of(arn).eq_ignore_ascii_case(wanted))
     }
 
     /// The global database's own writer endpoint, `<identifier>.global-<minted

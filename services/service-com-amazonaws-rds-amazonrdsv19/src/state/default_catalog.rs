@@ -25,6 +25,14 @@ pub fn default_db_parameter_group_description(family: &str) -> String {
     format!("Default parameter group for {family}")
 }
 
+/// How Amazon RDS describes a default DB CLUSTER parameter group: the same sentence
+/// [`default_db_parameter_group_description`] fills, naming the CLUSTER level the group
+/// belongs to — the two groups of one family are told apart by that one word, as their names
+/// are not.
+pub fn default_db_cluster_parameter_group_description(family: &str) -> String {
+    format!("Default cluster parameter group for {family}")
+}
+
 /// How Amazon RDS describes a default option group: the engine and the major engine
 /// version the group belongs to.
 pub fn default_option_group_description(engine: &str, major_engine_version: &str) -> String {
@@ -97,6 +105,80 @@ impl DbParameterGroupRecord {
             parameters: BTreeMap::new(),
         }
     }
+}
+
+impl DbClusterParameterGroupRecord {
+    /// The default DB CLUSTER parameter group of `family`, as RDS provides it in `region`:
+    /// the group named [`super::default_db_parameter_group_name`] — the two levels name their
+    /// default group of a family the same way — carrying the family it belongs to and the
+    /// description RDS gives it.
+    ///
+    /// It holds NO parameter of its own, for the reason
+    /// [`DbParameterGroupRecord::account_default`] states at the instance level: the engine's
+    /// defaults belong to the FAMILY, which publishes them
+    /// ([`super::published_cluster_parameters`]), so a describe of this group reports them
+    /// sourced `engine-default` exactly as it does for a group a request created.
+    pub fn account_default(region: &str, family: &str) -> Self {
+        Self {
+            name: default_db_parameter_group_name(family),
+            family: family.to_string(),
+            description: default_db_cluster_parameter_group_description(family),
+            region: region.to_string(),
+            tags: Vec::new(),
+            parameters: BTreeMap::new(),
+        }
+    }
+}
+
+/// Every default DB CLUSTER parameter group the account holds in `region`, in name order:
+/// one per `DBParameterGroupFamily` this service publishes an engine version of whose engine
+/// has a CLUSTER form.
+///
+/// A DB cluster parameter group belongs to a family of an engine a DB cluster can run
+/// (`super::DB_CLUSTER_ENGINES`, the value list `CreateDBClusterMessage$Engine` publishes):
+/// an engine that runs only as a single DB instance has no cluster, so RDS provides no
+/// cluster parameter group for its families. The instance-level sibling is
+/// [`default_db_parameter_groups`], which is not narrowed, because every family has a DB
+/// instance form.
+pub fn default_db_cluster_parameter_groups(region: &str) -> Vec<DbClusterParameterGroupRecord> {
+    let mut groups: Vec<DbClusterParameterGroupRecord> =
+        crate::ops::describe_db_engine_versions::published_parameter_group_families()
+            .into_iter()
+            .filter(|family| family_has_a_cluster_form(family))
+            .map(|family| DbClusterParameterGroupRecord::account_default(region, family))
+            .collect();
+    groups.sort_by(|left, right| left.name.cmp(&right.name));
+    groups
+}
+
+/// The default DB CLUSTER parameter group `named` in `region`, or `None` when the name is not
+/// one of RDS's own cluster groups.
+///
+/// What follows the prefix has to be a family of an engine with a cluster form
+/// ([`family_has_a_cluster_form`]); it need not be a family the engine-version catalogue
+/// publishes a row for, for the reason [`default_db_parameter_group`] gives — that catalogue
+/// is this emulator's published sample of the engine versions AWS serves, so reporting
+/// `default.<a family it lists no version of>` as missing would deny a group RDS does
+/// provide.
+pub fn default_db_cluster_parameter_group(
+    region: &str,
+    named: &str,
+) -> Option<DbClusterParameterGroupRecord> {
+    let folded = named.to_ascii_lowercase();
+    let family = folded.strip_prefix(DEFAULT_PARAMETER_GROUP_PREFIX)?;
+    family_has_a_cluster_form(family)
+        .then(|| DbClusterParameterGroupRecord::account_default(region, family))
+}
+
+/// Whether the DB parameter group family `family` names an engine that has a CLUSTER form,
+/// which is what decides whether RDS provides a default DB CLUSTER parameter group for it;
+/// see [`default_db_cluster_parameter_groups`].
+pub fn family_has_a_cluster_form(family: &str) -> bool {
+    crate::ops::describe_engine_default_parameters::family_engine(family).is_some_and(|engine| {
+        DB_CLUSTER_ENGINES
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(engine))
+    })
 }
 
 impl OptionGroupRecord {

@@ -165,32 +165,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `DBClusterParameterGroupName` constraint: "If provided, must match the name of an
         // existing DBClusterParameterGroup" — a name that matches none is the modelled 404,
-        // not an empty page.
+        // not an empty page. The default group of a cluster-capable family resolves as well:
+        // the account holds one per such family without any request having created it
+        // (`crate::state::visible_cluster_parameter_groups`).
         let selected: Vec<(String, crate::state::DbClusterParameterGroupRecord)> =
             match &input.db_cluster_parameter_group_name {
                 Some(requested) => {
-                    let name = requested.to_ascii_lowercase();
-                    let Some(record) = store
-                        .db_cluster_parameter_groups
-                        .get(&(region.clone(), name.clone()))
+                    let Some(record) =
+                        store.resolve_visible_cluster_parameter_group(&region, requested)
                     else {
                         return Err(
                         DescribeDBClusterParameterGroupsErrorModeled::DBParameterGroupNotFoundFault(
                             DBParameterGroupNotFoundFault {
-                                message: Some(format!(
-                                    "DBClusterParameterGroup not found: {requested}"
-                                )),
+                                message: Some(
+                                    crate::state::db_cluster_parameter_group_not_found_message(
+                                        requested,
+                                    ),
+                                ),
                             },
                         )
                         .into(),
                     );
                     };
-                    vec![(name, record.clone())]
+                    vec![(record.name.clone(), record)]
                 }
                 None => store
-                    .cluster_parameter_groups_in(&region)
+                    .visible_cluster_parameter_groups(&region)
                     .into_iter()
-                    .map(|record| (record.name.clone(), record.clone()))
+                    .map(|record| (record.name.clone(), record))
                     .collect(),
             };
 

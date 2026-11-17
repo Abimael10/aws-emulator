@@ -698,9 +698,23 @@ const IO2: StorageProfile = StorageProfile {
 };
 
 /// Aurora storage, which the CLUSTER manages: it is not ordered per instance, so the
-/// option reports the type and no bounds.
+/// option reports the type and no bounds. The NAME is the cluster's own published value
+/// ([`crate::state::AURORA_DEFAULT_STORAGE_TYPE`]), so this table and the value list a create
+/// is held to cannot name different types.
 const AURORA: StorageProfile = StorageProfile {
-    name: "aurora",
+    name: crate::state::AURORA_DEFAULT_STORAGE_TYPE,
+    size_range: None,
+    iops: None,
+    throughput: None,
+};
+
+/// Aurora I/O-Optimized storage, the second type an Aurora cluster is created with
+/// (`CreateDBClusterMessage$StorageType`: "Aurora DB clusters - `aurora` | `aurora-iopt1`",
+/// the value list `crate::state::db_cluster_storage_types` publishes). It is the same
+/// cluster-managed storage under a different I/O configuration, so it carries the same
+/// absence of per-instance bounds as [`AURORA`].
+const AURORA_IO_OPTIMIZED: StorageProfile = StorageProfile {
+    name: crate::state::AURORA_IO_OPTIMIZED_STORAGE_TYPE,
     size_range: None,
     iops: None,
     throughput: None,
@@ -710,18 +724,26 @@ const AURORA: StorageProfile = StorageProfile {
 ///
 /// `CreateDBClusterMessage$StorageType` in the DocumentDB and Neptune models: "Valid
 /// values for storage type - standard | iopt1 … Default value is standard" — and the
-/// CLUSTER carries it, so the instance orders neither size nor IOPS of its own.
+/// CLUSTER carries it, so the instance orders neither size nor IOPS of its own. The name is
+/// that value list's own ([`crate::state::SIBLING_CLUSTER_DEFAULT_STORAGE_TYPE`]).
 const CLUSTER_STANDARD: StorageProfile = StorageProfile {
-    name: "standard",
+    name: crate::state::SIBLING_CLUSTER_DEFAULT_STORAGE_TYPE,
     size_range: None,
     iops: None,
     throughput: None,
 };
 
-/// The storage types an Aurora DB instance is offered with.
-const AURORA_STORAGE: &[StorageProfile] = &[AURORA];
+/// The storage types an Aurora DB instance is offered with: one option per type the
+/// CLUSTER's own `StorageType` publishes, because that is what an order picks between.
+const AURORA_STORAGE: &[StorageProfile] = &[AURORA, AURORA_IO_OPTIMIZED];
 
 /// The storage types a DocumentDB or Neptune cluster member is offered with.
+///
+/// ONE type, where [`AURORA_STORAGE`] has one per value its cluster's member publishes: an
+/// option of an engine of another control plane is that control plane's own catalogue entry,
+/// and this front door's view of it must agree with that service's own view
+/// (`core/router/tests/all/rds_front_door_shared_catalogs.rs` holds the two to one answer),
+/// so the second type those models publish is offered once both views publish it.
 const CLUSTER_STANDARD_STORAGE: &[StorageProfile] = &[CLUSTER_STANDARD];
 
 /// The storage types a provisioned-storage (non-cluster) class is offered with, in the
@@ -903,12 +925,34 @@ fn engine_offers_performance_insights(engine: &str) -> bool {
     engine != crate::state::NEPTUNE_ENGINE
 }
 
+/// Whether an option of `engine` reports Kerberos authentication
+/// (`SupportsKerberosAuthentication`, "whether a DB instance supports Kerberos
+/// Authentication").
+///
+/// Kerberos authentication on Amazon RDS is the engine joining an AWS Managed Microsoft AD
+/// directory, which the `Domain` member of a create names. It is published for the MySQL,
+/// MariaDB, PostgreSQL, Oracle and SQL Server engines of this control plane — Aurora MySQL
+/// and Aurora PostgreSQL among them, whose own user guide carries the same section — and for
+/// neither the Db2 engines nor the graph engine of the other control plane this door serves,
+/// which publish no domain membership at all.
+fn supports_kerberos_authentication(engine: &str) -> bool {
+    !engine.starts_with("db2") && engine != crate::state::NEPTUNE_ENGINE
+}
+
 /// The Database Activity Streams modes an option reports, exactly as
 /// `OrderableDBInstanceOption$SupportedActivityStreamModes` documents them: "Aurora
 /// PostgreSQL returns the value `[sync, async]`. Aurora MySQL and RDS for Oracle return
 /// `[async]` only. If Database Activity Streams isn't supported, the return value is an
 /// empty list."
-fn activity_stream_modes(engine: &str) -> Vec<String> {
+///
+/// The CLASS decides too: a database activity stream is collected from the DB instance's own
+/// host, which the SERVERLESS capacity class does not give the caller — the capacity it is
+/// ordered with has no instance host to stream from — so an option of that class supports no
+/// mode and reports the empty list the member documents for exactly that case.
+fn activity_stream_modes(engine: &str, class: &InstanceClass) -> Vec<String> {
+    if class.name.eq_ignore_ascii_case(SERVERLESS_CLASS) {
+        return Vec::new();
+    }
     let modes: &[&str] = match engine {
         "aurora-postgresql" => &["sync", "async"],
         "aurora-mysql" => &["async"],
@@ -1073,56 +1117,136 @@ fn to_wire(
             version.profile.supports_global_databases,
             |capabilities| capabilities.global_databases,
         )),
-        // "Whether DB instances can be configured as a Multi-AZ DB cluster": the Multi-AZ
-        // DB cluster deployment is offered on the MySQL and PostgreSQL engines and never on
-        // a burstable class. An engine of ANOTHER control plane served by this door reports
-        // it too — an Amazon DocumentDB or Amazon Neptune instance is only ever a member of
-        // its cluster, and recorded behaviour for the DocumentDB engine reports this member
-        // true for every option.
+        // "Whether DB instances can be configured as a Multi-AZ DB cluster": an instance of a
+        // CLUSTER engine is only ever configured as a member of its cluster, so every option
+        // of one reports it — the wire recording of this report for `aurora-postgresql` on
+        // `db.serverless` carries `SupportsClusters` true, as the document engine's own
+        // recorded options do for every class — and an instance of an engine that owns its own
+        // storage reports it where that engine can back a Multi-AZ DB cluster: the MySQL and
+        // PostgreSQL engines, and never on a burstable class.
         supports_clusters: Some(
-            serves_another_control_plane(engine)
+            is_cluster_engine(engine)
                 || (!class.burstable && matches!(engine, "mysql" | "postgres")),
         ),
         // A dedicated log volume is offered on the RDS engines, whose log volume is
         // ordered with the instance; a cluster engine's storage is cluster-managed.
         supports_dedicated_log_volume: Some(!is_cluster_engine(engine)),
-        supported_activity_stream_modes: Some(activity_stream_modes(engine)),
-        // Present and EMPTY for an engine whose classes expose no configurable processor
-        // feature at all, absent for a class of this door's own engines that has none.
-        available_processor_features: (!processor_features.is_empty() || docdb.is_some())
-            .then_some(processor_features),
-        // This emulator's subnets are IPv4, so an option of this door's own engines is
-        // offered for IPv4 only rather than reporting a dual-stack network it does not
-        // provide; an engine of another control plane publishes its own network types
-        // (the document engine's `DBCluster$NetworkType`: "Valid Values: IPV4 | DUAL").
+        supported_activity_stream_modes: Some(activity_stream_modes(engine, class)),
+        // `AvailableProcessorFeatures` is "a list of the available processor features for the
+        // DB instance class", and a class that exposes none has an EMPTY list of them rather
+        // than no list: AWS reports the member on every orderable option, so a class with no
+        // configurable feature reports it empty.
+        available_processor_features: Some(processor_features),
+        // An option is offered for the network types the resource's own `NetworkType`
+        // publishes — the value list a create of this door's own engines is held to
+        // (`crate::state::NETWORK_TYPES`, "IPV4 | DUAL"), reported in the order a recorded
+        // option carries them — so the catalogue and the create cannot disagree about a
+        // network a resource can be placed on. An engine of another control plane publishes
+        // its own (the document engine's `DBCluster$NetworkType`: "Valid Values: IPV4 |
+        // DUAL").
         supported_network_types: Some(match docdb {
             Some(_) => ::service_common::docdb_engine_catalog::NETWORK_TYPES
                 .iter()
                 .map(|network_type| (*network_type).to_string())
                 .collect(),
-            None => vec!["IPV4".to_string()],
+            None => reported_network_types(),
         }),
         // `AvailabilityZoneGroup` names a Local Zone group and `OutpostCapable` an AWS
         // Outpost; this service offers neither, which is also what the document engine's
         // own capability set publishes, so no option claims one.
         outpost_capable: Some(docdb.is_some_and(|capabilities| capabilities.outpost_capable)),
-        // Kerberos authentication, additional storage volumes, the Data API HTTP endpoint,
-        // optimized reads and writes, and whether a class requires its processor features
-        // to be named: members this door models for none of its own engines, so they are
-        // left absent there rather than invented — and reported for an engine whose own
-        // control plane publishes the answer.
-        supports_kerberos_authentication: docdb.map(|capabilities| {
-            capabilities.kerberos_authentication
-        }),
-        supports_additional_storage_volumes: docdb.map(|capabilities| {
-            capabilities.additional_storage_volumes
-        }),
-        supports_http_endpoint: docdb.map(|capabilities| capabilities.http_endpoint),
-        supports_optimized_reads: docdb.map(|capabilities| capabilities.optimized_reads),
-        supports_optimized_writes: docdb.map(|capabilities| capabilities.optimized_writes),
-        requires_custom_processor_features: docdb.map(|capabilities| {
-            capabilities.requires_custom_processor_features
-        }),
+        // Kerberos authentication is published per ENGINE, and AWS answers the capability on
+        // every option, so an engine of this door's own control plane reports it too
+        // ([`supports_kerberos_authentication`]) rather than leaving it absent; an engine of
+        // another control plane answers from its own capability set.
+        supports_kerberos_authentication: Some(docdb.map_or_else(
+            || supports_kerberos_authentication(engine),
+            |capabilities| capabilities.kerberos_authentication,
+        )),
+        // Additional storage volumes are volumes ordered BESIDE the instance's own storage,
+        // which no class this door offers takes: the member is reported false rather than
+        // left absent, because AWS answers the capability on every option, and the options
+        // for them ([`AvailableAdditionalStorageVolumesOptions`]) are then none at all.
+        supports_additional_storage_volumes: Some(
+            docdb.is_some_and(|capabilities| capabilities.additional_storage_volumes),
+        ),
+        // The Data API HTTP endpoint IS modelled for this door's own engines: whether a
+        // cluster of the engine has one to turn on is the answer `EnableHttpEndpoint` is
+        // held to (`crate::state::cluster_has_toggleable_http_endpoint`), read here over the
+        // engine modes the VERSION is offered in, so the catalogue and the toggle cannot
+        // disagree about an engine's endpoint.
+        supports_http_endpoint: Some(docdb.map_or_else(
+            || {
+                version.profile.engine_modes.iter().any(|mode| {
+                    crate::state::cluster_has_toggleable_http_endpoint(engine, mode)
+                })
+            },
+            |capabilities| capabilities.http_endpoint,
+        )),
+        // Optimized reads, optimized writes and the custom-processor-feature requirement are
+        // members AWS reports on EVERY orderable option (each one's own documentation on
+        // `OrderableDBInstanceOption` says so), so they are answered for this door's own
+        // engines too rather than left absent:
+        //
+        // * Optimized Reads places temporary objects on the instance's LOCAL NVMe SSD
+        //   storage, so it is offered exactly on the classes that have one — the `d`
+        //   generations of the published class table ([`class_has_local_nvme_storage`]);
+        // * Optimized Writes is the MySQL-compatible RDS engines' atomic-write capability
+        //   ([`offers_optimized_writes`]); and
+        // * no class this door publishes has to have its processor features named at order
+        //   time, so the requirement is reported false.
+        supports_optimized_reads: Some(docdb.map_or_else(
+            || class_has_local_nvme_storage(&class.name),
+            |capabilities| capabilities.optimized_reads,
+        )),
+        supports_optimized_writes: Some(docdb.map_or_else(
+            || offers_optimized_writes(engine, class),
+            |capabilities| capabilities.optimized_writes,
+        )),
+        requires_custom_processor_features: Some(
+            docdb.is_some_and(|capabilities| capabilities.requires_custom_processor_features),
+        ),
         ..Default::default()
     }
+}
+
+/// Whether the DB instance class `name` has LOCAL NVMe SSD storage, which is what RDS and
+/// Aurora Optimized Reads place their temporary objects on.
+///
+/// The published instance-class naming states it in the ATTRIBUTE letters that follow a
+/// family's generation number: `d` there is local instance storage, which is what
+/// `db.m5d.large`, `db.r6gd.2xlarge` and `db.x2iedn.xlarge` carry and what `db.m6i.large`
+/// and `db.r7g.large` do not. A class without one has nowhere to put the temporary objects,
+/// and the serverless capacity class is not a family-and-size class at all.
+fn class_has_local_nvme_storage(name: &str) -> bool {
+    name.strip_prefix("db.")
+        .and_then(|rest| rest.split('.').next())
+        // The family is a prefix of letters, the generation number, then the attribute
+        // letters; only the last of the three is read here.
+        .map(|family| family.trim_start_matches(|c: char| c.is_ascii_alphabetic()))
+        .is_some_and(|attributes| attributes.contains('d'))
+}
+
+/// Whether an option of `engine` on `class` reports Optimized Writes.
+///
+/// Amazon RDS Optimized Writes is the MySQL-compatible engines' atomic-write capability: it
+/// is published for Amazon RDS for MySQL and Amazon RDS for MariaDB — the engines that run
+/// the storage engine whose double-write buffer it replaces — and on the full-size classes
+/// rather than the burstable ones, whose shared vCPUs it is not offered on. No other engine
+/// of this door publishes it.
+fn offers_optimized_writes(engine: &str, class: &InstanceClass) -> bool {
+    matches!(engine, "mysql" | "mariadb") && !class.burstable
+}
+
+/// `SupportedNetworkTypes` of an option of this door's own engines: the value list
+/// `NetworkType` publishes for a DB instance and a DB cluster
+/// ([`crate::state::NETWORK_TYPES`]), in ASCENDING order — the order a recorded option
+/// carries them in, the dual-stack value first.
+fn reported_network_types() -> Vec<String> {
+    let mut reported: Vec<String> = crate::state::NETWORK_TYPES
+        .iter()
+        .map(|network_type| (*network_type).to_string())
+        .collect();
+    reported.sort();
+    reported
 }

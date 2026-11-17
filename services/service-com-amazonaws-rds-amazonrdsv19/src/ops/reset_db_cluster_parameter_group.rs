@@ -183,6 +183,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut store = state.lock();
 
+        // A parameter group RDS provides itself is not the account's to change — and a reset
+        // IS a change — so such a name is refused with the protection RDS states for it
+        // rather than resolved against the groups a request created: the account holds one
+        // default cluster parameter group per cluster-capable family
+        // (`crate::state::visible_cluster_parameter_groups`), and it is reported by the reads
+        // and changed by nothing. Checked before the group is resolved, exactly as
+        // `ModifyDBClusterParameterGroup` checks it and as the instance-level reset does.
+        if crate::state::is_default_parameter_group_name(&input.db_cluster_parameter_group_name) {
+            return Err(ResetDBClusterParameterGroupError::invalid_parameter_value(
+                crate::state::CANNOT_MODIFY_DEFAULT_PARAMETER_GROUP_MESSAGE,
+            ));
+        }
+
         let key = (
             region,
             input.db_cluster_parameter_group_name.to_ascii_lowercase(),

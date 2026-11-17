@@ -22,7 +22,8 @@
 //!   published bound;
 //! * the pending-change rule over both apply types the catalog publishes and both apply
 //!   methods the model's `ApplyMethod` enum names, plus the absent one;
-//! * the `Source` filter in both of the API's vocabularies, plus a value naming no source.
+//! * the `Source` filter over every value the member publishes, beside the values it does
+//!   not.
 
 use service_com_amazonaws_rds_amazonrdsv19::state::{
     ClusterParameterSpec, DOCDB_CLUSTER_PARAMETERS, MAX_PARAMETER_GROUP_NAME_LEN,
@@ -199,7 +200,7 @@ async fn the_cluster_parameter_group_lifecycle_is_computed_from_persisted_state(
     );
 
     // 2. ...and it reads back through DescribeDBClusterParameterGroups, by the lowercased
-    //    name, by the name as sent, and in the unfiltered listing.
+    //    name and by the name as sent.
     for (case, params) in [
         (
             "describe by name",
@@ -209,7 +210,6 @@ async fn the_cluster_parameter_group_lifecycle_is_computed_from_persisted_state(
             "describe by the name as sent, mixed case",
             vec![("DBClusterParameterGroupName", "Probe-CPG")],
         ),
-        ("describe every group", Vec::new()),
     ] {
         let listed = expect_ok(
             case,
@@ -224,6 +224,19 @@ async fn the_cluster_parameter_group_lifecycle_is_computed_from_persisted_state(
             "case {case:?}: expected exactly the group just created, got {listed}"
         );
     }
+    // ...and in the unfiltered listing, which reports it BESIDE the default group RDS
+    // provides for every cluster-capable family (`aws_managed_cluster_parameter_groups`
+    // covers those), so the group is looked for by name rather than counted.
+    let every_group = expect_ok(
+        "describe every group",
+        call(&router, "DescribeDBClusterParameterGroups", &[]).await,
+    );
+    assert!(
+        texts(&every_group, "DBClusterParameterGroupArn").contains(&expected_arn),
+        "case {:?}: the unfiltered listing must report the group just created, got \
+         {every_group}",
+        "describe every group"
+    );
 
     // 3. A freshly created group has set no parameter of its own: every parameter its
     //    family publishes is reported at the engine's own default, and none under `user`.
@@ -698,18 +711,23 @@ async fn a_create_refuses_a_name_or_a_family_the_service_does_not_admit() {
                 400,
                 "InvalidParameterValue",
             );
-            // A refused create stored nothing: the name is not there to describe.
-            expect_error(
-                case,
-                call(
-                    &router,
-                    "DescribeDBClusterParameterGroups",
-                    &[("DBClusterParameterGroupName", name)],
-                )
-                .await,
-                404,
-                "DBParameterGroupNotFound",
-            );
+            // A refused create stored nothing: the name is not there to describe — unless
+            // it is one of RDS's OWN default groups, which the account holds for every
+            // cluster-capable family whatever this create did
+            // (`aws_managed_cluster_parameter_groups` covers those).
+            if !name.starts_with("default.") {
+                expect_error(
+                    case,
+                    call(
+                        &router,
+                        "DescribeDBClusterParameterGroups",
+                        &[("DBClusterParameterGroupName", name)],
+                    )
+                    .await,
+                    404,
+                    "DBParameterGroupNotFound",
+                );
+            }
         }
     }
 }
@@ -871,12 +889,11 @@ async fn a_reset_refuses_a_combination_the_api_forbids() {
 // ---------------------------------------------------------------------------
 
 /// `Source` selects what `DescribeDBClusterParameters` reports: the group's own parameters
-/// (`customer`/`user`), the family's published defaults (`engine`/`engine-default`), or
-/// nothing (`service`/`system`, which this emulator sets no parameter under, and any value
-/// naming no source at all — a `Source` is a filter, so it narrows the answer instead of
-/// refusing the request). A request naming NO source reports the group's whole detailed
-/// parameter list: every parameter of its family, each under the source its current value
-/// came from.
+/// (`user`), the family's published defaults (`engine-default`) or nothing (`system`, which
+/// this emulator sets no parameter under). A request naming NO source reports the group's
+/// whole detailed parameter list: every parameter of its family, each under the source its
+/// current value came from. A value outside the three the member publishes is REFUSED, so
+/// the vocabulary a caller may ask in is closed.
 #[tokio::test]
 async fn the_source_selects_which_parameters_a_describe_reports() {
     let router = emulator();
@@ -888,44 +905,25 @@ async fn the_source_selects_which_parameters_a_describe_reports() {
     let published = DOCDB_CLUSTER_PARAMETERS.len();
 
     // (case, Source, parameters expected, the Source each carries — `None` where the rows
-    // reported span more than one source). Both names of each source are rows: the request
-    // vocabulary the model documents (`customer`, `engine`, `service`) and the one a
-    // response reports (`user`, `engine-default`, `system`).
-    let rows: [(&str, Option<&str>, usize, Option<&str>); 7] = [
+    // reported span more than one source). One row per value the member publishes, plus the
+    // request that names none.
+    let rows: [(&str, Option<&str>, usize, Option<&str>); 4] = [
         ("no source named", None, published, None),
         (
-            "the customer's own parameters",
-            Some("customer"),
-            1,
-            Some(PARAMETER_SOURCE_USER),
-        ),
-        (
-            "the same source by its reported name",
+            "the caller's own parameters",
             Some(PARAMETER_SOURCE_USER),
             1,
             Some(PARAMETER_SOURCE_USER),
         ),
         (
             "the engine's published defaults",
-            Some("engine"),
-            published,
-            Some(PARAMETER_SOURCE_ENGINE_DEFAULT),
-        ),
-        (
-            "the same source by its reported name",
             Some(PARAMETER_SOURCE_ENGINE_DEFAULT),
             published,
             Some(PARAMETER_SOURCE_ENGINE_DEFAULT),
         ),
         (
             "the service's own parameters",
-            Some("service"),
-            0,
             Some(PARAMETER_SOURCE_SYSTEM),
-        ),
-        (
-            "a value naming no source this API knows",
-            Some("not-a-source"),
             0,
             Some(PARAMETER_SOURCE_SYSTEM),
         ),
@@ -950,6 +948,33 @@ async fn the_source_selects_which_parameters_a_describe_reports() {
                  {sources:?}"
             );
         }
+    }
+
+    // A value outside the published list is refused, whichever shape it has: the names an
+    // older documentation of the member used, and a value that names nothing at all. The
+    // refusal carries the rejected value and the values it could have named.
+    for source in ["customer", "engine", "service", "not-a-source"] {
+        let case = format!("Source {source:?}");
+        let refused = expect_error(
+            &case,
+            call(
+                &router,
+                "DescribeDBClusterParameters",
+                &[
+                    ("DBClusterParameterGroupName", group.as_str()),
+                    ("Source", source),
+                ],
+            )
+            .await,
+            400,
+            "InvalidParameterValue",
+        );
+        assert_eq!(
+            text(&refused, "Message"),
+            format!("Invalid Source: {source}. Allowed values are: engine-default, system, user"),
+            "case {case:?}: expected the refusal naming the value and the allowed ones, got \
+             {refused}"
+        );
     }
 
     // In that whole list the one parameter the group has SET is reported under `user` and
@@ -1221,24 +1246,24 @@ async fn a_group_belongs_to_the_region_it_was_created_in() {
     let router = emulator();
     let group = create_group(&router, "regional", "regional-cpg", DOCDB_FAMILY).await;
 
-    // (case, region, what that region sees)
+    // (case, region, what that region sees). The default groups RDS provides itself are in
+    // every region, so what is asserted is the group the create STORED: the creating region
+    // names it and the other does not.
     let other = "eu-central-1";
     let listed_here = expect_ok(
         "the region it was created in",
         call(&router, "DescribeDBClusterParameterGroups", &[]).await,
     );
-    assert_eq!(
-        count(&listed_here, "DBClusterParameterGroup"),
-        1,
+    assert!(
+        texts(&listed_here, "DBClusterParameterGroupName").contains(&group),
         "the creating region must see its own group, got {listed_here}"
     );
     let listed_there = expect_ok(
         "another region",
         call_in(&router, other, "DescribeDBClusterParameterGroups", &[]).await,
     );
-    assert_eq!(
-        count(&listed_there, "DBClusterParameterGroup"),
-        0,
+    assert!(
+        !texts(&listed_there, "DBClusterParameterGroupName").contains(&group),
         "another region must see none of it, got {listed_there}"
     );
     expect_error(

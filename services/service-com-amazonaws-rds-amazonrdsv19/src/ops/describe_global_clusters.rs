@@ -2,9 +2,9 @@
 
 //! @op DescribeGlobalClusters
 //! IMPLEMENTED: this operation reports the Aurora global database clusters out of this
-//! service's store, narrowed by `GlobalClusterIdentifier` and the documented `region`
-//! filter and paged by `MaxRecords` / `Marker`. It is the ONLY file to touch for this
-//! operation.
+//! service's store, narrowed by `GlobalClusterIdentifier` and the `region` and
+//! `db-cluster-id` filters and paged by `MaxRecords` / `Marker`. It is the ONLY file to
+//! touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken".
@@ -118,24 +118,48 @@ impl From<DescribeGlobalClustersErrorModeled> for DescribeGlobalClustersError {
     }
 }
 
-/// The one filter name this operation's `Filters` member documents: "This parameter is
-/// case-sensitive. Currently, the only supported filter is `region`. If used, the request
-/// returns information about any global cluster with at least one member (primary or
-/// secondary) in the specified Amazon Web Services Regions." Any other name is refused
-/// rather than ignored, because ignoring it would report global clusters the caller
-/// excluded.
-const SUPPORTED_FILTER_NAME: &str = "region";
+/// The filter names this operation accepts.
+///
+/// Its `Filters` member documents one — "This parameter is case-sensitive. Currently, the
+/// only supported filter is `region`. If used, the request returns information about any
+/// global cluster with at least one member (primary or secondary) in the specified Amazon Web
+/// Services Regions" — and recorded behaviour accepts a second, `db-cluster-id`, which
+/// selects the global cluster a DB CLUSTER belongs to: a filter name of the form the RDS
+/// describe operations publish for naming a DB cluster, matched against the global cluster's
+/// member clusters ([`crate::state::GlobalClusterRecord::has_member_cluster`]). Any other
+/// name is refused rather than ignored, because ignoring it would report global clusters the
+/// caller excluded.
+const SUPPORTED_FILTER_NAMES: [&str; 2] = [REGION_FILTER_NAME, DB_CLUSTER_ID_FILTER_NAME];
 
-/// Refuse a filter this operation does not support; see [`SUPPORTED_FILTER_NAME`].
+/// The filter that selects on the regions a global cluster has members in; see
+/// [`SUPPORTED_FILTER_NAMES`].
+const REGION_FILTER_NAME: &str = "region";
+
+/// The filter that selects on the global cluster's member DB clusters; see
+/// [`SUPPORTED_FILTER_NAMES`].
+const DB_CLUSTER_ID_FILTER_NAME: &str = "db-cluster-id";
+
+/// Refuse a filter this operation does not support; see [`SUPPORTED_FILTER_NAMES`].
 fn check_filter_names(filters: &[Filter]) -> Result<(), String> {
     for filter in filters {
-        if filter.name != SUPPORTED_FILTER_NAME {
+        if !SUPPORTED_FILTER_NAMES.contains(&filter.name.as_str()) {
             return Err(crate::state::unrecognized_filter_name_message(
                 &filter.name,
             ));
         }
     }
     Ok(())
+}
+
+/// Whether `record` matches `filter`: a global cluster matches a filter when any value the
+/// filter carries selects it, and a request carrying several filters reports the global
+/// clusters every one of them selects.
+fn matches_filter(record: &crate::state::GlobalClusterRecord, filter: &Filter) -> bool {
+    filter.values.iter().any(|wanted| match filter.name.as_str() {
+        DB_CLUSTER_ID_FILTER_NAME => record.has_member_cluster(wanted),
+        // `region` — the only other name `check_filter_names` admits.
+        _ => record.has_member_in(wanted),
+    })
 }
 
 /// The `DescribeGlobalClusters` operation.
@@ -229,18 +253,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None => store.global_clusters.values().collect(),
             };
 
-        // The `region` filter selects a global cluster with at least one member in ANY of
-        // the regions the filter names.
+        // Each filter narrows the report: a global cluster is reported only when EVERY
+        // filter selects it ([`matches_filter`]).
         let matching: Vec<(String, GlobalCluster)> = candidates
             .into_iter()
-            .filter(|record| {
-                filters.iter().all(|filter| {
-                    filter
-                        .values
-                        .iter()
-                        .any(|wanted| record.has_member_in(wanted))
-                })
-            })
+            .filter(|record| filters.iter().all(|filter| matches_filter(record, filter)))
             .map(|record| (record.identifier.clone(), record.to_wire()))
             .collect();
 

@@ -165,6 +165,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         check_filter_names(&filters).map_err(DescribeDBParametersError::invalid_parameter_value)?;
         crate::state::check_filter_terms(&filters)
             .map_err(DescribeDBParametersError::validation)?;
+        // `Source`: "Valid Values: user | system | engine-default" — a closed value list, so
+        // a value naming none of the three is refused rather than selecting nothing, the same
+        // rule the cluster-level describe holds its own `Source` to
+        // (`crate::state::check_parameter_source`). Checked here, before the group the
+        // request names is resolved, because it is a value of the REQUEST.
+        if let Some(source) = input.source.as_deref() {
+            crate::state::check_parameter_source(source)
+                .map_err(DescribeDBParametersError::invalid_parameter_value)?;
+        }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
@@ -208,7 +217,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .map(|name| (name.clone(), group.parameter_to_wire(name)))
                     .collect(),
                 // Nothing for `system`, because this emulator sets no service-sourced
-                // parameter, and nothing for a value naming no source at all.
+                // parameter. A value outside the three the member publishes was refused
+                // above, so the `Unknown` arm is unreachable here.
                 crate::state::ParameterSourceFilter::Service
                 | crate::state::ParameterSourceFilter::Unknown => BTreeMap::new(),
             },
