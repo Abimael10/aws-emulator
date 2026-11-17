@@ -38,7 +38,7 @@
 
 use serde_json::{json, Value};
 
-use crate::harness::{expected_bucket_arn, Emulator, Reply, ACCOUNT};
+use crate::harness::{assert_served, expected_bucket_arn, Emulator, Reply, ACCOUNT};
 
 /// The region every case works in.
 const REGION: &str = "us-east-1";
@@ -562,16 +562,6 @@ fn assert_denied(reply: &Reply, caller: &str, operation: &str, resource: &str, c
         expected,
         "case {case:?}: expected IAM's sentence for {operation}, got {actual:?}",
         actual = reply.message()
-    );
-}
-
-/// Assert `reply` is a call the policy left alone.
-fn assert_served(reply: &Reply, operation: &str, case: &str) {
-    assert_eq!(
-        reply.status, 200,
-        "case {case:?}: expected {operation} to be served, got {status} {body}",
-        status = reply.status,
-        body = reply.body
     );
 }
 

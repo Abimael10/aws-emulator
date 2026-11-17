@@ -187,15 +187,10 @@ fn tags_body(tags: &BTreeMap<String, String>) -> Value {
     )
 }
 
-/// Assert a setup call was served, and hand the reply on.
+/// Assert a setup call was served, and hand the reply on: the suites' one copy of that
+/// assertion, named for what this suite calls.
 fn served(reply: Reply, case: &str) -> Reply {
-    assert_eq!(
-        reply.status, 200,
-        "case {case:?}: the setup call must be served, got {status} {body}",
-        status = reply.status,
-        body = reply.body
-    );
-    reply
+    crate::harness::served(reply, "the setup call", case)
 }
 
 /// A table bucket with one namespace and one table in it: one live resource of

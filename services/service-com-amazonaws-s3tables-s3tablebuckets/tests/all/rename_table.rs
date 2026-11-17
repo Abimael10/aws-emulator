@@ -38,18 +38,30 @@
 //! hyphenated UUID. `wire_forms.rs` states those two rules over the create-and-read
 //! paths; this suite drives them over the post-rename and post-conflict listings.
 //!
+//! RULE 5 — a rename RE-KEYS the one stored record and changes nothing inside it, so
+//! every fact that record holds besides its coordinates moves with it: the metadata file
+//! the table is pointed at, the maintenance configuration a put settled on it, the
+//! encryption it is stored under, its storage class and its tags are all reported for the
+//! table at its new coordinates exactly as they were reported at its old ones, and each
+//! of those name-addressed reads resolves nowhere at the coordinates the table left
+//! (`GetTableMetadataLocation`, `GetTableMaintenanceConfiguration`, `GetTableEncryption`
+//! and `GetTableStorageClass` all address a table by `tableBucketARN`/`namespace`/`name`,
+//! and `RenameTable` declares no output, so the move is only observable through them).
+//!
 //! Each rule is asserted over a TABLE of cases spanning what it generalises over: which
 //! coordinate moves (name, namespace, both), name length and form, whether the caller
-//! presents its `versionToken`, how many tables share the namespace, and every class of
-//! refusal.
+//! presents its `versionToken`, how many tables share the namespace, which facts the
+//! moved record holds, and every class of refusal.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_s3tables_s3tablebuckets::state::{
-    OpenTableFormat, BUCKET_NOT_FOUND_MESSAGE, NAMESPACE_NOT_FOUND_MESSAGE,
-    TABLE_ALREADY_EXISTS_MESSAGE, TABLE_NOT_FOUND_MESSAGE, TABLE_VERSION_TOKEN_MISMATCH_MESSAGE,
+    OpenTableFormat, SseAlgorithm, StorageClass, TableMaintenanceType, BUCKET_NOT_FOUND_MESSAGE,
+    NAMESPACE_NOT_FOUND_MESSAGE, TABLE_ALREADY_EXISTS_MESSAGE, TABLE_NOT_FOUND_MESSAGE,
+    TABLE_VERSION_TOKEN_MISMATCH_MESSAGE,
 };
 
-use crate::harness::{expected_bucket_arn, timestamp_seconds, Emulator, Reply};
+use crate::harness::{expected_bucket_arn, served, timestamp_seconds, Emulator, Reply};
+use crate::table_maintenance_configuration::{reported_task, Reported};
 use crate::wire_forms::{assert_canonical_uuid, summary_of, table_id_of};
 
 /// The region every case in this suite is scoped to; the ARN assertions follow the
@@ -918,6 +930,471 @@ async fn the_token_a_client_read_before_a_rename_still_guards_the_table_afterwar
         assert_eq!(
             bucket.status, 204,
             "case {case:?}: DeleteTableBucket after the moves: {bucket:?}"
+        );
+    }
+}
+
+/// One case of [`a_rename_carries_every_fact_the_moved_record_holds`]: which coordinates
+/// the move names, and what the record it moves holds.
+#[derive(Debug, Clone, Copy)]
+struct Carried {
+    label: &'static str,
+    new_namespace: Option<&'static str>,
+    new_name: Option<&'static str>,
+    /// Whether the create describes the table's open-table metadata, so the record holds
+    /// a metadata document and a metadata file an `UpdateTableMetadataLocation` then
+    /// moves. The cases span both, because `metadataLocation` is an OPTIONAL output
+    /// member of `GetTableMetadataLocation` — absent until a metadata file exists for the
+    /// table — and because a table the control plane holds and has no metadata document
+    /// for is no table of the Iceberg REST catalog.
+    holds_metadata: bool,
+}
+
+/// The cases: they span which coordinate the move names — the name, the namespace, both —
+/// the length and form of the new name, and whether the moved record holds open-table
+/// metadata at all.
+const CARRIED: &[Carried] = &[
+    Carried {
+        label: "the name only, on a record that holds a metadata file",
+        new_namespace: None,
+        new_name: Some("carried_tbl_0123456789"),
+        holds_metadata: true,
+    },
+    Carried {
+        label: "the namespace only, on a record that holds a metadata file",
+        new_namespace: Some(TARGET_NAMESPACE),
+        new_name: None,
+        holds_metadata: true,
+    },
+    Carried {
+        label: "the namespace and the name together",
+        new_namespace: Some(TARGET_NAMESPACE),
+        new_name: Some("c"),
+        holds_metadata: true,
+    },
+    Carried {
+        label: "the name only, on a record that holds no metadata file",
+        new_namespace: None,
+        new_name: Some("c0"),
+        holds_metadata: false,
+    },
+];
+
+/// The table each case moves: created beside the two the fixture holds, so the move is
+/// graded on a record whose own configuration the case settled.
+const CARRIED_TABLE: &str = "carried_tbl";
+
+/// The metadata file the cases that hold one point the table at, as a path under the
+/// table's own warehouse location — the only place `UpdateTableMetadataLocation` accepts a
+/// metadata file at (`table_metadata_location.rs` is what pins that rule).
+const CARRIED_METADATA_FILE: &str =
+    "/metadata/00001-3f6c1b0e8a2d4e5f9b7c8d9e0f112233.metadata.json";
+
+/// The schema the cases that describe the table's metadata create it with: one field, in
+/// the member names the model gives them (`smithy_query(query="shape",
+/// shape="IcebergSchema,SchemaField")`: a required `fields` list of `name`/`type`, with an
+/// optional `required`).
+fn carried_schema() -> Value {
+    json!({ "fields": [{ "name": "event_id", "type": "long", "required": true }] })
+}
+
+/// The compaction target file size each case settles on the table: inside the window S3
+/// Tables compacts towards, and not the 512 MB default, so a read after the move reports
+/// what the put persisted rather than the default a task with no configuration runs under.
+const CARRIED_TARGET_FILE_SIZE_MB: i64 = 128;
+
+/// The compaction strategy each case settles: a modeled
+/// `com.amazonaws.s3tables#IcebergCompactionStrategy` value that needs no sort order in
+/// the table's metadata, and not the `auto` default.
+const CARRIED_STRATEGY: &str = "binpack";
+
+/// The maintenance status each case settles: the modeled `MaintenanceStatus` value that is
+/// not the default a task runs under.
+const CARRIED_STATUS: &str = "disabled";
+
+/// The tags each case attaches to the table before it moves.
+fn carried_tags() -> Value {
+    json!({ "environment": "production", "owner": "analytics" })
+}
+
+/// The `value` member of the `PutTableMaintenanceConfiguration` each case sends.
+fn carried_maintenance() -> Value {
+    json!({
+        "status": CARRIED_STATUS,
+        "settings": {
+            "icebergCompaction": {
+                "targetFileSizeMB": CARRIED_TARGET_FILE_SIZE_MB,
+                "strategy": CARRIED_STRATEGY,
+            },
+        },
+    })
+}
+
+/// What the name-addressed reads of one table's own configuration report for it: the body
+/// of each, so a comparison across a move names the read that disagrees.
+struct Facts {
+    metadata_location: Reply,
+    maintenance: Reply,
+    encryption: Reply,
+    storage_class: Reply,
+}
+
+impl Facts {
+    /// Every read, at the coordinates given, each asserted to be served.
+    async fn read(emulator: &Emulator, bucket_arn: &str, at: (&str, &str), case: &str) -> Self {
+        let (namespace, name) = at;
+        Self {
+            metadata_location: served(
+                emulator
+                    .get_table_metadata_location(REGION, bucket_arn, namespace, name)
+                    .await,
+                "GetTableMetadataLocation",
+                case,
+            ),
+            maintenance: served(
+                emulator
+                    .get_table_maintenance_configuration(REGION, bucket_arn, namespace, name)
+                    .await,
+                "GetTableMaintenanceConfiguration",
+                case,
+            ),
+            encryption: served(
+                emulator
+                    .get_table_encryption(REGION, bucket_arn, namespace, name)
+                    .await,
+                "GetTableEncryption",
+                case,
+            ),
+            storage_class: served(
+                emulator
+                    .get_table_storage_class(REGION, bucket_arn, namespace, name)
+                    .await,
+                "GetTableStorageClass",
+                case,
+            ),
+        }
+    }
+
+    /// Each read of `self` beside the one `other` answers for the same operation, so a
+    /// comparison across a move is of one operation's two answers and names which read
+    /// disagrees.
+    fn against<'a>(&'a self, other: &'a Self) -> [(&'static str, &'a Reply, &'a Reply); 4] {
+        [
+            (
+                "GetTableMetadataLocation",
+                &self.metadata_location,
+                &other.metadata_location,
+            ),
+            (
+                "GetTableMaintenanceConfiguration",
+                &self.maintenance,
+                &other.maintenance,
+            ),
+            ("GetTableEncryption", &self.encryption, &other.encryption),
+            (
+                "GetTableStorageClass",
+                &self.storage_class,
+                &other.storage_class,
+            ),
+        ]
+    }
+}
+
+/// RULE 5: a move re-keys the record and changes nothing inside it, so every read of the
+/// table's own configuration answers at the new coordinates what it answered at the old
+/// ones, and answers nothing at all at the coordinates the table left.
+#[tokio::test]
+async fn a_rename_carries_every_fact_the_moved_record_holds() {
+    for (index, case) in CARRIED.iter().enumerate() {
+        let label = case.label;
+        let fixture = Fixture::new(&format!("rename-carries-{index}"), label).await;
+        let bucket_arn = fixture.bucket_arn.clone();
+        let emulator = &fixture.emulator;
+
+        // The table this case moves, created in the source namespace beside the two the
+        // fixture holds — and created with a storage class and an encryption configuration
+        // that are NOT the service defaults, so each read of them is a fact this record
+        // carries rather than the answer any record would give.
+        let key_arn = emulator.create_kms_key(REGION).await;
+        let mut create = json!({
+            "name": CARRIED_TABLE,
+            "format": OpenTableFormat::Iceberg.as_wire(),
+            "encryptionConfiguration": {
+                "sseAlgorithm": SseAlgorithm::AwsKms.as_wire(),
+                "kmsKeyArn": key_arn,
+            },
+            "storageClassConfiguration": {
+                "storageClass": StorageClass::IntelligentTiering.as_wire(),
+            },
+        });
+        if case.holds_metadata {
+            create["metadata"] = json!({ "iceberg": { "schema": carried_schema() } });
+        }
+        let created = emulator
+            .create_table(REGION, &bucket_arn, SOURCE_NAMESPACE, &create)
+            .await;
+        assert_eq!(
+            created.status, 200,
+            "case {label:?}: CreateTable {CARRIED_TABLE}: {created:?}"
+        );
+        let table_arn = created.text("tableARN");
+
+        // The facts the record holds before it moves: a maintenance configuration a put
+        // settled on the table, tags a caller attached to it, and — on the cases that
+        // hold one — the metadata file the table is pointed at.
+        let put = emulator
+            .put_table_maintenance_configuration(
+                REGION,
+                &bucket_arn,
+                SOURCE_NAMESPACE,
+                CARRIED_TABLE,
+                TableMaintenanceType::IcebergCompaction.as_wire(),
+                &carried_maintenance(),
+            )
+            .await;
+        assert_eq!(
+            put.status, 204,
+            "case {label:?}: PutTableMaintenanceConfiguration: {put:?}"
+        );
+        let tagged = emulator
+            .tag_resource(REGION, &table_arn, &carried_tags())
+            .await;
+        assert_eq!(tagged.status, 200, "case {label:?}: TagResource: {tagged:?}");
+
+        let mut expected_location = None;
+        if case.holds_metadata {
+            let before = served(
+                emulator
+                    .get_table_metadata_location(
+                        REGION,
+                        &bucket_arn,
+                        SOURCE_NAMESPACE,
+                        CARRIED_TABLE,
+                    )
+                    .await,
+                "GetTableMetadataLocation",
+                label,
+            );
+            let location = format!(
+                "{warehouse}{CARRIED_METADATA_FILE}",
+                warehouse = before.text("warehouseLocation")
+            );
+            let updated = emulator
+                .update_table_metadata_location(
+                    REGION,
+                    &bucket_arn,
+                    SOURCE_NAMESPACE,
+                    CARRIED_TABLE,
+                    &json!({
+                        "metadataLocation": location,
+                        "versionToken": before.text("versionToken"),
+                    }),
+                )
+                .await;
+            assert_eq!(
+                updated.status, 200,
+                "case {label:?}: UpdateTableMetadataLocation: {updated:?}"
+            );
+            expected_location = Some(location);
+        }
+
+        // The baseline: what each read answers while the table is still where it was
+        // created, with the configuration the put settled actually in force — so the
+        // comparison after the move is against a record that holds something.
+        let before =
+            Facts::read(emulator, &bucket_arn, (SOURCE_NAMESPACE, CARRIED_TABLE), label).await;
+        assert_eq!(
+            before.metadata_location.optional_text("metadataLocation"),
+            expected_location,
+            "case {label:?}: GetTableMetadataLocation before the move: expected \
+             {expected_location:?}, got {reply:?}",
+            reply = before.metadata_location
+        );
+        let expected_compaction = Reported::Compaction(
+            Some(CARRIED_STATUS.to_string()),
+            Some(CARRIED_TARGET_FILE_SIZE_MB),
+            Some(CARRIED_STRATEGY.to_string()),
+        );
+        let settled = reported_task(
+            &before.maintenance,
+            label,
+            TableMaintenanceType::IcebergCompaction,
+        );
+        assert_eq!(
+            settled, expected_compaction,
+            "case {label:?}: before the move the put must be in force: expected \
+             {expected_compaction:?}, got {settled:?}"
+        );
+        // The two configurations the create settled, so the comparison across the move is
+        // of a carried fact and not of one default against another.
+        assert_eq!(
+            before
+                .encryption
+                .body
+                .get("encryptionConfiguration")
+                .and_then(|configuration| configuration.get("sseAlgorithm"))
+                .and_then(Value::as_str),
+            Some(SseAlgorithm::AwsKms.as_wire()),
+            "case {label:?}: before the move GetTableEncryption must report the \
+             configuration the create named: {reply:?}",
+            reply = before.encryption
+        );
+        assert_eq!(
+            before
+                .storage_class
+                .body
+                .get("storageClassConfiguration")
+                .and_then(|configuration| configuration.get("storageClass"))
+                .and_then(Value::as_str),
+            Some(StorageClass::IntelligentTiering.as_wire()),
+            "case {label:?}: before the move GetTableStorageClass must report the class the \
+             create named: {reply:?}",
+            reply = before.storage_class
+        );
+
+        // The token the caller holds for the record it is about to move: the metadata
+        // write advanced it, so this is the one the conditional rename presents.
+        let current = fixture.read(SOURCE_NAMESPACE, CARRIED_TABLE).await;
+        assert_eq!(current.status, 200, "case {label:?}: GetTable: {current:?}");
+        let version_token = current.text("versionToken");
+
+        let target_namespace = case.new_namespace.unwrap_or(SOURCE_NAMESPACE);
+        let target_name = case.new_name.unwrap_or(CARRIED_TABLE);
+        let mut request = json!({ "versionToken": version_token });
+        if let Some(namespace) = case.new_namespace {
+            request["newNamespaceName"] = json!(namespace);
+        }
+        if let Some(name) = case.new_name {
+            request["newName"] = json!(name);
+        }
+        let renamed = emulator
+            .rename_table(
+                REGION,
+                &bucket_arn,
+                SOURCE_NAMESPACE,
+                CARRIED_TABLE,
+                &request,
+            )
+            .await;
+        assert_eq!(
+            renamed.status, 204,
+            "case {label:?}: RenameTable: expected 204, got {renamed:?}"
+        );
+
+        // Every read answers for the table at its new coordinates what it answered for it
+        // at its old ones: the move re-keyed the record and changed nothing in it.
+        let after = Facts::read(emulator, &bucket_arn, (target_namespace, target_name), label).await;
+        for (operation, expected, actual) in before.against(&after) {
+            assert_eq!(
+                actual.body, expected.body,
+                "case {label:?}: {operation} at {target_namespace}/{target_name} must report \
+                 what it reported before the move: expected {expected:?}, got {actual:?}"
+            );
+        }
+        assert_eq!(
+            after.metadata_location.optional_text("metadataLocation"),
+            expected_location,
+            "case {label:?}: the metadata file the moved table is pointed at: expected \
+             {expected_location:?}, got {reply:?}",
+            reply = after.metadata_location
+        );
+        let carried = reported_task(
+            &after.maintenance,
+            label,
+            TableMaintenanceType::IcebergCompaction,
+        );
+        assert_eq!(
+            carried, expected_compaction,
+            "case {label:?}: the maintenance configuration the moved table runs under: \
+             expected {expected_compaction:?}, got {carried:?}"
+        );
+
+        // And nothing answers for the coordinates the table left: there is one record,
+        // not a copy at each end of the move.
+        for (operation, reply) in [
+            (
+                "GetTableMetadataLocation",
+                emulator
+                    .get_table_metadata_location(
+                        REGION,
+                        &bucket_arn,
+                        SOURCE_NAMESPACE,
+                        CARRIED_TABLE,
+                    )
+                    .await,
+            ),
+            (
+                "GetTableMaintenanceConfiguration",
+                emulator
+                    .get_table_maintenance_configuration(
+                        REGION,
+                        &bucket_arn,
+                        SOURCE_NAMESPACE,
+                        CARRIED_TABLE,
+                    )
+                    .await,
+            ),
+            (
+                "GetTableEncryption",
+                emulator
+                    .get_table_encryption(REGION, &bucket_arn, SOURCE_NAMESPACE, CARRIED_TABLE)
+                    .await,
+            ),
+            (
+                "GetTableStorageClass",
+                emulator
+                    .get_table_storage_class(REGION, &bucket_arn, SOURCE_NAMESPACE, CARRIED_TABLE)
+                    .await,
+            ),
+        ] {
+            assert_eq!(
+                reply.status, 404,
+                "case {label:?}: {operation} at the coordinates the table left: expected 404, \
+                 got {reply:?}"
+            );
+            assert_eq!(
+                reply.message(),
+                TABLE_NOT_FOUND_MESSAGE,
+                "case {label:?}: {operation} at the coordinates the table left: unexpected \
+                 message {reply:?}"
+            );
+        }
+
+        // The tags are the record's too, and the ARN they are addressed by is the one the
+        // move left alone, so the moved table still answers for them.
+        let tags = emulator.list_tags_for_resource(REGION, &table_arn).await;
+        assert_eq!(
+            tags.status, 200,
+            "case {label:?}: ListTagsForResource after the move: {tags:?}"
+        );
+        assert_eq!(
+            tags.body.get("tags"),
+            Some(&carried_tags()),
+            "case {label:?}: the tags the moved table carries: {tags:?}"
+        );
+
+        // The Iceberg REST catalog resolves the same record at the coordinates the move
+        // named, and nothing at the ones it left — and a record that holds no metadata
+        // document is no table of that catalog at either end of the move, because the
+        // catalog serves a table out of its open-table metadata and a table that has none
+        // has no document to serve (`iceberg_rest_catalog.rs` drives the load of such a
+        // table, which the catalog refuses with its own no-such-table error).
+        let resolves = if case.holds_metadata { 204 } else { 404 };
+        let exists = emulator
+            .table_exists(REGION, &bucket_arn, target_namespace, target_name)
+            .await;
+        assert_eq!(
+            exists.status, resolves,
+            "case {label:?}: the catalog at {target_namespace}/{target_name}: expected \
+             {resolves}, got {exists:?}"
+        );
+        let gone = emulator
+            .table_exists(REGION, &bucket_arn, SOURCE_NAMESPACE, CARRIED_TABLE)
+            .await;
+        assert_eq!(
+            gone.status, 404,
+            "case {label:?}: the catalog must resolve nothing at the coordinates the table \
+             left, got {gone:?}"
         );
     }
 }

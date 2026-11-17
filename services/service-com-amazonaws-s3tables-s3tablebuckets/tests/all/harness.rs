@@ -1206,6 +1206,23 @@ pub fn timestamp_seconds(body: &Value, member: &str, case: &str) -> f64 {
     }
 }
 
+/// Assert `reply` is the modelled 200 of a read or a setup call. The ONE copy of that
+/// assertion the suites share.
+pub fn assert_served(reply: &Reply, operation: &str, case: &str) {
+    assert_eq!(
+        reply.status, 200,
+        "case {case:?}: {operation} must be served, got {status} {body}",
+        status = reply.status,
+        body = reply.body
+    );
+}
+
+/// The same assertion for a call whose reply the caller goes on to read.
+pub fn served(reply: Reply, operation: &str, case: &str) -> Reply {
+    assert_served(&reply, operation, case);
+    reply
+}
+
 pub fn now_seconds() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
