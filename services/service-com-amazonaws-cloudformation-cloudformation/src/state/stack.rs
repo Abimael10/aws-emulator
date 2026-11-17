@@ -3075,8 +3075,7 @@ impl StoredStack {
     /// again creates the resource.
     fn in_progress_status_of(&self, logical_id: &str) -> &'static str {
         let held = self.resources.iter().any(|deployed| {
-            deployed.resource.logical_id == logical_id
-                && deployed.status != resource_status::DELETE_COMPLETE
+            deployed.resource.logical_id == logical_id && holds_the_resource(deployed)
         });
         if held {
             resource_status::UPDATE_IN_PROGRESS
@@ -4505,6 +4504,23 @@ fn disposed_resources(
     records
 }
 
+/// Whether the stack really HOLDS the resource a record describes, and so whether a
+/// deployment that declares its logical id again CHANGES a resource or CREATES one.
+///
+/// A record the stack kept at `DELETE_COMPLETE` is a resource an operation took away, and one
+/// whose create the service that owns the resource REFUSED describes a resource that does not
+/// exist there ([`provisioning::already_deployed`]) — neither is a resource to change, so the
+/// next deployment that declares it creates it and reports it as created.
+///
+/// The ONE place that question is answered for a stack's own records, so what a resource
+/// reports while the operation is under way ([`StoredStack::in_progress_status_of`]) and what
+/// it reports once the operation finished ([`installed_resources`]) cannot disagree, and
+/// neither can disagree with what the deployment walk really did.
+fn holds_the_resource(record: &DeployedResource) -> bool {
+    record.status != resource_status::DELETE_COMPLETE
+        && provisioning::already_deployed(&record.resource)
+}
+
 /// The resources a completed create or update leaves the stack with, each carrying the
 /// resource-level status that operation left it in.
 ///
@@ -4537,15 +4553,17 @@ fn installed_resources(
             {
                 // Deployed before and identical: this operation did not touch it.
                 Some(before) if before.resource == resource => before.clone(),
-                // Deployed before under this logical id and now different: the operation
-                // updated it.
-                Some(_) => DeployedResource::new(
+                // The stack HELD the resource under this logical id and it is now different:
+                // the operation updated it.
+                Some(before) if holds_the_resource(before) => DeployedResource::new(
                     resource,
                     resource_status::UPDATE_COMPLETE,
                     updated_at,
                 ),
-                // Not deployed before: the operation created it.
-                None => DeployedResource::new(
+                // The stack held no such resource — it had no record at all, or one that
+                // describes a resource the services that own it do not hold: the operation
+                // created it.
+                _ => DeployedResource::new(
                     resource,
                     resource_status::CREATE_COMPLETE,
                     updated_at,

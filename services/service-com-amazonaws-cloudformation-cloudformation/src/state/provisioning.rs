@@ -3349,8 +3349,14 @@ pub fn is_same_resource(left: &StoredResource, right: &StoredResource) -> bool {
 /// create, nothing to carry out) from one whose create an owning service refused or never
 /// reached: that resource does not exist there, so a deployment that declares it again
 /// creates it.
+///
+/// Which types are declared-only is asked of [`owner_for`] — the one seam that answers who
+/// provisions a type, whichever module that type's arms live in. Asking a sub-catalogue of it
+/// instead would read a type it does not list as declared-only, and a refused create of such
+/// a type would then be taken for a resource that exists: the next deployment would ask its
+/// owning service to CHANGE a resource that service does not hold.
 pub(super) fn already_deployed(existing: &StoredResource) -> bool {
-    existing.materialised || provisioner_for(&existing.resource_type).is_none()
+    existing.materialised || owner_for(&existing.resource_type).is_none()
 }
 
 /// What deleting a stack's resources left.

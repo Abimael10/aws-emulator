@@ -18,7 +18,12 @@
 //!    the stack takes an `UpdateStack` or an `ExecuteChangeSet` while that is what the
 //!    request asks for — stated on the call, or as the change set's own documented
 //!    equivalent `OnStackFailure=DO_NOTHING` — and otherwise answers the non-terminal-state
-//!    refusal, which leaves the stack and the change set exactly where they were.
+//!    refusal, which leaves the stack and the change set exactly where they were. The status
+//!    the refusal brackets is the one the stack is really in, whichever operation parked it
+//!    there (a create's failure or an update's), and the second way out of that state — the
+//!    stack's own `RollbackStack` — takes the stack to a status that holds no configuration an
+//!    update could change, so from there even a request that asks for the failed state to be
+//!    kept is refused, by the sentence that names the stack and its status.
 //! 3. **A change set is computed against the configuration the stack's resources CARRY.** A
 //!    resource whose change the failed operation could not carry through was put back to the
 //!    configuration in force before it, which the template in force no longer declares — so
@@ -27,12 +32,20 @@
 //!    refused with the modelled `InvalidChangeSetStatus`), while one that restates the
 //!    template in force proposes putting the failed value back.
 //!
+//! 4. **A resource whose create the owning service REFUSED does not exist there, so the next
+//!    deployment that declares it CREATES it** rather than asking that service to change a
+//!    resource it does not hold. That is what the fix-forward update rule 2 admits is for: the
+//!    stack kept the estate the failed operation had made, and the resources it could NOT make
+//!    are the outstanding work. It holds for every type this emulator provisions, whichever
+//!    module that type's own create and update arms live in.
+//!
 //! The rows span what each rule generalises over: every `StackStatus` a live stack carries
-//! for rule 1, the ways a request can and cannot ask for the failed state to be kept for rule
-//! 2, and how many resources the failed operation broke — beside a change it carried through
-//! — for rule 3. Every call goes over the awsQuery wire, and each resource is read back
-//! through the OWNING service's own wire (AWS Lambda), so what is asserted is what a client
-//! sees.
+//! for rule 1, the ways a request can and cannot ask for the failed state to be kept and the
+//! operation whose failure parked the stack for rule 2, how many resources the failed
+//! operation broke — beside a change it carried through — for rule 3, and the resource TYPE
+//! whose create was refused for rule 4. Every call goes over the awsQuery wire, and each
+//! resource is read back through the OWNING service's own wire (AWS Lambda, Amazon CloudWatch
+//! Logs), so what is asserted is what a client sees.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -49,7 +62,8 @@ use crate::harness::{
     call, create_stack, member, refusal, router_with_engine, store, xml_blocks, xml_text,
     xml_texts, REGION,
 };
-use crate::stack_lifecycle::{acknowledging_iam, describe_stack};
+use crate::logs_group_children_resources::group_exists;
+use crate::stack_lifecycle::{acknowledging_iam, describe_stack, resource_event_statuses};
 
 /// The code every refusal under test carries: the detections model no error of their own and
 /// the deployment gate is not one of `ExecuteChangeSet`'s modelled errors either, so both are
@@ -494,10 +508,7 @@ async fn an_execution_onto_a_parked_stack_has_to_ask_for_the_failed_state_to_be_
             "case {case:?}: expected the execution to be refused, got {status_code} {body}"
         );
         let (code, message) = refusal(&body);
-        let expected = "This stack is currently in a non-terminal [UPDATE_FAILED] state. To \
-                        update the stack from this state, please use the disable-rollback \
-                        parameter with update-stack API. To rollback to the last known good \
-                        state, use the rollback-stack API";
+        let expected = non_terminal_refusal("UPDATE_FAILED");
         assert_eq!(
             code, VALIDATION_ERROR,
             "case {case:?}: expected {VALIDATION_ERROR:?}, got {code:?}"
@@ -549,10 +560,7 @@ async fn an_update_of_a_parked_stack_has_to_ask_for_the_failed_state_to_be_kept(
          {answered}"
     );
     let (code, message) = refusal(&answered);
-    let expected = "This stack is currently in a non-terminal [UPDATE_FAILED] state. To \
-                    update the stack from this state, please use the disable-rollback \
-                    parameter with update-stack API. To rollback to the last known good \
-                    state, use the rollback-stack API";
+    let expected = non_terminal_refusal("UPDATE_FAILED");
     assert_eq!(
         code, VALIDATION_ERROR,
         "case {case:?}: expected {VALIDATION_ERROR:?}, got {code:?}"
@@ -838,6 +846,534 @@ async fn a_change_set_of_a_parked_stack_is_computed_against_the_live_configurati
             scope, expected_scope,
             "case {case:?}: expected every change to be scoped to {expected_scope:?}, got \
              {scope:?}"
+        );
+    }
+}
+
+/// The refusal CloudFormation words for a deploy onto a stack whose own failed operation was
+/// left standing: fixed text apart from the status the stack is really in, which the sentence
+/// brackets, and no full stop after the last clause.
+///
+/// Spelled here rather than read off the service, so what the rows assert is the WORDING and
+/// not whatever the service happens to produce.
+fn non_terminal_refusal(status: &str) -> String {
+    format!(
+        "This stack is currently in a non-terminal [{status}] state. To update the stack from \
+         this state, please use the disable-rollback parameter with update-stack API. To \
+         rollback to the last known good state, use the rollback-stack API"
+    )
+}
+
+/// Which operation's failure PARKED the stack a row updates, and so which status the refusal
+/// brackets.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ParkedBy {
+    /// A CREATE whose alias named a version the function never published, submitted with
+    /// `DisableRollback=true`: the stack rests in `CREATE_FAILED` still holding the role and
+    /// the function the walk did make.
+    AFailedCreate,
+    /// The same refusal on an UPDATE of a stack whose create completed: the stack rests in
+    /// `UPDATE_FAILED` with every resource the update could not change put back.
+    AFailedUpdate,
+}
+
+impl ParkedBy {
+    /// The `StackStatus` such a stack reports, and so the status its refusal names.
+    fn status(self) -> &'static str {
+        match self {
+            Self::AFailedCreate => "CREATE_FAILED",
+            Self::AFailedUpdate => "UPDATE_FAILED",
+        }
+    }
+}
+
+/// One row of the update gate: how the stack was parked, what the update states about keeping
+/// that state, and whether it is carried out.
+struct ParkedUpdateRow {
+    case: &'static str,
+    stack: &'static str,
+    parked_by: ParkedBy,
+    /// The version the broken revision points this row's alias at — a version the function
+    /// never published, so the owning service refuses it. Its own per row.
+    missing_version: &'static str,
+    /// `DisableRollback` the update states, where the row states it at all.
+    disable_rollback: Option<&'static str>,
+    /// Whether the update asks for the failed state to be kept, and so is carried out.
+    accepted: bool,
+}
+
+/// The class rule 2 covers on `UpdateStack`: both operations whose failure can park a stack,
+/// and each way a request can state — or fail to state — that the failed state is to be kept.
+const PARKED_UPDATE_ROWS: &[ParkedUpdateRow] = &[
+    ParkedUpdateRow {
+        case: "a create that failed, with nothing asked about keeping it",
+        stack: "cfnuf-create-gate-unasked",
+        parked_by: ParkedBy::AFailedCreate,
+        missing_version: "7",
+        disable_rollback: None,
+        accepted: false,
+    },
+    ParkedUpdateRow {
+        case: "a create that failed, with DisableRollback=false",
+        stack: "cfnuf-create-gate-unflagged",
+        parked_by: ParkedBy::AFailedCreate,
+        missing_version: "31",
+        disable_rollback: Some("false"),
+        accepted: false,
+    },
+    ParkedUpdateRow {
+        case: "a create that failed, with DisableRollback=true",
+        stack: "cfnuf-create-gate-flagged",
+        parked_by: ParkedBy::AFailedCreate,
+        missing_version: "412",
+        disable_rollback: Some("true"),
+        accepted: true,
+    },
+    ParkedUpdateRow {
+        case: "an update that failed, with DisableRollback=false",
+        stack: "cfnuf-update-gate-unflagged",
+        parked_by: ParkedBy::AFailedUpdate,
+        missing_version: "86",
+        disable_rollback: Some("false"),
+        accepted: false,
+    },
+];
+
+/// Drive a CREATE that the owning service refuses part way, with the failed state kept: the
+/// stack rests in `CREATE_FAILED` holding the role and the function the walk did make, and
+/// nothing holds the alias its create was refused for.
+async fn parked_in_create_failed(
+    router: &MultiServiceRouter,
+    engine: &Arc<engine::InMemoryEngine>,
+    case: &str,
+    stack: &str,
+    missing_version: &str,
+) {
+    let broken = template(stack, &[missing_version], CREATED_DESCRIPTION);
+    let mut members = acknowledging_iam(&[]);
+    members.push(member("DisableRollback", "true"));
+    let (status_code, body) = create_stack(router, stack, &broken, &members).await;
+    assert_eq!(
+        status_code, 200,
+        "case {case:?}: expected CreateStack to be accepted, got {status_code} {body}"
+    );
+    let settled = settled_status(router, engine, case, stack).await;
+    assert_eq!(
+        settled, "CREATE_FAILED",
+        "case {case:?}: expected the kept create to park the stack, got {settled:?}"
+    );
+    // The partially created estate the caller kept it for, reported resource by resource.
+    for (logical_id, expected) in [
+        ("Role", "CREATE_COMPLETE"),
+        ("Fn0", "CREATE_COMPLETE"),
+        ("Fn0Alias", "CREATE_FAILED"),
+    ] {
+        let reported = reported_resource_status(router, case, stack, logical_id).await;
+        assert_eq!(
+            reported, expected,
+            "case {case:?}: expected {logical_id:?} to report {expected:?}, got {reported:?}"
+        );
+    }
+    // ...and the function it did make is still there in the service that owns it.
+    let function = function_name(stack, 0);
+    let described = function_description(router, &function).await;
+    assert_eq!(
+        described.as_deref(),
+        Some(CREATED_DESCRIPTION),
+        "case {case:?}: expected AWS Lambda to still hold {function:?}, got {described:?}"
+    );
+}
+
+/// The `StackStatusReason` the stack reports right now, which is what a failed deployment
+/// names its cause in — carried into a row's assertion so a failure says WHY.
+async fn reported_status_reason(router: &MultiServiceRouter, case: &str, stack: &str) -> String {
+    let (status_code, body) = describe_stack(router, stack).await;
+    assert_eq!(
+        status_code, 200,
+        "case {case:?}: expected DescribeStacks to answer, got {status_code} {body}"
+    );
+    xml_text(&body, "StackStatusReason").unwrap_or_default()
+}
+
+/// The `ResourceStatus` the stack's own per-resource view reports for `logical_id`.
+async fn reported_resource_status(
+    router: &MultiServiceRouter,
+    case: &str,
+    stack: &str,
+    logical_id: &str,
+) -> String {
+    let (status_code, body) = call(
+        router,
+        "DescribeStackResources",
+        &[member("StackName", stack)],
+    )
+    .await;
+    assert_eq!(
+        status_code, 200,
+        "case {case:?}: expected DescribeStackResources to answer, got {status_code} {body}"
+    );
+    xml_blocks(&body, "member")
+        .iter()
+        .find(|entry| xml_text(entry, "LogicalResourceId").as_deref() == Some(logical_id))
+        .and_then(|entry| xml_text(entry, "ResourceStatus"))
+        .unwrap_or_default()
+}
+
+/// RULE 2 on `UpdateStack`, over BOTH statuses an operation that preserved its failure leaves:
+/// the deploy is carried out only while the request asks for that state to go on being kept,
+/// and otherwise the call is refused with the status the stack is really in and the two APIs
+/// that move it on — leaving the stack, and the estate the failure kept, exactly as they were.
+#[tokio::test]
+async fn an_update_of_a_stack_parked_by_any_failure_has_to_ask_for_that_state() {
+    for row in PARKED_UPDATE_ROWS {
+        let case = row.case;
+        let (router, engine) = router_with_engine();
+        match row.parked_by {
+            ParkedBy::AFailedCreate => {
+                parked_in_create_failed(&router, &engine, case, row.stack, row.missing_version)
+                    .await;
+            }
+            ParkedBy::AFailedUpdate => {
+                parked_in_update_failed(
+                    &router,
+                    &engine,
+                    case,
+                    row.stack,
+                    &[row.missing_version],
+                    CREATED_DESCRIPTION,
+                )
+                .await;
+            }
+        }
+        let parked = row.parked_by.status();
+        let parked_id = stack_id(&router, case, row.stack).await;
+
+        let correcting = correcting_change_set(row.stack);
+        let mut members = acknowledging_iam(&[
+            member("StackName", row.stack),
+            member("TemplateBody", &correcting),
+        ]);
+        if let Some(disable_rollback) = row.disable_rollback {
+            members.push(member("DisableRollback", disable_rollback));
+        }
+        let (status_code, answered) = call(&router, "UpdateStack", &members).await;
+
+        if row.accepted {
+            assert_eq!(
+                status_code, 200,
+                "case {case:?}: expected the fix-forward update of a stack in {parked} to be \
+                 accepted, got {status_code} {answered}"
+            );
+            let settled = settled_status(&router, &engine, case, row.stack).await;
+            let reason = reported_status_reason(&router, case, row.stack).await;
+            assert_eq!(
+                settled, "UPDATE_COMPLETE",
+                "case {case:?}: expected the fix-forward update to complete, got {settled:?} \
+                 ({reason:?})"
+            );
+            // ...and what it deployed is in force in the service that owns it: the alias the
+            // parked create could not make now invokes the version the correction names.
+            let function = function_name(row.stack, 0);
+            let invoked = alias_version(&router, &function).await;
+            assert_eq!(
+                invoked.as_deref(),
+                Some(HEALTHY_VERSION),
+                "case {case:?}: expected the alias of {function:?} to invoke \
+                 {HEALTHY_VERSION:?}, got {invoked:?}"
+            );
+            let described = function_description(&router, &function).await;
+            assert_eq!(
+                described.as_deref(),
+                Some(UPDATED_DESCRIPTION),
+                "case {case:?}: expected AWS Lambda to hold the deployed description for \
+                 {function:?}, got {described:?}"
+            );
+            continue;
+        }
+
+        assert_eq!(
+            status_code, 400,
+            "case {case:?}: expected the update of a stack in {parked} to be refused, got \
+             {status_code} {answered}"
+        );
+        let (code, message) = refusal(&answered);
+        let expected = non_terminal_refusal(parked);
+        assert_eq!(
+            code, VALIDATION_ERROR,
+            "case {case:?}: expected {VALIDATION_ERROR:?}, got {code:?}"
+        );
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected {expected:?}, got {message:?}"
+        );
+        // A refused update changes nothing: the stack is the one it named, still parked, and
+        // the estate the failure kept is still there.
+        let still = stack_status(&router, case, row.stack).await;
+        assert_eq!(
+            still, parked,
+            "case {case:?}: expected the refused update to leave {parked_id:?} in {parked}, \
+             got {still:?}"
+        );
+        let function = function_name(row.stack, 0);
+        let described = function_description(&router, &function).await;
+        assert_eq!(
+            described.as_deref(),
+            Some(CREATED_DESCRIPTION),
+            "case {case:?}: expected the refused update to leave {function:?} as it was, got \
+             {described:?}"
+        );
+    }
+}
+
+/// RULE 2's OTHER way out of a parked state, and where it leads: `RollbackStack` puts the
+/// stack back to its last stable state, which for a create that never had one is a stack
+/// holding no configuration at all — so from there an update is refused by the status
+/// sentence, however it asks for a failed state to be kept.
+#[tokio::test]
+async fn a_rolled_back_stack_takes_no_update_however_the_request_asks() {
+    let case = "the update after the rollback the refusal pointed at";
+    let stack = "cfnuf-create-rolled-back";
+    let (router, engine) = router_with_engine();
+    parked_in_create_failed(&router, &engine, case, stack, "7").await;
+    let stack_id = stack_id(&router, case, stack).await;
+
+    let (status_code, body) = call(&router, "RollbackStack", &[member("StackName", stack)]).await;
+    assert_eq!(
+        status_code, 200,
+        "case {case:?}: expected RollbackStack to be accepted, got {status_code} {body}"
+    );
+    let settled = settled_status(&router, &engine, case, stack).await;
+    let rolled_back = "ROLLBACK_COMPLETE";
+    assert_eq!(
+        settled, rolled_back,
+        "case {case:?}: expected the rollback of a create with no stable state to reach \
+         {rolled_back}, got {settled:?}"
+    );
+    // The estate the parked create kept is gone from the service that owns it: the rollback
+    // really was carried out.
+    let function = function_name(stack, 0);
+    let described = function_description(&router, &function).await;
+    assert_eq!(
+        described, None,
+        "case {case:?}: expected AWS Lambda to no longer hold {function:?}, got {described:?}"
+    );
+
+    // Asking for the failed state to be kept no longer helps: there is no failed state to
+    // keep, and the stack holds no configuration an update could change.
+    let correcting = correcting_change_set(stack);
+    for disable_rollback in [None, Some("true")] {
+        let mut members = acknowledging_iam(&[
+            member("StackName", stack),
+            member("TemplateBody", &correcting),
+        ]);
+        if let Some(stated) = disable_rollback {
+            members.push(member("DisableRollback", stated));
+        }
+        let (status_code, refused) = call(&router, "UpdateStack", &members).await;
+        assert_eq!(
+            status_code, 400,
+            "case {case:?} (DisableRollback {disable_rollback:?}): expected the update to be \
+             refused, got {status_code} {refused}"
+        );
+        let (code, message) = refusal(&refused);
+        let expected = format!("Stack:{stack_id} is in {rolled_back} state and can not be updated.");
+        assert_eq!(
+            code, VALIDATION_ERROR,
+            "case {case:?} (DisableRollback {disable_rollback:?}): expected \
+             {VALIDATION_ERROR:?}, got {code:?}"
+        );
+        assert_eq!(
+            message, expected,
+            "case {case:?} (DisableRollback {disable_rollback:?}): expected {expected:?}, got \
+             {message:?}"
+        );
+        let still = stack_status(&router, case, stack).await;
+        assert_eq!(
+            still, rolled_back,
+            "case {case:?} (DisableRollback {disable_rollback:?}): expected the refused update \
+             to leave the stack in {rolled_back}, got {still:?}"
+        );
+    }
+}
+
+/// The type whose create the owning service refuses in one row of rule 4.
+///
+/// Both of them are types whose create and update arms live in their OWN module rather than in
+/// the per-type catalogue the deployment's declared-only question used to be put to — which is
+/// exactly the distinction the rule must not turn on.
+#[derive(Clone, Copy, Debug)]
+enum RefusedResource {
+    /// `AWS::Lambda::Alias` pointed at a version the function never published: AWS Lambda
+    /// refuses the `CreateAlias`, so no alias exists.
+    AnAlias,
+    /// `AWS::Logs::LogGroup` declaring a retention that is not one of the values its owning
+    /// service takes: the setting cannot be applied, so the group the create had made is taken
+    /// away again and none exists.
+    ALogGroup,
+}
+
+/// One row of rule 4: the type under test and the stack that drives it.
+struct RefusedRow {
+    case: &'static str,
+    stack: &'static str,
+    resource: RefusedResource,
+    /// The logical id of the resource whose create is refused, as the row's template declares
+    /// it.
+    logical_id: &'static str,
+}
+
+/// The class rule 4 covers: one refused resource per type, each in its own stack.
+const REFUSED_ROWS: &[RefusedRow] = &[
+    RefusedRow {
+        case: "an alias AWS Lambda refused to create",
+        stack: "cfnuf-recreate-alias",
+        resource: RefusedResource::AnAlias,
+        logical_id: "Fn0Alias",
+    },
+    RefusedRow {
+        case: "a log group Amazon CloudWatch Logs refused to configure",
+        stack: "cfnuf-recreate-group",
+        resource: RefusedResource::ALogGroup,
+        logical_id: "Group",
+    },
+];
+
+/// The log group the `ALogGroup` row declares, one per stack.
+fn group_name(stack: &str) -> String {
+    format!("/aws/{stack}")
+}
+
+/// A retention the owning service TAKES, and one it refuses.
+///
+/// Source: `PutRetentionPolicy`'s own `retentionInDays` catalogue
+/// (`smithy_query(query="operation",operation="PutRetentionPolicy")`), which lists 7 and does
+/// not list 9.
+const TAKEN_RETENTION: u32 = 7;
+const REFUSED_RETENTION: u32 = 9;
+
+/// The log group template, with whatever retention the row deploys.
+fn log_group_template(stack: &str, retention: u32) -> String {
+    format!(
+        r#"{{"Resources":{{"Group":{{"Type":"AWS::Logs::LogGroup","Properties":{{"LogGroupName":"{}","RetentionInDays":{retention}}}}}}}}}"#,
+        group_name(stack)
+    )
+}
+
+/// The template whose resource the owning service refuses, and the one that corrects it.
+fn refused_and_corrected(resource: RefusedResource, stack: &str) -> (String, String) {
+    match resource {
+        RefusedResource::AnAlias => (
+            template(stack, &["911"], CREATED_DESCRIPTION),
+            template(stack, &[HEALTHY_VERSION], CREATED_DESCRIPTION),
+        ),
+        RefusedResource::ALogGroup => (
+            log_group_template(stack, REFUSED_RETENTION),
+            log_group_template(stack, TAKEN_RETENTION),
+        ),
+    }
+}
+
+/// Whether the service that OWNS the row's resource holds it, read through that service's own
+/// wire.
+async fn held_by_the_owning_service(
+    router: &MultiServiceRouter,
+    resource: RefusedResource,
+    stack: &str,
+) -> bool {
+    match resource {
+        RefusedResource::AnAlias => alias_version(router, &function_name(stack, 0))
+            .await
+            .is_some(),
+        RefusedResource::ALogGroup => group_exists(router, &group_name(stack)).await,
+    }
+}
+
+/// RULE 4: a resource whose create the owning service refused does not exist there, so the
+/// fix-forward deployment that declares it again CREATES it — and the resource then exists in
+/// that service, whichever module holds its type's arms.
+#[tokio::test]
+async fn a_refused_resource_is_created_by_the_next_deployment() {
+    for row in REFUSED_ROWS {
+        let case = row.case;
+        let (router, engine) = router_with_engine();
+        let (refused, corrected) = refused_and_corrected(row.resource, row.stack);
+
+        let mut members = acknowledging_iam(&[]);
+        members.push(member("DisableRollback", "true"));
+        let (status_code, body) = create_stack(&router, row.stack, &refused, &members).await;
+        assert_eq!(
+            status_code, 200,
+            "case {case:?}: expected CreateStack to be accepted, got {status_code} {body}"
+        );
+        let settled = settled_status(&router, &engine, case, row.stack).await;
+        assert_eq!(
+            settled, "CREATE_FAILED",
+            "case {case:?}: expected the refused create to park the stack, got {settled:?}"
+        );
+        let reported = reported_resource_status(&router, case, row.stack, row.logical_id).await;
+        assert_eq!(
+            reported, "CREATE_FAILED",
+            "case {case:?}: expected {:?} to report its refused create, got {reported:?}",
+            row.logical_id
+        );
+        let held = held_by_the_owning_service(&router, row.resource, row.stack).await;
+        assert!(
+            !held,
+            "case {case:?}: expected the owning service to hold no {:?}, got one",
+            row.logical_id
+        );
+
+        // The fix-forward update rule 2 admits: what it has to carry out is the CREATE of the
+        // resource the refusal left unmade.
+        let members = acknowledging_iam(&[
+            member("StackName", row.stack),
+            member("TemplateBody", &corrected),
+            member("DisableRollback", "true"),
+        ]);
+        let (status_code, answered) = call(&router, "UpdateStack", &members).await;
+        assert_eq!(
+            status_code, 200,
+            "case {case:?}: expected the fix-forward update to be accepted, got {status_code} \
+             {answered}"
+        );
+        let settled = settled_status(&router, &engine, case, row.stack).await;
+        let reason = reported_status_reason(&router, case, row.stack).await;
+        assert_eq!(
+            settled, "UPDATE_COMPLETE",
+            "case {case:?}: expected the fix-forward update to complete, got {settled:?} \
+             ({reason:?})"
+        );
+        let reported = reported_resource_status(&router, case, row.stack, row.logical_id).await;
+        assert_eq!(
+            reported, "CREATE_COMPLETE",
+            "case {case:?}: expected {:?} to report the create this deployment carried out, got \
+             {reported:?}",
+            row.logical_id
+        );
+        // ...and so does the resource's own event stream, which is where a client watches the
+        // work WHILE it is under way: the deployment opened a CREATE on it, not a change to a
+        // resource nothing held.
+        let mut sequence = resource_event_statuses(&router, case, row.stack, row.logical_id).await;
+        sequence.reverse();
+        let after_the_refusal: Vec<String> = sequence
+            .into_iter()
+            .skip_while(|status| status != "CREATE_FAILED")
+            .skip(1)
+            .collect();
+        assert!(
+            after_the_refusal.last().map(String::as_str) == Some("CREATE_COMPLETE")
+                && after_the_refusal
+                    .iter()
+                    .all(|status| status.starts_with("CREATE_")),
+            "case {case:?}: expected the fix-forward deployment to open and finish a CREATE of \
+             {:?} and report no change to it, got {after_the_refusal:?}",
+            row.logical_id
+        );
+        let held = held_by_the_owning_service(&router, row.resource, row.stack).await;
+        assert!(
+            held,
+            "case {case:?}: expected the owning service to hold {:?} now, got none",
+            row.logical_id
         );
     }
 }
