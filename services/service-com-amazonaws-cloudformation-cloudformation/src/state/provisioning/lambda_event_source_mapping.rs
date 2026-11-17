@@ -24,9 +24,10 @@
 //! `DeleteEventSourceMapping` address the mapping by, and what the stack publishes for it.
 //!
 //! `CreateEventSourceMapping` answers a mapping whose `State` is `Creating` while Lambda
-//! stands the poller up, and the mapping EXISTS from that moment — every call that addresses
-//! one takes it — so the resource's creation is not held open on it ([`readiness`]), exactly
-//! as a function's `Pending` window does not hold a function's.
+//! stands the poller up, and the mapping reads nothing from its event source until that window
+//! closes — so the resource's creation is HELD OPEN until Lambda reports the mapping in one of
+//! the two states its `Enabled` setting settles it in ([`readiness`]), exactly as a table a
+//! stack declares is held open while Amazon DynamoDB still reports it `CREATING`.
 
 use std::time::Duration;
 
@@ -249,15 +250,48 @@ pub(super) async fn create(
     })
 }
 
-/// Whether Lambda reports the mapping this create made ready.
+/// The two `State` values a mapping SETTLES in, from `Enabled`'s own sentence: "When true, the
+/// event source mapping is active. When false, Lambda pauses polling and invocation." Every
+/// other value `EventSourceMappingConfiguration`'s `State` documents — "Creating, Enabling,
+/// Enabled, Disabling, Disabled, Updating, or Deleting" — is a window the mapping is still
+/// moving through, in which it is not yet reading what its declaration asked it to read.
+const SETTLED_STATES: &[&str] = &["Enabled", "Disabled"];
+
+/// Whether Lambda reports the mapping this create made settled.
 ///
-/// Nothing is asked, and nothing waits: the mapping EXISTS from the moment
-/// `CreateEventSourceMapping` answers — `GetEventSourceMapping` resolves it, the update and
-/// delete calls take it — and the `Creating` state it answers with is AWS Lambda's own
-/// transition while it stands the poller up, not a resource that has yet to come into being.
-/// It is the case [`super::lambda_function::readiness`] states for a function's `Pending`.
-pub(super) fn readiness() -> Readiness {
-    Readiness::Ready
+/// A mapping's `State` is `Creating` while that service stands its poller up, and the trigger
+/// the template declared reads nothing from its event source inside that window, so the
+/// resource's creation is held open until Lambda reports the mapping in the state its `Enabled`
+/// setting settles it in ([`SETTLED_STATES`]) — the relation a table still `CREATING`
+/// ([`super::dynamodb_table::readiness`]) and an instance still `pending`
+/// ([`super::ec2_instance::readiness`]) hold their own resources open by. The same answer ends
+/// the wait a CHANGE opens: `UpdateEventSourceMapping` is accepted while the mapping reports
+/// `Updating`, and the declaration it carries is not in force until that state is left.
+///
+/// A read Lambda refuses, and one reporting no state this can read, say nothing about the
+/// mapping — one unanswered read is no evidence about it — so neither holds the resource open,
+/// exactly as [`super::dynamodb_table::readiness`] treats a refused read.
+pub(super) async fn readiness(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Readiness {
+    let Ok(answered) = call_rest_json(
+        ctx,
+        LAMBDA_SIGNING_NAME,
+        region,
+        "GET",
+        &mapping_uri(physical_resource_id),
+        None,
+    )
+    .await
+    else {
+        return Readiness::Ready;
+    };
+    match reported_text(&answered, STATE_MEMBER) {
+        Some(state) if !SETTLED_STATES.contains(&state.as_str()) => Readiness::Pending(state),
+        _ => Readiness::Ready,
+    }
 }
 
 /// Apply a CHANGED declaration to the mapping the stack already has, through Lambda's own

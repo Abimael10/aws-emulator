@@ -31,6 +31,7 @@ use std::sync::Arc;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::change_set_lifecycle::settle_the_store;
+use crate::elbv2_resource_provisioning::poll_to_terminal;
 use crate::iam_identity_resources::xml_policy_document;
 use crate::sam_transform::sam_template;
 use crate::stack_resource_provisioning::stage_code_objects;
@@ -435,11 +436,14 @@ async fn deploy(
         "case {case:?}: expected CreateStack to be accepted, got {code} {body}"
     );
     settle_the_store(router, engine).await;
-    let (code, body) = call(router, "DescribeStacks", &[member("StackName", stack)]).await;
-    assert_eq!(
-        code, 200,
-        "case {case:?}: expected DescribeStacks to answer, got {code} {body}"
-    );
+    // A resource whose owning service reports it still coming up holds the create open until
+    // that service reports it settled, and the mapping the transform generates for a stream
+    // event is one of those: AWS Lambda reports a new event source mapping `Creating` until its
+    // poller is up. So the stack is read AGAIN until it reports a status no operation is in
+    // flight in, rather than once — the same CONDITION every other suite that deploys such a
+    // resource waits for ([`poll_to_terminal`]). The status the row then has to report is
+    // unchanged.
+    let body = poll_to_terminal(router, case, stack).await;
     assert_eq!(
         xml_text(&body, "StackStatus").as_deref(),
         Some("CREATE_COMPLETE"),

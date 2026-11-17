@@ -257,7 +257,13 @@ impl Owner {
             // the call that made it answers: both are snapshots of a function AWS Lambda
             // already reports settled.
             Self::LambdaAlias | Self::LambdaVersion => Ok(Readiness::Ready),
-            Self::LambdaEventSourceMapping => Ok(lambda_event_source_mapping::readiness()),
+            // `CreateEventSourceMapping` answers the mapping `Creating`, in which it reads
+            // nothing from its event source, so this arm waits for AWS Lambda to report it in
+            // the state its `Enabled` setting settles it in
+            // ([`lambda_event_source_mapping::readiness`]).
+            Self::LambdaEventSourceMapping => {
+                Ok(lambda_event_source_mapping::readiness(ctx, region, physical_resource_id).await)
+            }
             Self::LambdaEventInvokeConfig => Ok(lambda_event_invoke_config::readiness()),
             Self::LambdaFunction => Ok(lambda_function::readiness()),
             // The version exists, and a function may name it, the moment
