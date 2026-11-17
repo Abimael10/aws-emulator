@@ -13,6 +13,12 @@
 //! `resourceArn` naming no stored resource is a 404 carrying the tagging route's own
 //! not-found class (`resource_tag_writes.rs` states that rule and spans it over the
 //! route's operations).
+//!
+//! Beside it, the rule the tagging layer applies to the VALUE before any resource is
+//! looked up: a `resourceArn` that matches no ARN syntax at all is refused, on every
+//! operation of that route, with the layer's own bad-request class and its fixed syntax
+//! sentence, rather than with the modelled `@pattern` constraint's generic validation
+//! refusal.
 
 use std::sync::Arc;
 
@@ -520,13 +526,15 @@ async fn a_resource_arn_outside_the_modelled_pattern_is_refused() {
     // `GenericV2ARN`'s pattern
     // (^arn:[^:]*:greengrass:[^:]*:(aws|[0-9]+):(components|deployments|coreDevices):)
     // is what the request must satisfy before any handler runs; each row breaches one
-    // part of it. The tagging route reads the ARN's VENDOR field first, so a row whose
-    // value is a well-formed ARN of ANOTHER service is refused as that layer's own bad
-    // request (`BadRequestException`, naming the vendor it expected); every other row
-    // keeps the modelled constraint refusal. Both are a 400.
+    // part of it. The tagging route PARSES the ARN first, so a row whose value is no ARN
+    // at all, and a row whose value is a well-formed ARN of ANOTHER service, are refused
+    // as that layer's own bad request (`BadRequestException`, with its syntax sentence and
+    // its vendor sentence respectively); a well-formed ARN of THIS vendor that breaks
+    // another part of the pattern keeps the modelled constraint refusal. Both are a 400.
+    let bad_syntax = "Invalid input resource arn: bad syntax";
     let expected_vendor = "Invalid input resource arn: expected vendor greengrass";
     let rows = [
-        ("no ARN at all", "not-an-arn".to_string(), None),
+        ("no ARN at all", "not-an-arn".to_string(), Some(bad_syntax)),
         (
             "another service's ARN",
             format!("arn:aws:iot:{REGION}:{ACCOUNT}:thing/PresentCore"),
@@ -554,13 +562,13 @@ async fn a_resource_arn_outside_the_modelled_pattern_is_refused() {
         ),
     ];
 
-    for (case, arn, vendor_sentence) in rows {
+    for (case, arn, layer_sentence) in rows {
         let (status, body) = list_tags(&router, &arn).await;
         assert_eq!(
             status, 400,
             "case {case:?}: an ARN outside the modelled pattern must answer 400, got {status} {body}"
         );
-        match vendor_sentence {
+        match layer_sentence {
             None => assert_eq!(
                 error_code(&body),
                 "ValidationException",
@@ -569,8 +577,106 @@ async fn a_resource_arn_outside_the_modelled_pattern_is_refused() {
             Some(sentence) => assert_eq!(
                 (error_code(&body), body["message"].as_str()),
                 ("BadRequestException".to_string(), Some(sentence)),
-                "case {case:?}: expected the tagging layer's vendor refusal, got {body}"
+                "case {case:?}: expected the tagging layer's refusal, got {body}"
             ),
         }
     }
+}
+
+/// Values that match NO ARN syntax at all, which is what the tagging layer refuses before
+/// it reads any field of the value. The rows differ along the ways a value can fail that
+/// parse — an ARN is `arn:<partition>:<vendor>:<region>:<account>:<resource>`, with the
+/// literal first field and a non-empty vendor and resource (`service_common::arn`) — not
+/// along the resource a value would have named.
+///
+/// A value the modelled `@pattern` ADMITS is not among them: that request is not refused at
+/// the boundary at all and is answered by the resource lookup, so the rows are values the
+/// pattern and the ARN parse both reject.
+const MALFORMED_ARNS: &[(&str, &str)] = &[
+    ("a bare token with no arn: prefix", "clearly-not-an-arn"),
+    ("a URL rather than an ARN", "https://example.com/components/c"),
+    ("only the arn: prefix", "arn:"),
+    ("too few colon-separated fields", "arn:aws:greengrass:us-west-2"),
+    (
+        "six fields whose first is not `arn`",
+        "urn:aws:greengrass:us-west-2:000000000000:components:c:versions:1.0.0",
+    ),
+    (
+        "an upper-case first field",
+        "ARN:aws:greengrass:us-west-2:000000000000:components:c:versions:1.0.0",
+    ),
+    (
+        "an empty vendor field",
+        "arn:aws::us-west-2:000000000000:components:c:versions:1.0.0",
+    ),
+    (
+        "no resource field at all",
+        "arn:aws:greengrass:us-west-2:000000000000",
+    ),
+    (
+        "an empty resource field",
+        "arn:aws:greengrass:us-west-2:000000000000:",
+    ),
+];
+
+#[tokio::test]
+async fn a_resource_arn_that_is_no_arn_at_all_is_the_tagging_layers_bad_request() {
+    let router = emulator();
+
+    // The positive control: a real resource, tagged, so every refusal below is about the
+    // value the request carried and not about an empty store.
+    let tags = vec![("env".to_string(), "staging".to_string())];
+    let (status, body) = create_component(&router, "com.example.Tagged", "1.0.0", &tags).await;
+    assert_eq!(
+        status, 201,
+        "publishing the component must succeed, got {status} {body}"
+    );
+    let present = version_arn("com.example.Tagged", "1.0.0");
+
+    // The layer's own class and its FIXED sentence, which carries no variable part at all.
+    let bad_request = "BadRequestException";
+    let bad_syntax = "Invalid input resource arn: bad syntax";
+
+    for (case, arn) in MALFORMED_ARNS {
+        // The rule is the ROUTE's: every operation the tagging layer serves — the read, the
+        // write, the removal, and the removal that names no key — refuses such a value
+        // alike.
+        let path = format!("/tags/{}", encoded_label(arn));
+        let probe = json!({ "tags": { "env": "staging" } });
+        for (operation, answer) in [
+            ("ListTagsForResource", get(&router, &path).await),
+            ("TagResource", post(&router, &path, &probe).await),
+            (
+                "UntagResource",
+                delete(&router, &format!("{path}?tagKeys=env")).await,
+            ),
+            ("UntagResource with no key", delete(&router, &path).await),
+        ] {
+            let (status, body) = answer;
+            assert_eq!(
+                status, 400,
+                "case {case:?} on {operation}: a value that is no ARN must answer 400, \
+                 got {status} {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                bad_request,
+                "case {case:?} on {operation}: expected {bad_request}, got {body}"
+            );
+            assert_eq!(
+                body["message"].as_str(),
+                Some(bad_syntax),
+                "case {case:?} on {operation}: expected the layer's fixed sentence, which is \
+                 the same for every value it refuses and reports none of them, got {body}"
+            );
+        }
+    }
+
+    // Nothing above touched the stored resource: its tags read back as they were written.
+    let (status, listed) = list_tags(&router, &present).await;
+    assert_eq!(
+        (status, &listed["tags"]),
+        (200, &tag_object(&tags)),
+        "case \"the stored resource\": its tags must be unchanged, got {status} {listed}"
+    );
 }

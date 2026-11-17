@@ -55,10 +55,12 @@
 //! operation this service HAS. See [`EmulatedService::addressed_operation`], and
 //! [`untag_without_keys`] for the one of those requests that is SERVED rather than refused.
 //!
-//! `override_refusal` is taken for one refusal of the tagging route this service words
-//! itself — an ARN of another vendor — which is [`tagging_vendor`]; every other boundary
-//! refusal keeps the AWS envelope the shared renderer states.
+//! `override_refusal` is taken for the refusals of the tagging route this service words
+//! itself — a `resourceArn` that is no ARN at all, and one that is an ARN of another vendor
+//! — which are [`tagging_resource_arn`]; every other boundary refusal keeps the AWS envelope
+//! the shared renderer states.
 
+mod tagging_resource_arn;
 mod tagging_vendor;
 mod untag_without_keys;
 
@@ -348,11 +350,11 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The tagging route reads its `resourceArn`'s VENDOR field before it looks for any
-        // resource, and an ARN of another service is refused as a bad request about that
-        // value rather than as a constraint the model states ([`tagging_vendor`]). Every
-        // other refusal keeps the envelope below.
-        if let Some(refused) = tagging_vendor::vendor_refusal(refusal) {
+        // The tagging route PARSES its `resourceArn` before it looks for any resource: a
+        // value that is no ARN at all, and an ARN of another service, are each refused as a
+        // bad request about that value rather than as a constraint the model states
+        // ([`tagging_resource_arn`]). Every other refusal keeps the envelope below.
+        if let Some(refused) = tagging_resource_arn::resource_arn_refusal(refusal) {
             return Some(refused);
         }
         // AWS answers a value its own model does not admit as `400 ValidationException`
