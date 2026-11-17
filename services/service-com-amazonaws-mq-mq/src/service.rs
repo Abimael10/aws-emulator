@@ -39,7 +39,8 @@
 //! model's `restJson1` codec with every timestamp of a modelled response in the
 //! ISO-8601 `date-time` form this model's only timestamp shape declares, and with an
 //! answer that carries no content framed as one — no body, and the length it has (see
-//! [`iso8601_timestamps`]).
+//! [`iso8601_timestamps`]) — and with the log groups a broker read lists that this model
+//! declares no member for (see [`broker_log_groups`]).
 //!
 //! The model-derived half of this service — its identity, wire protocol, routing
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
@@ -54,6 +55,10 @@ use std::sync::Arc;
 /// How this service's responses are written: the timestamp form a modelled body carries,
 /// and the framing an answer that carries no content states.
 pub mod iso8601_timestamps;
+
+/// The log groups a broker read lists beside its modelled logs summary, which this
+/// model declares no member for.
+pub mod broker_log_groups;
 
 /// The `com-amazonaws-mq-mq` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -163,11 +168,12 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
-        // The model's own restJson1 codec, with the TWO differences the generic renderer
+        // The model's own restJson1 codec, with the THREE differences the generic renderer
         // cannot express: a timestamp is written in the ISO-8601 date-time form this
         // model's only timestamp shape declares, rather than in the protocol's default
-        // epoch-seconds form, and an answer at the no-content status states the length it
-        // has (see `iso8601_timestamps`).
+        // epoch-seconds form; a broker read lists its log groups, which this model
+        // declares no member for (see `broker_log_groups`); and an answer at the
+        // no-content status states the length it has (see `iso8601_timestamps`).
         // Borrowed from the field built in `new`, never constructed per request.
         Some(&self.protocol)
     }

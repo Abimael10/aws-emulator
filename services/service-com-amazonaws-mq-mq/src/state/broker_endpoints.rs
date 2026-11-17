@@ -14,6 +14,11 @@
 //! ActiveMQ Web Console on 8162; a RabbitMQ broker serves AMQP over TLS, with its
 //! management console on the HTTPS port.
 //!
+//! The ORDER of the published list is that PROTOCOL order — never the alphabetical order
+//! of the URI schemes — so a client that takes the first endpoint as the broker's primary
+//! one (as the console's and the Developer Guide's connection snippets do) finds the
+//! engine's primary wire there rather than whichever scheme happens to sort first.
+//!
 //! The ADDRESS they name is the host this emulator serves on, recorded on the broker
 //! when it was created ([`Broker::published_host`]), so what a broker publishes leads
 //! back to the emulator the client is already talking to rather than to a hostname
@@ -47,29 +52,39 @@ impl WireProtocol {
 }
 
 /// The protocols an ActiveMQ broker serves, each over TLS, in the order Amazon MQ
-/// publishes them in: AMQP, MQTT, OpenWire, STOMP and WebSocket \u2014 by protocol name,
-/// which is the order a recorded broker answer lists its endpoints in.
+/// publishes them in: OpenWire, AMQP, STOMP, MQTT and WebSocket — the order the
+/// Developer Guide's ActiveMQ endpoint table names them in and the order a recorded
+/// broker answer lists its endpoints in.
+///
+/// The order is the broker's own PROTOCOL order and not the spelling of the URI schemes:
+/// the first endpoint is the broker's primary (OpenWire/JMS) one, which is what a client
+/// that reads one endpoint rather than parsing every URI dials.
 const ACTIVEMQ_WIRE_PROTOCOLS: &[WireProtocol] = &[
-    WireProtocol {
-        scheme: "amqp+ssl",
-        port: 5_671,
-        served: false,
-    },
-    WireProtocol {
-        scheme: "mqtt+ssl",
-        port: 8_883,
-        served: false,
-    },
+    // OpenWire — the broker's primary wire, which JMS clients connect over.
     WireProtocol {
         scheme: "ssl",
         port: 61_617,
         served: false,
     },
+    // AMQP.
+    WireProtocol {
+        scheme: "amqp+ssl",
+        port: 5_671,
+        served: false,
+    },
+    // STOMP.
     WireProtocol {
         scheme: "stomp+ssl",
         port: 61_614,
         served: false,
     },
+    // MQTT.
+    WireProtocol {
+        scheme: "mqtt+ssl",
+        port: 8_883,
+        served: false,
+    },
+    // WebSocket.
     WireProtocol {
         scheme: "wss",
         port: 61_619,

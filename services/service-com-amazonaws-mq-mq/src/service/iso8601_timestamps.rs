@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! How this service's `restJson1` responses are written: the TIMESTAMP form every
-//! modelled body carries, and the FRAMING an answer that carries no content states.
+//! modelled body carries, the LOG GROUPS a broker read lists, and the FRAMING an answer
+//! that carries no content states.
 //!
 //! This is the one seam every response a modelled operation produces passes through
 //! ([`smithy_server_runtime::Service::override_protocol`], wired in [`crate::service`]),
-//! so both corrections live on it rather than being restated by each operation that
-//! needs one. Everything else — routing, request deserialization, the body bytes of
-//! every answer that carries content, and every modelled failure — is the framework's
-//! own `restJson1` protocol, delegated to unchanged.
+//! so every one of those corrections lives on it rather than being restated by each
+//! operation that needs one. Everything else — routing, request deserialization, the body
+//! bytes of every answer whose members the model declares, and every modelled failure — is
+//! the framework's own `restJson1` protocol, delegated to unchanged.
 //!
 //! # Timestamps
 //!
@@ -45,6 +46,15 @@
 //! Only the modelled SUCCESS body goes through it. No error shape of this model
 //! carries a timestamp member, so an error document has nothing to re-render, and
 //! request deserialization is untouched: no input member of this model is a timestamp.
+//!
+//! # The log groups a broker read lists
+//!
+//! RULE: a broker read lists the CloudWatch Logs log groups of every kind of log the
+//! broker's engine keeps, beside the modelled summary those groups are named in.
+//!
+//! The model declares no member for that list at all, so it cannot be written from a
+//! handler; it is written at this seam instead, from the summary the handler answered. The
+//! rule, and why it belongs here, is [`super::broker_log_groups`]'s.
 //!
 //! # An answer that carries no content
 //!
@@ -193,7 +203,8 @@ impl ShapeSerializer for IsoTimestampSerializer<'_> {
 
 /// This service's wire protocol: `restJson1` exactly as the model declares it, with
 /// every timestamp of a modelled response in the `date-time` form the model's one
-/// timestamp shape declares, and an answer that carries no content framed as one.
+/// timestamp shape declares, the log groups a broker read lists, and an answer that
+/// carries no content framed as one.
 #[derive(Debug)]
 pub struct Iso8601TimestampRestJson {
     inner: RestJsonServerProtocol,
@@ -244,9 +255,10 @@ impl ServerProtocol for Iso8601TimestampRestJson {
         self.inner.deserialize_input(request, input_schema)
     }
 
-    /// The modelled success, with every timestamp in its date-time form and, when it is
-    /// an answer that carries no content, framed as one. An answer that DOES carry
-    /// content keeps the status, the headers and every body byte its renderer wrote.
+    /// The modelled success, with every timestamp in its date-time form, with the log
+    /// groups a broker read lists beside its modelled summary, and, when it is an answer
+    /// that carries no content, framed as one. An answer that DOES carry content keeps the
+    /// status and the headers its renderer wrote.
     fn serialize_output(
         &self,
         output: &dyn SerializableStruct,
@@ -260,6 +272,8 @@ impl ServerProtocol for Iso8601TimestampRestJson {
             operation_name,
             success_status,
         )?;
+        let rendered =
+            super::broker_log_groups::with_served_log_groups(operation_name, rendered);
         Ok(::service_common::no_content_responses::without_content(
             rendered,
         ))

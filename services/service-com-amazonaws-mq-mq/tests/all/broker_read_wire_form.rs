@@ -27,6 +27,12 @@
 //! 8. A `Username` that resolves to no user of an existing broker is the modelled
 //!    `NotFoundException` (404) worded as Amazon MQ words a missing USER, which is not
 //!    how it words a missing broker.
+//! 9. That endpoint list is ordered by WIRE PROTOCOL — an ActiveMQ broker's OpenWire
+//!    endpoint first, then AMQP, STOMP, MQTT and WebSocket — and never by the spelling of
+//!    the URI schemes, so the first endpoint is the broker's primary one.
+//! 10. A broker read lists the CloudWatch Logs log group of every kind of log its engine
+//!     keeps — general first, then audit — each entry naming the kind, whether that kind
+//!     of logging is enabled on the broker, and the group named after the broker itself.
 //!
 //! The tables span the model's own enumerations (`ENGINE_TYPE_VALUES`,
 //! `BROKER_STORAGE_TYPE_VALUES`, `AUTHENTICATION_STRATEGY_VALUES`, `DAY_OF_WEEK_VALUES`)
@@ -45,21 +51,18 @@ use service_com_amazonaws_mq_mq::ops::types::{
     ENGINE_TYPE_VALUES,
 };
 use service_com_amazonaws_mq_mq::state::{
-    latest_engine_version, published_engine_versions, BROKER_PROVISIONING,
+    latest_engine_version, published_engine_versions, BROKER_STATE_RUNNING,
     ENGINE_TYPE_ACTIVEMQ, ENGINE_TYPE_RABBITMQ, FIRST_CONFIGURATION_REVISION,
-    MAX_BROKER_DEFAULT_CONFIGURATIONS, STORAGE_TYPE_EBS, STORAGE_TYPE_EFS,
+    LOG_KIND_AUDIT, LOG_KIND_GENERAL, MAX_BROKER_DEFAULT_CONFIGURATIONS, STORAGE_TYPE_EBS,
+    STORAGE_TYPE_EFS,
 };
 
 use crate::broker_lifecycle::{create_body, string_at, Mq};
+use crate::broker_restart::poll_until_state;
 use crate::configuration_name::configuration_body;
 use crate::configuration_wire_form::{
     authentication_strategy_on_the_wire, engine_type_on_the_wire,
 };
-
-/// Long enough for a broker's `CREATION_IN_PROGRESS` -> `RUNNING` span to come due.
-fn past_provisioning() -> std::time::Duration {
-    BROKER_PROVISIONING + std::time::Duration::from_millis(200)
-}
 
 /// The wire spelling of a `BrokerStorageType`: the modelled value lower-cased, which is
 /// what the recorded Amazon MQ broker answer carries (`efs` for the broker the recording
@@ -68,16 +71,11 @@ fn storage_type_on_the_wire(storage_type: &str) -> String {
     storage_type.to_ascii_lowercase()
 }
 
-/// `GET /v1/brokers/{BrokerId}` after the provisioning span has come due, so the broker
-/// is RUNNING and reports everything a running broker reports.
+/// `GET /v1/brokers/{BrokerId}` once the broker reports RUNNING, so it reports everything
+/// a running broker reports. The CONDITION is what is waited on, through the poll
+/// [`crate::broker_restart`] already drives every broker-state wait with.
 async fn describe_running(mq: &Mq, broker_id: &str) -> Value {
-    tokio::time::sleep(past_provisioning()).await;
-    let (status, described) = mq.describe_broker(broker_id).await;
-    assert_eq!(
-        status, 200,
-        "describe {broker_id}: expected 200, got {status} {described:?}"
-    );
-    described
+    poll_until_state(mq, broker_id, BROKER_STATE_RUNNING).await
 }
 
 /// The strings of a list member, or an empty vector when the member is absent.
@@ -391,6 +389,22 @@ async fn a_broker_reports_the_members_the_service_decides_for_it() {
     }
 }
 
+/// The wire protocols an ActiveMQ broker publishes, as `(scheme, port)` IN THE ORDER
+/// Amazon MQ publishes them: OpenWire, AMQP, STOMP, MQTT, then WebSocket.
+///
+/// Source: the Developer Guide's ActiveMQ broker endpoint table, which names the protocols
+/// in that order and gives each one's scheme and port; it is also the order the recorded
+/// Amazon MQ answer lists a broker's endpoints in. It is NOT the alphabetical order of the
+/// schemes, which `an_activemq_broker_lists_its_endpoints_by_wire_protocol` pins.
+const ACTIVEMQ_PROTOCOL_ORDER: &[(&str, u16)] = &[
+    // OpenWire, the broker's primary (JMS) wire.
+    ("ssl", 61_617),
+    ("amqp+ssl", 5_671),
+    ("stomp+ssl", 61_614),
+    ("mqtt+ssl", 8_883),
+    ("wss", 61_619),
+];
+
 /// What one engine's brokers publish: the engine, its wire protocols as
 /// `(scheme, port)` IN THE ORDER Amazon MQ publishes them, and the port its web console
 /// is published on.
@@ -409,19 +423,13 @@ struct PublishedAddresses {
 /// The wire protocols and console port of each engine the model declares.
 ///
 /// Source: the protocols and ports Amazon MQ publishes per engine (the Developer
-/// Guide's broker endpoint tables, which list them by protocol name — AMQP, MQTT,
-/// OpenWire, STOMP, WebSocket). The ActiveMQ set is the one the recorded answer
-/// carries; the RabbitMQ row is the entry the recording does not cover.
+/// Guide's broker endpoint tables), IN THE ORDER it publishes them — an ActiveMQ broker's
+/// OpenWire, AMQP, STOMP, MQTT and WebSocket, which is the order the recorded answer
+/// lists them in; the RabbitMQ row is the entry the recording does not cover.
 const PUBLISHED_PROTOCOLS: &[PublishedAddresses] = &[
     PublishedAddresses {
         engine_type: ENGINE_TYPE_ACTIVEMQ,
-        protocols: &[
-            ("amqp+ssl", 5_671),
-            ("mqtt+ssl", 8_883),
-            ("ssl", 61_617),
-            ("stomp+ssl", 61_614),
-            ("wss", 61_619),
-        ],
+        protocols: ACTIVEMQ_PROTOCOL_ORDER,
         console_port: 8_162,
         served_by_a_socket: false,
     },
@@ -980,4 +988,198 @@ async fn a_username_that_resolves_to_nothing_is_refused_in_amazon_mqs_words() {
          broker permissions.",
         "a missing broker must be worded as a missing broker, got {missing_broker:?}"
     );
+}
+
+/// RULE 9: an ActiveMQ broker lists its endpoints by WIRE PROTOCOL — OpenWire first, then
+/// AMQP, STOMP, MQTT and WebSocket — so the first endpoint is the broker's primary (JMS)
+/// one and the position of each endpoint names the protocol a client dials there. The list
+/// is never ordered by the spelling of the URI schemes.
+#[tokio::test]
+async fn an_activemq_broker_lists_its_endpoints_by_wire_protocol() {
+    let mq = Mq::new("us-east-1");
+
+    // Rows: ActiveMQ brokers differing along everything a create decides about one — its
+    // deployment mode, its storage and whether it is publicly accessible — none of which
+    // changes the order of the protocols the broker publishes.
+    let rows: &[(&str, &str, bool)] = &[
+        ("SINGLE_INSTANCE", STORAGE_TYPE_EBS, false),
+        ("ACTIVE_STANDBY_MULTI_AZ", STORAGE_TYPE_EFS, true),
+        ("SINGLE_INSTANCE", STORAGE_TYPE_EFS, true),
+    ];
+
+    for (index, (deployment_mode, storage_type, publicly_accessible)) in rows.iter().enumerate() {
+        let case = format!("{deployment_mode}/{storage_type}/public={publicly_accessible}");
+        let mut body = create_body(&format!("ordered-{index}"));
+        body["engineType"] = json!(ENGINE_TYPE_ACTIVEMQ);
+        body["deploymentMode"] = json!(deployment_mode);
+        body["storageType"] = json!(storage_type);
+        body["publiclyAccessible"] = json!(publicly_accessible);
+        let (status, created) = mq.create_broker(body).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 from create, got {status} {created:?}"
+        );
+        let broker_id = string_at(&created, "/brokerId");
+
+        let described = describe_running(&mq, &broker_id).await;
+        let endpoints = strings_at(&described, "/brokerInstances/0/endpoints");
+        let schemes: Vec<&str> = endpoints
+            .iter()
+            .map(|endpoint| endpoint.split("://").next().unwrap_or_default())
+            .collect();
+        let expected: Vec<&str> = ACTIVEMQ_PROTOCOL_ORDER
+            .iter()
+            .map(|(scheme, _port)| *scheme)
+            .collect();
+        assert_eq!(
+            schemes, expected,
+            "case {case:?}: expected the endpoints in the published protocol order \
+             {expected:?}, got {endpoints:?}"
+        );
+
+        // Each endpoint carries the port Amazon MQ publishes that protocol on, so the
+        // position of an endpoint and the protocol answered at it agree.
+        for ((scheme, port), endpoint) in ACTIVEMQ_PROTOCOL_ORDER.iter().zip(&endpoints) {
+            assert!(
+                endpoint.starts_with(&format!("{scheme}://")) && endpoint.ends_with(&format!(":{port}")),
+                "case {case:?}: expected the {scheme:?} endpoint on port {port}, got \
+                 {endpoint:?}"
+            );
+        }
+
+        // The order is the protocols' and not the schemes': sorting the schemes gives a
+        // DIFFERENT list, so a client that indexes the list positionally — the first
+        // endpoint being the broker's primary one — cannot be served an alphabetical one.
+        let mut sorted = schemes.clone();
+        sorted.sort_unstable();
+        assert_ne!(
+            schemes, sorted,
+            "case {case:?}: the published order must not be the schemes sorted, got \
+             {endpoints:?}"
+        );
+    }
+}
+
+/// The kinds of log a broker keeps, as the entry name a broker read carries for each and
+/// the modelled summary members reporting the same flag and the same group.
+///
+/// Source: `LogsSummary`'s own members — `general` with `generalLogGroup`, and `audit`
+/// with `auditLogGroup`
+/// (`smithy_query(query="shape",shape="LogsSummary")`) — in the order a read lists them.
+const LOG_KINDS: &[(&str, &str, &str)] = &[
+    (LOG_KIND_GENERAL, "/logs/general", "/logs/generalLogGroup"),
+    (LOG_KIND_AUDIT, "/logs/audit", "/logs/auditLogGroup"),
+];
+
+/// RULE 10: a broker read lists the CloudWatch Logs log group of every kind of log the
+/// broker's ENGINE keeps — general first, then audit — each entry naming the kind, whether
+/// that kind of logging is enabled on the broker, and the group Amazon MQ derives from the
+/// broker's own id. A kind the engine does not keep (`Logs$audit` "does not apply to
+/// RabbitMQ brokers") contributes no entry.
+#[tokio::test]
+async fn a_broker_read_lists_the_log_group_of_every_kind_its_engine_keeps() {
+    let mq = Mq::new("eu-west-1");
+
+    // Rows: the logging a create can ask for, on each engine — none named at all, each
+    // kind on by itself, and both on. Audit logging is asked for only on the engine it
+    // applies to, because the create refuses it on the other.
+    let rows: &[(&str, Option<Value>)] = &[
+        (ENGINE_TYPE_ACTIVEMQ, None),
+        (ENGINE_TYPE_ACTIVEMQ, Some(json!({"general": true}))),
+        (ENGINE_TYPE_ACTIVEMQ, Some(json!({"audit": true}))),
+        (
+            ENGINE_TYPE_ACTIVEMQ,
+            Some(json!({"general": true, "audit": true})),
+        ),
+        (ENGINE_TYPE_RABBITMQ, None),
+        (ENGINE_TYPE_RABBITMQ, Some(json!({"general": true}))),
+    ];
+
+    for (index, (engine_type, logs)) in rows.iter().enumerate() {
+        let case = format!("{engine_type} logs={logs:?}");
+        let mut body = create_body(&format!("logged-{index}"));
+        body["engineType"] = json!(engine_type);
+        if let Some(asked) = logs {
+            body["logs"] = asked.clone();
+        }
+        let (status, created) = mq.create_broker(body).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 from create, got {status} {created:?}"
+        );
+        let broker_id = string_at(&created, "/brokerId");
+
+        let described = describe_running(&mq, &broker_id).await;
+        let listed = described
+            .pointer("/logGroups")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: a broker read lists its log groups, got {described:?}")
+            });
+
+        // One entry per kind the broker keeps, in the order a read lists them, each
+        // reporting what the modelled summary reports for that kind.
+        let expected: Vec<Value> = LOG_KINDS
+            .iter()
+            .filter_map(|(name, enabled, group)| {
+                let log_group = described.pointer(group).and_then(Value::as_str)?;
+                Some(json!({
+                    "name": name,
+                    "enabled": described.pointer(enabled).and_then(Value::as_bool),
+                    "logGroup": log_group,
+                }))
+            })
+            .collect();
+        assert_eq!(
+            listed, expected,
+            "case {case:?}: expected the log groups {expected:?}, got {described:?}"
+        );
+
+        // The kinds an engine keeps: audit is one only the engine it applies to has.
+        let kinds: Vec<String> = listed
+            .iter()
+            .map(|entry| string_at(entry, "/name"))
+            .collect();
+        let expected_kinds: Vec<&str> = if *engine_type == ENGINE_TYPE_RABBITMQ {
+            vec![LOG_KIND_GENERAL]
+        } else {
+            vec![LOG_KIND_GENERAL, LOG_KIND_AUDIT]
+        };
+        assert_eq!(
+            kinds, expected_kinds,
+            "case {case:?}: expected the kinds {expected_kinds:?}, got {described:?}"
+        );
+
+        for entry in &listed {
+            let kind = string_at(entry, "/name");
+            // The group Amazon MQ names after the broker itself.
+            let expected_group = format!("/aws/amazonmq/broker/{broker_id}/{kind}");
+            assert_eq!(
+                string_at(entry, "/logGroup"),
+                expected_group,
+                "case {case:?} {kind:?}: expected the group {expected_group:?}, got {entry:?}"
+            );
+            // The flag that kind of logging was created with — `false` for a kind the
+            // create did not ask for, which is a value and not an absence.
+            let asked = logs
+                .as_ref()
+                .and_then(|asked| asked.pointer(&format!("/{kind}")))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            assert_eq!(
+                entry.pointer("/enabled").and_then(Value::as_bool),
+                Some(asked),
+                "case {case:?} {kind:?}: expected enabled={asked}, got {entry:?}"
+            );
+        }
+
+        // A read decides nothing: reading the broker again lists the same groups.
+        let again = describe_running(&mq, &broker_id).await;
+        assert_eq!(
+            again.pointer("/logGroups"),
+            described.pointer("/logGroups"),
+            "case {case:?}: a second read must list the same groups, got {again:?}"
+        );
+    }
 }
