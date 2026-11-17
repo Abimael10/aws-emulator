@@ -30,8 +30,11 @@
 //! Each suite is a TABLE whose rows differ along what the rule generalises over: which
 //! characters the document carries (the punctuation JSON is made of, the spaces and tabs a
 //! caller indents with, the `+` and `%` a decode of UNencoded text corrupts, the slashes of
-//! an ARN, a byte above ASCII), the page size the collection is walked with, the path prefix
-//! it is filtered by, and which of the two listings serves the page.
+//! an ARN, a byte above ASCII), the SIZE of the document (`policyDocumentType` is
+//! `@length 1..131072`, so a report has to carry a document of thousands of characters
+//! whole), the page size the collection is walked with, the path prefix it is filtered by,
+//! which role the profile is bound to at the time of the read, and which of the two listings
+//! serves the page.
 
 use std::collections::BTreeMap;
 
@@ -475,4 +478,230 @@ async fn a_replaced_trust_policy_is_reported_encoded_by_both_listings() {
         "the walk must report {:?}, got {reported:?}",
         profile_name(0)
     );
+}
+
+/// The path the size fixture's profile lives under, so a listing selects exactly it.
+const SIZE_PATH: &str = "/sizes/";
+
+/// The path the rebinding fixture's profile lives under, for the same reason.
+const REBOUND_PATH: &str = "/rebound/";
+
+/// One statement of [`trust_policy_of_statements`], naming the EC2 service principal an
+/// instance profile's role trusts, under the statement id `index`.
+fn trust_statement(index: usize) -> String {
+    format!(
+        r#"{{"Sid":"s{index}","Effect":"Allow","Principal":{{"Service":"ec2.amazonaws.com"}},"Action":"sts:AssumeRole"}}"#
+    )
+}
+
+/// A compact trust policy of `statements` statements — the knob this suite's SIZE rows turn,
+/// since the document's length is what it varies with.
+///
+/// The text is also what the account stores for it: it carries no whitespace between its JSON
+/// tokens, no one-element string-or-array value and no account named by its id alone, which
+/// are the three things a save rewrites, so the rendering leaves it as written.
+fn trust_policy_of_statements(statements: usize) -> String {
+    let body: Vec<String> = (0..statements).map(trust_statement).collect();
+    format!(
+        r#"{{"Version":"2012-10-17","Statement":[{}]}}"#,
+        body.join(",")
+    )
+}
+
+/// Every profile a single page of `listing` reports, as the `(InstanceProfileName,
+/// AssumeRolePolicyDocument)` pairs it carries — unlike [`walk`], without requiring one
+/// document per profile, which is what lets a profile holding NO role be asserted.
+async fn page(
+    router: &MultiServiceRouter,
+    listing: &str,
+    params: &[(String, String)],
+) -> (Vec<String>, Vec<String>) {
+    let case = format!("{listing} with {params:?}");
+    let (status, body) = call(router, listing, &borrowed(params)).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected 200, got {status}: {body}"
+    );
+    (
+        elements(&body, "InstanceProfileName"),
+        elements(&body, "AssumeRolePolicyDocument"),
+    )
+}
+
+/// RULE: the report is the WHOLE stored document percent-encoded, so a trust policy of any
+/// length the member admits is reported entire — never truncated, never partly escaped — by
+/// both instance-profile listings and by the single-resource read of the same records.
+#[tokio::test]
+async fn a_trust_policy_of_any_size_is_reported_encoded_in_full() {
+    // Rows: how many statements the document carries, which is what its LENGTH varies with —
+    // one statement, a handful, and one two orders of magnitude larger, which is a document of
+    // thousands of characters and so a report of tens of thousands, still inside the member's
+    // `@length 1..131072` (`smithy_query(query="shape",shape="policyDocumentType")`). The
+    // recorded case is one statement; these are the same rule at other sizes.
+    for statements in [1_usize, 7, 200] {
+        let document = trust_policy_of_statements(statements);
+        let router = router();
+        let role = format!("size-role-{statements}");
+        // TWO profiles hold that one role, so a walk at one profile per page really crosses a
+        // page boundary and the document is read off a follow-up page reached by `Marker` as
+        // well as off the first.
+        let profiles = [
+            format!("size-profile-{statements}-a"),
+            format!("size-profile-{statements}-b"),
+        ];
+        let case = format!("a trust policy of {statements} statement(s)");
+        create_role(&router, &case, &role, &document).await;
+        for profile in &profiles {
+            bind_profile(&router, profile, SIZE_PATH, &role).await;
+        }
+
+        // Both listings, walked one profile per page: every page reports that whole document,
+        // encoded.
+        for (listing, params) in [
+            ("ListInstanceProfiles", vec![param("PathPrefix", SIZE_PATH)]),
+            (
+                "ListInstanceProfilesForRole",
+                vec![param("RoleName", &role)],
+            ),
+        ] {
+            let case = format!("{case} through {listing}");
+            let reported = walk(&router, listing, &params, Some(1)).await;
+            assert_eq!(
+                reported.len(),
+                profiles.len(),
+                "case {case:?}: expected a page per bound profile, got {reported:?}"
+            );
+            for (profile, reported) in &reported {
+                assert_reported_document(&format!("{case} / {profile}"), &document, reported);
+            }
+        }
+
+        // And the single-resource reads of the same records, which carry the document whole for
+        // the same reason.
+        for (reader, params) in [
+            (
+                "GetInstanceProfile",
+                vec![param("InstanceProfileName", &profiles[0])],
+            ),
+            ("GetRole", vec![param("RoleName", &role)]),
+        ] {
+            let case = format!("{case} through {reader}");
+            let (_, documents) = page(&router, reader, &params).await;
+            assert_eq!(
+                documents.len(),
+                1,
+                "case {case:?}: expected the one document the fixture holds, got {documents:?}"
+            );
+            assert_reported_document(&case, &document, &documents[0]);
+        }
+    }
+}
+
+/// RULE: a listing reports the trust policy of the role each profile holds NOW, so the
+/// document follows the BINDING — a profile rebound to another role reports that role's
+/// policy, encoded, and a profile holding no role reports no document at all.
+#[tokio::test]
+async fn a_listing_reports_the_trust_policy_of_the_role_a_profile_holds_now() {
+    // The second document differs from the first in both its principal and the characters it
+    // carries — a `+`, a space and a `%`, each of which a decode of UNencoded text corrupts —
+    // so a report left over from the first binding cannot pass for it.
+    const SECOND_DOCUMENT: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::210987654321:role/deploy"},"Action":"sts:AssumeRole","Condition":{"StringEquals":{"sts:ExternalId":"x+y 50%"}}}]}"#;
+    const PROFILE: &str = "rebound-profile";
+
+    let router = router();
+    create_role(&router, "the first binding", "rebound-first", CANONICAL_TRUST_POLICY).await;
+    create_role(&router, "the second binding", "rebound-second", SECOND_DOCUMENT).await;
+    bind_profile(&router, PROFILE, REBOUND_PATH, "rebound-first").await;
+
+    // Rows: the three bindings a profile passes through, each with the role the profile holds
+    // after it and the document every reader of the profile must then report.
+    let first_binding = vec![param("PathPrefix", REBOUND_PATH)];
+    let (names, documents) = page(&router, "ListInstanceProfiles", &first_binding).await;
+    assert_eq!(
+        names,
+        vec![PROFILE.to_string()],
+        "the prefix must select the one fixture profile, got {names:?}"
+    );
+    assert_eq!(
+        documents.len(),
+        1,
+        "the profile holds a role, so its report carries that role's document, got \
+         {documents:?}"
+    );
+    assert_reported_document("the first binding", CANONICAL_TRUST_POLICY, &documents[0]);
+
+    // Unbound: the profile is still reported, and with no document, since it holds no role to
+    // carry one.
+    let (status, body) = call(
+        &router,
+        "RemoveRoleFromInstanceProfile",
+        &[("InstanceProfileName", PROFILE), ("RoleName", "rebound-first")],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the fixture RemoveRoleFromInstanceProfile must succeed, got {status}: {body}"
+    );
+    let (names, documents) = page(&router, "ListInstanceProfiles", &first_binding).await;
+    assert_eq!(
+        names,
+        vec![PROFILE.to_string()],
+        "an unbound profile is still listed, got {names:?}"
+    );
+    assert!(
+        documents.is_empty(),
+        "case \"the unbound profile\": a profile holding no role carries no document, got \
+         {documents:?}"
+    );
+    let (names, documents) = page(
+        &router,
+        "ListInstanceProfilesForRole",
+        &[param("RoleName", "rebound-first")],
+    )
+    .await;
+    assert!(
+        names.is_empty() && documents.is_empty(),
+        "case \"the unbound role\": the role is bound into no profile, got {names:?} and \
+         {documents:?}"
+    );
+
+    // Rebound to the other role: both listings report THAT role's document, encoded.
+    let (status, body) = call(
+        &router,
+        "AddRoleToInstanceProfile",
+        &[
+            ("InstanceProfileName", PROFILE),
+            ("RoleName", "rebound-second"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the fixture AddRoleToInstanceProfile must succeed, got {status}: {body}"
+    );
+    for (reader, params) in [
+        ("ListInstanceProfiles", first_binding.clone()),
+        (
+            "ListInstanceProfilesForRole",
+            vec![param("RoleName", "rebound-second")],
+        ),
+        (
+            "GetInstanceProfile",
+            vec![param("InstanceProfileName", PROFILE)],
+        ),
+    ] {
+        let case = format!("the second binding through {reader}");
+        let (names, documents) = page(&router, reader, &params).await;
+        assert_eq!(
+            names,
+            vec![PROFILE.to_string()],
+            "case {case:?}: expected the rebound profile, got {names:?}"
+        );
+        assert_eq!(
+            documents.len(),
+            1,
+            "case {case:?}: expected the document of the role it now holds, got {documents:?}"
+        );
+        assert_reported_document(&case, SECOND_DOCUMENT, &documents[0]);
+    }
 }
