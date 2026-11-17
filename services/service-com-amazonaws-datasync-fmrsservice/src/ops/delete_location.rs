@@ -3,7 +3,8 @@
 //! @op DeleteLocation
 //!
 //! Removes the transfer location a `CreateLocation*` stored in [`crate::state`], so no
-//! later read of its ARN resolves it again.
+//! later read of its ARN resolves it again — unless a transfer task still names that
+//! location as one of its endpoints, which the removal refuses as in use.
 //!
 //! ## Shape of an operation
 //!
@@ -145,11 +146,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         store.advance_clock(::std::time::SystemTime::now());
-        // The service holds a location only because a create stored it, so an ARN that
-        // resolves to nothing is refused and nothing is removed — worded and classified
-        // in `crate::state`, the same way every operation that resolves a `LocationArn`
-        // reports a location the account does not hold. A location of any kind is
-        // removed by the one ARN that addresses it, so no kind is named here.
+        // Two refusals, both worded and classified in `crate::state` so every operation
+        // that resolves a `LocationArn` reports them the same way. The service holds a
+        // location only because a create stored it, so an ARN that resolves to nothing is
+        // refused and nothing is removed; and a location a stored transfer task still
+        // names as an endpoint is refused as in use, because removing it would leave that
+        // task pointing at a resource nothing resolves. A location of any kind is removed
+        // by the one ARN that addresses it, so no kind is named here.
         store
             .remove_location(&input.location_arn)
             .map_err(|refusal| {

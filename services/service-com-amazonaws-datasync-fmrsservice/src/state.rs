@@ -921,12 +921,45 @@ impl ComAmazonawsDatasyncFmrsserviceState {
         Ok((location, config))
     }
 
+    /// The transfer tasks that still name `location_arn` as one of their two endpoints,
+    /// earliest-created first.
+    ///
+    /// A task names its endpoints by ARN and nothing else resolves them, so a location
+    /// is referenced exactly while a stored task carries its ARN as either endpoint —
+    /// whatever lifecycle status that task is in.
+    pub fn tasks_referencing_location(&self, location_arn: &str) -> Vec<&Task> {
+        let mut referencing: Vec<&Task> = self
+            .tasks
+            .values()
+            .filter(|task| {
+                task.source_location_arn == location_arn
+                    || task.destination_location_arn == location_arn
+            })
+            .collect();
+        referencing.sort_by_key(|task| task.seq);
+        referencing
+    }
+
     /// Remove the location stored under `arn`, as `DeleteLocation` does.
     ///
-    /// `Err` is the refusal an ARN naming no location this account holds earns: the
-    /// service holds a location only because a create stored it, so a delete of an ARN
-    /// that resolves to nothing is a client error and nothing is removed.
+    /// Two refusals, and in this order, because an ARN that resolves to nothing cannot
+    /// be in use by anything:
+    ///
+    /// * an ARN naming no location this account holds — the service holds a location
+    ///   only because a create stored it, so a delete of an ARN that resolves to nothing
+    ///   is a client error;
+    /// * a location a stored transfer task still names as an endpoint — the task would
+    ///   be left pointing at a resource nothing resolves, so the delete is refused and
+    ///   the location stays.
+    ///
+    /// Nothing is removed in either case.
     pub fn remove_location(&mut self, arn: &str) -> Result<Location, LocationRefusal> {
+        if !self.locations.contains_key(arn) {
+            return Err(LocationRefusal::not_found(arn));
+        }
+        if let Some(task) = self.tasks_referencing_location(arn).first() {
+            return Err(LocationRefusal::in_use(arn, &task.arn));
+        }
         self.locations
             .remove(arn)
             .ok_or_else(|| LocationRefusal::not_found(arn))
@@ -1030,6 +1063,13 @@ pub fn default_server_port(server_protocol: &str) -> i32 {
 /// it there.
 pub const LOCATION_NOT_FOUND_CODE: &str = "LocationNotFound";
 
+/// The class discriminator DataSync reports for a request to delete a location another
+/// resource this account holds still references.
+///
+/// Carried by both code members of the modelled client error, like every other refusal
+/// class of this service, so a caller ordering its teardown branches on it.
+pub const LOCATION_IN_USE_CODE: &str = "LocationInUse";
+
 /// The class discriminator DataSync reports for a request whose parameters it will not
 /// accept — a member outside the values the operation takes, or a dependency between
 /// members that the shapes alone cannot state.
@@ -1128,6 +1168,23 @@ impl LocationRefusal {
                 described = expected.described()
             ),
             error_code: None,
+        }
+    }
+
+    /// The refusal a delete of a location a transfer task still names as an endpoint
+    /// earns.
+    ///
+    /// The message names both resources the rule is about — the location that cannot go
+    /// and one task that still holds it — each by its bare resource id, the way this
+    /// service identifies a resource in a refusal ([`resource_id`]).
+    pub fn in_use(location_arn: &str, task_arn: &str) -> Self {
+        Self {
+            message: format!(
+                "Location {location} is in use by task {task}.",
+                location = resource_id(location_arn),
+                task = resource_id(task_arn)
+            ),
+            error_code: Some(LOCATION_IN_USE_CODE.to_string()),
         }
     }
 

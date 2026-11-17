@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Deleting a DataSync transfer location, and what a read of a location the account
-//! does not hold answers, driven end to end over HTTP.
+//! Deleting a DataSync transfer location, what a read of a location the account does not
+//! hold answers, and when a delete is refused because a transfer task still references
+//! the location, driven end to end over HTTP.
 //!
 //! Every case goes through the same front door a client uses: `POST /` with
 //! `X-Amz-Target: FmrsService.<Operation>` and an `awsJson1_1` body, dispatched by the
@@ -21,6 +22,10 @@ const ACCOUNT: &str = "000000000000";
 /// The discriminator DataSync reports, in both `errorCode` and `datasyncErrorCode`, for
 /// a request that names a location the account does not hold.
 const LOCATION_NOT_FOUND: &str = "LocationNotFound";
+
+/// The discriminator DataSync reports, in both `errorCode` and `datasyncErrorCode`, for
+/// a delete of a location a transfer task still references.
+const LOCATION_IN_USE: &str = "LocationInUse";
 
 /// A router with just this service mounted on a fresh engine.
 fn service() -> MultiServiceRouter {
@@ -432,6 +437,371 @@ async fn create_task_refuses_a_deleted_location() {
         &router,
         kinds[1].describe_operation,
         serde_json::json!({ "LocationArn": arns[1] }),
+        case,
+    )
+    .await;
+}
+
+/// The bare resource id of a DataSync ARN — `loc-…`, `task-…`: how this service names a
+/// resource in a refusal message.
+fn resource_id(arn: &str) -> &str {
+    arn.rsplit('/').next().unwrap_or(arn)
+}
+
+/// A transfer task between two locations, created and returned by ARN.
+async fn create_task(
+    router: &MultiServiceRouter,
+    source: &str,
+    destination: &str,
+    name: &str,
+    case: &str,
+) -> String {
+    let created = ok(
+        router,
+        "CreateTask",
+        serde_json::json!({
+            "SourceLocationArn": source,
+            "DestinationLocationArn": destination,
+            "Name": name,
+        }),
+        case,
+    )
+    .await;
+    string(&created, "TaskArn", case)
+}
+
+/// Assert the whole refusal envelope a delete of a still-referenced location earns: the
+/// one in-use discriminator in both code members, and a message that names the location
+/// that cannot go and a task that still holds it.
+///
+/// No recording pins the wording, so the assertion is on the two resources the message
+/// has to identify rather than on a sentence.
+fn assert_location_in_use(
+    refusal: &serde_json::Value,
+    location_arn: &str,
+    task_arns: &[&str],
+    case: &str,
+) {
+    for member in ["errorCode", "datasyncErrorCode"] {
+        assert_eq!(
+            string(refusal, member, case),
+            LOCATION_IN_USE,
+            "case {case:?}: expected {member} {LOCATION_IN_USE:?}, got {refusal}"
+        );
+    }
+    let message = string(refusal, "message", case);
+    assert!(
+        message.contains(resource_id(location_arn)),
+        "case {case:?}: the refusal must name the location it would not delete, got {refusal}"
+    );
+    assert!(
+        task_arns
+            .iter()
+            .any(|task_arn| message.contains(resource_id(task_arn))),
+        "case {case:?}: the refusal must name a task that still references the location \
+         (one of {task_arns:?}), got {refusal}"
+    );
+}
+
+/// Read a task's status back through `DescribeTask` until it is `want`, or give up after
+/// a deadline far longer than the transition the clock owes.
+///
+/// The wait is for the CONDITION, never for an elapsed time, so a loaded host only makes
+/// the loop go round more often.
+async fn poll_task_status(router: &MultiServiceRouter, task_arn: &str, want: &str, case: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let described = ok(
+            router,
+            "DescribeTask",
+            serde_json::json!({ "TaskArn": task_arn }),
+            case,
+        )
+        .await;
+        let status = string(&described, "Status", case);
+        if status == want {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: expected the task to reach {want:?}, last saw {status:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// RULE: a transfer location a transfer task still names as an endpoint cannot be
+/// deleted — `DeleteLocation` refuses it with the in-use discriminator in both code
+/// members and removes nothing, and serves the same delete once no task references the
+/// location any more.
+///
+/// The rows differ along what the rule generalises over: which endpoint member of the
+/// task holds the ARN (source and destination are both asserted per row) and which KIND
+/// of location each endpoint is, so no pairing of kinds is privileged.
+#[tokio::test]
+async fn a_location_a_task_references_cannot_be_deleted_until_the_task_is_gone() {
+    let kinds = kinds();
+
+    for source_index in 0..kinds.len() {
+        let destination_index = (source_index + 1) % kinds.len();
+        let source_kind = &kinds[source_index];
+        let destination_kind = &kinds[destination_index];
+        let case = format!(
+            "{source} as source, {destination} as destination",
+            source = source_kind.case,
+            destination = destination_kind.case
+        );
+        // One account per row, so each row's two locations are the only ones held.
+        let router = service();
+
+        let source = string(
+            &ok(
+                &router,
+                source_kind.create_operation,
+                (source_kind.request)(),
+                &case,
+            )
+            .await,
+            "LocationArn",
+            &case,
+        );
+        let destination = string(
+            &ok(
+                &router,
+                destination_kind.create_operation,
+                (destination_kind.request)(),
+                &case,
+            )
+            .await,
+            "LocationArn",
+            &case,
+        );
+        let task = create_task(&router, &source, &destination, "in-use", &case).await;
+
+        // Both endpoints are in use, and the refusal leaves each location readable.
+        for (endpoint, arn, kind) in [
+            ("source", &source, source_kind),
+            ("destination", &destination, destination_kind),
+        ] {
+            let case = format!("{case}, deleting the {endpoint}");
+            let refusal = refused(
+                &router,
+                "DeleteLocation",
+                serde_json::json!({ "LocationArn": arn }),
+                &case,
+            )
+            .await;
+            assert_location_in_use(&refusal, arn, &[task.as_str()], &case);
+
+            let described = ok(
+                &router,
+                kind.describe_operation,
+                serde_json::json!({ "LocationArn": arn }),
+                &case,
+            )
+            .await;
+            assert_eq!(
+                &string(&described, "LocationArn", &case),
+                arn,
+                "case {case:?}: the refused delete must leave the location held, got {described}"
+            );
+        }
+
+        // Teardown in the order the refusal asks for: the task first, then the two
+        // locations it referenced — each an empty 200, because the refusal above kept
+        // them.
+        ok(
+            &router,
+            "DeleteTask",
+            serde_json::json!({ "TaskArn": task }),
+            &case,
+        )
+        .await;
+
+        for (endpoint, arn, kind) in [
+            ("source", &source, source_kind),
+            ("destination", &destination, destination_kind),
+        ] {
+            let case = format!("{case}, deleting the {endpoint} after the task");
+            let deleted = ok(
+                &router,
+                "DeleteLocation",
+                serde_json::json!({ "LocationArn": arn }),
+                &case,
+            )
+            .await;
+            assert_eq!(
+                deleted,
+                serde_json::json!({}),
+                "case {case:?}: DeleteLocation reports no members, got {deleted}"
+            );
+            let gone = refused(
+                &router,
+                kind.describe_operation,
+                serde_json::json!({ "LocationArn": arn }),
+                &case,
+            )
+            .await;
+            assert_location_not_found(&gone, arn, &case);
+        }
+    }
+}
+
+/// RULE (the same one, over the COUNT of references): a location is deletable only once
+/// NO task names it, so a location two tasks share survives the delete of either one of
+/// them and goes only after both.
+#[tokio::test]
+async fn a_location_two_tasks_share_is_in_use_until_both_tasks_are_gone() {
+    let router = service();
+    let case = "one location shared by two tasks";
+    let kinds = kinds();
+
+    let mut arns: Vec<String> = Vec::new();
+    for kind in kinds.iter().take(3) {
+        let created = ok(&router, kind.create_operation, (kind.request)(), case).await;
+        arns.push(string(&created, "LocationArn", case));
+    }
+    // The middle location is the destination of one task and the source of the other.
+    let first = create_task(&router, &arns[0], &arns[1], "shared-first", case).await;
+    let second = create_task(&router, &arns[1], &arns[2], "shared-second", case).await;
+
+    let refusal = refused(
+        &router,
+        "DeleteLocation",
+        serde_json::json!({ "LocationArn": arns[1] }),
+        case,
+    )
+    .await;
+    assert_location_in_use(&refusal, &arns[1], &[first.as_str(), second.as_str()], case);
+
+    // One task gone, one still referencing: still in use, and the refusal now names the
+    // task that remains.
+    ok(
+        &router,
+        "DeleteTask",
+        serde_json::json!({ "TaskArn": first }),
+        case,
+    )
+    .await;
+    let case_after_first = format!("{case}, after the first task was deleted");
+    let refusal = refused(
+        &router,
+        "DeleteLocation",
+        serde_json::json!({ "LocationArn": arns[1] }),
+        &case_after_first,
+    )
+    .await;
+    assert_location_in_use(&refusal, &arns[1], &[second.as_str()], &case_after_first);
+
+    ok(
+        &router,
+        "DeleteTask",
+        serde_json::json!({ "TaskArn": second }),
+        case,
+    )
+    .await;
+    let case_after_both = format!("{case}, after both tasks were deleted");
+    let deleted = ok(
+        &router,
+        "DeleteLocation",
+        serde_json::json!({ "LocationArn": arns[1] }),
+        &case_after_both,
+    )
+    .await;
+    assert_eq!(
+        deleted,
+        serde_json::json!({}),
+        "case {case_after_both:?}: DeleteLocation reports no members, got {deleted}"
+    );
+
+    // That delete is what removed the location: a second one finds nothing, and the two
+    // locations the deleted tasks also referenced are deletable as well.
+    let second_delete = refused(
+        &router,
+        "DeleteLocation",
+        serde_json::json!({ "LocationArn": arns[1] }),
+        &case_after_both,
+    )
+    .await;
+    assert_location_not_found(&second_delete, &arns[1], &case_after_both);
+    for arn in [&arns[0], &arns[2]] {
+        ok(
+            &router,
+            "DeleteLocation",
+            serde_json::json!({ "LocationArn": arn }),
+            &case_after_both,
+        )
+        .await;
+    }
+}
+
+/// RULE (the same one, over the task's lifecycle status): a task references its two
+/// locations from the moment it is created, so the in-use refusal does not depend on the
+/// status the task has reached.
+#[tokio::test]
+async fn a_location_is_in_use_whatever_status_the_referencing_task_has() {
+    let router = service();
+    let kinds = kinds();
+
+    let source = string(
+        &ok(
+            &router,
+            kinds[0].create_operation,
+            (kinds[0].request)(),
+            "setup",
+        )
+        .await,
+        "LocationArn",
+        "setup",
+    );
+    let destination = string(
+        &ok(
+            &router,
+            kinds[1].create_operation,
+            (kinds[1].request)(),
+            "setup",
+        )
+        .await,
+        "LocationArn",
+        "setup",
+    );
+    let task = create_task(&router, &source, &destination, "status-span", "setup").await;
+
+    // Straight after the create, while the task is still reaching its first status.
+    let case = "immediately after CreateTask";
+    let refusal = refused(
+        &router,
+        "DeleteLocation",
+        serde_json::json!({ "LocationArn": source }),
+        case,
+    )
+    .await;
+    assert_location_in_use(&refusal, &source, &[task.as_str()], case);
+
+    // And once the task has settled into the status it waits in.
+    poll_task_status(&router, &task, "AVAILABLE", "waiting for the task").await;
+    let case = "after the task reached AVAILABLE";
+    let refusal = refused(
+        &router,
+        "DeleteLocation",
+        serde_json::json!({ "LocationArn": source }),
+        case,
+    )
+    .await;
+    assert_location_in_use(&refusal, &source, &[task.as_str()], case);
+
+    // The same delete, once nothing references the location.
+    ok(
+        &router,
+        "DeleteTask",
+        serde_json::json!({ "TaskArn": task }),
+        case,
+    )
+    .await;
+    ok(
+        &router,
+        "DeleteLocation",
+        serde_json::json!({ "LocationArn": source }),
         case,
     )
     .await;
