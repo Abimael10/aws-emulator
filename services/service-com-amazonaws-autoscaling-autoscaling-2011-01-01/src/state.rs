@@ -152,6 +152,23 @@ pub mod scaling_policies;
 
 pub use scaling_policies::{PolicyKey, StoredScalingPolicy};
 
+/// The recurring schedule a scheduled action states — the crontab expression its
+/// `Recurrence` is written in and the IANA zone its `TimeZone` names — and the next instant
+/// such a schedule fires at.
+pub mod recurrence;
+
+/// The scheduled scaling actions of a group: the named collection
+/// `PutScheduledUpdateGroupAction` upserts into and `DescribeScheduledActions` projects
+/// from, and the rules every writer of it shares.
+pub mod scheduled_actions;
+
+pub use scheduled_actions::{
+    invalid_recurrence_message, invalid_time_zone_message, scheduled_action_arn,
+    too_many_scheduled_actions_message, ScheduledActionPut, ScheduledActionRefusal,
+    ScheduledActions, StoredScheduledAction, END_TIME_MESSAGE, MAX_SCHEDULED_ACTIONS_PER_GROUP,
+    SIZE_REQUIRED_MESSAGE,
+};
+
 /// Performing one of those policies — `ExecutePolicy` — which policy a request names, the
 /// capacity the policy's own adjustment moves the group to, and the cooldowns it honours
 /// and leaves behind.
@@ -765,6 +782,10 @@ pub struct StoredGroup {
     /// collection every reader and writer of a suspension of this group reaches
     /// ([`suspended_processes`]), so deleting the group takes its suspensions with it.
     pub suspended_processes: SuspendedProcesses,
+    /// The group's scheduled scaling actions, keyed by `ScheduledActionName`: the ONE
+    /// collection every reader and writer of a scheduled action of this group reaches
+    /// ([`scheduled_actions`]), so deleting the group takes its scheduled actions with it.
+    pub scheduled_actions: ScheduledActions,
     /// The group metrics collected for this group, keyed by metric name, each holding the
     /// granularity it is collected at: the ONE collection every reader and writer of this
     /// group's metrics collection reaches ([`metrics_collection`]), so deleting the group

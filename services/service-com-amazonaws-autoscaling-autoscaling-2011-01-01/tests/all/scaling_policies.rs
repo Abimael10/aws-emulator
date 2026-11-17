@@ -42,6 +42,14 @@ use service_com_amazonaws_cloudwatch_graniteserviceversion20100801 as cloudwatch
 
 use crate::support::{borrowed, new_engine, p, query, tag_value, tag_values, xml_unescape, REGION};
 
+/// The group's SCHEDULED scaling actions, in their own file beside this one: the other way
+/// its three sizes are set without a request per change, and this suite's sibling concern.
+/// `tests/all.rs` declares one module per suite FILE, and this is that file's module; the
+/// `#[path]` points it into this suite's own directory, as that file's own declaration points
+/// into `tests/all/`.
+#[path = "scaling_policies/scheduled_actions.rs"]
+mod scheduled_actions;
+
 /// The launch source every group in this suite is created from — a launch TEMPLATE,
 /// because no account can create a launch configuration (see
 /// `launch_configurations_are_unavailable.rs`).

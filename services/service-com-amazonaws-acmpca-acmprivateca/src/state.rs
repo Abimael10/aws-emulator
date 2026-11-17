@@ -2759,9 +2759,24 @@ pub fn mint_resource_id() -> String {
 /// A serial number for a CA or for one of its certificates, minted from `seed`.
 ///
 /// Private CA reports serials as hex, so this is 16 bytes of hex digits.
+///
+/// Never a leading ZERO byte: a certificate's serial is an INTEGER, so a leading zero is not
+/// part of its value, and a client reading the serial off the certificate would read one
+/// octet fewer than were minted here — leaving the renderings of the same serial (this one,
+/// the certificate's own, the one an audit report row states) unable to be joined.
 pub fn mint_serial(seed: &str) -> String {
-    ::hex::encode(&mint_digest(seed)[..16])
+    let mut bytes = [0u8; SERIAL_BYTES];
+    bytes.copy_from_slice(&mint_digest(seed)[..SERIAL_BYTES]);
+    if let Some(first) = bytes.first_mut() {
+        if *first == 0 {
+            *first = 1;
+        }
+    }
+    ::hex::encode(bytes)
 }
+
+/// How many bytes a minted serial carries.
+const SERIAL_BYTES: usize = 16;
 
 /// A digest over `seed`, the current instant and a process-wide sequence, so two mints
 /// with the same seed never collide.

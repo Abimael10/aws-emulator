@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutScheduledUpdateGroupAction
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutScheduledUpdateGroupAction`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutScheduledUpdateGroupAction::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates or updates one scheduled scaling action of an Auto Scaling group.
+//!
+//! The collection, the upsert rule and the rules a put is taken against are
+//! [`crate::state::scheduled_actions`]; `DescribeScheduledActions` reports from that same
+//! collection.
 //!
 //! ## Shape of an operation
 //!
@@ -198,18 +195,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutScheduledUpdateGroupAction` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutScheduledUpdateGroupActionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutScheduledUpdateGroupAction"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                PutScheduledUpdateGroupActionErrorModeled::ResourceContentionFault(
+                    ResourceContentionFault {
+                        message: Some(
+                            "the Auto Scaling store is not mounted on this engine".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let group_name = input.auto_scaling_group_name;
+        let action_name = input.scheduled_action_name;
+        // Whether IAM lets this caller schedule an action on THIS group, decided against the
+        // group's own ARN before anything is read or written
+        // ([`crate::service::authorization`]).
+        if let Some(refusal) = crate::service::authorization::group_action_refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &group_name,
+        ) {
+            crate::state::audit(
+                ctx.parts(),
+                Self::NAME,
+                &group_name,
+                "refused: not authorized",
+            );
+            return Err(refusal);
+        }
+        // "This property is no longer used" (`PutScheduledUpdateGroupActionType$Time`): the
+        // legacy member and `StartTime` name the ONE instant the action starts at, so the
+        // request's `StartTime` is read first and `Time` only when it states none.
+        let put = crate::state::ScheduledActionPut {
+            start_time: input.start_time.or(input.time),
+            end_time: input.end_time,
+            recurrence: input.recurrence,
+            min_size: input.min_size,
+            max_size: input.max_size,
+            desired_capacity: input.desired_capacity,
+            time_zone: input.time_zone,
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut state = store.lock();
+        state.materialize_due(&*self.engine, now);
+
+        // A scheduled action belongs to a group, so the group is resolved before any other
+        // member of the request is read: a request naming no stored group is refused for
+        // the group whatever else it carries.
+        if !state.groups.contains_key(&group_name) {
+            crate::state::audit(
+                ctx.parts(),
+                Self::NAME,
+                &group_name,
+                "refused: no such group",
+            );
+            return Err(absent_group(&group_name));
+        }
+        let stored = state
+            .put_scheduled_action(&group_name, &action_name, put, now)
+            .map_err(|refusal| {
+                let message = refusal.message();
+                if refusal.is_quota() {
+                    // A ceiling on the account's resources is the operation's modelled
+                    // `LimitExceededFault`; everything else is about what the request
+                    // carries, which this service answers `ValidationError` for.
+                    PutScheduledUpdateGroupActionErrorModeled::LimitExceededFault(
+                        LimitExceededFault {
+                            message: Some(message),
+                        },
+                    )
+                    .into()
+                } else {
+                    crate::scaffolded::Scaffolded::validation_error(message)
+                }
+            })?;
+        drop(state);
+        // The group was resolved above, so the writer found it too; a name it no longer
+        // answers to is refused as any unknown name is.
+        if stored.is_none() {
+            return Err(absent_group(&group_name));
+        }
+
+        crate::state::audit(
+            ctx.parts(),
+            Self::NAME,
+            &format!("{group_name}/{action_name}"),
+            "scheduled action put",
+        );
+        Ok(PutScheduledUpdateGroupActionOutput)
     }
+}
+
+/// The refusal a request naming a group the account does not hold is answered with: the
+/// `ValidationError` Amazon EC2 Auto Scaling answers such a request with, carrying this
+/// service's absent-group sentence for the name the request asked for.
+fn absent_group(group_name: &str) -> PutScheduledUpdateGroupActionError {
+    crate::scaffolded::Scaffolded::validation_error(crate::state::absent_group_message(group_name))
 }

@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeScheduledActions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeScheduledActions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeScheduledActions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the scheduled scaling actions of the account, or of one Auto Scaling group.
+//!
+//! The collection every action is read from is [`crate::state::scheduled_actions`], the one
+//! `PutScheduledUpdateGroupAction` writes: a read reports what the store holds and writes
+//! nothing but what the clock had already made due.
+//!
+//! "the scheduled actions that haven't run or that have not reached their end time" (this
+//! operation's own documentation): this service does not run a scheduled action, so no
+//! action it holds has run and each one it holds is reported.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +162,129 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeScheduledActions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeScheduledActionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeScheduledActions"))
+        let _ = ctx;
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeScheduledActionsErrorModeled::ResourceContentionFault(
+                ResourceContentionFault {
+                    message: Some(
+                        "the Auto Scaling store is not mounted on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let wanted_names = input.scheduled_action_names.unwrap_or_default();
+
+        let mut state = store.lock();
+        state.materialize_due(&*self.engine, ::std::time::SystemTime::now());
+
+        // `AutoScalingGroupName` is optional — this read is of the scheduled actions in the
+        // account and Region — but a name the request DOES carry has to name a stored
+        // group, and that is resolved before any other member is read, cursor included.
+        if let Some(group_name) = input.auto_scaling_group_name.as_deref() {
+            if !state.groups.contains_key(group_name) {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::absent_group_message(group_name),
+                ));
+            }
+        }
+
+        // The requested cursor: the offset it decodes to, and the token itself, kept so a
+        // later refusal can name the token the caller actually submitted.
+        let (offset, token) = match input.next_token.clone() {
+            None => (0, String::new()),
+            Some(token) => match crate::state::decode_next_token(&token) {
+                Some(offset) => (offset, token),
+                None => {
+                    return Err(DescribeScheduledActionsErrorModeled::InvalidNextToken(
+                        InvalidNextToken {
+                            message: Some(crate::state::invalid_next_token_message(&token)),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+        // "The default value is 50 and the maximum value is 100"
+        // (`DescribeScheduledActionsType$MaxRecords`): a page size outside that range is
+        // refused, not quietly reshaped.
+        if let Some(max_records) = crate::state::max_records_out_of_range(input.max_records) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::max_records_violation_message(max_records),
+            ));
+        }
+
+        // "The earliest scheduled start time to return. If scheduled action names are
+        // provided, this property is ignored"
+        // (`DescribeScheduledActionsType$StartTime`, and `EndTime` says the same of the
+        // latest): the window selects by the action's own start time, and a request that
+        // names the actions it wants selects by those names alone.
+        let (earliest, latest) = if wanted_names.is_empty() {
+            (input.start_time, input.end_time)
+        } else {
+            (None, None)
+        };
+
+        // "If you omit this property, all scheduled actions are described. If you specify
+        // an unknown scheduled action, it is ignored with no error"
+        // (`DescribeScheduledActionsType$ScheduledActionNames`): a name nothing answers to
+        // selects nothing rather than refusing the read.
+        let matching: Vec<ScheduledUpdateGroupAction> = state
+            .groups
+            .values()
+            .filter(|group| {
+                input
+                    .auto_scaling_group_name
+                    .as_deref()
+                    .is_none_or(|group_name| group.name == group_name)
+            })
+            .flat_map(|group| {
+                group
+                    .scheduled_actions
+                    .iter()
+                    .map(move |(name, action)| (group, name, action))
+            })
+            .filter(|(_, name, _)| {
+                wanted_names.is_empty() || wanted_names.iter().any(|wanted| wanted == *name)
+            })
+            .filter(|(_, _, action)| starts_within(action.start_time, earliest, latest))
+            .map(|(group, name, action)| action.view(&group.name, name))
+            .collect();
+        // A token this service issued always points inside the list it was issued for; one
+        // that points past the end was not issued for this list. Only a decoded token
+        // reaches a non-zero offset, so `token` is the one submitted.
+        if offset > 0 && offset >= matching.len() {
+            return Err(DescribeScheduledActionsErrorModeled::InvalidNextToken(
+                InvalidNextToken {
+                    message: Some(crate::state::invalid_next_token_message(&token)),
+                },
+            )
+            .into());
+        }
+        let (scheduled_update_group_actions, next_token) =
+            crate::state::page(&matching, offset, input.max_records);
+
+        Ok(DescribeScheduledActionsOutput {
+            scheduled_update_group_actions: Some(scheduled_update_group_actions),
+            next_token,
+        })
     }
+}
+
+/// An instant a request stated, where it stated one.
+type Instant = Option<::aws_smithy_types::DateTime>;
+
+/// Whether an action starting at `start_time` falls inside the window the request stated:
+/// from `earliest` to `latest`, each bound only where the request carries it.
+///
+/// The window bounds the action's own scheduled start time, so an action that states none has
+/// no start time to fall outside either bound and is reported whichever bounds the request
+/// carries.
+fn starts_within(start_time: Instant, earliest: Instant, latest: Instant) -> bool {
+    let Some(start_time) = start_time else {
+        return true;
+    };
+    earliest.is_none_or(|earliest| start_time.as_secs_f64() >= earliest.as_secs_f64())
+        && latest.is_none_or(|latest| start_time.as_secs_f64() <= latest.as_secs_f64())
 }

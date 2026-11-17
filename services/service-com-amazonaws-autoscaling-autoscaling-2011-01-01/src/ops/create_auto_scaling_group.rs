@@ -874,6 +874,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Every process of a new group runs: the create carries no process member, so
             // the first suspension comes from `SuspendProcesses`.
             suspended_processes: crate::state::SuspendedProcesses::new(),
+            // A group is created with no scheduled action either: the create carries no
+            // scheduled-action member, so the first one comes from
+            // `PutScheduledUpdateGroupAction`.
+            scheduled_actions: crate::state::ScheduledActions::new(),
             // A new group collects no group metric either: the create carries no metrics
             // member, so the first one comes from `EnableMetricsCollection`.
             enabled_metrics: crate::state::EnabledMetrics::new(),

@@ -70,6 +70,17 @@ aws-sdk-eventbridge = { version = "1", default-features = false }
 # (`state::sns_notifications`). Only the generated client is needed — the emulator supplies
 # the transport, so the SDK's own HTTPS stack is left out.
 aws-sdk-sns = { version = "1", default-features = false }
+# `cron`: the crontab expression a scheduled action's `Recurrence` states its schedule as,
+# read through the maintained parser this workspace already reads cron with rather than a
+# grammar written here (`state::recurrence`).
+cron = "0.15"
+# `chrono`: the calendar arithmetic that parser states an occurrence in, which is what turns
+# the next occurrence of a recurrence into the instant a read reports.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+# `chrono-tz`: the IANA time zone database a scheduled action's `TimeZone` names a zone from
+# ("the canonical names of the IANA time zones"), which is the zone its recurrence is read
+# in.
+chrono-tz = { version = "0.10", default-features = false, features = ["std"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
