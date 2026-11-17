@@ -9,10 +9,12 @@
 //!
 //! The rules under test:
 //!
-//! * **A page that reported a log group hands back a `nextToken`**, whether or not groups
-//!   follow it: a continuation is how a client learns the enumeration is finished, and the
-//!   page that reports nothing is the one that carries no token. Walking the tokens covers the
-//!   selected groups exactly once, in name order, and terminates.
+//! * **A page hands back a `nextToken` exactly while selected log groups remain
+//!   UNREPORTED**: the token is "the token for the next set of items to return", so the page
+//!   that reported the last match carries none and its absence is how a client learns the
+//!   enumeration is finished. Walking the tokens covers the selected groups exactly once, in
+//!   name order, in as many pages as the page size divides the selection into — never an
+//!   extra round trip for a set that is already complete.
 //! * **`logGroupNamePattern` is LITERAL TEXT for a case-sensitive substring search**, not an
 //!   expression: a value carrying a character a log group name can never hold matches no log
 //!   group, which is a success whose `logGroups` is the EMPTY LIST rather than a refusal. The
@@ -70,11 +72,12 @@ async fn account_with_groups(logs: &Logs) {
     }
 }
 
-/// Every page that reported a group carries a token, the walk covers the selection exactly
-/// once in name order, and it ends at the empty page that carries no token — over a grid of
-/// selection sizes and page sizes.
+/// A page carries a token exactly while selected groups remain unreported, the walk covers
+/// the selection exactly once in name order, and it ends on the page that reported the last
+/// match — over a grid of selection sizes and page sizes, page sizes that divide the
+/// selection exactly included.
 #[tokio::test]
-async fn a_page_that_reported_a_group_hands_back_a_continuation() {
+async fn a_page_hands_back_a_continuation_exactly_while_groups_remain() {
     let logs = Logs::new();
     account_with_groups(&logs).await;
 
@@ -104,7 +107,10 @@ async fn a_page_that_reported_a_group_hands_back_a_continuation() {
     ];
 
     for (case, selector, selected) in &selections {
-        for limit in 1_usize..=3 {
+        // Page sizes from one group per page up to one past the whole selection, so every row
+        // is walked with a size that divides it exactly (the page that reports the last match
+        // is FULL) as well as with sizes that leave a remainder.
+        for limit in 1_usize..=selected.len().saturating_add(1).max(2) {
             let case = format!("{case}, limit {limit}");
             let mut walked: Vec<String> = Vec::new();
             let mut token: Option<String> = None;
@@ -126,14 +132,16 @@ async fn a_page_that_reported_a_group_hands_back_a_continuation() {
                     reported.len() <= limit,
                     "case {case:?}: a page holds at most {limit} groups, got {page}"
                 );
+                walked.extend(reported.clone());
                 let next = page.get("nextToken").and_then(Value::as_str);
                 assert_eq!(
                     next.is_some(),
-                    !reported.is_empty(),
-                    "case {case:?}: a page carries a token exactly when it reported a group, \
-                     got {page}"
+                    walked.len() < selected.len(),
+                    "case {case:?}: a page carries a token exactly while selected groups \
+                     remain unreported ({} of {} reported so far), got {page}",
+                    walked.len(),
+                    selected.len()
                 );
-                walked.extend(reported.clone());
                 match next {
                     Some(next) => token = Some(next.to_string()),
                     None => break,
@@ -147,7 +155,105 @@ async fn a_page_that_reported_a_group_hands_back_a_continuation() {
                     .collect::<Vec<String>>(),
                 "case {case:?}: the walk covers the selection once, in name order"
             );
+            // No round trip beyond the pages the selection itself fills: a selection of `n`
+            // groups read `limit` at a time is exactly ceil(n / limit) pages, and an empty
+            // selection is the one page that reports nothing.
+            let expected_pages = selected.len().div_ceil(limit).max(1);
+            assert_eq!(
+                pages, expected_pages,
+                "case {case:?}: expected {expected_pages} page(s) for {} group(s), got {pages}",
+                selected.len()
+            );
         }
+    }
+}
+
+/// The page that reports the last selected group carries NO token, whichever member made the
+/// selection and whether that page is full or short — and a page with groups still behind it
+/// does carry one, which resumes at exactly those groups.
+///
+/// The rows span the members this listing selects with (none, the name prefix, the substring
+/// pattern, the identifier list and the log group class), because the rule is about what is
+/// left unreported rather than about which filter left it.
+#[tokio::test]
+async fn the_page_that_reports_the_last_selected_group_carries_no_token() {
+    let logs = Logs::new();
+    account_with_groups(&logs).await;
+
+    // (case, the selector, the names it selects in order)
+    let selections: Vec<(&str, Value, Vec<&str>)> = vec![
+        ("every group of the account", json!({}), GROUPS.to_vec()),
+        (
+            "the groups under a name prefix",
+            json!({"logGroupNamePrefix": "/aws/"}),
+            vec![GROUPS[0], GROUPS[1]],
+        ),
+        (
+            "the groups holding a substring",
+            json!({"logGroupNamePattern": "alpha"}),
+            vec![GROUPS[1], GROUPS[2]],
+        ),
+        (
+            "the groups an identifier list names",
+            json!({"logGroupIdentifiers": [GROUPS[0], GROUPS[2]]}),
+            vec![GROUPS[0], GROUPS[2]],
+        ),
+        (
+            "the groups of one class",
+            json!({"logGroupClass": "STANDARD"}),
+            GROUPS.to_vec(),
+        ),
+    ];
+
+    for (case, selector, selected) in &selections {
+        let count = selected.len();
+        // A page sized exactly to the selection reports all of it and ends there: the page is
+        // FULL, and a token would promise a set that does not exist.
+        let mut exact = selector.clone();
+        exact["limit"] = json!(count);
+        let page = logs.ok(DESCRIBE, &exact).await;
+        assert_eq!(
+            names(case, &page),
+            selected
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<String>>(),
+            "case {case:?}: a page sized to the selection reports all of it, got {page}"
+        );
+        assert_eq!(
+            page.get("nextToken"),
+            None,
+            "case {case:?}: the page that reported the last of {count} group(s) carries no \
+             token, got {page}"
+        );
+
+        // A page one group short of the selection DOES carry a token, and continuing it
+        // reports exactly the group left over — itself the last page, so it carries none.
+        let mut short = selector.clone();
+        short["limit"] = json!(count - 1);
+        let page = logs.ok(DESCRIBE, &short).await;
+        let token = page
+            .get("nextToken")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: a page leaving a group unreported carries a token, got {page}")
+            })
+            .to_string();
+        let mut resumed = selector.clone();
+        resumed["limit"] = json!(count);
+        resumed["nextToken"] = json!(token);
+        let page = logs.ok(DESCRIBE, &resumed).await;
+        assert_eq!(
+            names(case, &page),
+            vec![selected[count - 1].to_string()],
+            "case {case:?}: the continuation reports exactly the group left over, got {page}"
+        );
+        assert_eq!(
+            page.get("nextToken"),
+            None,
+            "case {case:?}: the continuation that reported the last group carries no token, \
+             got {page}"
+        );
     }
 }
 

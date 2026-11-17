@@ -397,22 +397,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let last = first.saturating_add(limit).min(matching.len());
         let page = &matching[first..last];
 
-        // "The token for the next set of items to return": CloudWatch Logs hands one back on
-        // every page it reported a log group on, whether or not groups follow it — a
-        // continuation is how a client learns the enumeration is finished, and the
-        // continuation of the last page is the empty page that carries no token at all. So
-        // the token is minted from the position of the last group reported, and a page that
-        // reported nothing ends the walk.
-        let next_token = page.last().map(|group| {
-            Cursor {
-                log_group_name_prefix: input.log_group_name_prefix.clone(),
-                log_group_name_pattern: input.log_group_name_pattern.clone(),
-                log_group_class: input.log_group_class.clone(),
-                log_group_identifiers: input.log_group_identifiers.clone(),
-                after: group.name.clone(),
-            }
-            .encode()
-        });
+        // "The token for the next set of items to return": a paginated read hands one back only
+        // while items the request selected remain UNREPORTED, so the page that reported the
+        // last match carries none — the absence of the token is how a client learns the
+        // enumeration is finished. The token is minted from the position of the last group
+        // reported, and only when the scan has more matches past it.
+        let next_token = (last < matching.len())
+            .then(|| page.last())
+            .flatten()
+            .map(|group| {
+                Cursor {
+                    log_group_name_prefix: input.log_group_name_prefix.clone(),
+                    log_group_name_pattern: input.log_group_name_pattern.clone(),
+                    log_group_class: input.log_group_class.clone(),
+                    log_group_identifiers: input.log_group_identifiers.clone(),
+                    after: group.name.clone(),
+                }
+                .encode()
+            });
 
         // A pattern lookup answers a REDUCED projection of each log group: the identity and
         // classification members — `arn`, `creationTime`, `logGroupArn`, `logGroupClass`,

@@ -511,6 +511,21 @@ async fn a_query_that_does_not_compile_is_refused_with_the_parsers_diagnostic() 
             "none",
         ),
         (
+            // The same rule for an operand that is no number at all, which is the form the
+            // recorded wire step of this class carries.
+            "a limit whose operand is an identifier",
+            "fields @message | limit abc",
+            "abc",
+        ),
+        (
+            // "limit — Specify the number of log events returned": a number that counts no
+            // event is no count either, so the operand is judged by what it IS and not by
+            // whether it parses as a number.
+            "a limit that counts no log event",
+            "fields @message | limit 0",
+            "0",
+        ),
+        (
             // A query string carries newlines as readily as a console does, and the place
             // a diagnostic states is the LINE and the position within it.
             "a command the language does not define, on the third line",
