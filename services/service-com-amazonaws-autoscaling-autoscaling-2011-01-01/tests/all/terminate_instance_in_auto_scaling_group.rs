@@ -6,8 +6,11 @@
 //! — one through `InstanceId`, or up to the modelled hundred through `InstanceIds`
 //! together with the `AutoScalingGroupName` that holds them — and every id it names must
 //! be an instance of that Auto Scaling group, so a call naming an instance of another
-//! group, or of no group at all, terminates NONE of them and is refused `ValidationError`
-//! naming the instance and the group it is not part of. A call whose every id belongs to
+//! group terminates NONE of them and is refused `ValidationError` naming the instance and
+//! the group it is not part of — while a call that names ONE instance and NO group at all,
+//! for an instance no group of the account manages, carries no group for a refusal to
+//! report and is refused `ValidationError` reporting that instance as one Auto Scaling does
+//! not manage. A call whose every id belongs to
 //! the group reports each named instance `Terminating`, answers with the scaling activity
 //! each termination recorded (`Activity` for the `InstanceId` form, `Activities` for the
 //! `InstanceIds` form, as the model documents), and treats
@@ -33,9 +36,14 @@
 //! A termination already under way owes nothing further: naming the same instance again,
 //! in either form, is served and records no second activity, which is its own row below.
 
+use std::time::{Duration, Instant};
+
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::support::{borrowed, new_engine, p, query, router_with, tag_value, xml_unescape};
+use crate::support::{
+    borrowed, ec2_query, emulator, new_engine, p, query, router_with, seed_subnets, tag_value,
+    xml_unescape,
+};
 
 /// The launch source every group here is created from — a launch TEMPLATE, because no
 /// account can create a launch configuration (see
@@ -275,12 +283,17 @@ fn listed_activities(body: &str) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
-/// The message a termination naming an instance that is not part of the group is refused
-/// with: fixed text, with the instance id and the group name from the request, and the
-/// unfilled token where the request named no group.
-fn not_part_of_group_message(instance_id: &str, group_name: Option<&str>) -> String {
-    let group_name = group_name.unwrap_or("null");
+/// The message a termination naming an instance that is not part of the group it NAMED is
+/// refused with: fixed text, with the instance id and the group name from the request.
+fn not_part_of_group_message(instance_id: &str, group_name: &str) -> String {
     format!("Instance {instance_id} is not part of Auto Scaling group {group_name}.")
+}
+
+/// The message a termination that names ONE instance and NO group is refused with when no
+/// group of the account manages that instance: fixed text whose one variable part is the
+/// instance id from the request, and no group name at all — the request named none.
+fn no_managed_instance_message(instance_id: &str) -> String {
+    format!("Instance Id not found - No managed instance found for instance ID: {instance_id}")
 }
 
 /// One accepted single-instance row: the case, the group's bounds and capacity, the
@@ -673,9 +686,10 @@ struct RefusedRow {
     reported: Foreign,
 }
 
-/// Every row: HTTP 400, `ValidationError`, the refusal naming the instance and the group
-/// it is not part of, and NOTHING terminated — every instance of either group is still in
-/// service and both groups still report the capacity they held.
+/// Every row: HTTP 400, `ValidationError`, the refusal naming the instance — beside the
+/// group it is not part of, where the request named one — and NOTHING terminated: every
+/// instance of either group is still in service and both groups still report the capacity
+/// they held.
 #[tokio::test]
 async fn a_termination_naming_an_instance_the_group_does_not_hold_is_refused_whole() {
     let rows = [
@@ -753,7 +767,11 @@ async fn a_termination_naming_an_instance_the_group_does_not_hold_is_refused_who
             "case {:?}: expected the ValidationError code, got {:?} {:?}",
             row.case, answer.code, answer.message
         );
-        let expected = not_part_of_group_message(&id_of(&row.reported), group_name);
+        let reported_id = id_of(&row.reported);
+        let expected = match group_name {
+            Some(group) => not_part_of_group_message(&reported_id, group),
+            None => no_managed_instance_message(&reported_id),
+        };
         assert_eq!(
             answer.message, expected,
             "case {:?}: expected the message {expected:?}, got {:?}",
@@ -1263,5 +1281,265 @@ async fn the_activity_a_termination_answers_with_describes_that_termination() {
         xml_unescape(&tag_value(&body, "Cause")),
         cause,
         "expected the stored activity to carry the cause the response did, got {body:?}"
+    );
+}
+
+/// How long a case here waits for a state Amazon EC2's own clock owes before calling it a
+/// failure.
+///
+/// A BACKSTOP, not a wait: the wait below looks again until the condition holds, so this
+/// only turns a state that never arrives into a failure instead of a hang.
+const DEADLINE: Duration = Duration::from_secs(60);
+
+/// How long one look waits before looking again.
+const LOOK_AGAIN: Duration = Duration::from_millis(25);
+
+/// The AMI a standalone instance of this suite is launched from. An AMI id is all a launch
+/// has to name, and this is one of the issued form.
+const IMAGE_ID: &str = "ami-0123456789abcdef0";
+
+/// The state Amazon EC2 reports a standalone instance in once it is up.
+const RUNNING: &str = "running";
+
+/// The greatest length the member that names the one instance admits:
+/// `TerminateInstanceInAutoScalingGroupType$InstanceId` is `XmlStringMaxLen19`, length 1..19.
+const MAX_INSTANCE_ID_LENGTH: usize = 19;
+
+/// The token a message leaves in a slot it has nothing to fill, which no refusal about an
+/// INSTANCE may carry: a request that named no group names none in its refusal either.
+const UNFILLED_TOKEN: &str = "null";
+
+/// What Amazon EC2 reports one instance's state as, read from a `DescribeInstances` that
+/// named exactly that instance. `""` when Amazon EC2 resolves the id to nothing.
+async fn ec2_instance_state(router: &MultiServiceRouter, instance_id: &str) -> String {
+    let (status, body) =
+        ec2_query(router, "DescribeInstances", &[p("InstanceId.1", instance_id)]).await;
+    if status != 200 {
+        return String::new();
+    }
+    tag_value(&tag_value(&body, "instanceState"), "name")
+}
+
+/// Launch one standalone Amazon EC2 instance into `subnet_id` over Amazon EC2's own wire and
+/// answer its id, once Amazon EC2 reports it running.
+///
+/// An instance Amazon EC2 has just launched is `pending` and reaches `running` on EC2's own
+/// clock, so this looks again until EC2 reports it up rather than waiting for a span.
+async fn run_standalone_instance(router: &MultiServiceRouter, subnet_id: &str) -> String {
+    let (status, body) = ec2_query(
+        router,
+        "RunInstances",
+        &[
+            p("ImageId", IMAGE_ID),
+            p("MinCount", "1"),
+            p("MaxCount", "1"),
+            p("SubnetId", subnet_id),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "RunInstances expected HTTP 200, got {status} with {body:?}"
+    );
+    let instance_id = tag_value(&body, "instanceId");
+    assert!(
+        !instance_id.is_empty(),
+        "RunInstances must report its instance, got {body}"
+    );
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        let state = ec2_instance_state(router, &instance_id).await;
+        if state == RUNNING {
+            return instance_id;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "expected Amazon EC2 to report {instance_id} {RUNNING}, got {state:?}"
+        );
+        tokio::time::sleep(LOOK_AGAIN).await;
+    }
+}
+
+/// One row of the refusal a termination that names NO group answers for an instance no
+/// group manages: the case, the id the request names, and whether Amazon EC2 runs an
+/// instance of that id (which the refusal must leave exactly as it was).
+struct UnmanagedRow {
+    case: &'static str,
+    instance_id: String,
+    runs_in_ec2: bool,
+}
+
+/// A request that names ONE instance and no group identifies no group at all, so an instance
+/// no Auto Scaling group manages is refused as an instance that cannot be found — never with
+/// a group name the request did not supply.
+///
+/// Every row: HTTP 400, `ValidationError`, the not-found sentence naming the id the request
+/// carried and no group, nothing left of the instance's own state changed, and the group that
+/// does hold instances untouched. The rows span what the rule generalises over: what the id
+/// resolves to (a standalone instance Amazon EC2 runs, and an id the account has no instance
+/// of at all) and the id's own form and length. The accepted rows of
+/// [`a_termination_takes_the_named_instance_out_of_service`] are the positive control — the
+/// same call for an instance a group DOES manage is served and decrements the group.
+#[tokio::test]
+async fn a_termination_naming_an_instance_no_group_manages_reports_the_instance_not_found() {
+    // Amazon EC2 is mounted beside Auto Scaling here: the instance an outsider row names is
+    // the account's OWN Amazon EC2 instance, read back where a client reads it.
+    let (router, engine) = emulator();
+    let subnets = seed_subnets(&engine, 1);
+    let held = create_group(&router, "asg-managed", 0, 2, 2).await;
+    let standalone = run_standalone_instance(&router, &subnets[0].id).await;
+    let second_standalone = run_standalone_instance(&router, &subnets[0].id).await;
+
+    let rows = [
+        UnmanagedRow {
+            case: "a standalone instance Amazon EC2 runs, in no Auto Scaling group",
+            instance_id: standalone.clone(),
+            runs_in_ec2: true,
+        },
+        UnmanagedRow {
+            case: "a second standalone instance, launched beside a group that holds its own",
+            instance_id: second_standalone.clone(),
+            runs_in_ec2: true,
+        },
+        UnmanagedRow {
+            case: "a well-formed id no instance of the account has",
+            instance_id: "i-0fff0000000000001".to_string(),
+            runs_in_ec2: false,
+        },
+        UnmanagedRow {
+            // `XmlStringMaxLen19` admits a length of one upwards, so a short spelling is a
+            // row of its own.
+            case: "a short id form the member admits",
+            instance_id: "i-1".to_string(),
+            runs_in_ec2: false,
+        },
+        UnmanagedRow {
+            case: "an id of the greatest length the member admits",
+            // Every `f`, so the id is of the bound's length and is no id this emulator mints
+            // (it numbers the instances it launches).
+            instance_id: format!("i-{}", "f".repeat(MAX_INSTANCE_ID_LENGTH - 2)),
+            runs_in_ec2: false,
+        },
+    ];
+
+    for row in &rows {
+        assert!(
+            row.instance_id.len() <= MAX_INSTANCE_ID_LENGTH,
+            "case {:?}: a row names an id the member admits, got {:?}",
+            row.case,
+            row.instance_id
+        );
+        let answer = terminate(&router, None, Some(&row.instance_id), &[], false).await;
+        assert_eq!(
+            answer.status, 400,
+            "case {:?}: expected HTTP 400, got {} with {:?} {:?}",
+            row.case, answer.status, answer.code, answer.message
+        );
+        assert_eq!(
+            answer.code, "ValidationError",
+            "case {:?}: expected the ValidationError code, got {:?} {:?}",
+            row.case, answer.code, answer.message
+        );
+        let expected = no_managed_instance_message(&row.instance_id);
+        assert_eq!(
+            answer.message, expected,
+            "case {:?}: expected the message {expected:?}, got {:?}",
+            row.case, answer.message
+        );
+        assert!(
+            !answer.message.contains(UNFILLED_TOKEN),
+            "case {:?}: a refusal about an instance names no group, so it carries no \
+             {UNFILLED_TOKEN:?}, got {:?}",
+            row.case,
+            answer.message
+        );
+        if row.runs_in_ec2 {
+            let state = ec2_instance_state(&router, &row.instance_id).await;
+            assert_eq!(
+                state, RUNNING,
+                "case {:?}: a refused termination leaves {} as Amazon EC2 had it, got {state:?}",
+                row.case, row.instance_id
+            );
+        }
+    }
+
+    // None of the refusals above touched the group that does hold instances.
+    let reported = reported_group(&router, "asg-managed").await;
+    assert_eq!(
+        reported.desired_capacity, 2,
+        "the refusals above leave the group's desired capacity alone, got {reported:?}"
+    );
+    let still_held: Vec<String> = reported
+        .active()
+        .iter()
+        .map(|instance| instance.instance_id.clone())
+        .collect();
+    assert_eq!(
+        still_held, held,
+        "the refusals above leave the group's own instances in service, got {reported:?}"
+    );
+}
+
+/// The other side of the same rule: a refusal reports a group exactly where the request
+/// supplied one. The SAME outsider instance, named with the group and named without it, is
+/// refused with the group-naming sentence and with the not-found one respectively — and
+/// neither leaves an unfilled slot behind.
+#[tokio::test]
+async fn a_termination_refusal_names_a_group_only_where_the_request_named_one() {
+    let (router, engine) = emulator();
+    let subnets = seed_subnets(&engine, 1);
+    let held = create_group(&router, "asg-named", 0, 2, 1).await;
+    let standalone = run_standalone_instance(&router, &subnets[0].id).await;
+
+    let cases = [
+        (
+            "the request names the group",
+            Some("asg-named"),
+            not_part_of_group_message(&standalone, "asg-named"),
+        ),
+        (
+            "the request names no group",
+            None,
+            no_managed_instance_message(&standalone),
+        ),
+    ];
+    for (case, group_name, expected) in &cases {
+        let answer = terminate(&router, *group_name, Some(&standalone), &[], false).await;
+        assert_eq!(
+            answer.status, 400,
+            "case {case:?}: expected HTTP 400, got {} with {:?} {:?}",
+            answer.status, answer.code, answer.message
+        );
+        assert_eq!(
+            answer.code, "ValidationError",
+            "case {case:?}: expected the ValidationError code, got {:?} {:?}",
+            answer.code, answer.message
+        );
+        assert_eq!(
+            &answer.message, expected,
+            "case {case:?}: expected the message {expected:?}, got {:?}",
+            answer.message
+        );
+        assert!(
+            !answer.message.contains(UNFILLED_TOKEN),
+            "case {case:?}: no refusal carries {UNFILLED_TOKEN:?} where a name belongs, got {:?}",
+            answer.message
+        );
+    }
+
+    let state = ec2_instance_state(&router, &standalone).await;
+    assert_eq!(
+        state, RUNNING,
+        "the refused calls leave the standalone instance as Amazon EC2 had it, got {state:?}"
+    );
+    let reported = reported_group(&router, "asg-named").await;
+    let still_held: Vec<String> = reported
+        .active()
+        .iter()
+        .map(|instance| instance.instance_id.clone())
+        .collect();
+    assert_eq!(
+        still_held, held,
+        "the refused calls leave the group's own instance in service, got {reported:?}"
     );
 }

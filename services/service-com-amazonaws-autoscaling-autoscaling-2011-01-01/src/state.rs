@@ -3162,10 +3162,6 @@ pub fn too_many_instance_ids_message() -> String {
     )
 }
 
-/// The token this service's refusals carry where a message names a part of the request
-/// the request did not supply, as [`ABSENT_GROUP_MESSAGE_WITHOUT_DETAIL`] carries it.
-pub const UNFILLED_DETAIL_TOKEN: &str = "null";
-
 /// The clause both of this service's "that instance is not part of that group" refusals
 /// are built around: an instance-scoped request is resolved against the group the
 /// request NAMES, so the refusal names the instance AND that group, and one sentence
@@ -3198,15 +3194,31 @@ pub fn the_instance_not_in_group_message(instance_id: &str, group_name: &str) ->
 ///
 /// One sentence per offending instance, as the refusal class is worded: the fixed text
 /// is `Instance ` / ` is not part of Auto Scaling group ` / `.`, and the two variable
-/// parts are the instance id and the group name, both from the request. A request that
-/// names no group at all leaves that part unfilled, so it travels as
-/// [`UNFILLED_DETAIL_TOKEN`] — there is no group the instance could be part of.
+/// parts are the instance id and the group name, both from the request — so this is the
+/// answer only where the request NAMED a group to resolve the instance against. A request
+/// that names no group identifies no group the instance could be part of, and is refused
+/// with [`instance_managed_by_no_group_message`] instead: a refusal never reports a group
+/// the request did not supply.
 ///
 /// Same class as [`the_instance_not_in_group_message`], in the subject this
 /// operation's own refusal opens with.
-pub fn instance_not_in_group_message(instance_id: &str, group_name: Option<&str>) -> String {
-    let group_name = group_name.unwrap_or(UNFILLED_DETAIL_TOKEN);
+pub fn instance_not_in_group_message(instance_id: &str, group_name: &str) -> String {
     format!("Instance {instance_id}{NOT_PART_OF_GROUP_CLAUSE}{group_name}.")
+}
+
+/// The message an instance-scoped request that names NO Auto Scaling group is refused with
+/// when no group of the account manages the instance it names.
+///
+/// Such a request carries one instance id and nothing else that identifies a group, so the
+/// refusal is about the INSTANCE: the subject is not findable among the instances Amazon EC2
+/// Auto Scaling manages, whether the account holds no Amazon EC2 instance of that id at all
+/// or holds one that is simply in no group. The fixed text is `Instance Id not found - No
+/// managed instance found for instance ID: ` — the same `<subject> not found - <detail>`
+/// shape this service's absent-group refusal carries
+/// ([`ABSENT_GROUP_MESSAGE_WITHOUT_DETAIL`]) — and its ONE variable part is the instance id
+/// the request carried.
+pub fn instance_managed_by_no_group_message(instance_id: &str) -> String {
+    format!("Instance Id not found - No managed instance found for instance ID: {instance_id}")
 }
 
 /// The message a request that would bring an instance into a group which is ALREADY an
@@ -3349,7 +3361,9 @@ pub fn absent_group_message_as_group_not_found(name: &str) -> String {
 
 /// The absent-group refusal whose detail field the operation leaves unfilled, so it
 /// travels as the literal token `null`: the whole message is fixed text and no part of
-/// the request appears in it.
+/// the request appears in it. Its subject is the GROUP the request named, which is why the
+/// detail may stand unfilled here — a refusal about an INSTANCE names that instance
+/// ([`instance_managed_by_no_group_message`]) rather than leaving a slot of its own empty.
 pub const ABSENT_GROUP_MESSAGE_WITHOUT_DETAIL: &str = "AutoScalingGroup name not found - null";
 
 /// The sentence a rollback of a refresh that carries no desired configuration is

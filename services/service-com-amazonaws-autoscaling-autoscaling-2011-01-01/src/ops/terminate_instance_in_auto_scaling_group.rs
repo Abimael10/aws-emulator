@@ -226,11 +226,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 };
                 match state.group_holding_instance(instance_id) {
                     Some(group) => group.name.clone(),
-                    // An instance of no Auto Scaling group is part of none, and the
-                    // request named no group for the message to report.
+                    // The request named no group, so there is no group this instance could
+                    // be part of and none for a refusal to report: what it states is that
+                    // the instance it names is not one Amazon EC2 Auto Scaling manages.
                     None => {
                         return Err(crate::scaffolded::Scaffolded::validation_error(
-                            crate::state::instance_not_in_group_message(instance_id, None),
+                            crate::state::instance_managed_by_no_group_message(instance_id),
                         ));
                     }
                 }
@@ -246,7 +247,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Checked for EVERY named instance before anything is terminated: an instance
         // that is not part of the group is refused, and the instances of the group the
-        // same request named stay exactly as they were.
+        // same request named stay exactly as they were. The group the refusal reports is
+        // the one the REQUEST named — the only way to reach here, since a request that
+        // named none was resolved against the group holding its instance above.
         if let Some(foreign) = requested.iter().find(|instance_id| {
             !group
                 .instances
@@ -254,7 +257,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .any(|instance| instance.instance_id == **instance_id)
         }) {
             return Err(crate::scaffolded::Scaffolded::validation_error(
-                crate::state::instance_not_in_group_message(foreign, Some(&group_name)),
+                crate::state::instance_not_in_group_message(foreign, &group_name),
             ));
         }
 
