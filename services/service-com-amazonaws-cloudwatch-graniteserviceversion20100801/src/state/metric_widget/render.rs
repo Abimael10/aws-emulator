@@ -25,9 +25,13 @@
 //! holding different datapoints would be the same picture. A graph too small to hold the
 //! lettering beside a plot is drawn without it rather than drawn over itself.
 //!
-//! The legend is the colour swatch of each series: a series' label is the definition's or the
-//! metric's own text rather than a number read off the graph, so it is not what the image has
-//! to carry.
+//! The legend is the colour swatch of each series beside the label it is legended under, and
+//! the TITLE the definition names is written over the plot: both are the definition's own text,
+//! so two definitions that differ only in them are different images.
+//!
+//! A series that could not load the whole window the graph asks for is legended with the load
+//! warning the operation documents in place of an error — "an orange triangle with an
+//! exclamation point appears next to the graph legend".
 
 use ::plotters::prelude::*;
 
@@ -41,6 +45,16 @@ const PAD: i32 = 8;
 
 /// How tall the legend strip under the plot is, in pixels.
 const LEGEND_HEIGHT: i32 = 14;
+
+/// The size of the load warning drawn beside an incomplete series' legend entry, in pixels.
+const WARNING: (i32, i32) = (9, 8);
+
+/// The colour the load warning is drawn in on either theme: "an orange triangle with an
+/// exclamation point" (`GetMetricWidgetImageInput$MetricWidget`).
+const WARNING_COLOR: [u8; 3] = [0xf8, 0x92, 0x33];
+
+/// The glyph written over that triangle.
+const WARNING_MARK: &str = "!";
 
 /// The size of one series' legend swatch, in pixels.
 const SWATCH: (i32, i32) = (12, 8);
@@ -119,6 +133,40 @@ struct AxisLabel {
     text: String,
 }
 
+/// One entry of the legend strip: where it begins, and the series it legends.
+#[derive(Debug, Clone)]
+struct LegendEntry<'a> {
+    /// The column the entry's swatch begins at.
+    at: i32,
+    /// The label text the entry carries, clipped to the room the strip has left for it.
+    label: String,
+    /// The series it legends.
+    series: &'a PlottedSeries,
+}
+
+impl LegendEntry<'_> {
+    /// The column the entry's label begins at.
+    fn label_at(&self) -> i32 {
+        self.at + SWATCH.0 + LABEL_GAP
+    }
+
+    /// The column the entry's load warning begins at, for a series that could not load the
+    /// whole window.
+    fn warning_at(&self) -> i32 {
+        self.label_at() + lettering::text_width(&self.label) + LABEL_GAP
+    }
+
+    /// How wide the whole entry is, in pixels.
+    fn width(&self) -> i32 {
+        let warning = if self.series.incomplete {
+            WARNING.0 + LABEL_GAP
+        } else {
+            0
+        };
+        SWATCH.0 + LABEL_GAP + lettering::text_width(&self.label) + warning
+    }
+}
+
 /// Where the plot sits in the image.
 #[derive(Debug, Clone, Copy)]
 struct Frame {
@@ -135,6 +183,39 @@ struct Frame {
     instants: i32,
     /// Whether the axes carry their labels.
     lettered: bool,
+}
+
+/// The entries the legend strip holds, left to right under the plot, in the order the
+/// definition listed the series.
+///
+/// A strip that runs out of width legends as many series as fit, and a label longer than the
+/// room left is clipped to it: the layout is computed ONCE here, so the swatch the plot draws
+/// and the text written over it cannot disagree about where an entry sits.
+fn legend_entries<'a>(frame: Frame, series: &'a [PlottedSeries]) -> Vec<LegendEntry<'a>> {
+    let mut entries: Vec<LegendEntry<'a>> = Vec::new();
+    let mut at = frame.left;
+    for drawn in series {
+        let fixed = SWATCH.0
+            + LABEL_GAP
+            + if drawn.incomplete {
+                WARNING.0 + LABEL_GAP
+            } else {
+                0
+            };
+        let room = frame.right - at - fixed;
+        if room < 0 {
+            break;
+        }
+        let glyphs = usize::try_from(room / lettering::GLYPH_WIDTH).unwrap_or(0);
+        let entry = LegendEntry {
+            at,
+            label: drawn.label.chars().take(glyphs).collect(),
+            series: drawn,
+        };
+        at += entry.width() + SWATCH_GAP;
+        entries.push(entry);
+    }
+    entries
 }
 
 impl Frame {
@@ -157,9 +238,9 @@ impl Frame {
 /// [`super::MAX_IMAGE_SIDE`] on the line before it is made — the definition's own sizes were
 /// already refused past that bound when it was parsed, so the clamp is the backstop that makes
 /// the ceiling a property of this function rather than of its caller. The work the drawing
-/// does is bounded the same way: the pixels by that ceiling, and the points by the resolution
-/// that read them (`crate::state::metric_query`, which refuses a definition asking for more
-/// datapoints than one read retrieves).
+/// does is bounded the same way: the pixels by that ceiling, and the points by the window the
+/// resolution could read them over ([`super::plotted_series`], which resolves a graph over the
+/// part of its window the granularity it asks for is still held at).
 ///
 /// The failure channel exists because both the drawing library and the encoder are fallible
 /// seams; neither can fail over an owned in-memory bitmap of a size this module already
@@ -181,15 +262,25 @@ fn draw(
 ) -> Result<(), String> {
     let theme = if widget.dark { DARK } else { LIGHT };
     let range = value_range(widget, series);
-    let values = value_labels(range);
+    let values = value_labels(widget, series, range);
     let instants = instant_labels(widget);
-    let frame = frame_of((width, height), series, &values);
+    let frame = frame_of((width, height), widget, series, &values);
+    let legend = legend_entries(frame, series);
 
-    plot(widget, series, (width, height), bitmap, theme, frame, range)?;
+    plot(
+        widget,
+        series,
+        &legend,
+        (width, height),
+        bitmap,
+        theme,
+        frame,
+        range,
+    )?;
 
     // The plotting library has handed the buffer back, so the labels go straight into the
     // pixels — over the grid they annotate rather than under it.
-    if frame.lettered && !frame.is_empty() {
+    if !frame.is_empty() {
         letter(
             widget,
             (width, height),
@@ -198,15 +289,30 @@ fn draw(
             frame,
             range,
             (&values, &instants),
+            &legend,
         );
     }
     Ok(())
 }
 
-/// Where the plot sits in a `width` x `height` image: inside the margin, less the legend strip
-/// when there is a series to legend, and less the room the axis labels take when the graph is
-/// big enough to letter.
-fn frame_of((width, height): (u32, u32), series: &[PlottedSeries], values: &[AxisLabel]) -> Frame {
+/// How tall the strip over the plot the definition's `title` is written in is, which is no
+/// strip at all for a definition naming none.
+fn title_height(widget: &MetricWidget) -> i32 {
+    match widget.title.as_deref() {
+        None | Some("") => 0,
+        Some(_) => lettering::GLYPH_HEIGHT + LABEL_GAP,
+    }
+}
+
+/// Where the plot sits in a `width` x `height` image: inside the margin, under the title strip,
+/// less the legend strip when there is a series to legend, and less the room the axis labels
+/// take when the graph is big enough to letter.
+fn frame_of(
+    (width, height): (u32, u32),
+    widget: &MetricWidget,
+    series: &[PlottedSeries],
+    values: &[AxisLabel],
+) -> Frame {
     let legend = if series.is_empty() { 0 } else { LEGEND_HEIGHT };
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let (width, height) = (width as i32, height as i32);
@@ -218,9 +324,10 @@ fn frame_of((width, height): (u32, u32), series: &[PlottedSeries], values: &[Axi
         .unwrap_or(0)
         + LABEL_GAP;
     let instants = lettering::GLYPH_HEIGHT + LABEL_GAP;
+    let top = PAD + title_height(widget);
     let plain = Frame {
         left: PAD,
-        top: PAD,
+        top,
         right,
         bottom: height - 1 - PAD - legend,
         instants: 0,
@@ -228,7 +335,7 @@ fn frame_of((width, height): (u32, u32), series: &[PlottedSeries], values: &[Axi
     };
     let lettered = Frame {
         left: PAD + gutter,
-        top: PAD,
+        top,
         right,
         bottom: height - 1 - PAD - legend - instants,
         instants,
@@ -248,6 +355,7 @@ fn frame_of((width, height): (u32, u32), series: &[PlottedSeries], values: &[Axi
 fn plot(
     widget: &MetricWidget,
     series: &[PlottedSeries],
+    legend: &[LegendEntry<'_>],
     (width, height): (u32, u32),
     bitmap: &mut [u8],
     theme: Theme,
@@ -340,31 +448,45 @@ fn plot(
         }
     }
 
-    // One swatch per series, left to right under the plot, in the order the definition listed
-    // them; a strip that runs out of width legends as many as fit.
-    let mut at = left;
+    // One swatch per legended series, at the column the strip's layout placed it, and the load
+    // warning's triangle beside the series that could not load the whole window.
     let legend_top = frame.legend_top();
-    for drawn in series {
-        if at + SWATCH.0 > right {
-            break;
-        }
+    for entry in legend {
         root.draw(&Rectangle::new(
-            [(at, legend_top), (at + SWATCH.0, legend_top + SWATCH.1)],
-            rgb(drawn.color).filled(),
+            [
+                (entry.at, legend_top),
+                (entry.at + SWATCH.0, legend_top + SWATCH.1),
+            ],
+            rgb(entry.series.color).filled(),
         ))
         .map_err(failed)?;
-        at += SWATCH.0 + SWATCH_GAP;
+        if !entry.series.incomplete {
+            continue;
+        }
+        let warning = entry.warning_at();
+        root.draw(&Polygon::new(
+            vec![
+                (warning + WARNING.0 / 2, legend_top),
+                (warning, legend_top + WARNING.1),
+                (warning + WARNING.0, legend_top + WARNING.1),
+            ],
+            rgb(WARNING_COLOR).filled(),
+        ))
+        .map_err(failed)?;
     }
 
     root.present().map_err(failed)?;
     Ok(())
 }
 
-/// Write the axis labels into `bitmap`: the values the plot's grid lines stand at, in the
-/// gutter left of it, and the instants its columns fall on, in the strip under it.
+/// Write the text of the image into `bitmap`: the definition's title over the plot, the values
+/// the plot's grid lines stand at in the gutter left of it, the instants its columns fall on in
+/// the strip under it, and each legend entry's label beside its swatch.
 ///
 /// A label is written only where the one before it has left room, so a plot narrow or short
-/// enough that its labels would collide carries the ones that fit rather than a smear.
+/// enough that its labels would collide carries the ones that fit rather than a smear. The axis
+/// labels are written only on a graph big enough to letter beside its plot; the title and the
+/// legend have strips of their own, so they are written whatever the plot's size.
 #[allow(clippy::too_many_arguments)]
 fn letter(
     widget: &MetricWidget,
@@ -374,8 +496,36 @@ fn letter(
     frame: Frame,
     range: (f64, f64),
     (values, instants): (&[AxisLabel], &[AxisLabel]),
+    legend: &[LegendEntry<'_>],
 ) {
     let mut canvas = lettering::Canvas::new(bitmap, (width, height));
+
+    // "title — The title to be displayed for the graph or number." — centred over the plot, in
+    // the strip the frame reserved for it.
+    if let Some(title) = widget.title.as_deref().filter(|title| !title.is_empty()) {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let image_width = width.min(i32::MAX as u32) as i32;
+        let column = ((image_width - lettering::text_width(title)) / 2).max(0);
+        canvas.write(title, (column, PAD), theme.text);
+    }
+
+    // The label of each legend entry, beside its swatch, and the exclamation point over the
+    // warning triangle of a series that could not load the whole window.
+    let legend_top = frame.legend_top();
+    for entry in legend {
+        canvas.write(&entry.label, (entry.label_at(), legend_top), theme.text);
+        if entry.series.incomplete {
+            canvas.write(
+                WARNING_MARK,
+                (entry.warning_at() + (WARNING.0 - lettering::GLYPH_WIDTH) / 2, legend_top),
+                theme.background,
+            );
+        }
+    }
+
+    if !frame.lettered {
+        return;
+    }
 
     // Top down, so the highest value on the axis is the one that keeps its label.
     let mut next_free_row = i32::MIN;
@@ -405,7 +555,24 @@ fn letter(
 
 /// The values the value axis is labelled with: the one every grid line of the plot stands at,
 /// lowest first.
-fn value_labels((low, high): (f64, f64)) -> Vec<AxisLabel> {
+///
+/// The axis states the values the graph's series TOOK, so it is lettered where there are values
+/// to state: a graph on which nothing was plotted — no series holds a value inside its window —
+/// and whose definition fixes neither end of the axis has no values to letter, and is drawn as
+/// the plot alone rather than against numbers the store does not hold.
+fn value_labels(
+    widget: &MetricWidget,
+    series: &[PlottedSeries],
+    (low, high): (f64, f64),
+) -> Vec<AxisLabel> {
+    let plotted = series
+        .iter()
+        .flat_map(|drawn| drawn.points.iter())
+        .any(|(instant, value)| instant.is_finite() && value.is_finite());
+    let fixed = widget.y_min.is_some() || widget.y_max.is_some();
+    if !plotted && !fixed {
+        return Vec::new();
+    }
     (0..=GRID_DIVISIONS)
         .map(|division| {
             let value = low + (high - low) * f64::from(division) / f64::from(GRID_DIVISIONS);

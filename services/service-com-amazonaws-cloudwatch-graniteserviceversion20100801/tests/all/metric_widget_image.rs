@@ -580,12 +580,12 @@ async fn a_definition_this_service_cannot_render_is_refused() {
         (
             "a document naming no metrics",
             json!({"MetricWidget": "{}"}),
-            "The parameter MetricWidget.metrics is required.",
+            "Should have required property 'metrics'",
         ),
         (
             "a document naming an empty metrics array",
             json!({"MetricWidget": json!({"metrics": []}).to_string()}),
-            "The parameter MetricWidget.metrics is required.",
+            "MetricWidget/metrics should NOT have fewer than 1 items",
         ),
         (
             "a width of no pixels",
@@ -784,4 +784,237 @@ async fn rendering_a_graph_writes_nothing() {
         "the metrics the store lists must be unchanged by rendering a graph of them, got \
          {listed} then {listed_after}"
     );
+}
+
+/// The image carries the TEXT the definition names: the graph's `title` and each series' legend
+/// label are drawn into it, so two definitions that differ only in that text are different
+/// images.
+///
+/// The rows differ along what the text can differ in — which title is named, whether one is
+/// named at all, how long it is, and the label a `metrics` entry gives its series — over ONE
+/// store, so nothing but the definition's text can make the bytes differ. A definition naming
+/// the empty title names no text to draw, so it renders the image a definition naming no title
+/// renders: that pair is the one row asserted EQUAL.
+#[tokio::test]
+async fn the_image_carries_the_text_the_definition_names() {
+    let router = build_router();
+    let base = base_time();
+    publish(&router, METRIC, base, &[(150.0, 10.0), (450.0, 40.0)]).await;
+
+    let window = json!({
+        "start": absolute(base),
+        "end": absolute(base + 12.0 * PERIOD),
+        "width": 400,
+        "height": 240,
+    });
+
+    // (the case, the members that change the text the image carries)
+    // "title — The title to be displayed for the graph or number." / "label — … the string
+    // displayed in the legend" (the metric widget structure reference).
+    let rows: [(&str, Value); 6] = [
+        ("no title at all", json!({})),
+        ("a title", json!({"title": "Latency, p50"})),
+        ("another title of the same length", json!({"title": "Latency, p90"})),
+        ("a longer title", json!({"title": "Latency of the checkout API"})),
+        (
+            "a label on the series",
+            json!({"metrics": [entry(METRIC, json!({"label": "checkout"}))]}),
+        ),
+        (
+            "another label on the series",
+            json!({"metrics": [entry(METRIC, json!({"label": "search"}))]}),
+        ),
+    ];
+
+    let mut images: BTreeMap<&str, Vec<u8>> = BTreeMap::new();
+    for (case, members) in rows {
+        let mut widget = widget_over(METRIC, &window);
+        merge(&mut widget, &members);
+        let image = rendered(&router, case, &widget).await;
+        let again = rendered(&router, case, &widget).await;
+        assert_eq!(
+            image, again,
+            "case {case:?}: the same definition over the same store must render the same bytes, \
+             got {} then {} bytes",
+            image.len(),
+            again.len()
+        );
+        for (other, drawn) in &images {
+            assert_ne!(
+                &image, drawn,
+                "case {case:?}: a graph carrying this text must differ from the graph of \
+                 {other:?}, got the same {} bytes",
+                image.len()
+            );
+        }
+        images.insert(case, image);
+    }
+
+    let mut untitled = widget_over(METRIC, &window);
+    merge(&mut untitled, &json!({"title": ""}));
+    let empty_title = rendered(&router, "the empty title", &untitled).await;
+    assert_eq!(
+        &empty_title,
+        images.get("no title at all").expect("the untitled graph"),
+        "case {:?}: a definition naming no text to draw must render the untitled graph, got {} \
+         bytes",
+        "the empty title",
+        empty_title.len()
+    );
+}
+
+/// A window reaching back past the retention of the granularity it asks for is RENDERED, with
+/// the load warning the operation documents beside the legend of the series that fell short —
+/// never refused.
+///
+/// The rows differ along the retention tier the definition's `period` selects and whether the
+/// window reaches past that tier's own span, which is the class this rule generalises over:
+/// "Data points with a period of less than 60 seconds are available for 3 hours. Data points
+/// with a period of 60 seconds (1-minute) are available for 15 days. Data points with a period
+/// of 300 seconds (5-minute) are available for 63 days. Data points with a period of 3600
+/// seconds (1 hour) are available for 455 days (15 months)." (`GetMetricStatistics`), with each
+/// tier tested just inside its span and past it.
+#[tokio::test]
+async fn a_window_past_the_retention_of_its_granularity_is_rendered_with_the_load_warning() {
+    let router = build_router();
+
+    // The colour of the load indication the render draws: "an orange triangle with an
+    // exclamation point appears next to the graph legend"
+    // (`GetMetricWidgetImageInput$MetricWidget`).
+    const WARNING: [u8; 3] = [0xf8, 0x92, 0x33];
+
+    // (the case, the period the definition names, the start it names, whether the window
+    // reaches past that granularity's retention)
+    let rows: [(&str, i64, &str, bool); 9] = [
+        ("a sub-minute granularity inside its three hours", 10, "-PT2H", false),
+        ("a sub-minute granularity past its three hours", 10, "-PT6H", true),
+        ("a one-minute granularity inside its fifteen days", 60, "-P14D", false),
+        ("a one-minute granularity past its fifteen days", 60, "-P16D", true),
+        ("a one-minute granularity far past its fifteen days", 60, "-P900D", true),
+        ("a five-minute granularity inside its sixty-three days", 300, "-P62D", false),
+        ("a five-minute granularity past its sixty-three days", 300, "-P64D", true),
+        ("an hourly granularity inside its four hundred and fifty-five days", 3_600, "-P450D", false),
+        ("an hourly granularity past its four hundred and fifty-five days", 3_600, "-P460D", true),
+    ];
+
+    for (case, period, start, short) in rows {
+        let widget = widget_over(
+            METRIC,
+            &json!({
+                "period": period,
+                "start": start,
+                "end": "PT0H",
+                "width": 400,
+                "height": 300,
+            }),
+        );
+        let image = rendered(&router, case, &widget).await;
+        let (_, _, pixels) = decoded(case, &image);
+        let warned = painted(&pixels, WARNING);
+        assert_eq!(
+            warned > 0,
+            short,
+            "case {case:?}: expected the graph to {} the load warning, got {warned} pixels of it",
+            if short { "carry" } else { "carry none of" }
+        );
+    }
+}
+
+/// The part of an over-retention window that IS still held is drawn: a graph whose window
+/// reaches back years is a graph of the datapoints inside it, not an empty picture.
+///
+/// The rows are the granularities whose tier still holds a recent datapoint, each over a window
+/// reaching far past that tier: every one of them must draw the published series, so the graph
+/// differs from the one an empty store draws over the same window.
+#[tokio::test]
+async fn an_over_retention_window_is_drawn_of_the_history_there_is() {
+    let with_data = build_router();
+    let empty = build_router();
+    let base = base_time();
+    publish(&with_data, METRIC, base, &[(150.0, 42.0), (450.0, 17.0)]).await;
+
+    // (the case, the period the definition names)
+    let rows: [(&str, i64); 3] = [
+        ("a one-minute granularity over nine hundred days", 60),
+        ("a five-minute granularity over nine hundred days", 300),
+        ("an hourly granularity over nine hundred days", 3_600),
+    ];
+
+    for (case, period) in rows {
+        let widget = widget_over(
+            METRIC,
+            &json!({
+                "period": period,
+                "start": "-P900D",
+                "end": "PT0H",
+                "width": 400,
+                "height": 300,
+            }),
+        );
+        let drawn = rendered(&with_data, case, &widget).await;
+        let nothing = rendered(&empty, case, &widget).await;
+        assert_ne!(
+            drawn, nothing,
+            "case {case:?}: a window reaching past retention must still draw the datapoints \
+             inside it, got the graph of an empty store ({} bytes)",
+            drawn.len()
+        );
+    }
+}
+
+/// A window wider than the graph resolves over — the `end` a definition names can be placed
+/// arbitrarily far ahead, a signed ISO 8601 offset taking it there — is RENDERED over the part
+/// the graph could resolve, with the same load warning, rather than refused or resolved window
+/// by window.
+///
+/// The rows differ along how far past the resolvable span the window reaches and at which
+/// granularity, which is what decides the span: the finest period and the default one, each with
+/// an end far ahead, against the same window ending at the current instant.
+#[tokio::test]
+async fn a_window_wider_than_the_graph_resolves_over_is_rendered_with_the_load_warning() {
+    let router = build_router();
+
+    // The colour of the load indication the render draws: "an orange triangle with an
+    // exclamation point appears next to the graph legend"
+    // (`GetMetricWidgetImageInput$MetricWidget`).
+    const WARNING: [u8; 3] = [0xf8, 0x92, 0x33];
+
+    // (the case, the window members, whether the window is wider than the graph resolves over)
+    let rows: [(&str, Value, bool); 4] = [
+        (
+            "an end a hundred thousand days ahead",
+            json!({"period": 60, "start": "-PT1H", "end": "P100000D"}),
+            true,
+        ),
+        (
+            "an end a thousand years ahead at the finest granularity",
+            json!({"period": 1, "start": "-PT1H", "end": "+P365000D"}),
+            true,
+        ),
+        (
+            "a window ending at the current instant",
+            json!({"period": 60, "start": "-PT1H", "end": "PT0H"}),
+            false,
+        ),
+        (
+            "a window of a day at the finest granularity",
+            json!({"period": 1, "start": "-PT1H", "end": "PT0H"}),
+            false,
+        ),
+    ];
+
+    for (case, window, wider) in rows {
+        let mut members = window;
+        merge(&mut members, &json!({"width": 400, "height": 300}));
+        let widget = widget_over(METRIC, &members);
+        let image = rendered(&router, case, &widget).await;
+        let (_, _, pixels) = decoded(case, &image);
+        let warned = painted(&pixels, WARNING);
+        assert_eq!(
+            warned > 0,
+            wider,
+            "case {case:?}: expected the graph to {} the load warning, got {warned} pixels of it",
+            if wider { "carry" } else { "carry none of" }
+        );
+    }
 }

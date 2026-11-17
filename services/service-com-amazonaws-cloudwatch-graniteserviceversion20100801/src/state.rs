@@ -1028,6 +1028,27 @@ pub fn granularity_available_from(requested_start: f64, period: i32, now: f64) -
     retained_at_period(requested_start.max(horizon), period, now)
 }
 
+/// How far back a read of `period`-wide windows can still see a datapoint, in seconds.
+///
+/// The span of the youngest retention tier `period` can be read out of
+/// ([`retained_at_period`]): a datapoint older than this is held at no granularity `period` is a
+/// multiple of, so no window of that width can report it. The ONE place that span is named, so a
+/// read that judges each datapoint by its own age and a reader that resolves the part of a wide
+/// range it can answer over agree about where that part begins.
+#[must_use]
+pub fn retention_secs_at_period(period: i32) -> f64 {
+    let multiple_of = |granularity: i32| period % granularity == 0;
+    if multiple_of(3_600) {
+        ONE_HOUR_RETENTION_SECS
+    } else if multiple_of(300) {
+        SIXTY_THREE_DAYS_SECS
+    } else if multiple_of(60) {
+        FIFTEEN_DAYS_SECS
+    } else {
+        SUB_MINUTE_RETENTION_SECS
+    }
+}
+
 /// Fold one series' datapoints into the `period`-wide windows of `[start, end)`, keyed by the
 /// window's index from `start` and by the UNIT the datapoints in it were published with.
 ///

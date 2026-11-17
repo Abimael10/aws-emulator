@@ -94,7 +94,7 @@ pub const DEFAULT_EXPRESSION_PERIOD: f64 = 60.0;
 /// How many data points ONE resolution may retrieve: "A GetMetricData operation that does not
 /// include a query can retrieve as many as 500 different metrics in a single request, with a
 /// total of as many as 100,800 data points." (`GetMetricData`)
-const MAX_RETRIEVED_POINTS: usize = 100_800;
+pub const MAX_RETRIEVED_POINTS: usize = 100_800;
 
 /// How many queries ONE resolution resolves: "A single GetMetricData call can include up to
 /// 500 MetricDataQuery structures." (`GetMetricData`)

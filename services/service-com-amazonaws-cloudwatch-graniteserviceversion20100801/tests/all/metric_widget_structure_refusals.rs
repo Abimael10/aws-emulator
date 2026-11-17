@@ -11,6 +11,9 @@
 //! with HTTP 400 in this service's own refusal code, in a sentence naming the node by its
 //! pointer from the request member — the members and array positions that lead to it, joined by
 //! `/` with each position written as its ZERO-based index — and the type that node must have.
+//! A member the structure REQUIRES, and an array holding fewer entries than it requires, are
+//! stated in the same vocabulary: the condition the node failed, after the pointer that leads to
+//! it, and with no pointer at all when that node is the document's own root.
 //!
 //! Every table row is a distinct input along what the rule generalises over (which position in
 //! the structure the wrong-shaped node sits at, how deep it is, which index it carries, and which
@@ -130,6 +133,69 @@ async fn a_node_of_the_metrics_structure_of_the_wrong_type_is_named_by_its_point
             "an entry whose only element is a nested array",
             json!({"metrics": [[["AWS/EC2", "CPUUtilization"]]]}),
             "MetricWidget/metrics/0/0 should be string",
+        ),
+    ];
+
+    for (case, widget, expected) in rows {
+        let (status, answered) = call(
+            &router,
+            "GetMetricWidgetImage",
+            &json!({"MetricWidget": widget.to_string()}),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&answered).as_str()),
+            (400, REFUSAL_CODE),
+            "case {case:?}: expected HTTP 400 {REFUSAL_CODE}, got {status} with {answered}"
+        );
+        let got = error_message(&answered);
+        assert_eq!(
+            got, expected,
+            "case {case:?}: expected the refusal {expected:?}, got {got:?} in {answered}"
+        );
+    }
+}
+
+/// A member the widget structure REQUIRES of the definition, and a `metrics` array holding
+/// fewer entries than a graph is of, are refused in the same document vocabulary as a node of
+/// the wrong type: the condition the node failed, after the pointer that leads to it — and with
+/// no pointer at all when the node that failed is the document's own root.
+///
+/// The rows differ along how the definition falls short and what else it carries, so neither
+/// diagnostic depends on the rest of the document: a document with no members at all, one
+/// carrying every other member, one naming the member as null, and the empty array alone and
+/// beside other members.
+#[tokio::test]
+async fn a_definition_missing_what_the_structure_requires_is_refused_by_the_condition_it_failed() {
+    let router = build_router();
+
+    // (case, the widget definition, the sentence the refusal is worded in).
+    let rows: Vec<(&str, Value, &str)> = vec![
+        (
+            // The recorded case.
+            "a document with no members at all",
+            json!({}),
+            "Should have required property 'metrics'",
+        ),
+        (
+            "a document carrying every member but metrics",
+            json!({"width": 400, "height": 300, "title": "cpu", "view": "timeSeries"}),
+            "Should have required property 'metrics'",
+        ),
+        (
+            "a document naming the metrics member as null",
+            json!({"metrics": Value::Null}),
+            "Should have required property 'metrics'",
+        ),
+        (
+            "an empty metrics array",
+            json!({"metrics": []}),
+            "MetricWidget/metrics should NOT have fewer than 1 items",
+        ),
+        (
+            "an empty metrics array beside the graph's size",
+            json!({"metrics": [], "width": 400, "height": 300}),
+            "MetricWidget/metrics should NOT have fewer than 1 items",
         ),
     ];
 

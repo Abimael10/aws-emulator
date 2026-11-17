@@ -22,6 +22,14 @@
 //! shape for a bad parameter, so the refusal is `crate::scaffolded`'s `ValidationError`, the
 //! code CloudWatch answers such a request with.
 //!
+//! A definition this service CAN render is never refused for the WINDOW it asks for. The
+//! operation models no error and documents its own degradation instead — "If any metric on the
+//! graph could not load all the requested data points, an orange triangle with an exclamation
+//! point appears next to the graph legend." — so a window reaching back past where its
+//! granularity is still held is drawn of the history there is, with that warning beside the
+//! legend of each series that fell short. The per-call datapoint ceiling the metric-read
+//! operations publish is theirs: no such limit is on this one.
+//!
 //! Two deviations this handler states rather than hides. `OutputFormat: image/png` renders the
 //! same PNG as `png` and carries it in the modelled `MetricWidgetImage` blob: the raw
 //! `image/png` BODY that value documents is the HTTP framing of the answer, which belongs to
@@ -214,8 +222,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map_err(GetMetricWidgetImageError::validation_error)?;
 
         // One acquisition of the store for the whole graph: a definition carries at most
-        // `MAX_WIDGET_METRICS` entries ("As many as 100 metrics in the graph"), so neither the
-        // critical section nor the work inside it grows without bound with the request.
+        // `MAX_WIDGET_METRICS` entries ("As many as 100 metrics in the graph"), and each is
+        // resolved over the part of the graph's window its granularity is still held at, so
+        // neither the critical section nor the work inside it grows without bound with the
+        // request.
         let series = {
             let store = state.lock();
             crate::state::metric_widget::plotted_series(&store, &widget, now)

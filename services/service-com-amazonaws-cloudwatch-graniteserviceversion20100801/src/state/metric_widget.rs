@@ -16,10 +16,10 @@
 //! members that place the graph's window and axes, and the defaults it takes for the ones it
 //! leaves out — and the bitmap the resolved series are drawn into ([`render`]).
 //!
-//! Every member this reading does not act on (`region`, `accountId`, `timezone`, `title`,
-//! `legend`, `liveData`, `sparkline`, `labels`, `setPeriodToTimeRange`) is accepted and
-//! ignored: the store holds one account's and Region's series, and the rest change how a
-//! console lays a graph out rather than what the graph is of.
+//! Every member this reading does not act on (`region`, `accountId`, `timezone`, `legend`,
+//! `liveData`, `sparkline`, `labels`, `setPeriodToTimeRange`) is accepted and ignored: the store
+//! holds one account's and Region's series, and the rest change how a console lays a graph out
+//! rather than what the graph is of.
 
 use ::serde_json::{Map, Value};
 
@@ -53,6 +53,28 @@ pub const MAX_WIDGET_METRICS: usize = 100;
 /// payload that is no JSON at all and one that is JSON but not an object are the same failure to
 /// a caller, which is that the definition could not be read.
 const BAD_JSON_CONTENT: &str = "MetricWidget property 'metricWidget' has a bad JSON content";
+
+/// How a refusal states that the definition is missing a member the widget structure requires
+/// of it: the condition the document itself failed, and the member that has to be there.
+///
+/// The widget document is validated as a DOCUMENT — the same vocabulary [`should_be`] states a
+/// node's type in — so a member the structure requires is named as the property the document
+/// should have, and nothing of the submitted document is quoted back. The node that failed is
+/// the document's ROOT, which no pointer leads to, so the condition stands on its own rather
+/// than after a path.
+fn should_have(member: &str) -> String {
+    format!("Should have required property '{member}'")
+}
+
+/// How a refusal states that the array at `pointer` holds fewer elements than the widget
+/// structure requires there — "metrics — An array of metrics", of which a graph is of at least
+/// one.
+fn should_not_have_fewer_items(pointer: &str, fewest: usize) -> String {
+    format!("{pointer} should NOT have fewer than {fewest} items")
+}
+
+/// The fewest elements the `metrics` array carries: a graph is of at least one metric.
+const FEWEST_METRICS: usize = 1;
 
 /// The graph's width in pixels when the definition names none: "width — The width of the
 /// graph in pixels. The default is 600." (the metric widget structure reference
@@ -102,6 +124,9 @@ pub enum View {
 /// its `metrics` array names.
 #[derive(Debug, Clone)]
 pub struct MetricWidget {
+    /// The text written over the graph: "title — The title to be displayed for the graph or
+    /// number." (the metric widget structure reference), `None` when the definition names none.
+    pub title: Option<String>,
     /// The graph's width in pixels.
     pub width: u32,
     /// The graph's height in pixels.
@@ -153,6 +178,12 @@ pub struct PlottedSeries {
     pub color: [u8; 3],
     /// Its `(epoch seconds, value)` points, oldest first.
     pub points: Vec<(f64, f64)>,
+    /// Whether part of the window the graph asks for could not be loaded for this series: "If
+    /// any metric on the graph could not load all the requested data points, an orange triangle
+    /// with an exclamation point appears next to the graph legend."
+    /// (`GetMetricWidgetImageInput$MetricWidget`) \u2014 so the shortfall is reported INSIDE the
+    /// image, beside this series' legend entry, rather than as a refusal of the call.
+    pub incomplete: bool,
 }
 
 /// The colours a graph assigns its series when their entries name none.
@@ -193,6 +224,9 @@ impl MetricWidget {
             })
             .ok_or_else(|| BAD_JSON_CONTENT.to_string())?;
 
+        // "title — The title to be displayed for the graph or number." (the metric widget
+        // structure reference) — the text belongs to the graph, so it is drawn into it.
+        let title = string_member(&widget, WIDGET_MEMBER, "title")?.map(String::from);
         let width = pixels(&widget, "width", DEFAULT_WIDTH)?;
         let height = pixels(&widget, "height", DEFAULT_HEIGHT)?;
         let view = view_of(&widget)?;
@@ -210,13 +244,16 @@ impl MetricWidget {
         let annotations = annotations_of(&widget)?;
 
         let entries = match widget.get(METRICS_MEMBER).filter(|value| !value.is_null()) {
-            None => return Err(super::parameter_required_message(&path(METRICS_MEMBER))),
+            None => return Err(should_have(METRICS_MEMBER)),
             Some(value) => value.as_array().ok_or_else(|| {
                 should_be(&pointer(&[METRICS_MEMBER]), JSON_ARRAY)
             })?,
         };
-        if entries.is_empty() {
-            return Err(super::parameter_required_message(&path(METRICS_MEMBER)));
+        if entries.len() < FEWEST_METRICS {
+            return Err(should_not_have_fewer_items(
+                &pointer(&[METRICS_MEMBER]),
+                FEWEST_METRICS,
+            ));
         }
         if entries.len() > MAX_WIDGET_METRICS {
             return Err(super::collection_too_large_message(
@@ -242,6 +279,7 @@ impl MetricWidget {
         }
 
         Ok(Self {
+            title,
             width,
             height,
             view,
@@ -707,25 +745,40 @@ fn rgb(text: &str) -> Option<[u8; 3]> {
 ///
 /// An entry the definition hides contributes no series to the graph while still resolving, so
 /// an expression can read it.
+///
+/// A graph is never REFUSED for the width of the window it asks for. This operation models no
+/// error at all and documents its own degradation instead — "If any metric on the graph could
+/// not load all the requested data points, an orange triangle with an exclamation point appears
+/// next to the graph legend." — so a window wider than this graph can be resolved over is
+/// resolved over the part it CAN be ([`resolved_window`]) and the shortfall is reported inside
+/// the image ([`PlottedSeries::incomplete`]). That is what makes a multi-year chart a graph of
+/// the history there is rather than a 4xx: the per-call datapoint ceiling the metric-read
+/// operations publish is theirs, not this one's.
 pub fn plotted_series(
     store: &State,
     widget: &MetricWidget,
     now: f64,
 ) -> Result<Vec<PlottedSeries>, QueryRefusal> {
-    if let Some(refused) =
-        metric_query::resolution_refusal(&widget.queries, widget.start, widget.end)
-    {
-        return Err(refused);
-    }
-
     let mut resolution = Resolution::default();
+    // The queries whose series the graph could not load the whole requested window of.
+    let mut incomplete: Vec<&str> = Vec::new();
     for query in &widget.queries {
         let Some(stat) = query.metric_stat.as_ref() else {
             continue;
         };
+        let window = resolved_window(widget, query.period.unwrap_or(stat.period), now);
+        if !window.whole {
+            incomplete.push(query.id.as_str());
+        }
         let series =
-            metric_query::retrieved_series(store, query, stat, widget.start, widget.end, now)?;
-        resolution.retrieve(query, series)?;
+            metric_query::retrieved_series(store, query, stat, window.start, window.end, now)?;
+        // The resolution's own retrieval ceiling is reached only by a store holding more points
+        // in the window than one resolution reads. A graph does not refuse that either: the
+        // series it could not take is the series whose data points did not all load.
+        if resolution.retrieve(query, series).is_err() && !incomplete.contains(&query.id.as_str())
+        {
+            incomplete.push(query.id.as_str());
+        }
     }
 
     let parsed = metric_query::parse_queries(&widget.queries)?;
@@ -737,17 +790,27 @@ pub fn plotted_series(
         let Some(query) = widget.queries.iter().find(|query| query.id == *id) else {
             continue;
         };
+        // An expression's own series is constructed over the window at ITS granularity, so the
+        // window it is evaluated over is the one that granularity can be resolved over — which
+        // is what bounds the points an expression of a wide window builds.
+        let period = metric_query::query_period(query);
+        let window = resolved_window(widget, period_of_seconds(period), now);
+        if !window.whole && !incomplete.contains(&query.id.as_str()) {
+            incomplete.push(query.id.as_str());
+        }
         let evaluated = resolution.evaluate(
             id,
             tree,
             &StoreSeriesSource {
                 store,
-                requested_start: widget.start,
-                end: widget.end,
+                // A search inside an expression discovers series over the same window the
+                // expression is evaluated over.
+                requested_start: window.start,
+                end: window.end,
                 now,
             },
-            (widget.start, widget.end),
-            metric_query::query_period(query),
+            (window.start, window.end),
+            period,
         )?;
         resolution.record(id, evaluated);
     }
@@ -757,17 +820,28 @@ pub fn plotted_series(
         if !plot.visible {
             continue;
         }
+        let short = incomplete.contains(&plot.id.as_str());
         let Some(value) = resolution.value(&plot.id) else {
+            // A series the graph holds no value for at all is still ON the graph when what is
+            // missing is its data: it is legended with the shortfall rather than left out.
+            if short {
+                plotted.push(PlottedSeries {
+                    label: legend_label(query, plot),
+                    color: plot.color,
+                    points: Vec::new(),
+                    incomplete: true,
+                });
+            }
             continue;
         };
         match value {
             MathValue::Series(series) => {
-                plotted.push(drawn(plot, query.label.as_deref(), series, 0));
+                plotted.push(drawn(plot, query.label.as_deref(), series, 0, short));
             }
             // A search answers with every series it matched, each drawn in its own colour.
             MathValue::Array(list) => {
                 for (position, series) in list.iter().enumerate() {
-                    plotted.push(drawn(plot, query.label.as_deref(), series, position));
+                    plotted.push(drawn(plot, query.label.as_deref(), series, position, short));
                 }
             }
             // A scalar holds across the whole window, which is how a graph draws one: a level
@@ -776,10 +850,76 @@ pub fn plotted_series(
                 label: query.label.clone().unwrap_or_else(|| plot.id.clone()),
                 color: plot.color,
                 points: vec![(widget.start, *number), (widget.end, *number)],
+                incomplete: short,
             }),
         }
     }
     Ok(plotted)
+}
+
+/// The window one query of a graph is RESOLVED over: the part of the graph's own window that
+/// query can be resolved over at all.
+///
+/// Two bounds place it, and each bounds the WORK a definition can ask for rather than refusing
+/// it:
+///
+/// * A datapoint is readable at a granularity only while the retention tier of that granularity
+///   still holds it ([`super::retention_secs_at_period`]), so the window opens no earlier than
+///   that tier's horizon: a graph of several years is drawn of the history there is.
+/// * It then spans no more than [`metric_query::MAX_RETRIEVED_POINTS`] of the query's own period
+///   windows — the data points one resolution reads at all — so the windows one query folds, and
+///   the points an expression's constructed series is spaced into, are bounded by this emulator
+///   rather than by the `end` the definition names, which a signed ISO 8601 offset can place
+///   arbitrarily far in the future. The same kind of ceiling as the bitmap's own
+///   ([`MAX_IMAGE_SIDE`]): what one caller may ask this process to allocate.
+///
+/// `whole` is whether that is the whole window the definition asked for. A query for which it is
+/// not could not load all the requested data points, which the image says beside that query's
+/// legend entry ([`PlottedSeries::incomplete`]).
+fn resolved_window(widget: &MetricWidget, period: i32, now: f64) -> ResolvedWindow {
+    let span = f64::from(period.max(1));
+    let start = widget.start.max(now - super::retention_secs_at_period(period.max(1)));
+    #[allow(clippy::cast_precision_loss)]
+    let widest = span * metric_query::MAX_RETRIEVED_POINTS as f64;
+    let end = widget.end.min(start + widest);
+    ResolvedWindow {
+        start,
+        end,
+        whole: start <= widget.start && end >= widget.end,
+    }
+}
+
+/// The window one query of a graph is resolved over ([`resolved_window`]).
+#[derive(Debug, Clone, Copy)]
+struct ResolvedWindow {
+    /// Its first instant, in epoch seconds.
+    start: f64,
+    /// The first instant after it, in epoch seconds.
+    end: f64,
+    /// Whether it is the whole window the definition asked for.
+    whole: bool,
+}
+
+/// The granularity `seconds` names, as a retention tier is keyed by — a period no reading of this
+/// store takes as a wider number than it can hold.
+#[allow(clippy::cast_possible_truncation)]
+fn period_of_seconds(seconds: f64) -> i32 {
+    seconds.max(1.0).min(f64::from(i32::MAX)) as i32
+}
+
+/// The label a series with no value at all is legended under: the one the entry asks for, else
+/// the metric it names, else the id it resolves under.
+fn legend_label(query: &MetricDataQuery, plot: &Plot) -> String {
+    query
+        .label
+        .clone()
+        .or_else(|| {
+            query
+                .metric_stat
+                .as_ref()
+                .and_then(|stat| stat.metric.metric_name.clone())
+        })
+        .unwrap_or_else(|| plot.id.clone())
 }
 
 /// One resolved series as the graph draws it: the label the entry asks for, else the one the
@@ -790,6 +930,7 @@ fn drawn(
     label: Option<&str>,
     series: &MathSeries,
     position: usize,
+    incomplete: bool,
 ) -> PlottedSeries {
     PlottedSeries {
         label: label.unwrap_or(series.label.as_str()).to_string(),
@@ -799,5 +940,6 @@ fn drawn(
             PALETTE[position % PALETTE.len()]
         },
         points: series.points.clone(),
+        incomplete,
     }
 }
