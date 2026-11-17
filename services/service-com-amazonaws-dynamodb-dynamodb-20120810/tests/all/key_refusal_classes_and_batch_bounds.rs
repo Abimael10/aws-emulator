@@ -15,19 +15,21 @@
 //! schema's shape, and an item that gives no value for either key.
 //!
 //! RULE 2 — WHICH side decided a bad key decides which answer states it inside a
-//! transaction: a key the TABLE's key schema does not admit (a type it does not declare
-//! for that attribute, a value past the size limit of the role it gives it) cancels the
+//! transaction: a key the TABLE's key schema does not admit — a type it does not declare
+//! for that attribute, a value past the size limit of the role it gives it, an attribute it
+//! declares no key for, or a key element a `Key`-shaped member leaves out — cancels the
 //! element with the documented `ValidationError` reason, while a member that is not shaped
-//! like a key at all (a key attribute no value was given for, a value that is no value of
-//! its own type) is the request's own defect and refuses the call. The rows span the
-//! defect class, the action the key arrived in, and both transactional surfaces.
+//! like a key for any schema to be read against (an `Item` that gives no value for a key
+//! attribute, a member carrying no attribute at all, a value that is no value of its own
+//! type) is the request's own defect and refuses the call. The rows span the defect class,
+//! the action the key arrived in, and both transactional surfaces.
 //!
 //! RULE 3 — a refusal about a VALUE a request carried is stated inside the
 //! `<N> validation error(s) detected: ` envelope by the operations that WRITE an item and
-//! as the sentence alone by the operations that READ one; a value in the `Key` of ONE
-//! ELEMENT of a multi-item request is that element's member rather than the request's, so
-//! it is stated alone there too. The rows span the operation, the member the value arrived
-//! in and the malformed numeric texts.
+//! as the sentence alone by the operations that READ one; a value in ONE ELEMENT of a
+//! multi-item request is that element's member rather than the request's, so a transaction
+//! states it alone there too, in a `Key` and in the `Item` a `Put` writes alike. The rows
+//! span the operation, the member the value arrived in and the malformed numeric texts.
 //!
 //! RULE 4 — "Edits an existing item's attributes, or adds a new item to the table if it
 //! does not already exist" is read as what the update WRITES: an update that states
@@ -41,11 +43,32 @@
 //! groups them under, and reports a violation of it over the member path the request
 //! validator builds. The rows span both ends of the bound, the bound itself, and how the
 //! requests are spread over tables.
+//!
+//! RULE 6 — a `Key` member's value is held to the documented rules of its own TYPE before
+//! it is held to the key schema, and the clause that rule states takes the form RULE 3
+//! gives it: the operations that WRITE state it inside the envelope and the operations that
+//! READ state it alone. The rows span the three set types, both set rules, and the reading
+//! and writing surfaces a key arrives on, the paging members included.
+//!
+//! RULE 7 — the side that decided a bad key (RULE 2) is decided by what had to be READ to
+//! decide it: every way a NON-EMPTY `Key` differs from the table's key schema — an
+//! attribute that schema declares no key for, a spare one beside the key, a key element
+//! left out — is decided against that table, so a transaction cancels the element that
+//! carried it, while a `Key` carrying no attribute at all states no key for any schema to
+//! be read against and refuses the call. The rows span the defect, the action the key
+//! arrived in and both transactional surfaces.
+//!
+//! RULE 8 — a resume token for a read of a secondary index carries that index's key
+//! attributes beside the table's, and each of them is held to the same per-VALUE rules
+//! every key attribute is held to — a non-empty `S`/`B` value, the documented numeric
+//! domain, the set rules — each stating that rule's own sentence, naming the attribute. The
+//! rows span the index kind, the attribute's role in its key schema, the value type and the
+//! paged read.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::emulator::{call, emulator, error_code, message, ok};
+use crate::emulator::{call, describe_when_active, emulator, error_code, message, ok};
 use crate::table_items::create_active_table;
 
 /// The clause every refusal of a parameter value in this service opens with.
@@ -192,9 +215,11 @@ async fn a_transactional_key_is_answered_by_the_side_that_decided_it() {
 
     // Each row: the case, the whole transaction, which answer it earns, and the sentence
     // that answer states. The rows span the defect class (a type the schema does not
-    // declare, a value past the role's size limit, a key no value was given for, a number
-    // whose text is no number), the action the key arrived in (`Put`'s item, `Delete`,
-    // `ConditionCheck`, `Update`, `Get`) and both transactional surfaces.
+    // declare, a value past the role's size limit, a key element a `Key` member leaves
+    // out, an attribute the schema declares no key for, a member carrying no attribute at
+    // all, an item that gives no value for either key), the action the key arrived in
+    // (`Put`'s item, `Delete`, `ConditionCheck`, `Update`, `Get`) and both transactional
+    // surfaces.
     let rows: Vec<(&str, &str, Value, Answer, String)> = vec![
         (
             "a put item whose partition key has a type the schema does not declare",
@@ -253,11 +278,14 @@ async fn a_transactional_key_is_answered_by_the_side_that_decided_it() {
             KEY_SCHEMA_MISMATCH.to_string(),
         ),
         (
+            // A `Key`-shaped member names the primary key as a whole, so which elements
+            // it has to name is the TABLE's key schema to say: a non-empty map that
+            // leaves one out is refused against that schema and cancels the element.
             "a delete key that gives no value for the sort key",
             "TransactWriteItems",
             json!({"TransactItems": [{"Delete": {"TableName": "Keys",
                                                  "Key": {"pk": {"S": "k"}}}}]}),
-            Answer::Refuses,
+            Answer::Cancels,
             KEY_SCHEMA_MISMATCH.to_string(),
         ),
         (
@@ -265,15 +293,25 @@ async fn a_transactional_key_is_answered_by_the_side_that_decided_it() {
             "TransactGetItems",
             json!({"TransactItems": [{"Get": {"TableName": "Keys",
                                               "Key": {"pk": {"S": "k"}}}}]}),
-            Answer::Refuses,
+            Answer::Cancels,
             KEY_SCHEMA_MISMATCH.to_string(),
         ),
         (
+            // Deciding that `spare` is no key of this table needs that table too.
             "a delete key naming an attribute the schema does not declare",
             "TransactWriteItems",
             json!({"TransactItems": [{"Delete": {
                 "TableName": "Keys",
                 "Key": {"pk": {"S": "k"}, "sk": {"S": "s"}, "spare": {"S": "x"}}}}]}),
+            Answer::Cancels,
+            KEY_SCHEMA_MISMATCH.to_string(),
+        ),
+        (
+            // A `Key` member carrying NO attribute at all states no key for any schema to
+            // be read against, which is the request's own defect.
+            "a delete key carrying no attribute at all",
+            "TransactWriteItems",
+            json!({"TransactItems": [{"Delete": {"TableName": "Keys", "Key": {}}}]}),
             Answer::Refuses,
             KEY_SCHEMA_MISMATCH.to_string(),
         ),
@@ -385,15 +423,6 @@ async fn a_value_refusal_carries_the_envelope_on_a_write_and_not_on_a_read() {
                        "UpdateExpression": "SET note = :v",
                        "ExpressionAttributeValues": {":v": {"S": "x"}}}),
             ),
-            (
-                // The ITEM a transactional `Put` writes is held to the rules a written
-                // item is held to everywhere, so its clause keeps the envelope too.
-                "the item of a transactional put",
-                "TransactWriteItems",
-                json!({"TransactItems": [{"Put": {"TableName": "Numbers",
-                                                  "Item": {"pk": {"S": "k"},
-                                                           "v": {"N": text}}}}]}),
-            ),
         ] {
             let case = format!("{text:?} written through {case}");
             let stated = refusal(&router, &case, operation, request).await;
@@ -403,8 +432,9 @@ async fn a_value_refusal_carries_the_envelope_on_a_write_and_not_on_a_read() {
             );
         }
 
-        // An ELEMENT's own `Key` is that element's member rather than the request's, so
-        // its clause is stated outside the envelope on the transactional write as well.
+        // An ELEMENT's own members are that element's rather than the request's, so every
+        // clause a transaction states about a value one of its elements carried — in a
+        // `Key` and in the `Item` a `Put` writes alike — is stated outside the envelope.
         for (case, request) in [
             (
                 "a transactional delete's key",
@@ -416,6 +446,12 @@ async fn a_value_refusal_carries_the_envelope_on_a_write_and_not_on_a_read() {
                 json!({"TransactItems": [{"ConditionCheck": {
                     "TableName": "Numbers", "Key": {"pk": {"N": text}},
                     "ConditionExpression": "attribute_exists(pk)"}}]}),
+            ),
+            (
+                "a transactional put's item",
+                json!({"TransactItems": [{"Put": {"TableName": "Numbers",
+                                                  "Item": {"pk": {"S": "k"},
+                                                           "v": {"N": text}}}}]}),
             ),
         ] {
             let case = format!("{text:?} in {case}");
@@ -800,4 +836,498 @@ async fn a_refused_request_map_renders_the_values_the_request_nested() {
         json!({}),
         "case a nested value inside the bound: expected it written in full, got {served}"
     );
+}
+
+// ===========================================================================
+// RULE 6. A key value is held to its own type's rules, in the form its
+// operation states clauses in
+// ===========================================================================
+
+#[tokio::test]
+async fn a_key_collection_clause_takes_the_form_its_operation_states() {
+    let router = emulator();
+    create_active_table(&router, "Sets", &[("pk", "HASH", "S")]).await;
+
+    // Each row: the value the `Key` member carries for the partition key, and the clause
+    // the rule that value breaks states. The rows span the three set types and both
+    // documented set rules (a set may not be empty, and may not list one member twice —
+    // `NS` members compared as the numbers they are, so two spellings of one number are
+    // one member).
+    let values: Vec<(&str, Value, String)> = vec![
+        (
+            "a string set listing one member twice",
+            json!({"SS": ["a", "a"]}),
+            format!("{INVALID_PARAMETER}: Input collection [\"a\", \"a\"] contains duplicates."),
+        ),
+        (
+            "a number set listing one number twice, spelled differently",
+            json!({"NS": ["1", "1.00"]}),
+            format!("{INVALID_PARAMETER}: Input collection contains duplicates."),
+        ),
+        (
+            "a binary set listing one member twice",
+            json!({"BS": ["YQ==", "YQ=="]}),
+            format!(
+                "{INVALID_PARAMETER}: Input collection [\"YQ==\",\"YQ==\"]of type BS contains \
+                 duplicates."
+            ),
+        ),
+        (
+            "an empty string set",
+            json!({"SS": []}),
+            format!("{INVALID_PARAMETER}: An string set  may not be empty"),
+        ),
+        (
+            "an empty number set",
+            json!({"NS": []}),
+            format!("{INVALID_PARAMETER}: An number set  may not be empty"),
+        ),
+        (
+            "an empty binary set",
+            json!({"BS": []}),
+            format!("{INVALID_PARAMETER}: Binary sets should not be empty"),
+        ),
+    ];
+
+    for (case, value, clause) in values {
+        // The READS the key arrives on — the single-item read, both multi-item reads, and
+        // the paging member of each paged read — state the clause alone.
+        for (surface, operation, request) in [
+            (
+                "GetItem",
+                "GetItem",
+                json!({"TableName": "Sets", "Key": {"pk": value.clone()}}),
+            ),
+            (
+                "a batched get",
+                "BatchGetItem",
+                json!({"RequestItems": {"Sets": {"Keys": [{"pk": value.clone()}]}}}),
+            ),
+            (
+                "a transactional get",
+                "TransactGetItems",
+                json!({"TransactItems": [{"Get": {"TableName": "Sets",
+                                                  "Key": {"pk": value.clone()}}}]}),
+            ),
+            (
+                "a query's resume token",
+                "Query",
+                json!({"TableName": "Sets",
+                       "KeyConditionExpression": "pk = :p",
+                       "ExpressionAttributeValues": {":p": {"S": "k"}},
+                       "ExclusiveStartKey": {"pk": value.clone()}}),
+            ),
+            (
+                "a scan's resume token",
+                "Scan",
+                json!({"TableName": "Sets", "ExclusiveStartKey": {"pk": value.clone()}}),
+            ),
+        ] {
+            let case = format!("{case} read through {surface}");
+            let stated = refusal(&router, &case, operation, request).await;
+            assert_eq!(
+                stated, clause,
+                "case {case:?}: expected the sentence alone, got {stated:?}"
+            );
+        }
+
+        // The WRITES state the same clause inside the envelope that counts the clauses.
+        let enveloped = format!("1 validation error detected: {clause}");
+        for (surface, operation, request) in [
+            (
+                "DeleteItem",
+                "DeleteItem",
+                json!({"TableName": "Sets", "Key": {"pk": value.clone()}}),
+            ),
+            (
+                "UpdateItem",
+                "UpdateItem",
+                json!({"TableName": "Sets", "Key": {"pk": value.clone()},
+                       "UpdateExpression": "SET note = :v",
+                       "ExpressionAttributeValues": {":v": {"S": "x"}}}),
+            ),
+        ] {
+            let case = format!("{case} written through {surface}");
+            let stated = refusal(&router, &case, operation, request).await;
+            assert_eq!(
+                stated, enveloped,
+                "case {case:?}: expected the enveloped clause, got {stated:?}"
+            );
+        }
+    }
+
+    // A set that breaks neither rule is simply not the type the schema declares for the
+    // key, so it earns the key-schema sentence instead: the rows above are about the
+    // collections and not about a key being a set.
+    let stated = refusal(
+        &router,
+        "a well-formed set where the schema declares a string",
+        "GetItem",
+        json!({"TableName": "Sets", "Key": {"pk": {"SS": ["a", "b"]}}}),
+    )
+    .await;
+    assert_eq!(
+        stated, KEY_SCHEMA_MISMATCH,
+        "case a well-formed set: expected {KEY_SCHEMA_MISMATCH:?}, got {stated:?}"
+    );
+}
+
+// ===========================================================================
+// RULE 7. What had to be read to decide a bad key decides who answers it
+// ===========================================================================
+
+/// One transaction carrying a `Key` that is not this table's primary key: the answer it
+/// earns, as the `CancellationReason$Code`s of a cancellation, or `None` where the whole
+/// call is refused and nothing is cancelled.
+struct Classified {
+    case: &'static str,
+    operation: &'static str,
+    request: Value,
+    reasons: Option<Vec<&'static str>>,
+}
+
+#[tokio::test]
+async fn a_key_the_schema_decided_cancels_its_element_and_an_empty_one_refuses_the_call() {
+    let router = emulator();
+    create_active_table(
+        &router,
+        "Decided",
+        &[("pk", "HASH", "S"), ("sk", "RANGE", "S")],
+    )
+    .await;
+    // The element nothing is wrong with, so a cancellation has a `None` reason to report
+    // beside the one it names.
+    let innocent = json!({"Put": {"TableName": "Decided",
+                                  "Item": {"pk": {"S": "ok"}, "sk": {"S": "ok"}}}});
+
+    // The rows span HOW the key differs from the schema (an attribute it declares no key
+    // for, a spare attribute beside the key, a key element left out, no attribute at all),
+    // the action the key arrived in (`Delete`, `ConditionCheck`, `Update`, `Get`), both
+    // transactional surfaces, and the position of the offending element.
+    let rows: Vec<Classified> = vec![
+        Classified {
+            case: "a delete key naming an attribute the schema declares no key for",
+            operation: "TransactWriteItems",
+            request: json!({"TransactItems": [{"Delete": {
+                "TableName": "Decided", "Key": {"other": {"S": "x"}}}}]}),
+            reasons: Some(vec!["ValidationError"]),
+        },
+        Classified {
+            case: "that key after an element nothing is wrong with",
+            operation: "TransactWriteItems",
+            request: json!({"TransactItems": [
+                innocent.clone(),
+                {"Delete": {"TableName": "Decided", "Key": {"other": {"S": "x"}}}},
+            ]}),
+            reasons: Some(vec!["None", "ValidationError"]),
+        },
+        Classified {
+            case: "a delete key carrying a spare attribute beside both keys",
+            operation: "TransactWriteItems",
+            request: json!({"TransactItems": [{"Delete": {
+                "TableName": "Decided",
+                "Key": {"pk": {"S": "k"}, "sk": {"S": "s"}, "spare": {"S": "x"}}}}]}),
+            reasons: Some(vec!["ValidationError"]),
+        },
+        Classified {
+            case: "a condition check key that leaves the sort key out",
+            operation: "TransactWriteItems",
+            request: json!({"TransactItems": [{"ConditionCheck": {
+                "TableName": "Decided", "Key": {"pk": {"S": "k"}},
+                "ConditionExpression": "attribute_exists(pk)"}}]}),
+            reasons: Some(vec!["ValidationError"]),
+        },
+        Classified {
+            case: "an update key that leaves the sort key out",
+            operation: "TransactWriteItems",
+            request: json!({"TransactItems": [{"Update": {
+                "TableName": "Decided", "Key": {"pk": {"S": "k"}},
+                "UpdateExpression": "SET note = :v",
+                "ExpressionAttributeValues": {":v": {"S": "x"}}}}]}),
+            reasons: Some(vec!["ValidationError"]),
+        },
+        Classified {
+            case: "a get key naming an attribute the schema declares no key for",
+            operation: "TransactGetItems",
+            request: json!({"TransactItems": [{"Get": {
+                "TableName": "Decided", "Key": {"other": {"S": "x"}}}}]}),
+            reasons: Some(vec!["ValidationError"]),
+        },
+        Classified {
+            case: "a get key that leaves the sort key out, second of two",
+            operation: "TransactGetItems",
+            request: json!({"TransactItems": [
+                {"Get": {"TableName": "Decided",
+                         "Key": {"pk": {"S": "ok"}, "sk": {"S": "ok"}}}},
+                {"Get": {"TableName": "Decided", "Key": {"pk": {"S": "k"}}}},
+            ]}),
+            reasons: Some(vec!["None", "ValidationError"]),
+        },
+        Classified {
+            case: "a delete key carrying no attribute at all",
+            operation: "TransactWriteItems",
+            request: json!({"TransactItems": [{"Delete": {
+                "TableName": "Decided", "Key": {}}}]}),
+            reasons: None,
+        },
+        Classified {
+            case: "a get key carrying no attribute at all",
+            operation: "TransactGetItems",
+            request: json!({"TransactItems": [{"Get": {
+                "TableName": "Decided", "Key": {}}}]}),
+            reasons: None,
+        },
+    ];
+
+    for row in rows {
+        let (status, answered) = call(&router, row.operation, row.request.clone()).await;
+        let Some(expected) = row.reasons else {
+            assert_eq!(
+                (status, error_code(&answered).as_str(), message(&answered)),
+                (400, "ValidationException", KEY_SCHEMA_MISMATCH.to_string()),
+                "case {:?} ({}): expected the call refused with {KEY_SCHEMA_MISMATCH:?}, got \
+                 {status} with {answered}",
+                row.case,
+                row.operation
+            );
+            assert!(
+                answered.get("CancellationReasons").is_none(),
+                "case {:?} ({}): a request-level refusal cancels nothing, got {answered}",
+                row.case,
+                row.operation
+            );
+            continue;
+        };
+        assert_eq!(
+            (status, error_code(&answered).as_str()),
+            (400, "TransactionCanceledException"),
+            "case {:?} ({}): expected the element cancelled, got {status} with {answered}",
+            row.case,
+            row.operation
+        );
+        let reported: Vec<String> = answered["CancellationReasons"]
+            .as_array()
+            .map(|reasons| {
+                reasons
+                    .iter()
+                    .map(|reason| reason["Code"].as_str().unwrap_or_default().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            reported, expected,
+            "case {:?} ({}): expected the reason codes {expected:?}, got {answered}",
+            row.case, row.operation
+        );
+        let at = expected
+            .iter()
+            .position(|code| *code == "ValidationError")
+            .expect("a cancelling row names the refused element");
+        assert_eq!(
+            answered["CancellationReasons"][at]["Message"],
+            json!(KEY_SCHEMA_MISMATCH),
+            "case {:?} ({}): expected the element's reason to state \
+             {KEY_SCHEMA_MISMATCH:?}, got {answered}",
+            row.case,
+            row.operation
+        );
+    }
+
+    // The single-item surfaces have no element to cancel, so the same keys are the
+    // refusals they always were: the rows above are about which ANSWER states the
+    // sentence, not about the sentence.
+    for (case, operation, request) in [
+        (
+            "an unknown attribute on GetItem",
+            "GetItem",
+            json!({"TableName": "Decided", "Key": {"other": {"S": "x"}}}),
+        ),
+        (
+            "a key omitting the sort key on DeleteItem",
+            "DeleteItem",
+            json!({"TableName": "Decided", "Key": {"pk": {"S": "k"}}}),
+        ),
+    ] {
+        let stated = refusal(&router, case, operation, request).await;
+        assert_eq!(
+            stated, KEY_SCHEMA_MISMATCH,
+            "case {case:?}: expected {KEY_SCHEMA_MISMATCH:?}, got {stated:?}"
+        );
+    }
+}
+
+// ===========================================================================
+// RULE 8. An index cursor's values are held to the key-value rules
+// ===========================================================================
+
+/// The table RULE 8 is read against: a composite primary key, a global secondary index
+/// over a string and a number, a second global one over a binary attribute, and a local
+/// one over the table's own partition key.
+async fn create_cursor_table(router: &MultiServiceRouter) {
+    ok(
+        router,
+        "CreateTable",
+        json!({
+            "TableName": "Cursors",
+            "BillingMode": "PAY_PER_REQUEST",
+            "KeySchema": [
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "sk", "KeyType": "RANGE"},
+            ],
+            "AttributeDefinitions": [
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "sk", "AttributeType": "N"},
+                {"AttributeName": "tag", "AttributeType": "S"},
+                {"AttributeName": "rank", "AttributeType": "N"},
+                {"AttributeName": "bkey", "AttributeType": "B"},
+            ],
+            "GlobalSecondaryIndexes": [
+                {
+                    "IndexName": "ByTag",
+                    "KeySchema": [
+                        {"AttributeName": "tag", "KeyType": "HASH"},
+                        {"AttributeName": "rank", "KeyType": "RANGE"},
+                    ],
+                    "Projection": {"ProjectionType": "ALL"},
+                },
+                {
+                    "IndexName": "ByBlob",
+                    "KeySchema": [{"AttributeName": "bkey", "KeyType": "HASH"}],
+                    "Projection": {"ProjectionType": "ALL"},
+                },
+            ],
+            "LocalSecondaryIndexes": [{
+                "IndexName": "ByRank",
+                "KeySchema": [
+                    {"AttributeName": "pk", "KeyType": "HASH"},
+                    {"AttributeName": "rank", "KeyType": "RANGE"},
+                ],
+                "Projection": {"ProjectionType": "ALL"},
+            }],
+        }),
+    )
+    .await;
+    describe_when_active(router, "the cursor table", "Cursors").await;
+    ok(
+        router,
+        "PutItem",
+        json!({"TableName": "Cursors", "Item": {
+            "pk": {"S": "k"}, "sk": {"N": "1"},
+            "tag": {"S": "t"}, "rank": {"N": "2"}, "bkey": {"B": "YQ=="},
+        }}),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn an_index_cursor_holds_each_key_value_to_the_rule_of_its_own_type() {
+    let router = emulator();
+    create_cursor_table(&router).await;
+
+    // Each row: the index the read pages (`None` for the base table), the cursor it
+    // carries, and the sentence the rule that cursor's value breaks states. The rows span
+    // the schema being paged (the base table, a global index's hash and sort key, a second
+    // global index's binary key, a local index's sort key), the rule broken (an empty `S`
+    // value, an empty `B` value, a text that is no number, a set listing one member twice)
+    // and the attribute's role in the schema that declares it.
+    let empty_string = "One or more parameter values are not valid. The AttributeValue for a key \
+                        attribute cannot contain an empty string value. Key:";
+    let empty_binary = "One or more parameter values are not valid. The AttributeValue for a key \
+                        attribute cannot contain an empty binary value. Key:";
+    let rows: Vec<(&str, Option<&str>, Value, String)> = vec![
+        (
+            "the base table's partition key, empty",
+            None,
+            json!({"pk": {"S": ""}, "sk": {"N": "1"}}),
+            format!("{empty_string} pk"),
+        ),
+        (
+            "a global index's hash key, empty",
+            Some("ByTag"),
+            json!({"tag": {"S": ""}, "rank": {"N": "2"},
+                   "pk": {"S": "k"}, "sk": {"N": "1"}}),
+            format!("{empty_string} tag"),
+        ),
+        (
+            "a global index's binary hash key, empty",
+            Some("ByBlob"),
+            json!({"bkey": {"B": ""}, "pk": {"S": "k"}, "sk": {"N": "1"}}),
+            format!("{empty_binary} bkey"),
+        ),
+        (
+            "a global index's sort key, no number",
+            Some("ByTag"),
+            json!({"tag": {"S": "t"}, "rank": {"N": "nope"},
+                   "pk": {"S": "k"}, "sk": {"N": "1"}}),
+            "The parameter cannot be converted to a numeric value: nope".to_string(),
+        ),
+        (
+            "a local index's sort key, no number",
+            Some("ByRank"),
+            json!({"pk": {"S": "k"}, "rank": {"N": "1.2.3"}, "sk": {"N": "1"}}),
+            "The parameter cannot be converted to a numeric value: 1.2.3".to_string(),
+        ),
+        (
+            "a global index's hash key carrying a set that lists one member twice",
+            Some("ByTag"),
+            json!({"tag": {"SS": ["a", "a"]}, "rank": {"N": "2"},
+                   "pk": {"S": "k"}, "sk": {"N": "1"}}),
+            format!("{INVALID_PARAMETER}: Input collection [\"a\", \"a\"] contains duplicates."),
+        ),
+    ];
+
+    for (case, index, cursor, clause) in rows {
+        for operation in ["Query", "Scan"] {
+            let mut request = json!({"TableName": "Cursors", "ExclusiveStartKey": cursor.clone()});
+            if let Some(index) = index {
+                request["IndexName"] = json!(index);
+            }
+            if operation == "Query" {
+                // The condition names the partition key of the schema being paged, with an
+                // operand of the type that schema declares for it.
+                let (attribute, value) = match index {
+                    Some("ByTag") => ("tag", json!({"S": "t"})),
+                    Some("ByBlob") => ("bkey", json!({"B": "YQ=="})),
+                    _ => ("pk", json!({"S": "k"})),
+                };
+                request["KeyConditionExpression"] = json!(format!("{attribute} = :p"));
+                request["ExpressionAttributeValues"] = json!({":p": value});
+            }
+            let case = format!("{case} on {operation}");
+            let stated = refusal(&router, &case, operation, request).await;
+            assert_eq!(
+                stated, clause,
+                "case {case:?}: expected {clause:?}, got {stated:?}"
+            );
+        }
+    }
+
+    // A cursor whose values break no rule pages the read rather than earning a sentence,
+    // so the rows above are about the values and not about the cursors.
+    for (case, request) in [
+        (
+            "the base table's own key",
+            json!({"TableName": "Cursors",
+                   "ExclusiveStartKey": {"pk": {"S": "k"}, "sk": {"N": "1"}}}),
+        ),
+        (
+            "a global index's key beside the table's",
+            json!({"TableName": "Cursors", "IndexName": "ByTag",
+                   "ExclusiveStartKey": {"tag": {"S": "t"}, "rank": {"N": "2"},
+                                         "pk": {"S": "k"}, "sk": {"N": "1"}}}),
+        ),
+        (
+            "a local index's key beside the table's",
+            json!({"TableName": "Cursors", "IndexName": "ByRank",
+                   "ExclusiveStartKey": {"pk": {"S": "k"}, "rank": {"N": "2"},
+                                         "sk": {"N": "1"}}}),
+        ),
+    ] {
+        let page = ok(&router, "Scan", request).await;
+        assert_eq!(
+            page["Count"],
+            json!(0),
+            "case {case:?}: the page resumes strictly after the only item, got {page}"
+        );
+    }
 }

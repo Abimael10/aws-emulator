@@ -223,6 +223,9 @@ async fn a_null_attribute_value_must_state_true() {
             format!("{ENVELOPE}{NULL_CLAUSE}"),
         ),
         (
+            // A value in ONE ELEMENT of a transaction is that element's member rather
+            // than the request's, so the clause is stated alone — the same split the
+            // element's `Key` and its expression members follow.
             "a NULL a transactional put carries",
             "TransactWriteItems",
             json!({
@@ -231,7 +234,7 @@ async fn a_null_attribute_value_must_state_true() {
                              "Item": {"pk": {"S": "n5"}, "flag": {"NULL": false}}}},
                 ],
             }),
-            format!("{ENVELOPE}{NULL_CLAUSE}"),
+            NULL_CLAUSE.to_string(),
         ),
         (
             // A read states its value clauses bare, which is the same split every other

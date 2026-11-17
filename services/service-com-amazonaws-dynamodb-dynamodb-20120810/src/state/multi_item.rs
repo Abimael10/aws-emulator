@@ -829,15 +829,17 @@ pub const INVALID_PARAMETER_CLAUSE: &str = "One or more parameter values were in
 ///
 /// * [`Self::Schema`] — the value is a well-formed attribute value and the table's KEY
 ///   SCHEMA is what does not admit it: a type the schema does not declare for that
-///   attribute, or a value past the size limit of the role the schema gives it. Deciding
-///   it needs the table, so it is a refusal OF THAT ELEMENT and the transaction cancels
-///   with the documented `ValidationError` reason
+///   attribute, a value past the size limit of the role the schema gives it, an attribute
+///   the schema declares no key for, or a key element a `Key`-shaped member leaves out.
+///   Deciding it needs the table, so it is a refusal OF THAT ELEMENT and the transaction
+///   cancels with the documented `ValidationError` reason
 ///   ([`cancelled_by_element_reasons`]).
-/// * [`Self::Request`] — the member the request sent is not shaped like a key at all: a
-///   key attribute it supplied no value for, a value that is no value of its own type (a
-///   number whose text is not a number), an empty key value, or an attribute that is no
-///   key of the schema. Deciding it is deciding about the REQUEST, so the whole call is
-///   refused with that `ValidationException` and nothing is cancelled.
+/// * [`Self::Request`] — the member the request sent is not shaped like a key for any
+///   schema to be read against: a member carrying no attribute at all, an `Item` that
+///   gives no value for a key attribute, a value that is no value of its own type (a
+///   number whose text is not a number), or an empty key value. Deciding it is deciding
+///   about the REQUEST, so the whole call is refused with that `ValidationException` and
+///   nothing is cancelled.
 ///
 /// The SENTENCE is the same either way — each path words its refusal exactly as the
 /// single-item one does — so what this carries is only which answer states it.

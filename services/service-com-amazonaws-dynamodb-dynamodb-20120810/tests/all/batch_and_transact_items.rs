@@ -1214,8 +1214,10 @@ async fn a_refusals_class_says_whether_the_transaction_was_cancelled() {
                 innocent.clone(),
                 json!({"Delete": {"TableName": table, "Key": {"other": {"S": "x"}}}}),
             ],
-            code: "ValidationException",
-            reasons: None,
+            // Deciding that `other` is no key of this table needs the table's own key
+            // schema, so the element that carried it cancels the transaction.
+            code: "TransactionCanceledException",
+            reasons: Some(vec!["None", "ValidationError"]),
             message: KEY_SCHEMA_MISMATCH,
         },
         Row {

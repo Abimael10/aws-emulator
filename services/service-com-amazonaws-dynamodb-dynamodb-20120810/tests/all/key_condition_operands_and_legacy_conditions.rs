@@ -824,30 +824,37 @@ async fn a_key_value_is_held_to_the_rules_of_its_own_type_first() {
     let router = emulator();
     seeded(&router).await;
 
-    // Each row: the value a `Key` member carries for the partition key, and the clause it
-    // earns. The rows span the three set types and both set rules, beside a set that
-    // breaks neither and is simply not the type the schema declares.
-    let cases: Vec<(&str, Value, &str)> = vec![
+    // Each row: the value a `Key` member carries for the partition key, the clause it
+    // earns, and whether that clause is one about the VALUE the member carried — which a
+    // WRITE states inside the `<N> validation error(s) detected: ` envelope and a READ
+    // states alone — or the key-schema sentence, which is fixed on every surface. The rows
+    // span the three set types and both set rules, beside a set that breaks neither and is
+    // simply not the type the schema declares.
+    let cases: Vec<(&str, Value, &str, bool)> = vec![
         (
             "a string set listing one member twice",
             json!({"SS": ["a", "a"]}),
             "One or more parameter values were invalid: Input collection [\"a\", \"a\"] \
              contains duplicates.",
+            true,
         ),
         (
             "a number set listing one member twice, spelled differently",
             json!({"NS": ["1", "1.0"]}),
             "One or more parameter values were invalid: Input collection contains duplicates.",
+            true,
         ),
         (
             "an empty string set",
             json!({"SS": []}),
             "One or more parameter values were invalid: An string set  may not be empty",
+            true,
         ),
         (
             "an empty binary set",
             json!({"BS": []}),
             "One or more parameter values were invalid: Binary sets should not be empty",
+            true,
         ),
         (
             // The collection breaks no rule of its own, so the key is held to the SCHEMA
@@ -855,13 +862,19 @@ async fn a_key_value_is_held_to_the_rules_of_its_own_type_first() {
             "a well-formed set of the wrong type for the key",
             json!({"SS": ["a", "b"]}),
             "The provided key element does not match the schema",
+            false,
         ),
     ];
-    for (case, value, clause) in cases {
-        // A clause about the COLLECTION a key carried is stated on its own, whichever
-        // operation the key arrived on: it refuses the value for what it is rather than
-        // reporting a constraint on the member that carried it.
+    for (case, value, clause, about_the_value) in cases {
+        // A clause about the COLLECTION a key carried is the rule that collection broke,
+        // whichever operation the key arrived on; only its FORM follows that operation, the
+        // way every other clause about a value this service was handed does.
         for operation in ["GetItem", "DeleteItem"] {
+            let expected = if about_the_value && operation == "DeleteItem" {
+                format!("1 validation error detected: {clause}")
+            } else {
+                clause.to_string()
+            };
             let stated = refusal(
                 &router,
                 case,
@@ -871,8 +884,8 @@ async fn a_key_value_is_held_to_the_rules_of_its_own_type_first() {
             )
             .await;
             assert_eq!(
-                stated, clause,
-                "case {case:?} through {operation}: expected {clause:?}, got {stated:?}"
+                stated, expected,
+                "case {case:?} through {operation}: expected {expected:?}, got {stated:?}"
             );
         }
     }
@@ -901,7 +914,8 @@ async fn a_key_value_is_held_to_the_rules_of_its_own_type_first() {
             json!({"TableName": TABLE, "Key": {"pk": value, "sk": {"S": "a"}}}),
         )
         .await;
-        let opening = "One or more parameter values were invalid: Input collection [";
+        let opening = "1 validation error detected: One or more parameter values were invalid: \
+                       Input collection [";
         assert!(
             stated.starts_with(opening) && stated.ends_with("]of type BS contains duplicates."),
             "case {case:?}: expected the binary duplicate-collection clause, got {stated:?}"

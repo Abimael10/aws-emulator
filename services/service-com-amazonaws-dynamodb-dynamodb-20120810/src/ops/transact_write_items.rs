@@ -454,7 +454,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // the request ([`check_element_shape`]); canonicalizing is idempotent,
                     // so what is stored below is the item in the one form the store keeps.
                     let mut item = put.item.clone();
-                    crate::state::canonicalize_item(&mut item).map_err(lift)?;
+                    crate::state::canonicalize_item(&mut item)
+                        .map_err(crate::state::unenveloped)
+                        .map_err(lift)?;
                     let table = store.active_table(&region, &name, now).map_err(lift)?;
                     deny(&caller, table, action, now)?;
                     table.check_index_key_types(&item).map_err(keying)?;
@@ -531,9 +533,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     for (attribute, value) in &item {
                         crate::state::check_attribute_value(attribute, value)
                             .map_err(crate::state::stated_for_an_update)
+                            .map_err(crate::state::unenveloped)
                             .map_err(lift)?;
                     }
-                    crate::state::canonicalize_item(&mut item).map_err(lift)?;
+                    crate::state::canonicalize_item(&mut item)
+                        .map_err(crate::state::unenveloped)
+                        .map_err(lift)?;
                     // Sized over what this element ASKED FOR, exactly as the single-item
                     // `UpdateItem` of the same expression is: the stored item plus the
                     // frame each clause of the update costs
@@ -906,21 +911,6 @@ impl<'a> Requested<'a> {
         }
     }
 
-    /// Whether the map [`Self::addressed`] answers is a `Key` — the primary key the
-    /// action addresses an item BY — rather than the whole `Item` a `Put` writes.
-    ///
-    /// A refusal about a value in an ELEMENT's `Key` is stated as the sentence it is,
-    /// outside the `<N> validation error(s) detected: ` envelope: the member it is about
-    /// belongs to that ELEMENT rather than to the request, which is the same rule this
-    /// service already states for an element's expression members
-    /// ([`crate::state::refused_in_element`]). The `Item` a `Put` carries is the item the
-    /// transaction WRITES, held to the value rules a written item is held to everywhere,
-    /// so a refusal about one of its attribute values keeps the envelope the single-item
-    /// writes state it in.
-    fn addresses_key(&self) -> bool {
-        !matches!(self, Self::Put(_))
-    }
-
     /// The IAM action this one performs, which is the action a table's resource-based
     /// policy is read for: a transaction performs the item actions of the operations it
     /// is made of, and `dynamodb:ConditionCheckItem` for a `ConditionCheck`.
@@ -1081,23 +1071,22 @@ fn check_element_shape(
     // so the element is held to them before any table is looked up; the item an `Update`
     // LEAVES is read against the stored one, so it is held to the same rules where it is
     // computed.
-    // The clause a value in an ELEMENT's `Key` earns is stated as the sentence it is: the
-    // member is that element's, not the request's, which is the rule this service states
-    // for every refusal about an element's own members ([`Requested::addresses_key`]).
+    // The clause is stated as the sentence it is, out of the
+    // `<N> validation error(s) detected: ` envelope: that envelope counts violations of the
+    // REQUEST's own members, and the item or the `Key` of one `TransactItems` entry is a
+    // member of that entry — which is the rule this service states for every refusal about
+    // an element's own members ([`crate::state::refused_in_element`], and
+    // [`crate::state::unenveloped`] for a clause about a value).
     for (attribute, value) in action.addressed() {
         crate::state::check_attribute_value(attribute, value)
-            .map_err(|error| {
-                if action.addresses_key() {
-                    crate::state::unenveloped(error)
-                } else {
-                    error
-                }
-            })
+            .map_err(crate::state::unenveloped)
             .map_err(lift)?;
     }
     if let Requested::Put(put) = action {
         let mut item = put.item.clone();
-        crate::state::canonicalize_item(&mut item).map_err(lift)?;
+        crate::state::canonicalize_item(&mut item)
+            .map_err(crate::state::unenveloped)
+            .map_err(lift)?;
         if crate::state::item_size(&item) > crate::state::MAX_ITEM_SIZE_BYTES {
             return Err(crate::scaffolded::Scaffolded::validation(
                 crate::state::ITEM_SIZE_EXCEEDED_MESSAGE,

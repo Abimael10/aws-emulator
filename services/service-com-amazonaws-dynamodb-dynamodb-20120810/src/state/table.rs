@@ -452,8 +452,17 @@ impl Table {
     /// only when the token carries exactly that schema's key attributes and states one of
     /// them in another TYPE than the schema declares
     /// ([`START_KEY_SCHEMA_MISMATCH_MESSAGE`]).
+    ///
+    /// A clause about a VALUE the token carried is stated BARE, out of the
+    /// `<N> validation error(s) detected: ` envelope: a resume token is a member only a
+    /// paged READ carries, and a read states a clause about a value it was handed as the
+    /// sentence it is ([`unenveloped`]), which is the split this service states everywhere
+    /// between the members a write states its intent through and the members a read is
+    /// pointed at.
     pub fn key_of_start_key(&self, key: &Item) -> Result<ItemKey, RequestError> {
-        self.key_of_map(key, KeySource::StartKey).map_err(Into::into)
+        self.key_of_map(key, KeySource::StartKey)
+            .map_err(RequestError::from)
+            .map_err(unenveloped)
     }
 
     /// The primary key of the ITEM a transactional `Put` carries, with WHICH side
@@ -487,6 +496,13 @@ impl Table {
     /// is no value this service accepts WHEREVER a request carries it, so it is refused
     /// as the invalid collection it is rather than as a key element of another type than
     /// the schema declares.
+    ///
+    /// WHICH side decided a refusal follows what had to be read to decide it
+    /// ([`KeyRefusal`]): a map carrying NO attribute at all states no key for any schema
+    /// to be read against, which is the request's own defect, while a NON-EMPTY map that
+    /// names an attribute this table's key schema declares no key for, or leaves one it
+    /// declares out, is held to THAT schema — so inside a transaction it cancels the
+    /// element that carried it rather than refusing the call.
     fn key_of_map(&self, key: &Item, source: KeySource) -> Result<ItemKey, KeyRefusal> {
         // A map carrying NOTHING names no key element of this schema to be held to it, so
         // it is not shaped like a key at all rather than a key stated wrongly.
@@ -498,9 +514,16 @@ impl Table {
         }
         for name in key.keys() {
             if name != self.partition_key_name() && Some(name.as_str()) != self.sort_key_name() {
-                // A map carrying an attribute that is no key of this schema is not
-                // shaped like a key, which is the request's own defect.
-                return Err(KeyRefusal::Request(source.mismatch()));
+                // Deciding that an attribute is no key of this table needs the table, so
+                // it is the key schema that turned the map down.
+                return Err(KeyRefusal::Schema(source.mismatch()));
+            }
+        }
+        for element in &self.key_schema {
+            if !key.contains_key(&element.attribute_name) {
+                // The same for a key element the map leaves out: which elements a key of
+                // this table has to name is the schema's to say.
+                return Err(KeyRefusal::Schema(source.absent(&element.attribute_name)));
             }
         }
         self.key_from(key, source)
@@ -916,7 +939,29 @@ impl Table {
     /// ([`Self::key_of_start_key`]), which words a DROPPED table key attribute as the
     /// invalid token too. An index cursor carries both schemas' key attributes, so one it
     /// does not carry in full is not that cursor at all.
+    ///
+    /// Those two sentences are about the token's SHAPE. Each element it does carry is then
+    /// held to the rules every key attribute's value is held to — the documented numeric
+    /// domain, the non-emptiness an `S`/`B` key value must have, the size limit of the role
+    /// the schema gives it — and a value that breaks one of them earns that rule's own
+    /// sentence, naming the attribute ([`Self::key_value`]), exactly as the same value does
+    /// in a base-table token: the rule belongs to the value, so which schema the attribute
+    /// is a key of does not change what it says.
+    ///
+    /// Every one of those clauses is stated BARE, for the reason
+    /// [`Self::key_of_start_key`] states it: a resume token is a member only a paged READ
+    /// carries.
     pub fn index_key_of_start_key(
+        &self,
+        index: &SecondaryIndex<'_>,
+        key: &Item,
+    ) -> Result<IndexItemKey, RequestError> {
+        self.index_cursor(index, key).map_err(unenveloped)
+    }
+
+    /// That cursor, with each refusal worded as the rule that raised it states it; the
+    /// caller above is what states the FORM.
+    fn index_cursor(
         &self,
         index: &SecondaryIndex<'_>,
         key: &Item,
@@ -928,6 +973,13 @@ impl Table {
         if key.len() != named.len() || key.keys().any(|name| !named.contains(name.as_str())) {
             return Err(KeySource::StartKey.mismatch());
         }
+        // Each value is held to the documented rules for the SETS it holds before it is
+        // held to either schema, the way a base-table token's values are
+        // ([`Self::key_of_map`]): a collection that is empty or lists one member twice is
+        // no value this service accepts wherever a request carries it.
+        for value in key.values() {
+            check_collection_rules(value)?;
+        }
         let mut values = Vec::with_capacity(index.key_schema.len());
         for element in Self::index_key_elements(index.key_schema) {
             let name = element.attribute_name.as_str();
@@ -938,10 +990,7 @@ impl Table {
             {
                 return Err(KeySource::StartKey.typed_against_schema());
             }
-            values.push(
-                self.key_value(name, value)
-                    .map_err(|_| KeySource::StartKey.mismatch())?,
-            );
+            values.push(self.key_value(name, value)?);
         }
         // The table's own half of the token is read through the one walk every
         // `ExclusiveStartKey` is read through, over just the attributes it declares.

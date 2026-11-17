@@ -21,10 +21,11 @@
 //!
 //! WHICH ANSWER states that sentence inside a transaction follows the side that decided
 //! it: a key the TABLE's key schema does not admit — a type it does not declare for that
-//! attribute, a value past the size limit of the role it gives it — cancels the element
-//! (RULE 3), while a member that is not shaped like a key at all — a key attribute the
-//! element supplied no value for, an empty key value — is the request's own defect and
-//! refuses the call.
+//! attribute, a value past the size limit of the role it gives it, an attribute it declares
+//! no key for, or a key element a `Key`-shaped member leaves out — cancels the element
+//! (RULE 3), while a member that is not shaped like a key for any schema to be read against
+//! — an `Item` that gives no value for a key attribute, a member carrying no attribute at
+//! all, an empty key value — is the request's own defect and refuses the call.
 //!
 //! RULE 2 — an empty `S`/`B` value in a secondary index key is refused either way, and the
 //! sentence depends on HOW it arrived: an item a write carried names the index and the
@@ -317,11 +318,11 @@ async fn a_key_member_of_every_surface_states_the_same_sentence() {
     create_indexed_table(&router).await;
 
     // A `Key` IS the primary key, so every way it differs from the schema is the same
-    // sentence — on the single-item surfaces and inside the batched and transactional
-    // ones. The rows span the operation, the defect and the member the key arrived in.
-    // The transactional WRITE's `Key` members are not here: a type the table's schema
-    // does not declare is decided against that table, so the element cancels with that
-    // same sentence (`a_transactional_key_the_schema_does_not_admit_cancels_the_element`).
+    // sentence — on the single-item surfaces and inside the batched one. The rows span the
+    // operation, the defect and the member the key arrived in. The TRANSACTIONAL surfaces'
+    // `Key` members are not here: every way a non-empty `Key` differs from the table's key
+    // schema is decided against that table, so the element cancels with that same sentence
+    // (`a_transactional_key_the_schema_does_not_admit_cancels_the_element`).
     let bad_key = json!({"pk": {"S": "k"}, "sk": {"N": "7"}});
     let rows: Vec<(&str, &str, Value)> = vec![
         (
@@ -363,16 +364,16 @@ async fn a_key_member_of_every_surface_states_the_same_sentence() {
             json!({"RequestItems": {TABLE: {"Keys": [bad_key.clone()]}}}),
         ),
         (
-            "a transactional write's key omitting the sort key",
+            // A `Key` member carrying NO attribute at all states no key for any schema to
+            // be read against, so even inside a transaction it is the request's own defect.
+            "a transactional write's key carrying no attribute at all",
             "TransactWriteItems",
-            json!({"TransactItems": [{"Delete": {
-                "TableName": TABLE, "Key": {"pk": {"S": "k"}}}}]}),
+            json!({"TransactItems": [{"Delete": {"TableName": TABLE, "Key": {}}}]}),
         ),
         (
-            "a transactional get's key omitting the sort key",
+            "a transactional get's key carrying no attribute at all",
             "TransactGetItems",
-            json!({"TransactItems": [{"Get": {
-                "TableName": TABLE, "Key": {"pk": {"S": "k"}}}}]}),
+            json!({"TransactItems": [{"Get": {"TableName": TABLE, "Key": {}}}]}),
         ),
     ];
 
@@ -390,12 +391,14 @@ async fn a_transactional_key_the_schema_does_not_admit_cancels_the_element() {
     let router = emulator();
     create_indexed_table(&router).await;
 
-    // The `Key`-shaped members of a transactional WRITE, each carrying a key the TABLE's
-    // key schema does not admit: a sort key of a type it does not declare, and a partition
-    // key one byte past the size limit of the role it plays in that schema. Deciding
-    // either needs the table, so each is the element's own cancellation under the
-    // documented `ValidationError` code rather than a refusal of the request. The rows
-    // span the action the key arrived in and which half of the schema refused it.
+    // The `Key`-shaped members of a transactional WRITE and GET, each carrying a key the
+    // TABLE's key schema does not admit: a sort key of a type it does not declare, a
+    // partition key one byte past the size limit of the role it plays in that schema, a key
+    // element the member leaves out, and an attribute that schema declares no key for.
+    // Deciding any of them needs the table, so each is the element's own cancellation under
+    // the documented `ValidationError` code rather than a refusal of the request. The rows
+    // span the action the key arrived in, the defect, and which half of the schema refused
+    // it.
     let bad_key = json!({"pk": {"S": "k"}, "sk": {"N": "7"}});
     // "The maximum length of any partition key value is 2048 bytes" ("Service, Account,
     // and Table Quotas"), so this is one byte past it.
@@ -405,6 +408,28 @@ async fn a_transactional_key_the_schema_does_not_admit_cancels_the_element() {
             "a transactional delete's wrong-typed sort key",
             "TransactWriteItems",
             json!({"TransactItems": [{"Delete": {"TableName": TABLE, "Key": bad_key.clone()}}]}),
+            KEY_SCHEMA_MISMATCH,
+        ),
+        (
+            "a transactional delete's key omitting the sort key",
+            "TransactWriteItems",
+            json!({"TransactItems": [{"Delete": {
+                "TableName": TABLE, "Key": {"pk": {"S": "k"}}}}]}),
+            KEY_SCHEMA_MISMATCH,
+        ),
+        (
+            "a transactional get's key omitting the sort key",
+            "TransactGetItems",
+            json!({"TransactItems": [{"Get": {
+                "TableName": TABLE, "Key": {"pk": {"S": "k"}}}}]}),
+            KEY_SCHEMA_MISMATCH,
+        ),
+        (
+            "a transactional get's key naming an attribute the schema declares no key for",
+            "TransactGetItems",
+            json!({"TransactItems": [{"Get": {
+                "TableName": TABLE,
+                "Key": {"pk": {"S": "k"}, "sk": {"S": "s"}, "extra": {"S": "x"}}}}]}),
             KEY_SCHEMA_MISMATCH,
         ),
         (

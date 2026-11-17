@@ -4474,17 +4474,18 @@ fn joined(members: impl Iterator<Item = String>, separator: &str) -> String {
 }
 
 /// Hold every SET one attribute value carries to the documented set rules — a set may
-/// not be empty, and may not list one member twice — at every depth, stating the clause
-/// it earns ON ITS OWN.
+/// not be empty, and may not list one member twice — at every depth.
 ///
 /// The rules and the clauses are the ones the canonicalizing walk states
 /// ([`canonicalize_attribute_value`]) and the same renderers word them, so the two
-/// cannot drift; what differs is that this only READS the value, and that the clause is
-/// stated outside the `<N> validation error(s) detected: ` envelope
-/// ([`unenveloped`]) — a collection is refused for what it IS, whichever member of
-/// whichever operation carried it. The numeric rules are not restated here: a value's
-/// own numeric domain is stated where that value is read (a key's by its encoder,
-/// [`Table::key_value`]).
+/// cannot drift; what differs is that this only READS the value. The clause is stated in
+/// the same FORM every other clause about a value a request carried is stated in — inside
+/// the `<N> validation error(s) detected: ` envelope — so the operation that carried the
+/// value decides the form, as it does for every other value rule: the operations that
+/// WRITE an item state it as it stands and the operations that READ one state it bare
+/// ([`unenveloped`] is where each reader does that). The numeric rules are not restated
+/// here: a value's own numeric domain is stated where that value is read (a key's by its
+/// encoder, [`Table::key_value`]).
 ///
 /// The walk is ITERATIVE, over an explicit stack, for the reason
 /// [`canonicalize_attribute_value`]'s is: how deeply a value nests is the caller's
@@ -4494,7 +4495,7 @@ pub(crate) fn check_collection_rules(value: &AttributeValue) -> Result<(), Reque
     while let Some(value) = pending.pop() {
         match value {
             AttributeValue::Ns(members) => {
-                check_set_not_empty(SetType::Number, members.len()).map_err(unenveloped)?;
+                check_set_not_empty(SetType::Number, members.len())?;
                 // Distinctness is decided on the NUMBERS and not on their texts, so two
                 // spellings of one number are one member — which is why the comparison
                 // is made over the canonical texts. A text that is no number at all is
@@ -4505,19 +4506,19 @@ pub(crate) fn check_collection_rules(value: &AttributeValue) -> Result<(), Reque
                     .collect();
                 if numbers.len() == members.len() && has_duplicate(&numbers) {
                     // The number-set wording names no members at all.
-                    return Err(unenveloped(duplicate_set_member(String::new())));
+                    return Err(duplicate_set_member(String::new()));
                 }
             }
             AttributeValue::Ss(members) => {
-                check_set_not_empty(SetType::String, members.len()).map_err(unenveloped)?;
+                check_set_not_empty(SetType::String, members.len())?;
                 if has_duplicate(members) {
-                    return Err(unenveloped(duplicate_set_member(echoed_strings(members))));
+                    return Err(duplicate_set_member(echoed_strings(members)));
                 }
             }
             AttributeValue::Bs(members) => {
-                check_set_not_empty(SetType::Binary, members.len()).map_err(unenveloped)?;
+                check_set_not_empty(SetType::Binary, members.len())?;
                 if has_duplicate(members) {
-                    return Err(unenveloped(duplicate_set_member(echoed_blobs(members))));
+                    return Err(duplicate_set_member(echoed_blobs(members)));
                 }
             }
             AttributeValue::L(members) => pending.extend(members.iter()),
