@@ -75,7 +75,11 @@ const WINDOW_MARGIN_SECONDS: i64 = 60;
 
 /// One `GetCredentialReport` call, presented as signed by `akid` when a row names one. The
 /// operation takes no input, so the call carries no form parameter beyond the action.
-async fn get(router: &MultiServiceRouter, akid: Option<&str>) -> (u16, String) {
+///
+/// `pub(crate)` because the suite about GENERATING the report
+/// (`tests/all/credential_report_generation.rs`) reads the account's report back through
+/// this same call, to assert a poll left the report it holds readable and unchanged.
+pub(crate) async fn get(router: &MultiServiceRouter, akid: Option<&str>) -> (u16, String) {
     call_signed_by(router, akid, "GetCredentialReport", &[]).await
 }
 
