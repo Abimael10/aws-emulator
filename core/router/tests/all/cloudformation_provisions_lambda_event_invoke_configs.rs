@@ -681,9 +681,9 @@ struct RoleRow {
     /// Whether the stack reaches `CREATE_COMPLETE` (so the configuration exists) or is
     /// rolled back.
     deployed: bool,
-    /// The call Lambda's refusal must name for a row that is rolled back, and the service it
-    /// would have been made to.
-    withheld: Option<(&'static str, &'static str)>,
+    /// The call Lambda's refusal must name for a row that is rolled back; the refusal names
+    /// the declared destination beside it.
+    withheld: Option<&'static str>,
 }
 
 /// The rows differ along what the role is granted — nothing at all, another service's write,
@@ -697,7 +697,7 @@ const ROLE_ROWS: &[RoleRow] = &[
         topic: false,
         granted: &[],
         deployed: false,
-        withheld: Some(("SendMessage", "SQS")),
+        withheld: Some("SendMessage"),
     },
     RoleRow {
         case: "a queue destination and a role granted only a topic's write",
@@ -705,7 +705,7 @@ const ROLE_ROWS: &[RoleRow] = &[
         topic: false,
         granted: &["sns:Publish"],
         deployed: false,
-        withheld: Some(("SendMessage", "SQS")),
+        withheld: Some("SendMessage"),
     },
     RoleRow {
         case: "a queue destination and a role granted the queue's own write",
@@ -721,7 +721,7 @@ const ROLE_ROWS: &[RoleRow] = &[
         topic: true,
         granted: &["sqs:SendMessage"],
         deployed: false,
-        withheld: Some(("Publish", "SNS")),
+        withheld: Some("Publish"),
     },
     RoleRow {
         case: "a topic destination and a role granted the topic's own write",
@@ -735,11 +735,12 @@ const ROLE_ROWS: &[RoleRow] = &[
 
 /// The sentence AWS Lambda refuses a configuration whose function execution role may not make
 /// the write that delivers a record to the named destination with — the wording that service
-/// answers this error class with, naming the call and the service it would have been made to.
-fn refusal_sentence(withheld: (&str, &str)) -> String {
+/// answers this error class with, naming the call and then the DESTINATION the configuration
+/// declared, by its own ARN.
+fn refusal_sentence(withheld: &str, destination: &str) -> String {
     format!(
-        "The provided execution role does not have permissions to call {} on {}",
-        withheld.0, withheld.1
+        "The function execution role does not have permissions to call {withheld} on \
+         {destination}"
     )
 }
 
@@ -832,7 +833,11 @@ async fn a_destination_the_execution_role_cannot_write_rolls_the_stack_back() {
                 "case {case:?}: expected HTTP 200 from DescribeStackEvents, got {status} with \
                  body {events}"
             );
-            let sentence = refusal_sentence(row.withheld.unwrap_or_default());
+            let sentence = refusal_sentence(
+                row.withheld
+                    .expect("a rolled-back row names the call its role may not make"),
+                &destination,
+            );
             let reasons = elements(&events, "ResourceStatusReason");
             assert!(
                 reasons.iter().any(|reason| reason.contains(&sentence)),

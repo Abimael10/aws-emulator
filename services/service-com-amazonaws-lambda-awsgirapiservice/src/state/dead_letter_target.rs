@@ -14,12 +14,21 @@
 //! from asynchronous invocations whose events are silently lost.
 //!
 //! A dead-letter target is a destination of the very kind an asynchronous-invocation
-//! configuration names, so what a write to it takes, how the refusal is worded and what
-//! evidence the decision is made on are NOT restated here: this module names the target the
-//! configuration asks for and hands it to the one reading this crate states for a
-//! destination the execution role has to be able to write
-//! ([`super::event_invoke_config::unwritable_destination`]), so the two gates cannot drift
-//! apart on either the decision or the sentence.
+//! configuration names, so what a write to it takes and what evidence the decision is made
+//! on are NOT restated here: this module names the target the configuration asks for and
+//! hands it to the one reading this crate states for a destination the execution role has to
+//! be able to write ([`super::event_invoke_config::withheld_destination_write`]), so the two
+//! gates cannot drift apart on the decision.
+//!
+//! The SENTENCE is this door's own, and the difference is recorded rather than chosen: a
+//! `DeadLetterConfig` the role may not write is refused "The provided execution role does not
+//! have permissions to call Publish on SNS"
+//! ([`super::event_source_authorization::provided_role_refusal_message`]) — wholly fixed
+//! text naming the call and the service it would have been made to, and never the target —
+//! while the destination of an asynchronous-invocation configuration is refused a sentence
+//! that names the destination's own ARN
+//! ([`super::event_invoke_config::unwritable_destination`]). Two error classes, two
+//! spellings, each of them text a client compares exactly.
 //!
 //! Nothing is refused on evidence this emulator does not have, exactly as that reading
 //! states: an engine carrying no IAM store, a role ARN the store holds no role for, a role
@@ -60,11 +69,19 @@ pub fn unwritable_dead_letter_target<Eng: Send + Sync + 'static>(
     role_arn: &str,
     dead_letter_config: Option<&DeadLetterConfig>,
 ) -> Option<String> {
-    super::event_invoke_config::unwritable_destination(
-        engine,
-        role_arn,
-        &dead_letter_targets(dead_letter_config),
-    )
+    let iam = super::event_source_authorization::iam_state(engine)?;
+    let held = iam.lock();
+    dead_letter_targets(dead_letter_config)
+        .iter()
+        .find_map(|target| {
+            super::event_invoke_config::withheld_destination_write(&held, role_arn, target).map(
+                |(action, service)| {
+                    super::event_source_authorization::provided_role_refusal_message(
+                        action, service,
+                    )
+                },
+            )
+        })
 }
 
 #[cfg(test)]

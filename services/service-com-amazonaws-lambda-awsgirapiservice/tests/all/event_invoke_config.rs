@@ -18,7 +18,9 @@
 //! and a qualifier holding none answers `ResourceNotFoundException` (HTTP 404) to every read,
 //! update and delete of one. A destination is written to by Lambda acting as the function's
 //! execution role, so a configuration naming one the role may not write is refused
-//! `InvalidParameterValueException` (HTTP 400) with nothing stored.
+//! `InvalidParameterValueException` (HTTP 400) with nothing stored, and the refusal names the
+//! write that destination's kind takes and the destination's OWN ARN as the request carried
+//! it.
 //!
 //! Every row drives real HTTP requests through the router and reads the configuration back
 //! through `GetFunctionEventInvokeConfig`, so a value that was answered but never stored
@@ -35,7 +37,8 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use crate::event_source_mapping_role_access::{
-    allow, create_function_as, given_role, logs_only, router_with_iam,
+    allow, assert_refused, call_refusal, create_function_as, given_role, logs_only,
+    router_with_iam,
 };
 use crate::event_source_mappings::{call, create_function, router_on, Answer};
 use smithy_server_runtime::MultiServiceRouter;
@@ -1082,8 +1085,8 @@ struct RoleRow {
     /// Whether the grant names the destination itself or some other resource.
     on_destination: bool,
     destination: &'static str,
-    /// The withheld call and the service the refusal names.
-    refusal: Option<(&'static str, &'static str)>,
+    /// The withheld call the refusal names, beside the destination's own ARN.
+    refusal: Option<&'static str>,
 }
 
 /// The authorization table: one row per kind of destination whose write is decided on, with
@@ -1102,14 +1105,14 @@ fn role_rows() -> Vec<RoleRow> {
             granted: None,
             on_destination: true,
             destination: QUEUE_DESTINATION,
-            refusal: Some(("SendMessage", "SQS")),
+            refusal: Some("SendMessage"),
         },
         RoleRow {
             case: "a queue granted on another queue",
             granted: Some(("sqs", &["SendMessage"])),
             on_destination: false,
             destination: QUEUE_DESTINATION,
-            refusal: Some(("SendMessage", "SQS")),
+            refusal: Some("SendMessage"),
         },
         RoleRow {
             case: "a topic the role may publish to",
@@ -1123,7 +1126,7 @@ fn role_rows() -> Vec<RoleRow> {
             granted: Some(("sns", &["Subscribe"])),
             on_destination: true,
             destination: TOPIC_DESTINATION,
-            refusal: Some(("Publish", "SNS")),
+            refusal: Some("Publish"),
         },
         RoleRow {
             case: "an event bus the role may put events on",
@@ -1137,7 +1140,7 @@ fn role_rows() -> Vec<RoleRow> {
             granted: None,
             on_destination: true,
             destination: BUS_DESTINATION,
-            refusal: Some(("PutEvents", "EventBridge")),
+            refusal: Some("PutEvents"),
         },
         RoleRow {
             case: "a function the role may invoke",
@@ -1151,7 +1154,7 @@ fn role_rows() -> Vec<RoleRow> {
             granted: None,
             on_destination: true,
             destination: FUNCTION_DESTINATION,
-            refusal: Some(("InvokeFunction", "Lambda")),
+            refusal: Some("InvokeFunction"),
         },
         RoleRow {
             // A bucket's write is an object-level call, so a role scoped to the objects it
@@ -1205,7 +1208,7 @@ async fn a_destination_the_execution_role_may_not_write_is_refused() {
             on_failure: Some(row.destination),
         };
         let answer = put_config(&router, &function, None, &settings).await;
-        let Some((withheld, service)) = row.refusal else {
+        let Some(withheld) = row.refusal else {
             assert_reports(
                 case,
                 "PutFunctionEventInvokeConfig",
@@ -1228,10 +1231,10 @@ async fn a_destination_the_execution_role_may_not_write_is_refused() {
             "case {case:?}: expected {INVALID_PARAMETER}, got {:?}",
             answer.error_code()
         );
-        let expected = format!(
-            "The provided execution role does not have permissions to call {withheld} on \
-             {service}"
-        );
+        // The ONE spelling of this error class in the test tree
+        // (`tests/all/event_source_mapping_role_access.rs`), rendered on what the call would
+        // have been made ON: the destination the request named.
+        let expected = call_refusal(withheld, row.destination);
         let message = answer
             .string("message")
             .or_else(|| answer.string("Message"))
@@ -1318,6 +1321,221 @@ async fn a_destination_the_execution_role_may_not_write_is_refused() {
                 ..Settings::default()
             },
             &configured_arn(&function, None),
+        );
+    }
+}
+
+/// One row of the sentence table: the destination a configuration names and the write
+/// delivering a record there takes.
+struct SentenceRow {
+    case: &'static str,
+    destination: &'static str,
+    withheld: &'static str,
+}
+
+/// The sentence table: one row per KIND of destination whose write is decided on, and
+/// several forms of ARN inside the kinds — another Region, another account, a partition of
+/// its own, and the punctuation a resource name admits — because the sentence carries the
+/// ARN through whatever it is.
+///
+/// The kinds are the ones `DestinationConfig` documents (see [`QUEUE_DESTINATION`]) less the
+/// Amazon S3 bucket, whose write is an object-level call and so is decided on nothing.
+fn sentence_rows() -> [SentenceRow; 8] {
+    [
+        SentenceRow {
+            case: "a queue of the function's own Region and account",
+            destination: QUEUE_DESTINATION,
+            withheld: "SendMessage",
+        },
+        SentenceRow {
+            case: "a queue of another Region",
+            destination: "arn:aws:sqs:eu-west-1:000000000000:async-records",
+            withheld: "SendMessage",
+        },
+        SentenceRow {
+            case: "a queue of another account",
+            destination: "arn:aws:sqs:us-east-1:210987654321:async-records",
+            withheld: "SendMessage",
+        },
+        SentenceRow {
+            case: "a queue of a partition of its own",
+            destination: "arn:aws-us-gov:sqs:us-gov-west-1:000000000000:async-records",
+            withheld: "SendMessage",
+        },
+        SentenceRow {
+            case: "a topic",
+            destination: TOPIC_DESTINATION,
+            withheld: "Publish",
+        },
+        SentenceRow {
+            case: "a topic whose name carries the punctuation a name admits",
+            destination: "arn:aws:sns:ap-southeast-2:000000000000:async_records-v2.fifo",
+            withheld: "Publish",
+        },
+        SentenceRow {
+            case: "an event bus",
+            destination: BUS_DESTINATION,
+            withheld: "PutEvents",
+        },
+        SentenceRow {
+            case: "a function",
+            destination: FUNCTION_DESTINATION,
+            withheld: "InvokeFunction",
+        },
+    ]
+}
+
+/// The grants every role in the two tests below carries: each kind's write, on a resource
+/// that is never the destination under test.
+///
+/// So every row below is refused on the destination it NAMES while a grant of the same write
+/// is in force on another resource of the same kind — which is what makes the ARN in the
+/// sentence the one the REQUEST carried rather than any value the policy mentions.
+fn granted_elsewhere() -> Value {
+    json!([
+        logs_only(),
+        allow("sqs", &["SendMessage"], OTHER_DESTINATION),
+        allow("sns", &["Publish"], "arn:aws:sns:us-east-1:000000000000:other-records"),
+        allow(
+            "events",
+            &["PutEvents"],
+            "arn:aws:events:us-east-1:000000000000:event-bus/other-records"
+        ),
+        allow(
+            "lambda",
+            &["InvokeFunction"],
+            "arn:aws:lambda:us-east-1:000000000000:function:other-records"
+        ),
+    ])
+}
+
+#[tokio::test]
+async fn the_destination_refusal_names_the_destination_the_request_asked_for() {
+    let router = router_with_iam();
+
+    for (index, row) in sentence_rows().into_iter().enumerate() {
+        let case = row.case;
+        let function = format!("destination-sentence-{index}");
+        let role = given_role(
+            &router,
+            case,
+            &format!("destination-sentence-role-{index}"),
+            Some(granted_elsewhere()),
+        )
+        .await;
+        create_function_as(&router, case, &function, &role).await;
+        let expected = call_refusal(row.withheld, row.destination);
+
+        // Either SLOT is a destination Lambda delivers a record to, so each is refused by
+        // the same sentence about the destination it names.
+        for slot in ["OnFailure", "OnSuccess"] {
+            let settings = Settings {
+                on_failure: (slot == "OnFailure").then_some(row.destination),
+                on_success: (slot == "OnSuccess").then_some(row.destination),
+                ..Settings::default()
+            };
+            let answer = put_config(&router, &function, None, &settings).await;
+            assert_refused(&format!("{case} in {slot}"), &answer, &expected);
+            // The refusal is instead of the configuration, not beside it.
+            let fetched = get_config(&router, &function, None).await;
+            assert_eq!(
+                fetched.status,
+                404,
+                "case {case:?} in {slot}: a refused put must store nothing, got {} {}",
+                fetched.status,
+                fetched.text()
+            );
+        }
+
+        // The UPDATE door words it the same way, and leaves the stored configuration as it
+        // found it.
+        let settled = Settings {
+            retries: Some(0),
+            ..Settings::default()
+        };
+        let stored = put_config(&router, &function, None, &settled).await;
+        assert_eq!(
+            stored.status,
+            200,
+            "case {case:?}: a configuration naming no destination must be stored, got {} {}",
+            stored.status,
+            stored.text()
+        );
+        let updated = update_config(
+            &router,
+            &function,
+            None,
+            &json!({ "DestinationConfig": { "OnFailure": { "Destination": row.destination } } }),
+        )
+        .await;
+        assert_refused(&format!("{case} on the update door"), &updated, &expected);
+        let held = get_config(&router, &function, None).await;
+        assert_reports(
+            case,
+            "GetFunctionEventInvokeConfig",
+            &held,
+            &settled,
+            &configured_arn(&function, None),
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_refusal_names_the_slot_whose_destination_is_withheld() {
+    // A configuration may name a destination in each slot, and only one of them may be the
+    // one the role may not write: the sentence carries THAT destination's ARN, whichever slot
+    // it sits in, which is how an operator learns which of the two was rejected.
+    //
+    // (case, the on-success destination, the on-failure destination)
+    let rows: [(&str, &str, &str); 2] = [
+        (
+            "the withheld destination in the on-failure slot",
+            OTHER_DESTINATION,
+            TOPIC_DESTINATION,
+        ),
+        (
+            "the withheld destination in the on-success slot",
+            TOPIC_DESTINATION,
+            OTHER_DESTINATION,
+        ),
+    ];
+    let router = router_with_iam();
+
+    for (index, (case, on_success, on_failure)) in rows.into_iter().enumerate() {
+        let function = format!("destination-slot-sentence-{index}");
+        // The queue of `OTHER_DESTINATION` is the one resource this role may write, so the
+        // topic beside it is the one destination the configuration is refused on.
+        let role = given_role(
+            &router,
+            case,
+            &format!("destination-slot-role-{index}"),
+            Some(json!([
+                logs_only(),
+                allow("sqs", &["SendMessage"], OTHER_DESTINATION)
+            ])),
+        )
+        .await;
+        create_function_as(&router, case, &function, &role).await;
+
+        let answer = put_config(
+            &router,
+            &function,
+            None,
+            &Settings {
+                on_success: Some(on_success),
+                on_failure: Some(on_failure),
+                ..Settings::default()
+            },
+        )
+        .await;
+        assert_refused(case, &answer, &call_refusal("Publish", TOPIC_DESTINATION));
+        let fetched = get_config(&router, &function, None).await;
+        assert_eq!(
+            fetched.status,
+            404,
+            "case {case:?}: a refused put must store nothing, got {} {}",
+            fetched.status,
+            fetched.text()
         );
     }
 }

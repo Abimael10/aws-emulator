@@ -292,14 +292,20 @@ fn queue_refusal(action: &str) -> String {
     call_refusal(action, "SQS")
 }
 
-/// How AWS words the refusal of a role that may not make one CALL on the named source:
-/// the call it may not make, and the service it would have been made to.
+/// How AWS words the refusal of a role that may not make one CALL Lambda makes on the
+/// function's behalf: the call it may not make, then what it would have been made ON.
+///
+/// `on` is the SERVICE for a mapping's own refusals — a read of its event source, or the
+/// write of a discarded batch's record — as that service worded them when they were observed,
+/// and the DESTINATION's own ARN for an asynchronous-invocation configuration's destination
+/// (`tests/all/event_invoke_config.rs`), whose two slots an operator tells apart by exactly
+/// that value.
 ///
 /// `pub(crate)` because this sentence has ONE owner here: the suite over its wording across
 /// the source services reads it from this function too
 /// (`tests/all/event_source_read_refusal_sentence.rs`), so the two tables cannot drift apart.
-pub(crate) fn call_refusal(action: &str, service: &str) -> String {
-    format!("The function execution role does not have permissions to call {action} on {service}")
+pub(crate) fn call_refusal(action: &str, on: &str) -> String {
+    format!("The function execution role does not have permissions to call {action} on {on}")
 }
 
 /// A statement allowing `actions` of `namespace` on `resource`.

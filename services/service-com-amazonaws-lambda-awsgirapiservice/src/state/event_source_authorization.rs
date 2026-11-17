@@ -397,35 +397,45 @@ fn access_of(event_source_arn: &str) -> Option<&'static EventSourceAccess> {
 /// ([`super::vpc_attachment_authorization`]). Only the CALL and the service it would have
 /// been made to vary with the request; the rest is fixed text.
 ///
-/// Shared with the gate on the destination an asynchronous invocation record is delivered to
-/// ([`super::event_invoke_config`]), so one error class is worded one way. The refusal of a
-/// read of a mapping's event SOURCE is a sentence of its own ([`Refusal::Call`]), as that
-/// service answered it when it was observed.
+/// Shared with the gate on a function's DEAD-LETTER target
+/// ([`super::dead_letter_target`]), so one error class is worded one way. The refusal of a
+/// read of a mapping's event SOURCE, and the refusal of a destination an asynchronous
+/// invocation's record is delivered to, are sentences of their own
+/// ([`function_role_refusal_message`]), as that service answered each of them when they were
+/// observed.
 pub(super) fn provided_role_refusal_message(action: &str, service: &str) -> String {
     format!("The provided execution role does not have permissions to call {action} on {service}")
 }
 
 /// How Lambda words the refusal of a role that may not make one call Lambda itself would make
-/// ON AN EVENT SOURCE MAPPING's behalf — a read of the source it polls, or the write that
-/// records a batch it gave up on: "The function execution role does not have permissions to
-/// call SendMessage on SQS".
+/// ON THE FUNCTION's behalf — a read of the source a mapping polls, the write that records a
+/// batch a mapping gave up on, or the write that delivers an asynchronous invocation's record
+/// to a destination: "The function execution role does not have permissions to call
+/// SendMessage on SQS" for a mapping's own refusals, and "… to call SendMessage on
+/// arn:aws:sqs:…" for an asynchronous-invocation destination.
 ///
-/// The ONE rendering of that sentence in this crate: [`EventSourceAccess::message`]'s
-/// `Refusal::Call` arm, which is how the service worded the refusal of a QUEUE source's reads
-/// when it was observed, and the destination gate
-/// ([`super::event_source_mapping_destination::unwritable_mapping_destination`]) both answer
-/// through here, so one error class has one spelling.
+/// The ONE rendering of that sentence in this crate. Three gates answer through it, so one
+/// error class has one spelling: [`EventSourceAccess::message`]'s `Refusal::Call` arm, which
+/// is how the service worded the refusal of a QUEUE source's reads when it was observed, a
+/// mapping's destination gate
+/// ([`super::event_source_mapping_destination::unwritable_mapping_destination`]) and an
+/// asynchronous-invocation configuration's
+/// ([`super::event_invoke_config::unwritable_destination`]).
+///
+/// `on` is WHAT the call would have been made on, and it is the only part beside the call
+/// itself that varies with the request: the name of the service for the two gates about an
+/// event source mapping, as that service worded them when they were observed, and the
+/// DESTINATION's own ARN for an asynchronous-invocation configuration, whose two slots an
+/// operator tells apart by exactly that value.
 ///
 /// It is NOT [`provided_role_refusal_message`], and the difference is recorded rather than
 /// chosen: the model describes no message for `InvalidParameterValueException`, the surfaces
-/// that stand a resource UP (a VPC attachment's network interfaces, an
-/// asynchronous-invocation destination) were observed opening "The provided execution role",
-/// and a mapping's own refusals open "The function execution role". Two error classes, two
-/// spellings, each of them fixed text a client compares exactly. Only the CALL and the service
-/// it would have been made to vary with the request; the destination's own ARN is not in the
-/// sentence.
-pub(super) fn function_role_refusal_message(action: &str, service: &str) -> String {
-    format!("The function execution role does not have permissions to call {action} on {service}")
+/// that stand a resource UP (a VPC attachment's network interfaces, a function's dead-letter
+/// target) were observed opening "The provided execution role", and the refusals above open
+/// "The function execution role". Two error classes, two spellings, each of them fixed text a
+/// client compares exactly.
+pub(super) fn function_role_refusal_message(action: &str, on: &str) -> String {
+    format!("The function execution role does not have permissions to call {action} on {on}")
 }
 
 /// Whether the identity-based documents in force on `role_arn` WITHHOLD the call `action`

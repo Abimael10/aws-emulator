@@ -689,9 +689,9 @@ struct RoleRow {
     topic: bool,
     /// The actions the role's inline policy grants, on the destination itself.
     granted: &'static [&'static str],
-    /// The call the refusal must name and the service it would have been made to, or `None`
+    /// The call the refusal must name beside the destination the request asked for, or `None`
     /// for a row the configuration is stored for.
-    withheld: Option<(&'static str, &'static str)>,
+    withheld: Option<&'static str>,
 }
 
 /// The rows differ along what the role is granted — nothing at all, another service's write,
@@ -704,14 +704,14 @@ const ROLE_ROWS: &[RoleRow] = &[
         slug: "dest-none",
         topic: false,
         granted: &[],
-        withheld: Some(("SendMessage", "SQS")),
+        withheld: Some("SendMessage"),
     },
     RoleRow {
         case: "a queue destination and a role granted only another service's write",
         slug: "dest-other",
         topic: false,
         granted: &["sns:Publish"],
-        withheld: Some(("SendMessage", "SQS")),
+        withheld: Some("SendMessage"),
     },
     RoleRow {
         case: "a queue destination and a role granted the queue's own write",
@@ -725,17 +725,18 @@ const ROLE_ROWS: &[RoleRow] = &[
         slug: "dest-topic",
         topic: true,
         granted: &["sqs:SendMessage"],
-        withheld: Some(("Publish", "SNS")),
+        withheld: Some("Publish"),
     },
 ];
 
 /// The sentence Lambda refuses a configuration whose execution role may not make the write that
 /// delivers a record to the named destination with — fixed text, with only the call and the
-/// service it would have been made to varying with the request.
-fn refusal_sentence(withheld: (&str, &str)) -> String {
+/// DESTINATION it would have been made on, by the ARN the request named, varying with the
+/// request.
+fn refusal_sentence(withheld: &str, destination: &str) -> String {
     format!(
-        "The provided execution role does not have permissions to call {} on {}",
-        withheld.0, withheld.1
+        "The function execution role does not have permissions to call {withheld} on \
+         {destination}"
     )
 }
 
@@ -824,7 +825,7 @@ async fn a_destination_the_execution_role_cannot_write_is_refused_and_nothing_is
             configured.error_type,
             configured.body
         );
-        let sentence = refusal_sentence(withheld);
+        let sentence = refusal_sentence(withheld, &destination);
         assert_eq!(
             configured.body["message"].as_str(),
             Some(sentence.as_str()),

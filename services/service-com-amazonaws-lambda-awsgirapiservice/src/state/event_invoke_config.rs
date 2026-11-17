@@ -29,7 +29,7 @@ use crate::ops::types::{
     DestinationConfig, GetFunctionEventInvokeConfigOutput, OnFailure, OnSuccess,
 };
 
-use super::event_source_authorization::{iam_state, provided_role_refusal_message, withholds_call};
+use super::event_source_authorization::{function_role_refusal_message, iam_state, withholds_call};
 
 /// How a read of an asynchronous-invocation configuration no qualifier holds is refused:
 /// the resource is the configuration rather than the function, so the sentence names the
@@ -276,6 +276,14 @@ fn write_of(destination: &str) -> Option<&'static DestinationWrite> {
 /// no IAM store, a role ARN that store holds no role for, and a role carrying a grant this
 /// emulator cannot read all refuse nothing.
 ///
+/// The sentence names the DESTINATION the request asked for, by the ARN the request carried:
+/// "The function execution role does not have permissions to call SendMessage on
+/// arn:aws:sqs:…". Only the call and the destination vary with the request; the rest is fixed
+/// text ([`function_role_refusal_message`]). A configuration may name a destination in each
+/// of its two slots, and an operator reads this sentence to learn WHICH of them was refused,
+/// so the value that identifies it — its ARN — is what the sentence carries rather than the
+/// name of the service it belongs to.
+///
 /// A READ of both stores: it decides, and changes nothing.
 #[must_use]
 pub fn unwritable_destination<Eng: Send + Sync + 'static>(
@@ -287,7 +295,7 @@ pub fn unwritable_destination<Eng: Send + Sync + 'static>(
     let held = iam.lock();
     destinations.iter().find_map(|destination| {
         withheld_destination_write(&held, role_arn, destination)
-            .map(|(action, service)| provided_role_refusal_message(action, service))
+            .map(|(action, _service)| function_role_refusal_message(action, destination))
     })
 }
 

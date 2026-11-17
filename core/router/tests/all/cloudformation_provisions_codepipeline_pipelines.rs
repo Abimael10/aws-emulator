@@ -46,12 +46,35 @@ use crate::query_wire::{element, elements, form_encode, opt_element};
 /// Keep this at or above `boot_serve.rs`'s stack: the same assembly runs here.
 const BOOT_STACK_SIZE: usize = 64 * 1024 * 1024;
 
-/// Longer than CloudFormation's clock-owed stack transition (`STATUS_TRANSITION_DELAY`,
-/// 500 ms), so a stack this suite deployed has reached its terminal status — which is when
-/// its resources are reported — by the time it is read. A failed create owes TWO of those
-/// spans (the create's failure, then the rollback), so the waits below are taken twice
-/// where a rollback is expected.
-const PAST_STACK_SPAN: Duration = Duration::from_millis(900);
+/// How long a wait for a clock-owed stack transition is given before the reading it last
+/// took is the one asserted on.
+///
+/// The transitions themselves are short (CloudFormation's own `STATUS_TRANSITION_DELAY`),
+/// but what is waited for is the CONDITION and not a span of the clock: the work a
+/// transition owes runs when the host gets to it, so a loaded machine reaches the same state
+/// later than an idle one. The deadline is therefore generous, and a settled stack is
+/// answered as soon as it settles ([`until`]).
+const STACK_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How long one look at a clock-owed condition waits before the next; see [`until`].
+const STACK_POLL: Duration = Duration::from_millis(25);
+
+/// Take `read` again until `settled` holds of what it answered, or until
+/// [`STACK_DEADLINE`] has passed, and answer the last reading taken.
+///
+/// Every wait in this suite is for a state some clock-owed work of the emulator reaches, so
+/// it is a poll of the state and never a sleep of a fixed length: the caller asserts on the
+/// reading this answers, which is the settled one wherever the work ran inside the deadline.
+fn until<T>(mut read: impl FnMut() -> T, settled: impl Fn(&T) -> bool) -> T {
+    let deadline = std::time::Instant::now() + STACK_DEADLINE;
+    loop {
+        let reading = read();
+        if settled(&reading) || std::time::Instant::now() >= deadline {
+            return reading;
+        }
+        std::thread::sleep(STACK_POLL);
+    }
+}
 
 /// CodePipeline's `X-Amz-Target` prefix, from that service's own model (service shape
 /// `CodePipeline_20150709`).
@@ -592,10 +615,19 @@ fn a_cfn_declared_pipeline_bucket_and_role_exist_in_the_services_that_own_them()
                     status, 200,
                     "case {label:?}: CreateStack must succeed, got {status} with body {body}"
                 );
-                std::thread::sleep(PAST_STACK_SPAN);
 
-                let (status, described) =
-                    emulator.cloudformation(region, "DescribeStacks", &[("StackName", case.stack)]);
+                // The stack reports its resources once it has reached its terminal status,
+                // so the wait is for that status rather than for a span of the clock.
+                let (status, described) = until(
+                    || {
+                        emulator.cloudformation(
+                            region,
+                            "DescribeStacks",
+                            &[("StackName", case.stack)],
+                        )
+                    },
+                    |(_, described)| element(described, "StackStatus") == "CREATE_COMPLETE",
+                );
                 assert_eq!(
                     status, 200,
                     "case {label:?}: DescribeStacks must succeed, got {status} with body \
@@ -847,13 +879,17 @@ fn a_cfn_declared_pipeline_bucket_and_role_exist_in_the_services_that_own_them()
                 status, 200,
                 "case {label:?}: CreateStack must be accepted, got {status} with body {body}"
             );
-            // Twice the clock-owed span: the create's failure falls due, then the rollback.
-            std::thread::sleep(PAST_STACK_SPAN);
-            std::thread::sleep(PAST_STACK_SPAN);
-            let (status, described) = emulator.cloudformation(
-                region,
-                "DescribeStacks",
-                &[("StackName", "cfn-codepipeline-Refused")],
+            // Two clock-owed transitions in a row — the create's failure falls due, then the
+            // rollback — so the wait is for the terminal status both of them lead to.
+            let (status, described) = until(
+                || {
+                    emulator.cloudformation(
+                        region,
+                        "DescribeStacks",
+                        &[("StackName", "cfn-codepipeline-Refused")],
+                    )
+                },
+                |(_, described)| element(described, "StackStatus") == "ROLLBACK_COMPLETE",
             );
             assert_eq!(
                 status, 200,
@@ -929,11 +965,15 @@ fn a_cfn_declared_pipeline_bucket_and_role_exist_in_the_services_that_own_them()
                 status, 200,
                 "case {label:?}: DeleteStack must succeed, got {status} with body {body}"
             );
-            std::thread::sleep(PAST_STACK_SPAN);
-            let (status, answer) = emulator.codepipeline(
-                region,
-                "GetPipeline",
-                serde_json::json!({ "name": pipeline }),
+            let (status, answer) = until(
+                || {
+                    emulator.codepipeline(
+                        region,
+                        "GetPipeline",
+                        serde_json::json!({ "name": pipeline }),
+                    )
+                },
+                |(status, _)| *status == 400,
             );
             assert_eq!(
                 status, 400,
@@ -943,6 +983,14 @@ fn a_cfn_declared_pipeline_bucket_and_role_exist_in_the_services_that_own_them()
             assert!(
                 answer.to_string().contains(PIPELINE_NOT_FOUND),
                 "case {label:?}: the refusal must be {PIPELINE_NOT_FOUND}, got {answer}"
+            );
+            // The same delete releases the bucket. It is looked for with a READ until it is
+            // gone, so the write below is the call that reads the refusal rather than the one
+            // that waits for it — a write taken while the bucket is still there would leave an
+            // object in it and block the delete.
+            until(
+                || emulator.s3(region, "HEAD", &format!("/{bucket}"), b""),
+                |(status, _, _)| *status == 404,
             );
             let (status, _, body) =
                 emulator.s3(region, "PUT", &format!("/{bucket}/after-delete.zip"), b"after");
