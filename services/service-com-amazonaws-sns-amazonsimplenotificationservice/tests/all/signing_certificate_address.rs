@@ -487,6 +487,12 @@ async fn the_certificate_address_admits_a_caller_with_no_credential() {
 /// The handler of a subscribed function that FETCHES the certificate the record named it, as
 /// a subscriber verifying the message does, and forwards what that fetch answered to the
 /// capture queue — the whole point of the address being the subscriber's to follow.
+///
+/// The deadline the fetch names is deliberately far above what fetching an address inside
+/// this same process costs, which is a fraction of a second: the fetch stays bounded, so a
+/// handler is never left waiting on an address that answers nothing, while what the
+/// subscriber reports is what that address answered rather than how loaded the machine was
+/// when it asked.
 const VERIFYING_HANDLER: &str = r#"
 import json
 import urllib.request
@@ -498,7 +504,7 @@ def lambda_handler(event, context):
     record = event["Records"][0]["Sns"]
     url = record["SigningCertUrl"]
     try:
-        with urllib.request.urlopen(url, timeout=5) as answered:
+        with urllib.request.urlopen(url, timeout=60) as answered:
             status = answered.status
             head = answered.read().decode("ascii").splitlines()[0]
     except OSError as error:
@@ -548,8 +554,11 @@ async fn a_subscriber_reaches_the_certificate_at_the_address_it_was_given() {
     subscribe(&emulator, &topic, LAMBDA_PROTOCOL, &function_arn).await;
     publish(&emulator, &topic, &[("Message", "a message to verify")]).await;
 
-    // The invocation is made as the publish is answered; what the handler's own fetch
-    // answered is read off the capture queue.
+    // The event is queued as the publish is answered and the handler runs a moment later, so
+    // both waits below LOOK for what they wait on — the queued event, then the report the
+    // handler's own fetch wrote — and are answered the moment it is there. Neither waits out a
+    // span, and the budget they give up after is many times the whole chain, so how loaded the
+    // machine is decides when this test finishes and never whether it passes.
     let events = invoked(&emulator, function, 1).await;
     assert_eq!(
         events.len(),

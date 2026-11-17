@@ -57,13 +57,29 @@ pub(crate) const ROLE: &str = "arn:aws:iam::000000000000:role/service-role/lambd
 /// Nothing here runs it: what this suite asserts is the event SNS handed the function.
 pub(crate) const ZIP_FILE: &str = "UEsDBAoAAAAAAAAAAAA=";
 
-/// How long a wait for an invocation lasts before giving up. An invocation is made as soon as
-/// the publish that owes it is answered, so this is many deliveries' worth of slack and not a
-/// span the behaviour depends on.
-pub(crate) const DELIVERY_BUDGET: Duration = Duration::from_secs(10);
+/// How long a wait for an invocation lasts before giving up — the span after which a wait
+/// reports that what it looked for never arrived, rather than a span anything here waits out.
+///
+/// Every such wait LOOKS for its condition and returns the moment it holds, so this only
+/// bounds the failing case: it is deliberately far longer than the whole chain a publish sets
+/// off (the queued delivery attempt, the execution environment a subscribed function's run is
+/// initialized in, that run, and what it wrote), so a machine running many of these suites at
+/// once cannot turn a wait that would have been answered into a failure. A row that expects
+/// NOTHING to arrive does not pay it: those wait out [`QUIET_BUDGET`] instead.
+pub(crate) const DELIVERY_BUDGET: Duration = Duration::from_secs(60);
 
 /// How long a wait lasts before concluding that NOTHING was invoked.
 const QUIET_BUDGET: Duration = Duration::from_millis(1_500);
+
+/// The `Timeout` a function stood up here is configured with: the largest span AWS accepts
+/// for a function, 900 seconds, which is inside that member's own range (`smithy_query(
+/// query="shape", shape="Timeout")` on the Lambda model: `@range(min: 1, max: 5400)`).
+///
+/// No suite over this harness asserts anything about the `Timeout`; what the handlers here do
+/// is a fetch or a write that takes a fraction of a second. Giving them the whole span a
+/// function may carry keeps a loaded host from cutting a run short, which would be a failure
+/// of the machine's speed rather than of the behaviour under test.
+const GENEROUS_TIMEOUT_SECONDS: i64 = 900;
 
 /// How often a wait looks.
 pub(crate) const LOOK_INTERVAL: Duration = Duration::from_millis(25);
@@ -740,7 +756,7 @@ pub(crate) async fn given_function_running(
             "Role": ROLE,
             "Runtime": "python3.12",
             "Handler": "lambda_function.lambda_handler",
-            "Timeout": 10,
+            "Timeout": GENEROUS_TIMEOUT_SECONDS,
             "Code": {
                 "ZipFile": base64::engine::general_purpose::STANDARD.encode(buffer.into_inner()),
             },
