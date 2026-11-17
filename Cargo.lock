@@ -13390,6 +13390,7 @@ dependencies = [
 name = "service-com-amazonaws-ec2-amazonec2"
 version = "0.1.0"
 dependencies = [
+ "automod",
  "aws-emulator-build-support",
  "aws-emulator-emulator-telemetry",
  "aws-emulator-engine",
@@ -13421,8 +13422,10 @@ dependencies = [
  "serde_json",
  "service-com-amazonaws-acm-certificatemanager",
  "service-com-amazonaws-cloudwatch-graniteserviceversion20100801",
+ "service-com-amazonaws-cloudwatchlogs-logs-20140328",
  "service-com-amazonaws-ebs-ebs",
  "service-com-amazonaws-eventbridge-awsevents",
+ "service-com-amazonaws-firehose-firehose-20150804",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
  "service-com-amazonaws-kms-trentservice",
  "service-com-amazonaws-rbin-amazonrecyclebin",
@@ -21845,6 +21848,7 @@ dependencies = [
  "aws-sdk-cloudwatchlogs",
  "aws-sdk-dynamodbstreams",
  "aws-sdk-eventbridge",
+ "aws-sdk-firehose",
  "aws-sdk-iam",
  "aws-sdk-kinesis",
  "aws-sdk-organizations",

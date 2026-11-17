@@ -11,6 +11,15 @@
 //! same configuration and destination for is refused too (`FlowLogAlreadyExists`): one
 //! monitoring is turned on once.
 //!
+//! The DESTINATION is resolved too, where the service that owns it holds it
+//! ([`crate::state::absent_flow_log_destination`]): logging cannot be turned on towards a
+//! bucket or a delivery stream that is not there, so a create naming one is answered the
+//! partial-success way this operation reports a flow log it could not create — an empty
+//! `FlowLogIds` and one `Unsuccessful` item per monitored resource — and stores nothing. The
+//! one destination type with nothing to resolve is CloudWatch Logs, whose group is "a new or
+//! existing CloudWatch Logs log group" (`$LogGroupName`) and so is brought into existence by
+//! the delivery rather than found by the create.
+//!
 //! A flow log that publishes to Amazon S3 also leaves the destination bucket permitting the
 //! log delivery service to write its records there: that permission lives in the bucket's own
 //! policy, which Amazon S3 owns, so the create merges it in through that service
@@ -436,9 +445,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )?;
 
         // "The destination options" (`$DestinationOptions`), as the response shape reports
-        // them, with each member the request left out at the default its own documentation
-        // gives it: "The default is plain-text" (`DestinationOptionsRequest$FileFormat`),
-        // "The default is false" (`$HiveCompatiblePartitions`, `$PerHourPartition`).
+        // them. Each member the request left out is at the default its own documentation gives
+        // it — "The default is plain-text" (`DestinationOptionsRequest$FileFormat`), "The
+        // default is false" (`$HiveCompatiblePartitions`, `$PerHourPartition`) — which
+        // [`state::ComAmazonawsEc2Amazonec2State::insert_flow_log`] applies to every flow log
+        // it stores, so a request that carried none is reported the options in force all the
+        // same.
         let destination_options = input.destination_options.as_ref().map(|options| {
             DestinationOptionsResponse {
                 file_format: Some(
@@ -501,11 +513,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or_else(state::generated_client_token);
 
         let state_handle = state::require_service_state(&*self.engine)?;
-        // Everything this service's own store decides happens inside this scope, so the
-        // guard is released before the delivery grants below await the service that owns the
-        // destination bucket: a lock is never held across an await.
-        let flow_log_ids: Vec<String> = {
-            let mut store = state_handle.lock();
+
+        // What this call would store: one flow log per monitored resource, every one of
+        // them built the same way, so the batch is charged and stored as a whole.
+        //
+        // The creation instant is read ONCE here: every flow log this one call mints was
+        // created by that call, so they carry the same `CreationTime` rather than one
+        // per record.
+        let created_at = SystemTime::now();
+        let specs: Vec<state::FlowLogSpec> = resource_ids
+            .iter()
+            .map(|resource_id| state::FlowLogSpec {
+                resource_id: resource_id.clone(),
+                traffic_type: input.traffic_type.clone(),
+                log_destination_type: log_destination_type.clone(),
+                log_destination: log_destination.clone(),
+                log_group_name: log_group_name.clone(),
+                log_format: input.log_format.clone(),
+                deliver_logs_permission_arn: input.deliver_logs_permission_arn.clone(),
+                deliver_cross_account_role: input.deliver_cross_account_role.clone(),
+                max_aggregation_interval,
+                destination_options: destination_options.clone(),
+                tag_field_specifications: tag_field_specifications.clone(),
+                tags: tags.clone(),
+                client_token: Some(recorded_token.clone()),
+                created_at,
+            })
+            .collect();
+
+        // Everything this service's OWN store decides is decided in this scope, so the guard
+        // is released before the destination below is resolved against the service that owns
+        // it: a lock is never held across an await.
+        let replayed: Option<Vec<String>> = {
+            let store = state_handle.lock();
 
             // Idempotency: one token names the flow logs it minted, so a replay reports
             // those and creates nothing. A replay stores nothing, so it is charged nothing
@@ -542,76 +582,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ));
             }
 
-            // What this call would store: one flow log per monitored resource, every one of
-            // them built the same way, so the batch is charged and stored as a whole.
-            //
-            // The creation instant is read ONCE here: every flow log this one call mints was
-            // created by that call, so they carry the same `CreationTime` rather than one
-            // per record.
-            let created_at = SystemTime::now();
-            let specs: Vec<state::FlowLogSpec> = resource_ids
-                .iter()
-                .map(|resource_id| state::FlowLogSpec {
-                    resource_id: resource_id.clone(),
-                    traffic_type: input.traffic_type.clone(),
-                    log_destination_type: log_destination_type.clone(),
-                    log_destination: log_destination.clone(),
-                    log_group_name: log_group_name.clone(),
-                    log_format: input.log_format.clone(),
-                    deliver_logs_permission_arn: input.deliver_logs_permission_arn.clone(),
-                    deliver_cross_account_role: input.deliver_cross_account_role.clone(),
-                    max_aggregation_interval,
-                    destination_options: destination_options.clone(),
-                    tag_field_specifications: tag_field_specifications.clone(),
-                    tags: tags.clone(),
-                    client_token: Some(recorded_token.clone()),
-                    created_at,
-                })
-                .collect();
             // A count ceiling first, then the byte budget: a record count on its own admits
             // gigabytes, because each record holds strings the caller chose the length of. A
             // replay stores nothing, so it is charged nothing and clears both gates.
             if replayed.is_none() {
-                // "There is an existing Flow Log with the same configuration and log
-                // destination": a monitored resource carries ONE flow log of a given
-                // capture configuration delivered to a given destination, so a create that
-                // asks for one the account already holds is refused rather than doubling
-                // it — a client's duplicate detection depends on that refusal. The whole
-                // batch is asked before anything is stored, the way an unresolvable
-                // `ResourceIds` entry refuses the whole call.
-                if store.holds_any_flow_log_like(&specs) {
-                    return Err(state::flow_log_already_exists());
-                }
-                if !store.has_flow_log_capacity_for(specs.len()) {
-                    return Err(state::flow_logs_limit_exceeded(format!(
-                        "This emulator holds {max} flow logs, which is as many as it stores",
-                        max = state::MAX_STORED_RECORDS_PER_STORE,
-                    )));
-                }
-                let payload_bytes: usize =
-                    specs.iter().map(state::flow_log_payload_bytes).sum();
-                if store.would_exceed_stored_bytes(payload_bytes) {
-                    return Err(state::flow_logs_limit_exceeded(format!(
-                        "This emulator holds {held} of at most {max} bytes of \
-                         caller-supplied data, so it cannot store {payload_bytes} more",
-                        held = store.stored_bytes(),
-                        max = state::MAX_STORED_BYTES,
-                    )));
-                }
+                store_admits_flow_logs(&store, &specs)?;
             }
 
-            // "Unique, case-sensitive identifier that you provide to ensure the idempotency
-            // of the request" (`CreateFlowLogsResult$ClientToken`): the token is echoed on
-            // the answer, a replay's included.
-            if let Some(flow_log_ids) = replayed {
+            replayed
+        };
+
+        // "Unique, case-sensitive identifier that you provide to ensure the idempotency
+        // of the request" (`CreateFlowLogsResult$ClientToken`): the token is echoed on
+        // the answer, a replay's included. A replay reports the flow logs its token
+        // already minted, so it resolves nothing and stores nothing.
+        if let Some(flow_log_ids) = replayed {
+            return Ok(CreateFlowLogsOutput {
+                client_token: input.client_token.clone(),
+                flow_log_ids: Some(flow_log_ids),
+                // Every flow log this token minted was stored, so none of them failed.
+                unsuccessful: Some(Vec::new()),
+            });
+        }
+
+        // WHERE the records would go has to be there before logging is turned on: the
+        // destination is a resource of ANOTHER service, and one that service does not hold
+        // could never receive a record. So it is resolved where its owner holds it
+        // ([`state::absent_flow_log_destination`], asked with no guard held), and a
+        // destination reported absent turns logging on for nothing at all: "Information about
+        // the flow logs that could not be created successfully"
+        // (`CreateFlowLogsResult$Unsuccessful`) reports one item per monitored resource the
+        // request named, the flow log id set is empty, and the store is left exactly as it
+        // was — rather than a flow log reported ACTIVE whose records nothing will ever
+        // receive.
+        if let Some(destination) = log_destination.as_deref() {
+            if let Some(absent) = state::absent_flow_log_destination(
+                ctx,
+                &state::request_region(ctx.parts()),
+                &log_destination_type,
+                destination,
+            )
+            .await
+            {
                 return Ok(CreateFlowLogsOutput {
-                    client_token: input.client_token.clone(),
-                    flow_log_ids: Some(flow_log_ids),
-                    // Every flow log this token minted was stored, so none of them failed.
-                    unsuccessful: Some(Vec::new()),
+                    client_token: Some(recorded_token),
+                    // "The IDs of the flow logs" (`$FlowLogIds`): this call created none.
+                    flow_log_ids: Some(Vec::new()),
+                    unsuccessful: Some(
+                        resource_ids
+                            .iter()
+                            .map(|resource_id| {
+                                state::flow_log_destination_absent_item(resource_id, &absent)
+                            })
+                            .collect(),
+                    ),
                 });
             }
+        }
 
+        // The flow logs this call stores, written in a scope of their own, so the guard is
+        // released before the delivery grants below await the service that owns the
+        // destination bucket: a lock is never held across an await.
+        //
+        // The store's own conditions are asked AGAIN here, under the guard that performs the
+        // write: the destination above was resolved with no guard held, so another create may
+        // have stored the flow logs this one asks for, or taken the room they need, in the
+        // meantime. Asking inside the writing scope is what makes the refusal a fact of the
+        // store rather than of an instant before it.
+        let flow_log_ids: Vec<String> = {
+            let mut store = state_handle.lock();
+            store_admits_flow_logs(&store, &specs)?;
             specs
                 .into_iter()
                 .map(|spec| store.insert_flow_log(spec))
@@ -651,6 +691,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             unsuccessful: Some(Vec::new()),
         })
     }
+}
+
+/// Whether the store admits the flow logs `specs` describe — and the refusal it does not.
+///
+/// The three conditions this service's own store decides a create by, asked as one so the
+/// scope that VALIDATES and the scope that WRITES cannot ask different questions:
+///
+/// * "There is an existing Flow Log with the same configuration and log destination": a
+///   monitored resource carries ONE flow log of a given capture configuration delivered to a
+///   given destination, so a create that asks for one the account already holds is refused
+///   rather than doubling it — a client's duplicate detection depends on that refusal. The
+///   whole batch is asked before anything is stored, the way an unresolvable `ResourceIds`
+///   entry refuses the whole call.
+/// * A count ceiling, then the byte budget: a record count on its own admits gigabytes,
+///   because each record holds strings the caller chose the length of.
+fn store_admits_flow_logs(
+    store: &crate::state::ComAmazonawsEc2Amazonec2State,
+    specs: &[crate::state::FlowLogSpec],
+) -> Result<(), CreateFlowLogsError> {
+    use crate::state;
+
+    if store.holds_any_flow_log_like(specs) {
+        return Err(state::flow_log_already_exists());
+    }
+    if !store.has_flow_log_capacity_for(specs.len()) {
+        return Err(state::flow_logs_limit_exceeded(format!(
+            "This emulator holds {max} flow logs, which is as many as it stores",
+            max = state::MAX_STORED_RECORDS_PER_STORE,
+        )));
+    }
+    let payload_bytes: usize = specs.iter().map(state::flow_log_payload_bytes).sum();
+    if store.would_exceed_stored_bytes(payload_bytes) {
+        return Err(state::flow_logs_limit_exceeded(format!(
+            "This emulator holds {held} of at most {max} bytes of caller-supplied data, so it \
+             cannot store {payload_bytes} more",
+            held = store.stored_bytes(),
+            max = state::MAX_STORED_BYTES,
+        )));
+    }
+    Ok(())
 }
 
 /// The member a request names a CloudWatch Logs log group with (`$LogGroupName`), as a

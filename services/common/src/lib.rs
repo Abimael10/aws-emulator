@@ -437,6 +437,11 @@ pub mod feature_store_groups;
 /// the one permission question the control plane that CONFIGURES an offline store and the
 /// data plane that WRITES it share.
 pub mod feature_store_offline_store;
+/// The ONE construction of the in-process Amazon Data Firehose client a service reaches a
+/// delivery stream through, and the ONE question of whether Firehose holds the stream a
+/// caller-supplied destination names — so that hop, and the reading of an absent stream, are
+/// stated once rather than per service.
+pub mod firehose_client;
 pub mod front_door;
 /// The request-claim rule for the two emulated services whose SigV4 signing name is
 /// `greengrass` — the 2017-06-07 and 2020-11-30 API versions of one product, which AWS

@@ -80,7 +80,7 @@ pub fn flow_log_destination_names_its_type(
         LOG_DESTINATION_TYPE_S3 => flow_log_s3_destination(log_destination).is_some(),
         LOG_DESTINATION_TYPE_CLOUD_WATCH_LOGS => log_group_name_in_arn(log_destination).is_some(),
         LOG_DESTINATION_TYPE_KINESIS_DATA_FIREHOSE => {
-            arn_names_firehose_delivery_stream(log_destination)
+            firehose_delivery_stream_in_arn(log_destination).is_some()
         }
         _ => true,
     }
@@ -92,23 +92,25 @@ pub fn flow_log_destination_names_its_type(
 /// (`CreateFlowLogsRequest$LogDestination`).
 const FIREHOSE_DELIVERY_STREAM_RESOURCE: &str = "deliverystream";
 
-/// Whether the Firehose ARN `arn` names a delivery stream with a name — its resource part is
-/// [`FIREHOSE_DELIVERY_STREAM_RESOURCE`] followed by one of the two separators an AWS ARN
-/// writes a resource's name after (`:` as that member's example spells it, `/` as the service
-/// itself spells its stream ARNs), and then a name.
-fn arn_names_firehose_delivery_stream(arn: &str) -> bool {
+/// The NAME of the delivery stream the Firehose ARN `arn` names, or `None` when it names no
+/// delivery stream at all — its resource part is [`FIREHOSE_DELIVERY_STREAM_RESOURCE`]
+/// followed by one of the two separators an AWS ARN writes a resource's name after (`:` as
+/// that member's example spells it, `/` as the service itself spells its stream ARNs), and
+/// then a name.
+///
+/// The NAME rather than a yes/no, because that is what Firehose itself holds a stream under:
+/// the same reading answers whether the destination is one of this type
+/// ([`flow_log_destination_names_its_type`]) and what to ask Firehose about
+/// ([`super::absent_flow_log_destination`]), the way [`log_group_name_in_arn`] serves both
+/// for the other destination type named by an ARN.
+pub fn firehose_delivery_stream_in_arn(arn: &str) -> Option<&str> {
     // Six parts: the `arn` literal, the partition, the service, the Region, the account and
     // the resource — the only part that may itself carry a separator.
-    let Some(resource) = arn.splitn(6, ':').nth(5) else {
-        return false;
-    };
-    let Some(name) = resource
+    let resource = arn.splitn(6, ':').nth(5)?;
+    let name = resource
         .strip_prefix(FIREHOSE_DELIVERY_STREAM_RESOURCE)
-        .and_then(|rest| rest.strip_prefix(':').or_else(|| rest.strip_prefix('/')))
-    else {
-        return false;
-    };
-    !name.is_empty()
+        .and_then(|rest| rest.strip_prefix(':').or_else(|| rest.strip_prefix('/')))?;
+    (!name.is_empty()).then_some(name)
 }
 
 /// Refuse a `LogDestination` that is not an ARN of the destination its `LogDestinationType`

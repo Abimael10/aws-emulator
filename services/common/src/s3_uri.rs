@@ -232,7 +232,10 @@ pub async fn object_is_absent(callback: &EmbeddedEmulator, region: &str, s3_uri:
 /// hold.
 ///
 /// What to ask about the place a job WRITES: the object under it is not there yet, so the
-/// bucket is what has to be. Same grounding as [`object_is_absent`].
+/// bucket is what has to be. The question itself is the tree's one reading of it
+/// ([`crate::s3_client::bucket_is_absent_over`]), so a destination named by a URI and one
+/// named by a bucket name cannot be resolved differently; same grounding as
+/// [`object_is_absent`].
 pub async fn bucket_is_absent(callback: &EmbeddedEmulator, region: &str, s3_uri: &str) -> bool {
     let Some(bucket) = bucket_name(s3_uri) else {
         return true;
@@ -240,17 +243,7 @@ pub async fn bucket_is_absent(callback: &EmbeddedEmulator, region: &str, s3_uri:
     let Some(region) = crate::arn::region_label(region) else {
         return false;
     };
-    match crate::s3_client::s3_client(callback, region)
-        .head_bucket()
-        .bucket(bucket)
-        .send()
-        .await
-    {
-        Ok(_) => false,
-        Err(error) => {
-            crate::s3_object_read::answered_refusal(&error) == crate::s3_object_read::ObjectRead::Absent
-        }
-    }
+    crate::s3_client::bucket_is_absent_over(callback, region, &bucket).await
 }
 
 #[cfg(test)]

@@ -124,6 +124,9 @@ aws-sdk-s3 = { version = "1", default-features = false }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Declares one module per `tests/all/<name>.rs` from `tests/all/main.rs`, so this crate's one
+# integration-test target picks each suite up from its own file.
+automod = { workspace = true }
 sha2 = { workspace = true }
 # The import tests build the public key material they send and read the base64 digest an
 # ED25519 import's fingerprint carries.
@@ -148,6 +151,12 @@ service-com-amazonaws-acm-certificatemanager = { workspace = true }
 # on a single engine — exactly as the assembled emulator does — because a create for an S3
 # destination amends that bucket's policy by calling it in process.
 service-com-amazonaws-s3-amazons3 = { workspace = true }
+# The destination-existence suite mounts the OTHER two services that own a flow-log destination
+# beside this one on a single engine, for the same reason: a create resolves the delivery stream
+# it was pointed at against Amazon Data Firehose, and reads a log group back from CloudWatch
+# Logs. TEST-ONLY — `src/` reaches both over the in-process callback instead.
+service-com-amazonaws-firehose-firehose-20150804 = { workspace = true }
+service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 # The KMS service, so the encrypted-volume suite can create, disable and schedule deletion of a
 # real key through the service that OWNS keys and watch what EC2 does with a volume under it.
 # TEST-ONLY — `src/` reaches that service over the in-process callback instead.

@@ -2766,6 +2766,12 @@ pub mod flow_log_s3_delivery;
 /// re-exported below, so a handler reaches it as
 /// `crate::state::flow_log_destination_names_its_type` like any helper of this module.
 pub mod flow_log_destinations;
+/// Whether the destination a flow log would publish to EXISTS, asked of the service that owns
+/// it, and the per-resource failure a create reports for one that does not — in a file of its
+/// own rather than as more lines here. Everything it declares is re-exported below, so a
+/// handler reaches it as `crate::state::absent_flow_log_destination` like any helper of this
+/// module.
+pub mod flow_log_destination_existence;
 /// EC2's request-PARAMETER validation refusal — the envelope, the path a parameter is named
 /// by, how a list parameter's value prints, and the refusal for a value outside a
 /// parameter's form — in a file of its own rather than as more lines here. Everything it
@@ -2991,6 +2997,8 @@ pub use enclave_certificate_iam_roles::*;
 pub use flow_log_s3_delivery::*;
 
 pub use flow_log_destinations::*;
+
+pub use flow_log_destination_existence::*;
 
 pub use parameter_validation::*;
 
@@ -4581,15 +4589,25 @@ impl ComAmazonawsEc2Amazonec2State {
     pub fn insert_flow_log(&mut self, spec: FlowLogSpec) -> String {
         let payload_bytes = flow_log_payload_bytes(&spec);
         let flow_log_id = self.next_id(FLOW_LOG_ID_PREFIX);
-        // The destination options this flow log is delivered under, every member at the
-        // value in force for it.
-        let (file_format, hive_compatible_partitions, per_hour_partition) =
-            flow_log_destination_options_in_force(spec.destination_options.as_ref());
-        let destination_options = DestinationOptionsResponse {
-            file_format: Some(file_format),
-            hive_compatible_partitions: Some(hive_compatible_partitions),
-            per_hour_partition: Some(per_hour_partition),
-        };
+        // The destination options a flow log is delivered under, every member at the value in
+        // force for it — and only for the destination type they describe. They are properties
+        // of the OBJECTS an Amazon S3 delivery writes (`DestinationOptionsResponse`: a file
+        // format, Hive-compatible prefixes, per-hour partitioning), which is why a request
+        // naming them for any other destination type is refused outright
+        // ([`flow_log_member_unsupported_for_destination`]) — so they are the Amazon S3 shape,
+        // reported for a flow log that publishes to Amazon S3 and absent from a flow log of
+        // every other type, exactly as the destination ARN member is.
+        let destination_options = (spec.log_destination_type == LOG_DESTINATION_TYPE_S3).then(
+            || {
+                let (file_format, hive_compatible_partitions, per_hour_partition) =
+                    flow_log_destination_options_in_force(spec.destination_options.as_ref());
+                DestinationOptionsResponse {
+                    file_format: Some(file_format),
+                    hive_compatible_partitions: Some(hive_compatible_partitions),
+                    per_hour_partition: Some(per_hour_partition),
+                }
+            },
+        );
         let view = FlowLog {
             creation_time: Some(system_time_to_date_time(spec.created_at)),
             // "The status of the logs delivery (SUCCESS | FAILED)"
@@ -4620,13 +4638,14 @@ impl ComAmazonawsEc2Amazonec2State {
             ),
             tags: Some(spec.tags),
             max_aggregation_interval: Some(spec.max_aggregation_interval),
-            // "The destination options" (`FlowLog$DestinationOptions`) — reported for EVERY
-            // flow log, at the values they are in force with: a create that named none, or
-            // left a member of them out, gets each at the default its own documentation
-            // gives it ([`flow_log_destination_options_in_force`], the same reading that
-            // decides whether two creates ask for one flow log). Derived HERE, so no writer
-            // can store a flow log whose delivery format a client cannot read.
-            destination_options: Some(destination_options),
+            // "The destination options" (`FlowLog$DestinationOptions`) — the Amazon S3 shape,
+            // at the values they are in force with: a create that named none, or left a
+            // member of them out, gets each at the default its own documentation gives it
+            // ([`flow_log_destination_options_in_force`], the same reading that decides
+            // whether two creates ask for one flow log). Derived HERE, so no writer can store
+            // a flow log whose delivery format a client cannot read, nor one carrying options
+            // for a delivery that has none.
+            destination_options,
             tag_field_specifications: spec.tag_field_specifications,
         };
         self.add_stored_bytes(payload_bytes);

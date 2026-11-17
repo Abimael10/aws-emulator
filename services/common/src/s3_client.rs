@@ -18,6 +18,10 @@
 //! The copies that predate this module — one per service that writes to a bucket — are to be
 //! MIGRATED onto it, each in the change that owns its service. Nothing new should build the
 //! client by hand.
+//!
+//! Beside the client, this module holds the one thing a service POINTED AT a bucket needs
+//! before it stores that destination: whether Amazon S3 holds the bucket at all
+//! ([`bucket_is_absent`]).
 
 use smithy_server_runtime::EmbeddedEmulator;
 
@@ -32,6 +36,58 @@ use smithy_server_runtime::EmbeddedEmulator;
 #[must_use]
 pub fn s3_client(callback: &EmbeddedEmulator, region: &str) -> ::aws_sdk_s3::Client {
     client_signing_with(callback, region, callback.aws_credentials_provider())
+}
+
+/// Whether Amazon S3 ANSWERED that it holds no bucket under `name`.
+///
+/// A service POINTED at a bucket it is to deliver into has to resolve that bucket where
+/// Amazon S3 holds it before it stores the destination, or it leaves an operator believing a
+/// delivery exists where no object is ever written. The question is put with `HeadBucket`, the
+/// operation Amazon S3 documents for exactly this ("You can use this operation to determine
+/// if a bucket exists"), and the answer is read by
+/// [`crate::s3_object_read::answered_refusal`], the one classification of what an object
+/// store's refusal establishes about the address a request named.
+///
+/// `false` — establish nothing — for every answer that is NOT the store saying the bucket is
+/// not there: an emulator assembled with no Amazon S3 to ask, and an answer that could not be
+/// read. A refusal has to be grounded in what the owning service said, which is the rule
+/// every cross-service pre-condition in this tree follows
+/// (`services/common/src/network.rs` states which resolution is which).
+///
+/// The copies that predate this reading — one per service that resolves such a destination
+/// (`service-com-amazonaws-s3files-s3files`'s `state::bucket_is_absent`,
+/// `service-com-amazonaws-braket-braket`'s `state::task_results::output_bucket_is_absent`) —
+/// are to be MIGRATED onto it, each in the change that owns its service.
+///
+/// Call it with NO state guard held — it awaits.
+pub async fn bucket_is_absent(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    name: &str,
+) -> bool {
+    bucket_is_absent_over(ctx.callback(), region, name).await
+}
+
+/// [`bucket_is_absent`] for a caller that holds the in-process transport ITSELF rather than a
+/// request's context — the `s3://` URI form ([`crate::s3_uri::bucket_is_absent`]) among them,
+/// so the two cannot disagree about which answer means the bucket is not there.
+pub async fn bucket_is_absent_over(
+    callback: &EmbeddedEmulator,
+    region: &str,
+    name: &str,
+) -> bool {
+    match s3_client(callback, region)
+        .head_bucket()
+        .bucket(name)
+        .send()
+        .await
+    {
+        Ok(_) => false,
+        Err(error) => {
+            crate::s3_object_read::answered_refusal(&error)
+                == crate::s3_object_read::ObjectRead::Absent
+        }
+    }
 }
 
 /// The same client, signing every call it makes as `credentials` rather than with the

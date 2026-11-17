@@ -38,8 +38,11 @@
 //!    `privateIpAddressesSet` only the primary entry carries a name, and every secondary
 //!    entry carries the member EMPTY — whichever call put the address on the interface and
 //!    whichever operation reports it.
-//! 8. EVERY FLOW LOG REPORTS ITS DESTINATION OPTIONS, each member at the value in force for
-//!    it: the value the create asked for, or the default its own documentation gives it.
+//! 8. A FLOW LOG THAT PUBLISHES TO AMAZON S3 REPORTS ITS DESTINATION OPTIONS, each member at
+//!    the value in force for it: the value the create asked for, or the default its own
+//!    documentation gives it. A flow log of any other destination type reports none — the
+//!    options describe the objects an Amazon S3 delivery writes, so they are that
+//!    destination's shape.
 //! 9. A PAGED `DescribeFlowLogs` ANSWERS A `NextToken` WHENEVER `MaxResults` FILLED THE
 //!    PAGE, and the walk ends on the page the limit did not fill.
 //! 10. A LAUNCH TEMPLATE NAMES THE IAM PRINCIPAL THAT CREATED IT — the identity the call
@@ -1062,33 +1065,35 @@ async fn an_instance_reports_its_interface_addresses_under_the_same_rule() {
 /// hiveCompatiblePartitions, perHourPartition)`, each `None` when the element is absent.
 type DestinationOptions = (Option<String>, Option<String>, Option<String>);
 
-/// The destination options of the one flow log a response reports.
-fn reported_destination_options(case: &str, body: &str) -> DestinationOptions {
+/// The destination options of the one flow log a response reports — `None` when the flow log
+/// carries no `destinationOptions` element at all.
+fn reported_destination_options(case: &str, body: &str) -> Option<DestinationOptions> {
     let parsed = document(case, body);
     let flow_log = parsed
         .descendants()
         .find(|node| node.is_element() && child(*node, "flowLogId").is_some())
         .unwrap_or_else(|| panic!("case {case:?}: no flow log (no <flowLogId>) in {body}"));
-    let options = child(flow_log, "destinationOptions")
-        .unwrap_or_else(|| panic!("case {case:?}: no <destinationOptions> on the flow log in \
-                                  {body}"));
-    (
+    let options = child(flow_log, "destinationOptions")?;
+    Some((
         child_text(options, "fileFormat"),
         child_text(options, "hiveCompatiblePartitions"),
         child_text(options, "perHourPartition"),
-    )
+    ))
 }
 
-/// RULE 8: every flow log reports its destination options, each member at the value in force
-/// for it — the value the create asked for, or the default `DestinationOptionsRequest`
-/// documents for the member ("The default is plain-text" for `$FileFormat`, "The default is
-/// false" for `$HiveCompatiblePartitions` and `$PerHourPartition`).
+/// RULE 8: a flow log that publishes to Amazon S3 reports its destination options, each
+/// member at the value in force for it — the value the create asked for, or the default
+/// `DestinationOptionsRequest` documents for the member ("The default is plain-text" for
+/// `$FileFormat`, "The default is false" for `$HiveCompatiblePartitions` and
+/// `$PerHourPartition`) — and a flow log of any other destination type reports none at all:
+/// the options describe the OBJECTS an Amazon S3 delivery writes, so they are that
+/// destination's shape, which is also why a request naming them for another type is refused.
 ///
 /// The rows differ in WHICH options the create named — none at all (twice: once for a
 /// destination type that takes no options at all), one of the three, all three, and all
 /// three spelled out at their own defaults.
 #[tokio::test]
-async fn every_reported_flow_log_carries_the_destination_options_in_force() {
+async fn a_flow_log_carries_the_destination_options_of_the_destination_it_publishes_to() {
     let (router, _engine) = emulator();
     let vpc = ok(
         &router,
@@ -1104,46 +1109,43 @@ async fn every_reported_flow_log_carries_the_destination_options_in_force() {
     const FALSE: &str = "false";
 
     // Rows: the destination the create publishes to, the destination options it names, and
-    // the options the flow log must then report.
-    type Row = (&'static str, Params, DestinationOptions);
+    // the options the flow log must then report — `None` where the flow log reports none.
+    type Row = (&'static str, Params, Option<DestinationOptions>);
     let rows: Vec<Row> = vec![
         (
             // A CloudWatch Logs destination takes no destination options at all, so this
-            // row is the one where the member cannot even be asked for.
+            // row is the one where the member cannot even be asked for — and the flow log
+            // reports none, the member being the Amazon S3 shape.
             "a CloudWatch Logs destination",
             super::flow_logs::cloud_watch_logs_params("VPC", &vpc_id, "destination-options"),
-            (
-                Some(PLAIN_TEXT.to_string()),
-                Some(FALSE.to_string()),
-                Some(FALSE.to_string()),
-            ),
+            None,
         ),
         (
             "an S3 destination naming no options",
             s3_flow_log_params(&vpc_id, "none", &[]),
-            (
+            Some((
                 Some(PLAIN_TEXT.to_string()),
                 Some(FALSE.to_string()),
                 Some(FALSE.to_string()),
-            ),
+            )),
         ),
         (
             "an S3 destination naming the file format alone",
             s3_flow_log_params(&vpc_id, "parquet", &[("FileFormat", "parquet")]),
-            (
+            Some((
                 Some("parquet".to_string()),
                 Some(FALSE.to_string()),
                 Some(FALSE.to_string()),
-            ),
+            )),
         ),
         (
             "an S3 destination naming Hive-compatible prefixes alone",
             s3_flow_log_params(&vpc_id, "hive", &[("HiveCompatiblePartitions", "true")]),
-            (
+            Some((
                 Some(PLAIN_TEXT.to_string()),
                 Some("true".to_string()),
                 Some(FALSE.to_string()),
-            ),
+            )),
         ),
         (
             "an S3 destination naming all three",
@@ -1156,11 +1158,11 @@ async fn every_reported_flow_log_carries_the_destination_options_in_force() {
                     ("PerHourPartition", "true"),
                 ],
             ),
-            (
+            Some((
                 Some("parquet".to_string()),
                 Some("true".to_string()),
                 Some("true".to_string()),
-            ),
+            )),
         ),
         (
             "an S3 destination spelling out the defaults",
@@ -1173,11 +1175,11 @@ async fn every_reported_flow_log_carries_the_destination_options_in_force() {
                     ("PerHourPartition", FALSE),
                 ],
             ),
-            (
+            Some((
                 Some(PLAIN_TEXT.to_string()),
                 Some(FALSE.to_string()),
                 Some(FALSE.to_string()),
-            ),
+            )),
         ),
     ];
 
