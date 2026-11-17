@@ -245,11 +245,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(applied) = idempotency_key
             .as_deref()
             .and_then(|key| store.idempotent_call(key))
-            .filter(|call| call.policy_id == policy_id)
+            .filter(|call| call.resource_id == policy_id)
             .and_then(|call| {
                 store
                     .policies
-                    .get(&call.policy_id)
+                    .get(&call.resource_id)
                     .filter(|policy| policy.version == call.version)
             })
         {

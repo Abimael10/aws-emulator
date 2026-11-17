@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! READS the rule [`crate::state`] holds — the reader that proves what `CreateRule`
+//! persisted. Reporting only: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -174,20 +167,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRule"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetRuleErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the rule store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let store = state.lock();
+        let Some(rule) = store.rule_by_identifier(&input.rule_identifier) else {
+            return Err(GetRuleErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "no rule answers to the identifier {:?}",
+                        input.rule_identifier
+                    ),
+                    resource_id: Some(input.rule_identifier.clone()),
+                    resource_type: Some(crate::state::RESOURCE_TYPE_RULE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetRuleOutput {
+            rule_id: rule.rule_id.clone(),
+            rule_arn: rule.rule_arn.clone(),
+            rule_name: rule.rule_name.clone(),
+            rule_description: rule.rule_description.clone(),
+            firewall_type: rule.firewall_type.clone(),
+            rule_type: Some(rule.rule_type.clone()),
+            configuration: rule.configuration.clone(),
+            status: rule.status.clone(),
+            version: rule.version_string(),
+            update_token: Some(rule.update_token.clone()),
+            is_snapshot: Some(rule.is_snapshot),
+            has_published_version: Some(rule.has_published_version),
+            updated_at: Some(rule.updated_at_timestamp()),
+        })
     }
 }

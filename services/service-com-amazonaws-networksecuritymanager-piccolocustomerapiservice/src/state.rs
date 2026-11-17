@@ -8,6 +8,13 @@
 //! id/token minting, the `policyIdentifier` resolution and the `nextToken` codec live
 //! here rather than in any one `src/ops/*.rs`, so all five operations agree on one copy
 //! of each.
+//!
+//! One entity per module: the Rule record and its lookups live in [`rules`], re-exported
+//! here so `crate::state::<name>` keeps naming every one of them.
+
+mod rules;
+
+pub use rules::*;
 
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -347,13 +354,27 @@ pub const VALIDATION_REASON_FIELD: &str = "FIELD_VALIDATION_FAILED";
 /// "of which at most 2 can be templates".
 const MAX_ASSOCIATED_TEMPLATES: usize = 2;
 
-/// What one `@idempotencyToken` already did: the policy the original call left behind,
+/// A fresh entity id: lowercase hex of 16 fresh bytes followed by `seq`'s next value,
+/// which satisfies the modelled `^[a-z0-9]{1,64}$` the `PolicyId` and `RuleId` shapes
+/// declare (at most 32 + 16 characters) and cannot collide with an id this store already
+/// handed out.
+///
+/// One function behind every entity's id, so each per-entity `mint_*_id` differs only in
+/// which counter it advances.
+fn mint_entity_id(seq: &mut u64) -> String {
+    *seq = seq.saturating_add(1);
+    format!("{}{:x}", ::hex::encode(&random_bytes()[..16]), *seq)
+}
+
+/// What one `@idempotencyToken` already did: the resource the original call left behind,
 /// and the `EntityVersion` it left it at, so a replay can tell whether the record it
 /// would answer with is still that call's result.
 #[derive(Debug, Clone)]
 pub struct IdempotentCall {
-    pub policy_id: String,
-    /// [`Policy::version`] as the original call left it.
+    /// The `policyId`/`ruleId` the original call created or updated. Which store it names
+    /// follows from the operation the key is namespaced by (see [`idempotency_key`]).
+    pub resource_id: String,
+    /// The entity's version as the original call left it.
     pub version: u32,
     /// Insertion order within [`ComAmazonawsNetworksecuritymanagerPiccolocustomerapiserviceState::idempotency`],
     /// so the oldest record is the one evicted at [`MAX_IDEMPOTENCY_RECORDS`].
@@ -363,8 +384,9 @@ pub struct IdempotentCall {
 /// Per-service state for com-amazonaws-networksecuritymanager-piccolocustomerapiservice. A handler reaches it through [`service_state`].
 ///
 /// Every map here is bounded: `policies` (and with it `policy_name_index`, one entry per
-/// policy) by [`MAX_POLICIES`], and `idempotency` by [`MAX_IDEMPOTENCY_RECORDS`], so no
-/// sequence of requests can grow this process without limit.
+/// policy) by [`MAX_POLICIES`], `rules` by [`MAX_RULES`], and `idempotency` by
+/// [`MAX_IDEMPOTENCY_RECORDS`], so no sequence of requests can grow this process without
+/// limit.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsNetworksecuritymanagerPiccolocustomerapiserviceState {
     /// Every persisted policy, keyed by its `policyId` and so iterated in a stable
@@ -385,19 +407,21 @@ pub struct ComAmazonawsNetworksecuritymanagerPiccolocustomerapiserviceState {
     next_idempotency_seq: u64,
     /// Monotonic counter feeding [`Self::mint_policy_id`].
     pub next_policy_seq: u64,
+    /// Every persisted rule, keyed by its `ruleId` and so iterated in a stable order —
+    /// which is what makes `ListRules`' `nextToken` resume exactly where the previous
+    /// page stopped. At most [`MAX_RULES`] entries.
+    ///
+    /// Rules are NOT indexed by name: unlike a policy, two rules may carry the same
+    /// `ruleName` and remain distinct resources.
+    pub rules: BTreeMap<String, Rule>,
+    /// Monotonic counter feeding [`Self::mint_rule_id`].
+    pub next_rule_seq: u64,
 }
 
 impl ComAmazonawsNetworksecuritymanagerPiccolocustomerapiserviceState {
-    /// A fresh `PolicyId`: lowercase hex of 16 fresh bytes followed by this store's next
-    /// sequence number, which satisfies the modelled `^[a-z0-9]{1,64}$` (at most 32 + 16
-    /// characters) and cannot collide with an id this store already handed out.
+    /// A fresh `PolicyId`, minted by [`mint_entity_id`].
     pub fn mint_policy_id(&mut self) -> String {
-        self.next_policy_seq = self.next_policy_seq.saturating_add(1);
-        format!(
-            "{}{:x}",
-            ::hex::encode(&random_bytes()[..16]),
-            self.next_policy_seq
-        )
+        mint_entity_id(&mut self.next_policy_seq)
     }
 
     /// The `policyId` a `policyIdentifier` names — the id itself or the policy's ARN —
@@ -424,16 +448,16 @@ impl ComAmazonawsNetworksecuritymanagerPiccolocustomerapiserviceState {
         self.idempotency.get(key)
     }
 
-    /// Remember that `key` produced `policy_id` at `version`, evicting the oldest record
+    /// Remember that `key` produced `resource_id` at `version`, evicting the oldest record
     /// once the store holds [`MAX_IDEMPOTENCY_RECORDS`] of them — the bound that keeps a
     /// caller sending fresh tokens from growing this map without limit.
-    pub fn remember_idempotent_call(&mut self, key: String, policy_id: String, version: u32) {
+    pub fn remember_idempotent_call(&mut self, key: String, resource_id: String, version: u32) {
         self.next_idempotency_seq = self.next_idempotency_seq.saturating_add(1);
         let seq = self.next_idempotency_seq;
         let replaced = self.idempotency.insert(
             key.clone(),
             IdempotentCall {
-                policy_id,
+                resource_id,
                 version,
                 seq,
             },
@@ -450,14 +474,14 @@ impl ComAmazonawsNetworksecuritymanagerPiccolocustomerapiserviceState {
         }
     }
 
-    /// Drop every idempotency record pointing at `policy_id`, so deleting a policy
+    /// Drop every idempotency record pointing at `resource_id`, so deleting a resource
     /// releases what creating it allocated instead of leaving rows for an id no later
     /// call can read.
-    pub fn forget_idempotent_calls_for(&mut self, policy_id: &str) {
+    pub fn forget_idempotent_calls_for(&mut self, resource_id: &str) {
         let stale: Vec<String> = self
             .idempotency
             .iter()
-            .filter(|(_, call)| call.policy_id == policy_id)
+            .filter(|(_, call)| call.resource_id == resource_id)
             .map(|(key, _)| key.clone())
             .collect();
         for key in stale {

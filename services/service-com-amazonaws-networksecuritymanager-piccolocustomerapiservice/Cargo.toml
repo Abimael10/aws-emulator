@@ -27,6 +27,10 @@ hex = { workspace = true }
 # Spreads the seed behind a minted `policyId`/`updateToken` (see `state::random_bytes`).
 sha2 = { workspace = true }
 
+[dev-dependencies]
+# Declares one test suite per `tests/all/<name>.rs` from `tests/all/main.rs`.
+automod = { workspace = true }
+
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 

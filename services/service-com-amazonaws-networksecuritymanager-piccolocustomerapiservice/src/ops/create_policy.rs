@@ -253,7 +253,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(existing) = idempotency_key
             .as_deref()
             .and_then(|key| store.idempotent_call(key))
-            .map(|call| call.policy_id.clone())
+            .map(|call| call.resource_id.clone())
             .and_then(|policy_id| store.policies.get(&policy_id))
         {
             return Ok(output_of(existing));

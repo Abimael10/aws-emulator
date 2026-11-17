@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints and PERSISTS a rule in [`crate::state`]: every member of the response is read
+//! back out of the stored record, so a following `GetRule` observes exactly what this
+//! call answered.
 //!
 //! ## Shape of an operation
 //!
@@ -208,18 +202,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRule"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateRuleErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the rule store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let idempotency_key = input
+            .client_token
+            .as_deref()
+            .map(|token| crate::state::idempotency_key(Self::NAME, token));
+
+        let mut store = state.lock();
+
+        // `clientToken` is `@idempotencyToken`: "If you retry a request with the same
+        // client token and the same parameters, the service returns the result of the
+        // original successful request." The original result is replayed out of the store;
+        // this service models no parameter-mismatch error, so a replay never becomes a
+        // failure and never mints a second rule.
+        if let Some(existing) = idempotency_key
+            .as_deref()
+            .and_then(|key| store.idempotent_call(key))
+            .map(|call| call.resource_id.clone())
+            .and_then(|rule_id| store.rules.get(&rule_id))
+        {
+            return Ok(output_of(existing));
+        }
+
+        // A rule's name is NOT one of its identifiers — the model's `ruleIdentifier` is
+        // the rule's ARN — and no modelled member or error makes it unique, so two rules
+        // may carry the same `ruleName` and stay distinct resources. Nothing is refused
+        // here for a name already in use.
+
+        // The store is bounded: past its capacity a create is REFUSED with the modelled
+        // quota error rather than growing the process for as long as callers keep asking.
+        if store.rules.len() >= crate::state::MAX_RULES {
+            return Err(CreateRuleErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "this account already holds the maximum of {} rules; delete one \
+                         before creating another",
+                        crate::state::MAX_RULES
+                    ),
+                    resource_type: Some(crate::state::RESOURCE_TYPE_RULE.to_string()),
+                    ..ServiceQuotaExceededException::default()
+                },
+            )
+            .into());
+        }
+
+        let rule_id = store.mint_rule_id();
+        let rule = crate::state::Rule {
+            rule_arn: ::engine::emulator_arn(
+                crate::state::ARN_NAMESPACE,
+                &region,
+                &format!("rule/{rule_id}"),
+            ),
+            rule_id: rule_id.clone(),
+            rule_name: input.rule_name,
+            rule_description: input.rule_description,
+            firewall_type: input.firewall_type,
+            rule_type: input.rule_type,
+            configuration: input.configuration,
+            status: crate::state::status_for(input.is_published).to_string(),
+            // `EntityVersion` starts at 1; `UpdateRule` is what bumps it.
+            version: 1,
+            update_token: crate::state::mint_update_token(),
+            // What this operation creates is the live resource, not a snapshot of a
+            // published version (`CreateRuleSnapshot` makes those).
+            is_snapshot: false,
+            has_published_version: input.is_published,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            created_at: now,
+            updated_at: now,
+        };
+
+        // Rendered from the record that is about to be stored, so the response cannot
+        // disagree with what a later read returns.
+        let output = output_of(&rule);
+        if let Some(key) = idempotency_key {
+            store.remember_idempotent_call(key, rule_id.clone(), rule.version);
+        }
+        store.rules.insert(rule_id, rule);
+        Ok(output)
+    }
+}
+
+/// The `CreateRuleOutput` view of a persisted rule.
+fn output_of(rule: &crate::state::Rule) -> CreateRuleOutput {
+    CreateRuleOutput {
+        rule_id: rule.rule_id.clone(),
+        rule_arn: rule.rule_arn.clone(),
+        rule_name: rule.rule_name.clone(),
+        rule_description: rule.rule_description.clone(),
+        firewall_type: rule.firewall_type.clone(),
+        rule_type: Some(rule.rule_type.clone()),
+        configuration: rule.configuration.clone(),
+        status: rule.status.clone(),
+        version: rule.version_string(),
+        update_token: Some(rule.update_token.clone()),
+        is_snapshot: Some(rule.is_snapshot),
+        has_published_version: Some(rule.has_published_version),
+        updated_at: Some(rule.updated_at_timestamp()),
     }
 }
