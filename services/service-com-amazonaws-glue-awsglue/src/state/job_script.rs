@@ -347,6 +347,15 @@ pub fn job_run_script_not_accessible(location: &str) -> String {
 /// own policies and the bucket's.
 const JOB_RUN_CREDENTIAL_SOURCE: &str = "glue-job-run-execution-role";
 
+/// The ROLE-SESSION NAME a job run's session of the job's `Role` is opened under.
+///
+/// RECORDED: the principal a service names when it refuses one of a job run's own calls is
+/// `arn:aws:sts::<account>:assumed-role/<the job's role>/GlueJobRunnerSession` — Glue opens a
+/// job runner's session under this ONE name, whichever job is running and whichever run it is,
+/// so the session name is not a value of one run and never the job's own name. The role and the
+/// account in that principal are the job's and this account's; this is the whole of the rest.
+pub const JOB_RUN_ROLE_SESSION_NAME: &str = "GlueJobRunnerSession";
+
 /// `JobRun$ErrorMessage` of a run whose script is in a language no engine of this emulator
 /// runs.
 ///
@@ -693,17 +702,25 @@ pub async fn perform_owed_job_runs<Eng: ::std::marker::Send + ::std::marker::Syn
 
             // The credential the run's own calls are made with is minted HERE, where the
             // request's own context is: it is the session of the job's execution role
-            // ([`execution_role_identity`], the one mint this workspace has for one), and the
-            // execution the run is handed is given it rather than reaching for a credential of
-            // its own.
+            // ([`execution_role_identity`], the one mint this workspace has for one), opened
+            // under the name Glue opens a job runner's session under
+            // ([`JOB_RUN_ROLE_SESSION_NAME`]) — so the principal that session speaks for is the
+            // one a service names when it refuses one of the run's calls — and the execution
+            // the run is handed is given it rather than reaching for a credential of its own.
             let identity = execution_role_identity(
                 engine,
                 ctx.credential_store(),
                 &plan.role_arn,
-                &plan.job_name,
+                JOB_RUN_ROLE_SESSION_NAME,
                 SystemTime::now(),
             );
-            let access = function_sdk_access(engine, ctx, region, &plan.role_arn, &plan.job_name);
+            let access = function_sdk_access(
+                engine,
+                ctx,
+                region,
+                &plan.role_arn,
+                JOB_RUN_ROLE_SESSION_NAME,
+            );
             if !hand_off_job_script(&state, ctx.callback(), region, plan, identity, access) {
                 break;
             }

@@ -1878,18 +1878,23 @@ fn host_module(vm: &VirtualMachine, session: &Arc<Session>) -> PyResult<PyRef<Py
     // What the SDK's own EXCEPTION CLASSES are: the error shapes the called service's model
     // declares, read out of that service's own model ([`super::sdk_model`]), so a refusal is
     // raised as the class its service really has for it and a code no shape is declared for is
-    // raised as the SDK's base class. Nothing is dispatched and no service answers, so this
-    // spends neither the call count nor the deadline; what the guest decides is only which
-    // service it asks about.
+    // raised as the SDK's base class. Asked about ONE operation, it answers the errors that
+    // operation can be answered with, which is what decides the class of a refusal of a call of
+    // it. Nothing is dispatched and no service answers, so this spends neither the call count
+    // nor the deadline; what the guest decides is only which service and operation it asks
+    // about.
     set_function(
         vm,
         &module,
         "error_shapes",
         move |args: FuncArgs, vm: &VirtualMachine| {
-            let service: String = args.bind(vm)?;
+            let (service, operation): (String, String) = args.bind(vm)?;
+            // The seam is string-in, string-out, so the guest names no operation by sending an
+            // empty one: that is the question about the SERVICE's whole list of classes.
+            let operation = Some(operation.as_str()).filter(|named| !named.is_empty());
             Ok(vm
                 .ctx
-                .new_str(super::aws_sdk_guest::error_shapes(&service))
+                .new_str(super::aws_sdk_guest::error_shapes(&service, operation))
                 .into())
         },
     );

@@ -24,10 +24,12 @@
 //!   from, so the call is judged on the policies in force on the role whichever service
 //!   serves it — and the credential is one the emulator's own request verifier accepts.
 //!   Nothing here constructs an access key id or a secret.
-//! * Its identity is the assumed-role session AWS reports for a function's calls:
-//!   `arn:<partition>:sts::<account>:assumed-role/<role name>/<function name>` — the session
-//!   is named for the FUNCTION it was opened for, which is how a refusal says which
-//!   function was refused.
+//! * Its identity is the assumed-role session AWS reports for the run's calls:
+//!   `arn:<partition>:sts::<account>:assumed-role/<role name>/<session name>` — the session is
+//!   named for what it was OPENED FOR, which is how a refusal says which run was refused. For a
+//!   function that is the function's own name, as Lambda reports it; for another service that
+//!   runs code as a role, it is the name THAT service opens its runner's session under, which
+//!   that service states ([`execution_role_identity`]'s `session_name`).
 //! * It belongs to the EXECUTION ENVIRONMENT rather than to one invocation: Lambda's
 //!   credentials are held by the environment and refreshed, so one session is held per
 //!   function here and re-minted once the clock has brought it close enough to its expiry
@@ -81,7 +83,7 @@ const MAX_SESSION_DURATION_RANGE: ::std::ops::RangeInclusive<i32> = 3600..=43_20
 const REFRESH_MARGIN: Duration = Duration::from_secs(900);
 
 /// The sessions this emulator holds for its functions' execution environments, keyed by the
-/// role and the function the session was opened for.
+/// role and the name the session was opened under.
 ///
 /// Engine-scoped rather than a field of this service's own store, so minting one takes the
 /// token service's lock and this small one and never this service's state guard. LOCK
@@ -90,7 +92,7 @@ const REFRESH_MARGIN: Duration = Duration::from_secs(900);
 /// takes them in, and the only order anything may.
 #[derive(Debug, Default)]
 pub struct ExecutionRoleSessions {
-    /// One held session per `(role ARN, function name)` — a structured key, so no spelling
+    /// One held session per `(role ARN, session name)` — a structured key, so no spelling
     /// of either part can collide with another pair's.
     held: BTreeMap<(String, String), Held>,
 }
@@ -113,9 +115,10 @@ fn sessions_state<Eng: Send + Sync + 'static>(
         .map(::engine::InMemoryEngine::state::<ExecutionRoleSessions>)
 }
 
-/// The SDK seam one invocation of `function_name` gets: the callback it reaches this
-/// emulator through, signing every call as the session of the function's execution role
-/// `role_arn`.
+/// The SDK seam one invocation of `session_name` gets: the callback it reaches this
+/// emulator through, signing every call as the session of the execution role `role_arn`,
+/// opened under `session_name` — the function's own name for a Lambda invocation, and the name
+/// the calling service opens its runner's session under for another service's run.
 ///
 /// This is what every operation that RUNS a handler builds the seam with, so a handler's
 /// own call is made by the role the function runs as whichever operation started it. Where
@@ -141,13 +144,13 @@ pub fn function_sdk_access<Eng: Send + Sync + 'static>(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     region: &str,
     role_arn: &str,
-    function_name: &str,
+    session_name: &str,
 ) -> Option<super::AwsAccess> {
     let identity = execution_role_identity(
         engine,
         ctx.credential_store(),
         role_arn,
-        function_name,
+        session_name,
         SystemTime::now(),
     );
     Some(
@@ -163,20 +166,19 @@ pub fn function_sdk_access<Eng: Send + Sync + 'static>(
     )
 }
 
-/// The credential the calls of an invocation of `function_name` running as `role_arn` are
-/// signed with, minting the session if this emulator holds none that is still good for a
-/// whole run.
+/// The credential the calls of one run as `role_arn` are signed with, as a session opened under
+/// `session_name`, minting it if this emulator holds none that is still good for a whole run.
 #[must_use]
 pub fn execution_role_identity<Eng: Send + Sync + 'static>(
     engine: &Eng,
     store: &CredentialStore,
     role_arn: &str,
-    function_name: &str,
+    session_name: &str,
     now: SystemTime,
 ) -> Option<CallerIdentity> {
     let role = held_role(engine, role_arn)?;
     let sessions = sessions_state(engine)?;
-    let key = (role_arn.to_string(), function_name.to_string());
+    let key = (role_arn.to_string(), session_name.to_string());
     let mut sessions = sessions.lock();
     // A session the clock has already expired is held by nobody: it is given up here, so a
     // credential no execution environment presents does not stay in either store for the
@@ -200,7 +202,7 @@ pub fn execution_role_identity<Eng: Send + Sync + 'static>(
     if let Some(held) = still_good {
         return Some(held.identity.clone());
     }
-    let minted = mint(engine, store, &role, function_name, now)?;
+    let minted = mint(engine, store, &role, session_name, now)?;
     let identity = minted.identity.clone();
     // The session this one replaces is forgotten where it was held, so a credential this
     // environment no longer presents stops being valid.
@@ -253,20 +255,20 @@ fn held_role<Eng: Send + Sync + 'static>(engine: &Eng, role_arn: &str) -> Option
     Some(resolved)
 }
 
-/// Mint one session of `role` for `function_name`, through the token service's own mint.
+/// Mint one session of `role` under `session_name`, through the token service's own mint.
 fn mint<Eng: Send + Sync + 'static>(
     engine: &Eng,
     store: &CredentialStore,
     role: &ResolvedRole,
-    function_name: &str,
+    session_name: &str,
     now: SystemTime,
 ) -> Option<Held> {
     let registry = sts_store::service_state(engine)?;
     let identity = sts_store::Identity {
-        user_id: format!("{}:{function_name}", role.id),
+        user_id: format!("{}:{session_name}", role.id),
         account: role.account.clone(),
         arn: format!(
-            "arn:{}:sts::{}:assumed-role/{}/{function_name}",
+            "arn:{}:sts::{}:assumed-role/{}/{session_name}",
             role.partition, role.account, role.name
         ),
     };
@@ -401,7 +403,7 @@ mod tests {
                 "case {case:?}: expected the replaced session {first:?} to be forgotten"
             );
         }
-        // One session per (role, function), however many invocations ask for it.
+        // One session per (role, session name), however many invocations ask for it.
         let sessions = sessions_state(&engine).expect("the engine carries the session store");
         let held = sessions.lock().held.len();
         assert_eq!(

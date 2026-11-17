@@ -39,6 +39,14 @@ pub struct ClientExports {
     /// The error shapes the service declares, each of which the package exports a class of
     /// the shape's own name for.
     pub errors: Vec<String>,
+    /// The error shapes each OPERATION declares — its own, plus the ones the service declares
+    /// for every operation of it — keyed by the operation's own name.
+    ///
+    /// Which errors one call can be answered with is the operation's list and not the
+    /// service's whole set: a refusal outside it is one the operation models no shape for, and
+    /// so one an SDK hands a caller as its base error class rather than as a modelled one. An
+    /// operation that declares none is not held at all.
+    pub operation_errors: BTreeMap<String, Vec<String>>,
     /// The members of each operation's input that the model marks as an idempotency token,
     /// keyed by the operation's own name — the members a client generates a value for. An
     /// operation with none is not held at all.
@@ -114,8 +122,12 @@ fn exports_of(model: &str) -> ClientExports {
     let mut operations = BTreeSet::new();
     let mut errors = BTreeSet::new();
     let mut idempotency_tokens = BTreeMap::new();
+    let mut operation_errors = BTreeMap::new();
     let mut pagination = BTreeMap::new();
     let defaults = service_pagination(&shapes);
+    // The errors the SERVICE declares, which every operation of it can be answered with as
+    // well as with its own.
+    let common = service_errors(&shapes);
     for (id, shape) in &shapes {
         let Some(name) = id.split('#').next_back().filter(|name| !name.is_empty()) else {
             continue;
@@ -130,6 +142,10 @@ fn exports_of(model: &str) -> ClientExports {
                 if let Some(paged) = pagination_of(&shapes, shape, defaults.as_ref()) {
                     pagination.insert(name.to_string(), paged);
                 }
+                let answered_with = declared_errors(shape, &common);
+                if !answered_with.is_empty() {
+                    operation_errors.insert(name.to_string(), answered_with);
+                }
             }
             Some("structure") if is_error(shape) => {
                 errors.insert(name.to_string());
@@ -140,9 +156,45 @@ fn exports_of(model: &str) -> ClientExports {
     ClientExports {
         operations: operations.into_iter().collect(),
         errors: errors.into_iter().collect(),
+        operation_errors,
         idempotency_tokens,
         pagination,
     }
+}
+
+/// The error shapes the SERVICE shape declares, which every operation of it can be answered
+/// with beside its own ([`declared_errors`]).
+fn service_errors(shapes: &::serde_json::Map<String, Value>) -> BTreeSet<String> {
+    shapes
+        .values()
+        .find(|shape| shape.get("type").and_then(Value::as_str) == Some("service"))
+        .map(error_names)
+        .unwrap_or_default()
+}
+
+/// The error shapes one operation can be answered with: the ones it declares itself, plus the
+/// `common` ones its service declares for every operation.
+fn declared_errors(operation: &Value, common: &BTreeSet<String>) -> Vec<String> {
+    let mut named = error_names(operation);
+    named.extend(common.iter().cloned());
+    named.into_iter().collect()
+}
+
+/// The shape NAMES an `errors` list names, each read off the shape id it targets.
+fn error_names(shape: &Value) -> BTreeSet<String> {
+    shape
+        .get("errors")
+        .and_then(Value::as_array)
+        .map(|listed| {
+            listed
+                .iter()
+                .filter_map(|error| error.get("target").and_then(Value::as_str))
+                .filter_map(|target| target.split('#').next_back())
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The pagination settings the SERVICE shape states, which every paginated operation of it
@@ -324,6 +376,54 @@ mod tests {
                  no name of one, got {} operations and {} errors",
                 exports.operations.len(),
                 exports.errors.len()
+            );
+        }
+    }
+
+    /// The errors ONE operation can be answered with are the ones IT declares, plus the ones its
+    /// service declares for every operation of it — and never every error shape the service's
+    /// model happens to carry.
+    ///
+    /// The rows differ along where the error is declared: on the operation itself, on the
+    /// service for all of them, on ANOTHER operation of the same service, and on no shape of a
+    /// service this emulator holds no model for.
+    #[test]
+    fn the_errors_one_operation_is_answered_with_are_its_own() {
+        // Each row: the service token, the operation, an error shape, and whether that
+        // operation can be answered with it.
+        let cases: &[(&str, &str, &str, bool)] = &[
+            // `PutObject`'s own errors (`smithy_query` operation=PutObject): no refusal of an
+            // authorization decision among them, which is why one is not a modelled class.
+            ("s3", "PutObject", "TooManyParts", true),
+            ("s3", "PutObject", "EncryptionTypeMismatch", true),
+            ("s3", "PutObject", "AccessDenied", false),
+            ("s3", "PutObject", "NoSuchKey", false),
+            // The same name IS this operation's own (`smithy_query` operation=GetObject).
+            ("s3", "GetObject", "NoSuchKey", true),
+            ("sqs", "SendMessage", "QueueDoesNotExist", true),
+            // A refusal the SERVICE declares for every operation of it.
+            ("sqs", "SendMessage", "InvalidSecurity", true),
+            ("sqs", "GetQueueAttributes", "InvalidAttributeName", true),
+            // Declared by `SendMessage` and by no other operation of that service.
+            ("sqs", "GetQueueAttributes", "InvalidMessageContents", false),
+            ("secretsmanager", "GetSecretValue", "ResourceNotFoundException", true),
+            // A service this emulator holds no model for declares nothing for any of its
+            // operations.
+            ("not-a-service", "ListThings", "ResourceNotFoundException", false),
+        ];
+        for (token, operation, error, answered_with) in cases {
+            let held = client_exports(token);
+            let declared = held
+                .operation_errors
+                .get(*operation)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            assert_eq!(
+                declared.iter().any(|named| named == error),
+                *answered_with,
+                "case {token:?}/{operation:?}: expected {error:?} to be answerable={}, and the \
+                 operation declares {declared:?}",
+                answered_with
             );
         }
     }

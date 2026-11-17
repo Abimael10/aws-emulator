@@ -31,6 +31,12 @@
 //!   model declares no error shape for — the AWS-common refusals, which no service's model
 //!   carries — has no class of its own in the SDK, so such a refusal is raised as the base
 //!   `ClientError` itself ([`error_shapes`]).
+//! * WHICH of those classes one call can be raised as is the CALLED OPERATION's own error
+//!   list: a refusal is raised as the modelled class for the error that operation declares
+//!   under the code the service answered, and as the base `ClientError` for every other code
+//!   — an authorization denial, a throttle, any refusal the operation models no shape for —
+//!   because an operation is answered with the errors it declares and the ones its service
+//!   declares for all of them, and nothing else ([`error_shapes`]).
 //! * DynamoDB's RESOURCE interface is supplied too ([`dynamodb`]), because it is the
 //!   interface an application stores from inside a function through:
 //!   `boto3.resource("dynamodb").Table(name)` carries the table name, its items are plain
@@ -151,18 +157,33 @@ pub fn pagination_config(service: &str, operation: &str) -> String {
 }
 
 /// The error SHAPES the service `service` declares, as the list a client reads its own
-/// exception classes off — empty for a service this emulator holds no model for.
+/// exception classes off — or, for `Some(operation)`, the shapes THAT operation can be answered
+/// with. Empty for a service this emulator holds no model for, and for an operation it holds no
+/// model of.
 ///
 /// An SDK has an exception class for each error its service's model declares and for nothing
-/// else, so this is what decides whether a refusal is raised as a class of its own or as the
-/// base [`ClientError`](BOTOCORE_EXCEPTIONS_SOURCE): a code the model declares no error shape
-/// for — the AWS-common refusals every service answers, which no service's model carries — has
-/// no class in the SDK and is raised as that base class. Read from the same reading of that
-/// model every other question about the service is answered from ([`super::sdk_model`]), so the
-/// classes this SDK has for a service are the ones it really declares.
+/// else, so the service's list is what decides whether a name has a class at all: a code the
+/// model declares no error shape for — the AWS-common refusals every service answers, which no
+/// service's model carries — has no class in the SDK and is handed over as the base
+/// [`ClientError`](BOTOCORE_EXCEPTIONS_SOURCE).
+///
+/// WHICH of those classes one answered call can be is narrower, and that is what the
+/// `operation` list answers: a call is answered with the errors the operation declares plus the
+/// ones its service declares for every operation, so a code outside that list is a refusal the
+/// operation models no shape for and is raised as the base class however many other operations
+/// of the service do model it.
+///
+/// Read from the same reading of that model every other question about the service is answered
+/// from ([`super::sdk_model`]), so the classes this SDK has are the ones the service really
+/// declares.
 #[must_use]
-pub fn error_shapes(service: &str) -> String {
-    ::serde_json::json!(super::sdk_model::client_exports(service).errors).to_string()
+pub fn error_shapes(service: &str, operation: Option<&str>) -> String {
+    let held = super::sdk_model::client_exports(service);
+    let Some(operation) = operation else {
+        return ::serde_json::json!(held.errors).to_string();
+    };
+    ::serde_json::json!(held.operation_errors.get(operation).cloned().unwrap_or_default())
+        .to_string()
 }
 
 /// `botocore`: the package the client interface and the exceptions live under.
@@ -897,27 +918,29 @@ class _ClientExceptions:
     def __init__(self, service_name):
         self._service_name = service_name
         self._classes = {"ClientError": ClientError}
-        self._declared = None
+        self._declared = {}
 
     def __getattr__(self, name):
         if name.startswith("_"):
             raise AttributeError(name)
         return self.from_code(name)
 
-    def _modelled(self):
-        """The error shapes the called service's own model DECLARES.
+    def _modelled(self, operation=None):
+        """The error shapes DECLARED: the called service's own, or one operation's.
 
-        An SDK carries one exception class per error its service declares, so this is what
-        says whether a name has a class of its own at all. Read once per client, from the
-        service's own model.
+        An SDK carries one exception class per error its service declares, so the service's
+        list is what says whether a name has a class of its own at all; an OPERATION's list is
+        what says which of those classes a call of it can be answered with. Read once per
+        client and per operation asked about, from the service's own model.
         """
-        if self._declared is None:
-            self._declared = frozenset(
-                json.loads(_host.error_shapes(self._service_name))
-            )
-        return self._declared
+        key = operation or ""
+        held = self._declared.get(key)
+        if held is None:
+            held = frozenset(json.loads(_host.error_shapes(self._service_name, key)))
+            self._declared[key] = held
+        return held
 
-    def from_code(self, code, shape=None):
+    def from_code(self, code, shape=None, operation=None):
         """The class for one error code, which is the class the modelled SHAPE names too.
 
         This SDK's model keys a query-compatible service's error class by the LEGACY code,
@@ -928,24 +951,22 @@ class _ClientExceptions:
 
         A name the service's model declares NO error shape for has no class of its own in the
         SDK — the AWS-common refusals every service answers are the ones no model carries —
-        so the base class is what it answers and what such a refusal is raised as.
+        so the base class is what it answers and what such a refusal is raised as. `operation`
+        narrows that to the errors ONE call can be answered with: a code the operation it names
+        declares no shape for is the base class too.
         """
-        held = self._classes.get(code)
-        if held is None and shape:
-            held = self._classes.get(shape)
+        declared = self._modelled(operation)
+        named = None
+        for candidate in (shape, code):
+            if candidate and candidate in declared:
+                named = candidate
+                break
+        if named is None:
+            return ClientError
+        held = self._classes.get(named)
         if held is None:
-            declared = self._modelled()
-            named = None
-            for candidate in (shape, code):
-                if candidate and candidate in declared:
-                    named = candidate
-                    break
-            if named is None:
-                return ClientError
             held = type(str(named), (ClientError,), {})
-        self._classes[code] = held
-        if shape:
-            self._classes[shape] = held
+            self._classes[named] = held
         return held
 
 
@@ -1198,7 +1219,7 @@ class Client:
             "Error": {"Code": code, "Message": _error_message(document)},
             "ResponseMetadata": metadata,
         }
-        raise self.exceptions.from_code(code, shape)(response, operation_name)
+        raise self.exceptions.from_code(code, shape, operation_name)(response, operation_name)
 
     def _sent(self, parameters):
         """The call's parameters, with every byte-carrying member encoded as base64."""
