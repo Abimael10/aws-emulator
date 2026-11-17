@@ -387,7 +387,10 @@ fn template(row: &Row) -> String {
 
 /// Every stack event of `stack` for the logical resource `logical_id`, as the pairs of status
 /// and reason a client reads.
-async fn resource_events(
+///
+/// `pub(crate)` with its caller below: a sibling suite that reads what a custom resource's own
+/// events report drives THIS reader rather than a second copy of it.
+pub(crate) async fn resource_events(
     router: &MultiServiceRouter,
     stack: &str,
     logical_id: &str,

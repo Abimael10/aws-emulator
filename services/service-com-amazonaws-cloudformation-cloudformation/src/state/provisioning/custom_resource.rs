@@ -128,6 +128,16 @@ const SNS_API_VERSION: &str = "2010-03-31";
 /// AWS Lambda's signing name — the transport a `ServiceToken` naming a FUNCTION rides.
 const LAMBDA_SIGNING_NAME: &str = "lambda";
 
+/// The IAM action reaching a provider over each transport PERFORMS, which is what the stack's
+/// service role has to be allowed on the `ServiceToken` for the request to be sent at all
+/// ([`crate::state::service_role::refusal_without_a_grant`]).
+///
+/// Invoking a function "requires permission for the `lambda:InvokeFunction` action" (`Invoke`)
+/// and publishing to a topic requires `sns:Publish` (`Publish`), so these are the two actions
+/// CloudFormation asks for on behalf of a template that names a provider.
+const INVOKE_FUNCTION_ACTION: &str = "lambda:InvokeFunction";
+const PUBLISH_ACTION: &str = "sns:Publish";
+
 /// The `InvocationType` CloudFormation invokes a function-backed provider under: the
 /// provider answers at the `ResponseURL` rather than in the invocation's response, so the
 /// invocation does not wait for it ("to invoke a function asynchronously, set
@@ -705,6 +715,18 @@ enum Provider {
     Function(String),
 }
 
+impl Provider {
+    /// What reaching this provider IS, as a call: the IAM action it performs
+    /// ([`INVOKE_FUNCTION_ACTION`], [`PUBLISH_ACTION`]) and the ARN that action is taken on,
+    /// which is the `ServiceToken` itself.
+    fn authorized_call(&self) -> (&'static str, &str) {
+        match self {
+            Self::Topic(topic_arn) => (PUBLISH_ACTION, topic_arn),
+            Self::Function(function_arn) => (INVOKE_FUNCTION_ACTION, function_arn),
+        }
+    }
+}
+
 /// The error code a refusal of the DECLARATION carries — a rule about the template rather
 /// than an answer from the provider's own service.
 const INVALID_REQUEST: &str = "InvalidRequest";
@@ -762,6 +784,22 @@ pub async fn send(
     call: &ProviderCall<'_>,
 ) -> Result<String, Refusal> {
     let provider = provider_of(call.properties, call.resource_type)?;
+    // The request is sent with the credentials of the stack's SERVICE ROLE — "CloudFormation
+    // uses the role's credentials to make calls on your behalf" — and the call that sends it is
+    // CloudFormation's own, on the ARN the template's `ServiceToken` names: so the role has to
+    // be ALLOWED that action on that ARN, which is IAM's ordinary default deny rather than the
+    // explicit-deny reading the deployment's own provisioning calls get
+    // ([`crate::state::service_role`]). A role that is not allowed it reaches no provider at
+    // all, and the resource fails with the sentence AWS words an unauthorized call with —
+    // which NAMES the action, so a client can tell this from a provider that answered FAILED.
+    let (action, authorized_on) = provider.authorized_call();
+    if let Some(message) = crate::state::service_role::refusal_without_a_grant(action, authorized_on)
+    {
+        return Err(Refusal {
+            code: crate::state::service_role::ACCESS_DENIED.to_string(),
+            message,
+        });
+    }
     let service_token = match &provider {
         Provider::Topic(token) | Provider::Function(token) => token.clone(),
     };
