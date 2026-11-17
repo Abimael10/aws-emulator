@@ -21,6 +21,11 @@
 //! reads the handler itself performs after submitting it (none, `GetInvalidation`,
 //! `ListInvalidations`) — every row then being read back through CloudFront's own API, which
 //! is where the invalidation has to exist.
+//!
+//! The wire harness below is `pub(crate)` because the suite that drives the same services from
+//! the other direction ([`super::events_rule_target_handler_invalidates_its_distribution`])
+//! reaches CloudFront, Amazon S3, Lambda and CloudFormation exactly this way: a second copy of
+//! it would let the two readings of one wire drift.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -32,26 +37,26 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::query_wire::{form_encode, outputs_of};
 
 /// The Region every request below is signed for.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The account every emulated ARN carries.
 const ACCOUNT: &str = "000000000000";
 
 /// CloudFront's control-plane host, and the API version every route is under.
-const CLOUDFRONT_HOST: &str = "cloudfront.amazonaws.com";
-const API_VERSION: &str = "2020-05-31";
+pub(crate) const CLOUDFRONT_HOST: &str = "cloudfront.amazonaws.com";
+pub(crate) const API_VERSION: &str = "2020-05-31";
 
 /// The bucket the distribution's origin is, and the object behind the paths invalidated.
 const BUCKET: &str = "edge-invalidation-origin";
 const KEY: &str = "assets/app.js";
 
 /// The `StackStatus` the setup waits for.
-const CREATE_COMPLETE: &str = "CREATE_COMPLETE";
+pub(crate) const CREATE_COMPLETE: &str = "CREATE_COMPLETE";
 
 /// How long work the clock owes is waited for, and how often it is looked at. Generous: the
 /// deadline is not what any row measures.
-const WAIT: Duration = Duration::from_secs(30);
-const LOOK_INTERVAL: Duration = Duration::from_millis(50);
+pub(crate) const WAIT: Duration = Duration::from_secs(30);
+pub(crate) const LOOK_INTERVAL: Duration = Duration::from_millis(50);
 
 /// The role the function runs as, and the function's own name.
 const ROLE: &str = "edge-invalidation-role";
@@ -97,7 +102,7 @@ def lambda_handler(event, context):
 /// The emulator as it is ASSEMBLED, on one engine: the handler's own SDK call is dispatched
 /// back into this same router, so the distribution it invalidates is the one this suite
 /// created.
-fn build_router() -> MultiServiceRouter {
+pub(crate) fn build_router() -> MultiServiceRouter {
     let engine: std::sync::Arc<engine::InMemoryEngine> =
         std::sync::Arc::new(engine::InMemoryEngine::new());
     let mut router = aws_emulator_router::build_router(engine);
@@ -109,28 +114,31 @@ fn build_router() -> MultiServiceRouter {
 
 /// A SigV4 `Authorization` whose credential scope names `service`, which is what routes the
 /// request. The signature itself is never checked here.
-fn authorization(service: &str) -> String {
+pub(crate) fn authorization(service: &str) -> String {
     format!(
         "AWS4-HMAC-SHA256 Credential=AKIDTEST/20260101/{REGION}/{service}/aws4_request, \
          SignedHeaders=host, Signature=not-verified"
     )
 }
 
-/// One response: the status and the body as text.
-struct Answer {
-    status: u16,
-    body: String,
+/// One response: the status, the body as text, and the `X-Amz-Function-Error` header — which
+/// only a Lambda invocation that FAULTED carries, and which a suite reading a handler's own
+/// result back therefore has to find absent.
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) body: String,
+    pub(crate) function_error: Option<String>,
 }
 
 impl Answer {
     /// The text of the first `<name>…</name>` element of the body, or the empty string.
-    fn element(&self, name: &str) -> String {
+    pub(crate) fn element(&self, name: &str) -> String {
         crate::query_wire::opt_element(&self.body, name).unwrap_or_default()
     }
 }
 
 /// One request against a service's own host, with `signing_name` in the credential scope.
-async fn call(
+pub(crate) async fn call(
     router: &MultiServiceRouter,
     signing_name: &str,
     host: &str,
@@ -150,12 +158,17 @@ async fn call(
     let response = router.dispatch(request).await;
     Answer {
         status: response.status().as_u16(),
+        function_error: response
+            .headers()
+            .get("x-amz-function-error")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string),
         body: String::from_utf8_lossy(response.body()).into_owned(),
     }
 }
 
 /// One Amazon S3 REST call, path-style as the emulator serves it.
-async fn s3(router: &MultiServiceRouter, method: &str, path: &str, body: &str) -> Answer {
+pub(crate) async fn s3(router: &MultiServiceRouter, method: &str, path: &str, body: &str) -> Answer {
     call(
         router,
         "s3",
@@ -169,7 +182,7 @@ async fn s3(router: &MultiServiceRouter, method: &str, path: &str, body: &str) -
 }
 
 /// One CloudFront control-plane call.
-async fn cloudfront(router: &MultiServiceRouter, method: &str, path: &str, body: &str) -> Answer {
+pub(crate) async fn cloudfront(router: &MultiServiceRouter, method: &str, path: &str, body: &str) -> Answer {
     call(
         router,
         "cloudfront",
@@ -183,7 +196,7 @@ async fn cloudfront(router: &MultiServiceRouter, method: &str, path: &str, body:
 }
 
 /// One awsQuery call of `service`, answered with the HTTP status and the XML body.
-async fn query(
+pub(crate) async fn query(
     router: &MultiServiceRouter,
     service: &str,
     version: &str,
@@ -244,7 +257,7 @@ async fn lambda(
 }
 
 /// The bucket the distribution serves, holding the object the paths name.
-async fn create_origin(router: &MultiServiceRouter) {
+pub(crate) async fn create_origin(router: &MultiServiceRouter) {
     let created = s3(router, "PUT", &format!("/{BUCKET}"), "").await;
     assert_eq!(
         created.status, 200,
@@ -260,7 +273,7 @@ async fn create_origin(router: &MultiServiceRouter) {
 }
 
 /// `cloudfront:CreateDistribution` over that bucket, answering the distribution's id.
-async fn create_distribution(router: &MultiServiceRouter, caller_reference: &str) -> String {
+pub(crate) async fn create_distribution(router: &MultiServiceRouter, caller_reference: &str) -> String {
     let body = format!(
         "<DistributionConfig xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">\
          <CallerReference>{caller_reference}</CallerReference>\
@@ -352,7 +365,7 @@ fn handler_stack(distribution: &str) -> String {
 }
 
 /// What `DescribeStacks` reports for `stack`: its status and the whole body.
-async fn stack_status(router: &MultiServiceRouter, stack: &str) -> (String, String) {
+pub(crate) async fn stack_status(router: &MultiServiceRouter, stack: &str) -> (String, String) {
     let (_status, body) = query(
         router,
         "cloudformation",
@@ -365,7 +378,7 @@ async fn stack_status(router: &MultiServiceRouter, stack: &str) -> (String, Stri
 }
 
 /// Create the stack, wait for `CREATE_COMPLETE` and answer its outputs.
-async fn deployed(
+pub(crate) async fn deployed(
     router: &MultiServiceRouter,
     stack: &str,
     template: &str,
@@ -406,7 +419,7 @@ async fn deployed(
 /// Wait until Lambda reports the function `Active` — the state an invocation needs. The span
 /// a created function spends coming up is that service's own, so nothing here sleeps a fixed
 /// span on its behalf.
-async fn wait_until_active(router: &MultiServiceRouter, name: &str) {
+pub(crate) async fn wait_until_active(router: &MultiServiceRouter, name: &str) {
     let looks = WAIT.as_millis() / LOOK_INTERVAL.as_millis();
     let mut state = String::new();
     for _ in 0..looks {
