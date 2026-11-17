@@ -67,7 +67,6 @@ const URL_ENCODED: &str = "URLEncoded";
 /// than taken from the crate, so a reworded refusal fails this suite.
 const NO_SUCH_CONFIG_MESSAGE: &str = "The specified field level encryption config does not exist.";
 const NO_SUCH_PROFILE_MESSAGE: &str = "The specified field level encryption profile does not exist.";
-const ID_FORMAT_INVALID_MESSAGE: &str = "Id format is invalid";
 const QUERY_ARG_PROFILE_EMPTY: &str =
     "The query arg profile in field level encryption config cannot be empty when content \
      type profile is empty or when no default profile id is given in any content type \
@@ -1292,15 +1291,15 @@ async fn an_id_no_configuration_holds_is_refused_by_the_reader() {
     let stored_id = created.root().text_at("Id").unwrap_or_default().to_string();
 
     // The rows span the ways an id can name no configuration: a well-shaped configuration id
-    // that was never minted (the one shape the service READS), an id in another namespace and
-    // of a width no identifier of this kind is issued at, a minted id of another kind — the
-    // profile's, a different resource under the same surface — and a value of no CloudFront
-    // identifier form at all, each with the sentence its shape earns.
+    // that was never minted, an id in another namespace and of a width no identifier of this
+    // kind is issued at, a minted id of another kind — the profile's, a different resource
+    // under the same surface — and a value of no CloudFront identifier form at all, each
+    // earning the one sentence this read answers an id it cannot resolve with.
     for (case, expected) in [
         ("C3V3PVOY5NSBVE", NO_SUCH_CONFIG_MESSAGE),
-        ("EDFDVBD6EXAMPLE", ID_FORMAT_INVALID_MESSAGE),
-        (profile.as_str(), ID_FORMAT_INVALID_MESSAGE),
-        ("not-a-configuration-id", ID_FORMAT_INVALID_MESSAGE),
+        ("EDFDVBD6EXAMPLE", NO_SUCH_CONFIG_MESSAGE),
+        (profile.as_str(), NO_SUCH_CONFIG_MESSAGE),
+        ("not-a-configuration-id", NO_SUCH_CONFIG_MESSAGE),
     ] {
         let answer = get_config(&router, case).await;
         assert_eq!(
@@ -1463,11 +1462,11 @@ async fn an_id_no_configuration_holds_is_refused_by_the_configuration_reader() {
     let mangled: String = mangled.into_iter().collect();
     for (case, expected) in [
         ("C3V3PVOY5NSBVE", NO_SUCH_CONFIG_MESSAGE),
-        ("EDFDVBD6EXAMPLE", ID_FORMAT_INVALID_MESSAGE),
-        (profile.as_str(), ID_FORMAT_INVALID_MESSAGE),
+        ("EDFDVBD6EXAMPLE", NO_SUCH_CONFIG_MESSAGE),
+        (profile.as_str(), NO_SUCH_CONFIG_MESSAGE),
         (mangled.as_str(), NO_SUCH_CONFIG_MESSAGE),
-        ("not-a-configuration-id", ID_FORMAT_INVALID_MESSAGE),
-        ("0", ID_FORMAT_INVALID_MESSAGE),
+        ("not-a-configuration-id", NO_SUCH_CONFIG_MESSAGE),
+        ("0", NO_SUCH_CONFIG_MESSAGE),
     ] {
         let answer = get_config_document(&router, case).await;
         assert_eq!(

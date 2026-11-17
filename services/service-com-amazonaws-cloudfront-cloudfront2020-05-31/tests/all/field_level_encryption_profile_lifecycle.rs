@@ -63,10 +63,6 @@ const CALLER_REFERENCE_ALREADY_EXISTS_MESSAGE: &str =
     "The caller reference that you are using to create a field level encryption profile is \
      associated with another field level encryption profile in your account.";
 
-/// The sentence CloudFront sends for a path identifier outside the shape its resource kind's
-/// ids take — spelled out here for the reason [`NAME_ALREADY_EXISTS_MESSAGE`] is.
-const ID_FORMAT_INVALID_MESSAGE: &str = "Id format is invalid";
-
 // ---------------------------------------------------------------------------
 // Calling the profile surface
 // ---------------------------------------------------------------------------
@@ -964,16 +960,22 @@ async fn an_id_no_profile_holds_is_refused_by_both_readers() {
     let stored_id = created.root().text_at("Id").unwrap_or_default().to_string();
 
     // The rows span the ways an id can name no profile: a well-shaped profile id that was
-    // never minted (the one shape the service READS), an id in another namespace and of a
-    // width no identifier of this kind is issued at, and a value of no CloudFront identifier
-    // form at all — each with the sentence its shape earns.
+    // never minted, an id in another namespace and of a width no identifier of this kind is
+    // issued at, and a value of no CloudFront identifier form at all — each earning the one
+    // sentence these readers answer an id they cannot resolve with.
     for (case, expected) in [
         (
             "P280MFCLSYOCVU",
             NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE,
         ),
-        ("EDFDVBD6EXAMPLE", ID_FORMAT_INVALID_MESSAGE),
-        ("not-a-profile-id", ID_FORMAT_INVALID_MESSAGE),
+        (
+            "EDFDVBD6EXAMPLE",
+            NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE,
+        ),
+        (
+            "not-a-profile-id",
+            NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE,
+        ),
     ] {
         for (reader, answer) in [
             ("GetFieldLevelEncryptionProfile", get_profile(&router, case).await),

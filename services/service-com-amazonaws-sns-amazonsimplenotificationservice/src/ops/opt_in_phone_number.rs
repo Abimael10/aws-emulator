@@ -173,7 +173,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        if let Some(message) = state::phone_number_refusal(&input.phone_number) {
+        // The form of the number, before the store is consulted. This member names no
+        // DESTINATION — the opt-out pair's `phoneNumber` is the number whose opt-out record
+        // is addressed — so it is admitted by the phone-number pattern this service publishes
+        // rather than by the narrower destination rule, exactly as the check beside it is.
+        if let Some(message) =
+            state::phone_number_form::phone_number_form_refusal(&input.phone_number)
+        {
             return Err(invalid_parameter(message));
         }
 

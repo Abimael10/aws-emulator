@@ -1591,8 +1591,8 @@ async fn a_private_api_is_deployable_only_once_a_resource_policy_is_attached() {
             .call("GET", &format!("/restapis/{api}/deployments"), None)
             .await;
         assert_eq!(
-            deployments.body["item"],
-            json!([]),
+            deployments.body.get("item"),
+            None,
             "case {case}: expected no deployment to have been created, got {:?}",
             deployments.body
         );

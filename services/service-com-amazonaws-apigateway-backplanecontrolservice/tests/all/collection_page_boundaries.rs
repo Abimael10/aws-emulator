@@ -11,8 +11,8 @@
 //!
 //! The rules asserted here, each over a SET of inputs rather than one call:
 //!
-//! * a collection that holds no element reports the EMPTY page — the member is written as
-//!   the empty list, with no cursor and no echoed page size beside it — across every
+//! * a collection that holds no element reports NO page member — the success envelope
+//!   alone, with no cursor and no echoed page size beside it — across every
 //!   listing of this service, whatever the collection is of;
 //! * a limited page of an API's documentation parts holds the parts at the first
 //!   ADDRESSES the request's filters select, and reports the address of the part it
@@ -71,7 +71,7 @@ fn reported_addresses(body: &Value, case: &str) -> Vec<String> {
 }
 
 #[tokio::test]
-async fn a_collection_that_holds_no_element_reports_the_empty_page() {
+async fn a_collection_that_holds_no_element_reports_no_page_member() {
     let gateway = Gateway::new();
     // A record each of the API-scoped and domain-name-scoped collections hangs off; both
     // are created with none of the collections below.
@@ -117,8 +117,8 @@ async fn a_collection_that_holds_no_element_reports_the_empty_page() {
         let answer = listed(&gateway, uri, case).await;
         assert_eq!(
             answer.body,
-            json!({ "item": [] }),
-            "case {case}: expected the empty page for a collection that holds no element, \
+            json!({}),
+            "case {case}: expected no page member for a collection that holds no element, \
              got {:?}",
             answer.body
         );
@@ -145,8 +145,8 @@ async fn a_collection_that_holds_no_element_reports_the_empty_page() {
         let answer = listed(&empty, uri, case).await;
         assert_eq!(
             answer.body,
-            json!({ "item": [] }),
-            "case {case}: expected the empty page for a collection that holds no element, \
+            json!({}),
+            "case {case}: expected no page member for a collection that holds no element, \
              got {:?}",
             answer.body
         );

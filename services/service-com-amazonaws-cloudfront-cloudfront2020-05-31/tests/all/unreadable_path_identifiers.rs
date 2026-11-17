@@ -24,8 +24,8 @@
 //! The rows span what the rules generalise over: for the first rule, four resource families,
 //! both an unmatched identifier and an unmatched resource word, a path longer than its route,
 //! a method no route of the path serves and a path outside this API's version prefix, against
-//! matched routes as the positive control; for the second, all three operations the recorded
-//! behaviour puts under it (two reads and one mutation), both member names those identifiers
+//! matched routes as the positive control; for the second, the two operations the recorded
+//! behaviour puts under it (one read and one mutation), both member names those identifiers
 //! arrive in (`Id` and `DistributionId`), two resource kinds whose identifiers share one form,
 //! and seven forms that are no identifier of the addressed kind — the other kind's own minted
 //! identifier, a lower-cased identifier, a body one character short and one character long,
@@ -40,7 +40,6 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
     id_format_invalid_message, NO_SUCH_DISTRIBUTION_MESSAGE,
-    NO_SUCH_ORIGIN_ACCESS_CONTROL_MESSAGE,
 };
 
 use crate::distribution_lifecycle::{
@@ -233,7 +232,6 @@ async fn a_path_that_names_no_action_is_the_front_doors_unknown_action() {
 enum Op {
     GetDistributionConfig,
     CreateInvalidation,
-    GetOriginAccessControl,
 }
 
 impl Op {
@@ -241,7 +239,6 @@ impl Op {
     fn code(self) -> &'static str {
         match self {
             Self::GetDistributionConfig | Self::CreateInvalidation => "NoSuchDistribution",
-            Self::GetOriginAccessControl => "NoSuchOriginAccessControl",
         }
     }
 
@@ -249,7 +246,7 @@ impl Op {
     fn member(self) -> &'static str {
         match self {
             Self::CreateInvalidation => "DistributionId",
-            Self::GetDistributionConfig | Self::GetOriginAccessControl => "Id",
+            Self::GetDistributionConfig => "Id",
         }
     }
 
@@ -260,7 +257,6 @@ impl Op {
             Self::GetDistributionConfig | Self::CreateInvalidation => {
                 NO_SUCH_DISTRIBUTION_MESSAGE
             }
-            Self::GetOriginAccessControl => NO_SUCH_ORIGIN_ACCESS_CONTROL_MESSAGE,
         }
     }
 
@@ -268,7 +264,7 @@ impl Op {
     fn served_status(self) -> u16 {
         match self {
             Self::CreateInvalidation => 201,
-            Self::GetDistributionConfig | Self::GetOriginAccessControl => 200,
+            Self::GetDistributionConfig => 200,
         }
     }
 
@@ -291,26 +287,14 @@ impl Op {
                 None,
             )
             .await,
-            Self::GetOriginAccessControl => call(
-                router,
-                "GET",
-                &format!("/{API_VERSION}/origin-access-control/{identifier}"),
-                None,
-                None,
-            )
-            .await,
         }
     }
 }
 
 /// Every operation of rule 2, with the identifier that addresses the resource it really holds
 /// and the identifier of the OTHER resource kind drawn from the same form.
-fn operations() -> [Op; 3] {
-    [
-        Op::GetDistributionConfig,
-        Op::CreateInvalidation,
-        Op::GetOriginAccessControl,
-    ]
+fn operations() -> [Op; 2] {
+    [Op::GetDistributionConfig, Op::CreateInvalidation]
 }
 
 #[tokio::test]
@@ -350,12 +334,7 @@ async fn an_identifier_of_no_such_kind_is_reported_unreadable() {
         // The identifier this operation's resource is really held under, and the identifier of
         // the other kind drawn from the SAME form — which is what the store, not the value,
         // tells apart.
-        let (held, other_kind) = match op {
-            Op::GetDistributionConfig | Op::CreateInvalidation => {
-                (distribution_id.clone(), control_id.clone())
-            }
-            Op::GetOriginAccessControl => (control_id.clone(), distribution_id.clone()),
-        };
+        let (held, other_kind) = (distribution_id.clone(), control_id.clone());
         let mut short = held.clone();
         short.pop();
         let long = format!("{held}Z");

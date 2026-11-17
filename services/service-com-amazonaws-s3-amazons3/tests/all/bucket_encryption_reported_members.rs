@@ -2,27 +2,28 @@
 
 //! Which MEMBERS a general purpose bucket's default encryption is reported with.
 //!
-//! RULE: `GetBucketEncryption` reports, for every rule, exactly the settings the bucket's
-//! configuration established — a setting with a documented default is materialised at that
-//! default, and an OPT-IN setting nothing established is reported with its member ABSENT.
+//! RULE: `GetBucketEncryption` reports, for every rule, the settings IN FORCE on the
+//! bucket — a setting with a documented default is materialised at that default, and the
+//! bucket-level blocked set is reported whether a configuration named it or not.
 //!
 //! The two documented defaults are the algorithm ("by default, all buckets have a default
 //! encryption configuration that uses server-side encryption with Amazon S3 managed keys
 //! (SSE-S3)", `GetBucketEncryption`'s own documentation) and the S3 Bucket Key ("general
 //! purpose buckets - by default, S3 Bucket Key is not enabled",
 //! `smithy_query(query="doc",shape="ServerSideEncryptionRule",member="BucketKeyEnabled")`),
-//! so both are reported whatever a rule named. `BlockedEncryptionTypes` is the opt-in one:
-//! "a bucket-level setting for Amazon S3 general purpose buckets used to prevent the upload
-//! of new objects encrypted with the specified server-side encryption type", and
-//! "currently, this parameter only supports blocking or unblocking server-side encryption
-//! with customer-provided keys (SSE-C)"
+//! so both are reported whatever a rule named. `BlockedEncryptionTypes` is "a bucket-level
+//! setting for Amazon S3 general purpose buckets used to prevent the upload of new objects
+//! encrypted with the specified server-side encryption type", and "currently, this parameter
+//! only supports blocking or unblocking server-side encryption with customer-provided keys
+//! (SSE-C)"
 //! (`smithy_query(query="doc",shape="ServerSideEncryptionRule",member="BlockedEncryptionTypes")`)
-//! — a setting with no documented on state, so only a `PutBucketEncryption` that names it
-//! establishes it, and a bucket no such put reached reports no such container.
+//! — a setting of the BUCKET rather than of one put, so a rule that named no set is in force
+//! with the set the bucket carries anyway (the customer-key type) and a rule that named one
+//! is in force with that.
 //!
-//! Why the absence matters on the wire rather than only in a parsed view: a client that
-//! round-trips the rules it is handed (Get → Put) would otherwise send a bucket-level block
-//! the bucket never carried, and a compliance reader would report one.
+//! Why it matters on the wire rather than only in a parsed view: a compliance reader asks
+//! this operation which encryption types the bucket blocks, and a client that round-trips the
+//! rules it is handed (Get → Put) must be handed the set in force.
 //!
 //! The rows differ along what the rule generalises over: whether the bucket was configured
 //! at all, WHICH algorithm a rule names (every `ServerSideEncryption` value the model
@@ -65,7 +66,7 @@ async fn delete_encryption(router: &MultiServiceRouter, bucket: &str) -> Answer 
 }
 
 /// Read the bucket's configuration back and assert, on the wire and in the parsed view,
-/// that it reports `expected` — including whether the opt-in container is there at all.
+/// that it reports `expected` — including which blocked set each rule carries.
 async fn assert_reports(
     router: &MultiServiceRouter,
     bucket_name: &str,
@@ -87,8 +88,8 @@ async fn assert_reports(
         text(&read)
     );
 
-    // The container's presence, asserted on the bytes as well: a rule reported without a
-    // blocked set must carry no such element at all, not an empty one.
+    // The container's presence, asserted on the bytes as well: every rule in force carries
+    // the blocked set the bucket is on, so the element appears once per rule.
     let blocking_rules = expected
         .iter()
         .filter(|rule| rule.blocked_encryption_types.is_some())
@@ -111,13 +112,16 @@ struct Row {
 }
 
 /// The rule every bucket reports while no `PutBucketEncryption` has configured one: the
-/// documented SSE-S3 algorithm with the Bucket Key off, and nothing else.
+/// documented SSE-S3 algorithm with the Bucket Key off, and the bucket-level blocked set.
 fn base_default() -> Rule {
-    Rule::by_default(DEFAULT_SSE_ALGORITHM).with_bucket_key(DEFAULT_BUCKET_KEY_ENABLED)
+    Rule::by_default(DEFAULT_SSE_ALGORITHM)
+        .with_bucket_key(DEFAULT_BUCKET_KEY_ENABLED)
+        .blocking(&[ENCRYPTION_TYPE_VALUES[1]])
 }
 
-/// The rules each row must report: the configured ones with `BucketKeyEnabled`
-/// materialised and every other member exactly as configured, or the base default.
+/// The rules each row must report: the configured ones with `BucketKeyEnabled` materialised,
+/// the bucket-level blocked set in force where a rule named none, and every other member
+/// exactly as configured — or the base default.
 fn expected_of(row: &Row) -> Vec<Rule> {
     match &row.configured {
         None => vec![base_default()],
@@ -125,6 +129,10 @@ fn expected_of(row: &Row) -> Vec<Rule> {
             .iter()
             .map(|rule| Rule {
                 bucket_key_enabled: Some(rule.bucket_key_enabled.unwrap_or(false)),
+                blocked_encryption_types: rule
+                    .blocked_encryption_types
+                    .clone()
+                    .or_else(|| Some(vec![ENCRYPTION_TYPE_VALUES[1].to_string()])),
                 ..rule.clone()
             })
             .collect(),
@@ -230,11 +238,11 @@ async fn a_bucket_reports_the_encryption_members_its_configuration_established()
 }
 
 #[tokio::test]
-async fn a_blocked_set_goes_away_when_the_configuration_that_named_it_does() {
+async fn a_blocked_set_a_put_named_is_replaced_by_the_one_in_force() {
     let router = router();
-    let [_, customer_key] = ENCRYPTION_TYPE_VALUES;
+    let [unblocked, customer_key] = ENCRYPTION_TYPE_VALUES;
     let name = "members-block-withdrawn";
-    let case = "a blocked set established, then replaced and reset";
+    let case = "a blocked set named, then named otherwise and reset";
     bucket(&router, name, case).await;
 
     // Established: the put names the block, so the bucket reports it.
@@ -256,8 +264,10 @@ async fn a_blocked_set_goes_away_when_the_configuration_that_named_it_does() {
     )
     .await;
 
-    // A put is a REPLACEMENT, so a configuration that names no block leaves none behind:
-    // the opt-in setting is not sticky.
+    // A put is a REPLACEMENT of the rules, and a rule that names NO block is in force with
+    // the set the bucket carries anyway — the bucket-level setting is not withdrawn by a put
+    // that says nothing about it, while a put that names the unblocking value IS the bucket's
+    // set.
     let replacement = vec![Rule::by_default(SERVER_SIDE_ENCRYPTION_VALUES[3])];
     let replaced = put_encryption(&router, name, &replacement).await;
     assert_eq!(
@@ -271,7 +281,26 @@ async fn a_blocked_set_goes_away_when_the_configuration_that_named_it_does() {
         name,
         "a replacement that names no block",
         &[Rule::by_default(SERVER_SIDE_ENCRYPTION_VALUES[3])
-            .with_bucket_key(DEFAULT_BUCKET_KEY_ENABLED)],
+            .with_bucket_key(DEFAULT_BUCKET_KEY_ENABLED)
+            .blocking(&[customer_key])],
+    )
+    .await;
+
+    let unblocking = vec![Rule::by_default(SERVER_SIDE_ENCRYPTION_VALUES[3]).blocking(&[unblocked])];
+    let unblocked_put = put_encryption(&router, name, &unblocking).await;
+    assert_eq!(
+        unblocked_put.status, 200,
+        "case {case:?}: the unblocking put must answer 200, got {} with body {:?}",
+        unblocked_put.status,
+        text(&unblocked_put)
+    );
+    assert_reports(
+        &router,
+        name,
+        "a put that names the unblocking value",
+        &[Rule::by_default(SERVER_SIDE_ENCRYPTION_VALUES[3])
+            .with_bucket_key(DEFAULT_BUCKET_KEY_ENABLED)
+            .blocking(&[unblocked])],
     )
     .await;
 

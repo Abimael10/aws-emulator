@@ -17,17 +17,17 @@
 //!   document as a mapping's `ProfileId`;
 //! * the SHAPES of an id the store holds no profile for (one never minted, a stored id in
 //!   lower case, a token that is no profile id at all, and a caller reference rather than an
-//!   id);
+//!   id), each of which earns the one absent-profile sentence;
 //! * which MAPPING KIND of which section of a configuration still names the profile a delete
 //!   is refused for — a query argument-profile mapping, a content type-profile mapping, or one
 //!   of each at once.
 //!
-//! One condition under that code is not the absent profile: an operation ADDRESSED by an `Id`
-//! outside the shape a profile id takes reports the identifier it cannot read, judged before
-//! the store is consulted. The last case below spans those shapes — another namespace of this
-//! service, a value of no minted id's alphabet, a caller reference — against the
-//! absent-profile rows, so the two conditions the one code covers stay told apart by their
-//! sentences.
+//! The id travels in the path on four of those operations and in a submitted DOCUMENT on the
+//! other two, and either way an id the store holds no profile for is the absent profile: these
+//! operations model this one not-found code and no argument error, so no shape of an
+//! unresolvable id earns a different sentence. The rows below span those shapes — another
+//! namespace of this service, a value of no minted id's alphabet, a caller reference — beside
+//! well-formed profile ids nothing answers to.
 //!
 //! Every message is also asserted NOT to be the documentation prose of its error shape
 //! (`smithy_query(query="doc",shape="NoSuchFieldLevelEncryptionProfile")` and
@@ -52,7 +52,6 @@ use crate::field_level_encryption_profile_lifecycle::{
 /// The sentences CloudFront sends on the wire for these refusals, spelled out here rather than
 /// taken from the crate, so a reworded refusal fails this suite.
 const NO_SUCH_PROFILE_MESSAGE: &str = "The specified field level encryption profile does not exist.";
-const ID_FORMAT_INVALID_MESSAGE: &str = "Id format is invalid";
 const PROFILE_IN_USE_MESSAGE: &str =
     "The field level encryption profile is currently associated with a field level encryption \
      config. Please disassociate the profile before deleting.";
@@ -197,12 +196,9 @@ fn assert_refusal(answer: &Answer, case: &str, status: u16, code: &str, message:
 // ---------------------------------------------------------------------------
 
 /// Every path that reports a field-level encryption profile id as naming nothing answers
-/// `NoSuchFieldLevelEncryptionProfile`, and the MESSAGE is the wire sentence for what it
-/// found: an `Id` outside the shape a profile id takes is refused as an identifier the
-/// service cannot read, a well-formed id no profile answers to is the absent-profile
-/// sentence, and a profile id borne by a DOCUMENT — a mapping's `ProfileId` on a
-/// configuration create or update — is the absent-profile sentence whatever its shape, since
-/// it addresses no operation.
+/// `NoSuchFieldLevelEncryptionProfile` with the one absent-profile wire sentence — whether the
+/// id travels in the PATH (both readers of the profile, its update and its delete) or in a
+/// submitted DOCUMENT as a mapping's `ProfileId`, and whatever shape the id takes.
 #[tokio::test]
 async fn every_path_that_reports_a_missing_profile_sends_the_wire_sentence() {
     let router = emulator();
@@ -219,11 +215,10 @@ async fn every_path_that_reports_a_missing_profile_sends_the_wire_sentence() {
     );
     let (config_id, config_etag) = store_config(&router, &referencing).await;
 
-    // The shapes an id takes that no stored profile carries, each with the sentence an
-    // operation ADDRESSED by it answers: one never minted and a stored id with a character
-    // changed are well-formed profile ids, so they are the absent profile, while a stored id
-    // in lower case, a token that is no profile id and a caller reference are outside the
-    // shape a profile id takes.
+    // The shapes an id takes that no stored profile carries, each earning the one sentence an
+    // operation addressed by it answers: a well-formed profile id never minted, a stored id
+    // with a character changed, a stored id in lower case, a token that is no profile id and a
+    // caller reference.
     let mut flipped: Vec<char> = known.chars().collect();
     let last = flipped.len() - 1;
     flipped[last] = if flipped[last] == 'A' { 'B' } else { 'A' };
@@ -241,17 +236,17 @@ async fn every_path_that_reports_a_missing_profile_sends_the_wire_sentence() {
         (
             "a stored id in lower case",
             known.to_lowercase(),
-            ID_FORMAT_INVALID_MESSAGE,
+            NO_SUCH_PROFILE_MESSAGE,
         ),
         (
             "a token that is no profile id",
             "not-a-profile-id".to_string(),
-            ID_FORMAT_INVALID_MESSAGE,
+            NO_SUCH_PROFILE_MESSAGE,
         ),
         (
             "the caller reference rather than the id",
             "fle-profile-message-known".to_string(),
-            ID_FORMAT_INVALID_MESSAGE,
+            NO_SUCH_PROFILE_MESSAGE,
         ),
     ];
 
@@ -341,19 +336,18 @@ async fn every_path_that_reports_a_missing_profile_sends_the_wire_sentence() {
     );
 }
 
-/// A READ of a profile answers its one not-found code for every `Id` it cannot resolve, and
-/// the MESSAGE says which condition it was: an `Id` outside the shape a profile id takes — a
-/// minted id of ANOTHER resource kind of this service, a value of no minted id's alphabet or
-/// width, a name or a caller reference — could never have named a profile, so it is reported
-/// as the identifier CloudFront cannot read, while a well-formed profile id the store holds
-/// nothing for is the profile that is absent.
+/// A READ of a profile answers its one not-found code and ONE sentence for every `Id` it
+/// cannot resolve: a minted id of ANOTHER resource kind of this service, a value of no minted
+/// id's alphabet or width, a name, a caller reference and a well-formed profile id nothing
+/// answers to all report the profile that is absent, because the read models no argument error
+/// to report an identifier under.
 ///
 /// The rows span the shapes an `Id` takes outside a profile id's: the namespaces of this
 /// service a profile id's is disjoint from, taking two of them from ids this emulator really
 /// minted, a stored id in another case, a bare word and the profile's own caller reference —
-/// against a well-formed profile id that was never minted.
+/// beside a well-formed profile id that was never minted.
 #[tokio::test]
-async fn a_profile_read_tells_an_unreadable_identifier_from_an_absent_profile() {
+async fn a_profile_read_answers_one_sentence_for_every_id_it_cannot_resolve() {
     let router = emulator();
     let key = upload_key(&router, 0).await;
     let (known, _) = store_profile_with_token(&router, "fle-profile-kinds-known", &key).await;
@@ -372,22 +366,22 @@ async fn a_profile_read_tells_an_unreadable_identifier_from_an_absent_profile() 
         (
             "the sibling configuration's own id",
             config_id.clone(),
-            ID_FORMAT_INVALID_MESSAGE,
+            NO_SUCH_PROFILE_MESSAGE,
         ),
         (
             "a public key id this service minted",
             key.clone(),
-            ID_FORMAT_INVALID_MESSAGE,
+            NO_SUCH_PROFILE_MESSAGE,
         ),
         (
             "a distribution id's namespace",
             "E1234567890ABC".to_string(),
-            ID_FORMAT_INVALID_MESSAGE,
+            NO_SUCH_PROFILE_MESSAGE,
         ),
         (
             "a UUID, the namespace the policy kinds are keyed by",
             "00000000-0000-0000-0000-000000000000".to_string(),
-            ID_FORMAT_INVALID_MESSAGE,
+            NO_SUCH_PROFILE_MESSAGE,
         ),
         (
             "a profile id never minted",
@@ -397,17 +391,17 @@ async fn a_profile_read_tells_an_unreadable_identifier_from_an_absent_profile() 
         (
             "the stored id in lower case",
             known.to_lowercase(),
-            ID_FORMAT_INVALID_MESSAGE,
+            NO_SUCH_PROFILE_MESSAGE,
         ),
         (
             "a bare word",
             "not-a-profile-id".to_string(),
-            ID_FORMAT_INVALID_MESSAGE,
+            NO_SUCH_PROFILE_MESSAGE,
         ),
         (
             "the profile's caller reference rather than its id",
             "fle-profile-kinds-known".to_string(),
-            ID_FORMAT_INVALID_MESSAGE,
+            NO_SUCH_PROFILE_MESSAGE,
         ),
     ];
 

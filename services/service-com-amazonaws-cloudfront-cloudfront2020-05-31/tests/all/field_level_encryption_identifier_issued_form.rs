@@ -5,16 +5,13 @@
 //!
 //! The rule under test is the one `field_level_encryption_identifier_width_and_namespace.rs`
 //! states over generated identifiers: an operation addressed by a field-level encryption
-//! identifier answers its one modelled not-found code (404) for every identifier it cannot
-//! resolve, and reports the ABSENT resource ("The specified field level encryption
-//! config/profile does not exist.") for an identifier written the way CloudFront issues one of
-//! the addressed kind, reserving the unreadable-identifier sentence ("Id format is invalid")
-//! for a value outside that form.
+//! identifier answers its one modelled not-found code (404) and the ABSENT resource ("The
+//! specified field level encryption config/profile does not exist.") for every identifier it
+//! cannot resolve.
 //!
 //! This suite reads that sentence back on the identifiers this emulator really ISSUED, after
-//! their resources are gone: a client holding an identifier of the form for a resource the
-//! account no longer has is the one case the two sentences must not collapse on, and the case a
-//! form judged more strictly than CloudFront judges it would answer "Id format is invalid" for.
+//! their resources are gone: a client holding an identifier for a resource the account no
+//! longer has is the case that matters most to it.
 //! The rows span both resource kinds of the surface and every operation addressed by one of
 //! their identifiers — both readers, the update and the delete — and the delete order is the
 //! one the service requires, since a profile a stored configuration still names is refused as

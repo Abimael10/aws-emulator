@@ -9,10 +9,9 @@
 //! this crate's one wire-test harness, reused from `rest_api_lifecycle`.
 //!
 //! The rule, asserted over a SET of inputs rather than one call: a listing reports "the
-//! current page of elements from this collection" ALWAYS — the member is present, and
-//! empty when the page holds nothing — so a client reads an empty page off a successful
-//! listing rather than having to tell an absent member from one that is present and
-//! empty.
+//! current page of elements from this collection" exactly when that page holds an element —
+//! a page that holds nothing is a success carrying NO collection member, which is the answer
+//! the recorded contract carries for a listing whose page came out empty.
 //!
 //! The rows span the collections of this service a caller fills and empties again,
 //! crossed with the two ways a page comes to hold nothing while the listing still
@@ -245,8 +244,17 @@ async fn listed(gateway: &Gateway, uri: &str, case: &str) -> Value {
     answer.body
 }
 
-/// Assert `body` reports the page member, and that the page holds `count` element(s).
+/// Assert `body` reports a page of `count` element(s): the member carries them when
+/// `count` is non-zero, and is ABSENT when the page holds nothing.
 fn assert_page_of(body: &Value, count: usize, case: &str) {
+    if count == 0 {
+        assert_eq!(
+            body.get("item"),
+            None,
+            "case {case}: a page that holds nothing reports no page member, got {body:?}"
+        );
+        return;
+    }
     let items = body
         .get("item")
         .unwrap_or_else(|| panic!("case {case}: expected the page member, got {body:?}"));
@@ -261,13 +269,13 @@ fn assert_page_of(body: &Value, count: usize, case: &str) {
 }
 
 #[tokio::test]
-async fn a_collection_emptied_of_its_last_element_reports_the_empty_page() {
+async fn a_collection_emptied_of_its_last_element_reports_no_page_member() {
     for collection in EMPTIED {
         let gateway = Gateway::new();
         let row = stand_up(&gateway, collection).await;
 
-        // The one element it holds is on the page, which is the member the emptied
-        // listing must still report.
+        // The one element it holds is on the page, which the emptied listing no longer
+        // reports at all.
         let case = format!("{collection}(one element)");
         let held = listed(&gateway, &row.listing, &case).await;
         assert_page_of(&held, 1, &case);
@@ -292,7 +300,7 @@ async fn a_collection_emptied_of_its_last_element_reports_the_empty_page() {
 }
 
 #[tokio::test]
-async fn a_listing_narrowed_to_no_element_reports_the_empty_page() {
+async fn a_listing_narrowed_to_no_element_reports_no_page_member() {
     for collection in COLLECTIONS {
         let gateway = Gateway::new();
         let row = stand_up(&gateway, collection).await;

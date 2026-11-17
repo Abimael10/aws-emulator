@@ -29,9 +29,8 @@
 //!
 //! The same split, for the kinds whose identifier form IS decided by the value alone, is made
 //! by the free functions beside the refusals they answer with:
-//! [`super::unresolved_key_group_id`], [`super::unresolved_public_key_id`] and
-//! [`super::unresolved_field_level_encryption_profile_id`]. Those need no store, which is the
-//! one reason the two below are methods.
+//! [`super::unresolved_key_group_id`] and [`super::unresolved_public_key_id`]. Those need no
+//! store, which is the one reason the one below is a method.
 //!
 //! Nothing here echoes the submitted value: both sentences are fixed text.
 
@@ -104,20 +103,6 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         } else {
             NoSuchDistribution {
                 message: Some(id_format_invalid_message(member)),
-            }
-        }
-    }
-
-    /// The modelled `NoSuchOriginAccessControl` an operation ADDRESSED by an origin access
-    /// control identifier answers an identifier it could not resolve — the same split
-    /// [`Self::unresolved_distribution`] makes, over the one member these operations address
-    /// their control by (`Id`).
-    pub fn unresolved_origin_access_control(&self, id: &str) -> NoSuchOriginAccessControl {
-        if self.addresses(EntityKind::OriginAccessControl, id) {
-            no_such_origin_access_control()
-        } else {
-            NoSuchOriginAccessControl {
-                message: Some(id_format_invalid_message(ADDRESSED_BY_ID)),
             }
         }
     }

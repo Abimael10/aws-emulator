@@ -30,9 +30,10 @@
 //! bodies and modelled errors asserted here are the ones a client sees.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_kinesis_kinesis_20131202::ops::get_shard_iterator::could_not_find_shard_message;
 use service_com_amazonaws_kinesis_kinesis_20131202::state::{
     retention_period_not_longer_message, retention_period_not_shorter_message,
-    shard_not_found_message, stream_not_found_message, DEFAULT_RETENTION_PERIOD_HOURS,
+    stream_not_found_message, DEFAULT_RETENTION_PERIOD_HOURS,
     STREAM_ACTIVE, stream_identifier_mismatch_message, STREAM_IDENTIFIER_REQUIRED_MESSAGE,
     STREAM_MODE_PROVISIONED, STREAM_UPDATING,
 };
@@ -605,7 +606,7 @@ async fn a_refusal_names_the_stream_the_request_resolved_by_name() {
                     "ShardIteratorType": "TRIM_HORIZON",
                 })
             },
-            says: |name| shard_not_found_message(ABSENT_SHARD_ID, name),
+            says: |name| could_not_find_shard_message(ABSENT_SHARD_ID, name),
             code: "ResourceNotFoundException",
         },
     ];

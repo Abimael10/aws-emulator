@@ -30,6 +30,7 @@
 
 use service_com_amazonaws_s3_amazons3::state::{
     DEFAULT_BUCKET_KEY_ENABLED, DEFAULT_SSE_ALGORITHM, MAX_SERVER_SIDE_ENCRYPTION_RULES,
+    SSE_C_ENCRYPTION_TYPE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -60,25 +61,29 @@ async fn delete_encryption(
 /// `ServerSideEncryption` value `AES256` ("server-side encryption with Amazon S3 managed
 /// keys (SSE-S3)", this operation's and `GetBucketEncryption`'s documentation) and "General
 /// purpose buckets - By default, S3 Bucket Key is not enabled"
-/// (`ServerSideEncryptionRule$BucketKeyEnabled`). It names no `BlockedEncryptionTypes`:
-/// blocking an encryption type is "a bucket-level setting … used to prevent the upload of
-/// new objects encrypted with the specified server-side encryption type"
-/// (`ServerSideEncryptionRule$BlockedEncryptionTypes`), an opt-in setting a reset leaves
-/// unestablished.
+/// (`ServerSideEncryptionRule$BucketKeyEnabled`). It names the blocked set every general
+/// purpose bucket carries, the customer-key type: blocking an encryption type is "a
+/// bucket-level setting … used to prevent the upload of new objects encrypted with the
+/// specified server-side encryption type"
+/// (`ServerSideEncryptionRule$BlockedEncryptionTypes`) rather than a per-put one, so a reset
+/// puts the bucket back on it.
 ///
 /// Every assertion about the restored default compares against THIS form, so a change to
 /// the crate's own defaults cannot make the suite agree with itself;
 /// [`the_restored_default_is_the_one_the_crate_publishes`] is what ties the two together.
 fn documented_default_rule() -> Rule {
-    Rule::by_default("AES256").with_bucket_key(false)
+    Rule::by_default("AES256")
+        .with_bucket_key(false)
+        .blocking(&["SSE-C"])
 }
 
 #[test]
 fn the_restored_default_is_the_one_the_crate_publishes() {
     // The constants the handlers compute the default from must be the documented default
     // above; otherwise one of the two is wrong, whichever way they were changed.
-    let published =
-        Rule::by_default(DEFAULT_SSE_ALGORITHM).with_bucket_key(DEFAULT_BUCKET_KEY_ENABLED);
+    let published = Rule::by_default(DEFAULT_SSE_ALGORITHM)
+        .with_bucket_key(DEFAULT_BUCKET_KEY_ENABLED)
+        .blocking(&[SSE_C_ENCRYPTION_TYPE]);
     assert_eq!(
         published,
         documented_default_rule(),

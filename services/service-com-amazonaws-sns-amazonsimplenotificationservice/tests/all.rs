@@ -142,6 +142,9 @@ mod origination_numbers_listing;
 #[path = "all/opt_out_check_reports_every_number.rs"]
 mod opt_out_check_reports_every_number;
 
+#[path = "all/phone_number_form_admission.rs"]
+mod phone_number_form_admission;
+
 #[path = "all/phone_number_opt_in.rs"]
 mod phone_number_opt_in;
 

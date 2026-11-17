@@ -29,6 +29,7 @@
 //! many shards the stream has.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_kinesis_kinesis_20131202::ops::get_shard_iterator::could_not_find_shard_message;
 use service_com_amazonaws_kinesis_kinesis_20131202::state::{
     dry_run_succeeded_message, hash_key_out_of_range_message, shard_id,
     shard_not_found_message, stream_creation_time_not_found_message,
@@ -259,22 +260,14 @@ async fn a_missing_resource_is_worded_at_what_was_asked_for() {
         );
     }
 
-    // A read that asked for a SHARD is worded at the shard, in the ONE sentence this service
-    // words that condition with: a stream this account and region do not hold at all, and a
-    // stream that IS held whose shard map the id was looked up in and missed, both state that
-    // the shard does not exist — the request asked for a shard, so that is what the refusal is
-    // about.
-    // Each row: the case, the stream the request names (one this account holds and one it
-    // does not), and the shard it asks for.
+    // A read that asked for a SHARD is worded at the shard: a stream this account and region
+    // do not hold at all states that the shard does not exist — the request asked for a
+    // shard, so that is what the refusal is about.
+    // Each row: the case, the stream the request names (one this account does not hold), and
+    // the shard it asks for.
     let shard_reads: Vec<(&str, &str, String)> = vec![
         ("a shard of a stream nothing holds", absent, shard_id(0)),
         ("another shard of that stream", absent, shard_id(7)),
-        ("a shard the held stream does not have", held, shard_id(9)),
-        (
-            "a shard id of no shape this service mints",
-            held,
-            "shard-9".to_string(),
-        ),
     ];
     for (case, stream, shard) in shard_reads {
         let shard = shard.as_str();
@@ -304,6 +297,48 @@ async fn a_missing_resource_is_worded_at_what_was_asked_for() {
         assert_eq!(
             message,
             shard_not_found_message(shard, stream),
+            "case {case}: the crate's own sentence is the one the wire carries"
+        );
+    }
+
+    // And a stream that IS held whose shard map the id was looked up in and missed is worded
+    // as the search that came up empty, the sentence the recorded contract carries for this
+    // operation.
+    let shard_searches: Vec<(&str, String)> = vec![
+        ("a shard the held stream does not have", shard_id(9)),
+        (
+            "a shard id of no shape this service mints",
+            "shard-9".to_string(),
+        ),
+    ];
+    for (case, shard) in shard_searches {
+        let shard = shard.as_str();
+        let (code, message) = refusal(
+            &emulator,
+            case,
+            "GetShardIterator",
+            &json!({
+                "StreamName": held,
+                "ShardId": shard,
+                "ShardIteratorType": SHARD_ITERATOR_TYPE_TRIM_HORIZON,
+            }),
+        )
+        .await;
+        assert_eq!(
+            code, "ResourceNotFoundException",
+            "case {case}: expected the modelled not-found, got {code} with {message:?}"
+        );
+        let expected = format!(
+            "Could not find shard {shard} in stream {held} under account {}.",
+            engine::EMULATOR_ACCOUNT_ID
+        );
+        assert_eq!(
+            message, expected,
+            "case {case}: expected the sentence that condition is worded with"
+        );
+        assert_eq!(
+            message,
+            could_not_find_shard_message(shard, held),
             "case {case}: the crate's own sentence is the one the wire carries"
         );
     }

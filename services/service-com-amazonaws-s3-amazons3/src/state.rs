@@ -3280,12 +3280,11 @@ pub struct BucketEncryptionRule {
 /// enabled" (`ServerSideEncryptionRule$BucketKeyEnabled`) — so the rule a never-configured
 /// bucket reports is [`DEFAULT_SSE_ALGORITHM`] with the Bucket Key off.
 ///
-/// It names NO `BlockedEncryptionTypes`: that member is "a bucket-level setting for Amazon
-/// S3 general purpose buckets used to prevent the upload of new objects encrypted with the
-/// specified server-side encryption type"
-/// (`ServerSideEncryptionRule$BlockedEncryptionTypes`), an OPT-IN setting with no
-/// documented on state, so a bucket no request has named it on blocks nothing and reports
-/// no such container.
+/// It names the blocked set every general purpose bucket carries
+/// ([`default_blocked_encryption_types`]): `BlockedEncryptionTypes` is "a bucket-level
+/// setting for Amazon S3 general purpose buckets"
+/// (`ServerSideEncryptionRule$BlockedEncryptionTypes`) whose recorded state on a bucket no
+/// request has named it on is the customer-key type blocked.
 ///
 /// COMPUTED rather than stored, so a read of a bucket that was never configured reports
 /// this without writing anything: [`Bucket::encryption`] stays `None` and a later reader
@@ -3295,7 +3294,7 @@ pub fn default_encryption_rule() -> BucketEncryptionRule {
         sse_algorithm: Some(DEFAULT_SSE_ALGORITHM.to_string()),
         kms_master_key_id: None,
         bucket_key_enabled: Some(DEFAULT_BUCKET_KEY_ENABLED),
-        blocked_encryption_types: None,
+        blocked_encryption_types: Some(default_blocked_encryption_types()),
     }
 }
 

@@ -56,11 +56,6 @@ use crate::field_level_encryption_profile_lifecycle::{
     upload_key, upload_keys, Entity, Profile,
 };
 
-/// The sentence CloudFront sends for a path identifier outside the shape its resource kind's
-/// ids take, spelled out here rather than taken from the crate, so a reworded refusal fails
-/// this suite.
-const ID_FORMAT_INVALID_MESSAGE: &str = "Id format is invalid";
-
 // ---------------------------------------------------------------------------
 // Calling the update
 // ---------------------------------------------------------------------------
@@ -734,12 +729,12 @@ async fn an_id_no_profile_holds_is_refused() {
         (
             "the existing id in lower case",
             id.to_lowercase(),
-            ID_FORMAT_INVALID_MESSAGE,
+            NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE,
         ),
         (
             "a token of no profile id's shape",
             "not-a-profile".to_string(),
-            ID_FORMAT_INVALID_MESSAGE,
+            NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE,
         ),
     ];
 

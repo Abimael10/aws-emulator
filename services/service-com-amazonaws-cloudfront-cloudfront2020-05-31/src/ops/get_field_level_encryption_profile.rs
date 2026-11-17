@@ -145,12 +145,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Get the ID for the field-level encryption profile information": the id resolves a
         // stored profile, and when nothing answers to it the one not-found code this
-        // operation models reports WHICH condition it was — an id of another resource kind
-        // was never a profile id, every other unresolved id is a profile that is not there.
+        // operation models reports the absent profile — whatever shape the value takes, since
+        // the operation models no argument error to report an identifier under.
         let Some(stored) = store.field_level_encryption_profile(&input.id) else {
             return Err(
                 GetFieldLevelEncryptionProfileErrorModeled::NoSuchFieldLevelEncryptionProfile(
-                    crate::state::unresolved_field_level_encryption_profile_id(&input.id),
+                    crate::state::no_such_field_level_encryption_profile(),
                 )
                 .into(),
             );

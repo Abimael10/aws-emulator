@@ -43,45 +43,6 @@ pub fn form_type_not_found_message(identifier: &str) -> String {
     catalog_refusal_document(&format!("Metadata form type {identifier} not found."))
 }
 
-/// The message the catalog's metadata form type surface refuses a DELETE of a form type an
-/// asset type still references with: the value of that refusal's `ConflictException$Message`.
-///
-/// RECORDED template. The fixed text is `Form type `, ` cannot be deleted because of the
-/// following dependencies: ` and the dependency objects that follow it
-/// ([`catalog_dependency_object`]); the variable parts are the form type the request
-/// addressed and the asset types the store holds against it. Wrapped in the JSON document
-/// this surface words every refusal in ([`catalog_refusal_document`]), so a client reading
-/// `Message` reads that document.
-///
-/// `dependencies` is named in the order the store holds the asset types in, so two refusals
-/// of one delete read the same.
-pub fn form_type_in_use_message(identifier: &str, dependencies: &[String]) -> String {
-    catalog_refusal_document(&format!(
-        "Form type {identifier} cannot be deleted because of the following dependencies: {named}",
-        named = dependencies.join(", "),
-    ))
-}
-
-/// The tag naming an asset-domain object — an asset type, or an asset of one — where a
-/// refusal of this surface names a dependency ([`catalog_dependency_object`]).
-///
-/// RECORDED: the dependency that prevents a form type's deletion is named
-/// `glueAsset#glue_<accountId>#<assetTypeName>`.
-pub const DEPENDENCY_TAG_ASSET: &str = "glueAsset";
-
-/// One stored object as a refusal of this surface NAMES it: `gluetype <tag>#glue_<accountId>#<name>`
-/// — the kind of object, the catalog it lives in ([`CATALOG_QUALIFIER_PREFIX`] and this
-/// emulator's account) and its own name inside that catalog.
-///
-/// Built from the store and the account, never from a recorded value, so a refusal names the
-/// object the call actually found.
-pub fn catalog_dependency_object(tag: &str, name: &str) -> String {
-    format!(
-        "gluetype {tag}#{CATALOG_QUALIFIER_PREFIX}{account}#{name}",
-        account = ::engine::emulator_account_id(),
-    )
-}
-
 /// `sentence` as the business-catalog surface puts a refusal on the wire: a JSON document
 /// carrying it under a `Message` key.
 ///

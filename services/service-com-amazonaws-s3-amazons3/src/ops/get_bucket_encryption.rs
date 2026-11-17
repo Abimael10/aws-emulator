@@ -268,15 +268,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             rule.bucket_key_enabled
                                 .unwrap_or(crate::state::DEFAULT_BUCKET_KEY_ENABLED),
                         ),
-                        // Reported ONLY when a configuration named it: blocking an
-                        // encryption type is "a bucket-level setting for Amazon S3 general
-                        // purpose buckets used to prevent the upload of new objects
-                        // encrypted with the specified server-side encryption type"
-                        // (`ServerSideEncryptionRule$BlockedEncryptionTypes`), an OPT-IN
-                        // setting with no documented on state — so a bucket no
-                        // `PutBucketEncryption` named it on reports no such container, and
-                        // a caller that round-trips the reported rules back through a put
-                        // sends nothing the bucket never carried.
+                        // Reported on every rule in force: blocking an encryption type is
+                        // "a bucket-level setting for Amazon S3 general purpose buckets
+                        // used to prevent the upload of new objects encrypted with the
+                        // specified server-side encryption type"
+                        // (`ServerSideEncryptionRule$BlockedEncryptionTypes`), so a rule
+                        // that named no set is in force with the set the bucket carries
+                        // anyway and a rule that named one is in force with that
+                        // (`crate::state::Bucket::effective_encryption_rules`).
                         blocked_encryption_types: rule.blocked_encryption_types.clone().map(
                             |encryption_type| BlockedEncryptionTypes {
                                 encryption_type: Some(encryption_type),

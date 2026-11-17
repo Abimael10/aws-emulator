@@ -3411,33 +3411,6 @@ impl ComAmazonawsGlueAwsglueState {
         self.form_types.remove(identifier)
     }
 
-    /// Every asset type of this store that still REFERENCES the form type `identifier`
-    /// names, by name, in the order the asset type namespace holds them.
-    ///
-    /// "A form type cannot be deleted if it is still referenced by an asset type"
-    /// (`smithy_query(query="doc",shape="DeleteFormType")`), so this is the dependency
-    /// `DeleteFormType` is held to. An asset type's `forms` hold the
-    /// `AssetTypeFormReference$FormTypeIdentifier` each put sent, resolved against this
-    /// namespace when it was stored ([`Self::form_type_by_reference`]), so a reference names
-    /// this form type exactly when it equals the identifier this namespace keys it by.
-    ///
-    /// It is a LIVE reference check over the records the store holds right now — a walk
-    /// bounded by [`MAX_ASSET_TYPES`] — so an asset type that has since been deleted holds
-    /// nothing up, and an asset that merely carries a form of this type is not an asset type
-    /// and holds nothing up either.
-    pub fn asset_types_referencing_form_type(&self, identifier: &str) -> Vec<String> {
-        self.asset_types
-            .values()
-            .filter(|asset_type| {
-                asset_type
-                    .forms
-                    .values()
-                    .any(|reference| reference == identifier)
-            })
-            .map(|asset_type| asset_type.name.clone())
-            .collect()
-    }
-
     /// Whether the store can hold another asset type, i.e. is below [`MAX_ASSET_TYPES`].
     pub fn can_store_asset_type(&self) -> bool {
         self.asset_types.len() < MAX_ASSET_TYPES

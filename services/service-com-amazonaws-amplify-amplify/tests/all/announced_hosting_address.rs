@@ -10,16 +10,15 @@
 //! The rule under test: `App$defaultDomain` is "the default domain for the Amplify app"
 //! (`smithy_query(query="doc",shape="App",member="defaultDomain")`) and
 //! `Branch$displayName` "is used as the default domain prefix"
-//! (`(shape="Branch",member="displayName")`), so the member is the DNS domain of the zone
-//! Amplify publishes an app's sites under and it names the APP: the app's own minted id
-//! followed by that zone, derived from the id alone and never from the endpoint, host or
-//! port the creating request happened to reach.
+//! (`(shape="Branch",member="displayName")`), so the member is the domain a client composes
+//! its site's address from — and it is the address THIS emulator is reached at, because a
+//! domain a response announces is one a client is told to fetch.
 //!
 //! So the value is an address and nothing else — no scheme, no path — resolved ONCE when the
 //! app is created, identical for every endpoint a client of this emulator is configured
 //! with, and a `GET` of `<displayName>.<defaultDomain>` is answered by the site that branch
-//! deployed. A client that resolves nothing but one local endpoint cannot dial that domain,
-//! so the same site is ALSO served under the path that names the app and the branch.
+//! deployed. A client that resolves nothing but one local endpoint cannot dial a branch label
+//! under it, so the same site is ALSO served under the path that names the app and the branch.
 //!
 //! The table below spans the class that rule generalises over: every spelling of the
 //! emulator's own endpoint a client is configured with (the IPv4 loopback address, the
@@ -33,15 +32,11 @@
 
 use serde_json::{json, Value};
 
-use crate::app_branch_lifecycle::{list_member, string_member, Emulator, REGION};
+use crate::app_branch_lifecycle::{announced_domain, list_member, string_member, Emulator, REGION};
 use crate::hosted_branch_site::{Hosted, SUCCEED};
 
 /// The root document the rows deploy, so a `GET` of the site has something to answer with.
 const ROOT_DOCUMENT: &str = "index.html";
-
-/// The zone Amplify hosts an app's default domain under, pinned here rather than read from
-/// the constant the service itself carries.
-const HOSTING_ZONE: &str = "amplifyapp.com";
 
 /// The path prefix an app announced on this emulator's own endpoint carries: the reserved
 /// data-plane marker and the label naming the hosting plane. Written here independently of
@@ -96,13 +91,13 @@ async fn read_app(emulator: &Emulator, endpoint: &str, app_id: &str) -> Value {
     reply.member("app")
 }
 
-/// Rule: an app's default domain is the app's own id under Amplify's hosting zone, whatever
+/// Rule: an app's default domain is the address this emulator is reached at, whatever
 /// endpoint the create was addressed at, and the site of a branch of that app is served at
-/// the address a client composes from it — host-style for a client that resolves that zone,
-/// and under the path that names the app and the branch for one that resolves only this
-/// emulator's own endpoint.
+/// the address a client composes from it — host-style, with the branch's label ahead of that
+/// domain, and under the path that names the app and the branch for a client that resolves
+/// only this emulator's own endpoint.
 #[tokio::test]
-async fn an_app_announces_its_hosting_under_the_hosting_zone_whatever_endpoint_it_was_created_at(
+async fn an_app_announces_the_address_this_emulator_is_reached_at_whatever_endpoint_it_was_created_at(
 ) {
     for row in rows() {
         let case = row.case;
@@ -123,13 +118,13 @@ async fn an_app_announces_its_hosting_under_the_hosting_zone_whatever_endpoint_i
         let app_id = string_member(&app, "appId");
         let reported = string_member(&app, "defaultDomain");
 
-        let expected = format!("{app_id}.{HOSTING_ZONE}");
+        let expected = announced_domain();
         assert_eq!(
             reported, expected,
-            "case {case:?}: expected the app's domain {expected:?}, got {reported:?}"
+            "case {case:?}: expected the emulator's own address {expected:?}, got {reported:?}"
         );
-        // The announced value is an ADDRESS and nothing else: a DNS name a branch label can
-        // be prefixed to, carrying no scheme and no path.
+        // The announced value is an ADDRESS and nothing else: a name a branch label can be
+        // prefixed to, carrying no scheme and no path.
         assert!(
             !reported.contains('/'),
             "case {case:?}: a domain carries no scheme and no path, got {reported:?}"
@@ -137,8 +132,8 @@ async fn an_app_announces_its_hosting_under_the_hosting_zone_whatever_endpoint_i
         assert!(
             reported.chars().all(|byte| byte.is_ascii_lowercase()
                 || byte.is_ascii_digit()
-                || "-.".contains(byte)),
-            "case {case:?}: the domain must be a DNS name, got {reported:?}"
+                || "-.:[]".contains(byte)),
+            "case {case:?}: the domain must be a host address, got {reported:?}"
         );
 
         // The same value is reported by every reader, and by one addressed somewhere
@@ -188,8 +183,8 @@ async fn an_app_announces_its_hosting_under_the_hosting_zone_whatever_endpoint_i
             "case {case:?}: the deployment must succeed, got {status}"
         );
         // BOTH addressings answer, whatever endpoint the app was created at: the host a
-        // client that resolves the hosting zone composes, and the path a client that
-        // resolves only this emulator's own endpoint reaches the same site under.
+        // client composes from the two members, and the path a client that resolves only
+        // this emulator's own endpoint reaches the same site under.
         let addressings = [
             (
                 "the host composed from the two members",

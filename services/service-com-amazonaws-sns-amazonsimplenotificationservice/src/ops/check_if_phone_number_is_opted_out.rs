@@ -142,15 +142,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// `false` otherwise — which is every number no opt-out was ever recorded for and
     /// every number `OptInPhoneNumber` opted back in.
     ///
-    /// A REPORT: it reads the record and writes nothing, so two reads of one number
-    /// answer the same thing. It reports for every number that COULD be one: SNS
-    /// documents a phone-number member as "Use E.164 format", so a value that is no
-    /// phone number at all is bad input and is refused `InvalidParameterException`
-    /// before the record is read ([`state::phone_number_refusal`]) — the same argument
-    /// validation the operations that ACT on a number apply, since the member is the
-    /// same one. A number of that form the account holds no record for is not bad input:
-    /// the output's documented default settles it — "false – The phone number is opted
-    /// in".
+    /// A REPORT, and one with nothing to refuse: it reads the record and writes nothing, so
+    /// two reads of one number answer the same thing. The member carries no constraint at all
+    /// (`smithy_query(query="operation",operation="CheckIfPhoneNumberIsOptedOut")` reports
+    /// `phoneNumber` targeting the plain, unconstrained `PhoneNumber` shape) and its own
+    /// documentation asks for nothing of its form — "the phone number for which you want to
+    /// check the opt out status" — so every value is reported ON rather than refused: what
+    /// this operation states is a property of the ACCOUNT's record, and a value the account
+    /// holds no record for is settled by the output's documented default, "false – The phone
+    /// number is opted in". The operations that ACT on a number (the opt-in, the sandbox
+    /// registration, a publish) are the ones that hold their member to a form, because what
+    /// they do needs one.
     async fn handle(
         &self,
         input: Self::Input,
@@ -166,19 +168,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CheckIfPhoneNumberIsOptedOutErrorModeled::AuthorizationErrorException(
                     AuthorizationErrorException {
-                        message: Some(message),
-                    },
-                )
-                .into(),
-            );
-        }
-
-        // The form of the number, before the store is consulted: a value that could be
-        // no phone number anywhere is bad input, whichever operation carried it.
-        if let Some(message) = state::phone_number_refusal(&input.phone_number) {
-            return Err(
-                CheckIfPhoneNumberIsOptedOutErrorModeled::InvalidParameterException(
-                    InvalidParameterException {
                         message: Some(message),
                     },
                 )

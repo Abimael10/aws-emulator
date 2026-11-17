@@ -60,6 +60,9 @@ pub mod topic_metrics;
 /// What makes a value a DESTINATION phone number an SMS could be sent to, and how the
 /// SMS service a number is handed on to refuses one that is not.
 pub mod destination_number;
+/// Which values this service ADMITS as a phone number at all, from the pattern it publishes
+/// for its one constrained phone-number shape.
+pub mod phone_number_form;
 mod message_structure;
 /// The rules a topic's TAG set is held to, shared by the operations that write one.
 mod tags;
@@ -196,14 +199,14 @@ pub const CONFIRMATION_TOKEN_HEX_CHARS: usize = 64;
 /// The sentence a `ConfirmSubscription` carrying a token that is not the one sent to
 /// one of the topic's awaiting endpoints is refused with.
 ///
-/// WHOLLY FIXED text: `Invalid parameter:` and the MEMBER the unusable value arrived in,
-/// which is all a caller can act on. The token is opaque and secret, so the sentence
-/// reproduces NEITHER the token the caller sent nor the one that was sent to the
-/// endpoint, and it states no reason clause either — nothing about an opaque token is
-/// readable enough to report. Recorded evidence: `ConfirmSubscription` with a token that
-/// is not a confirmation token of the topic answers `400 InvalidParameter` with exactly
-/// this sentence.
-pub const INVALID_CONFIRMATION_TOKEN_REFUSAL: &str = "Invalid parameter: Token";
+/// WHOLLY FIXED text: the token is opaque and secret, so the sentence reproduces NEITHER
+/// the token the caller sent nor the one that was sent to the endpoint, and it states no
+/// reason clause either — nothing about an opaque token is readable enough to report. The
+/// sentence names the token rather than the member, which is how this operation words the
+/// condition: recorded evidence has `ConfirmSubscription` with a token that is not a
+/// confirmation token of the topic answering `400 InvalidParameter` with exactly this
+/// sentence.
+pub const INVALID_CONFIRMATION_TOKEN_REFUSAL: &str = "Invalid token";
 
 /// The attribute names SNS defines for a subscription, from the `Subscribe` /
 /// `SetSubscriptionAttributes` docs. Closed for the same two reasons as
@@ -3379,7 +3382,13 @@ pub fn invalid_phone_number_message() -> String {
 
 /// The message a phone-number member holding `value` is refused with, or `None` when
 /// `value` is a phone number in E.164 format — the phone-number counterpart of
-/// [`arn_refusal`].
+/// [`arn_refusal`], for the members that name a DESTINATION the service has to be able to
+/// send a message to.
+///
+/// A member that names no destination — the opt-out pair's `phoneNumber`, which documents
+/// only "the phone number for which you want to check the opt out status" — is held to the
+/// wider form the service PUBLISHES for a phone number instead
+/// ([`phone_number_form::phone_number_form_refusal`]).
 pub fn phone_number_refusal(value: &str) -> Option<String> {
     (!is_e164(value)).then(invalid_phone_number_message)
 }

@@ -7,12 +7,13 @@
 //! The rules under test:
 //!
 //! 1. a phone-number parameter the model leaves an unconstrained string has to be a
-//!    phone number in E.164 format — a `+`, a country code that does not begin with
-//!    `0`, then digits only, between the published minimum and maximum digit counts —
-//!    and a value that is not one is refused as bad input (400 `InvalidParameter`),
-//!    before any state is read or written, by every operation that carries the member:
-//!    the one that ACTS on the number (the opt-in) and the one that REPORTS its
-//!    opt-out state (the check) alike;
+//!    phone number in a form this service PUBLISHES for one — a `+` followed by at
+//!    least the pattern's own digit floor, or digits alone up to its national bound —
+//!    wherever the operation ACTS on the number: the opt-in is refused a value that is
+//!    neither (400 `InvalidParameter`) before any state is read or written, while a value
+//!    that form admits is served even where the narrower DESTINATION rule would refuse it.
+//!    The CHECK beside it holds its member to no form at all, since it only reports on this
+//!    account's record (`opt_out_check_reports_every_number`);
 //! 2. the opt-out state a check reports is the one the number's record HOLDS, and an
 //!    opt-in is what clears it: a number with no record, and a number opted back in,
 //!    both report `false`;
@@ -32,7 +33,8 @@
 use std::time::{Duration, SystemTime};
 
 use service_com_amazonaws_sns_amazonsimplenotificationservice::state::{
-    invalid_phone_number_message, opt_in_too_soon_message, PhoneNumberRecord, MAX_E164_DIGITS,
+    invalid_phone_number_message, opt_in_too_soon_message,
+    phone_number_form::MIN_INTERNATIONAL_DIGITS, PhoneNumberRecord, MAX_E164_DIGITS,
     MIN_E164_DIGITS, OPT_IN_INTERVAL,
 };
 
@@ -45,8 +47,8 @@ use super::topics_subscriptions_publish::{Answer, Sns};
 /// `PhoneNumber`, and SNS's refusal states that spelling whichever operation refused.)
 const PHONE_NUMBER_PARAM: &str = "phoneNumber";
 
-/// Phone numbers in E.164 format, spanning the forms the rule accepts: both published
-/// digit bounds ([`MIN_E164_DIGITS`], [`MAX_E164_DIGITS`]) and numbers in between,
+/// Phone numbers in E.164 format, spanning the forms the DESTINATION rule accepts: both
+/// published digit bounds ([`MIN_E164_DIGITS`], [`MAX_E164_DIGITS`]) and numbers in between,
 /// across country codes of one, two and three digits.
 ///
 /// `pub(crate)` so the sibling opt-out LISTING suite drives the same accepted forms
@@ -67,12 +69,14 @@ pub(crate) fn e164_numbers() -> Vec<(&'static str, String)> {
     ]
 }
 
-/// Values that are NOT a phone number in E.164 format: one row per clause of the rule,
-/// including one digit below the published minimum and one past the published maximum.
+/// Values that are no phone number in ANY form this service admits — one row per branch of
+/// the published pattern they miss: a national form written with more digits than the
+/// pattern's digits-only branch takes, forms carrying separators or text, an empty value, the
+/// `+` alone and an international form one digit below the pattern's own floor.
 ///
 /// `pub(crate)` so the sibling suite that drives the opt-out CHECK over the same values
 /// reads them from this one catalog.
-pub(crate) fn not_e164_values() -> Vec<(&'static str, String)> {
+pub(crate) fn not_phone_number_values() -> Vec<(&'static str, String)> {
     vec![
         ("no plus prefix", "12065550100".to_string()),
         ("national form with separators", "+1-206-555-0100".to_string()),
@@ -82,15 +86,27 @@ pub(crate) fn not_e164_values() -> Vec<(&'static str, String)> {
         ("empty", String::new()),
         ("the plus alone", "+".to_string()),
         ("trailing extension text", "+12065550100x42".to_string()),
-        ("country code beginning with zero", "+0123456789".to_string()),
         (
             "one digit below the published minimum",
-            format!("+{}", "9".repeat(MIN_E164_DIGITS - 1)),
+            format!("+{}", "9".repeat(MIN_INTERNATIONAL_DIGITS - 1)),
         ),
+    ]
+}
+
+/// Values the published phone-number pattern ADMITS although the destination rule refuses
+/// them: a country code E.164 assigns to no country, an international form one digit past the
+/// E.164 digit maximum, and a bare short code. The operations that read or write this
+/// account's own record of a number take each of them.
+///
+/// `pub(crate)` for the same reason the catalog above is.
+pub(crate) fn admitted_but_not_e164_values() -> Vec<(&'static str, String)> {
+    vec![
+        ("country code beginning with zero", "+0123456789".to_string()),
         (
-            "one digit past the published maximum",
+            "one digit past the published E.164 maximum",
             format!("+{}", "1".repeat(MAX_E164_DIGITS + 1)),
         ),
+        ("a bare short code", "12345".to_string()),
     ]
 }
 
@@ -357,18 +373,18 @@ async fn a_second_opt_in_inside_the_documented_interval_is_refused() {
     }
 }
 
-/// A value that is not a phone number in E.164 format is bad input to EVERY operation
-/// that carries the member — the one that acts on the number and the one that reports
-/// its opt-out state: the refusal names the member and the constraint, echoes none of
-/// the (sensitive) value, and leaves the store alone.
+/// A value that is no phone number in any form this service admits is bad input to the
+/// operation that ACTS on the number: the refusal names the member and the constraint, echoes
+/// none of the (sensitive) value, and leaves the store alone. A value the published pattern
+/// DOES admit is served, even where the destination rule would refuse it.
 #[tokio::test]
-async fn a_phone_number_that_is_not_e164_is_refused_by_the_opt_in() {
+async fn a_value_that_is_no_phone_number_is_refused_by_the_opt_in() {
     let sns = Sns::new();
     let opted_out = "+12065550100";
     seed_opted_out(&sns, opted_out, None);
 
-    for action in ["OptInPhoneNumber", "CheckIfPhoneNumberIsOptedOut"] {
-        for (case, value) in not_e164_values() {
+    for action in ["OptInPhoneNumber"] {
+        for (case, value) in not_phone_number_values() {
             let answer = sns.call(action, &[(PHONE_NUMBER_PARAM, &value)]).await;
             assert_eq!(
                 answer.status, 400,
@@ -425,4 +441,18 @@ async fn a_phone_number_that_is_not_e164_is_refused_by_the_opt_in() {
         reported(&sns, "the seeded number", opted_out).await,
         "expected the seeded opt-out to survive every refusal"
     );
+
+    // The other half of the rule: a value the published pattern admits is SERVED, even one
+    // the destination rule would refuse — the opt-out record is written for every value that
+    // could be a phone number, and read back for every value at all.
+    for (case, value) in admitted_but_not_e164_values() {
+        for action in ["CheckIfPhoneNumberIsOptedOut", "OptInPhoneNumber"] {
+            let answer = sns.call(action, &[(PHONE_NUMBER_PARAM, &value)]).await;
+            assert_eq!(
+                answer.status, 200,
+                "{action} case {case:?}: expected the admitted form to be served, got {} / {}",
+                answer.status, answer.body
+            );
+        }
+    }
 }

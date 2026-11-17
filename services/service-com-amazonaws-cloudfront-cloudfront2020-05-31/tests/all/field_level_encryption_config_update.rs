@@ -66,10 +66,6 @@ use crate::public_key_lifecycle::is_wire_timestamp;
 /// rather than taken from the crate, so a reworded refusal fails this suite.
 const NO_SUCH_PROFILE_MESSAGE: &str = "The specified field level encryption profile does not exist.";
 
-/// The sentence CloudFront sends for a path identifier outside the shape its resource kind's
-/// ids take, spelled out here for the same reason.
-const ID_FORMAT_INVALID_MESSAGE: &str = "Id format is invalid";
-
 // ---------------------------------------------------------------------------
 // Calling the update
 // ---------------------------------------------------------------------------
@@ -1011,17 +1007,17 @@ async fn an_id_no_configuration_holds_is_refused() {
         (
             "the existing id in lower case",
             id.to_lowercase(),
-            ID_FORMAT_INVALID_MESSAGE,
+            NO_SUCH_FIELD_LEVEL_ENCRYPTION_CONFIG_MESSAGE,
         ),
         (
             "a profile id where a configuration id belongs",
             profile.clone(),
-            ID_FORMAT_INVALID_MESSAGE,
+            NO_SUCH_FIELD_LEVEL_ENCRYPTION_CONFIG_MESSAGE,
         ),
         (
             "a token of no configuration id's shape",
             "not-a-configuration".to_string(),
-            ID_FORMAT_INVALID_MESSAGE,
+            NO_SUCH_FIELD_LEVEL_ENCRYPTION_CONFIG_MESSAGE,
         ),
     ];
 

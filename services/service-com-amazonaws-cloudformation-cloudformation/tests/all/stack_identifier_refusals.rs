@@ -189,10 +189,9 @@ const IDENTIFIER_ROWS: &[IdentifierRow] = &[
 ];
 
 /// The identifiers no stack could ever carry: an empty value, values whose characters — or the
-/// position of them — the check does not admit, values carrying no name run at all, and values
-/// NEAR the form a stack's unique id takes without being it — the groups and their lengths are
-/// what that form IS (the form itself is resolved rather than refused, and
-/// `stack_unique_id_identifiers.rs` pins it on its own).
+/// position of them — the check does not admit, values carrying no name run at all, and the
+/// form a stack's unique id takes, which addresses no stack and is refused for its own shape
+/// (`stack_unique_id_identifiers.rs` pins that form on its own).
 const MALFORMED: &[(&str, &str)] = &[
     ("an empty identifier", ""),
     ("digits alone", "1234567890"),
@@ -207,6 +206,10 @@ const MALFORMED: &[(&str, &str)] = &[
     ("a name starting with a digit", "9identifier"),
     ("a name starting with a hyphen", "-identifier"),
     ("a name with a space", "identifier stack"),
+    (
+        "the unique id a stack id ends in",
+        "0e81d159-090a-7b61-9856-04d0999cb465",
+    ),
     (
         "a unique id a group short",
         "0e81d159-090a-7b61-04d0999cb465",
@@ -230,18 +233,12 @@ const MALFORMED: &[(&str, &str)] = &[
 ];
 
 /// Identifiers the check DOES admit — so each one reaches the lookup — that no stack of the
-/// Region carries: a name nothing created, and the unique id a stack id ends in, which
-/// addresses no stack because only a name or a WHOLE stack id does.
+/// Region carries: names nothing created, in the forms the expression's name alternative
+/// admits.
 const ADMITTED_BUT_ABSENT: &[(&str, &str)] = &[
     ("a name nothing created", "identifier-absent"),
-    (
-        "a stack's unique id",
-        "0e81d159-090a-7b61-9856-04d0999cb465",
-    ),
-    (
-        "a unique id nothing ever minted",
-        "01234567-0123-0123-0123-012345678901",
-    ),
+    ("a one-character name", "z"),
+    ("a name of letters, digits and hyphens", "Stack-9-absent"),
 ];
 
 fn members_of(row: &IdentifierRow, identifier: &str) -> Vec<(String, String)> {

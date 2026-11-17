@@ -203,14 +203,34 @@ fn not_found(message: String) -> GetShardIteratorError {
     .into()
 }
 
+/// How this operation states that the stream it resolved holds no shard under the `ShardId`
+/// the request named: "Could not find shard `<shardId>` in stream `<streamName>` under
+/// account `<account>`."
+///
+/// The fixed text is `Could not find shard ` / ` in stream ` / ` under account ` / `.`, and
+/// its variable parts are taken from the request and from the emulator's own state: the shard
+/// id asked for, the NAME of the stream the request resolved (whichever identifier addressed
+/// it), and the account the caller speaks for.
+///
+/// A sentence of this operation's own, which is why it lives beside its handler rather than in
+/// `crate::state`: the shard LOOKUP of a stream this service holds is worded here at the
+/// search that came up empty, while the stream lookup that precedes it
+/// ([`lookup_refusal`]) states the class this service words at the shard everywhere else
+/// ([`crate::state::shard_not_found_message`]).
+pub fn could_not_find_shard_message(shard_id: &str, stream_name: &str) -> String {
+    format!(
+        "Could not find shard {shard_id} in stream {stream_name} under account {}.",
+        ::engine::emulator_account_id()
+    )
+}
+
 /// The modelled refusal for a request whose `StreamName` / `StreamARN` pair names no stream
 /// of this account and region: the rule the operation's own doc publishes for a request that
 /// names neither ("you must use either the StreamARN or the StreamName parameter, or both"),
 /// and `ResourceNotFoundException` for one that names a stream nothing created — which this
 /// operation words at the SHARD it was asked for, since a shard of a stream this account does
 /// not hold is a shard that does not exist ([`crate::state::shard_not_found_message`]) — the
-/// one sentence this service words that whole class with, a shard missing from a stream it
-/// DOES hold included.
+/// one sentence this service words that whole class with.
 fn lookup_refusal(
     failure: crate::state::StreamLookupFailure,
     input: &GetShardIteratorInput,
@@ -335,7 +355,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .iter()
             .find(|shard| shard.shard_id == input.shard_id)
         else {
-            return Err(not_found(crate::state::shard_not_found_message(
+            return Err(not_found(could_not_find_shard_message(
                 &input.shard_id,
                 // A refusal about the stream this request RESOLVED names it by its
                 // `StreamName`, whichever identifier addressed it.

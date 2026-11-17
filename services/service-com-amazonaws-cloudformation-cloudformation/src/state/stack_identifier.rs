@@ -11,15 +11,15 @@
 //! that its request is malformed rather than that the stack is missing, and EVERY constraint
 //! the value breaks is reported in one envelope, the expression first.
 //!
-//! The expression is what CloudFormation STATES when it will not take a value: a stack NAME,
-//! or a stack ARN. The forms it RESOLVES include one more — the unique id a stack id ENDS in.
-//! That form is hexadecimal, so it falls outside the name alternative whenever it starts with
-//! a digit, yet a request carrying one is ANSWERED FOR THE STACK rather than for its own
-//! shape: a read given a stack's bare unique id reports that no stack carries that id, which
-//! is what the recorded read of one shows. A stack is addressed by its name and by its WHOLE
-//! stack id (`arn:…:stack/<name>/<unique-id>`), so a value in one of those — and a bare unique
-//! id, which addresses no stack — is RESOLVED, and one that names no stack is answered as the
-//! missing stack it is ([`super::stack_does_not_exist`] and the forms beside it).
+//! The expression is what CloudFormation STATES when it will not take a value, and it is also
+//! what it TAKES: a stack NAME, or a stack ARN. A stack is addressed by its name and by its
+//! WHOLE stack id (`arn:…:stack/<name>/<unique-id>`), so a value in one of those is RESOLVED,
+//! and one that names no stack is answered as the missing stack it is
+//! ([`super::stack_does_not_exist`] and the forms beside it). The bare unique id a stack id
+//! ENDS in is NOT such a form — it is hexadecimal, so it falls outside the name alternative
+//! whenever it starts with a digit, and a request carrying one is answered for its own shape:
+//! the recorded read of one states the expression clause rather than reporting a missing
+//! stack.
 //!
 //! ## Why the check lives here and not at the boundary
 //!
@@ -45,9 +45,8 @@ use ::aws_smithy_schema_server::constraints::{Violation, ViolationKind};
 /// Quoted as the SERVICE states it, which is not the anchored spelling the model writes for
 /// the members that do carry a `@pattern`
 /// (`smithy_query(query="shape", shape="StackNameOrId")`): a requirement reaches a message as
-/// the layer that refuses states it. It is the expression a refusal STATES; which values are
-/// taken as addressing a stack is [`is_an_addressable_form`], where the unique-id form is
-/// admitted beside it.
+/// the layer that refuses states it. It is both the expression a refusal STATES and the set of
+/// values taken as addressing a stack ([`is_an_addressable_form`]).
 pub const STACK_IDENTIFIER_PATTERN: &str = "[a-zA-Z][-a-zA-Z0-9]*|arn:[-a-zA-Z0-9:/._+]*";
 
 /// The least a stack identifier may hold: `@length(min: 1)`, which the model states for the
@@ -55,16 +54,6 @@ pub const STACK_IDENTIFIER_PATTERN: &str = "[a-zA-Z][-a-zA-Z0-9]*|arn:[-a-zA-Z0-
 /// (`smithy_query(query="shape", shape="StackNameOrId")`) and which CloudFormation applies to
 /// every member that takes one.
 pub const STACK_IDENTIFIER_MIN_LENGTH: usize = 1;
-
-/// The form the unique id a stack id ENDS in takes: the five hyphen-separated groups of
-/// hexadecimal CloudFormation mints a stack id's last segment as
-/// (`arn:…:stack/<name>/<unique-id>`).
-///
-/// A request carrying one of these alone is a request about a STACK — answered for the stack
-/// it names, which is none, since only a name or a whole stack id addresses one — rather than
-/// a malformed request, so this form is admitted beside [`STACK_IDENTIFIER_PATTERN`].
-pub const STACK_UNIQUE_ID_PATTERN: &str =
-    "[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}";
 
 /// The member path a refusal states a stack identifier at for an operation whose validator
 /// names that member `StackName` — the lowerCamel spelling every violation path takes.
@@ -78,8 +67,8 @@ pub const STACK_NAME_PATH: &str = "stackName";
 /// refused.
 pub const STACK_NAME_OR_ID_PATH: &str = "stackNameOrId";
 
-/// [`STACK_IDENTIFIER_PATTERN`] and [`STACK_UNIQUE_ID_PATTERN`] as the expression a whole
-/// identifier has to BE, compiled once for the process.
+/// [`STACK_IDENTIFIER_PATTERN`] as the expression a whole identifier has to BE, compiled once
+/// for the process.
 ///
 /// `None` only if the expression itself could not be compiled, in which case nothing is
 /// refused by it rather than everything.
@@ -87,20 +76,14 @@ fn stated_expression() -> Option<&'static ::regex::Regex> {
     static COMPILED: ::std::sync::OnceLock<Option<::regex::Regex>> =
         ::std::sync::OnceLock::new();
     COMPILED
-        .get_or_init(|| {
-            ::regex::Regex::new(&format!(
-                "^(?:{STACK_IDENTIFIER_PATTERN}|{STACK_UNIQUE_ID_PATTERN})$"
-            ))
-            .ok()
-        })
+        .get_or_init(|| ::regex::Regex::new(&format!("^(?:{STACK_IDENTIFIER_PATTERN})$")).ok())
         .as_ref()
 }
 
-/// Whether CloudFormation takes `identifier` as naming a stack at all: a stack NAME, a stack
-/// ARN ([`STACK_IDENTIFIER_PATTERN`]), or the unique id a stack id ends in
-/// ([`STACK_UNIQUE_ID_PATTERN`]) — and nothing else. A value in one of those forms is
-/// RESOLVED, so one that names no stack is answered as a missing stack; everything else is
-/// answered for its own shape.
+/// Whether CloudFormation takes `identifier` as naming a stack at all: a stack NAME or a stack
+/// ARN ([`STACK_IDENTIFIER_PATTERN`]) — and nothing else. A value in one of those forms is
+/// RESOLVED, so one that names no stack is answered as a missing stack; everything else,
+/// the bare unique id a stack id ends in included, is answered for its own shape.
 fn is_an_addressable_form(identifier: &str) -> bool {
     stated_expression().is_none_or(|expression| expression.is_match(identifier))
 }
@@ -122,10 +105,6 @@ pub fn malformed_identifier(member_path: &str, identifier: &str) -> Option<Strin
     };
     let mut violations: Vec<Violation> = Vec::new();
     if !is_an_addressable_form(identifier) {
-        // The expression the clause STATES is the service's own, whichever addressable form
-        // admitted the values it does admit: a requirement reaches a message as the layer
-        // that refuses states it, and what CloudFormation states for an identifier it will
-        // not take is the name-or-ARN expression.
         violations.push(clause(ViolationKind::Pattern(
             STACK_IDENTIFIER_PATTERN.to_string(),
         )));
@@ -165,9 +144,10 @@ pub fn refuse_malformed_identifier<E>(
 mod tests {
     use super::*;
 
-    /// RULE: the identifiers CloudFormation takes are a stack name, a stack ARN and the
-    /// unique id a stack id ends in; every other value is refused for its own shape, and a
-    /// value breaking BOTH constraints is reported with both clauses, the expression first.
+    /// RULE: the identifiers CloudFormation takes are a stack name and a stack ARN; every
+    /// other value — the bare unique id a stack id ends in included — is refused for its own
+    /// shape, and a value breaking BOTH constraints is reported with both clauses, the
+    /// expression first.
     #[test]
     fn an_identifier_is_admitted_by_the_services_own_expression() {
         for admitted in [
@@ -176,12 +156,6 @@ mod tests {
             "Stack9",
             "arn:aws:cloudformation:us-east-1:123456789012:stack/a/0",
             "arn:aws-cn:cloudformation:cn-north-1:123456789012:stack/a/0",
-            // The unique id a stack id ENDS in, whichever character it begins with and in
-            // either case of hexadecimal: a request carrying one is about a STACK, and is
-            // answered for the stack it names.
-            "ae81d159-090a-7b61-9856-04d0999cb465",
-            "0e81d159-090a-7b61-9856-04d0999cb465",
-            "0E81D159-090A-7B61-9856-04D0999CB465",
         ] {
             assert_eq!(
                 malformed_identifier(STACK_NAME_PATH, admitted),
@@ -197,17 +171,17 @@ mod tests {
             ("a name with a dot", "a.stack"),
             ("a name starting with a digit", "9stack"),
             ("a name starting with a hyphen", "-stack"),
-            // A value that is nearly a unique id is no identifier either: the groups and
-            // their lengths are what the form IS, and neither form is admitted.
+            // The bare unique id a stack id ENDS in is no identifier of a stack: only the
+            // whole stack id addresses one.
+            (
+                "the unique id a stack id ends in",
+                "0e81d159-090a-7b61-9856-04d0999cb465",
+            ),
+            (
+                "that unique id in upper case",
+                "0E81D159-090A-7B61-9856-04D0999CB465",
+            ),
             ("a unique id a group short", "0e81d159-090a-7b61-04d0999cb465"),
-            (
-                "a unique id with a short last group",
-                "0e81d159-090a-7b61-9856-04d0999cb46",
-            ),
-            (
-                "a unique id with a group too many",
-                "0e81d159-090a-7b61-9856-04d0999cb465-9856",
-            ),
             (
                 "a unique id with a non-hexadecimal digit",
                 "0g81d159-090a-7b61-9856-04d0999cb465",

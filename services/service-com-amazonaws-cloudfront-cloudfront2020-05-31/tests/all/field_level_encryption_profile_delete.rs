@@ -48,7 +48,6 @@ use crate::field_level_encryption_profile_lifecycle::{
 /// The sentences CloudFront sends for these refusals, spelled out here rather than taken from
 /// the crate, so a reworded refusal fails this suite.
 const NO_SUCH_PROFILE_MESSAGE: &str = "The specified field level encryption profile does not exist.";
-const ID_FORMAT_INVALID_MESSAGE: &str = "Id format is invalid";
 const PROFILE_IN_USE_MESSAGE: &str =
     "The field level encryption profile is currently associated with a field level encryption \
      config. Please disassociate the profile before deleting.";
@@ -638,17 +637,17 @@ async fn an_id_no_profile_holds_is_refused() {
         (
             "a known id in lower case",
             known.to_lowercase(),
-            ID_FORMAT_INVALID_MESSAGE,
+            NO_SUCH_PROFILE_MESSAGE,
         ),
         (
             "a token that is no profile id",
             "not-a-profile-id".to_string(),
-            ID_FORMAT_INVALID_MESSAGE,
+            NO_SUCH_PROFILE_MESSAGE,
         ),
         (
             "the caller reference rather than the id",
             "fle-profile-the-only-one".to_string(),
-            ID_FORMAT_INVALID_MESSAGE,
+            NO_SUCH_PROFILE_MESSAGE,
         ),
     ];
 

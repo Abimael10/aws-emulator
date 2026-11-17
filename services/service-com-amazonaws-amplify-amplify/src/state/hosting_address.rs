@@ -10,12 +10,10 @@
 //! told both composes `https://<displayName>.<defaultDomain>/` — the deployed page, the
 //! branch's basic-authorization challenge, or the redirect a rule states.
 //!
-//! The member is a DNS DOMAIN of the hosting zone Amplify publishes an app's sites under,
-//! and it names the app itself: the app's own id followed by that zone
-//! ([`amplify_zone_default_domain`]). It is derived from the app's minted id alone — never
-//! from the endpoint, the host or the port the creating request happened to reach — so the
-//! value is the same whichever address a client of this emulator is configured with, and a
-//! client that was told it composes a site's host by prefixing a branch's label to it.
+//! The member is the DOMAIN an app's sites are published under, and it is the
+//! address THIS emulator is reached at ([`announced_default_domain`]): a domain a response
+//! announces is an address a client is told to fetch, so it has to lead back to this process
+//! rather than to a zone nothing here answers for.
 //!
 //! The member is a DOMAIN, so the value is an address and nothing else: no scheme, no path.
 //! What that address cannot carry — which app, and which of its branches — is carried in the
@@ -29,35 +27,29 @@
 //!
 //! The same two members decide which requests the edge serves, so the address a branch
 //! answers on is composed HERE too, from the stored record, and compared against the
-//! address a request carried ([`HostedSiteAddress`]): the HOST a client composes from a
-//! default domain under Amplify's own hosting zone ([`hosted_branch_host`],
-//! [`names_the_hosting_zone`]), read in one normal form ([`hosted_site_host`]) because a
+//! address a request carried ([`HostedSiteAddress`]): the HOST a client composes by
+//! prefixing a branch's label to the announced domain ([`hosted_branch_host`]), read in one
+//! normal form ([`hosted_site_host`]) because a
 //! host is the same host however its port, its userinfo, its trailing root dot or its case
 //! are written — and the PATH that names the app and the branch for an app announced on this
 //! emulator's own endpoint ([`hosted_site_path`], read back by [`addressed_hosted_site`]).
 
-/// The default domain an app of this id carries under Amplify's OWN hosting zone: the value
-/// the shape `App$defaultDomain` documents, derived from the app's minted id alone (see the
-/// module docs).
+/// The default domain an app's hosting is ANNOUNCED under: the address THIS emulator is
+/// reached at, read off the base URL `ctx.endpoint()` reports ("the base URL a later request
+/// addresses… Callers send normally signed requests to it") through the shared data-plane
+/// reading ([`::service_common::data_plane_addressing::emulator_endpoint_authority`]).
 ///
-/// The one form the member takes, and it is inside `DefaultDomain`'s modelled
-/// `length 1..1000` (`smithy_query(query="shape",shape="DefaultDomain")`).
-pub fn amplify_zone_default_domain(app_id: &str) -> String {
-    format!("{app_id}.{AMPLIFY_HOSTING_ZONE}")
-}
-
-/// The zone Amplify serves an app's default domain under.
-const AMPLIFY_HOSTING_ZONE: &str = "amplifyapp.com";
-
-/// Whether `default_domain` is one Amplify's OWN hosting zone publishes, which is the form
-/// a client prefixes a branch's label to ([`hosted_branch_host`]).
+/// A domain a response announces is an address a client is told to FETCH, so it has to lead
+/// back to this emulator: a value under a zone this process does not answer for resolves
+/// somewhere else or nowhere at all. The value is the authority alone — `host[:port]`, no
+/// scheme and no path — because `App$defaultDomain` is a DOMAIN, and what such an address
+/// cannot carry (which app, and which of its branches) is carried in the PATH this plane
+/// serves a site under ([`hosted_site_path`]).
 ///
-/// Every app this service creates carries such a domain ([`amplify_zone_default_domain`]),
-/// so this is the reading that tells a stored domain from a host that is no zone a branch
-/// label could be a label of — an address this emulator is dialled at, which addresses a
-/// site by the PATH that names it ([`hosted_site_path`]) instead.
-pub fn names_the_hosting_zone(default_domain: &str) -> bool {
-    hosted_site_host(default_domain).ends_with(&format!(".{AMPLIFY_HOSTING_ZONE}"))
+/// Resolved ONCE, by the create, and persisted as the app's `defaultDomain`, so every later
+/// read of that app reports the same string whatever it is addressed at.
+pub fn announced_default_domain(ctx: &::smithy_server_runtime::OperationContext<'_>) -> String {
+    ::service_common::data_plane_addressing::emulator_endpoint_authority(ctx)
 }
 
 /// The segment that names THIS plane under the reserved data-plane marker, ahead of the
@@ -196,26 +188,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_apps_domain_is_its_own_id_under_the_hosting_zone() {
-        // The rows span the shapes a minted app id takes: the modelled `d`-and-suffix
-        // form at both ends of its length, and one whose suffix is all digits.
-        let cases: &[&str] = &["d1", "dexamplezone", "d2k7yq1ab3cd4ef5gh6i", "d1234567890"];
-        for app_id in cases {
-            let domain = amplify_zone_default_domain(app_id);
-            assert_eq!(
-                domain,
-                format!("{app_id}.amplifyapp.com"),
-                "case {app_id:?}: expected the app's id under the hosting zone, got {domain:?}"
-            );
-        }
-    }
-
-    #[test]
     fn a_branchs_host_and_an_addressed_host_read_the_same() {
         // The rows span the ways the same host is written: the app's domain dialled
-        // plainly, with a port, rooted, in mixed case and carrying userinfo.
+        // plainly, with a port, rooted, in mixed case and carrying userinfo — over both the
+        // endpoint address an app announces and a domain written as a DNS name.
         let cases: &[(&str, &str, &str, &str)] = &[
-            ("the app's own domain", "main", "d1example.amplifyapp.com", "main.d1example.amplifyapp.com"),
+            ("the app's own domain", "main", "127.0.0.1:44285", "main.127.0.0.1:44285"),
+            ("that domain dialled on another port", "main", "127.0.0.1:44285", "main.127.0.0.1:9297"),
+            ("a DNS domain", "main", "d1example.amplifyapp.com", "main.d1example.amplifyapp.com"),
             ("the same domain dialled with a port", "main", "d1example.amplifyapp.com", "main.d1example.amplifyapp.com:44285"),
             ("a display name in mixed case", "Main-Two", "d1example.amplifyapp.com", "MAIN-TWO.d1example.amplifyapp.com"),
             ("a rooted host", "main", "d1example.amplifyapp.com", "main.d1example.amplifyapp.com."),
@@ -251,36 +231,19 @@ mod tests {
                 "case {case:?}: {addressed:?} must not read as the branch's host {branch:?}"
             );
         }
-    }
 
-    #[test]
-    fn a_domain_under_the_hosting_zone_is_told_from_an_endpoint_address() {
-        // The rows span both announced forms: the zone form at several app-id shapes, and
-        // the endpoint addresses a client of this emulator is configured with.
-        let zone: &[&str] = &[
-            "d1example.amplifyapp.com",
-            "D1EXAMPLE.AMPLIFYAPP.COM",
-            "d1.amplifyapp.com.",
-            "d1234567890.amplifyapp.com:443",
-        ];
-        for domain in zone {
-            assert!(
-                names_the_hosting_zone(domain),
-                "case {domain:?}: expected a domain under the hosting zone"
-            );
-        }
-        let endpoints: &[&str] = &[
-            "127.0.0.1:44285",
-            "localhost:9297",
-            "[::1]:38199",
-            "127.0.0.1",
-            "amplifyapp.com",
-            "notamplifyapp.com",
-        ];
-        for domain in endpoints {
-            assert!(
-                !names_the_hosting_zone(domain),
-                "case {domain:?}: expected no domain of the hosting zone"
+        // And the same, for the endpoint address an app really announces: a request
+        // addressed to the endpoint ITSELF names no branch, so it is no site's address.
+        let branch = hosted_branch_host("main", "127.0.0.1:44285");
+        for (case, addressed) in [
+            ("the endpoint itself", "127.0.0.1:44285"),
+            ("another branch of it", "other.127.0.0.1:44285"),
+            ("a label sharing a prefix", "mainline.127.0.0.1:44285"),
+        ] {
+            assert_ne!(
+                branch,
+                hosted_site_host(addressed),
+                "case {case:?}: {addressed:?} must not read as the branch's host {branch:?}"
             );
         }
     }

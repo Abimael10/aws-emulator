@@ -13,9 +13,9 @@
 //! API.
 //!
 //! The rule, asserted over a TABLE of collections rather than one listing: a paginated
-//! collection of this service writes its page member — `item` on the wire — whenever it
-//! answers, as the EMPTY list when the collection holds no element, on every collection
-//! alike.
+//! collection of this service writes its page member — `item` on the wire — exactly when
+//! that page holds an element, so a collection emptied of its last element answers with the
+//! success envelope and NO page member, on every collection alike.
 //!
 //! Each row reaches the empty collection by DELETING the one element it created, not by
 //! never creating one, so what is asserted is the answer a collection makes once it is
@@ -197,7 +197,7 @@ async fn emptied(gateway: &Gateway, collection: &str) -> String {
 }
 
 #[tokio::test]
-async fn an_emptied_collection_reports_the_empty_page_and_nothing_beside_it() {
+async fn an_emptied_collection_reports_no_page_member_and_nothing_beside_it() {
     for collection in COLLECTIONS {
         let gateway = Gateway::new();
         let uri = emptied(&gateway, collection).await;
@@ -209,20 +209,20 @@ async fn an_emptied_collection_reports_the_empty_page_and_nothing_beside_it() {
             "case {case}: expected 200, got {} with {:?}",
             answer.status, answer.body
         );
-        // The page member, and nothing beside it: an emptied collection has no element
-        // after the page it reports, so it carries on at no cursor and echoes no page
-        // size.
+        // No page member, and nothing beside it: the page an emptied collection reports
+        // holds no element, so the member is absent, it carries on at no cursor and it
+        // echoes no page size.
         assert_eq!(
             answer.body,
-            json!({ "item": [] }),
-            "case {case}: expected the empty page and nothing beside it, got {:?}",
+            json!({}),
+            "case {case}: expected the success envelope alone, got {:?}",
             answer.body
         );
     }
 }
 
 #[tokio::test]
-async fn an_emptied_collection_asked_for_a_page_size_reports_the_same_empty_page() {
+async fn an_emptied_collection_asked_for_a_page_size_reports_the_same_answer() {
     // The page sizes a request may ask of a collection: the smallest, the documented
     // default and the published maximum — "The maximum number of returned results per
     // page. The default value is 25 and the maximum value is 500"
@@ -244,8 +244,8 @@ async fn an_emptied_collection_asked_for_a_page_size_reports_the_same_empty_page
             );
             assert_eq!(
                 answer.body,
-                json!({ "item": [] }),
-                "case {case}: expected the same empty page, got {:?}",
+                json!({}),
+                "case {case}: expected the same success envelope, got {:?}",
                 answer.body
             );
         }

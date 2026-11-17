@@ -28,6 +28,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use serde_json::{json, Value};
+use service_com_amazonaws_kinesis_kinesis_20131202::ops::get_shard_iterator::could_not_find_shard_message;
 use service_com_amazonaws_kinesis_kinesis_20131202::state::{
     shard_id, shard_not_found_message, ShardIteratorToken,
     ShardPosition,
@@ -511,8 +512,9 @@ async fn a_request_that_names_no_position_or_no_shard_is_refused() {
         .await;
     assert_eq!(
         missing_shard_message,
-        shard_not_found_message(&missing_shard, stream),
-        "a shard the held stream does not carry is refused with the service's sentence for it"
+        could_not_find_shard_message(&missing_shard, stream),
+        "a shard the held stream does not carry is refused with this operation's sentence for \
+         the search that came up empty"
     );
 }
 

@@ -847,10 +847,25 @@ pub const DEFAULT_BUCKET_KEY_ENABLED: bool = false;
 ///
 /// It is the type a `BlockedEncryptionTypes` can block today: "currently, this parameter
 /// only supports blocking or unblocking server-side encryption with customer-provided keys
-/// (SSE-C)" (`ServerSideEncryptionRule$BlockedEncryptionTypes`). Blocking it is an OPT-IN
-/// bucket-level setting, so no bucket carries it until a `PutBucketEncryption` names it —
-/// there is no default blocked set.
+/// (SSE-C)" (`ServerSideEncryptionRule$BlockedEncryptionTypes`).
 pub const SSE_C_ENCRYPTION_TYPE: &str = "SSE-C";
+
+/// The `EncryptionType` values a general purpose bucket's default encryption configuration
+/// blocks while no `PutBucketEncryption` has named a set of its own: the customer-key type
+/// ([`SSE_C_ENCRYPTION_TYPE`]).
+///
+/// RECORDED: a read of the default encryption configuration of a general purpose bucket
+/// reports that type blocked, whether the bucket was ever configured or was configured by a
+/// put that named no `BlockedEncryptionTypes` — the setting is "a bucket-level setting for
+/// Amazon S3 general purpose buckets" (`ServerSideEncryptionRule$BlockedEncryptionTypes`)
+/// rather than a per-put one, so a put that does not name it leaves it where it stood.
+///
+/// A function rather than a constant because the member is a LIST
+/// (`BlockedEncryptionTypes$EncryptionType` targets `EncryptionTypeList`), so each caller
+/// gets its own copy to report.
+pub fn default_blocked_encryption_types() -> Vec<String> {
+    vec![SSE_C_ENCRYPTION_TYPE.to_string()]
+}
 
 /// The `ServerSideEncryption` values a `KMSMasterKeyID` may accompany in a default
 /// encryption rule.

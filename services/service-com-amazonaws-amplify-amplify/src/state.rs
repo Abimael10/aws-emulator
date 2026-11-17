@@ -46,9 +46,9 @@ pub use custom_headers::{
     MAX_CUSTOM_HEADER_RULES_PER_APP,
 };
 pub use hosting_address::{
-    addressed_hosted_site, amplify_zone_default_domain, default_domain_prefix, hosted_branch_host,
-    hosted_site_host, hosted_site_path, hosting_plane_prefix, names_the_hosting_zone,
-    HostedSiteAddress, HOSTING_PLANE_LABEL,
+    addressed_hosted_site, announced_default_domain, default_domain_prefix, hosted_branch_host,
+    hosted_site_host, hosted_site_path, hosting_plane_prefix, HostedSiteAddress,
+    HOSTING_PLANE_LABEL,
 };
 
 /// One Amplify app as this service persists it: the modelled record it hands back,
@@ -1721,13 +1721,16 @@ impl ComAmazonawsAmplifyAmplifyState {
     ///
     /// A branch's site is addressed in the two ways [`HostedSiteAddress`] states:
     ///
-    /// * by HOST, `<displayName>.<app defaultDomain>`, for an app announced under Amplify's
-    ///   own hosting zone ([`names_the_hosting_zone`]): `Branch$displayName` "is used as the
+    /// * by HOST, `<displayName>.<app defaultDomain>`: `Branch$displayName` "is used as the
     ///   default domain prefix"
     ///   (`smithy_query(query="doc",shape="Branch",member="displayName")`) and
     ///   `App$defaultDomain` is "the default domain for the Amplify app"
-    ///   (`(shape="App",member="defaultDomain")`). The match is case-insensitive and ignores
-    ///   any port, because a host is;
+    ///   (`(shape="App",member="defaultDomain")`), so a request whose host is that
+    ///   composition addresses that branch's site. The match is case-insensitive and ignores
+    ///   any port, because a host is; and the composition always carries the branch's own
+    ///   label ahead of the domain, so a request addressed to the domain ITSELF — the
+    ///   emulator's own endpoint, which is what an app announces — is no site's address and
+    ///   reaches the control plane as it always did;
     /// * by PATH, where the app is named by its id and the branch by that same display name
     ///   ([`hosted_site_path`]) — compared case-insensitively too, because it is the same
     ///   label. This is how a client that resolves nothing but this emulator's own endpoint
@@ -1738,9 +1741,6 @@ impl ComAmazonawsAmplifyAmplifyState {
                 let host = hosted_site_host(host);
                 self.apps.iter().find_map(|(app_id, app)| {
                     let domain = &app.app.default_domain;
-                    if !names_the_hosting_zone(domain) {
-                        return None;
-                    }
                     app.branches.iter().find_map(|(name, branch)| {
                         (hosted_branch_host(&branch.branch.display_name, domain) == host)
                             .then(|| (app_id.clone(), name.clone()))

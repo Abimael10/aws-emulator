@@ -218,17 +218,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle(now);
 
         // The profile being updated is looked up first: every refusal below is about the
-        // record this id names, and nothing is written for an id the store does not hold. The
-        // identifier's SHAPE is judged before the store is consulted, so a value no profile id
-        // could ever have been is reported as the identifier CloudFront cannot read
-        // ([`crate::state::unresolved_field_level_encryption_profile_id`]).
+        // record this id names, and nothing is written for an id the store does not hold. An
+        // `Id` the store holds no profile under is the absent profile, whatever shape the
+        // value takes ([`crate::state::no_such_field_level_encryption_profile`]).
         let Some(current) = store
             .field_level_encryption_profile(&input.id)
             .map(|stored| (stored.etag.clone(), stored.config.caller_reference.clone()))
         else {
             return Err(
                 UpdateFieldLevelEncryptionProfileErrorModeled::NoSuchFieldLevelEncryptionProfile(
-                    crate::state::unresolved_field_level_encryption_profile_id(&input.id),
+                    crate::state::no_such_field_level_encryption_profile(),
                 )
                 .into(),
             );
@@ -350,7 +349,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(
                 UpdateFieldLevelEncryptionProfileErrorModeled::NoSuchFieldLevelEncryptionProfile(
-                    crate::state::unresolved_field_level_encryption_profile_id(&input.id),
+                    crate::state::no_such_field_level_encryption_profile(),
                 )
                 .into(),
             );

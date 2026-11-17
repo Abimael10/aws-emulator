@@ -142,15 +142,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         let store = state.lock();
 
-        // "Get the ID for the field-level encryption profile configuration information": the
-        // identifier's SHAPE is judged before the store is consulted, so a value no profile id
-        // could ever have been is reported as the identifier CloudFront cannot read, while a
-        // well-formed id no stored profile carries is the absent profile
-        // ([`crate::state::unresolved_field_level_encryption_profile_id`]).
+        // "Get the ID for the field-level encryption profile configuration information": an
+        // `Id` the store holds no profile under is the absent profile, whatever shape the
+        // value takes — this operation models no argument error to report an identifier under
+        // ([`crate::state::no_such_field_level_encryption_profile`]).
         let Some(stored) = store.field_level_encryption_profile(&input.id) else {
             return Err(
                 GetFieldLevelEncryptionProfileConfigErrorModeled::NoSuchFieldLevelEncryptionProfile(
-                    crate::state::unresolved_field_level_encryption_profile_id(&input.id),
+                    crate::state::no_such_field_level_encryption_profile(),
                 )
                 .into(),
             );

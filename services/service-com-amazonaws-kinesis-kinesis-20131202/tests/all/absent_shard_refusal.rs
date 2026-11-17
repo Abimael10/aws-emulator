@@ -4,14 +4,16 @@
 //! EVERY operation addressed by one, end to end over the wire.
 //!
 //! THE RULE: a request naming a shard that is no shard of the stream it addresses is refused
-//! with the modelled `ResourceNotFoundException` (HTTP 400) and ONE sentence: `Shard
-//! <shardId> in stream <streamName> under account <accountId> does not exist`. The fixed text
-//! is `Shard ` / ` in stream ` / ` under account ` / ` does not exist`, and its variable parts
-//! come from the request and from the emulator's own state — the shard id the request named,
-//! the name of the stream the request resolved, and the account the caller speaks for. The
-//! request asked for a SHARD, so that is what the refusal is worded at, whether the shard is
-//! missing because the stream holds no such entry or because this account and region hold no
-//! such stream at all.
+//! with the modelled `ResourceNotFoundException` (HTTP 400) and the sentence this service
+//! words that condition with for the operation addressed: `Shard <shardId> in stream
+//! <streamName> under account <accountId> does not exist` for the reshards and the
+//! subscription, and `Could not find shard <shardId> in stream <streamName> under account
+//! <accountId>.` where `GetShardIterator` searched the resolved stream's shard map. Either
+//! sentence is fixed text whose variable parts come from the request and from the emulator's
+//! own state — the shard id the request named, the name of the stream the request resolved,
+//! and the account the caller speaks for. The request asked for a SHARD, so that is what the
+//! refusal is worded at, whether the shard is missing because the stream holds no such entry
+//! or because this account and region hold no such stream at all.
 //!
 //! The rows span what the rule generalises over: which OPERATION is addressed by the shard
 //! id (`GetShardIterator`, `SubscribeToShard`, `SplitShard`, `MergeShards`), which SHARD id
@@ -26,6 +28,7 @@
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
+use service_com_amazonaws_kinesis_kinesis_20131202::ops::get_shard_iterator::could_not_find_shard_message;
 use service_com_amazonaws_kinesis_kinesis_20131202::state::{
     shard_not_found_message, SHARD_ITERATOR_TYPE_TRIM_HORIZON, STREAM_ACTIVE,
 };
@@ -134,9 +137,9 @@ fn request(operation: &str, stream: &str, consumer_arn: &str, shard: &str) -> Va
     }
 }
 
-/// Assert `operation` refused `shard` of `stream` with the modelled not-found and the one
-/// sentence the rule requires.
-fn assert_refused(case: &str, answer: &(u16, Value), stream: &str, shard: &str) {
+/// Assert `operation` refused `shard` of `stream` with the modelled not-found and the
+/// sentence `expected`.
+fn assert_refused_with(case: &str, answer: &(u16, Value), expected: &str) {
     let (status, body) = answer;
     assert_eq!(
         *status, 400,
@@ -147,19 +150,40 @@ fn assert_refused(case: &str, answer: &(u16, Value), stream: &str, shard: &str) 
         "ResourceNotFoundException",
         "case {case}: expected the modelled not-found, got {body}"
     );
-    let expected = format!(
-        "Shard {shard} in stream {stream} under account {} does not exist",
-        engine::EMULATOR_ACCOUNT_ID
-    );
     assert_eq!(
         error_message(body),
         expected,
         "case {case}: expected the message {expected:?}, got {:?}",
         error_message(body)
     );
+}
+
+/// Assert `operation` refused `shard` of `stream` with the modelled not-found and the one
+/// sentence the rule requires for the class.
+fn assert_refused(case: &str, answer: &(u16, Value), stream: &str, shard: &str) {
+    let expected = format!(
+        "Shard {shard} in stream {stream} under account {} does not exist",
+        engine::EMULATOR_ACCOUNT_ID
+    );
+    assert_refused_with(case, answer, &expected);
     assert_eq!(
-        error_message(body),
+        error_message(&answer.1),
         shard_not_found_message(shard, stream),
+        "case {case}: the crate's own sentence is the one the wire carries"
+    );
+}
+
+/// Assert `GetShardIterator` refused `shard` of the stream it RESOLVED with its own
+/// sentence: the search of that stream's shard map that came up empty.
+fn assert_shard_search_failed(case: &str, answer: &(u16, Value), stream: &str, shard: &str) {
+    let expected = format!(
+        "Could not find shard {shard} in stream {stream} under account {}.",
+        engine::EMULATOR_ACCOUNT_ID
+    );
+    assert_refused_with(case, answer, &expected);
+    assert_eq!(
+        error_message(&answer.1),
+        could_not_find_shard_message(shard, stream),
         "case {case}: the crate's own sentence is the one the wire carries"
     );
 }
@@ -191,12 +215,7 @@ async fn every_operation_addressed_by_a_shard_id_states_one_sentence() {
         ("the first shard id of a wider map", shard_id(7)),
     ];
     for (case, shard) in &shards {
-        for operation in [
-            "GetShardIterator",
-            "SubscribeToShard",
-            "SplitShard",
-            "MergeShards",
-        ] {
+        for operation in ["SubscribeToShard", "SplitShard", "MergeShards"] {
             let answer = emulator
                 .call(operation, &request(operation, stream, &consumer_arn, shard))
                 .await;
@@ -207,6 +226,22 @@ async fn every_operation_addressed_by_a_shard_id_states_one_sentence() {
                 shard,
             );
         }
+
+        // `GetShardIterator` words the SAME condition as the search of the resolved
+        // stream's shard map that came up empty, which is the sentence the recorded
+        // contract carries for it.
+        let answer = emulator
+            .call(
+                "GetShardIterator",
+                &request("GetShardIterator", stream, &consumer_arn, shard),
+            )
+            .await;
+        assert_shard_search_failed(
+            &format!("{case} through GetShardIterator"),
+            &answer,
+            stream,
+            shard,
+        );
     }
 
     // And the shard the stream DOES hold is still served through the same operation, so the

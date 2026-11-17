@@ -35,7 +35,10 @@
 //!   mints nothing and changes nothing a later caller sees;
 //! * "The number of origin access controls in your Amazon Web Services account exceeds the
 //!   maximum allowed" — a create that would take the account past its origin access
-//!   control quota is refused with `TooManyOriginAccessControls` and mints nothing.
+//!   control quota is refused with `TooManyOriginAccessControls` and mints nothing;
+//! * a read of an `Id` this account holds no control under answers `NoSuchOriginAccessControl`
+//!   and ONE sentence — the control that is absent — whatever shape the value takes, since the
+//!   read models no argument error to report an identifier under.
 //!
 //! The table rows differ along everything these rules generalise over: every value of
 //! every enum the configuration carries (`SigningProtocol`, `SigningBehavior` and
@@ -65,6 +68,10 @@ use crate::distribution_lifecycle::{
 // The XML escaper and the entity-id shape check are the crate's: one escaper and one id
 // predicate for every suite, so no two of them can disagree about either.
 use crate::response_headers_policy_lifecycle::escape;
+
+/// The sentence this surface answers an id it holds no control under, spelled out here rather
+/// than read from the crate, so a reworded refusal fails this suite.
+const NO_SUCH_CONTROL_MESSAGE: &str = "The specified origin access control does not exist.";
 
 // ---------------------------------------------------------------------------
 // Calling the origin access control surface
@@ -480,9 +487,22 @@ async fn create_persists_the_configuration_every_read_then_reports() {
         );
     }
 
-    // An id no control holds exists in no namespace: neither a well-shaped one nor an
-    // arbitrary string.
-    for id in ["E1AAAAAAAAAAAA", "not-an-id", "0"] {
+    // An id no control holds exists in no namespace, and ONE sentence says so whatever shape
+    // the value takes: this read models no argument error to report an identifier under, so a
+    // well-shaped id nothing holds, another entity kind's own minted id, a lower-cased id, a
+    // bare word and a single digit all report the control that is absent.
+    let distribution_id = created
+        .first()
+        .map(|(_, id)| id.clone())
+        .unwrap_or_else(|| panic!("the table must create at least one control"));
+    for id in [
+        "E1AAAAAAAAAAAA",
+        "not-an-id",
+        "0",
+        &distribution_id.to_lowercase(),
+        "W1AAAAAAAAAAAA",
+        "00000000-0000-0000-0000-000000000000",
+    ] {
         let missing = get_control(&router, id).await;
         assert_eq!(
             missing.status, 404,
@@ -493,6 +513,12 @@ async fn create_persists_the_configuration_every_read_then_reports() {
             missing.error_code(),
             "NoSuchOriginAccessControl",
             "case {id}: expected NoSuchOriginAccessControl, got {}",
+            missing.raw
+        );
+        assert_eq!(
+            missing.root().find_text("Message"),
+            Some(NO_SUCH_CONTROL_MESSAGE),
+            "case {id}: expected the absent-control sentence, got {}",
             missing.raw
         );
     }

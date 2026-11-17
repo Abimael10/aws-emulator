@@ -223,17 +223,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle(now);
 
         // The configuration being updated is looked up first: every refusal below is about the
-        // record this id names, and nothing is written for an id the store does not hold. The
-        // identifier's SHAPE is judged before the store is consulted, so a value no
-        // configuration id could ever have been is reported as the identifier CloudFront
-        // cannot read ([`crate::state::unresolved_field_level_encryption_config_id`]).
+        // record this id names, and nothing is written for an id the store does not hold. An
+        // `Id` the store holds no configuration under is the absent configuration, whatever
+        // shape the value takes ([`crate::state::no_such_field_level_encryption_config`]).
         let Some(current) = store
             .field_level_encryption_config(&input.id)
             .map(|stored| (stored.etag.clone(), stored.config.caller_reference.clone()))
         else {
             return Err(
                 UpdateFieldLevelEncryptionConfigErrorModeled::NoSuchFieldLevelEncryptionConfig(
-                    crate::state::unresolved_field_level_encryption_config_id(&input.id),
+                    crate::state::no_such_field_level_encryption_config(),
                 )
                 .into(),
             );
@@ -387,7 +386,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(stored) = store.apply_field_level_encryption_config(&input.id, config, now) else {
             return Err(
                 UpdateFieldLevelEncryptionConfigErrorModeled::NoSuchFieldLevelEncryptionConfig(
-                    crate::state::unresolved_field_level_encryption_config_id(&input.id),
+                    crate::state::no_such_field_level_encryption_config(),
                 )
                 .into(),
             );

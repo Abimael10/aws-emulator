@@ -3258,8 +3258,8 @@ pub fn no_such_public_key() -> crate::ops::types::NoSuchPublicKey {
 /// The modelled `NoSuchPublicKey` (HTTP 404) an operation ADDRESSED by a public key `Id` in
 /// its path answers an `Id` it cannot resolve.
 ///
-/// The SAME split [`unresolved_field_level_encryption_profile_id`] makes for another
-/// resource of this service, over this kind's own predicate ([`is_public_key_id`]):
+/// The SAME split [`unresolved_key_group_id`] makes for another resource of this service,
+/// over this kind's own predicate ([`is_public_key_id`]):
 /// `GetPublicKey` and its siblings model this one not-found code, so one code and one status
 /// cover two conditions and the MESSAGE is what tells them apart, decided from the value
 /// alone and therefore before the store is consulted. Only a value written the way
@@ -3332,6 +3332,19 @@ pub const MAX_FIELD_LEVEL_ENCRYPTION_PROFILE_COMMENT: usize = MAX_ORIGIN_ACCESS_
 /// The modelled `NoSuchFieldLevelEncryptionProfile` (HTTP 404) for a profile id the store
 /// does not hold.
 ///
+/// ONE sentence for the whole condition, whatever shape the id takes:
+/// `GetFieldLevelEncryptionProfile` and its siblings model this one not-found code and no
+/// argument error
+/// (`smithy_query(query="operation",operation="GetFieldLevelEncryptionProfile")` reports
+/// `errors: [AccessDenied, NoSuchFieldLevelEncryptionProfile]`), and the recorded answers of
+/// this surface report every id the account holds no profile under as the profile that is
+/// absent — a profile id of another width, another namespace, a UUID, a name, a caller
+/// reference or a word included. So an operation ADDRESSED by a profile `Id` answers one it
+/// cannot resolve with this, exactly as a profile id borne by a submitted document does. The
+/// same rule the public key reads keep ([`no_such_public_key`]) and the one
+/// [`no_such_field_level_encryption_config`] keeps for the other field-level encryption
+/// resource.
+///
 /// The sentence states a property of the store rather than of the request — the id names no
 /// profile — so nothing from the request belongs in the text and every path that raises this
 /// code reads the same.
@@ -3351,47 +3364,6 @@ pub fn no_such_field_level_encryption_profile() -> crate::ops::types::NoSuchFiel
 /// is what a client reads. Do not "correct" this constant to the documentation sentence.
 pub const NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE: &str =
     "The specified field level encryption profile does not exist.";
-
-/// The modelled `NoSuchFieldLevelEncryptionProfile` (HTTP 404) an operation ADDRESSED by a
-/// profile `Id` in its path answers an `Id` it cannot resolve.
-///
-/// `GetFieldLevelEncryptionProfile` models this one not-found code, so one code and one
-/// status cover two conditions and the MESSAGE is what tells them apart, decided from the
-/// value alone and therefore before the store is consulted: only a value written the way
-/// CloudFront writes a profile identifier — the profile namespace letter followed by an
-/// identifier body of the width it issues one at
-/// ([`is_field_level_encryption_profile_id`]) — is an identifier the service READS, so the
-/// store holding no profile under it is the absent-profile sentence
-/// ([`NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE`]), and every other value — another
-/// resource kind's identifier, an identifier of this namespace at a width CloudFront issues
-/// none at, a lower-cased one, a UUID, a name, a caller reference, a word — is the
-/// identifier the service reports it cannot read ([`id_format_invalid_message`]). The SAME
-/// split [`unresolved_field_level_encryption_config_id`] makes for the other field-level
-/// encryption resource, over that kind's own predicate. Both sentences are fixed text and
-/// neither echoes the value submitted.
-///
-/// Recorded CloudFront answers are what decide the split, since the model gives the error
-/// shape and no message text: the identifier-format sentence for an `Id` outside the form
-/// this kind's identifiers take, and the absent-profile sentence for one OF that form the
-/// account does not hold (a profile read back after its delete). A public key is read by a
-/// rule of its own ([`no_such_public_key`]): its recorded answers report every id the
-/// account holds no key under as the key that is absent, whatever form the value takes.
-///
-/// Only an identifier that ADDRESSES the operation is judged this way: a profile id borne by a
-/// submitted DOCUMENT (a mapping's `ProfileId` on a configuration create or update) addresses
-/// nothing, so it is resolved against the store alone and reports the absent profile whatever
-/// its shape.
-pub fn unresolved_field_level_encryption_profile_id(
-    id: &str,
-) -> crate::ops::types::NoSuchFieldLevelEncryptionProfile {
-    if !is_field_level_encryption_profile_id(id) {
-        crate::ops::types::NoSuchFieldLevelEncryptionProfile {
-            message: Some(id_format_invalid_message("Id")),
-        }
-    } else {
-        no_such_field_level_encryption_profile()
-    }
-}
 
 /// The modelled `FieldLevelEncryptionProfileInUse` (HTTP 409) for a delete of a profile a
 /// stored field-level encryption configuration still names.
@@ -3478,6 +3450,15 @@ pub const MAX_FIELD_LEVEL_ENCRYPTION_CONFIG_COMMENT: usize = MAX_ORIGIN_ACCESS_I
 /// The modelled `NoSuchFieldLevelEncryptionConfig` (HTTP 404) for a configuration id the
 /// store does not hold.
 ///
+/// ONE sentence for the whole condition, whatever shape the id takes — the SAME rule
+/// [`no_such_field_level_encryption_profile`] keeps for the other field-level encryption
+/// resource: these operations model this one not-found code and no argument error
+/// (`smithy_query(query="operation",operation="GetFieldLevelEncryptionConfig")` reports
+/// `errors: [AccessDenied, NoSuchFieldLevelEncryptionConfig]`), and the recorded answers of
+/// this surface report every id the account holds no configuration under as the configuration
+/// that is absent. So an operation ADDRESSED by a configuration `Id` answers one it cannot
+/// resolve with this.
+///
 /// The sentence states a property of the store rather than of the request — the id names no
 /// configuration — so nothing from the request belongs in the text and every refusal of this
 /// condition reads the same.
@@ -3495,32 +3476,6 @@ pub fn no_such_field_level_encryption_config() -> crate::ops::types::NoSuchField
 /// wire wording is what a client reads.
 pub const NO_SUCH_FIELD_LEVEL_ENCRYPTION_CONFIG_MESSAGE: &str =
     "The specified field level encryption config does not exist.";
-
-/// The modelled `NoSuchFieldLevelEncryptionConfig` (HTTP 404) an operation ADDRESSED by a
-/// configuration `Id` in its path answers an `Id` it cannot resolve.
-///
-/// The SAME split [`unresolved_field_level_encryption_profile_id`] makes for the other
-/// field-level encryption resource, over this kind's own predicate
-/// ([`is_field_level_encryption_config_id`]): only an `Id` written the way CloudFront writes
-/// a configuration identifier — the configuration namespace letter followed by an identifier
-/// body of the width it issues one at — is an identifier the service READS, so the store
-/// holding no configuration under it is the absent-configuration sentence
-/// ([`NO_SUCH_FIELD_LEVEL_ENCRYPTION_CONFIG_MESSAGE`]), and every other value — another
-/// resource kind's identifier, this namespace at a width CloudFront issues none at, a
-/// lower-cased identifier, a UUID, a name, a caller reference, a word — is what the service
-/// reports it cannot read ([`id_format_invalid_message`]). Both are fixed text and neither
-/// echoes the value submitted.
-pub fn unresolved_field_level_encryption_config_id(
-    id: &str,
-) -> crate::ops::types::NoSuchFieldLevelEncryptionConfig {
-    if !is_field_level_encryption_config_id(id) {
-        crate::ops::types::NoSuchFieldLevelEncryptionConfig {
-            message: Some(id_format_invalid_message("Id")),
-        }
-    } else {
-        no_such_field_level_encryption_config()
-    }
-}
 
 /// The modelled `FieldLevelEncryptionConfigInUse` (HTTP 409) for a delete of a configuration
 /// a cache behaviour still names.

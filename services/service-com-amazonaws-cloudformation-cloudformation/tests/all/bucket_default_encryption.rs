@@ -29,12 +29,13 @@
 //! SPELLING (JSON and YAML), and whether the declared key is a CONDITIONAL that resolves to
 //! `AWS::NoValue` or to the key a parameter names.
 //!
-//! What a bucket reports is exactly what its declaration stated: a reported rule carries no
-//! member no `BucketEncryption` established, which the conditional rows assert for
-//! `BlockedEncryptionTypes` — "a bucket-level setting … used to prevent the upload of new
-//! objects encrypted with the specified server-side encryption type"
+//! What a bucket reports is what its declaration stated, plus the settings the BUCKET carries
+//! anyway: the conditional rows assert that for `BlockedEncryptionTypes` — "a bucket-level
+//! setting … used to prevent the upload of new objects encrypted with the specified
+//! server-side encryption type"
 //! (`smithy_query(query="doc",shape="ServerSideEncryptionRule",member="BlockedEncryptionTypes"`,
-//! in the s3 model), an opt-in setting no template here declares.
+//! in the s3 model), which is a setting of the bucket rather than of the declaration, so it is
+//! reported whether a template states it or not.
 //!
 //! Every expected value is computed from what the row declares, never read back out of the
 //! answer under test.
@@ -340,8 +341,10 @@ const CONDITIONAL_TEMPLATE: &str = r#"{
 const PARAMETERISED_KEY_ARN: &str =
     "arn:aws:kms:us-west-2:111122223333:key/1234abcd-12ab-34cd-56ef-1234567890ab";
 
-/// The element a reported rule would carry a blocked encryption type in.
+/// The element a reported rule carries the bucket's blocked encryption types in, and the one
+/// type a general purpose bucket carries blocked whatever a declaration states.
 const BLOCKED_ELEMENT: &str = "BlockedEncryptionTypes";
+const BLOCKED_TYPE: &str = "SSE-C";
 
 #[tokio::test]
 async fn a_declared_default_is_reported_with_only_the_members_it_declared() {
@@ -413,12 +416,16 @@ async fn a_declared_default_is_reported_with_only_the_members_it_declared() {
             "case {case:?}: {name:?} must report {expected:?}, got {reported:?} ({body})"
         );
 
-        // And nothing the declaration did not state: blocking an encryption type is an
-        // opt-in bucket-level setting, which no `BucketEncryption` here establishes, so the
-        // bucket reports no such container for a client to round-trip back.
+        // And nothing the declaration did not state, beyond the setting the BUCKET carries
+        // anyway: blocking an encryption type is a bucket-level setting rather than a
+        // per-declaration one, so the bucket reports the type it blocks whatever the
+        // `BucketEncryption` stated.
         assert!(
-            !body.contains(&format!("<{BLOCKED_ELEMENT}")),
-            "case {case:?}: {name:?} must report no <{BLOCKED_ELEMENT}>, got {body}"
+            body.contains(&format!(
+                "<{BLOCKED_ELEMENT}><EncryptionType>{BLOCKED_TYPE}</EncryptionType>"
+            )),
+            "case {case:?}: {name:?} must report the bucket's blocked type in \
+             <{BLOCKED_ELEMENT}>, got {body}"
         );
     }
 }

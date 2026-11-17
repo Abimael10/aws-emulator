@@ -186,9 +186,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         Ok(Paged::new(
             GetBasePathMappingsOutput {
-                // Always reported, and empty for a domain name that carries no mapping:
-                // "the current page of elements from this collection" is an answer a
-                // client reads, on this collection as on every other one of this service
+                // Reported exactly when the page holds a mapping: a domain name that carries
+                // none is answered with the success envelope alone, on this collection as on
+                // every other one of this service
                 // (`crate::state::Page::reported_items`).
                 items: page.reported_items(items),
                 position: page.next_position.clone(),
