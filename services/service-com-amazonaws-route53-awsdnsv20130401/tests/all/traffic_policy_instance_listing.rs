@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end coverage of `ListTrafficPolicyInstances`.
+//! End-to-end coverage of `ListTrafficPolicyInstances` and of the SAME listing
+//! held to one hosted zone, `ListTrafficPolicyInstancesByHostedZone`.
 //!
 //! The rule under test: the operation REPORTS the traffic policy instances the
 //! account holds at the moment of the call, read from the service's state in the
@@ -25,6 +26,15 @@
 //! the listing, each component of the triple on its own, and markers the account
 //! holds no instance under).
 //!
+//! `ListTrafficPolicyInstancesByHostedZone` reports that same listing RESTRICTED
+//! to the hosted zone its `id` names, so its page starts at the
+//! `(TrafficPolicyInstanceNameMarker, TrafficPolicyInstanceTypeMarker)` pair —
+//! the zone is already fixed, so there is no zone marker — and a zone the
+//! account does not hold is refused rather than reported as empty. Its tables
+//! vary the ZONE listed (each zone of the population, a zone holding no
+//! instance at all, and a zone the account does not hold), the SPELLING of the
+//! zone id, the page size and the markers.
+//!
 //! Every test drives the service through the real router, using the SAME
 //! harness the other traffic-policy suites use, so what is asserted is the
 //! HTTP/restXml behaviour a Route 53 client sees.
@@ -33,7 +43,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_route53_awsdnsv20130401::ops::types::R_R_TYPE_VALUES;
 use service_com_amazonaws_route53_awsdnsv20130401::state::{
-    DEFAULT_PAGE_SIZE, TRAFFIC_POLICY_INSTANCE_APPLIED, TRAFFIC_POLICY_INSTANCE_CREATING,
+    DEFAULT_PAGE_SIZE, NON_POSITIVE_PAGE_SIZE_MESSAGE, TRAFFIC_POLICY_INSTANCE_APPLIED,
+    TRAFFIC_POLICY_INSTANCE_CREATING,
 };
 
 use crate::hosted_zone_records::{call, create_zone_ok, router, Reply};
@@ -786,5 +797,514 @@ async fn listing_the_instances_leaves_the_account_exactly_as_it_was() {
         instances_of(&listing(&router, case, "").await, case),
         expected,
         "case {case:?}: the listing must follow the state the account is in"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ListTrafficPolicyInstancesByHostedZone: the same listing, held to one zone
+// ---------------------------------------------------------------------------
+
+/// Send one `ListTrafficPolicyInstancesByHostedZone` request for the hosted zone
+/// `zone`, with `query` appended to its query string.
+async fn list_zone_instances(router: &MultiServiceRouter, zone: &str, query: &str) -> Reply {
+    call(
+        router,
+        "GET",
+        &format!("/2013-04-01/trafficpolicyinstances/hostedzone?id={zone}{query}"),
+        "",
+    )
+    .await
+}
+
+/// List one zone's traffic policy instances, asserting the call succeeded.
+async fn zone_listing(router: &MultiServiceRouter, case: &str, zone: &str, query: &str) -> Reply {
+    let reply = list_zone_instances(router, zone, query).await;
+    assert_eq!(
+        reply.status, 200,
+        "case {case:?}: expected 200 from ListTrafficPolicyInstancesByHostedZone, got {} with \
+         body {}",
+        reply.status, reply.body
+    );
+    reply
+}
+
+/// The markers of a per-zone page: `None` once the listing has ended, where
+/// there is no instance left to resume at. The zone is fixed by the request, so
+/// the pair of the name and the type is the whole of what a per-zone page names.
+fn next_zone_markers(reply: &Reply) -> Option<(String, String)> {
+    let name = reply.first("TrafficPolicyInstanceNameMarker")?;
+    let rr_type = reply.first("TrafficPolicyInstanceTypeMarker")?;
+    Some((name.to_string(), rr_type.to_string()))
+}
+
+/// The markers that resume a per-zone listing at `instance`, as a query string.
+fn zone_marker_query(instance: &InstanceView, max_items: Option<usize>) -> String {
+    let size = max_items.map_or_else(String::new, |size| format!("&maxitems={size}"));
+    format!(
+        "&trafficpolicyinstancename={}&trafficpolicyinstancetype={}{size}",
+        instance.name, instance.traffic_policy_type
+    )
+}
+
+/// The instances of `listed` whose record sets live in the hosted zone `zone`,
+/// in the order they are listed in.
+fn in_zone(listed: &[InstanceView], zone: &str) -> Vec<InstanceView> {
+    listed
+        .iter()
+        .filter(|instance| instance.hosted_zone_id == zone)
+        .cloned()
+        .collect()
+}
+
+/// The fixed form this service words a missing hosted zone in, with the bare id
+/// the request asked about filled in (`crate::state::no_such_hosted_zone`).
+fn missing_zone_message(bare_id: &str) -> String {
+    format!("No hosted zone found with ID: {bare_id}")
+}
+
+#[tokio::test]
+async fn the_per_zone_listing_reports_the_instances_of_the_zone_it_names() {
+    // The varying axis is the ZONE listed: each zone of the population, a zone
+    // of the same account holding no instance at all, and each of those in both
+    // spellings a zone id is accepted in.
+    let router = router();
+    let zones = create_zones(&router, "zone-instance-listing").await;
+    let all = populate(&router, &zones).await;
+    let empty = create_zone_ok(&router, "empty.example.org", "zone-instance-listing-empty").await;
+
+    let mut listed_zones: Vec<&String> = zones.iter().chain([&empty]).collect();
+    // The account-wide listing orders by hosted zone id first, so the per-zone
+    // listings concatenate to it when they are taken in that order.
+    listed_zones.sort();
+
+    let mut concatenated: Vec<InstanceView> = Vec::new();
+    for zone in &listed_zones {
+        for spelling in [zone.to_string(), format!("/hostedzone/{zone}")] {
+            let case = format!("the zone {zone} named as {spelling}");
+            let reply = zone_listing(&router, &case, &spelling, "").await;
+            let listed = instances_of(&reply, &case);
+            assert_eq!(
+                listed,
+                in_zone(&all, zone),
+                "case {case:?}: the listing must report every instance of that zone and no \
+                 other, by DNS name then record type; body {}",
+                reply.body
+            );
+            assert_ne!(
+                reply.first("IsTruncated"),
+                Some("true"),
+                "case {case:?}: a listing that fits one page must not be truncated; body {}",
+                reply.body
+            );
+            assert_eq!(
+                next_zone_markers(&reply),
+                None,
+                "case {case:?}: an untruncated listing names no instance to resume at; body {}",
+                reply.body
+            );
+            assert_eq!(
+                reply.first("MaxItems"),
+                Some(DEFAULT_PAGE_SIZE.to_string()).as_deref(),
+                "case {case:?}: a request naming no maxitems asks for the default page; body {}",
+                reply.body
+            );
+
+            // Every listed instance is cross-checked against what
+            // GetTrafficPolicyInstance reports for the same id, so the listing
+            // is proved against another reader of the same state.
+            for (at, instance) in listed.iter().enumerate() {
+                let read = get_instance(&router, &instance.id).await;
+                assert_eq!(
+                    read.status, 200,
+                    "case {case:?}: the listed instance {} must be readable, got {} with body {}",
+                    instance.id, read.status, read.body
+                );
+                assert_eq!(
+                    instances_of(&read, &case).first(),
+                    Some(instance),
+                    "case {case:?}: instance {at} must be listed as GetTrafficPolicyInstance \
+                     reports it; body {}",
+                    read.body
+                );
+                let state = read.first("TrafficPolicyInstance/State").unwrap_or("");
+                assert!(
+                    [
+                        TRAFFIC_POLICY_INSTANCE_CREATING,
+                        TRAFFIC_POLICY_INSTANCE_APPLIED
+                    ]
+                    .contains(&state),
+                    "case {case:?}: instance {at} reported the state {state:?}; body {}",
+                    read.body
+                );
+            }
+            if spelling == **zone {
+                concatenated.extend(listed);
+            }
+        }
+    }
+
+    assert_eq!(
+        concatenated, all,
+        "the per-zone listings taken in hosted-zone order must concatenate to the \
+         account-wide listing exactly once"
+    );
+}
+
+#[tokio::test]
+async fn per_zone_paging_covers_that_zone_exactly_once() {
+    // The rule as an invariant: a page holds at most MaxItems instances of the
+    // named zone and the two markers say where the next page starts, so the
+    // pages concatenate to that zone's whole listing for EVERY page size. The
+    // page size and the zone are the varying axes.
+    let router = router();
+    let zones = create_zones(&router, "zone-instance-paging").await;
+    let all = populate(&router, &zones).await;
+
+    for zone in &zones {
+        let expected = in_zone(&all, zone);
+        assert!(
+            expected.len() > 1,
+            "the suite needs several instances in zone {zone} to page through, got {}",
+            expected.len()
+        );
+        for page_size in 1..=expected.len() + 1 {
+            let mut walked: Vec<InstanceView> = Vec::new();
+            let mut resume: Option<InstanceView> = None;
+            let mut pages = 0;
+            loop {
+                let case = format!("zone {zone}, maxitems={page_size}, resuming at {resume:?}");
+                let query = match &resume {
+                    Some(at) => zone_marker_query(at, Some(page_size)),
+                    None => format!("&maxitems={page_size}"),
+                };
+                let page = zone_listing(&router, &case, zone, &query).await;
+                assert_eq!(
+                    page.first("MaxItems"),
+                    Some(page_size.to_string()).as_deref(),
+                    "case {case:?}: the response must echo the request's maxitems; body {}",
+                    page.body
+                );
+                let listed = instances_of(&page, &case);
+                assert!(
+                    listed.len() <= page_size,
+                    "case {case:?}: a page held {} instance(s); body {}",
+                    listed.len(),
+                    page.body
+                );
+                walked.extend(listed);
+                pages += 1;
+                assert!(
+                    pages <= expected.len() + 2,
+                    "case {case:?}: paging did not terminate"
+                );
+                if page.first("IsTruncated") != Some("true") {
+                    assert_eq!(
+                        next_zone_markers(&page),
+                        None,
+                        "case {case:?}: a final page names no instance to resume at; body {}",
+                        page.body
+                    );
+                    break;
+                }
+                let markers = next_zone_markers(&page).unwrap_or_else(|| {
+                    panic!(
+                        "case {case:?}: a truncated page must name the instance the next page \
+                         starts at; body {}",
+                        page.body
+                    )
+                });
+                let next = expected.get(walked.len()).unwrap_or_else(|| {
+                    panic!("case {case:?}: a truncated page must leave an instance to resume at")
+                });
+                assert_eq!(
+                    markers,
+                    (next.name.clone(), next.traffic_policy_type.clone()),
+                    "case {case:?}: the markers must name the first instance of the next page; \
+                     body {}",
+                    page.body
+                );
+                resume = Some(next.clone());
+            }
+            assert_eq!(
+                walked, expected,
+                "case zone {zone}, maxitems={page_size}: paging must cover that zone's listing \
+                 exactly once"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_per_zone_markers_resume_the_listing_at_the_instance_they_name() {
+    // The markers name "the first traffic policy instance in the next group" of
+    // the zone the request names, so a listing resumed at any position reports
+    // exactly that zone's tail from that position. Every position is a row; so
+    // is each half of the pair on its own, which positions the first instance of
+    // the zone carrying it.
+    let router = router();
+    let zones = create_zones(&router, "zone-instance-markers").await;
+    let all = populate(&router, &zones).await;
+
+    for zone in &zones {
+        let expected = in_zone(&all, zone);
+        for (at, instance) in expected.iter().enumerate() {
+            let case = format!("zone {zone}: the full marker pair of its instance {at}");
+            let page = zone_listing(&router, &case, zone, &zone_marker_query(instance, None)).await;
+            assert_eq!(
+                instances_of(&page, &case),
+                expected[at..].to_vec(),
+                "case {case:?}: the listing must resume at the instance the markers name; \
+                 body {}",
+                page.body
+            );
+        }
+
+        // One half of the pair on its own names the FIRST instance of the zone
+        // carrying it, which is where the listing then resumes.
+        for instance in &expected {
+            let halves = [
+                (
+                    "the DNS name alone",
+                    format!("&trafficpolicyinstancename={}", instance.name),
+                    expected
+                        .iter()
+                        .position(|held| held.name == instance.name)
+                        .expect("the name came from an instance of this zone"),
+                ),
+                (
+                    "the record type alone",
+                    format!(
+                        "&trafficpolicyinstancetype={}",
+                        instance.traffic_policy_type
+                    ),
+                    expected
+                        .iter()
+                        .position(|held| held.traffic_policy_type == instance.traffic_policy_type)
+                        .expect("the type came from an instance of this zone"),
+                ),
+            ];
+            for (half, query, expected_at) in halves {
+                let case = format!("zone {zone}: {half}, {query}");
+                let page = zone_listing(&router, &case, zone, &query).await;
+                assert_eq!(
+                    instances_of(&page, &case),
+                    expected[expected_at..].to_vec(),
+                    "case {case:?}: the listing must resume at the first instance of the zone \
+                     the marker names; body {}",
+                    page.body
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_per_zone_listing_refuses_what_it_cannot_position() {
+    // A zone the account does not hold is REFUSED rather than reported as an
+    // empty listing, markers that name no instance OF THAT ZONE position
+    // nothing, and a page size below one asks for no page at all. The rows are
+    // each spelling of an unheld zone id, markers belonging to the other zone or
+    // to no instance, and the page sizes below one.
+    let router = router();
+    let zones = create_zones(&router, "zone-instance-refusals").await;
+    let all = populate(&router, &zones).await;
+    let first = &zones[0];
+    // An instance of the OTHER zone, so one row's markers name an instance the
+    // account holds but not one of the zone it asks about.
+    let elsewhere = in_zone(&all, &zones[1])
+        .first()
+        .expect("the population holds an instance in the second zone")
+        .clone();
+    // An instance of the zone asked about, picked by WHAT IT IS rather than by
+    // its place in the listing: the A instance at `www.example.com.`, whose name
+    // a second instance of the same zone carries at another type.
+    let held = in_zone(&all, first)
+        .into_iter()
+        .find(|instance| instance.name == "www.example.com." && instance.traffic_policy_type == "A")
+        .expect("the population holds an A instance at www.example.com.");
+
+    let unknown_zone = "Z0000000000000";
+    let missing = [
+        ("a hosted zone id the account holds no zone under", unknown_zone.to_string()),
+        (
+            "the /hostedzone/ spelling of that same id",
+            format!("/hostedzone/{unknown_zone}"),
+        ),
+    ];
+    for (case, spelling) in &missing {
+        let reply = list_zone_instances(&router, spelling, "").await;
+        assert_eq!(
+            reply.status, 404,
+            "case {case:?}: expected HTTP 404, got {} with body {}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            reply.error_code(),
+            "NoSuchHostedZone",
+            "case {case:?}: expected the modelled NoSuchHostedZone, got {:?}; body {}",
+            reply.error_code(),
+            reply.body
+        );
+        assert_eq!(
+            reply.first("Error/Message"),
+            Some(missing_zone_message(unknown_zone)).as_deref(),
+            "case {case:?}: expected the refusal to name the bare zone id, got {:?}; body {}",
+            reply.first("Error/Message"),
+            reply.body
+        );
+    }
+
+    let unpositioned = [
+        (
+            "markers naming an instance of another zone",
+            zone_marker_query(&elsewhere, None),
+        ),
+        (
+            "a DNS name no instance of the zone answers for",
+            "&trafficpolicyinstancename=nobody.example.com.".to_string(),
+        ),
+        (
+            "a record type no instance of the zone carries",
+            "&trafficpolicyinstancetype=SRV".to_string(),
+        ),
+        (
+            "a name and a type that belong to different instances",
+            format!(
+                "&trafficpolicyinstancename={}&trafficpolicyinstancetype=MX",
+                held.name
+            ),
+        ),
+    ];
+    for (case, query) in &unpositioned {
+        let reply = list_zone_instances(&router, first, query).await;
+        assert_eq!(
+            reply.status, 404,
+            "case {case:?}: expected HTTP 404, got {} with body {}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            reply.error_code(),
+            "NoSuchTrafficPolicyInstance",
+            "case {case:?}: expected the modelled NoSuchTrafficPolicyInstance, got {:?}; body {}",
+            reply.error_code(),
+            reply.body
+        );
+    }
+
+    for page_size in [0, -1] {
+        let case = format!("maxitems={page_size}");
+        let reply = list_zone_instances(&router, first, &format!("&maxitems={page_size}")).await;
+        assert_eq!(
+            reply.status, 400,
+            "case {case:?}: expected HTTP 400, got {} with body {}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            reply.error_code(),
+            "InvalidInput",
+            "case {case:?}: expected the modelled InvalidInput, got {:?}; body {}",
+            reply.error_code(),
+            reply.body
+        );
+        assert_eq!(
+            reply.first("Error/Message"),
+            Some(NON_POSITIVE_PAGE_SIZE_MESSAGE),
+            "case {case:?}: expected the page-size refusal's own sentence, got {:?}; body {}",
+            reply.first("Error/Message"),
+            reply.body
+        );
+    }
+
+    // The refusals left both zones' listings exactly as they were.
+    for zone in &zones {
+        let case = format!("zone {zone} after the refusals");
+        assert_eq!(
+            instances_of(&zone_listing(&router, &case, zone, "").await, &case),
+            in_zone(&all, zone),
+            "case {case:?}: a refused listing must leave the zone's instances alone"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_per_zone_listing_echoes_its_page_size_and_changes_nothing() {
+    // `MaxItems` in the response is "the value that you specified for the
+    // MaxItems parameter", so it is echoed whatever the caller sent, while the
+    // page itself never exceeds the 100 items this listing publishes. The rule
+    // is also a report: repeating it answers the same listing, consumes nothing,
+    // and what it reports still moves with a later create.
+    let router = router();
+    let zones = create_zones(&router, "zone-instance-page-size").await;
+    let all = populate(&router, &zones).await;
+    let first = zones[0].clone();
+    let expected = in_zone(&all, &first);
+    let before = instance_count(&router).await;
+
+    for requested in [1, 2, PAGE_BOUND, PAGE_BOUND + 1] {
+        let case = format!("maxitems={requested}");
+        let page = zone_listing(&router, &case, &first, &format!("&maxitems={requested}")).await;
+        assert_eq!(
+            page.first("MaxItems"),
+            Some(requested.to_string()).as_deref(),
+            "case {case:?}: expected the requested maxitems echoed, got {:?}; body {}",
+            page.first("MaxItems"),
+            page.body
+        );
+        let listed = instances_of(&page, &case);
+        let wanted = (requested as usize)
+            .min(PAGE_BOUND as usize)
+            .min(expected.len());
+        assert_eq!(
+            listed.len(),
+            wanted,
+            "case {case:?}: expected {wanted} instance(s), got {}; body {}",
+            listed.len(),
+            page.body
+        );
+        assert_eq!(
+            page.first("IsTruncated") == Some("true"),
+            listed.len() < expected.len(),
+            "case {case:?}: IsTruncated must say whether more instances of the zone remain; \
+             body {}",
+            page.body
+        );
+    }
+
+    for attempt in 1..=3 {
+        let case = format!("per-zone listing {attempt}");
+        assert_eq!(
+            instances_of(&zone_listing(&router, &case, &first, "").await, &case),
+            expected,
+            "case {case:?}: a read must report what the first read did"
+        );
+        assert_eq!(
+            instance_count(&router).await,
+            before,
+            "case {case:?}: listing must not change how many instances the account holds"
+        );
+    }
+
+    let added = create_row(
+        &router,
+        &zones,
+        &InstanceRow {
+            case: "an instance created after the per-zone listing",
+            zone: 0,
+            name: "late.example.com",
+            expect_name: "late.example.com.",
+            rr_type: "A",
+            ttl: 45,
+        },
+        population().len(),
+    )
+    .await;
+    let mut after = expected.clone();
+    after.push(added);
+    let after = in_listing_order(&after);
+    let case = "after a later create in the zone";
+    assert_eq!(
+        instances_of(&zone_listing(&router, case, &first, "").await, case),
+        after,
+        "case {case:?}: the per-zone listing must follow the state the zone is in"
     );
 }

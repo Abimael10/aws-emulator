@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTrafficPolicyInstancesByHostedZone
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTrafficPolicyInstancesByHostedZone`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTrafficPolicyInstancesByHostedZone::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -117,6 +108,22 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    dns_sort_key, no_such_hosted_zone, no_such_traffic_policy_instance, normalize_zone_id,
+    served_page_size, DEFAULT_PAGE_SIZE,
+};
+
+/// The most traffic policy instances one response carries: "Route 53 returns a
+/// maximum of 100 items in each response. If you have a lot of traffic policy
+/// instances, you can use the MaxItems parameter to list them in groups of up
+/// to 100" — which is [`DEFAULT_PAGE_SIZE`], also the page a request naming no
+/// `maxitems` asks for.
+///
+/// It bounds the WORK and the size of the answer, not what the response echoes:
+/// a request naming a larger `maxitems` reads its own value back while the page
+/// stays within this bound.
+const MAX_PAGE_SIZE: i32 = DEFAULT_PAGE_SIZE;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -185,20 +192,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTrafficPolicyInstancesByHostedZone` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTrafficPolicyInstancesByHostedZoneErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTrafficPolicyInstancesByHostedZone"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable under the router, which always mounts this service on
+            // the shared `InMemoryEngine`.
+            ListTrafficPolicyInstancesByHostedZoneErrorModeled::InvalidInput(InvalidInput {
+                message: Some("the Route 53 emulator's state store is unavailable".to_string()),
+            })
+        })?;
+
+        // A `maxitems` below one asks for no page at all, so it is refused rather than
+        // served.
+        let page_size = served_page_size(input.max_items, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE)
+            .map_err(ListTrafficPolicyInstancesByHostedZoneErrorModeled::InvalidInput)?;
+        // Route 53 echoes "the value that you specified for the MaxItems
+        // parameter", and the default page size a request that specified none
+        // asked for; the clamped `page_size` above only bounds the work and the
+        // size of this page.
+        let reported_max_items = input.max_items.unwrap_or(DEFAULT_PAGE_SIZE);
+
+        // The markers name the instance the page RESUMES at, each one a member
+        // of that instance, and an empty marker names nothing. This listing is
+        // already held to ONE hosted zone, so the pair of the name and the type
+        // is what positions it: there is no zone marker to carry.
+        let name_marker = input
+            .traffic_policy_instance_name_marker
+            .as_deref()
+            .filter(|marker| !marker.is_empty())
+            .map(dns_sort_key);
+        let type_marker = input
+            .traffic_policy_instance_type_marker
+            .as_deref()
+            .filter(|marker| !marker.is_empty());
+
+        // The zone id is accepted in either spelling, as everywhere else one is
+        // taken from a request.
+        let zone_id = normalize_zone_id(&input.hosted_zone_id);
+        // A pure read: nothing below writes to the store.
+        let store = state.lock();
+        if !store.zones.contains_key(zone_id) {
+            return Err(
+                ListTrafficPolicyInstancesByHostedZoneErrorModeled::NoSuchHostedZone(
+                    no_such_hosted_zone(&input.hosted_zone_id),
+                )
+                .into(),
+            );
+        }
+
+        // The account-wide listing order restricted to this zone: the instances
+        // of one zone keep the relative order they are listed in there, by the
+        // DNS name their record sets answer for and then their record type,
+        // which is the pair this listing's markers carry.
+        let ordered: Vec<_> = store
+            .traffic_policy_instances_in_listing_order()
+            .into_iter()
+            .filter(|instance| instance.hosted_zone_id == zone_id)
+            .collect();
+
+        let positioned = name_marker.is_some() || type_marker.is_some();
+        let start = if positioned {
+            // Markers that name no instance of this zone position nothing, so
+            // the caller is told so rather than handed a page that starts
+            // somewhere else: the modelled `NoSuchTrafficPolicyInstance`.
+            ordered
+                .iter()
+                .position(|instance| {
+                    name_marker
+                        .as_ref()
+                        .is_none_or(|name| dns_sort_key(&instance.name) == *name)
+                        && type_marker
+                            .is_none_or(|rr_type| instance.traffic_policy_type == rr_type)
+                })
+                .ok_or_else(|| {
+                    ListTrafficPolicyInstancesByHostedZoneErrorModeled::NoSuchTrafficPolicyInstance(
+                        no_such_traffic_policy_instance(),
+                    )
+                })?
+        } else {
+            0
+        };
+
+        let mut traffic_policy_instances = Vec::new();
+        let mut next_instance = None;
+        // `skip` rather than a slice index: `start` came from the request, and a
+        // walk that skips can never index past the end of the listing.
+        for instance in ordered.iter().skip(start) {
+            if traffic_policy_instances.len() >= page_size as usize {
+                next_instance = Some(*instance);
+                break;
+            }
+            traffic_policy_instances.push(instance.to_traffic_policy_instance());
+        }
+
+        Ok(ListTrafficPolicyInstancesByHostedZoneOutput {
+            traffic_policy_instances,
+            // "If IsTruncated is true, TrafficPolicyInstanceNameMarker is the
+            // name of the first traffic policy instance in the next group of
+            // traffic policy instances", and likewise for the type. A listing
+            // that ends here names no instance to resume at, so it carries
+            // neither.
+            traffic_policy_instance_name_marker: next_instance
+                .map(|instance| instance.name.clone()),
+            traffic_policy_instance_type_marker: next_instance
+                .map(|instance| instance.traffic_policy_type.clone()),
+            is_truncated: next_instance.is_some(),
+            // The echoed `maxitems`, so a request past the page bound reads its
+            // own value back while the page itself stays clamped.
+            max_items: reported_max_items,
+        })
     }
 }
