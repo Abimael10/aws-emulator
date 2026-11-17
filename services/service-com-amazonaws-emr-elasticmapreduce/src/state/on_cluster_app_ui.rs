@@ -8,8 +8,8 @@
 //! cluster decide what the operation can answer, and both are read off the cluster record
 //! rather than off the request:
 //!
-//! * whether the cluster is up at all ([`serves_app_ui_in_state`]) — a cluster whose
-//!   primary node is still coming up, or already gone, serves no interface, and the
+//! * whether the cluster has a primary node at all ([`serves_app_ui_in_state`]) — a cluster
+//!   that is shutting down or gone has none, so there is no interface to address and the
 //!   request is refused rather than answered with a URL that opens nothing;
 //! * whether the interface the request names has an application to serve it
 //!   ([`ClusterRecord::serves_on_cluster_app_ui`]), read off the applications the launch
@@ -63,74 +63,81 @@ pub fn on_cluster_app_ui_server(ui_type: &str) -> Option<&'static str> {
 
 /// Whether a cluster in `state` serves its applications' web interfaces at all.
 ///
-/// An on-cluster interface is served from the cluster's primary node, so a cluster that
-/// has not finished coming up and one that is shutting down or gone serve none: the
-/// cluster is up exactly in the two states this service already reads as up for the other
-/// surface the primary node answers ([`super::accepts_sessions_in_state`]).
+/// An on-cluster interface belongs to the cluster's primary node, so an ACTIVE cluster
+/// has one ([`cluster_state::ACTIVE`]) — a cluster that is still coming up is answered the
+/// address of the interface it is coming up to serve — while a cluster that is shutting
+/// down or gone has none at all and nothing to address.
 pub fn serves_app_ui_in_state(state: &str) -> bool {
-    state == cluster_state::RUNNING || state == cluster_state::WAITING
+    cluster_state::ACTIVE.contains(&state)
 }
 
-/// How a presigned-URL request for a cluster that is not up is refused.
+/// What a presigned-URL request for a cluster that is no longer active is refused with.
 ///
-/// AWS publishes no wording for it, so the text is built the way this service words its
-/// other cluster-state refusals ([`super::cluster_not_running_for_session_message`]): the
-/// cluster the request named, the state it is actually in, and the states that do serve an
-/// interface.
-pub fn cluster_not_running_for_app_ui_message(cluster_id: &str, state: &str) -> String {
-    format!(
-        "Cluster '{cluster_id}' is in state {state}; an application user interface is only \
-         served by a cluster in the {} or {} state.",
-        cluster_state::RUNNING,
-        cluster_state::WAITING
-    )
-}
+/// Recorded behavior for the text: ONE fixed sentence, carrying no value of the request or
+/// of the cluster — neither the cluster the request named nor the state it is in is part of
+/// it, so every inactive cluster is refused with the same words. It travels under the error
+/// code a rejected input on this operation carries
+/// ([`crate::scaffolded::Scaffolded::validation`]), the one the other unusable targets of
+/// the application-UI surface are refused through.
+pub const APP_UI_INACTIVE_CLUSTER_MESSAGE: &str =
+    "A presigned URL can only be created for an active cluster.";
 
-/// The refusal that request is answered with: that sentence under the client error the
-/// operation models.
+/// How long a presigned application-UI URL this service hands out stays valid.
 ///
-/// No `ErrorCode`: Amazon EMR publishes no discriminator for this class, the same way the
-/// session surface's own state refusal carries none.
-pub fn cluster_not_running_for_app_ui(cluster_id: &str, state: &str) -> InvalidRequestException {
-    InvalidRequestException {
-        error_code: None,
-        message: Some(cluster_not_running_for_app_ui_message(cluster_id, state)),
-    }
-}
+/// A CHOSEN bound: Amazon EMR publishes no validity for an application-UI presigned URL,
+/// so this is long enough for a caller to open the interface it addresses and short enough
+/// that a URL which was cached or shared stops working, well inside the longest validity
+/// the emulator's signer accepts.
+pub const APP_UI_PRESIGNED_URL_VALIDITY: Duration = Duration::from_secs(60 * 60);
 
-/// The address of the application user interface `ui_path` of the resource `host_id`, in
-/// `region`, for the application `application_id` when the caller named one, carrying the
-/// session token `session_token` the answering call minted for it.
+/// The address of the application user interface `ui_path` of the resource `host_id`, for
+/// the application `application_id` when the caller named one, carrying the session token
+/// `session_token` the answering call minted for it.
 ///
-/// The ONE composition of an application-UI address in this service: everything but the
-/// token is derived from the resource the interface belongs to — its own id under the
-/// regional Amazon EMR application-UI domain, with the interface as the path — so two
-/// calls for one interface open the same one. The TOKEN is what makes the URL a presigned
-/// one, and the answering call mints it per call rather than storing it, so no two calls
-/// hand back the same credential.
+/// The ONE composition of an application-UI address in this service, and it is PRESIGNED:
+/// the URL is query-signed by this emulator's own signer for
+/// [`APP_UI_PRESIGNED_URL_VALIDITY`], so a caller that follows it reaches the emulator that
+/// answered, and the URL carries the instant it was signed and how long it stays valid —
+/// which is what makes it stop working rather than open an interface for ever.
+///
+/// Everything but the token is derived from the resource the interface belongs to — its own
+/// id, with the interface as the path — so two calls for one interface address the same
+/// one. The TOKEN is minted per call by the answering call rather than stored, so no two
+/// calls hand back the same credential.
+///
+/// `None` when the request cannot be signed, which the answering call reports as its
+/// modelled server error rather than an address that verifies nowhere.
 pub fn app_ui_presigned_url(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
     host_id: &str,
-    region: &str,
     ui_path: &str,
     application_id: Option<&str>,
     session_token: &str,
-) -> String {
-    let mut url = format!(
-        "https://{host_id}.emrappui-prod.{region}.amazonaws.com/{}/",
-        ui_path.to_lowercase()
-    );
+) -> Option<String> {
+    let mut path = format!("/{host_id}/{}/", ui_path.to_lowercase());
     // The application id selects WHICH application's interface the URL opens, so it is
     // part of the path.
     if let Some(application_id) = application_id {
-        url.push_str("history/");
-        url.push_str(application_id);
-        url.push('/');
+        path.push_str("history/");
+        path.push_str(application_id);
+        path.push('/');
     }
-    url.push('?');
-    url.push_str(PRESIGNED_URL_TOKEN_PARAMETER);
-    url.push('=');
-    url.push_str(session_token);
-    url
+    let request = ::smithy_server_runtime::SignedUrlRequest::new(
+        ::http::Method::GET,
+        ctx.identity().signing_name(),
+        &path,
+    )
+    .query(PRESIGNED_URL_TOKEN_PARAMETER, session_token);
+    match ctx.url_signer().sign(request, APP_UI_PRESIGNED_URL_VALIDITY) {
+        Ok(url) => Some(url.as_str().to_string()),
+        Err(error) => {
+            ::tracing::warn!(
+                error = ?error,
+                "an application user interface URL could not be presigned"
+            );
+            None
+        }
+    }
 }
 
 impl ClusterRecord {
@@ -159,15 +166,15 @@ impl ClusterRecord {
         on_cluster_app_ui_server(ui_type).is_some_and(|server| self.runs_application(server))
     }
 
-    /// The address of this cluster's `ui_type` interface, composed by the one builder
+    /// The address of this cluster's `ui_type` interface, presigned by the one builder
     /// above from the cluster's own id.
     pub fn on_cluster_app_ui_url(
         &self,
-        region: &str,
+        ctx: &::smithy_server_runtime::OperationContext<'_>,
         ui_type: &str,
         application_id: Option<&str>,
         session_token: &str,
-    ) -> String {
-        app_ui_presigned_url(&self.id, region, ui_type, application_id, session_token)
+    ) -> Option<String> {
+        app_ui_presigned_url(ctx, &self.id, ui_type, application_id, session_token)
     }
 }

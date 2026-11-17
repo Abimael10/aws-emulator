@@ -3,13 +3,15 @@
 //! @op GetOnClusterAppUIPresignedURL
 //! Answers the address of an application user interface served ON a cluster, and whether
 //! there is one to open. Both facts are read off the cluster the request names: a cluster
-//! whose primary node is not up serves no interface at all and the call is REFUSED, a
-//! cluster that does not run the application serving the interface the request asked for
-//! has none to open (`PresignedURLReady` false), and a cluster that does is answered a URL
-//! composed from its own id ([`crate::state::ClusterRecord::on_cluster_app_ui_url`])
-//! carrying a session token minted for this one call. A `ClusterId` the service resolves
-//! no cluster for is refused as a bad request. A dry run reports the readiness and mints
-//! nothing. It is the ONLY file to touch for this operation.
+//! that is no longer active has no primary node, so no interface to address at all and the
+//! call is REFUSED; a cluster that does not run the application serving the interface the
+//! request asked for has none to open (`PresignedURLReady` false); and a cluster that does
+//! is answered a URL composed from its own id
+//! ([`crate::state::ClusterRecord::on_cluster_app_ui_url`]) and presigned against this
+//! emulator for a bounded validity, carrying a session token minted for this one call. A
+//! `ClusterId` the service resolves no cluster for is refused as a bad request. A dry run
+//! reports the readiness and mints nothing. It is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -156,7 +158,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::state::DEFAULT_ON_CLUSTER_APP_UI_TYPE;
 
         let now = ::std::time::SystemTime::now();
-        let region = crate::state::request_region(ctx.parts());
 
         // A rejected input on this operation is answered with HTTP 400
         // `ValidationException`: the error code Amazon EMR gives it, which this
@@ -206,29 +207,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //
         // An id the store resolves no cluster for is a bad request, not an empty answer:
         // it is refused with the cluster-id sentence the one place that builds it renders,
-        // which is what tells an unresolvable id apart from a cluster that is merely not
-        // serving yet below.
+        // which is what tells an unresolvable id apart from a cluster that resolves but is
+        // no longer active below.
         let Some(cluster) = store.cluster_mut(&input.cluster_id, now) else {
             return Err(refuse(crate::state::unknown_cluster_message(
                 &input.cluster_id,
             )));
         };
 
-        // A cluster that is not up serves no web interface at all — the interfaces are
-        // served from its primary node — so the call is refused through the client error
-        // this operation MODELS, naming the state the cluster is in. A caller can retry
-        // once the cluster is up, which is what keeps this apart from the unresolvable id
-        // above.
+        // A cluster that is shutting down or gone has no primary node, so there is no
+        // application user interface to address at all: the call is refused as a bad
+        // REQUEST, the same way this operation refuses every other target it cannot serve
+        // an interface for. That is what keeps it apart from a cluster that is still coming
+        // up, which is answered the address of the interface it is coming up to serve; the
+        // sentence is the one Amazon EMR states for it, which names no value of the request
+        // and so tells this refusal apart from the cluster-id one above.
         if !crate::state::serves_app_ui_in_state(&cluster.status.state) {
-            return Err(
-                GetOnClusterAppUIPresignedURLErrorModeled::InvalidRequestException(
-                    crate::state::cluster_not_running_for_app_ui(
-                        &input.cluster_id,
-                        &cluster.status.state,
-                    ),
-                )
-                .into(),
-            );
+            return Err(refuse(
+                crate::state::APP_UI_INACTIVE_CLUSTER_MESSAGE.to_string(),
+            ));
         }
 
         // The interface the request names, or the one a request that names none asks for.
@@ -274,12 +271,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let url = cluster.on_cluster_app_ui_url(
-            &region,
+            ctx,
             ui_type,
             input.application_id.as_deref(),
             &session_token,
         );
         drop(store);
+
+        // A URL this emulator could not sign leads nowhere, so it is not answered as one.
+        let Some(url) = url else {
+            return Err(GetOnClusterAppUIPresignedURLErrorModeled::InternalServerError(
+                InternalServerError {},
+            )
+            .into());
+        };
 
         Ok(GetOnClusterAppUIPresignedURLOutput {
             presigned_url_ready: Some(true),

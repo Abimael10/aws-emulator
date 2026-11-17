@@ -3,7 +3,8 @@
 //! @op GetPersistentAppUIPresignedURL
 //!
 //! Answers the URL of the persistent application user interface `PersistentAppUIId`
-//! names, derived from the stored UI ([`crate::state::PersistentAppUIRecord::presigned_url`]).
+//! names, derived from the stored UI ([`crate::state::PersistentAppUIRecord::presigned_url`])
+//! and presigned against this emulator for a bounded validity.
 //!
 //! An id no UI carries, a `PersistentAppUIType` the UI does not publish and an
 //! `ExecutionRoleArn` that is not the ARN of an IAM role are each refused with HTTP 400
@@ -213,8 +214,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let url = record.presigned_url(&ui_type, input.application_id.as_deref(), &session_token);
+        let url = record.presigned_url(ctx, &ui_type, input.application_id.as_deref(), &session_token);
         drop(store);
+
+        // A URL this emulator could not sign leads nowhere, so it is not answered as one.
+        let Some(url) = url else {
+            return Err(GetPersistentAppUIPresignedURLErrorModeled::InternalServerError(
+                InternalServerError {},
+            )
+            .into());
+        };
 
         Ok(GetPersistentAppUIPresignedURLOutput {
             presigned_url_ready: Some(true),

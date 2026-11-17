@@ -8,12 +8,12 @@
 //! `dispatch`, using the harness `tests/all/job_flow_lifecycle.rs` owns.
 //!
 //! THE RULE: each call PRESIGNS the URL afresh. The interface it opens is the stored user
-//! interface's — the UI's own id under the regional application-UI domain, with the type
-//! and, where the caller named one, the application as the path — but the session token
-//! the URL carries is minted for that one call, so no two calls for one user interface
-//! ever answer identical bytes and a URL that was cached or shared carries a credential of
-//! its own. A token is never a function of the request either: two calls with the same
-//! input differ.
+//! interface's — the UI's own id, with the type and, where the caller named one, the
+//! application as the path — the URL is signed AGAINST THIS EMULATOR and carries a bounded
+//! expiration, and the session token in it is minted for that one call, so no two calls for
+//! one user interface ever answer identical bytes and a URL that was cached or shared
+//! carries a credential of its own. A token is never a function of the request either: two
+//! calls with the same input differ.
 //!
 //! The rows span what the rule generalises over: which interface the UI publishes (each
 //! `ProfilerType` the create accepts), whether the request names the type or leaves it to
@@ -25,6 +25,7 @@ use std::time::Duration;
 use serde_json::json;
 
 use crate::job_flow_lifecycle::{at, kept_alive_request, Emr};
+use crate::on_cluster_app_ui::{assert_presigned_against_this_emulator, presigned_token};
 use crate::persistent_app_ui::opened_interface;
 
 /// Longer than the service's clock-owed transition span (500 ms), so a UI that was
@@ -70,28 +71,10 @@ const CASES: [Case; 3] = [
     },
 ];
 
-/// The token a presigned URL carries: everything after its query string's `=`.
+/// The token a presigned URL carries, read the one way every suite reads it.
 fn token_of(case: &str, url: &str) -> String {
-    let query = url
-        .split_once('?')
-        .unwrap_or_else(|| panic!("case {case:?}: expected a presigned URL with a token, got {url}"))
-        .1;
-    let (parameter, token) = query.split_once('=').unwrap_or_else(|| {
-        panic!("case {case:?}: expected a token parameter, got {query:?} in {url}")
-    });
-    assert!(
-        !parameter.is_empty() && !token.is_empty(),
-        "case {case:?}: expected a named, non-empty token, got {query:?}"
-    );
-    // A token travels in a URL query as itself, so it is drawn from the unreserved
-    // characters of RFC 3986 §2.3 and from nothing else.
-    assert!(
-        token
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '~')),
-        "case {case:?}: expected a URL-safe token, got {token:?}"
-    );
-    token.to_string()
+    assert_presigned_against_this_emulator(case, url);
+    presigned_token(case, url)
 }
 
 #[tokio::test]

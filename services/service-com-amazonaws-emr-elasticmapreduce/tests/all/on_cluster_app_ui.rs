@@ -10,23 +10,28 @@
 //! has reached, read back through `DescribeCluster`.
 //!
 //! THE RULE: `GetOnClusterAppUIPresignedURL` answers from the cluster the request names.
-//! A `ClusterId` the service resolves no cluster for is a bad REQUEST — HTTP 400
-//! `ValidationException` carrying the cluster-id sentence — while a cluster it DOES
-//! resolve is never refused that way: one that is not up yet is refused through the
-//! client error the operation models, naming the state it is in, so a caller can tell an
-//! id that can never work from one that works once the cluster is up. For a cluster that
-//! is up, `PresignedURLReady` says whether there is an interface to open — the cluster
-//! runs the application that serves the interface asked for — and the URL is that
-//! cluster's own address, presigned afresh per call; a dry run reports the readiness and
-//! hands back no URL.
+//! A `ClusterId` the service resolves no cluster for and a cluster that is no longer ACTIVE
+//! are each a bad REQUEST — HTTP 400 `ValidationException` — told apart by the sentence
+//! each carries: the cluster-id one for an id that resolves nothing, and Amazon EMR's own
+//! fixed sentence for a cluster that has been shut down, which has no primary node and so
+//! no interface to address. For an ACTIVE cluster — from the launch onward, not only once it
+//! is up — `PresignedURLReady` says whether there is an interface to open: the cluster runs
+//! the application that serves the interface asked for. The URL is that cluster's own
+//! address, presigned afresh per call AGAINST THIS EMULATOR and carrying the instant it was
+//! signed and the validity it keeps; a dry run reports the readiness and hands back no URL.
 //!
 //! The rows span what the rule generalises over: every `OnClusterAppUIType` the model
 //! declares, clusters whose launches installed different applications, every form of
 //! unresolvable id, and the cluster states on the way up and down.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_emr_elasticmapreduce::state::{
+    APP_UI_INACTIVE_CLUSTER_MESSAGE, APP_UI_PRESIGNED_URL_VALIDITY, PRESIGNED_URL_TOKEN_PARAMETER,
+};
+use smithy_server_runtime::{MAX_SIGNED_URL_EXPIRY, UNSERVED_URL_BASE};
 
 use crate::job_flow_lifecycle::{
     assert_refused, at, await_cluster_state, kept_alive_request, Emr,
@@ -77,9 +82,105 @@ async fn running_cluster(emr: &Emr, name: &'static str, applications: &[&str]) -
     cluster_id
 }
 
-/// The interface a presigned URL opens: everything before the token it carries.
+/// The interface a presigned URL opens: everything before the query it carries.
 fn opened_interface(url: &str) -> &str {
     url.split('?').next().unwrap_or(url)
+}
+
+/// The query fields a URL carries, `name` to `value`, each as the URL spells it.
+///
+/// `pub(crate)` so every suite that reads a presigned URL this service hands out reads it
+/// the same way.
+pub(crate) fn query_fields(case: &str, url: &str) -> BTreeMap<String, String> {
+    let query = url
+        .split_once('?')
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: expected a presigned URL carrying a query, got {url}")
+        })
+        .1;
+    query
+        .split('&')
+        .map(|field| {
+            let (name, value) = field.split_once('=').unwrap_or_else(|| {
+                panic!("case {case:?}: expected name=value query fields, got {query:?} in {url}")
+            });
+            (name.to_string(), value.to_string())
+        })
+        .collect()
+}
+
+/// The session token a presigned application-UI URL carries, which travels in the query as
+/// itself: it is drawn from the unreserved characters of RFC 3986 §2.3 and from nothing
+/// else.
+pub(crate) fn presigned_token(case: &str, url: &str) -> String {
+    let fields = query_fields(case, url);
+    let token = fields.get(PRESIGNED_URL_TOKEN_PARAMETER).unwrap_or_else(|| {
+        panic!("case {case:?}: expected a {PRESIGNED_URL_TOKEN_PARAMETER} field, got {url}")
+    });
+    assert!(
+        !token.is_empty()
+            && token
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '~')),
+        "case {case:?}: expected a token that travels in a query as itself, got {token:?}"
+    );
+    token.clone()
+}
+
+/// The fields a SigV4 query-signed URL carries beside its own: what makes the URL
+/// verifiable, and what bounds how long it verifies for.
+const SIGNATURE_FIELDS: [&str; 5] = [
+    "X-Amz-Algorithm",
+    "X-Amz-Credential",
+    "X-Amz-Date",
+    "X-Amz-SignedHeaders",
+    "X-Amz-Signature",
+];
+
+/// THE RULE's presigning half, asserted on one URL: a URL this emulator hands a caller to
+/// open later leads BACK to this emulator rather than to the vendor's own domain, is signed
+/// for this service, and carries a BOUNDED expiration — the instant it was signed and the
+/// seconds it stays valid — so it stops working instead of opening an interface for ever.
+///
+/// `pub(crate)` so the suite spanning the other presigned-URL surface asserts the same
+/// rule rather than a copy of it.
+pub(crate) fn assert_presigned_against_this_emulator(case: &str, url: &str) {
+    assert!(
+        url.starts_with(UNSERVED_URL_BASE),
+        "case {case:?}: a presigned URL leads back to this emulator ({UNSERVED_URL_BASE}), got \
+         {url}"
+    );
+    let fields = query_fields(case, url);
+    for field in SIGNATURE_FIELDS {
+        assert!(
+            fields.get(field).is_some_and(|value| !value.is_empty()),
+            "case {case:?}: a presigned URL carries {field}, got {url}"
+        );
+    }
+    assert!(
+        fields
+            .get("X-Amz-Credential")
+            .is_some_and(|scope| scope.contains("elasticmapreduce")),
+        "case {case:?}: the URL is signed for this service, got {url}"
+    );
+    let expires = fields
+        .get("X-Amz-Expires")
+        .unwrap_or_else(|| panic!("case {case:?}: a presigned URL carries X-Amz-Expires, got {url}"))
+        .parse::<u64>()
+        .unwrap_or_else(|error| {
+            panic!("case {case:?}: X-Amz-Expires counts seconds, got {error} in {url}")
+        });
+    assert_eq!(
+        expires,
+        APP_UI_PRESIGNED_URL_VALIDITY.as_secs(),
+        "case {case:?}: the URL declares the validity this service gives an application-UI \
+         URL, got {url}"
+    );
+    assert!(
+        expires > 0 && Duration::from_secs(expires) <= MAX_SIGNED_URL_EXPIRY,
+        "case {case:?}: the expiration is bounded (0 < {expires}s <= {}s), got {url}",
+        MAX_SIGNED_URL_EXPIRY.as_secs()
+    );
 }
 
 /// THE RULE's unresolvable half: an id the service resolves no cluster for is refused as a
@@ -117,59 +218,45 @@ async fn an_unresolvable_cluster_id_is_refused_as_an_invalid_request() {
     );
 }
 
-/// THE RULE's resolvable half: a cluster the service DOES resolve is never refused as an
-/// unresolvable id, whatever state it is in. A cluster that is not up serves no interface,
-/// so the call is refused through the client error the operation models, naming the state
-/// the cluster is in and the states that do serve one.
+/// THE RULE's resolvable half: a cluster that is no longer active has no primary node, so
+/// there is no interface to address: the call is refused as a bad request, carrying the
+/// fixed sentence Amazon EMR states for it rather than the sentence an id that resolves
+/// nothing answers.
 ///
-/// Rows span the states a cluster is in while it cannot serve: one on the way up — the
-/// state a caller acting straight after the launch sees, since the span the first phase
-/// takes is never zero — and one that has been terminated. Both are asserted with and
-/// without a dry run, because a dry run is still a question about this cluster.
+/// Rows span every form of the question about such a cluster — each dry-run form and every
+/// `OnClusterAppUIType` the model declares — since the cluster's own state settles all of
+/// them alike, and the sentence carries no value of the request, so every row reads the
+/// same.
 #[tokio::test]
-async fn a_cluster_that_is_not_up_is_refused_as_a_wrong_state_not_as_a_bad_id() {
+async fn a_cluster_that_is_no_longer_active_is_refused_for_its_state_not_as_a_bad_id() {
     let emr = Emr::new();
 
-    // Asked about straight away, while the cluster is still coming up.
-    let starting = emr
-        .run_job_flow(launch_running("app-ui-starting", &["Spark"]))
-        .await;
-    assert_wrong_state(&emr, "a starting cluster", &starting).await;
-
-    // And a cluster whose primary node is gone for good, which no span can change.
+    // A cluster whose primary node is gone for good, which no span can change.
     let gone = running_cluster(&emr, "app-ui-gone", &["Spark"]).await;
     emr.ok("TerminateJobFlows", json!({ "JobFlowIds": [&gone] }))
         .await;
     await_cluster_state(&emr, &gone, "app-ui-gone", "TERMINATED").await;
-    assert_wrong_state(&emr, "a terminated cluster", &gone).await;
-}
 
-/// Every dry-run form of one call against `cluster_id`, each refused for the cluster's
-/// STATE: the modelled client error, naming the cluster and the states that serve an
-/// interface, and never the sentence an id that resolves nothing answers.
-async fn assert_wrong_state(emr: &Emr, label: &str, cluster_id: &str) {
     for dry_run in [None, Some(true), Some(false)] {
-        let case = format!("{OPERATION} against {label} / DryRun {dry_run:?}");
-        let mut request = json!({ "ClusterId": cluster_id });
-        if let Some(dry_run) = dry_run {
-            request["DryRun"] = json!(dry_run);
+        for ui_type in [None].into_iter().chain(UI_TYPES.map(|(name, _)| Some(name))) {
+            let case =
+                format!("{OPERATION} against a terminated cluster / DryRun {dry_run:?} / {ui_type:?}");
+            let mut request = json!({ "ClusterId": &gone });
+            if let Some(dry_run) = dry_run {
+                request["DryRun"] = json!(dry_run);
+            }
+            if let Some(ui_type) = ui_type {
+                request["OnClusterAppUIType"] = json!(ui_type);
+            }
+            let (status, payload) = emr.call(OPERATION, request).await;
+            assert_refused(&case, status, &payload, "ValidationException");
+            assert_eq!(
+                message(&case, &payload),
+                APP_UI_INACTIVE_CLUSTER_MESSAGE,
+                "case {case:?}: the refusal states that a URL is only created for an active \
+                 cluster, got {payload}"
+            );
         }
-        let (status, payload) = emr.call(OPERATION, request).await;
-        assert_refused(&case, status, &payload, "InvalidRequestException");
-        let said = message(&case, &payload);
-        assert!(
-            said.contains(cluster_id)
-                && said.contains(
-                    "an application user interface is only served by a cluster in the RUNNING \
-                     or WAITING state."
-                ),
-            "case {case:?}: the refusal names the cluster and the states that serve, got \
-             {payload}"
-        );
-        assert!(
-            !said.contains("is not valid"),
-            "case {case:?}: a cluster that RESOLVES is not refused as a bad id, got {payload}"
-        );
     }
 }
 
@@ -214,6 +301,7 @@ async fn readiness_follows_the_applications_the_cluster_runs() {
                     .as_str()
                     .unwrap_or_else(|| panic!("case {case:?}: no URL in {out}"))
                     .to_string();
+                assert_presigned_against_this_emulator(&case, &url);
                 let interface = opened_interface(&url);
                 assert!(
                     interface.starts_with("https://")
@@ -313,19 +401,8 @@ async fn a_dry_run_mints_nothing_and_every_other_call_presigns_afresh() {
                     ),
                 }
                 interfaces.insert(opened_interface(&url).to_string());
-                let token = url
-                    .split_once('?')
-                    .and_then(|(_, query)| query.split_once('='))
-                    .map(|(_, token)| token.to_string())
-                    .unwrap_or_else(|| panic!("case {case:?}: no token in {url}"));
-                assert!(
-                    !token.is_empty()
-                        && token
-                            .chars()
-                            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '~')),
-                    "case {case:?}: the token travels in a URL query as itself, got {token:?}"
-                );
-                tokens.push(token);
+                assert_presigned_against_this_emulator(&case, &url);
+                tokens.push(presigned_token(&case, &url));
             }
             assert_eq!(
                 interfaces.len(),
@@ -381,4 +458,63 @@ async fn an_execution_role_arn_naming_no_role_of_this_account_is_refused() {
         Some(true),
         "the cluster itself is served, got {out}"
     );
+}
+
+/// THE RULE's active half: an ACTIVE cluster serves the interfaces its applications serve
+/// from the launch onward — a caller asking straight after the launch, while the cluster is
+/// still coming up, is answered the address of the interface it is coming up to serve, and
+/// the same question once it is up answers the same way.
+///
+/// Rows span the application the request names and whether it names the interface, so the
+/// answer is asserted for the whole class of questions, and each is asked both while the
+/// cluster is coming up and once it is up.
+#[tokio::test]
+async fn an_active_cluster_is_served_from_the_launch_onward() {
+    let emr = Emr::new();
+    let cluster_id = emr
+        .run_job_flow(launch_running("app-ui-coming-up", &["Spark", "Hadoop"]))
+        .await;
+
+    let rows: [(&str, Value); 3] = [
+        ("no interface named", json!({ "ClusterId": &cluster_id })),
+        (
+            "the Spark history server",
+            json!({ "ClusterId": &cluster_id, "OnClusterAppUIType": "SparkHistoryServer" }),
+        ),
+        (
+            "one application's own interface",
+            json!({
+                "ClusterId": &cluster_id,
+                "OnClusterAppUIType": "ApplicationMaster",
+                "ApplicationId": "application_1700000000000_0001",
+            }),
+        ),
+    ];
+
+    for phase in ["while the cluster is coming up", "once the cluster is up"] {
+        // The launch's own spans are what take the cluster up, read back through the state
+        // it reports rather than off a wall clock.
+        if phase == "once the cluster is up" {
+            await_cluster_state(&emr, &cluster_id, "app-ui-coming-up", "WAITING").await;
+        }
+        for (label, request) in &rows {
+            let case = format!("{label} {phase}");
+            let out = emr.ok(OPERATION, request.clone()).await;
+            assert_eq!(
+                at(&out, &["PresignedURLReady"]).as_bool(),
+                Some(true),
+                "case {case:?}: an active cluster serves the interfaces its applications \
+                 serve, got {out}"
+            );
+            let url = at(&out, &["PresignedURL"])
+                .as_str()
+                .unwrap_or_else(|| panic!("case {case:?}: no URL in {out}"))
+                .to_string();
+            assert_presigned_against_this_emulator(&case, &url);
+            assert!(
+                opened_interface(&url).contains(cluster_id.as_str()),
+                "case {case:?}: the URL is this cluster's own address, got {url}"
+            );
+        }
+    }
 }

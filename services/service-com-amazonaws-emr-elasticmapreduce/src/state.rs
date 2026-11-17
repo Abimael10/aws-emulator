@@ -232,6 +232,13 @@ pub mod cluster_state {
     /// cluster that is in one of the following states: STARTING, BOOTSTRAPPING,
     /// RUNNING, or WAITING." (`AddJobFlowSteps` doc, Smithy model.)
     pub const ACCEPTS_STEPS: &[&str] = &[STARTING, BOOTSTRAPPING, RUNNING, WAITING];
+
+    /// The states a cluster is ACTIVE in — it has been launched and not shut down, so it
+    /// still holds the Amazon EC2 capacity its launch asked for. Amazon EMR groups the
+    /// cluster states this way wherever it reports a cluster as active (the `--active`
+    /// cluster states of `ListClusters`): everything up to and including `WAITING`, and
+    /// nothing from `TERMINATING` on.
+    pub const ACTIVE: &[&str] = &[STARTING, BOOTSTRAPPING, RUNNING, WAITING];
 }
 
 /// `com.amazonaws.emr#StepState`, as the wire carries it.
@@ -4388,24 +4395,25 @@ impl PersistentAppUIRecord {
     /// `application_id` when the caller named one, carrying the session token
     /// `session_token` the answering call minted for it.
     ///
-    /// Everything but the token is derived from the UI itself — its own id under the
-    /// regional EMR application-UI domain, with the UI type as the path — exactly the way a
-    /// Studio's access URL is derived from the studio ([`studio_url`]), so two calls for one
-    /// UI open the same interface. The TOKEN is what makes the URL a presigned one, and it
-    /// is minted per call rather than stored, so no two calls hand back the same credential
-    /// and a URL that has been shared or cached cannot outlive the token in it.
+    /// Everything but the token is derived from the UI itself — its own id, with the UI
+    /// type as the path — so two calls for one UI address the same interface. The URL is
+    /// PRESIGNED by the one builder below, which signs it against this emulator for a
+    /// bounded validity; the TOKEN is minted per call rather than stored, so no two calls
+    /// hand back the same credential and a URL that has been shared or cached cannot
+    /// outlive the token in it. `None` when the request cannot be signed.
     pub fn presigned_url(
         &self,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
         ui_type: &str,
         application_id: Option<&str>,
         session_token: &str,
-    ) -> String {
+    ) -> Option<String> {
         // "The application ID associated with the presigned URL."
         // (`GetPersistentAppUIPresignedURL$ApplicationId` doc): it selects WHICH
         // application's interface the URL opens, so it is part of the path — which is
         // the composition [`app_ui_presigned_url`] makes for every application-UI
         // address this service answers, on-cluster interfaces included.
-        app_ui_presigned_url(&self.id, &self.region, ui_type, application_id, session_token)
+        app_ui_presigned_url(ctx, &self.id, ui_type, application_id, session_token)
     }
 }
 
