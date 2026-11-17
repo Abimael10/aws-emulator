@@ -19,6 +19,11 @@
 //!   (`description` and `all`) — its plain values are alternatives, each of its
 //!   `!`-prefixed values excludes what it matches, and `all` requires every word
 //!   of one value;
+//! * separate `ListSecrets` filters are ANDed, so a scoping `name` filter beside
+//!   a text-searching one selects exactly the secrets both hold for, and the
+//!   whole selection is reported by ONE paginated walk that leaves no
+//!   `NextToken` outstanding on its final page — including the walk over a
+//!   selection that is empty;
 //! * an empty `Description` describes nothing, so it is indistinguishable on
 //!   read-back from a create or an update that named none.
 //!
@@ -506,6 +511,294 @@ async fn list_secrets_filters_select_by_a_prefix_of_a_word() {
         both,
         vec!["svc/cache".to_string()],
         "expected both filters to have to hold"
+    );
+}
+
+/// How many pages one walk below may take before it is treated as
+/// non-terminating: far more than the handful of secrets any case here creates,
+/// so only a walk that never ends trips it.
+const PAGE_WALK_CAP: usize = 16;
+
+/// Walk `ListSecrets` for one filter set to its end, and report the names it
+/// reported — in the order it reported them — beside the number of pages the
+/// walk took.
+///
+/// A page is asked for with `MaxResults` when `page_size` is given, and as the
+/// whole remainder when it is not. The walk follows `NextToken` until a page
+/// carries none, which is what makes an outstanding token on the final page, or
+/// a token that never clears, a failure rather than a hang.
+async fn walked(
+    router: &MultiServiceRouter,
+    filters: &Value,
+    page_size: Option<usize>,
+    case: &str,
+) -> (Vec<String>, usize) {
+    let mut seen: Vec<String> = Vec::new();
+    let mut token: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        let mut body = json!({"Filters": filters.clone()});
+        if let Some(size) = page_size {
+            body["MaxResults"] = json!(size);
+        }
+        if let Some(token) = &token {
+            body["NextToken"] = json!(token);
+        }
+        let listed = ok(router, "ListSecrets", body, case).await;
+        let page: Vec<String> = listed
+            .get("SecretList")
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| panic!("case {case:?}: no SecretList in {listed}"))
+            .iter()
+            .map(|entry| text(entry, "Name", case))
+            .collect();
+        if let Some(size) = page_size {
+            assert!(
+                page.len() <= size,
+                "case {case:?}: expected at most {size} entries in a page, got {page:?}"
+            );
+        }
+        seen.extend(page);
+        pages += 1;
+        assert!(
+            pages <= PAGE_WALK_CAP,
+            "case {case:?}: the paginated walk did not terminate — it saw {seen:?} over {pages} \
+             pages and was still handed a NextToken"
+        );
+        match listed.get("NextToken").and_then(Value::as_str) {
+            Some(next) => token = Some(next.to_string()),
+            None => return (seen, pages),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_name_scoped_text_filter_selects_the_secrets_both_filters_hold_for() {
+    let router = emulator();
+    // The secrets the rows search. Their names, descriptions and tags carry the
+    // searched words in several positions, several cases, and inside hyphenated
+    // names and tag keys — so a row selecting one of them exercises the WORD as
+    // the unit the two text keys match a prefix of. The last secret carries the
+    // same description and tag value as the first but sits outside the scope the
+    // rows filter by, which is what makes the scoping filter's AND observable.
+    let scope = "search-scope";
+    for (name, description, tag) in [
+        (
+            "search-scope-app-1",
+            Some("Payment gateway credentials"),
+            Some(("search-scope-tier", "web")),
+        ),
+        ("search-scope-app-2", Some("reporting Database login"), None),
+        (
+            "search-scope-db-1",
+            None,
+            Some(("search-scope-tier", "data")),
+        ),
+        (
+            "other-scope-app-9",
+            Some("Payment gateway credentials"),
+            Some(("other-scope-tier", "web")),
+        ),
+    ] {
+        let mut create = json!({"Name": name, "SecretString": "v"});
+        if let Some(description) = description {
+            create["Description"] = json!(description);
+        }
+        if let Some((key, value)) = tag {
+            create["Tags"] = json!([{"Key": key, "Value": value}]);
+        }
+        ok(&router, "CreateSecret", create, name).await;
+    }
+
+    // The rows run over the filter key (`description` and `all`, the two keys
+    // `Filter$Key` documents as matching text and not case-sensitively), over
+    // which attribute carries the match (name, description, tag key, tag value),
+    // over the position of the matched word and the case it is written in, over
+    // how many words one value carries, and over how many secrets the answer
+    // holds — none, one and two. Each expected set is in the name order the
+    // listing pages in.
+    let rows: &[(&str, &str, &str, &[&str])] = &[
+        (
+            "description, the first word",
+            "description",
+            "Payment",
+            &["search-scope-app-1"],
+        ),
+        (
+            "description, the first word in another case",
+            "description",
+            "payment",
+            &["search-scope-app-1"],
+        ),
+        (
+            "description, a later word",
+            "description",
+            "gateway",
+            &["search-scope-app-1"],
+        ),
+        (
+            "description, a prefix of a later word",
+            "description",
+            "cred",
+            &["search-scope-app-1"],
+        ),
+        (
+            "description, a later word upper-cased",
+            "description",
+            "DATABASE",
+            &["search-scope-app-2"],
+        ),
+        (
+            "description, the last word",
+            "description",
+            "login",
+            &["search-scope-app-2"],
+        ),
+        (
+            "description, a word nothing in scope carries",
+            "description",
+            "absent",
+            &[],
+        ),
+        (
+            "all, a description word",
+            "all",
+            "gateway",
+            &["search-scope-app-1"],
+        ),
+        (
+            "all, a description word upper-cased",
+            "all",
+            "GATEWAY",
+            &["search-scope-app-1"],
+        ),
+        (
+            "all, a tag value",
+            "all",
+            "web",
+            &["search-scope-app-1"],
+        ),
+        (
+            "all, a whole hyphenated tag key",
+            "all",
+            "search-scope-tier",
+            &["search-scope-app-1", "search-scope-db-1"],
+        ),
+        (
+            "all, one word of a hyphenated tag key",
+            "all",
+            "tier",
+            &["search-scope-app-1", "search-scope-db-1"],
+        ),
+        (
+            "all, a word of a hyphenated name",
+            "all",
+            "db",
+            &["search-scope-db-1"],
+        ),
+        (
+            "all, a prefix shared by a description word and a tag value",
+            "all",
+            "data",
+            &["search-scope-app-2", "search-scope-db-1"],
+        ),
+        (
+            "all, two words one secret carries between its attributes",
+            "all",
+            "payment gateway",
+            &["search-scope-app-1"],
+        ),
+        (
+            "all, two words no secret in scope carries together",
+            "all",
+            "payment login",
+            &[],
+        ),
+    ];
+
+    // The scope on its own lists every secret inside it and nothing outside it,
+    // which is the baseline each row narrows.
+    let scoping = json!([{"Key": "name", "Values": [scope]}]);
+    let (baseline, pages) = walked(&router, &scoping, None, "the name scope alone").await;
+    assert_eq!(
+        baseline,
+        vec![
+            "search-scope-app-1".to_string(),
+            "search-scope-app-2".to_string(),
+            "search-scope-db-1".to_string(),
+        ],
+        "expected the name scope to list exactly the secrets inside it"
+    );
+    assert_eq!(
+        pages, 1,
+        "expected one page with no MaxResults and no NextToken outstanding, took {pages}"
+    );
+
+    for (case, key, value, expected) in rows {
+        let filters = json!([
+            {"Key": "name", "Values": [scope]},
+            {"Key": key, "Values": [value]},
+        ]);
+        let expected: Vec<String> = expected.iter().map(|name| (*name).to_string()).collect();
+
+        // One walk over the whole remainder: the documented answer, reported in
+        // a single page that leaves no NextToken behind.
+        let (selected, pages) = walked(&router, &filters, None, case).await;
+        assert_eq!(
+            selected, expected,
+            "case {case:?}: filter {key}={value:?} inside the scope selected the wrong set"
+        );
+        assert_eq!(
+            pages, 1,
+            "case {case:?}: expected the whole selection in one page with no NextToken \
+             outstanding, took {pages}"
+        );
+
+        // And the same selection walked one secret at a time, which is what an
+        // SDK paginator does: the same names, in the same order, and the walk
+        // ends.
+        let (paged, _) = walked(&router, &filters, Some(1), case).await;
+        assert_eq!(
+            paged, expected,
+            "case {case:?}: paging {key}={value:?} one secret at a time selected the wrong set"
+        );
+    }
+
+    // The narrowing is observable from the other side too: the same text filter
+    // WITHOUT the scope beside it selects the secret outside the scope as well,
+    // so the rows above leave it out because the two filters are ANDed and not
+    // because it fails the text filter.
+    let unscoped = json!([{"Key": "description", "Values": ["Payment"]}]);
+    let (both_scopes, pages) = walked(&router, &unscoped, None, "the text filter alone").await;
+    assert_eq!(
+        both_scopes,
+        vec![
+            "other-scope-app-9".to_string(),
+            "search-scope-app-1".to_string(),
+        ],
+        "expected the text filter alone to select the matching secret in either scope"
+    );
+    assert_eq!(
+        pages, 1,
+        "expected one page with no MaxResults and no NextToken outstanding, took {pages}"
+    );
+
+    // "name: Prefix match, case-sensitive." (`Filter$Key`, this service's Smithy
+    // model.) So a scope differing only in case selects nothing, whatever the
+    // filter beside it matches.
+    let shouted = json!([
+        {"Key": "description", "Values": ["Payment"]},
+        {"Key": "name", "Values": [scope.to_uppercase()]},
+    ]);
+    let (none, pages) = walked(&router, &shouted, None, "an upper-cased name scope").await;
+    assert_eq!(
+        none,
+        Vec::<String>::new(),
+        "expected an upper-cased name scope to select nothing, since `name` is case-sensitive"
+    );
+    assert_eq!(
+        pages, 1,
+        "expected the empty selection to be one page with no NextToken outstanding, took {pages}"
     );
 }
 
