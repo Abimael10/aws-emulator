@@ -420,11 +420,13 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for AuthorizedRoute<Eng> {
             };
             // IAM's decision, taken before the operation reads or writes anything: the action
             // is this operation's own name under this service's namespace, and the resource is
-            // the one the REQUEST addresses. A refused request never reaches the route below,
-            // so it stores nothing, sends nothing and reports nothing.
+            // the one the REQUEST acts on — the one its URI addresses, or, for a create, the
+            // one its input names. A refused request never reaches the route below, so it
+            // stores nothing, sends nothing and reports nothing.
             let resource = authorization::addressed_resource(
                 req.uri(),
                 &crate::state::request_region(ctx.parts()),
+                req.body().bytes().unwrap_or_default(),
             );
             if let Some(message) =
                 authorization::refusal(&*self.engine, ctx, operation, &resource)

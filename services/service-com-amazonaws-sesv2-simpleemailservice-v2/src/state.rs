@@ -97,14 +97,37 @@ pub use templates::*;
 /// How long after `CreateEmailIdentity` an identity's `PENDING` -> `SUCCESS`
 /// verification transition becomes due.
 ///
-/// Real SES completes verification only once it observes something it cannot
-/// observe here (the recipient following the link in the verification email, or
-/// the Easy DKIM CNAME records appearing in the domain's DNS), so the span is
-/// CHOSEN, not documented: it is the emulator's convention for a transition the
-/// clock owes, long enough that a caller which reads straight back still sees the
-/// transient `PENDING` state and the state errors that go with it. The due instant
-/// is stored on the record; nothing ever sleeps for it.
-pub const VERIFICATION_SETTLE: Duration = Duration::from_millis(500);
+/// Real SES does not complete a verification on its own: it completes one only once
+/// it OBSERVES something this service cannot observe — the recipient following the
+/// link in the verification message, or the Easy DKIM CNAME records appearing in the
+/// domain's own DNS — and it keeps looking for them on a schedule of its own
+/// ([`VERIFICATION_PROBE_INTERVAL`]), reporting the identity `PENDING` and
+/// `VerifiedForSendingStatus` false until one of those searches finds them. A
+/// caller that creates an identity and publishes nothing therefore reads it back
+/// unverified, however many reads it makes.
+///
+/// So the span is CHOSEN, and chosen LONG for that reason: it is the number of those
+/// searches a client's own wait for a verification covers
+/// ([`SEARCHES_BEFORE_VERIFICATION`]), so a client that creates an identity and goes
+/// on reading it sees the state the create left it in — the transient `PENDING`, the
+/// `VerifiedForSendingStatus` false and the state errors that go with them —
+/// rather than an identity this emulator declared verified while nothing had been
+/// published for it. The due instant is stored on the record; nothing ever sleeps
+/// for it.
+pub const VERIFICATION_SETTLE: Duration = Duration::from_secs(
+    SEARCHES_BEFORE_VERIFICATION * VERIFICATION_PROBE_INTERVAL.as_secs(),
+);
+
+/// How many searches of an identity's DNS records pass before the verification
+/// transition the clock owes it falls due ([`VERIFICATION_SETTLE`]).
+///
+/// CHOSEN, not documented: Amazon SES states no instant at which a verification
+/// completes — "it can take up to 72 hours" after the records are published, a span
+/// no emulated client could wait out — so what this fixes is the shape of the
+/// behaviour rather than its duration: several searches report the records as not
+/// found before any report them found, while a client that waits for the identity
+/// still converges well inside its own wait for one.
+const SEARCHES_BEFORE_VERIFICATION: u64 = 5;
 
 /// How long after one search of an identity's DNS records the next one falls due.
 ///

@@ -90,7 +90,7 @@ use super::template::{
     CLOUDFRONT_CONNECTION_FUNCTION, CLOUDFRONT_CONNECTION_GROUP, CLOUDFRONT_FUNCTION,
     CLOUDFRONT_KEY_VALUE_STORE, CLOUDFRONT_MONITORING_SUBSCRIPTION,
     CUSTOMER_PROFILES_DOMAIN, GLUE_TABLE_OPTIMIZER, MWAA_ENVIRONMENT, NEPTUNE_GRAPH_GRAPH,
-    NEPTUNE_GRAPH_GRAPH_SNAPSHOT, RBIN_RULE,
+    NEPTUNE_GRAPH_GRAPH_SNAPSHOT, RBIN_RULE, SES_EMAIL_IDENTITY,
 };
 
 /// The namespace Amazon Web Services' own resource types live under: a type spelled with
@@ -843,7 +843,9 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     "AWS::S3Vectors::VectorBucket",
     // Amazon SES
     "AWS::SES::ConfigurationSet",
-    "AWS::SES::EmailIdentity",
+    // The email identity is created in the owning service (`super::provisioner`), through
+    // that service's own `CreateEmailIdentity`.
+    SES_EMAIL_IDENTITY,
     "AWS::SES::ReceiptRule",
     "AWS::SES::ReceiptRuleSet",
     "AWS::SES::Template",

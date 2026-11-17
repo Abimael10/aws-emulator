@@ -4,13 +4,15 @@
 //!
 //! The rule under test: every request to SESv2 is a signed call, and such a call is served
 //! only to a caller whose identity-based IAM policies allow THAT operation's own action
-//! (`ses:<OperationName>`) on the resource the request addresses — the ARN of the email
+//! (`ses:<OperationName>`) on the resource the request ACTS ON — the ARN of the email
 //! identity, configuration set, contact list, dedicated IP pool or template its URI names,
-//! and IAM's any-resource wildcard for a call that names no single resource (an
-//! account-level read, a send, a create). Every other caller is refused HTTP 403 under the
-//! error code `AccessDeniedException`, with IAM's own sentence, BEFORE the operation reads
-//! or writes anything — so a refused caller learns nothing about what the account holds, a
-//! refused send delivers nothing and a refused create stores nothing.
+//! the ARN of the resource a CREATE's own input names (a create acts on the one resource it
+//! is about to make, which its URI does not carry), and IAM's any-resource wildcard for a
+//! call that acts on no single resource (an account-level read, a send). Every other caller
+//! is refused HTTP 403 under the error code `AccessDeniedException`, with IAM's own sentence,
+//! BEFORE the operation reads or writes anything — so a refused caller learns nothing about
+//! what the account holds, a refused send delivers nothing and a refused create stores
+//! nothing.
 //!
 //! This is a CROSS-SERVICE rule and only a cross-service suite can pin it: the principals
 //! below are made with IAM's and STS's OWN operations over the same engine (`CreateRole` +
@@ -21,11 +23,12 @@
 //! signed with a session of the function's execution role.
 //!
 //! The rows vary what the rule generalises over: the OPERATION asked for (a send, an
-//! account-level read, a read of each resource family the URI space names, a create), the
-//! kind of principal (the account's own published credential, an IAM user, an assumed-role
-//! session), and what its policies say (nothing about this service, a wildcard `Allow`, an
-//! `Allow` for this action on this resource, an `Allow` on another resource of the same
-//! kind, and an explicit `Deny` beside a wildcard `Allow`).
+//! account-level read, a read of each resource family the URI space names, and the create of
+//! each family, which names the resource it makes in its input), the kind of principal (the
+//! account's own published credential, an IAM user, an assumed-role session), and what its
+//! policies say (nothing about this service, a wildcard `Allow`, an `Allow` for this action
+//! on this resource, an `Allow` on another resource of the same kind, and an explicit `Deny`
+//! beside a wildcard `Allow`).
 
 use std::sync::Arc;
 
@@ -333,7 +336,8 @@ struct OperationCase {
 }
 
 /// The table: a send, an account-level read, a read of each resource family this model's URI
-/// space names, and a create — each with its own action and its own resource.
+/// space names, and the create of each of those families — a create acts on the resource it
+/// is about to make, which its own input names.
 fn operation_cases() -> Vec<OperationCase> {
     vec![
         OperationCase {
@@ -392,12 +396,50 @@ fn operation_cases() -> Vec<OperationCase> {
             resource: resource_arn("template", PROBE),
         },
         OperationCase {
-            case: "a create, which names no resource of its own in its URI",
+            case: "the create of a contact list, which its input names",
             operation: "CreateContactList",
             method: "POST",
             path: "/v2/email/contact-lists".to_string(),
             body: Some(json!({ "ContactListName": format!("{PROBE}-created") })),
-            resource: "*".to_string(),
+            resource: resource_arn("contact-list", &format!("{PROBE}-created")),
+        },
+        OperationCase {
+            case: "the create of an email identity, which its input names",
+            operation: "CreateEmailIdentity",
+            method: "POST",
+            path: "/v2/email/identities".to_string(),
+            body: Some(json!({ "EmailIdentity": format!("{PROBE}-created.example.com") })),
+            resource: resource_arn("identity", &format!("{PROBE}-created.example.com")),
+        },
+        OperationCase {
+            case: "the create of a configuration set, which its input names",
+            operation: "CreateConfigurationSet",
+            method: "POST",
+            path: "/v2/email/configuration-sets".to_string(),
+            body: Some(json!({ "ConfigurationSetName": format!("{PROBE}-created") })),
+            resource: resource_arn("configuration-set", &format!("{PROBE}-created")),
+        },
+        OperationCase {
+            case: "the create of a dedicated IP pool, which its input names",
+            operation: "CreateDedicatedIpPool",
+            method: "POST",
+            path: "/v2/email/dedicated-ip-pools".to_string(),
+            body: Some(json!({ "PoolName": format!("{PROBE}-created") })),
+            resource: resource_arn("dedicated-ip-pool", &format!("{PROBE}-created")),
+        },
+        OperationCase {
+            case: "the create of an email template, which its input names",
+            operation: "CreateEmailTemplate",
+            method: "POST",
+            path: "/v2/email/templates".to_string(),
+            body: Some(json!({
+                "TemplateName": format!("{PROBE}-created"),
+                "TemplateContent": {
+                    "Subject": "probe",
+                    "Text": "probe",
+                },
+            })),
+            resource: resource_arn("template", &format!("{PROBE}-created")),
         },
     ]
 }
@@ -593,9 +635,10 @@ async fn a_grant_covers_the_one_action_it_names() {
     }
 }
 
-/// RULE: a request that names ONE resource is decided against that resource's ARN, so a
-/// statement scoped to it allows the call and the same statement scoped to another resource of
-/// the same kind does not.
+/// RULE: a request that acts on ONE resource is decided against that resource's ARN — the
+/// resource its URI names, or the one a create's own input names — so a statement scoped to it
+/// allows the call and the same statement scoped to another resource of the same kind does
+/// not.
 #[tokio::test]
 async fn a_statement_scoped_to_one_resource_decides_the_request_that_names_it() {
     let router = build_router();

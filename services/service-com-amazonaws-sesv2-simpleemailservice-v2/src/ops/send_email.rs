@@ -266,8 +266,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "You can send either a Simple message, Raw message, or a Templated
-        // message" — exactly one of the three.
-        let parts = message_parts(&input.content)?;
+        // message" — exactly one of the three. Which form was sent is settled here;
+        // the message itself is composed below, once the store a templated message
+        // reads its template from is locked.
+        let form = content_form(&input.content)?;
 
         // The sending identity. SES takes it from the request's `FromEmailAddress`,
         // or, for a raw message, from the MIME `From` header.
@@ -304,6 +306,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         store.settle(now);
+
+        // The subject, the body parts and the headers of the message this request sends.
+        // A templated message is rendered from the account's own template store, which is
+        // why this is composed under the lock.
+        let parts = message_parts(form, &input.content, &store)?;
 
         // "An object used to specify a list or topic to which an email belongs, which
         // will be used when a contact chooses to unsubscribe": the list and the topic
@@ -579,31 +586,105 @@ fn bad_request(message: impl Into<String>) -> SendEmailError {
     .into()
 }
 
+/// Which of the three forms the request's content carries the message in.
+///
+/// Read before anything is locked, so a request that names no single message is refused for
+/// that and for nothing else; the message itself is composed from the same content once the
+/// store is held ([`message_parts`]).
+#[derive(Debug, Clone, Copy)]
+enum ContentForm {
+    /// `EmailContent$Simple`: the subject and body parts the request states itself.
+    Simple,
+    /// `EmailContent$Raw`: a MIME document the request carries whole.
+    Raw,
+    /// `EmailContent$Template`: a template and the values for its message variables.
+    Templated,
+}
+
+/// How this operation refuses templated content whose `TemplateData` is no set of key-value
+/// pairs, which is the one text a render reads with a parser.
+const INVALID_TEMPLATE_DATA: &str = "The template data is not a valid JSON object";
+
+/// How this operation refuses templated content that identifies no template at all — content
+/// whose `Template` names neither a stored template nor content of its own: there is no
+/// template to render the message from.
+const NO_TEMPLATE: &str = "The template does not exist";
+
+/// The resource type an email template's ARN addresses it by, as SES writes the resource
+/// field of one (`crate::state::ses_resource_of`).
+const EMAIL_TEMPLATE_RESOURCE_TYPE: &str = "template";
+
 /// The subject, the body parts and the headers recorded for one message.
 struct MessageParts {
-    /// The subject, which only a simple message carries as its own member.
+    /// The subject: a simple message's own member, and a templated message's rendered
+    /// subject line.
     subject: Option<String>,
-    /// The text part of a simple message, or the whole raw MIME document.
+    /// The text part of a simple or templated message, or the whole raw MIME document.
     body: Option<String>,
-    /// The HTML part of a simple message.
+    /// The HTML part of a simple or templated message.
     html: Option<String>,
-    /// `Message$Headers`: "the list of message headers that will be added to the email
-    /// message", which a simple message carries as its own member and a raw message
-    /// writes inside the MIME document itself.
+    /// `Message$Headers`/`Template$Headers`: "the list of message headers that will be
+    /// added to the email message", which a simple and a templated message carry as their
+    /// own member and a raw message writes inside the MIME document itself.
     headers: Vec<(String, String)>,
 }
 
-/// The subject and body recorded for one message, by content form.
+/// Which form carries the message, or the refusal for content that names no single one.
 ///
 /// Exactly one of `Simple`, `Raw` and `Template` carries the message; a request
 /// that sets none or several of them names no single message to send.
-fn message_parts(content: &EmailContent) -> Result<MessageParts, SendEmailError> {
+fn content_form(content: &EmailContent) -> Result<ContentForm, SendEmailError> {
     match (
         content.simple.as_ref(),
         content.raw.as_ref(),
         content.template.as_ref(),
     ) {
-        (Some(simple), None, None) => {
+        (Some(_), None, None) => Ok(ContentForm::Simple),
+        (None, Some(_), None) => Ok(ContentForm::Raw),
+        (None, None, Some(template)) => {
+            if template
+                .attachments
+                .as_ref()
+                .is_some_and(|attachments| !attachments.is_empty())
+            {
+                // "The List of attachments to include in your email. All recipients will
+                // receive the same attachments": assembling a MIME document that carries
+                // them is a capability this slice does not have, and the request is a valid
+                // one — answered as unwritten rather than as the caller's mistake, exactly
+                // as the bulk send answers the same member.
+                return Err(crate::scaffolded::Scaffolded::not_implemented(
+                    "SendEmail with template attachments",
+                ));
+            }
+            Ok(ContentForm::Templated)
+        }
+        _ => Err(bad_request(
+            "Content must carry exactly one of Simple, Raw or Template.",
+        )),
+    }
+}
+
+/// The subject, body parts and headers of the message `content` carries in `form`, composed
+/// from the account's template store for a templated message.
+///
+/// A templated message is rendered the way the model reads a template and its data —
+/// "Amazon SES supports only simple substitions" — through the ONE renderer of this service
+/// ([`crate::state::template_rendering`]), which is the same one a bulk send composes each
+/// of its destinations with. The template is the stored one when the request names it by
+/// `TemplateName` or by the `TemplateArn` that addresses it, and the content the request
+/// carries inline otherwise.
+fn message_parts(
+    form: ContentForm,
+    content: &EmailContent,
+    store: &crate::state::ComAmazonawsSesv2SimpleemailserviceV2State,
+) -> Result<MessageParts, SendEmailError> {
+    match (
+        form,
+        content.simple.as_ref(),
+        content.raw.as_ref(),
+        content.template.as_ref(),
+    ) {
+        (ContentForm::Simple, Some(simple), _, _) => {
             // `Body` carries an optional text part and an optional HTML part, so a
             // body with neither has no content to send; one with both is recorded
             // as both, which is what the caller sent.
@@ -633,20 +714,116 @@ fn message_parts(content: &EmailContent) -> Result<MessageParts, SendEmailError>
         // A raw message is already a MIME document: it is recorded as sent (up to
         // the log's retained size), and its headers are the caller's business —
         // they are written inside the document, which is where they are read from.
-        (None, Some(raw), None) => Ok(MessageParts {
+        (ContentForm::Raw, _, Some(raw), _) => Ok(MessageParts {
             subject: None,
             body: Some(String::from_utf8_lossy(&raw.data).into_owned()),
             html: None,
             headers: Vec::new(),
         }),
-        // A templated message is rendered from a stored email template, which
-        // `CreateEmailTemplate` and `TestRenderEmailTemplate` own and nobody has
-        // written yet; rendering one here would invent the message body.
-        (None, None, Some(_template)) => Err(crate::scaffolded::Scaffolded::not_implemented(
-            "SendEmail with templated content",
-        )),
+        (ContentForm::Templated, _, _, Some(template)) => {
+            let content = template_content(store, template)?;
+            // "An object that defines the values to use for message variables in the
+            // template": the data is the set of key-value pairs the variables take their
+            // values from. A template sent with no data at all has no value for any
+            // variable, and a name the data does not give renders as nothing, so the
+            // absent member renders the template's own text with every reference resolved
+            // to the empty string rather than refusing the send.
+            let variables = match template.template_data.as_deref() {
+                None => ::serde_json::Value::Object(::serde_json::Map::new()),
+                Some(raw) => match crate::state::template_rendering::message_variables(raw) {
+                    Some(variables) => variables,
+                    None => return Err(bad_request(INVALID_TEMPLATE_DATA)),
+                },
+            };
+            let rendered = match crate::state::template_rendering::render(&content, &variables) {
+                Ok(rendered) => rendered,
+                Err(crate::state::template_rendering::RenderRefusal::Unsupported) => {
+                    // A construct this emulator does not interpret is in the TEMPLATE, so
+                    // the request is answered as unwritten rather than as the caller's
+                    // mistake — the same answer the bulk send gives such a template.
+                    return Err(crate::scaffolded::Scaffolded::not_implemented(
+                        "SendEmail with a template that uses a section, a partial or a helper \
+                         call",
+                    ));
+                }
+                Err(crate::state::template_rendering::RenderRefusal::TooLarge) => {
+                    // An EMULATOR ceiling on what one render may amplify a template to, not
+                    // an AWS quota, so it is reported as the input being past what this
+                    // emulator renders.
+                    return Err(bad_request(format!(
+                        "The message rendered for this destination is larger than the {} bytes \
+                         this emulator renders.",
+                        crate::state::template_rendering::MAX_RENDERED_PART_BYTES
+                    )));
+                }
+            };
+            Ok(MessageParts {
+                subject: rendered.subject,
+                body: rendered.text,
+                html: rendered.html,
+                // "The list of message headers that will be added to the email message",
+                // in the order the template states them.
+                headers: template
+                    .headers
+                    .clone()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|header| (header.name, header.value))
+                    .collect(),
+            })
+        }
+        // Unreachable: the form was read from these same three members
+        // ([`content_form`]), and nothing between the two reads changes the request.
         _ => Err(bad_request(
             "Content must carry exactly one of Simple, Raw or Template.",
         )),
     }
+}
+
+/// The template content a templated send composes its message from.
+///
+/// A template the request names by `TemplateName`, or by the `TemplateArn` that addresses
+/// the same template, is the stored one: a name the account holds no template under is the
+/// modelled 404, worded as every operation over an `EmailTemplateName` words it. Content the
+/// request carries inline is the template itself, and is bounded here the way
+/// `CreateEmailTemplate` bounds a stored one, because a request's own content is never
+/// measured anywhere else.
+fn template_content(
+    store: &crate::state::ComAmazonawsSesv2SimpleemailserviceV2State,
+    template: &Template,
+) -> Result<EmailTemplateContent, SendEmailError> {
+    let named = template.template_name.clone().or_else(|| {
+        template
+            .template_arn
+            .as_deref()
+            .and_then(crate::state::ses_resource_of)
+            .filter(|(resource_type, _)| *resource_type == EMAIL_TEMPLATE_RESOURCE_TYPE)
+            .map(|(_, name)| name.to_string())
+    });
+    if let Some(name) = named {
+        let Some(stored) = store.email_templates.get(&name) else {
+            return Err(SendEmailErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::email_template_not_found(&name)),
+            })
+            .into());
+        };
+        return Ok(stored.content.clone());
+    }
+    let Some(content) = template.template_content.clone() else {
+        return Err(bad_request(NO_TEMPLATE));
+    };
+    // Content the request carries INLINE belongs to no named template, so the quota
+    // sentence a named write is refused with
+    // (`crate::state::email_template_exceeds_maximum_size`, which names the template) has
+    // no name to state, and this guard reports the size it measured against the bound
+    // instead.
+    let size = crate::state::email_template_size(&content);
+    if size > crate::state::MAX_EMAIL_TEMPLATE_BYTES {
+        return Err(bad_request(format!(
+            "The template is {size} bytes, which is larger than the maximum template size of \
+             {} bytes.",
+            crate::state::MAX_EMAIL_TEMPLATE_BYTES
+        )));
+    }
+    Ok(content)
 }

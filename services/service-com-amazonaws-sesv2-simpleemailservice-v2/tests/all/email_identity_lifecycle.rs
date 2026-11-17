@@ -1131,6 +1131,60 @@ async fn an_identity_becomes_verified_once_the_transition_falls_due() {
     );
 }
 
+/// RULE: the verification transition is OWED by the clock a whole settle span after the
+/// create, so a caller that creates an identity and reads it back in the same breath — with
+/// nothing holding the transition off — still sees the state the create left it in: the
+/// verification `PENDING` and `VerifiedForSendingStatus` false. Nothing in this service
+/// completes a verification the instant it was asked for.
+///
+/// The rows span the identity kinds the state is reported for: a domain, an address under
+/// another domain, and a deeper subdomain.
+#[tokio::test]
+async fn an_identity_read_back_in_the_same_breath_is_not_verified_yet() {
+    for identity in [
+        "probe.example.com",
+        "sender@probe.example.net",
+        "deep.sub.probe.example.org",
+    ] {
+        let ses = Ses::new();
+        let created = ses.create(json!({"EmailIdentity": identity})).await;
+        assert_eq!(
+            created.status, 200,
+            "case {identity:?}: expected 200 from the create, got {} {:?}",
+            created.status, created.body
+        );
+        assert!(
+            !created.flag("VerifiedForSendingStatus"),
+            "case {identity:?}: expected the create to report VerifiedForSendingStatus false, \
+             got {:?}",
+            created.body
+        );
+
+        // No hold, no sleep: the next call is made straight away, and the transition is not
+        // due yet.
+        let read = ses.get(identity).await;
+        assert_eq!(
+            read.text("VerificationStatus"),
+            "PENDING",
+            "case {identity:?}: expected PENDING on a read made straight after the create, got \
+             {:?}",
+            read.body
+        );
+        assert!(
+            !read.flag("VerifiedForSendingStatus"),
+            "case {identity:?}: expected VerifiedForSendingStatus false on a read made straight \
+             after the create, got {:?}",
+            read.body
+        );
+        let span = ses.verification_span(identity);
+        assert_eq!(
+            span, VERIFICATION_SETTLE,
+            "case {identity:?}: expected the transition to be owed a whole settle span after \
+             the create, got {span:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn send_records_the_message_and_mints_a_unique_id() {
     let ses = Ses::new();
@@ -1754,8 +1808,9 @@ async fn send_refuses_what_it_cannot_accept() {
         );
     }
 
-    // A templated message needs the stored template and renderer that
-    // CreateEmailTemplate owns, so it is answered as unwritten too.
+    // A templated message is rendered from the account's template store, so one naming a
+    // template the account does not hold is the missing resource this operation models —
+    // the same 404 every other read of an absent template answers.
     let reply = ses
         .send(json!({
             "FromEmailAddress": "solo@example.net",
@@ -1764,8 +1819,9 @@ async fn send_refuses_what_it_cannot_accept() {
         }))
         .await;
     assert_eq!(
-        reply.status, 501,
-        "case templated-content: expected 501, got {} {:?}",
+        (reply.status, reply.error_code().as_str()),
+        (404, "NotFoundException"),
+        "case templated-content: expected 404 NotFoundException, got {} {:?}",
         reply.status, reply.body
     );
 }

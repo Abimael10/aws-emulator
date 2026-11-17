@@ -744,6 +744,14 @@ pub(super) fn declared_name_property(resource_type: &str) -> Option<&'static str
         // set name" — so the type publishes `RuleSetName`; the type's last segment is
         // `ReceiptRuleSet`, so neither `ReceiptRuleSetName` nor `Name` finds it.
         SES_RECEIPT_RULE_SET => Some("RuleSetName"),
+        // The same service's `CreateEmailIdentity` takes the identity's own text as its
+        // `EmailIdentity` member — "Ref returns the email identity" — so the type publishes
+        // `EmailIdentity`; the type's last segment is `EmailIdentity`, so neither
+        // `EmailIdentityName` nor `Name` finds it. That text is what the identity is CREATED
+        // under and the identifier every SES operation on one takes, so it is the physical
+        // id: a generated `<stack>-<logical id>-<unique id>` would name no identity the
+        // owning service holds.
+        SES_EMAIL_IDENTITY => Some("EmailIdentity"),
         // Neptune Analytics' `CreateGraphSnapshot` takes a `snapshotName`, so the type
         // publishes `SnapshotName`; the type's last segment is `GraphSnapshot`, so neither
         // `GraphSnapshotName` nor `Name` finds it. (The GRAPH's own `GraphName` IS the

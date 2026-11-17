@@ -524,7 +524,8 @@ use super::template::{
     S3TABLES_NAMESPACE_PROPERTY, S3TABLES_TABLE_BUCKET, S3TABLES_TABLE_BUCKET_ARN_ATTRIBUTE,
     S3VECTORS_BUCKET_SEGMENT, S3VECTORS_INDEX,
     S3VECTORS_VECTOR_BUCKET, SAGEMAKER_MODEL_PACKAGE_GROUP, SCHEDULER_SCHEDULE,
-    SCHEDULER_SCHEDULE_GROUP, SES_CONFIGURATION_SET, SES_RECEIPT_RULE, SES_RECEIPT_RULE_SET,
+    SCHEDULER_SCHEDULE_GROUP, SES_CONFIGURATION_SET, SES_EMAIL_IDENTITY, SES_RECEIPT_RULE,
+    SES_RECEIPT_RULE_SET,
     SNS_SUBSCRIPTION,
     SNS_TOPIC, SNS_TOPIC_INLINE_POLICY, SNS_TOPIC_POLICY, SQS_QUEUE, SQS_QUEUE_INLINE_POLICY,
     SQS_QUEUE_POLICY,
@@ -1042,6 +1043,11 @@ pub(super) enum Provisioner {
     /// connection its declaration asks for associated, which is a call of its own.
     CodeArtifactRepository,
     SesConfigurationSet,
+    /// `AWS::SES::EmailIdentity`: an email identity of Amazon SES — the domain or the address
+    /// an account sends from — which `CreateEmailIdentity` creates under the text the
+    /// template states and `DeleteEmailIdentity` removes, with the attributes the declaration
+    /// asks for written on it.
+    SesEmailIdentity,
     /// `AWS::SES::ReceiptRuleSet`: a receipt rule set of Amazon SES, which
     /// `CreateReceiptRuleSet` creates empty and `DeleteReceiptRuleSet` deletes.
     SesReceiptRuleSet,
@@ -1365,6 +1371,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         CODEARTIFACT_DOMAIN => Some(Provisioner::CodeArtifactDomain),
         CODEARTIFACT_REPOSITORY => Some(Provisioner::CodeArtifactRepository),
         SES_CONFIGURATION_SET => Some(Provisioner::SesConfigurationSet),
+        SES_EMAIL_IDENTITY => Some(Provisioner::SesEmailIdentity),
         SES_RECEIPT_RULE_SET => Some(Provisioner::SesReceiptRuleSet),
         SES_RECEIPT_RULE => Some(Provisioner::SesReceiptRule),
         BACKUP_VAULT => Some(Provisioner::BackupVault),
@@ -1993,6 +2000,11 @@ impl Provisioner {
             Self::SesConfigurationSet => {
                 create_ses_configuration_set(ctx, region, resource).await
             }
+            // `AWS::SES::EmailIdentity` publishes `EmailIdentity`,
+            // `ConfigurationSetAttributes`, `DkimAttributes`, `DkimSigningAttributes`,
+            // `FeedbackAttributes` and `MailFromAttributes` and no `Tags`: the type is not
+            // taggable, so no tags are propagated to an email identity.
+            Self::SesEmailIdentity => create_ses_email_identity(ctx, region, resource).await,
             // `AWS::SES::ReceiptRuleSet` publishes `RuleSetName` alone and
             // `AWS::SES::ReceiptRule` publishes `After`, `Rule` and `RuleSetName`: neither
             // type publishes a `Tags` property — Amazon SES holds no tags on either — so no
@@ -3943,6 +3955,10 @@ impl Provisioner {
             Self::SesConfigurationSet => {
                 delete_ses_configuration_set(ctx, region, physical_resource_id).await
             }
+            // An identity is addressed by its own TEXT, which is this resource's physical id.
+            Self::SesEmailIdentity => {
+                delete_ses_email_identity(ctx, region, physical_resource_id).await
+            }
             Self::SesReceiptRuleSet => {
                 delete_ses_receipt_rule_set(ctx, region, physical_resource_id).await
             }
@@ -4537,6 +4553,10 @@ impl Provisioner {
             Self::SesConfigurationSet => {
                 describe_ses_configuration_set(ctx, region, physical_resource_id).await
             }
+            // Read back by the same text the delete addresses the identity by.
+            Self::SesEmailIdentity => {
+                describe_ses_email_identity(ctx, region, physical_resource_id).await
+            }
             Self::SesReceiptRuleSet => {
                 describe_ses_receipt_rule_set(ctx, region, physical_resource_id).await
             }
@@ -4743,6 +4763,11 @@ mod data_and_storage;
 mod iam_identities;
 mod application_services;
 mod platform_services;
+/// The Amazon SES email IDENTITY arms, beside the configuration-set and receipt-rule arms
+/// [`platform_services`] holds for the same owning service: an identity is created through
+/// that service's API v2, which owns the type's properties, so its create, delete and read
+/// are their own concern.
+mod ses_email_identities;
 /// The AWS X-Ray GROUP arms, beside the sampling-rule arms of the same service in
 /// [`platform_services`]: a group's identity is an ARN X-Ray draws per group, so its create,
 /// delete and read are their own concern.
@@ -4807,6 +4832,7 @@ pub(crate) use network_and_delivery::*;
 use eks_cluster_workloads::*;
 use s3_table_buckets::*;
 use platform_services::*;
+use ses_email_identities::*;
 use xray_groups::*;
 use route53_policies::*;
 pub(crate) use application_services::*;

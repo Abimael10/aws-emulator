@@ -774,6 +774,20 @@ pub const SNS_TOPIC_INLINE_POLICY: &str = "AWS::SNS::TopicInlinePolicy";
 /// `Fn::GetAtt` attribute, so it carries no entry in [`published_attribute_names`] either.
 pub const SES_CONFIGURATION_SET: &str = "AWS::SES::ConfigurationSet";
 
+/// An Amazon SES email IDENTITY's resource type, under the same namespace. This is the type
+/// `super::provisioning` creates in Amazon SES itself, through the API v2 that owns the
+/// type's properties (`CreateEmailIdentity`).
+///
+/// It carries NO [`return_values`] arm, so the default applies and its physical resource id
+/// is the identity's own text — the domain or the address the declaration states, which is
+/// that type's published return value ("Ref returns the email identity") and the identifier
+/// every operation of the owning service addresses an identity by (`EmailIdentity`, the
+/// `@httpLabel` of `GetEmailIdentity`, `DeleteEmailIdentity` and each
+/// `PutEmailIdentity*Attributes` alike). The property it is read from is the type's own
+/// `EmailIdentity`, which neither naming convention finds, so the type is registered in
+/// [`declared_name_property`].
+pub const SES_EMAIL_IDENTITY: &str = "AWS::SES::EmailIdentity";
+
 /// An Amazon SES receipt rule set's resource type, under the same namespace. This is the
 /// type `super::provisioning` creates in Amazon SES itself, through that service's own
 /// `CreateReceiptRuleSet`.

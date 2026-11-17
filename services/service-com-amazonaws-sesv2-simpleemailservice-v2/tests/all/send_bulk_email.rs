@@ -1596,3 +1596,281 @@ async fn a_template_the_request_carries_or_addresses_by_arn_composes_the_same_me
         );
     }
 }
+
+/// `SendEmail` with `body` as the whole request — the SINGLE-destination sibling of the bulk
+/// send, whose `EmailContent$Template` is composed from the same template by the same
+/// renderer.
+impl Ses {
+    async fn send(&self, body: Value) -> Reply {
+        self.call("POST", "/v2/email/outbound-emails", Some(body))
+            .await
+    }
+}
+
+/// One templated send: the `Template` document it carries, and the message that template
+/// renders for it.
+struct TemplatedCase {
+    case: &'static str,
+    /// The `EmailContent$Template` document the send carries.
+    template: Value,
+    /// The subject line the template renders.
+    subject: &'static str,
+    /// The text part it renders.
+    text: &'static str,
+    /// The HTML part it renders, for a template that carries one.
+    html: Option<&'static str>,
+    /// The headers the template states, which are added to the message.
+    headers: Vec<(String, String)>,
+}
+
+/// RULE: a message a send carries as TEMPLATED content is the template's own subject line and
+/// body parts with the message variables the request's `TemplateData` supplies substituted
+/// into them — the template being the stored one the request names by `TemplateName` or by the
+/// `TemplateArn` that addresses it, or the content the request carries inline — and a variable
+/// the data gives no value for renders as nothing. One send, one `MessageId`, composed through
+/// the same renderer the bulk send above composes each of its destinations with.
+///
+/// The rows differ along what the rule generalises over: HOW the template is identified (name,
+/// ARN, inline content), which parts it carries (subject and text, subject with an HTML part
+/// too), what the data states (every variable, one of them, none of them, no `TemplateData`
+/// member at all), and whether the template adds headers of its own.
+#[tokio::test]
+async fn a_templated_send_composes_its_message_from_the_template() {
+    let ses = seeded().await;
+    let account_id = ::engine::emulator_account_id();
+    let stored_arn = format!("arn:aws:ses:{HOME}:{account_id}:template/{TEMPLATE}");
+    let inline = json!({
+        "Subject": "Welcome {{name}}",
+        "Text": "Hello {{name}}, you paid {{amount}}.",
+        "Html": "<p>Hello {{name}}</p>",
+    });
+    let cases: Vec<TemplatedCase> = vec![
+        TemplatedCase {
+            case: "the stored template by name, with every variable given",
+            template: json!({
+                "TemplateName": TEMPLATE,
+                "TemplateData": "{\"name\":\"Ada\",\"amount\":\"$7.00\"}",
+            }),
+            subject: "Your receipt, Ada",
+            text: "Thanks Ada, you paid $7.00.",
+            html: None,
+            headers: Vec::new(),
+        },
+        TemplatedCase {
+            case: "the same stored template by the ARN that addresses it",
+            template: json!({
+                "TemplateArn": stored_arn,
+                "TemplateData": "{\"name\":\"Ada\",\"amount\":\"$7.00\"}",
+            }),
+            subject: "Your receipt, Ada",
+            text: "Thanks Ada, you paid $7.00.",
+            html: None,
+            headers: Vec::new(),
+        },
+        TemplatedCase {
+            case: "content the request carries inline, with an HTML part too",
+            template: json!({
+                "TemplateContent": inline,
+                "TemplateData": "{\"name\":\"Ada\",\"amount\":\"$7.00\"}",
+            }),
+            subject: "Welcome Ada",
+            text: "Hello Ada, you paid $7.00.",
+            html: Some("<p>Hello Ada</p>"),
+            headers: Vec::new(),
+        },
+        TemplatedCase {
+            case: "data that gives one of the two variables",
+            template: json!({ "TemplateName": TEMPLATE, "TemplateData": "{\"name\":\"Ada\"}" }),
+            subject: "Your receipt, Ada",
+            text: "Thanks Ada, you paid .",
+            html: None,
+            headers: Vec::new(),
+        },
+        TemplatedCase {
+            case: "data that gives neither",
+            template: json!({ "TemplateName": TEMPLATE, "TemplateData": "{}" }),
+            subject: "Your receipt, ",
+            text: "Thanks , you paid .",
+            html: None,
+            headers: Vec::new(),
+        },
+        TemplatedCase {
+            case: "no TemplateData member at all, so every variable renders as nothing",
+            template: json!({ "TemplateName": TEMPLATE }),
+            subject: "Your receipt, ",
+            text: "Thanks , you paid .",
+            html: None,
+            headers: Vec::new(),
+        },
+        TemplatedCase {
+            case: "headers the template states, which are added to the message",
+            template: json!({
+                "TemplateName": TEMPLATE,
+                "TemplateData": "{\"name\":\"Ada\",\"amount\":\"$7.00\"}",
+                "Headers": [
+                    {"Name": "X-Campaign", "Value": "spring"},
+                    {"Name": "X-Audience", "Value": "subscribers"},
+                ],
+            }),
+            subject: "Your receipt, Ada",
+            text: "Thanks Ada, you paid $7.00.",
+            html: None,
+            headers: vec![
+                ("X-Campaign".to_string(), "spring".to_string()),
+                ("X-Audience".to_string(), "subscribers".to_string()),
+            ],
+        },
+    ];
+
+    for TemplatedCase {
+        case,
+        template,
+        subject,
+        text,
+        html,
+        headers,
+    } in cases
+    {
+        let reply = ses
+            .send(json!({
+                "FromEmailAddress": SENDER,
+                "Destination": {"ToAddresses": ["reader@example.net"]},
+                "Content": {"Template": template},
+            }))
+            .await;
+        assert_eq!(
+            reply.status, 200,
+            "case {case:?}: expected the templated send to be accepted, got {} {:?}",
+            reply.status, reply.body
+        );
+        let message_id = reply.text("/MessageId");
+        assert!(
+            !message_id.is_empty(),
+            "case {case:?}: expected an accepted message to carry a MessageId, got {:?}",
+            reply.body
+        );
+        let logged = ses.logged(&message_id);
+        assert_eq!(
+            logged.subject.as_deref(),
+            Some(subject),
+            "case {case:?}: expected the subject the template renders, got {:?}",
+            logged.subject
+        );
+        assert_eq!(
+            logged.body.as_deref(),
+            Some(text),
+            "case {case:?}: expected the text part the template renders, got {:?}",
+            logged.body
+        );
+        assert_eq!(
+            logged.body_html.as_deref(),
+            html,
+            "case {case:?}: expected the HTML part the template renders, got {:?}",
+            logged.body_html
+        );
+        assert_eq!(
+            logged.headers, headers,
+            "case {case:?}: expected the headers the template states, got {:?}",
+            logged.headers
+        );        // The message a client reads back carries the rendered subject too, so what the
+        // render produced is observable over the wire and not only in the log.
+        let read = ses.insights(&message_id).await;
+        assert_eq!(
+            read.text("/Subject"),
+            subject,
+            "case {case:?}: expected the rendered subject to be reported, got {:?}",
+            read.body
+        );
+    }
+}
+
+/// RULE, the other half: a templated send that identifies no template this service can render
+/// is refused for exactly what is wrong with it, and nothing is sent — a name the account
+/// holds no template under is the modelled 404 every operation over an `EmailTemplateName`
+/// answers, data that is no set of key-value pairs and content naming no template at all are
+/// the input error, and content carrying a second form beside the template names no single
+/// message.
+#[tokio::test]
+async fn a_templated_send_that_names_no_renderable_template_is_refused() {
+    let ses = seeded().await;
+    // (case, the `Content` document, the status, the error code, the message)
+    let cases: &[(&str, Value, u16, &str, String)] = &[
+        (
+            "a template name the account holds nothing under",
+            json!({"Template": {"TemplateName": "absent", "TemplateData": "{}"}}),
+            404,
+            "NotFoundException",
+            "Template absent does not exist.".to_string(),
+        ),
+        (
+            "a template ARN addressing a template the account holds nothing under",
+            json!({"Template": {
+                "TemplateArn": format!(
+                    "arn:aws:ses:{HOME}:{}:template/absent",
+                    ::engine::emulator_account_id()
+                ),
+                "TemplateData": "{}",
+            }}),
+            404,
+            "NotFoundException",
+            "Template absent does not exist.".to_string(),
+        ),
+        (
+            "template data that is a JSON list rather than a set of key-value pairs",
+            json!({"Template": {"TemplateName": TEMPLATE, "TemplateData": "[]"}}),
+            400,
+            "BadRequestException",
+            "The template data is not a valid JSON object".to_string(),
+        ),
+        (
+            "template data that is no JSON at all",
+            json!({"Template": {"TemplateName": TEMPLATE, "TemplateData": "name=Ada"}}),
+            400,
+            "BadRequestException",
+            "The template data is not a valid JSON object".to_string(),
+        ),
+        (
+            "a template naming neither a stored template nor content of its own",
+            json!({"Template": {"TemplateData": "{}"}}),
+            400,
+            "BadRequestException",
+            "The template does not exist".to_string(),
+        ),
+        (
+            "content carrying a simple message beside the template",
+            json!({
+                "Template": {"TemplateName": TEMPLATE, "TemplateData": "{}"},
+                "Simple": {"Subject": {"Data": "s"}, "Body": {"Text": {"Data": "t"}}},
+            }),
+            400,
+            "BadRequestException",
+            "Content must carry exactly one of Simple, Raw or Template.".to_string(),
+        ),
+    ];
+
+    for (case, content, status, code, message) in cases {
+        let reply = ses
+            .send(json!({
+                "FromEmailAddress": SENDER,
+                "Destination": {"ToAddresses": ["reader@example.net"]},
+                "Content": content,
+            }))
+            .await;
+        assert_eq!(
+            (reply.status, reply.error_code().as_str(), reply.message()),
+            (*status, *code, message.clone()),
+            "case {case:?}: expected {status} {code} {message:?}, got {} {:?}",
+            reply.status,
+            reply.body
+        );
+    }
+
+    // Nothing was logged and no quota was consumed by a refused send.
+    let account = ses.account().await;
+    assert_eq!(
+        account.body.pointer("/SendQuota/SentLast24Hours"),
+        Some(&json!(0.0)),
+        "a refused templated send must charge no quota, got {:?}",
+        account.body.pointer("/SendQuota")
+    );
+}

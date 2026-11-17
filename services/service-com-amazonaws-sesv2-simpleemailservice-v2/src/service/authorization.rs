@@ -43,15 +43,18 @@
 //! the namespace its actions are published under and the one
 //! [`crate::state::ARN_NAMESPACE`] spells into every ARN this service mints.
 //!
-//! The resource is what the request's own URI ADDRESSES ([`addressed_resource`]): this
-//! model binds its operations under `/v2/email/<family>/<id>/…`, so a request that names one
-//! resource of a family this service mints ARNs for is decided against THAT resource's ARN,
-//! built from the id the URI carried and the Region the caller signed for rather than
-//! resolved out of the store — the decision is then the same whether or not the resource
-//! exists here, and a refusal tells an unauthorized caller nothing about what the account
-//! holds. A request that addresses no single resource of its own — an account-level read, a
-//! send, a listing, a call whose target is an ARN in its BODY — is decided on the weaker
-//! question the shared evaluator publishes for exactly that case
+//! The resource is the one the request ACTS ON ([`addressed_resource`]): this model binds its
+//! operations under `/v2/email/<family>/<id>/…`, so a request that names one resource of a
+//! family this service mints ARNs for is decided against THAT resource's ARN, built from the
+//! identifier the request carried and the Region the caller signed for rather than resolved
+//! out of the store — the decision is then the same whether or not the resource exists here,
+//! and a refusal tells an unauthorized caller nothing about what the account holds. A CREATE
+//! carries that identifier in its INPUT rather than in a URI label, since the resource it
+//! acts on is the one it is about to create ([`RESOURCE_FAMILIES`] names the member each
+//! family's create spells it in), so it is judged against that resource's own ARN and not
+//! against the collection it will join. A request that acts on no single resource of its own
+//! — an account-level read, a send, a listing, a call whose target is an ARN in its BODY — is
+//! decided on the weaker question the shared evaluator publishes for exactly that case
 //! ([`iam::identity_may_allow_action`]): whether any readable document could allow the action
 //! at all. KNOWN BOUND: such a request is therefore granted by a statement scoped to one
 //! resource, which is deliberate — refusing it would deny calls AWS permits, and nothing in
@@ -116,24 +119,33 @@ const EXPIRED_CREDENTIAL_PRINCIPAL: &str = "an expired session credential";
 const MODELLED_PATH_PREFIX: [&str; 2] = ["v2", "email"];
 
 /// Which resource one of this model's URI families addresses, as `(the path segment the
-/// family is bound under, the resource type that resource's ARN carries)`.
+/// family is bound under, the resource type that resource's ARN carries, the input member a
+/// create over that collection names the resource by)`.
 ///
-/// The left column is the segment after [`MODELLED_PATH_PREFIX`] in this model's own `@http`
-/// URIs (`smithy_query(query="operation")`); the right is the resource form SES writes that
+/// The first column is the segment after [`MODELLED_PATH_PREFIX`] in this model's own `@http`
+/// URIs (`smithy_query(query="operation")`); the second is the resource form SES writes that
 /// kind in the resource field of its ARN, which is stated for this service in exactly one
 /// place — the resolution of a caller-supplied `ResourceArn`
 /// (`crate::state::…::resource_tags`: `identity/<identity>`, `contact-list/<name>`,
 /// `configuration-set/<name>`, `dedicated-ip-pool/<name>`) and
-/// [`crate::state::TENANT_RESOURCE_TYPES`] (`template/<name>`). A family this service mints
-/// no ARN for is not listed: a request addressing one is decided as a request that names no
-/// single resource (see the module header), never against an ARN form this service does not
-/// publish.
-const RESOURCE_FAMILIES: [(&str, &str); 5] = [
-    ("identities", "identity"),
-    ("configuration-sets", "configuration-set"),
-    ("contact-lists", "contact-list"),
-    ("dedicated-ip-pools", "dedicated-ip-pool"),
-    ("templates", "template"),
+/// [`crate::state::TENANT_RESOURCE_TYPES`] (`template/<name>`). The third is the required
+/// member the create bound to that collection takes the new resource's name in
+/// (`smithy_query(query="operation")`: `CreateEmailIdentity$EmailIdentity`,
+/// `CreateConfigurationSet$ConfigurationSetName`, `CreateContactList$ContactListName`,
+/// `CreateDedicatedIpPool$PoolName`, `CreateEmailTemplate$TemplateName`). A family this
+/// service mints no ARN for is not listed: a request addressing one is decided as a request
+/// that names no single resource (see the module header), never against an ARN form this
+/// service does not publish.
+const RESOURCE_FAMILIES: [(&str, &str, &str); 5] = [
+    ("identities", "identity", "EmailIdentity"),
+    (
+        "configuration-sets",
+        "configuration-set",
+        "ConfigurationSetName",
+    ),
+    ("contact-lists", "contact-list", "ContactListName"),
+    ("dedicated-ip-pools", "dedicated-ip-pool", "PoolName"),
+    ("templates", "template", "TemplateName"),
 ];
 
 /// The IAM action `operation` is performed under: `ses:<OperationName>`.
@@ -142,18 +154,23 @@ pub fn action_for(operation: &str) -> String {
     format!("{ACTION_PREFIX}:{operation}")
 }
 
-/// The ARN the request to `uri` ADDRESSES, by the ARN forms this service publishes, and
-/// [`EVERY_RESOURCE`] for a request that addresses no single resource of its own.
+/// The ARN the request to `uri` with the input `body` ACTS ON, by the ARN forms this service
+/// publishes, and [`EVERY_RESOURCE`] for a request that acts on no single resource of its
+/// own.
 ///
-/// Read off the REQUEST LINE: this model binds a resource-scoped operation under
+/// Read off the REQUEST: this model binds a resource-scoped operation under
 /// `/v2/email/<family>/<id>…`, with the id in a `@httpLabel`, so the family picks the
 /// resource type ([`RESOURCE_FAMILIES`]) and the segment after it is the id — percent-decoded
 /// the way the codec that deserializes the request decodes a path label, so an identity whose
-/// `@` or `+` a client encoded names the same resource a policy names. Everything else — a
-/// collection path with no id, a family this service mints no ARN for, an account-level path,
-/// a call whose target is an ARN in its body — addresses no single resource.
+/// `@` or `+` a client encoded names the same resource a policy names. A request bound to the
+/// COLLECTION of such a family carries the identifier in its input instead when it is the
+/// create of that family, which is about to make exactly one resource: the name that create's
+/// own required member states is the resource it acts on, so the decision is made against
+/// that resource's ARN. Everything else — a family this service mints no ARN for, an
+/// account-level path, a listing over a collection, a call whose target is an ARN in its body
+/// — acts on no single resource.
 #[must_use]
-pub fn addressed_resource(uri: &str, region: &str) -> String {
+pub fn addressed_resource(uri: &str, region: &str, body: &[u8]) -> String {
     let path = ::service_common::uri_path(uri);
     for (index, expected) in MODELLED_PATH_PREFIX.iter().enumerate() {
         if ::service_common::nth_path_segment(path, index) != Some(*expected) {
@@ -161,15 +178,16 @@ pub fn addressed_resource(uri: &str, region: &str) -> String {
         }
     }
     let family = ::service_common::nth_path_segment(path, MODELLED_PATH_PREFIX.len());
-    let Some((_family, resource_type)) = RESOURCE_FAMILIES
+    let Some((_family, resource_type, name_member)) = RESOURCE_FAMILIES
         .iter()
-        .find(|(bound, _)| Some(*bound) == family)
+        .find(|(bound, _, _)| Some(*bound) == family)
     else {
         return EVERY_RESOURCE.to_string();
     };
     let id = ::service_common::nth_path_segment(path, MODELLED_PATH_PREFIX.len() + 1)
         .map(::service_common::percent_decode_path_label)
-        .filter(|id| !id.is_empty());
+        .filter(|id| !id.is_empty())
+        .or_else(|| named_in_input(body, name_member));
     match id {
         Some(id) => ::emulator_server::emulator_arn(
             crate::state::ARN_NAMESPACE,
@@ -180,13 +198,31 @@ pub fn addressed_resource(uri: &str, region: &str) -> String {
     }
 }
 
+/// The name the request's input states in `member`, for a create that names the resource it
+/// is about to make, or `None` when the body carries no such text.
+///
+/// Only that one member is read: the decision rests on the action and the resource, and
+/// nothing else of the input takes part. A body no reader can make a JSON object of — an
+/// empty one, a listing's own input, a document the framework's walk goes on to refuse — names
+/// nothing.
+fn named_in_input(body: &[u8], member: &str) -> Option<String> {
+    let ::serde_json::Value::Object(input) = ::serde_json::from_slice(body).ok()? else {
+        return None;
+    };
+    input
+        .get(member)?
+        .as_str()
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+}
+
 /// The refusal a request to `operation` on `resource` gets when the documents in force do not
 /// let the caller perform it — the sentence IAM states such a refusal with — and `None` when
 /// they do.
 ///
 /// `operation` is the operation's own name ([`smithy_server_runtime::Operation::NAME`], which
 /// is the routing key this service's protocol resolves) and `resource` the ARN the request
-/// ADDRESSES ([`addressed_resource`]).
+/// ACTS ON ([`addressed_resource`]).
 ///
 /// Asked BEFORE this service's store is read or written, and with an ARN built from what the
 /// request carried rather than from a stored record, so the decision does not depend on
@@ -415,69 +451,129 @@ mod tests {
     /// carry.
     const REGION: &str = "us-east-1";
 
-    /// RULE: the resource a request addresses is read off its own URI — the ARN of the
-    /// resource its family and id name, and IAM's any-resource wildcard for a request that
-    /// names no single resource.
+    /// RULE: the resource a request acts on is read off the request — the ARN of the resource
+    /// its family and id name, the ARN of the resource a create's own input names, and IAM's
+    /// any-resource wildcard for a request that names no single resource.
     ///
-    /// The rows differ along WHAT the URI says: each resource family this service mints ARNs
-    /// for (including `templates`, which no recorded case here drives), a collection path with
-    /// no id, a family this service mints no ARN for, an account-level path, a send, and a
-    /// percent-encoded id.
+    /// The rows differ along WHERE the request states the resource and WHICH family it
+    /// belongs to: every resource family this service mints ARNs for addressed by a URI label
+    /// (including `templates`, which no recorded case here drives), each family's create
+    /// naming it in the input instead, a percent-encoded label, a deeper path under one
+    /// resource, a collection a create's member is absent from, a body that is no JSON object,
+    /// a family this service mints no ARN for, an account-level path and a send.
     #[test]
-    fn the_resource_a_request_addresses_is_read_off_its_uri() {
+    fn the_resource_a_request_acts_on_is_read_off_the_request() {
         let arn = |resource: &str| {
             ::emulator_server::emulator_arn(crate::state::ARN_NAMESPACE, REGION, resource)
         };
-        // (case, the request's URI, the resource the decision is made against)
-        let rows: [(&str, &str, String); 9] = [
+        // (case, the request's URI, the request's body, the resource the decision is made
+        // against)
+        let rows: [(&str, &str, &str, String); 17] = [
             (
                 "an email identity",
                 "/v2/email/identities/sender@example.com",
+                "",
                 arn("identity/sender@example.com"),
             ),
             (
                 "a configuration set",
                 "/v2/email/configuration-sets/probe",
+                "",
                 arn("configuration-set/probe"),
             ),
             (
                 "a contact list",
                 "/v2/email/contact-lists/announcements",
+                "",
                 arn("contact-list/announcements"),
             ),
             (
                 "a dedicated IP pool",
                 "/v2/email/dedicated-ip-pools/warm",
+                "",
                 arn("dedicated-ip-pool/warm"),
             ),
             (
                 "an email template",
                 "/v2/email/templates/receipt",
+                "",
                 arn("template/receipt"),
             ),
             (
                 "a percent-encoded id",
                 "/v2/email/identities/sender%2Btag%40example.com",
+                "",
                 arn("identity/sender+tag@example.com"),
             ),
             (
                 "a deeper path under one resource",
                 "/v2/email/configuration-sets/probe/event-destinations",
+                "",
                 arn("configuration-set/probe"),
             ),
             (
-                "a collection with no id",
+                "the create of an email identity",
                 "/v2/email/identities",
+                r#"{"EmailIdentity":"minted.example.com"}"#,
+                arn("identity/minted.example.com"),
+            ),
+            (
+                "the create of a configuration set",
+                "/v2/email/configuration-sets",
+                r#"{"ConfigurationSetName":"minted-set","Tags":[]}"#,
+                arn("configuration-set/minted-set"),
+            ),
+            (
+                "the create of a contact list",
+                "/v2/email/contact-lists",
+                r#"{"ContactListName":"minted-list"}"#,
+                arn("contact-list/minted-list"),
+            ),
+            (
+                "the create of a dedicated IP pool",
+                "/v2/email/dedicated-ip-pools",
+                r#"{"PoolName":"minted-pool"}"#,
+                arn("dedicated-ip-pool/minted-pool"),
+            ),
+            (
+                "the create of an email template",
+                "/v2/email/templates",
+                r#"{"TemplateName":"minted-template"}"#,
+                arn("template/minted-template"),
+            ),
+            (
+                "a collection whose create member the input does not carry",
+                "/v2/email/identities",
+                r#"{"PageSize":10}"#,
                 EVERY_RESOURCE.to_string(),
             ),
             (
-                "a send, which names no single resource in its URI",
+                "a collection with no body at all",
+                "/v2/email/identities",
+                "",
+                EVERY_RESOURCE.to_string(),
+            ),
+            (
+                "a collection whose body is no JSON object",
+                "/v2/email/contact-lists",
+                "not a document",
+                EVERY_RESOURCE.to_string(),
+            ),
+            (
+                "a family this service mints no ARN for",
+                "/v2/email/suppression/addresses/blocked@example.com",
+                "",
+                EVERY_RESOURCE.to_string(),
+            ),
+            (
+                "a send, which names no single resource",
                 "/v2/email/outbound-emails",
+                r#"{"FromEmailAddress":"sender@example.com"}"#,
                 EVERY_RESOURCE.to_string(),
             ),
         ];
-        for (case, uri, expected) in rows {
-            let actual = addressed_resource(uri, REGION);
+        for (case, uri, body, expected) in rows {
+            let actual = addressed_resource(uri, REGION, body.as_bytes());
             assert_eq!(
                 actual, expected,
                 "case {case:?}: expected {expected:?}, got {actual:?}"
