@@ -32,3 +32,17 @@ botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling
 Boot the cloudformation emulator
 Call ListTypeVersions and observe HTTP 501 with no state persisted
 Replay any of the blocked units above and observe it fail on that refusal
+
+## Resolution
+`ListTypeVersions` is implemented: the handler in
+`services/service-com-amazonaws-cloudformation-cloudformation/src/ops/list_type_versions.rs`
+carries no scaffold header and serves the version records this account and Region's registry
+holds for the identified extension, narrowed by `DeprecatedStatus` and `PublisherId` and paged
+as the model's `@paginated` trait states. All five recorded units replay green.
+
+Its behaviour is pinned end to end by
+`services/service-com-amazonaws-cloudformation-cloudformation/tests/all/list_type_versions_registry_scope.rs`
+(what the listing is served from, the conditional identity across `Arn`/`Type`/`TypeName`, a
+version moving between the LIVE and DEPRECATED listings as `DeregisterType` takes it out of
+active use, and the page token being scoped to the extension it was minted for) and by
+`tests/all/extension_registrations.rs`.

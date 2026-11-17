@@ -26,6 +26,11 @@
 //! version, a registration whose versions are all deprecated, and a publisher the extension
 //! was not published by.
 //!
+//! The suite also holds the listing to the three rules that decide WHICH versions of the
+//! identified extension one response carries: the conditional identity the model states across
+//! `Arn`, `Type` and `TypeName`, the deprecation status `DeprecatedStatus` narrows to, and the
+//! paging of one extension's versions the `@paginated` trait states.
+//!
 //! Every catalogue a row is drawn from is READ from the source that defines it
 //! (`state::template::IMPLEMENTED_RESOURCE_TYPES`,
 //! `service_common::cfn_provisioning::NON_PROVISIONABLE_RESOURCE_TYPES`,
@@ -41,7 +46,9 @@ use service_com_amazonaws_cloudformation_cloudformation::state::registry::{
 use service_com_amazonaws_cloudformation_cloudformation::state::template::IMPLEMENTED_RESOURCE_TYPES;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{call, call_in, member, router_with_engine, store, xml_blocks, xml_text, REGION};
+use crate::harness::{
+    call, call_in, member, refusal, router_with_engine, store, xml_blocks, xml_text, REGION,
+};
 
 /// The error code the registry's own modelled refusal carries on the wire
 /// (`CFNRegistryException`'s `awsQueryError`), which is the only error `ListTypeVersions`
@@ -84,15 +91,14 @@ async fn assert_refused(case: &str, router: &MultiServiceRouter, members: &[(Str
         status, 400,
         "case {case:?}: expected the version listing to be refused, got {status} {body}"
     );
+    let (code, message) = refusal(&body);
     assert_eq!(
-        xml_text(&body, "Code").as_deref(),
-        Some(REGISTRY_REFUSAL_CODE),
+        code, REGISTRY_REFUSAL_CODE,
         "case {case:?}: expected the registry's own refusal code, got {body}"
     );
     assert_eq!(
-        xml_text(&body, "Message").as_deref(),
-        Some(TYPE_DOES_NOT_EXIST),
-        "case {case:?}: expected {TYPE_DOES_NOT_EXIST:?}, got {body}"
+        message, TYPE_DOES_NOT_EXIST,
+        "case {case:?}: expected {TYPE_DOES_NOT_EXIST:?}, got {message:?}"
     );
     assert!(
         listed.is_empty(),
@@ -489,4 +495,354 @@ async fn the_versions_a_registration_holds_are_what_the_listing_reports() {
         ],
     )
     .await;
+}
+
+/// The sentence the registry answers a request that states TWO identities for one listing.
+/// Entirely fixed text: it names neither member's value.
+const TWO_IDENTITIES: &str = "Specify either Arn, or Type and TypeName, but not both: an \
+                              extension is identified by its ARN or by its kind and name";
+
+/// The sentence the registry answers a request that identifies no extension at all.
+const NO_IDENTITY: &str =
+    "Either Arn, or both Type and TypeName, must be specified to identify an extension";
+
+/// One row of the identity table: the members a request carries, and the sentence the
+/// registry refuses that combination with.
+#[derive(Debug)]
+struct IdentityRefusal {
+    case: &'static str,
+    members: Vec<(String, String)>,
+    message: &'static str,
+}
+
+/// RULE: the model states the extension's identity across three members at once —
+/// "Conditional: You must specify either TypeName and Type, or Arn" — so the versions of an
+/// extension are listed for a request stating exactly ONE of those two forms, and every other
+/// combination of the three members identifies no single extension and is refused with the
+/// registry's own modelled `CFNRegistryException`.
+///
+/// The rows span that combination space: each admitted form on its own, each spelling of
+/// stating both forms at once, each half of the name form on its own, and a request carrying
+/// no identifying member at all.
+#[tokio::test]
+async fn only_one_of_the_two_identifying_forms_names_the_extension_to_list() {
+    let (router, engine) = router_with_engine();
+    let held = registration(
+        REGION,
+        registry_type::RESOURCE,
+        "My::Identified::Resource",
+        &["00000001", "00000002"],
+    );
+    {
+        let state = store(&engine);
+        state.lock().extensions = vec![held.clone()];
+    }
+    let expected = vec!["00000001".to_string(), "00000002".to_string()];
+
+    // The two forms the model admits, each stated on its own.
+    for (case, members) in [
+        (
+            "the kind and the name together",
+            vec![
+                member("Type", &held.type_kind),
+                member("TypeName", &held.type_name),
+            ],
+        ),
+        (
+            "the extension's own ARN",
+            vec![member("Arn", &held.arn)],
+        ),
+    ] {
+        let (status, body, listed) = list_type_versions(&router, &members).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the listing to succeed, got {status} {body}"
+        );
+        assert_eq!(
+            listed, expected,
+            "case {case:?}: expected {expected:?}, got {listed:?} in {body}"
+        );
+    }
+
+    // Every other combination of the three members, with the sentence each is refused with.
+    let refusals = vec![
+        IdentityRefusal {
+            case: "both forms at once",
+            members: vec![
+                member("Arn", &held.arn),
+                member("Type", &held.type_kind),
+                member("TypeName", &held.type_name),
+            ],
+            message: TWO_IDENTITIES,
+        },
+        IdentityRefusal {
+            case: "the ARN and the kind",
+            members: vec![member("Arn", &held.arn), member("Type", &held.type_kind)],
+            message: TWO_IDENTITIES,
+        },
+        IdentityRefusal {
+            case: "the ARN and the name",
+            members: vec![member("Arn", &held.arn), member("TypeName", &held.type_name)],
+            message: TWO_IDENTITIES,
+        },
+        // The kind without the name admits every extension of that kind …
+        IdentityRefusal {
+            case: "the kind without the name",
+            members: vec![member("Type", &held.type_kind)],
+            message: NO_IDENTITY,
+        },
+        // … and the name without the kind admits none.
+        IdentityRefusal {
+            case: "the name without the kind",
+            members: vec![member("TypeName", &held.type_name)],
+            message: NO_IDENTITY,
+        },
+        IdentityRefusal {
+            case: "no identifying member at all",
+            members: vec![member("DeprecatedStatus", deprecated_status::LIVE)],
+            message: NO_IDENTITY,
+        },
+    ];
+    for row in refusals {
+        let case = row.case;
+        let expected_message = row.message;
+        let (status, body, listed) = list_type_versions(&router, &row.members).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the listing to be refused, got {status} {body}"
+        );
+        let (code, message) = refusal(&body);
+        assert_eq!(
+            code, REGISTRY_REFUSAL_CODE,
+            "case {case:?}: expected the registry's own refusal code, got {body}"
+        );
+        assert_eq!(
+            message, expected_message,
+            "case {case:?}: expected {expected_message:?}, got {message:?}"
+        );
+        assert!(
+            listed.is_empty(),
+            "case {case:?}: a refusal reports no summaries, got {listed:?}"
+        );
+    }
+}
+
+/// The version ids the listing reports for `extension` in the deprecation status
+/// `status_filter` — `None` for a request naming none, which "the default is LIVE" decides.
+async fn listed_with_status(
+    case: &str,
+    router: &MultiServiceRouter,
+    extension: &registry::StoredExtension,
+    status_filter: Option<&str>,
+) -> Vec<String> {
+    let mut members = vec![
+        member("Type", &extension.type_kind),
+        member("TypeName", &extension.type_name),
+    ];
+    if let Some(status_filter) = status_filter {
+        members.push(member("DeprecatedStatus", status_filter));
+    }
+    let (status, body, listed) = list_type_versions(router, &members).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected the listing to succeed, got {status} {body}"
+    );
+    listed
+}
+
+/// One step of the deprecation table: the version taken out of active use at that step (none
+/// for the state before any was), and the version ids each of the two statuses then reports.
+#[derive(Debug)]
+struct DeprecationStep {
+    case: &'static str,
+    deregistered: Option<&'static str>,
+    live: &'static [&'static str],
+    deprecated: &'static [&'static str],
+}
+
+/// RULE: a version's deprecation status is the VERSION record's own, and `DeprecatedStatus`
+/// narrows the listing to the versions in the status asked for — so taking one version of an
+/// extension out of active use moves exactly that version from the LIVE listing (the one a
+/// request naming no status gets) into the DEPRECATED one, and leaves every other version of
+/// the extension where it was.
+///
+/// The rows span how many versions are in each status, from none deprecated to more than one,
+/// and each is read in all three spellings of the narrowing member.
+#[tokio::test]
+async fn a_deregistered_version_moves_from_the_live_listing_to_the_deprecated_one() {
+    let (router, engine) = router_with_engine();
+    let held = registration(
+        REGION,
+        registry_type::RESOURCE,
+        "My::Narrowed::Resource",
+        &["00000001", "00000002", "00000003"],
+    );
+    {
+        let state = store(&engine);
+        state.lock().extensions = vec![held.clone()];
+    }
+
+    // Each step takes one more version out of active use through the service's own wire. The
+    // record's FIRST version is its default one, which "cannot be deregistered", so the
+    // non-default versions are the ones that move.
+    let steps: &[DeprecationStep] = &[
+        DeprecationStep {
+            case: "nothing deregistered yet",
+            deregistered: None,
+            live: &["00000001", "00000002", "00000003"],
+            deprecated: &[],
+        },
+        DeprecationStep {
+            case: "one version deregistered",
+            deregistered: Some("00000002"),
+            live: &["00000001", "00000003"],
+            deprecated: &["00000002"],
+        },
+        DeprecationStep {
+            case: "two versions deregistered",
+            deregistered: Some("00000003"),
+            live: &["00000001"],
+            deprecated: &["00000002", "00000003"],
+        },
+    ];
+    for step in steps {
+        let case = step.case;
+        if let Some(version_id) = step.deregistered {
+            let (status, body) = call(
+                &router,
+                "DeregisterType",
+                &[
+                    member("Type", &held.type_kind),
+                    member("TypeName", &held.type_name),
+                    member("VersionId", version_id),
+                ],
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the deregistration to be accepted, got {status} {body}"
+            );
+        }
+        for (form, status_filter, expected) in [
+            ("the status the default admits", None, step.live),
+            ("LIVE", Some(deprecated_status::LIVE), step.live),
+            (
+                "DEPRECATED",
+                Some(deprecated_status::DEPRECATED),
+                step.deprecated,
+            ),
+        ] {
+            let case = format!("{case}, asked for {form}");
+            let listed = listed_with_status(&case, &router, &held, status_filter).await;
+            let expected: Vec<String> = expected.iter().map(|id| (*id).to_string()).collect();
+            assert_eq!(
+                listed, expected,
+                "case {case:?}: expected {expected:?}, got {listed:?}"
+            );
+        }
+    }
+}
+
+/// The code this service answers a request it refuses on input grounds with, which is the one
+/// a CloudFormation client branches on.
+const INPUT_REFUSAL_CODE: &str = "ValidationError";
+
+/// What the service answers a well-formed token of this collection presented on a walk it was
+/// not minted for.
+const TOKEN_OF_ANOTHER_WALK: &str = "Hash mismatch.";
+
+/// RULE: `@paginated(inputToken: NextToken, outputToken: NextToken, items:
+/// TypeVersionSummaries, pageSize: MaxResults)` pages ONE extension's versions, so the token a
+/// page hands out resumes that extension's walk just past the page and is refused on another
+/// extension's listing rather than resuming it there.
+#[tokio::test]
+async fn a_version_listings_token_resumes_only_the_extension_it_was_minted_for() {
+    let (router, engine) = router_with_engine();
+    // Two registrations, of different kinds, each holding the same version ids: so what tells
+    // the two walks apart can only be the extension the token was paged under.
+    let paged = registration(
+        REGION,
+        registry_type::RESOURCE,
+        "My::Paged::Resource",
+        &["00000001", "00000002"],
+    );
+    let another = registration(
+        REGION,
+        registry_type::HOOK,
+        "My::Paged::Hook",
+        &["00000001", "00000002"],
+    );
+    {
+        let state = store(&engine);
+        state.lock().extensions = vec![paged.clone(), another.clone()];
+    }
+    let one_at_a_time = |extension: &registry::StoredExtension, token: Option<&str>| {
+        let mut members = vec![
+            member("Type", &extension.type_kind),
+            member("TypeName", &extension.type_name),
+            member("MaxResults", "1"),
+        ];
+        if let Some(token) = token {
+            members.push(member("NextToken", token));
+        }
+        members
+    };
+
+    // The first page of one extension's versions, and the token that resumes past it.
+    let (status, body, first) = list_type_versions(&router, &one_at_a_time(&paged, None)).await;
+    assert_eq!(
+        status, 200,
+        "case \"the first page\": expected the listing to succeed, got {status} {body}"
+    );
+    assert_eq!(
+        first,
+        vec!["00000001".to_string()],
+        "case \"the first page\": expected the first version alone, got {first:?} in {body}"
+    );
+    let token = xml_text(&body, "NextToken").unwrap_or_else(|| {
+        panic!("case \"the first page\": expected a token past the page, got {body}")
+    });
+
+    // On the extension it was minted for, it resumes immediately past that page.
+    let (status, body, second) =
+        list_type_versions(&router, &one_at_a_time(&paged, Some(&token))).await;
+    assert_eq!(
+        status, 200,
+        "case \"the page the token resumes\": expected the listing to succeed, got {status} \
+         {body}"
+    );
+    assert_eq!(
+        second,
+        vec!["00000002".to_string()],
+        "case \"the page the token resumes\": expected the version past the first page, got \
+         {second:?} in {body}"
+    );
+    assert_eq!(
+        xml_text(&body, "NextToken"),
+        None,
+        "case \"the last page\": a page that leaves nothing behind carries no token, got {body}"
+    );
+
+    // On another extension's listing, it is the token of another walk.
+    let (status, body, listed) =
+        list_type_versions(&router, &one_at_a_time(&another, Some(&token))).await;
+    assert_eq!(
+        status, 400,
+        "case \"another extension's listing\": expected the token to be refused, got {status} \
+         {body}"
+    );
+    let (code, message) = refusal(&body);
+    assert_eq!(
+        code, INPUT_REFUSAL_CODE,
+        "case \"another extension's listing\": expected {INPUT_REFUSAL_CODE}, got {body}"
+    );
+    assert_eq!(
+        message, TOKEN_OF_ANOTHER_WALK,
+        "case \"another extension's listing\": expected {TOKEN_OF_ANOTHER_WALK:?}, got \
+         {message:?}"
+    );
+    assert!(
+        listed.is_empty(),
+        "case \"another extension's listing\": a refusal reports no summaries, got {listed:?}"
+    );
 }
