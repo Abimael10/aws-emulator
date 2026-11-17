@@ -23,6 +23,8 @@ mod control_plane_rules;
 mod customized_metric_alarms;
 #[path = "all/custom_resource_endpoint_targets.rs"]
 mod custom_resource_endpoint_targets;
+#[path = "all/custom_resource_target_tracking.rs"]
+mod custom_resource_target_tracking;
 #[path = "all/emulator.rs"]
 mod emulator;
 #[path = "all/keyspaces_table_resolution.rs"]

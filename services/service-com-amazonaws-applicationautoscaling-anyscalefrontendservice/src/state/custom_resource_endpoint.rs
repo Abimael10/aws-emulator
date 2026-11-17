@@ -218,8 +218,14 @@ pub async fn set_capacity(
 
 /// The document a request to MOVE the resource's capacity carries: the one member the
 /// contract names, as the number the endpoint reports its capacity as.
+///
+/// The document is rendered as the service words it — the member name, a colon and a space,
+/// and the capacity as a decimal number — rather than by a serialiser of this emulator's
+/// choosing, because the caller's own endpoint receives the bytes: an application that reads
+/// the raw body it was sent (recorded behaviour: an endpoint that stores what arrived sees
+/// `{"desiredCapacity": 4.0}`) would see a different document from one spelt any other way.
 fn capacity_document(capacity: i32) -> String {
-    ::serde_json::json!({DESIRED_CAPACITY: f64::from(capacity)}).to_string()
+    format!("{{\"{DESIRED_CAPACITY}\": {:?}}}", f64::from(capacity))
 }
 
 /// Make one request on the endpoint over the in-process transport, answering what it
@@ -316,10 +322,10 @@ mod tests {
         /// (case, the capacity, the document sent for it)
         type Row<'a> = (&'a str, i32, &'a str);
         let rows: &[Row<'_>] = &[
-            ("a capacity of one", 1, r#"{"desiredCapacity":1.0}"#),
-            ("the floor a registration pulled up to", 3, r#"{"desiredCapacity":3.0}"#),
-            ("no capacity at all", 0, r#"{"desiredCapacity":0.0}"#),
-            ("a large capacity", 1200, r#"{"desiredCapacity":1200.0}"#),
+            ("a capacity of one", 1, r#"{"desiredCapacity": 1.0}"#),
+            ("the floor a registration pulled up to", 3, r#"{"desiredCapacity": 3.0}"#),
+            ("no capacity at all", 0, r#"{"desiredCapacity": 0.0}"#),
+            ("a large capacity", 1200, r#"{"desiredCapacity": 1200.0}"#),
         ];
         for (case, capacity, expected) in rows {
             let actual = capacity_document(*capacity);

@@ -872,3 +872,9 @@ mod stage_method_settings_key;
 // completeness refusal stays distinct from the unreadable-ARN one.
 #[path = "all/domain_name_certificate_completeness.rs"]
 mod domain_name_certificate_completeness;
+// Appended for the reason the note above gives: the DIRECTIVES a mapping template is
+// performed for — `#set`, which binds a name the references after it render, and the
+// conditional family, which renders the one branch its condition chooses — beside the
+// directives that are still statements this emulator does not perform.
+#[path = "all/stage_set_directive.rs"]
+mod stage_set_directive;

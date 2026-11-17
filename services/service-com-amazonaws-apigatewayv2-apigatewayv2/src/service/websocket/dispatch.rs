@@ -550,10 +550,11 @@ mod tests {
             ("$stageVariables.tenant", Some("acme")),
             ("$input.json('$.action')", Some("\"ping\"")),
             ("price $9", Some("price $9")),
-            // Not rendered: a reference this call has no value for, and a directive.
+            // Not rendered: a reference this call has no value for, and a directive this
+            // emulator does not perform.
             ("$stageVariables.where", None),
             ("$context.nothing", None),
-            ("#set($x = 1)", None),
+            ("#foreach($x in $input.path('$.ids'))x#end", None),
         ];
         for (template, expected) in cases {
             let rendered = rendered_template(template, Some(call)).ok();

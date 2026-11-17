@@ -233,7 +233,7 @@ async fn every_internal_error_a_deployed_stage_answers_names_its_exception_class
         "templated",
         json!({
             "type": "MOCK",
-            "requestTemplates": { JSON: "#set($held = 1)\n{\"held\": $held}" },
+            "requestTemplates": { JSON: "#foreach($i in $input.path('$.ids'))\n{\"held\": 1}\n#end" },
         }),
     )
     .await;

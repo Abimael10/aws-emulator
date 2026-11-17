@@ -596,6 +596,9 @@ pub mod trail_log_files;
 /// documents a gateway control plane generates from it: the sample payload one answers a
 /// template request with, and the mapping skeleton the other does.
 pub mod model_mapping_template;
+/// The VELOCITY TEMPLATE LANGUAGE — its syntax and the value model its operators are
+/// defined over — read once for the two services whose API takes a template written in it.
+pub mod velocity_template;
 pub mod network;
 /// The framing of a response that carries no content: a success whose modelled output has
 /// no member answers 204 with no body, not the empty JSON object a serializer renders.

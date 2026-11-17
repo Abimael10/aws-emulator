@@ -415,7 +415,10 @@ async fn a_template_this_emulator_does_not_render_is_a_configuration_error() {
     // the documented set this call carries values for. Each is answered through the api's
     // own `API_CONFIGURATION_ERROR` gateway response rather than with a body guessed at.
     let unrendered: &[(&str, &str)] = &[
-        ("a directive", "#set($root = $input.path('$'))\n{\"a\":1}"),
+        (
+            "a directive this emulator does not perform",
+            "#foreach($i in $input.path('$.ids'))\n{\"a\":1}\n#end",
+        ),
         ("a comment directive", "## a comment"),
         (
             "a transformation this emulator does not perform",
@@ -485,7 +488,10 @@ async fn a_request_template_this_emulator_does_not_render_is_a_configuration_err
     // perform — the same exit its response template takes, rather than a status and a body
     // nothing produced.
     let unrendered: &[(&str, &str)] = &[
-        ("a directive", "#set($code = 200)\n{\"statusCode\": $code}"),
+        (
+            "a directive this emulator does not perform",
+            "#foreach($i in $input.path('$.ids'))\n{\"statusCode\": 200}\n#end",
+        ),
         (
             "a context member this call carries no value for",
             r#"{"statusCode": 200, "who": "$context.status"}"#,

@@ -35,20 +35,20 @@ use super::emulator::{error_code, error_message, REGION};
 /// The dimension the namespace publishes: its resource type and scaling property are
 /// placeholders, since "custom resources are not supported with a resource type […] the unique
 /// identifier is defined by the service provider".
-const DIMENSION: &str = "custom-resource:ResourceType:Property";
+pub(crate) const DIMENSION: &str = "custom-resource:ResourceType:Property";
 
 /// The table the endpoint's items live in: one item per scalable dimension, carrying the
 /// capacity the caller's own resource is at.
-const CAPACITY_TABLE: &str = "endpoint_capacity";
+pub(crate) const CAPACITY_TABLE: &str = "endpoint_capacity";
 
 /// The capacity the endpoint reports, which is what the registered window is enforced on.
 const REPORTED_CAPACITY: i64 = 2;
 
 /// The path the custom-resource contract publishes for one scalable dimension.
-const DIMENSION_PATH: &str = "scalableTargetDimensions";
+pub(crate) const DIMENSION_PATH: &str = "scalableTargetDimensions";
 
 /// The stage the endpoint is deployed to.
-const DEPLOYED_STAGE: &str = "prod";
+pub(crate) const DEPLOYED_STAGE: &str = "prod";
 
 /// A stage name the api carries no deployment of, so the endpoint it addresses serves nothing.
 const UNDEPLOYED_STAGE: &str = "never-deployed";
@@ -68,7 +68,7 @@ const MISSING_PERMISSIONS: &str =
 
 /// Application Auto Scaling, Amazon API Gateway — which serves the endpoint — and the two
 /// services a registration also touches, over ONE engine.
-fn router() -> MultiServiceRouter {
+pub(crate) fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // The suites drive unsigned requests; the `Authorization` header is still what routes each
@@ -103,7 +103,7 @@ fn router() -> MultiServiceRouter {
 }
 
 /// Call one Application Auto Scaling operation.
-async fn application_auto_scaling(
+pub(crate) async fn application_auto_scaling(
     router: &MultiServiceRouter,
     operation: &str,
     body: Value,
@@ -160,7 +160,11 @@ async fn api_gateway(
 }
 
 /// Call one DynamoDB operation, which is where the endpoint's items live.
-async fn dynamodb(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
+pub(crate) async fn dynamodb(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: Value,
+) -> (u16, Value) {
     let host = format!("dynamodb.{REGION}.amazonaws.com");
     let request = http::Request::builder()
         .method("POST")
@@ -184,8 +188,17 @@ async fn dynamodb(router: &MultiServiceRouter, operation: &str, body: Value) -> 
 }
 
 /// Create the table the endpoint's items live in, with one item per dimension at
-/// [`REPORTED_CAPACITY`], and wait for the owning service to make it writable.
+/// [`REPORTED_CAPACITY`].
 async fn given_items(router: &MultiServiceRouter, dimensions: &[String]) {
+    given_capacity_table(router).await;
+    for dimension in dimensions {
+        given_item(router, dimension, REPORTED_CAPACITY).await;
+    }
+}
+
+/// Create the table the endpoint's items live in, and wait for the owning service to make it
+/// writable.
+pub(crate) async fn given_capacity_table(router: &MultiServiceRouter) {
     let (status, created) = dynamodb(
         router,
         "CreateTable",
@@ -216,29 +229,33 @@ async fn given_items(router: &MultiServiceRouter, dimensions: &[String]) {
         );
         tokio::time::sleep(POLL_EVERY).await;
     }
-    for dimension in dimensions {
-        let (status, written) = dynamodb(
-            router,
-            "PutItem",
-            json!({
-                "TableName": CAPACITY_TABLE,
-                "Item": {
-                    "id": {"S": dimension},
-                    "desired": {"N": REPORTED_CAPACITY.to_string()},
-                },
-            }),
-        )
-        .await;
-        assert_eq!(
-            status, 200,
-            "setup PutItem({dimension}): expected 200, got {status} {written:?}"
-        );
-    }
+}
+
+/// Put the item the endpoint serves for one dimension, at `capacity`, with the counter its
+/// `PATCH` integration adds to.
+pub(crate) async fn given_item(router: &MultiServiceRouter, dimension: &str, capacity: i64) {
+    let (status, written) = dynamodb(
+        router,
+        "PutItem",
+        json!({
+            "TableName": CAPACITY_TABLE,
+            "Item": {
+                "id": {"S": dimension},
+                "desired": {"N": capacity.to_string()},
+                "patches": {"N": "0"},
+            },
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "setup PutItem({dimension}): expected 200, got {status} {written:?}"
+    );
 }
 
 /// The capacity the endpoint's own item holds for one dimension right now, as the service
 /// that owns it reports.
-async fn item_capacity(router: &MultiServiceRouter, dimension: &str) -> Option<f64> {
+pub(crate) async fn item_capacity(router: &MultiServiceRouter, dimension: &str) -> Option<f64> {
     let (status, read) = dynamodb(
         router,
         "GetItem",
@@ -271,7 +288,7 @@ fn member(body: &Value, name: &str, case: &str) -> String {
 /// `GET` reads the item and renders the document the contract declares, and the `PATCH` writes
 /// the `desiredCapacity` its body carries into that item. So what this suite observes is the
 /// caller's own resource moving, not an answer shaped like one.
-async fn given_endpoint(router: &MultiServiceRouter) -> String {
+pub(crate) async fn given_endpoint(router: &MultiServiceRouter) -> String {
     let (status, created) = api_gateway(
         router,
         "POST",

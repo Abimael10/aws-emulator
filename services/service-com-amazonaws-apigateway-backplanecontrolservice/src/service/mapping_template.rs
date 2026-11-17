@@ -18,6 +18,17 @@
 //! are a CLOSED set of values read off this call, so rendering one is a lookup, not an
 //! evaluation: nothing here executes anything the template says.
 //!
+//! The DIRECTIVES a template is performed for are the ones that state something about those
+//! same values ([`directives`]): `#set`, because what it states is a BINDING — "the `#set`
+//! directive is used to set the value of a reference", so the name it binds is a value of
+//! this same closed set, read once and resolved by the references that name it afterwards —
+//! and the conditional family (`#if`, `#elseif`, `#else`, `#end`), because what it states is a
+//! CHOICE between two pieces of the template decided by a condition over them. Together they
+//! are what lets a template name a SUB-DOCUMENT of the payload (the form every API Gateway
+//! mapping-template example opens with) and render one document for a request that carries a
+//! member and another for one that does not. A directive's own line renders nothing, and the
+//! text of a branch this call does not take renders nothing and resolves nothing.
+//!
 //! Everything else stays unrendered, and the caller of this module answers such a template
 //! the way it answers an integration it cannot perform:
 //!
@@ -31,14 +42,19 @@
 //!   gives for a string literal;
 //! * a `$input` reference to the payload where the call has no payload the template can
 //!   read (see [`TemplateInputs::payload`]);
-//! * a DIRECTIVE (`#set`, `#if`, `#foreach`, …), which is the half of the language that is
-//!   statements rather than values. Deciding what a directive produces means executing it,
-//!   which this emulator does not do; the caller checks for one before rendering.
+//! * a directive that is neither a binding nor a choice (`#foreach`, `#macro`, `#parse`, a
+//!   comment), which is a statement whose output this emulator does not decide; the caller
+//!   checks for one before rendering.
 //!
 //! A `$` that opens no reference at all is literal text, exactly as the language treats it,
 //! so a template carrying no reference renders to itself.
 
 use std::collections::BTreeMap;
+
+use ::service_common::velocity_template::Expr;
+
+/// Reading the directives a template is performed for: `#set` and the conditional family.
+mod directives;
 
 /// What a mapping template's references are rendered against: one call, as the method
 /// request and the stage present it.
@@ -105,8 +121,8 @@ const MAX_RENDER_WORK: usize = 4 * 1024 * 1024;
 
 
 /// `template` rendered against `inputs`, refusing outright a template that carries a
-/// DIRECTIVE — the half of the language that is statements rather than values (see the
-/// module docs).
+/// CONTROL-FLOW directive — the half of the language that is statements rather than values
+/// (see the module docs).
 ///
 /// The ONE entry point for a caller that renders a mapping template and reports both
 /// refusals the same way. The REST data plane in this crate checks the two halves
@@ -118,7 +134,7 @@ pub fn rendered_without_directives(
     template: &str,
     inputs: &TemplateInputs,
 ) -> Result<String, Unrendered> {
-    if super::invoke::carries_velocity_directive(template) {
+    if super::invoke::carries_unperformed_directive(template) {
         return Err(Unrendered {
             reason: "it carries a Velocity directive, which is a statement this emulator \
                      does not execute"
@@ -131,9 +147,9 @@ pub fn rendered_without_directives(
 /// `template` rendered against `inputs`, or the first reason this emulator does not render
 /// it.
 ///
-/// The work is one pass over the template: every character is either copied or part of a
-/// reference, and resolving a reference is a map lookup or one query of the payload — which
-/// is read as a document once per rendering, not once per reference. So rendering costs a
+/// The work is one pass over the template: every character is either copied, part of a
+/// reference or part of a `#set`, and resolving a reference is a map lookup or one query of
+/// the payload — which is read as a document once per rendering. So rendering costs a
 /// constant per template character, plus one value per reference, plus the reads
 /// [`MAX_RENDER_WORK`] bounds; the body it produces is bounded by [`MAX_RENDERED_BYTES`].
 pub fn rendered(template: &str, inputs: &TemplateInputs) -> Result<String, Unrendered> {
@@ -141,21 +157,61 @@ pub fn rendered(template: &str, inputs: &TemplateInputs) -> Result<String, Unren
     let mut render = Render {
         inputs,
         document: None,
+        bindings: BTreeMap::new(),
         work: MAX_RENDER_WORK,
     };
     let mut rendered = String::with_capacity(template.len());
+    // The conditional directives this template has opened and not closed yet: what decides
+    // whether the text being read is rendered at all.
+    let mut branches: Vec<Branch> = Vec::new();
     let mut at = 0usize;
     while at < glyphs.len() {
+        // A directive is a statement about the call — a binding, or a choice between two
+        // pieces of the template — and renders nothing itself; a `#` that opens none is text,
+        // which is what the language does with one (a colour, a fragment, a comment the
+        // caller already refused).
+        if glyphs[at] == '#' {
+            match directives::directive_at(&glyphs, at) {
+                Some(Ok((directive, next))) => {
+                    render.perform(&directive, &mut branches)?;
+                    at = directives::past_gobbled_newline(&glyphs, next);
+                }
+                Some(Err(reason)) => {
+                    return Err(Unrendered {
+                        reason: format!("it carries a directive and {reason}"),
+                    })
+                }
+                None => {
+                    if emitting(&branches) {
+                        rendered.push('#');
+                    }
+                    at += 1;
+                }
+            }
+            continue;
+        }
         if glyphs[at] != '$' {
-            rendered.push(glyphs[at]);
+            if emitting(&branches) {
+                rendered.push(glyphs[at]);
+            }
             at += 1;
             continue;
         }
         // A `$` that does not open a reference is text: the language renders it as it
         // stands, which is what a price or a shell-looking literal in a body is.
         if !opens_reference(&glyphs, at) {
-            rendered.push('$');
+            if emitting(&branches) {
+                rendered.push('$');
+            }
             at += 1;
+            continue;
+        }
+        // The text of a branch this call does NOT take is not rendered at all, so a
+        // reference inside it names nothing and resolves nothing: it is stepped over. That
+        // is what makes a template whose other branch reads a member this call has no value
+        // for renderable — the branch it took is the one that had to resolve.
+        if !emitting(&branches) {
+            at = reference_at(&glyphs, at, 0).map_or(at + 1, |(_, next)| next);
             continue;
         }
         // From here it IS a reference, so a text this module cannot take apart leaves the
@@ -181,22 +237,291 @@ pub fn rendered(template: &str, inputs: &TemplateInputs) -> Result<String, Unren
         }
         at = next;
     }
+    if !branches.is_empty() {
+        return Err(Unrendered {
+            reason: "it opens a #if it does not close".to_string(),
+        });
+    }
     Ok(rendered)
 }
 
+/// How many conditional directives one template may have open at once.
+///
+/// The template is caller-stored data, so the nesting this emulator follows is bounded here
+/// rather than by that text; it sits far above the one or two levels a mapping template is
+/// written with.
+const MAX_BRANCH_DEPTH: usize = 16;
+
+/// How deeply the expression of a directive may nest before this emulator stops evaluating
+/// it.
+///
+/// The evaluation recurses over the expression tree the language's reader built, and that
+/// tree is as deep as the stored template spells it — so the recursion is charged and refused
+/// at a bound of its own, the sibling of the one a reference's arguments are read under
+/// ([`MAX_REFERENCE_DEPTH`]). The reader bounds the tree it builds too
+/// (`::service_common::velocity_template::MAX_NESTING`); this is the bound of the walk over
+/// it, so neither rests on the other.
+const MAX_EXPRESSION_DEPTH: usize = 16;
+
+/// One conditional directive of a template that is open: whether the piece being read now is
+/// rendered, whether a branch of it has already been taken, and whether the directive itself
+/// sits in rendered text.
+#[derive(Debug)]
+struct Branch {
+    /// Whether the text up to the next `#elseif`/`#else`/`#end` is rendered.
+    emitting: bool,
+    /// Whether a branch of this directive has already been taken, so a later one is not.
+    taken: bool,
+    /// Whether the `#if` itself was reached in rendered text: a conditional nested inside a
+    /// branch nothing takes renders nothing whatever its own condition says.
+    inside: bool,
+}
+
+/// Whether the text being read now is rendered: every conditional directive open over it has
+/// to be rendering its current branch.
+fn emitting(branches: &[Branch]) -> bool {
+    branches.iter().all(|branch| branch.emitting)
+}
+
 /// One rendering in progress: the values it resolves against, the payload read as a
-/// document at most ONCE, and what is left of the reads [`MAX_RENDER_WORK`] allows.
+/// document at most ONCE, the names this template's own `#set` directives have bound, and
+/// what is left of the reads [`MAX_RENDER_WORK`] allows.
 struct Render<'i> {
     inputs: &'i TemplateInputs,
     /// The payload as a JSON document: `None` until a reference needs it, `Some(None)` once
     /// it has been read and is not a JSON document (or there is no payload to read), so
     /// neither the parse nor the refusal happens twice.
     document: Option<Option<::serde_json::Value>>,
+    /// What the `#set` directives seen so far have bound, by name.
+    bindings: BTreeMap<String, ::serde_json::Value>,
     /// How many more bytes this rendering may READ.
     work: usize,
 }
 
 impl Render<'_> {
+    /// Perform one directive: a `#set` binds a name for the references that follow it, and a
+    /// conditional opens, moves on or closes the choice it states.
+    ///
+    /// Nothing is bound and no condition is evaluated inside a branch this call does not
+    /// take: the piece of template it sits in renders nothing, so what it says about the call
+    /// is not asked at all.
+    fn perform(
+        &mut self,
+        directive: &directives::Directive,
+        branches: &mut Vec<Branch>,
+    ) -> Result<(), Unrendered> {
+        use directives::Directive;
+
+        let inside = emitting(branches);
+        match directive {
+            Directive::Set { name, value } => {
+                if inside {
+                    // A binding may hold a sub-document of the payload, so it is charged the
+                    // size of what it came to as well as the read that produced it: the
+                    // bindings of one rendering are bounded by the same budget every other
+                    // read is charged against, so one cannot be grown by copying it.
+                    let bound = self.value_of(value, 0)?;
+                    self.spend(weight(&bound))?;
+                    self.bindings.insert(name.clone(), bound);
+                }
+            }
+            Directive::If(condition) => {
+                if branches.len() >= MAX_BRANCH_DEPTH {
+                    return Err(Unrendered {
+                        reason: format!(
+                            "it nests conditional directives deeper than the \
+                             {MAX_BRANCH_DEPTH} this emulator performs"
+                        ),
+                    });
+                }
+                let taken = inside && self.truth(condition, 0)?;
+                branches.push(Branch {
+                    emitting: taken,
+                    taken,
+                    inside,
+                });
+            }
+            Directive::ElseIf(condition) => {
+                let Some(open) = branches.last() else {
+                    return Err(Unrendered {
+                        reason: "it carries a #elseif that closes no #if".to_string(),
+                    });
+                };
+                let (already, inside) = (open.taken, open.inside);
+                let take = !already && inside && self.truth(condition, 0)?;
+                if let Some(open) = branches.last_mut() {
+                    open.emitting = take;
+                    open.taken = already || take;
+                }
+            }
+            Directive::Else => {
+                let Some(open) = branches.last_mut() else {
+                    return Err(Unrendered {
+                        reason: "it carries a #else that closes no #if".to_string(),
+                    });
+                };
+                open.emitting = open.inside && !open.taken;
+                open.taken = true;
+            }
+            Directive::End => {
+                if branches.pop().is_none() {
+                    return Err(Unrendered {
+                        reason: "it carries a #end that closes no #if".to_string(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `condition` holds for this call.
+    ///
+    /// The truth of a value is the LANGUAGE's rule, so it is the tree's one reading of it
+    /// (`::service_common::velocity_template::truthy`): a boolean decides by its own value and
+    /// every other value by being there at all, an empty string and a zero among them.
+    ///
+    /// `depth` is how many expressions this evaluation is already inside
+    /// ([`MAX_EXPRESSION_DEPTH`]): an expression nests as deeply as the stored template
+    /// spells it, so the recursion over it is charged and refused rather than run as deep as
+    /// that text.
+    fn truth(&mut self, condition: &Expr, depth: usize) -> Result<bool, Unrendered> {
+        let value = self.value_of(condition, depth)?;
+        Ok(::service_common::velocity_template::truthy(Some(&value)))
+    }
+
+    /// The value one expression of a directive names.
+    ///
+    /// The operators are the language's own, and what each of them comes to is the shared
+    /// reading of its value model; what this plane does not perform is arithmetic over the
+    /// call's values and the list and map an expression may build, which name no value of a
+    /// method request.
+    fn value_of(
+        &mut self,
+        expression: &Expr,
+        depth: usize,
+    ) -> Result<::serde_json::Value, Unrendered> {
+        use ::serde_json::Value;
+        use ::service_common::velocity_template::{equal, ordering, truthy, Operator};
+
+        if depth > MAX_EXPRESSION_DEPTH {
+            return Err(Unrendered {
+                reason: format!(
+                    "it carries an expression nested deeper than the {MAX_EXPRESSION_DEPTH} \
+                     this emulator evaluates"
+                ),
+            });
+        }
+        let unperformed = || Unrendered {
+            reason: "it carries an expression this emulator does not evaluate over the values \
+                     of a call"
+                .to_string(),
+        };
+        match expression {
+            Expr::Literal(value) => Ok(value.clone()),
+            // "double quotes […] will render references": the interpolated form is rendered
+            // as a template of its own, so its value is the text it renders to — charged
+            // against the same budget as every other read.
+            Expr::Interpolated(nodes) => {
+                let text = self.interpolated(nodes)?;
+                self.spend(text.len())?;
+                Ok(Value::String(text))
+            }
+            Expr::Reference(reference) => {
+                self.spend(self.query_cost())?;
+                let reference = named(reference).ok_or_else(unperformed)?;
+                self.evaluated(&reference)
+            }
+            Expr::Not(inner) => Ok(Value::Bool(!self.truth(inner, depth + 1)?)),
+            Expr::Binary(operator, left, right) => match operator {
+                Operator::And => Ok(Value::Bool(
+                    self.truth(left, depth + 1)? && self.truth(right, depth + 1)?,
+                )),
+                Operator::Or => Ok(Value::Bool(
+                    self.truth(left, depth + 1)? || self.truth(right, depth + 1)?,
+                )),
+                Operator::Equal | Operator::NotEqual => {
+                    let left = self.value_of(left, depth + 1)?;
+                    let right = self.value_of(right, depth + 1)?;
+                    let same = equal(Some(&left), Some(&right));
+                    Ok(Value::Bool(if *operator == Operator::Equal {
+                        same
+                    } else {
+                        !same
+                    }))
+                }
+                Operator::Less
+                | Operator::LessOrEqual
+                | Operator::Greater
+                | Operator::GreaterOrEqual => {
+                    let left = self.value_of(left, depth + 1)?;
+                    let right = self.value_of(right, depth + 1)?;
+                    // Two values the language cannot order decide nothing, so the comparison
+                    // is false rather than the template being refused: that is what a
+                    // condition over a member the call does not carry asks.
+                    let Ok(order) = ordering(Some(&left), Some(&right)) else {
+                        return Ok(Value::Bool(false));
+                    };
+                    use ::std::cmp::Ordering;
+                    Ok(Value::Bool(match operator {
+                        Operator::Less => order == Ordering::Less,
+                        Operator::LessOrEqual => order != Ordering::Greater,
+                        Operator::Greater => order == Ordering::Greater,
+                        _ => order != Ordering::Less,
+                    }))
+                }
+                _ => Err(unperformed()),
+            },
+            // A value this plane builds nothing from: the arithmetic of the language, and the
+            // list and map an expression may carry.
+            Expr::Negate(_) | Expr::List(_) | Expr::Map(_) => {
+                let _ = truthy(None);
+                Err(unperformed())
+            }
+        }
+    }
+
+    /// The text an interpolated literal renders to: the references inside it resolved
+    /// against this same call, and everything else as written.
+    ///
+    /// The literal was parsed as a template of its own, so what it carries are the same
+    /// nodes; a directive inside one is not performed — it is a statement about the call in a
+    /// place that states a value.
+    fn interpolated(
+        &mut self,
+        nodes: &[::service_common::velocity_template::Node],
+    ) -> Result<String, Unrendered> {
+        use ::service_common::velocity_template::Node;
+
+        let mut rendered = String::new();
+        for node in nodes {
+            match node {
+                Node::Text(text) => rendered.push_str(text),
+                Node::Write { reference, .. } => {
+                    let reference = named(reference).ok_or_else(|| Unrendered {
+                        reason: "it carries a reference this emulator does not read".to_string(),
+                    })?;
+                    rendered.push_str(&self.resolved(&reference)?);
+                }
+                _ => {
+                    return Err(Unrendered {
+                        reason: "it carries a directive inside a value, which this emulator \
+                                 does not perform"
+                            .to_string(),
+                    })
+                }
+            }
+            if rendered.len() > MAX_RENDERED_BYTES {
+                return Err(Unrendered {
+                    reason: format!(
+                        "it renders to more than the {MAX_RENDERED_BYTES} bytes this emulator \
+                         renders"
+                    ),
+                });
+            }
+        }
+        Ok(rendered)
+    }
+
     /// Charge `cost` bytes of reading to this rendering, or refuse it for having done all
     /// the work one request may cause.
     fn spend(&mut self, cost: usize) -> Result<(), Unrendered> {
@@ -479,13 +804,41 @@ fn arguments_at(glyphs: &[char], at: usize, depth: usize) -> Option<(Vec<Argumen
 }
 
 impl Render<'_> {
-    /// The value `reference` names, or the reference itself when this emulator resolves
+    /// The TEXT `reference` renders to, or the reason this emulator renders none.
+    ///
+    /// A value renders as the text the language writes it as: a string as itself, a number
+    /// or a boolean as it spells, and a value the call does not have as nothing. An OBJECT
+    /// or an ARRAY is a Java object whose own rendering AWS does not state, so it is left
+    /// unresolved rather than written as something else — which is why a template that
+    /// means to read inside one BINDS it first (`#set`) and renders the members it names.
+    fn resolved(&mut self, reference: &Reference) -> Result<String, Unrendered> {
+        match self.evaluated(reference)? {
+            ::serde_json::Value::String(text) => Ok(text),
+            node @ (::serde_json::Value::Number(_) | ::serde_json::Value::Bool(_)) => {
+                Ok(node.to_string())
+            }
+            ::serde_json::Value::Null => Ok(String::new()),
+            ::serde_json::Value::Object(_) | ::serde_json::Value::Array(_) => Err(Unrendered {
+                reason: format!(
+                    "it names {}, which this emulator resolves no value of this call for",
+                    reference.source
+                ),
+            }),
+        }
+    }
+
+    /// The VALUE `reference` names, or the reference itself when this emulator resolves
     /// none.
     ///
-    /// Every variable below is one API Gateway documents a mapping template against, and
-    /// every method is one that variable documents; a reference outside that set is
-    /// answered as unresolved rather than rendered as something close to it.
-    fn resolved(&mut self, reference: &Reference) -> Result<String, Unrendered> {
+    /// Every variable below is one API Gateway documents a mapping template against, or one
+    /// this template's own `#set` bound; every method is one that variable documents. A
+    /// reference outside that set is answered as unresolved rather than rendered as
+    /// something close to it.
+    fn evaluated(
+        &mut self,
+        reference: &Reference,
+    ) -> Result<::serde_json::Value, Unrendered> {
+        let text = ::serde_json::Value::String;
         let unresolved = || Unrendered {
             reason: format!(
                 "it names {}, which this emulator resolves no value of this call for",
@@ -511,7 +864,7 @@ impl Render<'_> {
                     // undecodable bytes replaced, which would put a body in the response
                     // that the caller never sent.
                     ::std::str::from_utf8(payload)
-                        .map(str::to_string)
+                        .map(|payload| text(payload.to_string()))
                         .map_err(|_| Unrendered {
                             reason: format!(
                                 "it names {}, and this call's payload is not text",
@@ -524,32 +877,27 @@ impl Render<'_> {
                 [Step::Call(method, arguments)] if method == "json" => {
                     let path = self.one_argument(arguments)?.ok_or_else(unresolved)?;
                     match self.queried(&path)?.ok_or_else(unresolved)? {
-                        Some(node) => Ok(node.to_string()),
+                        Some(node) => Ok(text(node.to_string())),
                         // A path that selects nothing writes nothing.
-                        None => Ok(String::new()),
+                        None => Ok(text(String::new())),
                     }
                 }
                 // `$input.path(x)` — "takes a JSONPath expression string and returns a
-                // JSON object representation of the result". A selected SCALAR is that
-                // value; an object or an array is a Java object whose own rendering AWS
-                // does not state, so it is left unresolved rather than written as
-                // something else.
+                // JSON object representation of the result": the selected node itself,
+                // which a `#set` binds whole and a reference renders when it is a value
+                // the language writes as text ([`Render::resolved`]).
                 [Step::Call(method, arguments)] if method == "path" => {
                     let path = self.one_argument(arguments)?.ok_or_else(unresolved)?;
-                    match self.queried(&path)?.ok_or_else(unresolved)? {
-                        Some(::serde_json::Value::String(text)) => Ok(text),
-                        Some(
-                            node @ (::serde_json::Value::Number(_) | ::serde_json::Value::Bool(_)),
-                        ) => Ok(node.to_string()),
-                        Some(::serde_json::Value::Null) | None => Ok(String::new()),
-                        Some(_) => Err(unresolved()),
-                    }
+                    Ok(self
+                        .queried(&path)?
+                        .ok_or_else(unresolved)?
+                        .unwrap_or(::serde_json::Value::Null))
                 }
                 // `$input.params(x)` — "returns the method request parameter value from the
                 // path, query string, or header (in that order) given a parameter name".
                 [Step::Call(method, arguments)] if method == "params" => {
                     let name = self.one_argument(arguments)?.ok_or_else(unresolved)?;
-                    Ok(parameter(self.inputs, &name).unwrap_or_default())
+                    Ok(text(parameter(self.inputs, &name).unwrap_or_default()))
                 }
                 _ => Err(unresolved()),
             },
@@ -568,6 +916,7 @@ impl Render<'_> {
                     .stage_variables
                     .get(&name)
                     .cloned()
+                    .map(text)
                     .ok_or_else(unresolved)
             }
             // "$context" — "contains the contextual information of your request". Only the
@@ -607,6 +956,7 @@ impl Render<'_> {
                             .is_some_and(|first| first == AUTHORIZER_MEMBER)
                             .then(String::new)
                     })
+                    .map(text)
                     .ok_or_else(unresolved)
             }
             // "$util" — "contains utility functions", each documented with the conversion
@@ -618,29 +968,70 @@ impl Render<'_> {
             // docs give.
             "util" => match reference.steps.as_slice() {
                 [Step::Call(method, arguments)] => {
-                    let text = self.one_argument(arguments)?.ok_or_else(unresolved)?;
-                    self.spend(text.len())?;
+                    let argument = self.one_argument(arguments)?.ok_or_else(unresolved)?;
+                    self.spend(argument.len())?;
                     match method.as_str() {
                         // "$util.urlEncode(String) — Converts a string into
                         // 'application/x-www-form-urlencoded' format."
-                        "urlEncode" => Ok(::form_urlencoded::byte_serialize(text.as_bytes())
-                            .collect::<String>()),
+                        "urlEncode" => Ok(text(
+                            ::form_urlencoded::byte_serialize(argument.as_bytes())
+                                .collect::<String>(),
+                        )),
                         // "$util.urlDecode(String) — Decodes an
                         // 'application/x-www-form-urlencoded' string back into its
                         // original form." The decoder is the framework's one QUERY decoder,
                         // which resolves every escape and folds `+` to a space as that
                         // format's rule is.
-                        "urlDecode" => Ok(::smithy_server_runtime::percent_decode(&text)),
+                        "urlDecode" => {
+                            Ok(text(::smithy_server_runtime::percent_decode(&argument)))
+                        }
                         // "$util.escapeJavaScript() — Escapes the characters in a string
                         // using JavaScript string rules", which is what lets a template put
                         // a caller's own text inside a quoted string of the document it
                         // renders.
-                        "escapeJavaScript" => Ok(escaped_as_javascript(&text)),
+                        "escapeJavaScript" => Ok(text(escaped_as_javascript(&argument))),
                         _ => Err(unresolved()),
                     }
                 }
                 _ => Err(unresolved()),
             },
+            // A name this template's own `#set` bound, whose members the references after it
+            // read: the value is this call's, read once when it was bound, so what a
+            // reference to it names is a lookup like every other one.
+            //
+            // The lookup COPIES only the node it selects, not the document it selects from,
+            // and is charged that much against this rendering's budget: a reference to a
+            // member of a bound payload costs the member, so a template carrying many of
+            // them costs what it renders rather than the product of the payload's size and
+            // how many times it names one.
+            //
+            // A member the bound value does not carry is an ABSENT VALUE, as it is in every
+            // other map of the call ([`AUTHORIZER_MEMBER`]): it renders as nothing, and
+            // reading further through it goes on naming nothing.
+            bound if self.bindings.contains_key(bound) => {
+                // The keys the reference walks are read first: an argument of a call is
+                // itself resolved against this call, which the walk below holds no borrow
+                // for.
+                let mut keys = Vec::with_capacity(reference.steps.len());
+                for step in &reference.steps {
+                    match step {
+                        Step::Member(name) => keys.push(name.clone()),
+                        Step::Call(method, arguments) if method == "get" => {
+                            keys.push(self.one_argument(arguments)?.ok_or_else(unresolved)?);
+                        }
+                        Step::Call(_, _) => return Err(unresolved()),
+                    }
+                }
+                let mut selected = self.bindings.get(bound);
+                for key in &keys {
+                    selected = selected
+                        .and_then(::serde_json::Value::as_object)
+                        .and_then(|members| members.get(key));
+                }
+                let value = selected.cloned().unwrap_or(::serde_json::Value::Null);
+                self.spend(weight(&value))?;
+                Ok(value)
+            }
             _ => Err(unresolved()),
         }
     }
@@ -684,6 +1075,74 @@ impl Render<'_> {
         Ok(Some(
             ::service_common::json_reference_path::select_segments(&segments, document).cloned(),
         ))
+    }
+}
+
+/// The REFERENCE this plane's own reader names, for one the language's reader parsed.
+///
+/// The two readers describe the same thing — the variable a reference opens with and what it
+/// reaches through it — so a reference read out of a directive is resolved by the same
+/// resolution a reference of the template body is ([`Render::evaluated`]). `None` for one
+/// whose steps this plane does not resolve: an index that is no name, and an argument that is
+/// neither a literal nor another reference, which are the two forms a documented method
+/// takes.
+fn named(reference: &::service_common::velocity_template::Reference) -> Option<Reference> {
+    use ::serde_json::Value;
+    use ::service_common::velocity_template::{Access, Expr};
+
+    let mut steps = Vec::with_capacity(reference.accesses.len());
+    let mut source = format!("${}", reference.root);
+    for access in &reference.accesses {
+        match access {
+            Access::Prop(name) => {
+                source.push('.');
+                source.push_str(name);
+                steps.push(Step::Member(name.clone()));
+            }
+            // The bracketed spelling of the same member, which is how a key that is not a
+            // bare name is reached (`$context.authorizer.claims['cognito:username']`).
+            Access::Index(Expr::Literal(Value::String(key))) => {
+                source.push_str(&format!("['{key}']"));
+                steps.push(Step::Member(key.clone()));
+            }
+            Access::Index(_) => return None,
+            Access::Call(name, arguments) => {
+                source.push('.');
+                source.push_str(name);
+                source.push_str("(…)");
+                let mut taken = Vec::with_capacity(arguments.len());
+                for argument in arguments {
+                    match argument {
+                        Expr::Literal(Value::String(text)) => {
+                            taken.push(Argument::Literal(text.clone()));
+                        }
+                        Expr::Reference(inner) => {
+                            taken.push(Argument::Reference(named(inner)?));
+                        }
+                        _ => return None,
+                    }
+                }
+                steps.push(Step::Call(name.clone(), taken));
+            }
+        }
+    }
+    Some(Reference {
+        variable: reference.root.clone(),
+        steps,
+        source,
+    })
+}
+
+/// How many bytes a value a binding holds is charged.
+///
+/// The text of it, which is the most a reference to it can render and so the most holding it
+/// can cost: a binding is charged that against the same budget every read is charged against
+/// ([`MAX_RENDER_WORK`]), so a template cannot grow one binding by copying another.
+fn weight(value: &::serde_json::Value) -> usize {
+    match value {
+        ::serde_json::Value::String(text) => text.len(),
+        ::serde_json::Value::Null => 0,
+        other => other.to_string().len(),
     }
 }
 
@@ -832,6 +1291,294 @@ mod tests {
                 "case {template:?}: expected {expected:?}, got {rendered:?}"
             );
         }
+    }
+
+    /// RULE: a `#set` binds a name to the value its expression names, the references after it
+    /// render the members they reach through that name, and the directive itself renders
+    /// nothing.
+    #[test]
+    fn a_set_binds_a_name_the_references_after_it_render() {
+        /// (case, the template, what it renders to)
+        type Row<'a> = (&'a str, &'a str, &'a str);
+        let rows: &[Row<'_>] = &[
+            (
+                "the form every mapping-template example opens with: a bound payload, read \
+                 member by member",
+                r#"#set($root = $input.path('$')) {"id":"$root.id","qty":$root.qty}"#,
+                r#" {"id":"a1","qty":2}"#,
+            ),
+            (
+                "a bound SUB-document, which is what a reference cannot render on its own",
+                r#"#set($n = $input.path('$.nested')) {"deep":"$n.deep"}"#,
+                r#" {"deep":"value"}"#,
+            ),
+            (
+                "the directive on a line of its own, whose line break renders nothing",
+                "#set($root = $input.path('$'))\n{\"id\":\"$root.id\"}",
+                "{\"id\":\"a1\"}",
+            ),
+            (
+                "the formal spelling, and a member reached by the method a map documents",
+                "#{set}($root = $input.path('$'))$root.get('id')",
+                "a1",
+            ),
+            (
+                "a second binding, read through the first",
+                "#set($root = $input.path('$'))#set($q = $root.qty)$q",
+                "2",
+            ),
+            (
+                "a bound literal and a bound number",
+                "#set($a = 'alpha')#set($b = 7)$a/$b",
+                "alpha/7",
+            ),
+            (
+                "a bound literal the language interpolates",
+                r#"#set($a = "pet $input.params('pet')")$a"#,
+                "pet fido",
+            ),
+            (
+                "a member the bound value does not carry, which is an absent value",
+                "#set($root = $input.path('$'))[$root.absent]",
+                "[]",
+            ),
+            (
+                "a member reached through one the bound value does not carry",
+                "#set($root = $input.path('$'))[$root.absent.deeper]",
+                "[]",
+            ),
+            (
+                "a `#` that opens no directive, which is text",
+                "#set($a = 1){\"colour\":\"#fff\",\"a\":$a}",
+                r##"{"colour":"#fff","a":1}"##,
+            ),
+            (
+                "the binding of a parameter, which is text either way",
+                "#set($p = $input.params('tenant'))$p",
+                "acme",
+            ),
+        ];
+        let inputs = inputs();
+        for (case, template, expected) in rows {
+            let actual = rendered(template, &inputs);
+            assert_eq!(
+                actual.as_deref().ok(),
+                Some(*expected),
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// RULE: a `#set` this emulator cannot read, and a reference to a name nothing bound,
+    /// leave the template unrendered rather than rendering part of it.
+    #[test]
+    fn a_set_this_emulator_cannot_read_leaves_the_template_unrendered() {
+        let rows: &[(&str, &str)] = &[
+            ("arithmetic, which is not a value of the call", "#set($a = 1 + 1)$a"),
+            ("a list", "#set($a = [1,2])$a"),
+            ("a member assignment", "#set($a.b = 1)$a"),
+            ("an unterminated directive", "#set($a = 1 $a"),
+            (
+                "a name nothing bound, which is a variable outside the language",
+                "$root.id",
+            ),
+            (
+                "a binding of a reference nothing resolves",
+                "#set($a = $whatever.body)$a",
+            ),
+        ];
+        let inputs = inputs();
+        for (case, template) in rows {
+            let actual = rendered(template, &inputs);
+            assert!(
+                actual.is_err(),
+                "case {case:?}: expected the template to be left unrendered, got {actual:?}"
+            );
+        }
+    }
+
+    /// RULE: a conditional directive renders the ONE branch its condition chooses — and the
+    /// branches it does not choose render nothing and resolve nothing.
+    #[test]
+    fn a_conditional_renders_the_branch_its_condition_chooses() {
+        /// (case, the template, what it renders to)
+        type Row<'a> = (&'a str, &'a str, &'a str);
+        let rows: &[Row<'_>] = &[
+            (
+                "the comparison the recorded fixture is written with, taking the else branch",
+                "#set($d = $input.path('$.qty'))#if($d < 0)[low]#else[$d]#end",
+                "[2]",
+            ),
+            (
+                "the same comparison taking the if branch",
+                "#set($d = $input.path('$.qty'))#if($d > 0)[$d]#else[low]#end",
+                "[2]",
+            ),
+            (
+                "a quoted number against a number, which the language does not equate",
+                r#"#set($d = $input.json('$.qty'))#if($d == 2)[two]#else[other]#end"#,
+                "[other]",
+            ),
+            (
+                "the same quoted number against its own text, which it does equate",
+                r#"#set($d = $input.json('$.qty'))#if($d == '2')[two]#else[other]#end"#,
+                "[two]",
+            ),
+            (
+                "an equality of two texts",
+                "#if($input.params('tenant') == 'acme')[ours]#else[theirs]#end",
+                "[ours]",
+            ),
+            (
+                "a reference this call has a value for, which is true",
+                "#if($input.params('tenant'))[named]#else[unnamed]#end",
+                "[named]",
+            ),
+            (
+                "a reference this call has no value for, which is false",
+                "#if($input.params('absent') != '')[named]#else[unnamed]#end",
+                "[unnamed]",
+            ),
+            (
+                "a negation",
+                "#if(!$input.params('tenant'))[no]#else[yes]#end",
+                "[yes]",
+            ),
+            (
+                "an elseif, whose branch is the one taken",
+                "#set($d = $input.path('$.qty'))#if($d > 5)[big]#elseif($d > 1)[some]#else[none]#end",
+                "[some]",
+            ),
+            (
+                "an elseif after a branch already taken, which renders nothing",
+                "#if(true)[first]#elseif(true)[second]#else[third]#end",
+                "[first]",
+            ),
+            (
+                "a conjunction",
+                "#set($d = $input.path('$.qty'))#if($d > 1 && $d < 3)[inside]#else[outside]#end",
+                "[inside]",
+            ),
+            (
+                "a disjunction",
+                "#set($d = $input.path('$.qty'))#if($d < 0 || $d == 2)[either]#else[neither]#end",
+                "[either]",
+            ),
+            (
+                "a conditional nested in the branch that is taken",
+                "#if(true)[#if(false)a#else b#end]#end",
+                "[ b]",
+            ),
+            (
+                "a reference inside the branch NOT taken, which is never resolved",
+                "#if(false)$whatever.nothing#else[served]#end",
+                "[served]",
+            ),
+            (
+                "a binding inside the branch not taken, which never happens",
+                "#if(false)#set($a = 'no')#end#if(true)[kept]#end",
+                "[kept]",
+            ),
+            (
+                "the directives on lines of their own, whose line breaks render nothing",
+                "#if(true)\n{\"a\":1}\n#end\n",
+                "{\"a\":1}\n",
+            ),
+        ];
+        let inputs = inputs();
+        for (case, template, expected) in rows {
+            let actual = rendered(template, &inputs);
+            assert_eq!(
+                actual.as_deref().ok(),
+                Some(*expected),
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// RULE: a conditional whose directives do not pair up leaves the template unrendered,
+    /// rather than rendering a piece of it — and so does one that nests, or asks for work,
+    /// past the bounds this emulator renders under.
+    #[test]
+    fn an_unbalanced_conditional_leaves_the_template_unrendered() {
+        let rows: &[(&str, &str)] = &[
+            ("a #if nothing closes", "#if(true)[a]"),
+            ("a #end that closes nothing", "[a]#end"),
+            ("a #else that closes nothing", "[a]#else[b]"),
+            ("a #elseif that closes nothing", "[a]#elseif(true)[b]"),
+        ];
+        let inputs = inputs();
+        for (case, template) in rows {
+            let actual = rendered(template, &inputs);
+            assert!(
+                actual.is_err(),
+                "case {case:?}: expected the template to be left unrendered, got {actual:?}"
+            );
+        }
+        // OVERSIZED, built rather than written out: conditionals nested past the depth this
+        // emulator performs, and a `#set` of the payload repeated past the reads one
+        // rendering may do. Neither recurses on the text's own nesting.
+        let nested = format!(
+            "{}[a]{}",
+            "#if(true)".repeat(MAX_BRANCH_DEPTH + 1),
+            "#end".repeat(MAX_BRANCH_DEPTH + 1)
+        );
+        let refused = rendered(&nested, &inputs);
+        assert!(
+            refused.is_err(),
+            "case \"conditionals nested past {MAX_BRANCH_DEPTH}\": expected the template to \
+             be left unrendered, got {refused:?}"
+        );
+        let payload = inputs.payload.as_deref().unwrap_or_default().len();
+        let bindings = MAX_RENDER_WORK / payload + 2;
+        let repeated = "#set($root = $input.path('$'))".repeat(bindings);
+        let refused = rendered(&repeated, &inputs);
+        assert!(
+            refused.is_err(),
+            "case \"{bindings} bindings of the payload\": expected the rendering to be \
+             refused past {MAX_RENDER_WORK} bytes read, got {refused:?}"
+        );
+        // A binding grown by COPYING is charged what it copies, so a template that doubles
+        // one runs the same budget down rather than holding copies for free.
+        let doubled = format!(
+            "#set($a = \"$input.body\"){}",
+            "#set($a = \"$a$a\")".repeat(32)
+        );
+        let refused = rendered(&doubled, &inputs);
+        assert!(
+            refused.is_err(),
+            "case \"a binding doubled 32 times\": expected the rendering to be refused, got \
+             {} bytes",
+            refused.map(|body| body.len()).unwrap_or_default()
+        );
+        // And a reference to a MEMBER of a bound document costs that member rather than the
+        // document, so a template that names one many times still renders: the budget bounds
+        // what is copied, not how often a binding is read.
+        let many = format!(
+            "#set($root = $input.path('$')){}",
+            "$root.id".repeat(1_000)
+        );
+        let rendered_many = rendered(&many, &inputs);
+        assert_eq!(
+            rendered_many.as_deref().ok().map(str::len),
+            Some(2_000),
+            "case \"a thousand references to a bound member\": expected the member rendered \
+             each time, got {rendered_many:?}"
+        );
+        // And the nesting this emulator DOES perform renders, so the bound is a ceiling
+        // rather than a refusal of every nested conditional.
+        let inside = format!(
+            "{}[a]{}",
+            "#if(true)".repeat(MAX_BRANCH_DEPTH),
+            "#end".repeat(MAX_BRANCH_DEPTH)
+        );
+        let rendered = rendered(&inside, &inputs);
+        assert_eq!(
+            rendered.as_deref().ok(),
+            Some("[a]"),
+            "case \"conditionals nested to {MAX_BRANCH_DEPTH}\": expected [a], got \
+             {rendered:?}"
+        );
     }
 
     /// RULE: `$util.escapeJavaScript` replaces exactly the characters a JavaScript string

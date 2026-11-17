@@ -1,0 +1,1214 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! The VELOCITY TEMPLATE LANGUAGE, read once for every emulated service whose API takes a
+//! template written in it.
+//!
+//! Two services in this tree hand a caller's own Velocity template to the emulator and
+//! render it against a call: API Gateway's mapping templates — "a map of Velocity templates
+//! that are applied on the request payload" (`Integration$requestTemplates`) — and AppSync's
+//! resolver mapping templates — "Mapping templates are written in the Apache Velocity
+//! Template Language (VTL)" (`EvaluateMappingTemplate`). The LANGUAGE is the same for both;
+//! what differs is the VARIABLE SURFACE each one resolves a reference against (`$input` /
+//! `$stageVariables` / `$context` / `$util` for one, `$ctx` / `$util` for the other) and what
+//! each one does with a reference it cannot resolve.
+//!
+//! So this module holds the language and nothing of either service: the SYNTAX ([`parse`],
+//! [`Parse`]) — text, references, the `#set` assignment, the `#if` / `#elseif` / `#else` /
+//! `#end` conditional, the `#foreach` loop, `#break`, `#stop`, the `##` and `#* … *#`
+//! comments, the `#[[ … ]]#` block that is written out unparsed, the expression grammar and
+//! the line break a directive's own line ends with — and the VALUE model its operators are
+//! defined over ([`truthy`], [`equal`], [`ordering`], [`arithmetic`], [`rendered`],
+//! [`number`]), which is JSON because a template's values are the ones its call carries.
+//!
+//! Each service drives it from its own renderer: it walks the [`Node`]s this produces,
+//! resolves a [`Reference`] against its own surface, and decides its own answer for one it
+//! cannot resolve. Nothing here reads a store, a request or the clock, and nothing here
+//! executes anything the template says beyond the operators above.
+//!
+//! BOUNDS. The text is caller-supplied, so the parse is bounded rather than as deep as that
+//! text nests: every block, every expression and every operator of a chain is one level
+//! charged against [`MAX_NESTING`], a reference walks at most [`MAX_ACCESSES`] members, and
+//! both are released again as the parse leaves them. The parse recurses only through those
+//! charged levels. What a RUN of the parsed template may spend is the caller's own bound,
+//! because only the caller knows what it is rendering for.
+
+use ::serde_json::{Map as JsonMap, Value as Json};
+
+/// How deeply a template may nest — a block within a block, an expression within an
+/// expression, a string that is itself a template. A parse guard, so a caller-supplied
+/// template cannot drive the parser's own recursion past the host's stack.
+pub const MAX_NESTING: usize = 64;
+
+/// How far one reference may walk: how many members, indexes and calls it may chain. The
+/// same guard, for the recursion a walk into a value takes.
+pub const MAX_ACCESSES: usize = 64;
+
+/// One piece of a parsed template.
+#[derive(Debug, Clone)]
+pub enum Node {
+    /// Text written out as it stands.
+    Text(String),
+    /// A reference written out: the value, or — for one that resolves to nothing — whatever
+    /// the renderer's own rule says, which is why the reference's own text travels with it.
+    Write {
+        reference: Reference,
+        quiet: bool,
+        literal: String,
+    },
+    /// `#set($target = value)`.
+    Set { target: Reference, value: Expr },
+    /// `#if` with its `#elseif` branches and its `#else` body.
+    If {
+        branches: Vec<(Expr, Vec<Node>)>,
+        otherwise: Vec<Node>,
+    },
+    /// `#foreach($name in over)`.
+    ForEach {
+        name: String,
+        over: Expr,
+        body: Vec<Node>,
+    },
+    /// `#break`, which ends the innermost loop.
+    Break,
+    /// `#stop`, which ends the whole evaluation.
+    Stop,
+}
+
+/// A reference: the variable it starts at, and how it walks into the value.
+#[derive(Debug, Clone)]
+pub struct Reference {
+    pub root: String,
+    pub accesses: Vec<Access>,
+}
+
+/// One step of a reference's walk.
+#[derive(Debug, Clone)]
+pub enum Access {
+    /// `.name`
+    Prop(String),
+    /// `[expr]`
+    Index(Expr),
+    /// `.name(args)`
+    Call(String, Vec<Expr>),
+}
+
+/// An expression, as a condition, a `#set` value or an argument.
+#[derive(Debug, Clone)]
+pub enum Expr {
+    Literal(Json),
+    /// A double-quoted string carrying references, which renders as a template of its own.
+    Interpolated(Vec<Node>),
+    Reference(Reference),
+    List(Vec<Expr>),
+    Map(Vec<(Expr, Expr)>),
+    Not(Box<Expr>),
+    Negate(Box<Expr>),
+    Binary(Operator, Box<Expr>, Box<Expr>),
+}
+
+/// The operators an expression may carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Operator {
+    Or,
+    And,
+    Equal,
+    NotEqual,
+    Less,
+    LessOrEqual,
+    Greater,
+    GreaterOrEqual,
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Remainder,
+}
+
+/// What ended a block of nodes.
+#[derive(Debug)]
+pub enum Terminator {
+    Eof,
+    End,
+    Else,
+    ElseIf(Expr),
+}
+
+/// Parse a whole template.
+pub fn parse(template: &str) -> Result<Vec<Node>, String> {
+    let characters: Vec<char> = template.chars().collect();
+    let mut parse = Parse {
+        src: &characters,
+        at: 0,
+        nesting: 0,
+    };
+    let (nodes, terminator) = parse.block()?;
+    match terminator {
+        Terminator::Eof => Ok(nodes),
+        _ => Err(UNEXPECTED_DIRECTIVE.to_string()),
+    }
+}
+
+/// The parser's cursor over one template.
+///
+/// Public because a renderer that reads a template ONE construct at a time — API Gateway's,
+/// whose references are resolved by its own reader — drives the same grammar from here
+/// rather than keeping a second reading of it.
+pub struct Parse<'t> {
+    pub src: &'t [char],
+    pub at: usize,
+    /// How deeply the parse is nested, which [`MAX_NESTING`] bounds.
+    pub nesting: usize,
+}
+
+impl<'t> Parse<'t> {
+    /// A cursor over `src`, positioned at `at`.
+    #[must_use]
+    pub fn at(src: &'t [char], at: usize) -> Self {
+        Self {
+            src,
+            at,
+            nesting: 0,
+        }
+    }
+}
+
+impl Parse<'_> {
+    /// Enter one level of nesting, or refuse a template that nests past the bound.
+    pub fn deeper(&mut self) -> Result<(), String> {
+        self.nesting = self.nesting.saturating_add(1);
+        if self.nesting > MAX_NESTING {
+            return Err(format!("{TOO_DEEP} {MAX_NESTING}."));
+        }
+        Ok(())
+    }
+
+    /// Leave it again.
+    pub fn shallower(&mut self) {
+        self.nesting = self.nesting.saturating_sub(1);
+    }
+
+    /// Parse nodes until the template ends or a directive that closes a block is reached.
+    pub fn block(&mut self) -> Result<(Vec<Node>, Terminator), String> {
+        self.deeper()?;
+        let parsed = self.block_nodes();
+        self.shallower();
+        parsed
+    }
+
+    /// The body of [`Self::block`], which that one bounds the nesting of.
+    pub fn block_nodes(&mut self) -> Result<(Vec<Node>, Terminator), String> {
+        let mut nodes: Vec<Node> = Vec::new();
+        let mut text = String::new();
+        let flush = |text: &mut String, nodes: &mut Vec<Node>| {
+            if !text.is_empty() {
+                nodes.push(Node::Text(::std::mem::take(text)));
+            }
+        };
+        while let Some(character) = self.peek(0) {
+            match character {
+                // An escaped `$` or `#` is the character itself.
+                '\\' if matches!(self.peek(1), Some('$' | '#')) => {
+                    text.push(self.peek(1).unwrap_or('\\'));
+                    self.at += 2;
+                }
+                '#' => {
+                    // A comment, an unparsed block, a directive — or, for anything else, a
+                    // `#` of the text.
+                    if self.matches(&['#', '#']) {
+                        self.skip_line();
+                        continue;
+                    }
+                    if self.matches(&['#', '*']) {
+                        self.at += 2;
+                        self.skip_until(&['*', '#']);
+                        continue;
+                    }
+                    if self.matches(&['#', '[', '[']) {
+                        self.at += 3;
+                        let start = self.at;
+                        // Text written out UNPARSED, to its closing marker or to the end of
+                        // the template when it carries none.
+                        let end = if self.skip_until(&[']', ']', '#']) {
+                            self.at.saturating_sub(3)
+                        } else {
+                            self.at
+                        };
+                        text.extend(self.src[start..end.max(start)].iter());
+                        continue;
+                    }
+                    let Some(name) = self.directive_name() else {
+                        text.push('#');
+                        self.at += 1;
+                        continue;
+                    };
+                    match name.as_str() {
+                        "set" => {
+                            let (target, value) = self.assignment()?;
+                            flush(&mut text, &mut nodes);
+                            nodes.push(Node::Set { target, value });
+                            self.skip_trailing_newline();
+                        }
+                        "if" => {
+                            let node = self.conditional()?;
+                            flush(&mut text, &mut nodes);
+                            nodes.push(node);
+                        }
+                        "foreach" => {
+                            let node = self.loop_over()?;
+                            flush(&mut text, &mut nodes);
+                            nodes.push(node);
+                        }
+                        "break" | "stop" => {
+                            flush(&mut text, &mut nodes);
+                            nodes.push(if name == "break" {
+                                Node::Break
+                            } else {
+                                Node::Stop
+                            });
+                            self.skip_trailing_newline();
+                        }
+                        "end" => {
+                            self.skip_trailing_newline();
+                            flush(&mut text, &mut nodes);
+                            return Ok((nodes, Terminator::End));
+                        }
+                        "else" => {
+                            self.skip_trailing_newline();
+                            flush(&mut text, &mut nodes);
+                            return Ok((nodes, Terminator::Else));
+                        }
+                        "elseif" => {
+                            let condition = self.parenthesised()?;
+                            self.skip_trailing_newline();
+                            flush(&mut text, &mut nodes);
+                            return Ok((nodes, Terminator::ElseIf(condition)));
+                        }
+                        // A directive this does not know is text: a `#` followed by a word
+                        // is only a directive when it is one of the above.
+                        _ => {
+                            text.push('#');
+                            self.at += 1;
+                        }
+                    }
+                }
+                '$' => match self.reference() {
+                    Some((reference, quiet, literal)) => {
+                        flush(&mut text, &mut nodes);
+                        nodes.push(Node::Write {
+                            reference,
+                            quiet,
+                            literal,
+                        });
+                    }
+                    None => {
+                        text.push('$');
+                        self.at += 1;
+                    }
+                },
+                other => {
+                    text.push(other);
+                    self.at += 1;
+                }
+            }
+        }
+        if !text.is_empty() {
+            nodes.push(Node::Text(text));
+        }
+        Ok((nodes, Terminator::Eof))
+    }
+
+    /// The character `ahead` positions on, when the template has one.
+    #[must_use]
+    pub fn peek(&self, ahead: usize) -> Option<char> {
+        self.src.get(self.at.saturating_add(ahead)).copied()
+    }
+
+    /// Whether the cursor is on `expected`.
+    #[must_use]
+    pub fn matches(&self, expected: &[char]) -> bool {
+        expected
+            .iter()
+            .enumerate()
+            .all(|(offset, character)| self.peek(offset) == Some(*character))
+    }
+
+    /// Skip to just past the end of this line.
+    pub fn skip_line(&mut self) {
+        while let Some(character) = self.peek(0) {
+            self.at += 1;
+            if character == '\n' {
+                return;
+            }
+        }
+    }
+
+    /// Skip to just past the next `marker`, or to the end of the template; `true` when the
+    /// marker was the reason it stopped.
+    pub fn skip_until(&mut self, marker: &[char]) -> bool {
+        while self.at < self.src.len() {
+            if self.matches(marker) {
+                self.at = self.at.saturating_add(marker.len());
+                return true;
+            }
+            self.at += 1;
+        }
+        false
+    }
+
+    /// Velocity eats the line break that follows a directive, so a template written one
+    /// directive per line renders without the blank lines between them.
+    pub fn skip_trailing_newline(&mut self) {
+        let mut at = self.at;
+        while matches!(self.src.get(at), Some(' ' | '\t')) {
+            at += 1;
+        }
+        if self.src.get(at) == Some(&'\r') {
+            at += 1;
+        }
+        if self.src.get(at) == Some(&'\n') {
+            self.at = at.saturating_add(1);
+        }
+    }
+
+    /// Skip the whitespace an expression may be written around.
+    pub fn skip_spaces(&mut self) {
+        while matches!(self.peek(0), Some(character) if character.is_whitespace()) {
+            self.at += 1;
+        }
+    }
+
+    /// The name of the directive the cursor is on, with the cursor left just past it —
+    /// `None` for a `#` that starts no directive, with the cursor left where it was.
+    pub fn directive_name(&mut self) -> Option<String> {
+        let start = self.at;
+        self.at += 1;
+        let braced = self.peek(0) == Some('{');
+        if braced {
+            self.at += 1;
+        }
+        let name = self.identifier();
+        match name {
+            Some(name) if !name.is_empty() => {
+                if braced && self.peek(0) == Some('}') {
+                    self.at += 1;
+                }
+                Some(name)
+            }
+            _ => {
+                self.at = start;
+                None
+            }
+        }
+    }
+
+    /// The identifier the cursor is on, with the cursor left just past it.
+    pub fn identifier(&mut self) -> Option<String> {
+        let first = self.peek(0)?;
+        if !(first.is_alphabetic() || first == '_') {
+            return None;
+        }
+        let mut name = String::new();
+        while let Some(character) = self.peek(0) {
+            if character.is_alphanumeric() || character == '_' || character == '-' {
+                name.push(character);
+                self.at += 1;
+            } else {
+                break;
+            }
+        }
+        Some(name)
+    }
+
+    /// The reference the cursor is on, its quiet flag and its own text — `None` for a `$`
+    /// that starts no reference, with the cursor left where it was.
+    pub fn reference(&mut self) -> Option<(Reference, bool, String)> {
+        let start = self.at;
+        self.at += 1;
+        let quiet = self.peek(0) == Some('!');
+        if quiet {
+            self.at += 1;
+        }
+        let braced = self.peek(0) == Some('{');
+        if braced {
+            self.at += 1;
+        }
+        let Some(root) = self.identifier() else {
+            self.at = start;
+            return None;
+        };
+        let mut accesses = Vec::new();
+        loop {
+            if self.peek(0) == Some('.')
+                && matches!(self.peek(1), Some(character) if character.is_alphabetic() || character == '_')
+            {
+                self.at += 1;
+                let Some(name) = self.identifier() else { break };
+                if self.peek(0) == Some('(') {
+                    match self.arguments() {
+                        Ok(args) => accesses.push(Access::Call(name, args)),
+                        Err(_) => {
+                            self.at = start;
+                            return None;
+                        }
+                    }
+                } else {
+                    accesses.push(Access::Prop(name));
+                }
+                continue;
+            }
+            if self.peek(0) == Some('[') {
+                self.at += 1;
+                let Ok(index) = self.expression() else {
+                    self.at = start;
+                    return None;
+                };
+                self.skip_spaces();
+                if self.peek(0) != Some(']') {
+                    self.at = start;
+                    return None;
+                }
+                self.at += 1;
+                accesses.push(Access::Index(index));
+                continue;
+            }
+            break;
+        }
+        if braced {
+            if self.peek(0) != Some('}') {
+                self.at = start;
+                return None;
+            }
+            self.at += 1;
+        }
+        if accesses.len() > MAX_ACCESSES {
+            self.at = start;
+            return None;
+        }
+        let literal: String = self.src[start..self.at].iter().collect();
+        Some((Reference { root, accesses }, quiet, literal))
+    }
+
+    /// The argument list the cursor is on: `(` expressions `)`.
+    pub fn arguments(&mut self) -> Result<Vec<Expr>, String> {
+        if self.peek(0) != Some('(') {
+            return Err(NOT_AN_ARGUMENT_LIST.to_string());
+        }
+        self.at += 1;
+        let mut args = Vec::new();
+        self.skip_spaces();
+        if self.peek(0) == Some(')') {
+            self.at += 1;
+            return Ok(args);
+        }
+        loop {
+            args.push(self.expression()?);
+            self.skip_spaces();
+            match self.peek(0) {
+                Some(',') => {
+                    self.at += 1;
+                    self.skip_spaces();
+                }
+                Some(')') => {
+                    self.at += 1;
+                    return Ok(args);
+                }
+                _ => return Err(NOT_AN_ARGUMENT_LIST.to_string()),
+            }
+        }
+    }
+
+    /// The `( expression )` a directive takes.
+    pub fn parenthesised(&mut self) -> Result<Expr, String> {
+        self.skip_spaces();
+        if self.peek(0) != Some('(') {
+            return Err(NOT_A_DIRECTIVE.to_string());
+        }
+        self.at += 1;
+        let expression = self.expression()?;
+        self.skip_spaces();
+        if self.peek(0) != Some(')') {
+            return Err(NOT_A_DIRECTIVE.to_string());
+        }
+        self.at += 1;
+        Ok(expression)
+    }
+
+    /// The `( $target = value )` a `#set` takes.
+    pub fn assignment(&mut self) -> Result<(Reference, Expr), String> {
+        self.skip_spaces();
+        if self.peek(0) != Some('(') {
+            return Err(NOT_A_DIRECTIVE.to_string());
+        }
+        self.at += 1;
+        self.skip_spaces();
+        let Some((target, _, _)) = self.reference() else {
+            return Err(NOT_AN_ASSIGNMENT.to_string());
+        };
+        self.skip_spaces();
+        if self.peek(0) != Some('=') {
+            return Err(NOT_AN_ASSIGNMENT.to_string());
+        }
+        self.at += 1;
+        let value = self.expression()?;
+        self.skip_spaces();
+        if self.peek(0) != Some(')') {
+            return Err(NOT_AN_ASSIGNMENT.to_string());
+        }
+        self.at += 1;
+        Ok((target, value))
+    }
+
+    /// `#if` through its `#end`.
+    pub fn conditional(&mut self) -> Result<Node, String> {
+        let mut condition = self.parenthesised()?;
+        self.skip_trailing_newline();
+        let mut branches = Vec::new();
+        loop {
+            let (body, terminator) = self.block()?;
+            match terminator {
+                Terminator::End => {
+                    branches.push((condition, body));
+                    return Ok(Node::If {
+                        branches,
+                        otherwise: Vec::new(),
+                    });
+                }
+                Terminator::ElseIf(next) => {
+                    branches.push((condition, body));
+                    condition = next;
+                }
+                Terminator::Else => {
+                    branches.push((condition, body));
+                    let (otherwise, terminator) = self.block()?;
+                    return match terminator {
+                        Terminator::End => Ok(Node::If {
+                            branches,
+                            otherwise,
+                        }),
+                        _ => Err(NO_END.to_string()),
+                    };
+                }
+                Terminator::Eof => return Err(NO_END.to_string()),
+            }
+        }
+    }
+
+    /// `#foreach` through its `#end`.
+    pub fn loop_over(&mut self) -> Result<Node, String> {
+        self.skip_spaces();
+        if self.peek(0) != Some('(') {
+            return Err(NOT_A_DIRECTIVE.to_string());
+        }
+        self.at += 1;
+        self.skip_spaces();
+        if self.peek(0) != Some('$') {
+            return Err(NOT_A_LOOP.to_string());
+        }
+        self.at += 1;
+        let braced = self.peek(0) == Some('{');
+        if braced {
+            self.at += 1;
+        }
+        let Some(name) = self.identifier() else {
+            return Err(NOT_A_LOOP.to_string());
+        };
+        if braced && self.peek(0) == Some('}') {
+            self.at += 1;
+        }
+        self.skip_spaces();
+        if !self.matches(&['i', 'n']) {
+            return Err(NOT_A_LOOP.to_string());
+        }
+        self.at += 2;
+        let over = self.expression()?;
+        self.skip_spaces();
+        if self.peek(0) != Some(')') {
+            return Err(NOT_A_LOOP.to_string());
+        }
+        self.at += 1;
+        self.skip_trailing_newline();
+        let (body, terminator) = self.block()?;
+        match terminator {
+            Terminator::End => Ok(Node::ForEach { name, over, body }),
+            _ => Err(NO_END.to_string()),
+        }
+    }
+
+    /// One expression, lowest precedence first.
+    pub fn expression(&mut self) -> Result<Expr, String> {
+        self.deeper()?;
+        let parsed = self.either();
+        self.shallower();
+        parsed
+    }
+
+    /// A left-associative operator CHAIN: `operand` parses each side and `operator` reads the
+    /// operator at the cursor, answering it and how many characters it takes.
+    ///
+    /// Every operator is one more level of the tree this builds, charged against the nesting
+    /// bound like every other level — evaluation recurses over that tree, so its depth is
+    /// bounded however the text spells it — and the levels are released when the chain ends.
+    pub fn chain(
+        &mut self,
+        operator: impl Fn(&mut Self) -> Option<(Operator, usize)>,
+        operand: impl Fn(&mut Self) -> Result<Expr, String>,
+    ) -> Result<Expr, String> {
+        let mut left = operand(self)?;
+        let mut charged = 0usize;
+        let parsed = loop {
+            self.skip_spaces();
+            let Some((named, width)) = operator(self) else {
+                break Ok(left);
+            };
+            self.at = self.at.saturating_add(width);
+            if let Err(why) = self.deeper() {
+                break Err(why);
+            }
+            charged = charged.saturating_add(1);
+            match operand(self) {
+                Ok(right) => left = Expr::Binary(named, Box::new(left), Box::new(right)),
+                Err(why) => break Err(why),
+            }
+        };
+        for _ in 0..charged {
+            self.shallower();
+        }
+        parsed
+    }
+
+    pub fn either(&mut self) -> Result<Expr, String> {
+        self.chain(
+            |parse| parse.matches(&['|', '|']).then_some((Operator::Or, 2)),
+            Self::both,
+        )
+    }
+
+    pub fn both(&mut self) -> Result<Expr, String> {
+        self.chain(
+            |parse| parse.matches(&['&', '&']).then_some((Operator::And, 2)),
+            Self::equality,
+        )
+    }
+
+    pub fn equality(&mut self) -> Result<Expr, String> {
+        self.chain(
+            |parse| {
+                if parse.matches(&['=', '=']) {
+                    Some((Operator::Equal, 2))
+                } else if parse.matches(&['!', '=']) {
+                    Some((Operator::NotEqual, 2))
+                } else {
+                    None
+                }
+            },
+            Self::relational,
+        )
+    }
+
+    pub fn relational(&mut self) -> Result<Expr, String> {
+        self.chain(
+            |parse| {
+                if parse.matches(&['<', '=']) {
+                    Some((Operator::LessOrEqual, 2))
+                } else if parse.matches(&['>', '=']) {
+                    Some((Operator::GreaterOrEqual, 2))
+                } else if parse.matches(&['<']) {
+                    Some((Operator::Less, 1))
+                } else if parse.matches(&['>']) {
+                    Some((Operator::Greater, 1))
+                } else {
+                    None
+                }
+            },
+            Self::additive,
+        )
+    }
+
+    pub fn additive(&mut self) -> Result<Expr, String> {
+        self.chain(
+            |parse| match parse.peek(0) {
+                Some('+') => Some((Operator::Add, 1)),
+                // A `-` that starts a number is part of it, not an operator; the cursor is
+                // past an operand here, so this one is the operator.
+                Some('-') => Some((Operator::Subtract, 1)),
+                _ => None,
+            },
+            Self::multiplicative,
+        )
+    }
+
+    pub fn multiplicative(&mut self) -> Result<Expr, String> {
+        self.chain(
+            |parse| match parse.peek(0) {
+                Some('*') => Some((Operator::Multiply, 1)),
+                Some('/') => Some((Operator::Divide, 1)),
+                Some('%') => Some((Operator::Remainder, 1)),
+                _ => None,
+            },
+            Self::unary,
+        )
+    }
+
+    pub fn unary(&mut self) -> Result<Expr, String> {
+        self.skip_spaces();
+        match self.peek(0) {
+            // A prefix operator is one more level of nesting, charged like every other, so a
+            // chain of them cannot drive this recursion past the bound.
+            Some('!') if self.peek(1) != Some('=') => {
+                self.at += 1;
+                self.deeper()?;
+                let inner = self.unary();
+                self.shallower();
+                Ok(Expr::Not(Box::new(inner?)))
+            }
+            Some('-') if !matches!(self.peek(1), Some(digit) if digit.is_ascii_digit()) => {
+                self.at += 1;
+                self.deeper()?;
+                let inner = self.unary();
+                self.shallower();
+                Ok(Expr::Negate(Box::new(inner?)))
+            }
+            _ => self.primary(),
+        }
+    }
+
+    pub fn primary(&mut self) -> Result<Expr, String> {
+        self.skip_spaces();
+        match self.peek(0) {
+            Some('(') => {
+                self.at += 1;
+                let inner = self.expression()?;
+                self.skip_spaces();
+                if self.peek(0) != Some(')') {
+                    return Err(NOT_AN_EXPRESSION.to_string());
+                }
+                self.at += 1;
+                Ok(inner)
+            }
+            Some('$') => match self.reference() {
+                Some((reference, _, _)) => Ok(Expr::Reference(reference)),
+                None => Err(NOT_AN_EXPRESSION.to_string()),
+            },
+            Some('\'') => {
+                let text = self.quoted('\'')?;
+                Ok(Expr::Literal(Json::String(text)))
+            }
+            Some('"') => {
+                let text = self.quoted('"')?;
+                // A double-quoted string carries references, so it renders as a template.
+                if text.contains('$') || text.contains('#') {
+                    let nested: Vec<char> = text.chars().collect();
+                    let mut parse = Parse {
+                        src: &nested,
+                        at: 0,
+                        nesting: self.nesting,
+                    };
+                    let (nodes, terminator) = parse.block()?;
+                    return match terminator {
+                        Terminator::Eof => Ok(Expr::Interpolated(nodes)),
+                        _ => Err(UNEXPECTED_DIRECTIVE.to_string()),
+                    };
+                }
+                Ok(Expr::Literal(Json::String(text)))
+            }
+            Some('[') => {
+                self.at += 1;
+                let mut elements = Vec::new();
+                self.skip_spaces();
+                if self.peek(0) == Some(']') {
+                    self.at += 1;
+                    return Ok(Expr::List(elements));
+                }
+                loop {
+                    elements.push(self.expression()?);
+                    self.skip_spaces();
+                    match self.peek(0) {
+                        Some(',') => self.at += 1,
+                        Some(']') => {
+                            self.at += 1;
+                            return Ok(Expr::List(elements));
+                        }
+                        _ => return Err(NOT_AN_EXPRESSION.to_string()),
+                    }
+                }
+            }
+            Some('{') => {
+                self.at += 1;
+                let mut entries = Vec::new();
+                self.skip_spaces();
+                if self.peek(0) == Some('}') {
+                    self.at += 1;
+                    return Ok(Expr::Map(entries));
+                }
+                loop {
+                    let key = self.expression()?;
+                    self.skip_spaces();
+                    if self.peek(0) != Some(':') {
+                        return Err(NOT_AN_EXPRESSION.to_string());
+                    }
+                    self.at += 1;
+                    let value = self.expression()?;
+                    entries.push((key, value));
+                    self.skip_spaces();
+                    match self.peek(0) {
+                        Some(',') => self.at += 1,
+                        Some('}') => {
+                            self.at += 1;
+                            return Ok(Expr::Map(entries));
+                        }
+                        _ => return Err(NOT_AN_EXPRESSION.to_string()),
+                    }
+                }
+            }
+            Some(character) if character.is_ascii_digit() || character == '-' => self.number(),
+            Some(character) if character.is_alphabetic() => {
+                let Some(word) = self.identifier() else {
+                    return Err(NOT_AN_EXPRESSION.to_string());
+                };
+                match word.as_str() {
+                    "true" => Ok(Expr::Literal(Json::Bool(true))),
+                    "false" => Ok(Expr::Literal(Json::Bool(false))),
+                    "null" => Ok(Expr::Literal(Json::Null)),
+                    _ => Err(NOT_AN_EXPRESSION.to_string()),
+                }
+            }
+            _ => Err(NOT_AN_EXPRESSION.to_string()),
+        }
+    }
+
+    /// The number the cursor is on.
+    pub fn number(&mut self) -> Result<Expr, String> {
+        let start = self.at;
+        if self.peek(0) == Some('-') {
+            self.at += 1;
+        }
+        let mut seen_point = false;
+        while let Some(character) = self.peek(0) {
+            if character.is_ascii_digit() {
+                self.at += 1;
+            } else if character == '.'
+                && !seen_point
+                && matches!(self.peek(1), Some(digit) if digit.is_ascii_digit())
+            {
+                seen_point = true;
+                self.at += 1;
+            } else {
+                break;
+            }
+        }
+        let text: String = self.src[start..self.at].iter().collect();
+        text.parse::<f64>()
+            .map(|parsed| Expr::Literal(number(parsed)))
+            .map_err(|_| NOT_AN_EXPRESSION.to_string())
+    }
+
+    /// The quoted string the cursor is on, with its escapes resolved.
+    pub fn quoted(&mut self, quote: char) -> Result<String, String> {
+        self.at += 1;
+        let mut text = String::new();
+        while let Some(character) = self.peek(0) {
+            self.at += 1;
+            if character == '\\' {
+                if let Some(escaped) = self.peek(0) {
+                    self.at += 1;
+                    text.push(match escaped {
+                        'n' => '\n',
+                        't' => '\t',
+                        'r' => '\r',
+                        other => other,
+                    });
+                }
+                continue;
+            }
+            if character == quote {
+                return Ok(text);
+            }
+            text.push(character);
+        }
+        Err(NOT_AN_EXPRESSION.to_string())
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// The VALUES the language's operators are defined over.
+// ---------------------------------------------------------------------------------------
+
+/// How a value is written into the rendered text.
+///
+/// A string is written as itself and every other value as the JSON text of it, which is the
+/// form a template's own output is read back as.
+#[must_use]
+pub fn rendered(value: &Json) -> String {
+    match value {
+        Json::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Whether a value is TRUE to a condition, by Velocity's own rule: a `boolean` decides by
+/// its own value, and every other value decides by being there at all — which is why an
+/// empty string is true here.
+#[must_use]
+pub fn truthy(value: Option<&Json>) -> bool {
+    match value {
+        None | Some(Json::Null) => false,
+        Some(Json::Bool(flag)) => *flag,
+        Some(_) => true,
+    }
+}
+
+/// Whether two values are EQUAL: numbers by their numeric value, strings, booleans, lists
+/// and objects by structure, and an absent value only to another absent one.
+#[must_use]
+pub fn equal(left: Option<&Json>, right: Option<&Json>) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (None, Some(Json::Null)) | (Some(Json::Null), None) => true,
+        (Some(left), Some(right)) => match (left.as_f64(), right.as_f64()) {
+            (Some(left), Some(right)) => left == right,
+            _ => left == right,
+        },
+        _ => false,
+    }
+}
+
+/// How two values ORDER, for `<`, `<=`, `>` and `>=`: numbers numerically and strings
+/// lexicographically. Anything else cannot be ordered, which is a fault.
+pub fn ordering(left: Option<&Json>, right: Option<&Json>) -> Result<::std::cmp::Ordering, String> {
+    match (left, right) {
+        (Some(left), Some(right)) => match (left.as_f64(), right.as_f64()) {
+            (Some(left), Some(right)) => left
+                .partial_cmp(&right)
+                .ok_or_else(|| NOT_COMPARABLE.to_string()),
+            _ => match (left.as_str(), right.as_str()) {
+                (Some(left), Some(right)) => Ok(left.cmp(right)),
+                _ => Err(NOT_COMPARABLE.to_string()),
+            },
+        },
+        _ => Err(NOT_COMPARABLE.to_string()),
+    }
+}
+
+/// What `+`, `-`, `*`, `/` and `%` come to.
+///
+/// Two numbers are arithmetic, and `+` with a string on either side concatenates — the
+/// Java operator a template reaches for when it builds a key out of parts. Anything else is
+/// a fault.
+pub fn arithmetic(operator: char, left: &Json, right: &Json) -> Result<Json, String> {
+    if operator == '+' && (left.is_string() || right.is_string()) {
+        return Ok(Json::String(format!(
+            "{}{}",
+            rendered(left),
+            rendered(right)
+        )));
+    }
+    let (Some(left), Some(right)) = (left.as_f64(), right.as_f64()) else {
+        return Err(format!("{NOT_ARITHMETIC} {operator}"));
+    };
+    let produced = match operator {
+        '+' => left + right,
+        '-' => left - right,
+        '*' => left * right,
+        '/' => {
+            if right == 0.0 {
+                return Err(DIVIDE_BY_ZERO.to_string());
+            }
+            left / right
+        }
+        '%' => {
+            if right == 0.0 {
+                return Err(DIVIDE_BY_ZERO.to_string());
+            }
+            left % right
+        }
+        other => return Err(format!("{NOT_ARITHMETIC} {other}")),
+    };
+    Ok(number(produced))
+}
+
+/// A computed number as the value a template carries: an integral result stays an integer,
+/// so a count or an index renders as `3` rather than as `3.0`.
+#[must_use]
+pub fn number(produced: f64) -> Json {
+    if produced.fract() == 0.0 && produced.abs() < 9.007_199_254_740_992e15 {
+        return Json::Number((produced as i64).into());
+    }
+    ::serde_json::Number::from_f64(produced).map_or(Json::Null, Json::Number)
+}
+
+/// An empty object, as the value a template that builds one starts from.
+#[must_use]
+pub fn empty_object() -> Json {
+    Json::Object(JsonMap::new())
+}
+
+/// The sentences a template fault states.
+pub const UNEXPECTED_DIRECTIVE: &str =
+    "This template closes a block it never opened: #end, #else or #elseif with no #if or \
+     #foreach.";
+pub const NO_END: &str = "This template opens a block it never closes with #end.";
+pub const NOT_A_DIRECTIVE: &str = "This directive is not written as ( … ).";
+pub const NOT_AN_ASSIGNMENT: &str = "This #set is not written as ( $target = value ).";
+pub const NOT_A_LOOP: &str = "This #foreach is not written as ( $element in value ).";
+pub const NOT_AN_ARGUMENT_LIST: &str = "This call's arguments are not written as ( … ).";
+pub const NOT_AN_EXPRESSION: &str = "This is not an expression.";
+pub const TOO_DEEP: &str = "This template nests deeper than this endpoint parses:";
+pub const NOT_COMPARABLE: &str = "These two values cannot be compared.";
+pub const NOT_ARITHMETIC: &str = "These two values cannot be combined with";
+pub const DIVIDE_BY_ZERO: &str = "This expression divides by zero.";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RULE: the language's two constructs are told apart and read as what they are — text,
+    /// a reference, and each directive this grammar states — whatever the template spells
+    /// around them.
+    #[test]
+    fn every_construct_of_the_language_is_read_as_what_it_is() {
+        /// (case, the template, how many nodes it parses into, the first node's shape)
+        type Row<'a> = (&'a str, &'a str, usize, &'a str);
+        let rows: &[Row<'_>] = &[
+            ("literal text", "{\"a\": 1}", 1, "Text"),
+            ("a `$` that opens no reference", "cost is $12", 1, "Text"),
+            ("a `#` that opens no directive", "#fff0aa", 1, "Text"),
+            ("a reference", "$input.body", 1, "Write"),
+            ("a braced reference", "${input.body}", 1, "Write"),
+            ("a quiet reference", "$!input.body", 1, "Write"),
+            ("a reference with a quoted member", "$a['k:1']", 1, "Write"),
+            ("a binding", "#set($a = 1)", 1, "Set"),
+            ("the formal spelling of one", "#{set}($a = 1)", 1, "Set"),
+            ("a conditional", "#if($a)x#end", 1, "If"),
+            ("a conditional with branches", "#if($a)x#elseif($b)y#else z#end", 1, "If"),
+            ("a loop", "#foreach($x in $a)y#end", 1, "ForEach"),
+            ("a comment, which renders nothing", "## a note", 0, ""),
+            ("a block comment", "#* a note *#", 0, ""),
+            ("an unparsed block", "#[[ $a #if ]]#", 1, "Text"),
+            ("a binding then the body it builds", "#set($a = 1)\n{\"a\": $a}", 4, "Set"),
+        ];
+        for (case, template, count, first) in rows {
+            let parsed = parse(template);
+            let nodes = parsed
+                .as_ref()
+                .unwrap_or_else(|why| panic!("case {case:?}: expected a parse, got {why}"));
+            assert_eq!(
+                nodes.len(),
+                *count,
+                "case {case:?}: expected {count} node(s), got {nodes:?}"
+            );
+            let shape = match nodes.first() {
+                None => "",
+                Some(Node::Text(_)) => "Text",
+                Some(Node::Write { .. }) => "Write",
+                Some(Node::Set { .. }) => "Set",
+                Some(Node::If { .. }) => "If",
+                Some(Node::ForEach { .. }) => "ForEach",
+                Some(Node::Break) => "Break",
+                Some(Node::Stop) => "Stop",
+            };
+            assert_eq!(
+                shape, *first,
+                "case {case:?}: expected a {first} node, got {shape}"
+            );
+        }
+    }
+
+    /// RULE: a template this grammar cannot read is reported as one, rather than read in
+    /// part — including one that nests past the bound this parse is done under.
+    #[test]
+    fn a_template_this_grammar_cannot_read_is_reported() {
+        let rows: &[(&str, &str)] = &[
+            ("a block nothing closes", "#if($a)x"),
+            ("a close with no block", "x#end"),
+            ("a binding that is no assignment", "#set($a)"),
+            ("a binding of nothing", "#set($a = )"),
+            ("a condition that is no expression", "#if(,)"),
+            ("a loop that names no element", "#foreach(x in $a)y#end"),
+            ("an unterminated argument", "#if($a.b('x)"),
+        ];
+        for (case, template) in rows {
+            let parsed = parse(template);
+            assert!(
+                parsed.is_err(),
+                "case {case:?}: expected the template to be reported unread, got {parsed:?}"
+            );
+        }
+        // Nested past the bound, built rather than written out: the parse refuses instead of
+        // recursing as deeply as the text does.
+        let deep = format!(
+            "{}x{}",
+            "#if(true)".repeat(MAX_NESTING + 2),
+            "#end".repeat(MAX_NESTING + 2)
+        );
+        assert!(
+            parse(&deep).is_err(),
+            "case \"blocks nested past {MAX_NESTING}\": expected the template to be reported \
+             unread"
+        );
+        let chained = format!("#if({}$a)x#end", "!".repeat(MAX_NESTING + 2));
+        assert!(
+            parse(&chained).is_err(),
+            "case \"a condition nested past {MAX_NESTING}\": expected the template to be \
+             reported unread"
+        );
+    }
+
+    /// RULE: the language's value model decides truth, equality and order as Velocity does:
+    /// a boolean by itself, anything else by being there, numbers numerically whatever JSON
+    /// shape they arrive in, and strings lexicographically.
+    #[test]
+    fn the_value_model_decides_truth_equality_and_order() {
+        let yes = Json::Bool(true);
+        let no = Json::Bool(false);
+        let zero = Json::Number(0.into());
+        let empty = Json::String(String::new());
+        let rows: &[(&str, Option<&Json>, bool)] = &[
+            ("a true boolean", Some(&yes), true),
+            ("a false boolean", Some(&no), false),
+            ("a zero, which is a value", Some(&zero), true),
+            ("an empty string, which is a value", Some(&empty), true),
+            ("null", Some(&Json::Null), false),
+            ("nothing at all", None, false),
+        ];
+        for (case, value, expected) in rows {
+            let actual = truthy(*value);
+            assert_eq!(
+                actual, *expected,
+                "case {case:?}: expected {expected}, got {actual}"
+            );
+        }
+        let two = Json::Number(2.into());
+        let two_point = ::serde_json::json!(2.0);
+        assert!(
+            equal(Some(&two), Some(&two_point)),
+            "case \"a number spelt two ways\": expected them to be equal"
+        );
+        assert!(
+            !equal(Some(&two), None),
+            "case \"a number against nothing\": expected them not to be equal"
+        );
+        let one = Json::Number(1.into());
+        assert_eq!(
+            ordering(Some(&one), Some(&two)).ok(),
+            Some(::std::cmp::Ordering::Less),
+            "case \"one against two\": expected Less"
+        );
+        let alpha = Json::String("alpha".to_string());
+        let beta = Json::String("beta".to_string());
+        assert_eq!(
+            ordering(Some(&beta), Some(&alpha)).ok(),
+            Some(::std::cmp::Ordering::Greater),
+            "case \"two strings\": expected Greater"
+        );
+        assert!(
+            ordering(Some(&yes), Some(&no)).is_err(),
+            "case \"two booleans\": expected them not to be orderable"
+        );
+        // An integral result stays an integer, so a count renders as `3`.
+        assert_eq!(
+            rendered(&number(3.0)),
+            "3",
+            "case \"an integral number\": expected 3"
+        );
+    }
+}

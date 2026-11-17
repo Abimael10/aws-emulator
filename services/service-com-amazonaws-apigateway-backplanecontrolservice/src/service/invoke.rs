@@ -3938,13 +3938,13 @@ struct UnrenderableTemplate {
 ///
 /// A mapping template is "a map of Velocity templates" (`Integration$requestTemplates`),
 /// which has two halves: REFERENCES, which name values of the call and are rendered from
-/// them ([`mapping_template`]), and DIRECTIVES, which are statements that would have to be
-/// EXECUTED. This emulator renders the first and states the second, so a template it cannot
-/// render is reported as the integration it cannot perform rather than passed through as if
-/// it were a literal body. A template with neither half IS the body, and renders to itself
-/// through the same path.
+/// them ([`mapping_template`]), and DIRECTIVES, which are statements. This emulator renders
+/// the references and performs the one directive that states a BINDING (`#set`); a template
+/// carrying a CONTROL-FLOW directive is reported as the integration it cannot perform rather
+/// than passed through as if it were a literal body. A template with neither half IS the
+/// body, and renders to itself through the same path.
 fn rendered_mapping_template(template: &str, inputs: &TemplateInputs) -> Result<String, String> {
-    if carries_velocity_directive(template) {
+    if carries_unperformed_directive(template) {
         return Err("it carries a Velocity directive, which is a statement this emulator \
                     does not execute"
             .to_string());
@@ -4027,6 +4027,25 @@ const VELOCITY_DIRECTIVES: &[&str] = &[
     "include", "evaluate", "define",
 ];
 
+/// The directives a mapping template IS performed for, so a template carrying one of them
+/// and no other is rendered rather than refused.
+///
+/// `#set`, which states a BINDING of a name to a value of the call, and the conditional
+/// family, which states a CHOICE between two pieces of the template decided by those same
+/// values — both performed by the renderer ([`mapping_template`]). Every other directive
+/// (a loop, a macro, an include, a comment) is left unperformed.
+const PERFORMED_DIRECTIVES: &[&str] = &["set", "if", "elseif", "else", "end"];
+
+/// Whether `template` carries a Velocity directive this emulator does NOT perform — the
+/// control-flow half of the language, which no substitution and no binding can stand in for.
+///
+/// The question the two mapping-template renderers ask before rendering: a template whose
+/// only directives are performed ones is rendered, and one carrying any other is reported as
+/// the integration it cannot perform.
+pub(crate) fn carries_unperformed_directive(template: &str) -> bool {
+    carries_directive(template, true)
+}
+
 /// Whether `template` carries a Velocity DIRECTIVE — the half of the language that is
 /// statements rather than references, and the half no substitution can stand in for.
 ///
@@ -4034,9 +4053,9 @@ const VELOCITY_DIRECTIVES: &[&str] = &[
 /// an identifier or `{`, which names a value and is RENDERED from the call
 /// ([`rendered_mapping_template`], [`rendered_gateway_template`]); and a DIRECTIVE, `#`
 /// followed by one of [`VELOCITY_DIRECTIVES`] (optionally braced) or by a comment marker
-/// (`##`, `#*`), which is a statement that would have to be EXECUTED. This tells the two
-/// apart, so the halves that resolve references can refuse the half that cannot be resolved
-/// at all.
+/// (`##`, `#*`), which is a statement. This tells the two apart for the renderer that
+/// performs no directive at all — a GATEWAY RESPONSE's template, which substitutes the
+/// refusal's own values and nothing else.
 ///
 /// TOTAL over every `&str`, including a template carrying non-ASCII text: a template is
 /// caller-stored data that nothing restricts to ASCII, and this runs while serving a
@@ -4044,6 +4063,12 @@ const VELOCITY_DIRECTIVES: &[&str] = &[
 /// after one is always a character boundary; the remainder is still taken with `str::get`,
 /// which answers `None` rather than panicking for any position that is not.
 pub(crate) fn carries_velocity_directive(template: &str) -> bool {
+    carries_directive(template, false)
+}
+
+/// Whether `template` carries a directive, optionally leaving out the ones this emulator
+/// PERFORMS.
+fn carries_directive(template: &str, performed_aside: bool) -> bool {
     for (index, byte) in template.as_bytes().iter().enumerate() {
         if *byte != b'#' {
             continue;
@@ -4051,7 +4076,7 @@ pub(crate) fn carries_velocity_directive(template: &str) -> bool {
         let Some(rest) = template.get(index + 1..) else {
             continue;
         };
-        if carries_directive_at(rest) {
+        if carries_directive_at(rest, performed_aside) {
             return true;
         }
     }
@@ -4060,20 +4085,23 @@ pub(crate) fn carries_velocity_directive(template: &str) -> bool {
 
 /// Whether the text right after a `#` begins a directive or a comment marker; see
 /// [`carries_velocity_directive`] for why the NAME has to end where an identifier cannot
-/// continue.
-fn carries_directive_at(rest: &str) -> bool {
+/// continue. `performed_aside` leaves out the directives this emulator performs.
+fn carries_directive_at(rest: &str, performed_aside: bool) -> bool {
     if rest.starts_with('#') || rest.starts_with('*') {
         return true;
     }
     let directive = rest.strip_prefix('{').unwrap_or(rest);
-    VELOCITY_DIRECTIVES.iter().any(|name| {
-        directive.strip_prefix(name).is_some_and(|after| {
-            after
-                .chars()
-                .next()
-                .is_none_or(|next| !next.is_ascii_alphanumeric() && next != '_')
+    VELOCITY_DIRECTIVES
+        .iter()
+        .filter(|name| !performed_aside || !PERFORMED_DIRECTIVES.contains(name))
+        .any(|name| {
+            directive.strip_prefix(name).is_some_and(|after| {
+                after
+                    .chars()
+                    .next()
+                    .is_none_or(|next| !next.is_ascii_alphanumeric() && next != '_')
+            })
         })
-    })
 }
 
 /// The `$context` variables a GATEWAY RESPONSE's template names, and what each one stands

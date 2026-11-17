@@ -20,13 +20,12 @@ use ::serde_json::{Map as JsonMap, Value as Json};
 ///
 /// A string is written as itself and every other value as the JSON text of it, which is the
 /// form a template's own output is read back as (an object or a list reaches the text only
-/// through `$util.toJson`, and a number and a boolean render the same either way).
+/// through `$util.toJson`, and a number and a boolean render the same either way). The rule
+/// is the LANGUAGE's, so it is the tree's one reading of it
+/// ([`::service_common::velocity_template`]).
 #[must_use]
 pub fn rendered(value: &Json) -> String {
-    match value {
-        Json::String(text) => text.clone(),
-        other => other.to_string(),
-    }
+    ::service_common::velocity_template::rendered(value)
 }
 
 /// Whether a value is TRUE to a condition, by Velocity's own rule: a `boolean` decides by
@@ -34,43 +33,20 @@ pub fn rendered(value: &Json) -> String {
 /// `$util.isNullOrEmpty` exists for the question an empty string answers `true` to here.
 #[must_use]
 pub fn truthy(value: Option<&Json>) -> bool {
-    match value {
-        None | Some(Json::Null) => false,
-        Some(Json::Bool(flag)) => *flag,
-        Some(_) => true,
-    }
+    ::service_common::velocity_template::truthy(value)
 }
 
 /// Whether two values are EQUAL: numbers by their numeric value, strings, booleans, lists
 /// and objects by structure, and an absent value only to another absent one.
 #[must_use]
 pub fn equal(left: Option<&Json>, right: Option<&Json>) -> bool {
-    match (left, right) {
-        (None, None) => true,
-        (None, Some(Json::Null)) | (Some(Json::Null), None) => true,
-        (Some(left), Some(right)) => match (left.as_f64(), right.as_f64()) {
-            (Some(left), Some(right)) => left == right,
-            _ => left == right,
-        },
-        _ => false,
-    }
+    ::service_common::velocity_template::equal(left, right)
 }
 
 /// How two values ORDER, for `<`, `<=`, `>` and `>=`: numbers numerically and strings
 /// lexicographically. Anything else cannot be ordered, which is a fault.
 pub fn ordering(left: Option<&Json>, right: Option<&Json>) -> Result<::std::cmp::Ordering, String> {
-    match (left, right) {
-        (Some(left), Some(right)) => match (left.as_f64(), right.as_f64()) {
-            (Some(left), Some(right)) => left
-                .partial_cmp(&right)
-                .ok_or_else(|| NOT_COMPARABLE.to_string()),
-            _ => match (left.as_str(), right.as_str()) {
-                (Some(left), Some(right)) => Ok(left.cmp(right)),
-                _ => Err(NOT_COMPARABLE.to_string()),
-            },
-        },
-        _ => Err(NOT_COMPARABLE.to_string()),
-    }
+    ::service_common::velocity_template::ordering(left, right)
 }
 
 /// What `+`, `-`, `*`, `/` and `%` come to.
@@ -79,45 +55,14 @@ pub fn ordering(left: Option<&Json>, right: Option<&Json>) -> Result<::std::cmp:
 /// Java operator a template reaches for when it builds a key out of parts. Anything else is
 /// a fault.
 pub fn arithmetic(operator: char, left: &Json, right: &Json) -> Result<Json, String> {
-    if operator == '+' && (left.is_string() || right.is_string()) {
-        return Ok(Json::String(format!(
-            "{}{}",
-            rendered(left),
-            rendered(right)
-        )));
-    }
-    let (Some(left), Some(right)) = (left.as_f64(), right.as_f64()) else {
-        return Err(format!("{NOT_ARITHMETIC} {operator}"));
-    };
-    let produced = match operator {
-        '+' => left + right,
-        '-' => left - right,
-        '*' => left * right,
-        '/' => {
-            if right == 0.0 {
-                return Err(DIVIDE_BY_ZERO.to_string());
-            }
-            left / right
-        }
-        '%' => {
-            if right == 0.0 {
-                return Err(DIVIDE_BY_ZERO.to_string());
-            }
-            left % right
-        }
-        other => return Err(format!("{NOT_ARITHMETIC} {other}")),
-    };
-    Ok(number(produced))
+    ::service_common::velocity_template::arithmetic(operator, left, right)
 }
 
 /// A computed number as the value a template carries: an integral result stays an integer,
 /// so a count or an index renders as `3` rather than as `3.0`.
 #[must_use]
 pub fn number(produced: f64) -> Json {
-    if produced.fract() == 0.0 && produced.abs() < 9.007_199_254_740_992e15 {
-        return Json::Number((produced as i64).into());
-    }
-    ::serde_json::Number::from_f64(produced).map_or(Json::Null, Json::Number)
+    ::service_common::velocity_template::number(produced)
 }
 
 /// Call `name` on `target` with `args`, and answer what it returned — `None` for a method
@@ -335,10 +280,8 @@ fn kind_of(value: &Json) -> &'static str {
     }
 }
 
-/// The sentences a value fault states.
-const NOT_COMPARABLE: &str = "These two values cannot be compared.";
-const NOT_ARITHMETIC: &str = "These two values cannot be combined with";
-const DIVIDE_BY_ZERO: &str = "This expression divides by zero.";
+/// The sentences a value fault states. The three the language's own OPERATORS state are
+/// the tree's one reading of them ([`::service_common::velocity_template`]).
 const OUTSIDE_THE_STRING: &str = "This substring is outside the string:";
 const NOT_AN_INDEX: &str = "This is not an index into the value:";
 const NO_SUCH_METHOD: &str = "No such method: ";
