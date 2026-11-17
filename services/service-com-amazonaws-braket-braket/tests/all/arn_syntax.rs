@@ -196,8 +196,8 @@ async fn get_quantum_task_separates_a_malformed_arn_from_an_absent_task() {
         .create_task(create_body("arn-syntax-get", &device_arn, 1))
         .await;
     assert_eq!(
-        created.status, 201,
-        "case a created task: expected HTTP 201, got {} {}",
+        created.status, 200,
+        "case a created task: expected HTTP 200, got {} {}",
         created.status, created.body
     );
     let arn = created.str_member("quantumTaskArn");
@@ -241,8 +241,8 @@ async fn cancel_quantum_task_separates_a_malformed_arn_from_an_absent_task() {
         .create_task(create_body("arn-syntax-cancel", &device_arn, 1))
         .await;
     assert_eq!(
-        created.status, 201,
-        "case a created task: expected HTTP 201, got {} {}",
+        created.status, 200,
+        "case a created task: expected HTTP 200, got {} {}",
         created.status, created.body
     );
     let arn = created.str_member("quantumTaskArn");
@@ -343,8 +343,8 @@ async fn create_quantum_task_refuses_a_device_arn_that_is_not_an_arn() {
         .create_task(create_body("arn-syntax-create-ok", &device_arn, 1))
         .await;
     assert_eq!(
-        created.status, 201,
-        "case a seeded device {device_arn}: expected HTTP 201, got {} {}",
+        created.status, 200,
+        "case a seeded device {device_arn}: expected HTTP 200, got {} {}",
         created.status, created.body
     );
 }

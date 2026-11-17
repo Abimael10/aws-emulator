@@ -27,9 +27,114 @@ pub struct CreateQuantumTaskInput {
     pub experimental_capabilities: Option<ExperimentalCapabilities>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.braket#CreateQuantumTaskResponse")]
+/// `CreateQuantumTask`'s response, with its schema and codec written out instead of
+/// derived.
+///
+/// WHY: the response Amazon Braket really sends carries the created task's initial
+/// `status` beside the task ARN, and the on-disk model declares only `quantumTaskArn`
+/// (`smithy_query(query="operation",operation="CreateQuantumTask")` reports an output of
+/// `{quantumTaskArn required}`), so the model is stale here. `#[smithy_macros::smithy(shape
+/// = ...)]` derives a structure's schema and codec from the model's member list and admits
+/// EXACTLY that list — a Rust field with no member behind it is a compile error — so a
+/// member the service reports and the model omits cannot be declared through the derive at
+/// all.
+///
+/// Everything mirrors the macro's output: one `M_<MEMBER>` schema per member (index =
+/// position in the member list), the `SCHEMA` naming them in that order, the
+/// `CREATE_QUANTUM_TASK_OUTPUT_SCHEMA` alias and the serialize/deserialize pair. The
+/// model's own member keeps the index the model gives it, and the member the model omits is
+/// appended LAST with its shape id in [`RECORDED_NAMESPACE`] rather than in the service's
+/// own, so it can neither claim to be modelled nor collide with a member a later model
+/// refresh may declare — a refresh then only has to move it into place and put the derive
+/// back.
 #[derive(Debug, Clone, Default)]
 pub struct CreateQuantumTaskOutput {
     pub quantum_task_arn: String,
+    /// The status the created task is in, which the model does not declare on this shape.
+    pub status: String,
+}
+
+/// The namespace a member the on-disk model does not declare has its own shape id in: not
+/// this service's, so nothing built here can claim to be modelled or collide with a shape
+/// the model may declare later.
+///
+/// The member schema below takes this constant for its namespace. Its ABSOLUTE id is still
+/// written out as one literal, because a shape id is built in a `const` and the absolute
+/// form cannot be concatenated there — keep the two spellings of the namespace in step.
+pub const RECORDED_NAMESPACE: &str = "com.amazonaws.braket.recorded";
+
+#[allow(non_upper_case_globals)]
+impl CreateQuantumTaskOutput {
+    const NAMESPACE: &'static str = "com.amazonaws.braket";
+
+    pub const M_QUANTUM_TASK_ARN: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.braket#CreateQuantumTaskResponse$quantumTaskArn",
+                Self::NAMESPACE,
+                "quantumTaskArn",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "quantumTaskArn",
+            0,
+        );
+
+    /// The member the on-disk model does not declare; see [`RECORDED_NAMESPACE`].
+    pub const M_STATUS: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.braket.recorded#CreateQuantumTaskResponse$status",
+            RECORDED_NAMESPACE,
+            "status",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "status",
+        1,
+    );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.braket#CreateQuantumTaskResponse",
+            Self::NAMESPACE,
+            "CreateQuantumTaskResponse",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[&Self::M_QUANTUM_TASK_ARN, &Self::M_STATUS],
+    );
+}
+
+pub static CREATE_QUANTUM_TASK_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema =
+    &CreateQuantumTaskOutput::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for CreateQuantumTaskOutput {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        s.write_string(&Self::M_QUANTUM_TASK_ARN, self.quantum_task_arn.as_str())?;
+        s.write_string(&Self::M_STATUS, self.status.as_str())?;
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for CreateQuantumTaskOutput {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut quantum_task_arn: Option<String> = None;
+        let mut status: Option<String> = None;
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => quantum_task_arn = Some(d.read_string(&Self::M_QUANTUM_TASK_ARN)?),
+                Some(1) => status = Some(d.read_string(&Self::M_STATUS)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(Self {
+            quantum_task_arn: quantum_task_arn
+                .ok_or_else(|| ::aws_smithy_schema_server::missing_member("quantumTaskArn"))?,
+            status: status.unwrap_or_default(),
+        })
+    }
 }
 

@@ -14,6 +14,11 @@
 //! One suite at the end is the exception: the store's retention bound is exercised
 //! against the state struct directly, because filling the store through the API would
 //! mean waiting out the lifecycle of a thousand tasks.
+//!
+//! The last group of suites pins the WIRE SHAPE of these paths rather than their
+//! behaviour: the status code the create answers with and the members a client parses off
+//! each response — the accepted task's status, the form each timestamp travels in, the
+//! tags map, and the device-parameters document the task ran under.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -765,8 +770,8 @@ async fn a_created_quantum_task_reads_back_exactly_as_it_was_created() {
 
         let created = braket.create_task(body).await;
         assert_eq!(
-            created.status, 201,
-            "case row {index}: expected 201 Created, got {} {}",
+            created.status, 200,
+            "case row {index}: expected 200 OK, got {} {}",
             created.status, created.body
         );
         let arn = created.str_member("quantumTaskArn");
@@ -815,11 +820,34 @@ async fn a_created_quantum_task_reads_back_exactly_as_it_was_created() {
             "case row {index}: expected outputS3Directory <keyPrefix>/<taskId>, got {}",
             member(&fetched.body, "outputS3Directory")
         );
-        assert_eq!(
-            member(&fetched.body, "deviceParameters"),
-            device_parameters.unwrap_or("{}"),
-            "case row {index}: deviceParameters must round-trip, defaulting to {{}}"
-        );
+        // `deviceParameters` is what the task RAN UNDER: the submitted document as it was
+        // sent, or the device's own default document for the program when the create
+        // carried none. (The rule itself is pinned over a table by
+        // `device_parameters_report_what_the_task_ran_under` below.)
+        let reported_parameters = member(&fetched.body, "deviceParameters");
+        match device_parameters {
+            Some(sent) => assert_eq!(
+                reported_parameters, *sent,
+                "case row {index}: a submitted deviceParameters document comes back as sent"
+            ),
+            None => {
+                let document: Value = serde_json::from_str(reported_parameters)
+                    .unwrap_or_else(|e| {
+                        panic!("case row {index}: {reported_parameters} is not JSON: {e}")
+                    });
+                assert!(
+                    member(&document["braketSchemaHeader"], "name")
+                        .ends_with("_device_parameters"),
+                    "case row {index}: expected the device's parameters schema, got \
+                     {document}"
+                );
+                assert_eq!(
+                    document["paradigmParameters"]["qubitCount"].as_u64(),
+                    Some(2),
+                    "case row {index}: expected the program's qubit count, got {document}"
+                );
+            }
+        }
         assert_eq!(
             member(&fetched.body, "status"),
             "CREATED",
@@ -844,9 +872,10 @@ async fn a_created_quantum_task_reads_back_exactly_as_it_was_created() {
                 fetched.body.get("tags")
             );
         } else {
-            assert!(
-                fetched.body.get("tags").is_none(),
-                "case row {index}: no tags were set, got {:?}",
+            assert_eq!(
+                fetched.body.get("tags"),
+                Some(&json!({})),
+                "case row {index}: a task with no tags reports an empty map, got {:?}",
                 fetched.body.get("tags")
             );
         }
@@ -875,8 +904,8 @@ async fn a_created_quantum_task_reads_back_exactly_as_it_was_created() {
     }]);
     let with_extras = braket.create_task(extras.clone()).await;
     assert_eq!(
-        with_extras.status, 201,
-        "case optional members: expected 201, got {} {}",
+        with_extras.status, 200,
+        "case optional members: expected 200, got {} {}",
         with_extras.status, with_extras.body
     );
     let read_extras = braket
@@ -936,16 +965,16 @@ async fn one_client_token_creates_exactly_one_quantum_task() {
         body["outputS3KeyPrefix"] = json!(prefix);
         let first = braket.create_task(body.clone()).await;
         assert_eq!(
-            first.status, 201,
-            "case token {token}: expected 201, got {} {}",
+            first.status, 200,
+            "case token {token}: expected 200, got {} {}",
             first.status, first.body
         );
         let arn = first.str_member("quantumTaskArn");
         for attempt in 0..3 {
             let replay = braket.create_task(body.clone()).await;
             assert_eq!(
-                replay.status, 201,
-                "case token {token} replay {attempt}: expected 201, got {} {}",
+                replay.status, 200,
+                "case token {token} replay {attempt}: expected 200, got {} {}",
                 replay.status, replay.body
             );
             assert_eq!(
@@ -1016,7 +1045,7 @@ async fn create_quantum_task_refuses_by_device_status_and_shot_range() {
     // (device status, expected HTTP status, expected error code) — one row per
     // modelled DeviceStatus, plus an ARN that is in no inventory at all.
     let rows: Vec<(&str, u16, &str)> = vec![
-        ("ONLINE", 201, ""),
+        ("ONLINE", 200, ""),
         ("OFFLINE", 424, "DeviceOfflineException"),
         ("RETIRED", 410, "DeviceRetiredException"),
     ];
@@ -1082,7 +1111,7 @@ async fn create_quantum_task_refuses_by_device_status_and_shot_range() {
             range[0].as_i64().expect("a numeric lower bound"),
             range[1].as_i64().expect("a numeric upper bound"),
         );
-        for (shots, expected) in [(min, 201_u16), (max, 201), (max + 1, 400)] {
+        for (shots, expected) in [(min, 200_u16), (max, 200), (max + 1, 400)] {
             let token = format!("tok-{arn}-{shots}");
             let reply = braket.create_task(create_body(&token, arn, shots)).await;
             assert_eq!(
@@ -1132,8 +1161,8 @@ async fn search_quantum_tasks_applies_every_filter_name_and_operator() {
             .create_task(create_body(&format!("tok-{index}"), &device_arn, 1))
             .await;
         assert_eq!(
-            reply.status, 201,
-            "case setup {index}: expected 201, got {} {}",
+            reply.status, 200,
+            "case setup {index}: expected 200, got {} {}",
             reply.status, reply.body
         );
         created.push((reply.str_member("quantumTaskArn"), device_arn));
@@ -1778,8 +1807,8 @@ async fn a_device_admits_only_its_quota_of_tasks_in_flight() {
         .create_task(create_body("quota-other-device", &online[1], 1))
         .await;
     assert_eq!(
-        elsewhere.status, 201,
-        "case quota on another device {}: expected 201, got {} {}",
+        elsewhere.status, 200,
+        "case quota on another device {}: expected 200, got {} {}",
         online[1], elsewhere.status, elsewhere.body
     );
 
@@ -1800,8 +1829,8 @@ async fn a_device_admits_only_its_quota_of_tasks_in_flight() {
         .create_task(create_body("quota-after-a-slot-frees", device_arn, 1))
         .await;
     assert_eq!(
-        admitted.status, 201,
-        "case a freed slot on {device_arn}: expected 201, got {} {}",
+        admitted.status, 200,
+        "case a freed slot on {device_arn}: expected 200, got {} {}",
         admitted.status, admitted.body
     );
 }
@@ -2014,4 +2043,384 @@ fn the_token_index_drops_only_the_entries_that_cannot_replay() {
             .contains_key(&format!("cap-token-{:08}", over - 1)),
         "case over the cap: the newest token must be kept"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The wire SHAPE of the create and the reads
+//
+// The status code the create answers with, and the members a client parses off each
+// response: the status the create reports for the task it accepted, the form a timestamp
+// travels in, the tags map, and the device-parameters document the task ran under.
+// ---------------------------------------------------------------------------
+
+/// The status `CreateQuantumTask` answers with, and the status its body reports for the
+/// task it just accepted.
+const CREATE_STATUS: u16 = 200;
+const ACCEPTED_STATUS: &str = "INITIALIZED";
+
+/// The suffix every Braket device-parameters schema name ends in, whichever device family
+/// publishes it (`braket.device_schema.simulators.gate_model_simulator_device_parameters`
+/// for a simulator, `braket.device_schema.<provider>.<provider>_device_parameters` for a
+/// QPU).
+const PARAMETERS_SCHEMA_SUFFIX: &str = "_device_parameters";
+
+/// An OpenQASM action document declaring `qubits` qubits, as a client sends it.
+fn action_of(qubits: usize) -> String {
+    let mut source = format!("OPENQASM 3.0; qubit[{qubits}] q;");
+    for qubit in 0..qubits {
+        source.push_str(&format!(" h q[{qubit}];"));
+    }
+    json!({
+        "braketSchemaHeader": { "name": "braket.ir.openqasm.program", "version": "1" },
+        "source": source,
+    })
+    .to_string()
+}
+
+/// Whether `value` is the RFC 3339 date-time STRING a `date-time` member travels as.
+fn is_date_time(value: Option<&Value>) -> bool {
+    value.and_then(Value::as_str).is_some_and(|rendered| {
+        ::aws_smithy_types::DateTime::from_str(
+            rendered,
+            ::aws_smithy_types::date_time::Format::DateTime,
+        )
+        .is_ok()
+    })
+}
+
+/// Poll `GetQuantumTask` until the task reaches a terminal status, and answer what it then
+/// reports.
+///
+/// The terminal transition is owed by the clock, so this waits for the CONDITION rather
+/// than for a span; a task that never gets there fails the suite instead of hanging it.
+async fn poll_until_terminal(braket: &Braket, arn: &str) -> Value {
+    for _ in 0..200 {
+        let reply = braket.get_task(arn).await;
+        assert_eq!(
+            reply.status, 200,
+            "case poll {arn}: expected 200, got {} {}",
+            reply.status, reply.body
+        );
+        if matches!(
+            member(&reply.body, "status"),
+            "COMPLETED" | "FAILED" | "CANCELLED"
+        ) {
+            return reply.body;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("case poll {arn}: the task never reached a terminal status");
+}
+
+/// RULE: the create answers HTTP 200, and its body carries the task's ARN together with the
+/// status of the task the call just accepted. The rows differ along what the request
+/// carries — the device, the shot count, the tag set, a parameters document — none of which
+/// changes the answer's shape.
+#[tokio::test]
+async fn the_create_answers_200_with_the_accepted_tasks_status() {
+    let braket = Braket::new();
+    let simulator = braket.an_online_device().await;
+    let qpu = crate::spending_limits::a_device(&braket, "QPU", "ONLINE").await;
+
+    // (case, device, shots, tags, deviceParameters)
+    let rows: Vec<(&str, &String, i64, Value, Option<&str>)> = vec![
+        ("the smallest request", &simulator, 1, json!(null), None),
+        (
+            "a request carrying tags",
+            &simulator,
+            10,
+            json!({ "team": "quantum" }),
+            None,
+        ),
+        (
+            "a request carrying its own device parameters",
+            &simulator,
+            100,
+            json!(null),
+            Some("{\"braketSchemaHeader\": {\"name\": \"x\", \"version\": \"1\"}}"),
+        ),
+        ("a quantum processor", &qpu, 1, json!(null), None),
+    ];
+
+    for (index, (case, device, shots, tags, parameters)) in rows.iter().enumerate() {
+        let mut body = create_body(&format!("wire-shape-{index}"), device, *shots);
+        if tags.is_object() {
+            body["tags"] = tags.clone();
+        }
+        if let Some(document) = parameters {
+            body["deviceParameters"] = json!(document);
+        }
+        let created = braket.create_task(body).await;
+        assert_eq!(
+            created.status, CREATE_STATUS,
+            "case {case:?}: expected HTTP {CREATE_STATUS}, got {} {}",
+            created.status, created.body
+        );
+        let arn = created.str_member("quantumTaskArn");
+        assert!(
+            arn.contains(":quantum-task/"),
+            "case {case:?}: expected a quantum-task ARN, got {arn}"
+        );
+        assert_eq!(
+            created.body.get("status").and_then(Value::as_str),
+            Some(ACCEPTED_STATUS),
+            "case {case:?}: expected the accepted task's status, got {}",
+            created.body
+        );
+        // The status a READ reports is the stored one, which the clock moves.
+        let read = braket.get_task(&arn).await;
+        assert_eq!(
+            read.status, 200,
+            "case {case:?}: the created task reads back, got {} {}",
+            read.status, read.body
+        );
+        assert!(
+            matches!(
+                member(&read.body, "status"),
+                "CREATED" | "QUEUED" | "RUNNING" | "COMPLETED" | "FAILED"
+            ),
+            "case {case:?}: expected a modelled QuantumTaskStatus, got {}",
+            read.body
+        );
+    }
+}
+
+/// RULE: a timestamp member travels in the wire form its model declares — the `date-time`
+/// ones as RFC 3339 strings, the two `epoch-seconds` ones as numbers. The rows span the
+/// read paths of all three resources this service reports a timestamp for.
+#[tokio::test]
+async fn a_timestamp_travels_in_the_form_its_model_declares() {
+    use crate::spending_limits::{a_device, create_limit, limit_body, limits_on, now_epoch, period};
+
+    let braket = Braket::new();
+    let simulator = braket.an_online_device().await;
+    let qpu = a_device(&braket, "QPU", "ONLINE").await;
+
+    // A quantum task, read through its own door and through the search.
+    let created = braket
+        .create_task(create_body("wire-time-task", &simulator, 1))
+        .await;
+    assert_eq!(
+        created.status, CREATE_STATUS,
+        "creating the task to read: got {} {}",
+        created.status, created.body
+    );
+    let arn = created.str_member("quantumTaskArn");
+    let terminal = poll_until_terminal(&braket, &arn).await;
+    let searched = braket.search_tasks(json!({ "filters": [] })).await;
+    let summary = searched
+        .body
+        .get("quantumTasks")
+        .and_then(Value::as_array)
+        .and_then(|tasks| tasks.first())
+        .cloned()
+        .unwrap_or_else(|| panic!("SearchQuantumTasks reports no task: {}", searched.body));
+
+    // A hybrid job, read through its own door.
+    let job = braket
+        .create_job(crate::hybrid_job_loop::job_body(
+            "wire-time-job",
+            "wire-time-job",
+            &simulator,
+        ))
+        .await;
+    assert_eq!(
+        job.status, 201,
+        "creating the job to read: got {} {}",
+        job.status, job.body
+    );
+    let job_read = braket.get_job(&job.str_member("jobArn")).await;
+
+    // A spending limit, read through the search, with the period it was created with.
+    let start = now_epoch();
+    let mut limit = limit_body("wire-time-limit", &qpu, "500");
+    limit["timePeriod"] = period(start, start + 3_600);
+    let minted = create_limit(&braket, limit).await;
+    assert!(
+        minted.status < 300,
+        "creating the limit to read: got {} {}",
+        minted.status,
+        minted.body
+    );
+    let limit = limits_on(&braket, &qpu)
+        .await
+        .first()
+        .cloned()
+        .unwrap_or_else(|| panic!("SearchSpendingLimits reports no limit on {qpu}"));
+
+    // Every member the model declares `date-time` on, across the three resources.
+    let date_time_members: Vec<(&str, Option<&Value>)> = vec![
+        ("GetQuantumTask createdAt", terminal.get("createdAt")),
+        ("GetQuantumTask endedAt", terminal.get("endedAt")),
+        ("QuantumTaskSummary createdAt", summary.get("createdAt")),
+        ("QuantumTaskSummary endedAt", summary.get("endedAt")),
+        ("GetJob createdAt", job_read.body.get("createdAt")),
+        ("SpendingLimitSummary createdAt", limit.get("createdAt")),
+        ("SpendingLimitSummary updatedAt", limit.get("updatedAt")),
+    ];
+    for (case, value) in date_time_members {
+        assert!(
+            is_date_time(value),
+            "case {case}: expected an RFC 3339 date-time string, got {value:?}"
+        );
+    }
+
+    // And the two the model declares `epoch-seconds` on, which stay numbers — and the
+    // numbers they were created with.
+    for (case, name, expected) in [
+        ("TimePeriod startAt", "startAt", start),
+        ("TimePeriod endAt", "endAt", start + 3_600),
+    ] {
+        let value = limit.get("timePeriod").and_then(|period| period.get(name));
+        assert_eq!(
+            value.and_then(Value::as_i64),
+            Some(expected),
+            "case {case}: expected the epoch second {expected}, got {value:?}"
+        );
+    }
+}
+
+/// RULE: a quantum task's `tags` are reported as a map, empty when the task carries none.
+/// The rows span the tag sets a create may carry, and both read paths report the same set.
+#[tokio::test]
+async fn a_tasks_tags_are_reported_as_a_map_even_when_it_carries_none() {
+    let braket = Braket::new();
+    let device = braket.an_online_device().await;
+
+    // (case, the tags the create carries, the map the reads must report)
+    let rows: Vec<(&str, Value, Value)> = vec![
+        ("no tags at all", json!(null), json!({})),
+        ("an empty map", json!({}), json!({})),
+        (
+            "one tag",
+            json!({ "team": "quantum" }),
+            json!({ "team": "quantum" }),
+        ),
+        (
+            "several tags, one with an empty value",
+            json!({ "team": "quantum", "note": "" }),
+            json!({ "team": "quantum", "note": "" }),
+        ),
+    ];
+
+    for (index, (case, submitted, expected)) in rows.iter().enumerate() {
+        let mut body = create_body(&format!("wire-tags-{index}"), &device, 1);
+        if submitted.is_object() {
+            body["tags"] = submitted.clone();
+        }
+        let created = braket.create_task(body).await;
+        assert_eq!(
+            created.status, CREATE_STATUS,
+            "case {case:?}: creating the task, got {} {}",
+            created.status, created.body
+        );
+        let arn = created.str_member("quantumTaskArn");
+        let read = braket.get_task(&arn).await;
+        assert_eq!(
+            read.body.get("tags"),
+            Some(expected),
+            "case {case:?}: expected the tags {expected}, got {:?}",
+            read.body.get("tags")
+        );
+        let searched = braket
+            .search_tasks(json!({
+                "filters": [{
+                    "name": "quantumTaskArn",
+                    "operator": "EQUAL",
+                    "values": [arn],
+                }],
+            }))
+            .await;
+        let summary = searched
+            .body
+            .get("quantumTasks")
+            .and_then(Value::as_array)
+            .and_then(|tasks| tasks.first())
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: the search reports no task: {}", searched.body)
+            });
+        assert_eq!(
+            summary.get("tags"),
+            Some(expected),
+            "case {case:?}: the summary reports the same set, got {:?}",
+            summary.get("tags")
+        );
+    }
+}
+
+/// RULE: `deviceParameters` is the document the task ran under — the submitted document as
+/// it was sent, or the device's own default parameters document for the program. The rows
+/// differ along the device family that decides the schema name and the program that decides
+/// the qubit count.
+#[tokio::test]
+async fn device_parameters_report_what_the_task_ran_under() {
+    let braket = Braket::new();
+    let simulator = braket.an_online_device().await;
+    let qpu = crate::spending_limits::a_device(&braket, "QPU", "ONLINE").await;
+
+    // (case, device, qubits the program declares, the document the create carries)
+    let rows: Vec<(&str, &String, usize, Option<&str>)> = vec![
+        ("a simulator and a two-qubit program", &simulator, 2, None),
+        ("a simulator and a three-qubit program", &simulator, 3, None),
+        ("a quantum processor", &qpu, 2, None),
+        (
+            "a document the create carried",
+            &simulator,
+            2,
+            Some(
+                "{\"braketSchemaHeader\": {\"name\": \
+                 \"braket.device_schema.simulators.gate_model_simulator_device_parameters\", \
+                 \"version\": \"1\"}, \"paradigmParameters\": {\"qubitCount\": 9}}",
+            ),
+        ),
+        (
+            "an empty document the create carried",
+            &simulator,
+            2,
+            Some("{}"),
+        ),
+    ];
+
+    for (index, (case, device, qubits, submitted)) in rows.iter().enumerate() {
+        let mut body = create_body(&format!("wire-params-{index}"), device, 1);
+        body["action"] = json!(action_of(*qubits));
+        if let Some(document) = submitted {
+            body["deviceParameters"] = json!(document);
+        }
+        let created = braket.create_task(body).await;
+        assert_eq!(
+            created.status, CREATE_STATUS,
+            "case {case:?}: creating the task, got {} {}",
+            created.status, created.body
+        );
+        let read = braket.get_task(&created.str_member("quantumTaskArn")).await;
+        let reported = member(&read.body, "deviceParameters");
+        match submitted {
+            Some(document) => assert_eq!(
+                reported, *document,
+                "case {case:?}: a submitted document is reported as it was sent"
+            ),
+            None => {
+                let parsed: Value = serde_json::from_str(reported)
+                    .unwrap_or_else(|e| panic!("case {case:?}: {reported} is not JSON: {e}"));
+                let schema = member(&parsed["braketSchemaHeader"], "name");
+                assert!(
+                    schema.ends_with(PARAMETERS_SCHEMA_SUFFIX)
+                        && schema.starts_with("braket.device_schema."),
+                    "case {case:?}: expected the device's parameters schema, got {parsed}"
+                );
+                assert_eq!(
+                    parsed["paradigmParameters"]["qubitCount"].as_u64(),
+                    Some(*qubits as u64),
+                    "case {case:?}: expected the program's {qubits} qubits, got {parsed}"
+                );
+                assert_eq!(
+                    parsed["paradigmParameters"]["disableQubitRewiring"].as_bool(),
+                    Some(false),
+                    "case {case:?}: expected rewiring to stay enabled, got {parsed}"
+                );
+            }
+        }
+    }
 }

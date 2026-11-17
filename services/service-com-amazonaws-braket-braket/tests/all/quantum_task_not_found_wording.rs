@@ -230,8 +230,8 @@ async fn a_stored_task_still_answers_and_only_its_absent_neighbour_is_refused() 
         .create_task(create_body("tok-absent-roundtrip", &device_arn, 1))
         .await;
     assert_eq!(
-        created.status, 201,
-        "case a created task: expected HTTP 201, got {} ({})",
+        created.status, 200,
+        "case a created task: expected HTTP 200, got {} ({})",
         created.status, created.body
     );
     let arn = created.str_member("quantumTaskArn");

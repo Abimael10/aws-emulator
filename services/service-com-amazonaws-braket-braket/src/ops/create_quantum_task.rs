@@ -9,6 +9,18 @@
 //! which this task's later statuses fall due. `GetQuantumTask`, `SearchQuantumTasks` and
 //! `CancelQuantumTask` all read that one record.
 //!
+//! The ANSWER is HTTP 200 carrying the task's ARN and the status of the task the call just
+//! accepted ([`INITIAL_STATUS`]) — the recorded wire response of this operation, which the
+//! on-disk model does not describe: its `@http` declares 201 and its output shape declares
+//! only `quantumTaskArn`. Both corrections are stated where they apply: the status code on
+//! `SUCCESS_STATUS` below, the member on the output shape in
+//! `crate::ops::types::create_quantum_task_types`.
+//!
+//! What the task RAN UNDER is resolved here too: `deviceParameters` is optional on the way
+//! in and required on the way out, so a create that carries the document stores it as sent
+//! and one that omits it stores the device's default document for the program that ran
+//! (`crate::state::device_parameters`).
+//!
 //! Three things are resolved before a task is minted, because each of them decides
 //! whether the request can be served at all:
 //!
@@ -75,6 +87,9 @@
 //!
 //! * `quantumTaskArn` (QuantumTaskArn, len 0..256) **required** — The ARN of the quantum task
 //!   created by the request.
+//!
+//! (The recorded response also carries `status`, the accepted task's initial status, which
+//! this shape does not declare; see the note at the top of this module.)
 //!
 //! ## Errors
 //!
@@ -189,8 +204,31 @@ fn request_digest(input: &CreateQuantumTaskInput) -> String {
 /// (`crate::state::DEVICE_ARN_NOT_FOUND`, which names no member and echoes nothing).
 const INVALID_ARN_MEMBER: &str = "deviceArn";
 
+/// The status Amazon Braket reports for a quantum task it has just accepted, in the
+/// response to the create itself.
+///
+/// RECORDED behaviour, not modelled: the on-disk model declares no `status` member on this
+/// operation's output at all (`smithy_query(query="operation",
+/// operation="CreateQuantumTask")` reports `{quantumTaskArn required}`), and the value is
+/// not one of the `QuantumTaskStatus` the READ paths report either — it is the status of a
+/// task that has been accepted and not yet entered its device's queue, which is what the
+/// create's own answer states. The status a later read reports is the stored one
+/// (`crate::state::STATUS_CREATED` onwards), moved by the clock.
+const INITIAL_STATUS: &str = "INITIALIZED";
+
+/// The task being minted, as the run needs to see it: what the result document names the
+/// task, where that document is written, and the instants it reports for the task.
+struct MintedTask<'t> {
+    quantum_task_arn: &'t str,
+    output_s3_directory: &'t str,
+    created_at: ::std::time::SystemTime,
+    ended_at: ::std::time::SystemTime,
+}
+
 /// Run the task's program on the device's simulator and write its result document to the
-/// output location, and report what that produced.
+/// output location, and report what that produced: the terminal status the clock owes the
+/// task, the key its result document was written as, and the device-parameters document the
+/// task RAN UNDER.
 ///
 /// This is what decides the terminal status the clock later owes the task
 /// ([`crate::state::TaskOutcome`]): the program is lowered and executed, and the result
@@ -198,17 +236,29 @@ const INVALID_ARN_MEMBER: &str = "deviceArn";
 /// this service reports as completed is one whose results are really there, and one that
 /// produced nothing carries the reason it did not.
 ///
+/// The parameters are resolved HERE, where the run is, because a create that carried no
+/// `deviceParameters` runs under the device's default document for the program that ran
+/// (`crate::state::device_parameters::resolved`) — so the document the result object
+/// reports and the one the read paths report are the one value, computed once.
+///
 /// Call it with NO guard of this service's store held: it awaits.
 async fn run_quantum_task(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
+    device: &crate::state::Device,
     input: &CreateQuantumTaskInput,
-    quantum_task_arn: &str,
-    output_s3_directory: &str,
-    created_at: ::std::time::SystemTime,
-    ended_at: ::std::time::SystemTime,
-) -> (crate::state::TaskOutcome, Option<String>) {
-    let failed = |reason: String| (crate::state::TaskOutcome::Failed { reason }, None);
+    task: &MintedTask<'_>,
+) -> (crate::state::TaskOutcome, Option<String>, String) {
+    let parameters = |run: Option<&crate::state::TaskMeasurements>| {
+        crate::state::device_parameters::resolved(device, input.device_parameters.as_deref(), run)
+    };
+    let failed = |reason: String, run: Option<&crate::state::TaskMeasurements>| {
+        (
+            crate::state::TaskOutcome::Failed { reason },
+            None,
+            parameters(run),
+        )
+    };
     // Reading the program and running it are both CPU-bound and both descend the
     // program's own structure, so they run together on a BLOCKING thread with a stack
     // sized for the depth the lowering admits
@@ -222,7 +272,7 @@ async fn run_quantum_task(
             .await;
     let measurements = match simulated {
         Ok(Ok(measurements)) => measurements,
-        Ok(Err(refusal)) => return failed(refusal.reason().to_string()),
+        Ok(Err(refusal)) => return failed(refusal.reason().to_string(), None),
         Err(error) => {
             // The thread that was running the program did not finish: nothing produced a
             // result, so the task reports that rather than measurements nobody drew.
@@ -234,21 +284,25 @@ async fn run_quantum_task(
                 "The quantum task's program did not run to completion, so no result was \
                  produced for it."
                     .to_string(),
+                None,
             );
         }
     };
+    let device_parameters = parameters(Some(&measurements));
     let key = format!(
-        "{output_s3_directory}/{}",
+        "{}/{}",
+        task.output_s3_directory,
         crate::state::task_results::RESULTS_OBJECT
     );
     let document = crate::state::task_results::gate_model_result(
         crate::state::task_results::ResultContext {
-            quantum_task_arn,
+            quantum_task_arn: task.quantum_task_arn,
             device_arn: &input.device_arn,
             action: &input.action,
+            device_parameters: &device_parameters,
             shots: input.shots,
-            created_at: &crate::state::as_iso8601(created_at),
-            ended_at: &crate::state::as_iso8601(ended_at),
+            created_at: &crate::state::as_iso8601(task.created_at),
+            ended_at: &crate::state::as_iso8601(task.ended_at),
             status: crate::state::STATUS_COMPLETED,
         },
         &measurements,
@@ -266,12 +320,21 @@ async fn run_quantum_task(
         (
             crate::state::TaskOutcome::Completed { successful_shots },
             Some(key),
+            device_parameters,
         )
     } else {
-        failed(crate::state::task_results::unwritten_results_reason(
-            &input.output_s3_bucket,
-            &key,
-        ))
+        // The program ran, so the parameters it ran under are still the task's; what is
+        // missing is the result document, which is why the task fails.
+        (
+            crate::state::TaskOutcome::Failed {
+                reason: crate::state::task_results::unwritten_results_reason(
+                    &input.output_s3_bucket,
+                    &key,
+                ),
+            },
+            None,
+            device_parameters,
+        )
     }
 }
 
@@ -304,7 +367,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "CreateQuantumTask";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::CREATE_QUANTUM_TASK_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::CREATE_QUANTUM_TASK_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 201u16;
+    // The recorded wire response of this operation is HTTP 200, not the 201 the on-disk
+    // model's `@http` declares (`smithy_query(query="operation",
+    // operation="CreateQuantumTask")` reports `code: 201`): the model is stale here, and
+    // what a client sees is the status Amazon Braket really answers with.
+    const SUCCESS_STATUS: u16 = 200u16;
 
     async fn handle(
         &self,
@@ -358,6 +425,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 return Ok(CreateQuantumTaskOutput {
                     quantum_task_arn: seen.resource_arn.clone(),
+                    status: INITIAL_STATUS.to_string(),
                 });
             }
 
@@ -441,14 +509,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let terminal_due = now + crate::state::TERMINAL_SPAN;
         // The device runs the program and the result document is written where a client
         // reads it; what that produced is the terminal status the clock owes the task.
-        let (outcome, result_object_key) = run_quantum_task(
+        let (outcome, result_object_key, device_parameters) = run_quantum_task(
             ctx,
             &region,
+            &device,
             &input,
-            &quantum_task_arn,
-            &output_s3_directory,
-            now,
-            terminal_due,
+            &MintedTask {
+                quantum_task_arn: &quantum_task_arn,
+                output_s3_directory: &output_s3_directory,
+                created_at: now,
+                ended_at: terminal_due,
+            },
         )
         .await;
 
@@ -462,6 +533,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if seen.fingerprint == fingerprint {
                 return Ok(CreateQuantumTaskOutput {
                     quantum_task_arn: seen.resource_arn.clone(),
+                    status: INITIAL_STATUS.to_string(),
                 });
             }
             return Err(refuse(format!(
@@ -480,12 +552,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             quantum_task_arn: quantum_task_arn.clone(),
             status: crate::state::STATUS_CREATED.to_string(),
             device_arn: device.device_arn.clone(),
-            // `deviceParameters` is required on the way out even when the caller sends
-            // none, so an omitted value is stored as the empty JSON object.
-            device_parameters: input
-                .device_parameters
-                .clone()
-                .unwrap_or_else(|| "{}".to_string()),
+            // The parameters the task RAN UNDER, resolved beside the run itself: the
+            // caller's own document when the create carried one, and otherwise the
+            // device's default document for the program that ran
+            // (`crate::state::device_parameters::resolved`).
+            device_parameters,
             action: input.action.clone(),
             shots: input.shots,
             output_s3_bucket: input.output_s3_bucket.clone(),
@@ -522,6 +593,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         );
 
-        Ok(CreateQuantumTaskOutput { quantum_task_arn })
+        Ok(CreateQuantumTaskOutput {
+            quantum_task_arn,
+            status: INITIAL_STATUS.to_string(),
+        })
     }
 }

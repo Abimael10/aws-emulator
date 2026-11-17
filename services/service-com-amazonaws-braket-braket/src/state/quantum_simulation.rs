@@ -28,6 +28,9 @@ use super::quantum_program::{GateCall, GateModelProgram, ProgramRefusal};
 /// What a run of a quantum task produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskMeasurements {
+    /// How many qubits the program that ran DECLARES — the width of the state the run
+    /// held, which is also what the device parameters of a gate-model program state.
+    pub qubit_count: usize,
     /// The qubits measured, ascending — the columns of each row below.
     pub measured_qubits: Vec<usize>,
     /// One row per shot, each holding one bit per measured qubit.
@@ -167,6 +170,7 @@ pub fn run(program: &GateModelProgram, shots: i64) -> Result<TaskMeasurements, P
     })?;
     let rows = sample(&probabilities, program.measured_qubits.len(), draws);
     Ok(TaskMeasurements {
+        qubit_count: program.qubit_count,
         measured_qubits: program.measured_qubits.clone(),
         rows,
         duration: started.elapsed(),

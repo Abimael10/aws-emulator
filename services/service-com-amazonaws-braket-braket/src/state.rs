@@ -38,6 +38,11 @@ pub use quantum_simulation::*;
 pub mod task_results;
 pub use task_results::*;
 
+/// The device-parameters document a quantum task ran under, split out and re-exported the
+/// same way.
+pub mod device_parameters;
+pub use device_parameters::*;
+
 // ---------------------------------------------------------------------------
 // Modelled enum values this service stores and emits.
 //

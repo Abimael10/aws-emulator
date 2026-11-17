@@ -132,6 +132,9 @@ pub struct ResultContext<'r> {
     pub device_arn: &'r str,
     /// The `action` document the task was created with, as it was sent.
     pub action: &'r str,
+    /// The device-parameters document the task RAN UNDER, as the task's own record holds
+    /// it (`crate::state::device_parameters`).
+    pub device_parameters: &'r str,
     pub shots: i64,
     /// When the task was created, and when its run ended, as ISO-8601 instants.
     pub created_at: &'r str,
@@ -153,6 +156,10 @@ pub fn gate_model_result(
 ) -> ::serde_json::Value {
     let action: ::serde_json::Value = ::serde_json::from_str(context.action)
         .unwrap_or_else(|_| ::serde_json::Value::String(context.action.to_string()));
+    // The parameters document is reported as the DOCUMENT it is, the same way the action
+    // is: both are carried on the API as JSON text and nested in this one as JSON.
+    let device_parameters: ::serde_json::Value = ::serde_json::from_str(context.device_parameters)
+        .unwrap_or_else(|_| ::serde_json::Value::String(context.device_parameters.to_string()));
     ::serde_json::json!({
         "braketSchemaHeader": {
             "name": GATE_MODEL_RESULT_SCHEMA,
@@ -173,6 +180,7 @@ pub fn gate_model_result(
             },
             "id": context.quantum_task_arn,
             "deviceId": context.device_arn,
+            "deviceParameters": device_parameters,
             "shots": context.shots,
             "createdAt": context.created_at,
             "endedAt": context.ended_at,
@@ -242,6 +250,7 @@ mod tests {
     #[test]
     fn the_result_document_reports_the_run_it_belongs_to() {
         let measurements = TaskMeasurements {
+            qubit_count: 2,
             measured_qubits: vec![0, 1],
             rows: vec![vec![0, 0], vec![1, 1], vec![0, 0]],
             duration: Duration::from_millis(7),
@@ -256,6 +265,7 @@ mod tests {
                 quantum_task_arn: "arn:aws:braket:eu-west-1:000000000000:quantum-task/abc",
                 device_arn: "arn:aws:braket:::device/quantum-simulator/amazon/sv1",
                 action: &action,
+                device_parameters: "{\"paradigmParameters\": {\"qubitCount\": 2}}",
                 shots: 3,
                 created_at: "2026-01-01T00:00:00Z",
                 ended_at: "2026-01-01T00:00:02Z",
@@ -285,6 +295,13 @@ mod tests {
             document["taskMetadata"]["status"].as_str(),
             Some(crate::state::STATUS_COMPLETED),
             "case taskMetadata.status: expected the task's status, got {}",
+            document["taskMetadata"]
+        );
+        assert_eq!(
+            document["taskMetadata"]["deviceParameters"]["paradigmParameters"]["qubitCount"],
+            ::serde_json::json!(2),
+            "case taskMetadata.deviceParameters: expected the parameters the task ran \
+             under, got {}",
             document["taskMetadata"]
         );
         assert_eq!(

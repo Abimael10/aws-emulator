@@ -72,12 +72,21 @@ fn update_body(client_token: &str, amount: Option<&str>, time_period: Option<Val
     body
 }
 
-/// A numeric timestamp member of a reported summary, as epoch seconds.
+/// A `date-time` timestamp member of a reported summary, as epoch seconds.
+///
+/// `createdAt` and `updatedAt` carry `@timestampFormat("date-time")`, so they travel as
+/// RFC 3339 STRINGS; this reads one back to a number so two instants can be compared.
 fn stamp(limit: &Value, name: &str) -> f64 {
-    limit
+    let rendered = limit
         .get(name)
-        .and_then(Value::as_f64)
-        .unwrap_or_else(|| panic!("the summary has no numeric {name}: {limit}"))
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("the summary has no date-time {name}: {limit}"));
+    ::aws_smithy_types::DateTime::from_str(
+        rendered,
+        ::aws_smithy_types::date_time::Format::DateTime,
+    )
+    .unwrap_or_else(|e| panic!("{name} {rendered:?} is not an RFC 3339 date-time: {e}"))
+    .as_secs_f64()
 }
 
 /// Create one limit on `device` with [`ORIGINAL_AMOUNT`], the period `start..start+3600`

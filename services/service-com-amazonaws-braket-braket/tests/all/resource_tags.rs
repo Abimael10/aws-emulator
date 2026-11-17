@@ -154,8 +154,8 @@ async fn taggable_resources(braket: &Braket) -> Vec<Resource> {
         }
         let reply = braket.create_task(body).await;
         assert_eq!(
-            reply.status, 201,
-            "creating the quantum task to tag: expected 201, got {} {}",
+            reply.status, 200,
+            "creating the quantum task to tag: expected 200, got {} {}",
             reply.status, reply.body
         );
         resources.push(Resource {
@@ -347,7 +347,7 @@ async fn a_resources_own_read_reports_the_tags_the_tag_doors_wrote() {
         .create_task(create_body("tok-task-read", &device, 10))
         .await;
     assert_eq!(
-        task.status, 201,
+        task.status, 200,
         "creating the quantum task: got {} {}",
         task.status, task.body
     );
@@ -466,7 +466,7 @@ async fn the_arn_decides_which_resource_the_tag_doors_resolve() {
         .create_task(create_body("tok-task-refusals", &device, 10))
         .await;
     assert_eq!(
-        created.status, 201,
+        created.status, 200,
         "creating the quantum task: got {} {}",
         created.status, created.body
     );
@@ -634,7 +634,7 @@ async fn listing_tags_changes_nothing_a_later_caller_sees() {
         .create_task(create_body("tok-task-reads", &device, 25))
         .await;
     assert_eq!(
-        created.status, 201,
+        created.status, 200,
         "creating the quantum task: got {} {}",
         created.status, created.body
     );
@@ -690,7 +690,7 @@ async fn the_tag_set_a_resource_carries_is_bounded_by_count() {
         .create_task(create_body("tok-task-bound", &device, 10))
         .await;
     assert_eq!(
-        created.status, 201,
+        created.status, 200,
         "creating the quantum task: got {} {}",
         created.status, created.body
     );

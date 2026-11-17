@@ -633,8 +633,8 @@ async fn the_reported_spend_is_computed_from_the_devices_quantum_tasks() {
             .create_task(create_body(&format!("task-spend-{index}"), &device, *shots))
             .await;
         assert_eq!(
-            task.status, 201,
-            "case {case:?}: CreateQuantumTask expected 201, got {} {}",
+            task.status, 200,
+            "case {case:?}: CreateQuantumTask expected 200, got {} {}",
             task.status, task.body
         );
 

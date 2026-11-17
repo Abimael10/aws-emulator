@@ -296,8 +296,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             output_s3_directory: task.output_s3_directory.clone(),
             created_at: crate::state::to_date_time(task.created_at),
             ended_at: task.ended_at.map(crate::state::to_date_time),
-            tags: (!task.tags.is_empty())
-                .then(|| task.tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+            // A quantum task's `tags` are reported as a MAP, empty for a task that carries
+            // none, rather than the member being withheld: a client that reads the map off
+            // the response finds one whatever the task was created with.
+            tags: Some(task.tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
             job_arn: task.job_arn.clone(),
             queue_info: wants_queue_info.then(|| queue_info(&guard, &task)),
             associations: (!task.associations.is_empty()).then(|| task.associations.clone()),

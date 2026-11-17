@@ -81,6 +81,23 @@
 //! `tests/all/client_error_wording.rs` pins both over every ARN parameter the model gives
 //! a `@pattern` outside the body (`jobArn`, `spendingLimitArn`).
 
+//! ## And the one codec correction: a `date-time` timestamp
+//!
+//! Every `Timestamp` member of this model declares the wire form it travels in, and all
+//! but two declare `@timestampFormat("date-time")` — a quantum task's and a hybrid job's
+//! `createdAt`/`startedAt`/`endedAt`, a job event's `timeOfEvent`, a spending limit's
+//! `createdAt`/`updatedAt` (`smithy_query(query="shape",
+//! shape="GetQuantumTaskResponse,QuantumTaskSummary,GetJobResponse,JobSummary,JobEventDetails,SpendingLimitSummary,TimePeriod")`).
+//! The vendored codegen emits no member-level format at all, so the JSON codec fell back
+//! to the protocol default and put an epoch NUMBER on the wire where the model pins a
+//! date-time STRING. [`service_common::date_time_json::DateTimeRestJson`] is the tree's one
+//! correction for that class and this service takes it at [`Service::override_protocol`];
+//! it supplies the format only to a member that reports NONE, so the two members whose
+//! declared form really is `epoch-seconds` — `TimePeriod$startAt` and `TimePeriod$endAt` —
+//! keep it by declaring it on their own schemas
+//! (`crate::ops::types::shared_types::TimePeriod`).
+
+use service_common::date_time_json::DateTimeRestJson;
 use service_common::front_door::FrontDoor;
 use service_common::validation::SubmittedEcho;
 use smithy_server_runtime::{
@@ -168,6 +185,9 @@ arn_parameter_wordings!(
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// This service's wire protocol, built ONCE here because
+    /// [`Service::override_protocol`] hands back a borrow of it.
+    protocol: DateTimeRestJson,
     /// The same modelled operations the generated table holds, each wrapped in
     /// [`FrontDoor`] so a request BODY that breaks a modelled constraint is refused
     /// with `BadRequestException` before the operation runs. Keyed by the routing key
@@ -233,6 +253,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         );
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            protocol: DateTimeRestJson::new(),
             front_door,
         }
     }
@@ -320,5 +341,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
+    }
+
+    fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
+        // The model's own `restJson1`, with a timestamp member that reports no format
+        // written in the `date-time` form this model declares for all but two of them
+        // (see the module docs). Those two declare `epoch-seconds` on their own member
+        // schemas, which this codec never overrides.
+        Some(&self.protocol)
     }
 }

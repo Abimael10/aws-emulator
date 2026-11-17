@@ -164,11 +164,105 @@ pub enum ExperimentalCapabilities {
     Enabled(String),
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.braket#TimePeriod")]
+/// A spending limit's active window, with its schema written out instead of derived.
+///
+/// WHY: both members carry `@timestampFormat("epoch-seconds")`
+/// (`smithy_query(query="shape",shape="TimePeriod")` reports
+/// `"timestampFormat": "epoch-seconds"` on `startAt` and on `endAt`, and each member's own
+/// doc says so in prose — "The start date and time for the spending limit period, in epoch
+/// seconds"), so these two are the ONLY timestamps of this service whose declared wire form
+/// is the epoch NUMBER rather than a `date-time` string. The vendored codegen emits no
+/// `with_timestamp_format` at all, so a derived member schema reports NO format and the JSON
+/// codec falls back to the protocol default — which happens to be epoch seconds, but only by
+/// accident of the default. Declaring the format HERE is what makes these members keep their
+/// own form while `crate::service`'s codec supplies `date-time` to every member that reports
+/// none (see that module: it never overrides a format a member declares).
+///
+/// Everything else mirrors the macro's output: one `M_<MEMBER>` schema per member (index =
+/// position in the model's member list), the `SCHEMA` naming them in that order, the
+/// `TIME_PERIOD_SCHEMA` alias, and the serialize/deserialize pair in which an absent
+/// `@required` member becomes the same `missing_member` failure the macro emits. No
+/// constraint traits: neither member declares one.
 #[derive(Debug, Clone)]
 pub struct TimePeriod {
     pub start_at: ::aws_smithy_types::DateTime,
     pub end_at: ::aws_smithy_types::DateTime,
+}
+
+#[allow(non_upper_case_globals)]
+impl TimePeriod {
+    const NAMESPACE: &'static str = "com.amazonaws.braket";
+
+    /// `@timestampFormat("epoch-seconds")` — the chain the vendored codegen cannot emit.
+    pub const M_START_AT: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.braket#TimePeriod$startAt",
+            Self::NAMESPACE,
+            "startAt",
+        ),
+        ::aws_smithy_schema::ShapeType::Timestamp,
+        "startAt",
+        0,
+    )
+    .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::EpochSeconds);
+
+    /// `@timestampFormat("epoch-seconds")`, as for `startAt`.
+    pub const M_END_AT: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.braket#TimePeriod$endAt",
+            Self::NAMESPACE,
+            "endAt",
+        ),
+        ::aws_smithy_schema::ShapeType::Timestamp,
+        "endAt",
+        1,
+    )
+    .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::EpochSeconds);
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.braket#TimePeriod",
+            Self::NAMESPACE,
+            "TimePeriod",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[&Self::M_START_AT, &Self::M_END_AT],
+    );
+}
+
+pub static TIME_PERIOD_SCHEMA: &::aws_smithy_schema::Schema = &TimePeriod::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for TimePeriod {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        s.write_timestamp(&Self::M_START_AT, &self.start_at)?;
+        s.write_timestamp(&Self::M_END_AT, &self.end_at)?;
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for TimePeriod {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut start_at: Option<::aws_smithy_types::DateTime> = None;
+        let mut end_at: Option<::aws_smithy_types::DateTime> = None;
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => start_at = Some(d.read_timestamp(&Self::M_START_AT)?),
+                Some(1) => end_at = Some(d.read_timestamp(&Self::M_END_AT)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(Self {
+            start_at: start_at
+                .ok_or_else(|| ::aws_smithy_schema_server::missing_member("startAt"))?,
+            end_at: end_at.ok_or_else(|| ::aws_smithy_schema_server::missing_member("endAt"))?,
+        })
+    }
 }
 
 /// The values `AssociationType` accepts on the wire.

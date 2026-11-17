@@ -198,8 +198,8 @@ async fn a_quantum_task_runs_its_program_and_writes_its_measurements() {
             ))
             .await;
         assert_eq!(
-            created.status, 201,
-            "case {case}: expected 201, got {} {}",
+            created.status, 200,
+            "case {case}: expected 200, got {} {}",
             created.status, created.body
         );
         let arn = created.str_member("quantumTaskArn");
@@ -387,7 +387,7 @@ async fn a_program_the_simulator_cannot_run_fails_its_task_with_the_reason() {
             ))
             .await;
         assert_eq!(
-            created.status, 201,
+            created.status, 200,
             "case {case}: the create is accepted, got {} {}",
             created.status, created.body
         );
@@ -421,8 +421,8 @@ async fn a_program_the_simulator_cannot_run_fails_its_task_with_the_reason() {
         ))
         .await;
     assert_eq!(
-        after.status, 201,
-        "case the control after the table: expected 201, got {} {}",
+        after.status, 200,
+        "case the control after the table: expected 200, got {} {}",
         after.status, after.body
     );
     let task = poll_until_terminal(&braket, &after.str_member("quantumTaskArn")).await;
@@ -535,8 +535,8 @@ async fn a_create_the_service_cannot_serve_is_refused_before_a_task_is_minted() 
         .create_task(create_body("accepted-token", SV1, 10, BUCKET, &bell))
         .await;
     assert_eq!(
-        accepted.status, 201,
-        "case the control request: expected 201, got {} {}",
+        accepted.status, 200,
+        "case the control request: expected 200, got {} {}",
         accepted.status, accepted.body
     );
 }
