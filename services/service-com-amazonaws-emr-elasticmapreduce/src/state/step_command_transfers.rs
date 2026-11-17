@@ -46,7 +46,10 @@
 //! The local side of a transfer is the session's own TREE
 //! ([`::service_common::posix_shell_session::ProgramFiles`]): the file the commands around it
 //! wrote with a redirection is the file it uploads, and the file it downloads is the one they
-//! read back. A path is a key of that tree; no host file is opened, created or removed.
+//! read back. A path is a key of that tree; no host file is opened, created or removed. The
+//! one local side that is not a path is the CLI's own stream operand ([`STREAM_OPERAND`]): an
+//! upload from it carries what the stage before the command wrote, and a download to it writes
+//! the object's bytes onto the stream the stage after it reads.
 //!
 //! # Bounds
 //!
@@ -86,6 +89,13 @@ pub const PERFORMED_S3_COMMANDS: [&str; 3] = ["cp", "mv", "rm"];
 /// ([`S3_URI_SCHEMES`]) are the Hadoop filesystem's, which these commands do not take, so a
 /// path written in one of them is a local path to them.
 const S3_SCHEME: &str = "s3://";
+
+/// The operand the CLI's `cp` takes for the command's own standard input or standard output:
+/// "Uploading a local file stream to Amazon S3 … `aws s3 cp - s3://bucket/stream.txt`" and
+/// "Downloading an Amazon S3 object as a local file stream … `aws s3 cp s3://bucket/stream.txt
+/// -`" (the `aws s3 cp` command reference). It is an OPERAND rather than an option, so a
+/// command line carrying it is one this program performs; `mv` and `rm` take no such operand.
+const STREAM_OPERAND: &str = "-";
 
 /// The status a command answers when its transfer was made: "0 -- Command was successful.
 /// There were no errors thrown by either the CLI or by the service the request was made to."
@@ -202,19 +212,27 @@ pub fn step_object_cli<Eng: Send + Sync + 'static>(
     })
 }
 
-/// One end of a transfer: a path of the session's tree, or an object of the store.
+/// One end of a transfer: a path of the session's tree, an object of the store, or the
+/// command's own standard input or standard output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Location {
     /// A path the command line named, which is a key of the session's own tree.
     Local(String),
     /// An `s3://<bucket>/<key>` address.
     Object(S3Object),
+    /// The CLI's [`STREAM_OPERAND`]: what the stage before this command wrote, when it is the
+    /// SOURCE, and what this command writes, when it is the destination.
+    Stream,
 }
 
 impl Location {
-    /// `written` as the CLI reads it: an `s3://` address is an object and everything else is a
-    /// local path. `None` for an `s3://` address that names no ONE object.
+    /// `written` as the CLI reads it: `-` is the command's own stream, an `s3://` address is an
+    /// object and everything else is a local path. `None` for an `s3://` address that names no
+    /// ONE object.
     fn of(written: &str) -> Option<Self> {
+        if written == STREAM_OPERAND {
+            return Some(Self::Stream);
+        }
         if written.starts_with(S3_SCHEME) {
             return Some(Self::Object(addressed_object(written)?));
         }
@@ -226,6 +244,7 @@ impl Location {
         match self {
             Self::Local(path) => path.clone(),
             Self::Object(object) => object_shown(object),
+            Self::Stream => STREAM_OPERAND.to_string(),
         }
     }
 }
@@ -274,6 +293,9 @@ enum Requested {
 /// what the command does, so a line carrying one is not this invocation), carrying the wrong
 /// number of operands, naming no object at all, or asking for a transfer with no end in the
 /// object store is one this program answers nothing for.
+///
+/// [`STREAM_OPERAND`] is an operand rather than an option, and `cp` is the one command that
+/// takes it: a `mv` or an `rm` written with it is an invocation of theirs that does not exist.
 fn requested(arguments: &[String]) -> Option<Requested> {
     let mut words = arguments.iter();
     if words.next()?.as_str() != S3_COMMAND_GROUP {
@@ -284,7 +306,10 @@ fn requested(arguments: &[String]) -> Option<Requested> {
         return None;
     }
     let operands: Vec<&String> = words.collect();
-    if operands.iter().any(|operand| operand.starts_with('-')) {
+    if operands
+        .iter()
+        .any(|operand| operand.starts_with('-') && operand.as_str() != STREAM_OPERAND)
+    {
         return None;
     }
     match command {
@@ -305,13 +330,21 @@ fn requested(arguments: &[String]) -> Option<Requested> {
             };
             let from = Location::of(from)?;
             let to = Location::of(to)?;
-            if matches!(from, Location::Local(_)) && matches!(to, Location::Local(_)) {
+            let reaches_the_store =
+                matches!(from, Location::Object(_)) || matches!(to, Location::Object(_));
+            if !reaches_the_store {
+                return None;
+            }
+            let taking_source_away = command == "mv";
+            if taking_source_away
+                && (matches!(from, Location::Stream) || matches!(to, Location::Stream))
+            {
                 return None;
             }
             Some(Requested::Carry {
                 from,
                 to,
-                taking_source_away: command == "mv",
+                taking_source_away,
             })
         }
     }
@@ -321,24 +354,48 @@ impl EnvironmentPrograms for StepObjectCli {
     /// The `aws s3` transfers above, performed against the object store; `None` for every
     /// other program name and every invocation [`requested`] answers nothing for, which the
     /// session reports as a command it could not run.
+    ///
+    /// A command written with no standard input is performed without one, which is the
+    /// invocation [`Self::run_with_input`] answers with none.
     fn run(
         &self,
         name: &str,
         arguments: &[String],
         files: &mut dyn ProgramFiles,
     ) -> Option<ProgramOutcome> {
+        self.run_with_input(name, arguments, None, files)
+    }
+
+    /// The same, for the invocation that READS the command's own standard input: an upload
+    /// whose source is [`STREAM_OPERAND`] carries what the stage before it wrote, or the file
+    /// an input redirection named.
+    fn run_with_input(
+        &self,
+        name: &str,
+        arguments: &[String],
+        standard_input: Option<&str>,
+        files: &mut dyn ProgramFiles,
+    ) -> Option<ProgramOutcome> {
         if name != OBJECT_CLI_PROGRAM {
             return None;
         }
         let requested = requested(arguments)?;
-        Some(self.performed(&requested, files))
+        Some(self.performed(&requested, standard_input, files))
     }
 }
 
 impl StepObjectCli {
     /// Perform one asked-for transfer and answer what the command exits with and the line it
     /// wrote, the way the CLI reports one.
-    fn performed(&self, requested: &Requested, files: &mut dyn ProgramFiles) -> ProgramOutcome {
+    ///
+    /// `standard_input` is what the command was given on its own standard input, which is what
+    /// an upload from [`STREAM_OPERAND`] carries.
+    fn performed(
+        &self,
+        requested: &Requested,
+        standard_input: Option<&str>,
+        files: &mut dyn ProgramFiles,
+    ) -> ProgramOutcome {
         match requested {
             Requested::Remove { target } => match self.delete_object(target) {
                 Ok(()) => reported(
@@ -358,14 +415,18 @@ impl StepObjectCli {
                 // The word the CLI reports the transfer under: what it did with the file.
                 let did = match (*taking_source_away, from, to) {
                     (true, _, _) => "move",
-                    (false, Location::Local(_), _) => "upload",
-                    (false, Location::Object(_), Location::Local(_)) => "download",
-                    (false, _, _) => "copy",
+                    (false, Location::Object(_), Location::Object(_)) => "copy",
+                    (false, Location::Object(_), _) => "download",
+                    (false, _, _) => "upload",
                 };
                 let shown = format!("{} to {}", from.shown(), to.shown());
-                if let Err(detail) = self.carried(from, to, files) {
-                    return reported(TRANSFER_FAILED, format!("{did} failed: {shown} {detail}"));
-                }
+                let carried = self.carried(from, to, standard_input, files);
+                let streamed = match carried {
+                    Err(detail) => {
+                        return reported(TRANSFER_FAILED, format!("{did} failed: {shown} {detail}"))
+                    }
+                    Ok(streamed) => streamed,
+                };
                 // `mv` takes the source away once the destination holds it, so a move that
                 // could not be completed leaves the file where it was.
                 if *taking_source_away {
@@ -381,14 +442,27 @@ impl StepObjectCli {
                         Location::Local(path) => {
                             files.remove(path);
                         }
+                        // Filtered out by [`requested`]: `mv` takes no stream operand.
+                        Location::Stream => {}
                     }
                 }
-                reported(TRANSFER_SUCCEEDED, format!("{did}: {shown}"))
+                // A download to the command's own standard OUTPUT writes the object's bytes
+                // there and nothing else: they are what the stage after it reads, so no report
+                // of this emulator's is written onto that stream.
+                match streamed {
+                    Some(text) => ProgramOutcome {
+                        status: TRANSFER_SUCCEEDED,
+                        output: text.lines().map(str::to_string).collect(),
+                    },
+                    None => reported(TRANSFER_SUCCEEDED, format!("{did}: {shown}")),
+                }
             }
         }
     }
 
-    /// Carry the file at `from` to `to`, or answer why it was not carried.
+    /// Carry the file at `from` to `to`, or answer why it was not carried; `Ok(Some(text))` is
+    /// a transfer whose destination is the command's own standard OUTPUT, which the caller
+    /// writes there.
     ///
     /// An object carried to another object is copied in the store itself, which is the one
     /// transfer whose bytes never enter this process.
@@ -396,17 +470,18 @@ impl StepObjectCli {
         &self,
         from: &Location,
         to: &Location,
+        standard_input: Option<&str>,
         files: &mut dyn ProgramFiles,
-    ) -> Result<(), String> {
+    ) -> Result<Option<String>, String> {
         match (from, to) {
             (Location::Object(source), Location::Object(destination)) => {
-                self.copy_object(source, destination)
+                self.copy_object(source, destination).map(|()| None)
             }
             (Location::Local(path), Location::Object(destination)) => {
                 let Some(contents) = files.read(path) else {
                     return Err(format!("The user-provided path {path} does not exist."));
                 };
-                self.put_object(destination, &contents)
+                self.put_object(destination, &contents).map(|()| None)
             }
             (Location::Object(source), Location::Local(path)) => {
                 let contents = self.get_object(source)?;
@@ -416,12 +491,28 @@ impl StepObjectCli {
                          gives the files one command may hold."
                     ));
                 }
-                Ok(())
+                Ok(None)
+            }
+            // An upload FROM the command's own standard input carries what the stage before it
+            // wrote. A command that was given no standard input at all carries nothing, so
+            // nothing is written: an empty object would be a write the command never made.
+            (Location::Stream, Location::Object(destination)) => {
+                let Some(contents) = standard_input else {
+                    return Err(
+                        "The command was given no standard input to upload.".to_string()
+                    );
+                };
+                self.put_object(destination, contents).map(|()| None)
+            }
+            // A download TO it answers the object's own text, which the caller writes onto
+            // that stream.
+            (Location::Object(source), Location::Stream) => {
+                self.get_object(source).map(Some)
             }
             // Filtered out by [`requested`]: a transfer with no end in the object store is
             // not one this program performs.
-            (Location::Local(_), Location::Local(_)) => Err(
-                "This command performs no transfer between two local paths.".to_string(),
+            (Location::Local(_) | Location::Stream, Location::Local(_) | Location::Stream) => Err(
+                "This command performs no transfer that does not reach Amazon S3.".to_string(),
             ),
         }
     }
@@ -611,7 +702,7 @@ mod tests {
             key: key.to_string(),
         };
         // (case, the arguments after `aws`, what it asks for)
-        let rows: [(&str, &str, Option<Requested>); 13] = [
+        let rows: [(&str, &str, Option<Requested>); 17] = [
             (
                 "an upload",
                 "s3 cp /tmp/out.txt s3://reports/output/out.txt",
@@ -681,6 +772,34 @@ mod tests {
             (
                 "a Hadoop filesystem scheme, which these commands do not take",
                 "s3 cp s3a://reports/a /tmp/one",
+                None,
+            ),
+            (
+                "an upload from the command's own standard input",
+                "s3 cp - s3://reports/stream.txt",
+                Some(Requested::Carry {
+                    from: Location::Stream,
+                    to: Location::Object(object("reports", "stream.txt")),
+                    taking_source_away: false,
+                }),
+            ),
+            (
+                "a download to the command's own standard output",
+                "s3 cp s3://reports/stream.txt -",
+                Some(Requested::Carry {
+                    from: Location::Object(object("reports", "stream.txt")),
+                    to: Location::Stream,
+                    taking_source_away: false,
+                }),
+            ),
+            (
+                "a transfer between the two streams, which reaches no store",
+                "s3 cp - -",
+                None,
+            ),
+            (
+                "a move written with the stream operand, which `mv` does not take",
+                "s3 mv - s3://reports/stream.txt",
                 None,
             ),
         ];

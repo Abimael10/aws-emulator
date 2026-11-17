@@ -170,6 +170,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         };
+        // Reporting only, and before this service's store is taken: a cluster whose capacity is
+        // up is OWED the run of each bootstrap action its launch carried, and no step of it
+        // runs until those have run (`crate::state::bootstrap_run`).
+        crate::state::run_due_bootstrap_actions(
+            &*self.engine,
+            ctx,
+            &crate::state::request_region(ctx.parts()),
+            &input.cluster_id,
+            now,
+        )
+        .await;
         // Reporting only, and before this service's store is taken: a step the cluster has
         // started is OWED the run of the application it submitted, which was owed at this
         // instant whether or not anybody listed the steps, and neither the Amazon S3 read

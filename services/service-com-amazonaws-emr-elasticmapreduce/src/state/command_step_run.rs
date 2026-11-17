@@ -18,18 +18,12 @@
 //!
 //! # Where a command is performed
 //!
-//! On a THREAD of its own, like a submitted application's run, because the transfers the
-//! command's own program makes are calls into this emulator: the thread is not one of the
-//! async runtime's workers, so those calls are driven by blocking it rather than by making
-//! the session asynchronous. What ONE command's transfers may spend is that module's
+//! On a THREAD of its own, like a submitted application's run, under the claim and the permit
+//! every caller-supplied program of this crate is performed under
+//! ([`super::performed_programs`], which states that part once for this module and the
+//! bootstrap path both). What ONE command's transfers may spend is the transfers module's
 //! ([`super::step_command_transfers::TRANSFER_BUDGET`]), and the wait for the thread is that
-//! budget plus the grace below.
-//!
-//! How many such threads this process carries at once is bounded
-//! ([`MAX_CONCURRENT_COMMAND_RUNS`], with a bounded wait for a permit), and one owed command is
-//! performed once at a time however many callers report its step ([`COMMANDS_IN_FLIGHT`]):
-//! a command's transfers are real effects on the object store, so neither a second caller nor a
-//! call that has given up waiting makes them twice.
+//! budget plus the grace that module gives one.
 
 use super::*;
 
@@ -48,35 +42,8 @@ pub const MAX_COMMANDS_RESOLVED_PER_CALL: usize = 32;
 /// command is given rather than the product of the per-command budget and the count above.
 pub const COMMAND_CALL_CEILING: Duration = Duration::from_secs(8);
 
-/// How long after its budget is spent a command's thread is still waited for. CHOSEN: the
-/// room a call that has just been given up on needs to come back, so a command that answered
-/// at its bound is still read rather than being reported as a command nothing answered for.
-pub const COMMAND_ABANDON_GRACE: Duration = Duration::from_secs(2);
-
-/// How many commands this process performs AT ONCE.
-///
-/// CHOSEN, the sibling of the Spark path's own ceiling
-/// ([`super::spark_step_run::MAX_CONCURRENT_APPLICATION_RUNS`]): a command is a session, a
-/// thread and the calls the two make, so the number of them this process carries follows from
-/// this bound rather than from how many callers report a cluster at once. The permit is held by
-/// the command's own thread and given back when that thread ends.
-pub const MAX_CONCURRENT_COMMAND_RUNS: usize = 4;
-
-/// How long a command waits for one of [`MAX_CONCURRENT_COMMAND_RUNS`] to come free before
-/// nothing is performed for it. CHOSEN: a bounded wait, so the operation that performs it
-/// answers either way; a command that found no free slot stays owed an answer and the next call
-/// performs it.
-pub const COMMAND_PERMIT_WAIT: Duration = Duration::from_secs(2);
-
-/// The permits [`MAX_CONCURRENT_COMMAND_RUNS`] hands out, for the whole process.
-///
-/// Held as an owned permit MOVED INTO the thread that performs the command, so it is given back
-/// when that thread really ends — including a command the caller has already given up waiting
-/// for, which would otherwise take this bound past its count while its thread was still going.
-static COMMAND_RUN_PERMITS: ::std::sync::LazyLock<::std::sync::Arc<::tokio::sync::Semaphore>> =
-    ::std::sync::LazyLock::new(|| {
-        ::std::sync::Arc::new(::tokio::sync::Semaphore::new(MAX_CONCURRENT_COMMAND_RUNS))
-    });
+/// The thread one step's command is performed on ([`performed_on_its_own_thread`]).
+const COMMAND_THREAD_NAME: &str = "emr-step-command";
 
 /// One command this service owes an answer: which step submitted it, what it is, and the
 /// runtime role it carries of its own.
@@ -218,94 +185,30 @@ pub async fn resolve_due_step_commands<Eng: Send + Sync + 'static>(
     }
 }
 
-/// The commands being performed RIGHT NOW, as `<cluster>/<step>`, for the whole process.
-///
-/// A command's transfers are real effects on the object store, so one owed command is
-/// performed once at a time however many callers report its step: a second call leaves it
-/// owed and the answer the first produces is the one the step takes.
-static COMMANDS_IN_FLIGHT: ::std::sync::LazyLock<
-    ::std::sync::Mutex<::std::collections::BTreeSet<String>>,
-> = ::std::sync::LazyLock::new(|| ::std::sync::Mutex::new(::std::collections::BTreeSet::new()));
-
-/// A claim on performing ONE step's command, given up when the THREAD that performs it really
-/// ends — including a command the caller has already stopped waiting for, which is still
-/// making its calls until then.
-#[derive(Debug)]
-struct InFlight {
-    key: String,
-}
-
-impl Drop for InFlight {
-    fn drop(&mut self) {
-        held_commands().remove(&self.key);
-    }
-}
-
-/// The in-flight set, recovering a guard a panicking command left poisoned: one caller's
-/// command must not stop every later one from being performed.
-fn held_commands() -> ::std::sync::MutexGuard<'static, ::std::collections::BTreeSet<String>> {
-    COMMANDS_IN_FLIGHT
-        .lock()
-        .unwrap_or_else(::std::sync::PoisonError::into_inner)
-}
-
-/// Claim the command of `step_id` for this call, or `None` when it is already being performed.
+/// The key one step's command is claimed under, so a command two callers report at once is
+/// performed by the first of them alone ([`claimed_program`]).
 fn claimed(cluster_id: &str, step_id: &str) -> Option<InFlight> {
-    let key = format!("{cluster_id}/{step_id}");
-    held_commands()
-        .insert(key.clone())
-        .then_some(InFlight { key })
+    claimed_program(&format!("{cluster_id}/{step_id}"))
 }
 
 /// Perform ONE owed command and answer what its step ends in, or `None` when nothing answered
 /// for it at all.
 ///
-/// The session is synchronous and makes calls of its own, so it runs on a thread with no
-/// runtime context of its own and the caller's wait for it is bounded by the budget one
-/// command's transfers have plus [`COMMAND_ABANDON_GRACE`]. `claim` is this command's place in
-/// [`COMMANDS_IN_FLIGHT`] and the permit is its share of [`MAX_CONCURRENT_COMMAND_RUNS`]; both
-/// are MOVED into that thread, so both are given up when the thread really ends rather than
-/// when this call stops waiting. A command that found no free slot inside
-/// [`COMMAND_PERMIT_WAIT`] is performed by nothing here and stays owed an answer.
+/// The session is synchronous and makes calls of its own, so it is performed where every
+/// caller-supplied program of this crate is ([`performed_on_its_own_thread`]): on a thread with
+/// no runtime context of its own, holding `claim` and one of that module's permits, inside the
+/// budget one command's transfers have plus the grace it gives them.
 async fn performed_command(
     plan: &StepCommandPlan,
     cli: Option<StepObjectCli>,
     claim: InFlight,
 ) -> Option<StepOutcome> {
-    let permit = ::tokio::time::timeout(
-        COMMAND_PERMIT_WAIT,
-        ::std::sync::Arc::clone(&COMMAND_RUN_PERMITS).acquire_owned(),
-    )
-    .await
-    .ok()?
-    .ok()?;
     let command = plan.command.clone();
-    let (sender, receiver) = ::tokio::sync::oneshot::channel();
-    let spawned = ::std::thread::Builder::new()
-        .name("emr-step-command".to_string())
-        .spawn(move || {
-            // Both held for as long as the command is being performed, whoever is still
-            // waiting for it.
-            let _claim = claim;
-            let _permit = permit;
-            // A command the session answered for nothing of ends the step the way every
-            // unaccounted-for submission of this service ends it: in the modelled failure
-            // state saying its work was not run, never a status nothing produced.
-            let outcome = command_outcome(&command, cli).unwrap_or_else(not_executed);
-            let _ = sender.send(outcome);
-        });
-    if spawned.is_err() {
-        return None;
-    }
-    match ::tokio::time::timeout(
-        TRANSFER_BUDGET.saturating_add(COMMAND_ABANDON_GRACE),
-        receiver,
-    )
+    performed_on_its_own_thread(COMMAND_THREAD_NAME, TRANSFER_BUDGET, claim, move || {
+        // A command the session answered for nothing of ends the step the way every
+        // unaccounted-for submission of this service ends it: in the modelled failure
+        // state saying its work was not run, never a status nothing produced.
+        command_outcome(&command, cli).unwrap_or_else(not_executed)
+    })
     .await
-    {
-        Ok(Ok(outcome)) => Some(outcome),
-        // The command was given up on, or its thread ended without reporting: nothing is
-        // known about what it came to, so nothing is claimed about it.
-        Ok(Err(_)) | Err(_) => None,
-    }
 }

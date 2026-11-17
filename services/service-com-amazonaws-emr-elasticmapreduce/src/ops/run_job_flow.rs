@@ -820,6 +820,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             applications,
             configurations: input.configurations.unwrap_or_default(),
             bootstrap_actions: input.bootstrap_actions.unwrap_or_default(),
+            // What those actions came to is answered later, when the cluster's bootstrap
+            // phase runs them (`crate::state::run_due_bootstrap_actions`): a launch has
+            // answered for none of them yet.
+            bootstrap_runs: Vec::new(),
             // The placement groups the launch really creates: an entry asking for the
             // NONE strategy asks for no placement group at all.
             placement_groups: crate::state::created_placement_groups(

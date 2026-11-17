@@ -198,6 +198,17 @@ pub use sessions::*;
 mod bootstrap_actions;
 pub use bootstrap_actions::*;
 
+/// RUNNING those actions — fetching each script out of Amazon S3 and performing it before the
+/// cluster reports itself ready — split out and re-exported the same way.
+mod bootstrap_run;
+pub use bootstrap_run::*;
+
+/// WHERE a caller-supplied shell program of this crate is performed — the thread, the claim
+/// and the permit one gets, shared by the step-command and bootstrap paths — split out and
+/// re-exported the same way.
+mod performed_programs;
+pub use performed_programs::*;
+
 /// The application user interfaces served ON a cluster — which of them a cluster serves,
 /// and the one composition of an application-UI address — split out and re-exported the
 /// same way.
@@ -429,6 +440,10 @@ pub mod cluster_state_change_reason_code {
     /// `KeepJobFlowAliveWhenNoSteps` is false (`RunJobFlow` doc), which is what
     /// `Cluster$AutoTerminate` reports.
     pub const ALL_STEPS_COMPLETED: &str = "ALL_STEPS_COMPLETED";
+
+    /// A bootstrap action of the cluster did not succeed, so its nodes were never brought up
+    /// the way the launch asked ([`super::bootstrap_run`]).
+    pub const BOOTSTRAP_FAILURE: &str = "BOOTSTRAP_FAILURE";
 }
 
 /// `com.amazonaws.emr#InvalidRequestException$ErrorCode` — "the error code associated
@@ -2793,6 +2808,11 @@ pub struct ClusterRecord {
     pub applications: Vec<Application>,
     pub configurations: Vec<Configuration>,
     pub bootstrap_actions: Vec<BootstrapActionConfig>,
+    /// What each of those actions CAME TO, in launch order: one record per action this
+    /// cluster's bootstrap phase has answered for ([`BootstrapActionRun`],
+    /// [`run_due_bootstrap_actions`]). A cluster whose actions have not all run and succeeded
+    /// does not report itself ready, and one whose action failed goes down for it.
+    pub bootstrap_runs: Vec<BootstrapActionRun>,
     pub placement_groups: Vec<PlacementGroupConfig>,
     pub kerberos_attributes: Option<KerberosAttributes>,
     pub monitoring_configuration: Option<MonitoringConfiguration>,
@@ -2869,7 +2889,12 @@ impl ClusterRecord {
         if self.status.state == cluster_state::TERMINATING {
             if let Some(due) = self.status.terminated_due_at {
                 if now >= due {
-                    self.status.state = cluster_state::TERMINATED.to_string();
+                    // WHICH terminal state follows from why the cluster shut down
+                    // ([`terminal_cluster_state`]): a shutdown that is a failure of the
+                    // cluster ends `TERMINATED_WITH_ERRORS`, and every other one `TERMINATED`.
+                    self.status.state =
+                        terminal_cluster_state(self.status.state_change_reason.as_ref())
+                            .to_string();
                     self.status.end_date_time = Some(due);
                     self.status.terminated_due_at = None;
                     // A group or a fleet outlives its cluster by nothing: once the
@@ -2903,8 +2928,19 @@ impl ClusterRecord {
             }
         }
         if self.status.state == cluster_state::BOOTSTRAPPING {
+            // A bootstrap action that did not succeed takes the cluster DOWN rather than on to
+            // ready: its nodes were never brought up the way the launch asked
+            // ([`Self::begin_bootstrap_failure`]).
+            if self.begin_bootstrap_failure(now) {
+                return;
+            }
             if let Some(due) = self.status.ready_due_at {
-                if now >= due {
+                // The cluster is ready once the phase is due AND every bootstrap action its
+                // launch carried has run: they run "before Hadoop starts on the cluster
+                // nodes" (`RunJobFlow$BootstrapActions` doc), so one that has not answered yet
+                // holds the cluster in this phase rather than letting it report itself ready
+                // for a script nothing performed ([`run_due_bootstrap_actions`]).
+                if now >= due && self.bootstrap_actions_have_run() {
                     self.status.state = if self.instances.keep_job_flow_alive_when_no_steps {
                         cluster_state::WAITING.to_string()
                     } else {
