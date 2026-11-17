@@ -23,13 +23,18 @@
 //!   and refuses an ARN that names no resource this service holds with the tagging
 //!   route's OWN not-found class;
 //! * and an operation whose modelled output structure declares no member answers
-//!   `204 No Content` with no body at all (`DeleteDeployment`, `UntagResource`,
-//!   `TagResource`).
+//!   `204 No Content` with no body at all — the set of such operations being read from
+//!   the model, so the rule is pinned over every one of them (`DeleteComponent`,
+//!   `DeleteCoreDevice`, `DeleteDeployment`, `TagResource`, `UntagResource`) rather than
+//!   over the one that reported it, while an operation whose output declares members
+//!   answers its own modelled status carrying that body.
 //!
 //! Every assertion drives the real `restJson1` front door: the request is built the way
 //! an SDK builds it, dispatched through [`MultiServiceRouter`], and judged on the HTTP
 //! status and the JSON body. Nothing reaches into the state struct, so a listing served
-//! from anything but what the creates persisted fails here.
+//! from anything but what the creates persisted fails here — with one exception, a core
+//! device's own status report, which no operation of this model binds and which the
+//! no-content case therefore writes the way the device's status update does.
 //!
 //! The rows differ along what the rules generalise over — the target FORM (a thing, a
 //! thing group, a subdeployment under a parent), how many revisions a target has, the
@@ -937,5 +942,346 @@ async fn untagging_an_arn_that_names_nothing_is_the_tagging_routes_own_refusal()
         (200, tag_object(&[])),
         "case \"the published component version\": the removal must be readable, got \
          {status} {listed}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The success that carries no content, over the whole surface
+// ---------------------------------------------------------------------------
+
+/// This service's Smithy model, as it ships beside this crate. Read at test time rather
+/// than embedded: it is JSON that no non-test build needs, and it is the SOURCE of the
+/// operation set driven below rather than a list written out by hand here.
+const MODEL_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/smithy-model/com-amazonaws-greengrassv2-greengrassv2.json"
+);
+
+/// The status the protocol defaults an unstated `@http` code to, which is what a
+/// members-less output answers when nothing states otherwise.
+const PROTOCOL_DEFAULT_STATUS: u16 = 200;
+
+/// One operation whose modelled output declares no member: its name, whether that output is
+/// `smithy.api#Unit`, and the `code` its `@http` trait states, if it states one.
+#[derive(Debug)]
+struct NoContentOperation {
+    operation: String,
+    unit_output: bool,
+    modelled_code: Option<u64>,
+}
+
+/// Every operation this model declares whose success carries NO CONTENT — the ones whose
+/// output declares no member, `smithy.api#Unit` and a members-less structure alike — sorted
+/// by name.
+///
+/// Read off the model rather than listed here, so it is the GUARD on the set the case below
+/// drives: an operation added to the model that answers no content fails that guard, instead
+/// of being silently left out of a hand-written list.
+fn no_content_operations() -> Vec<NoContentOperation> {
+    let model = std::fs::read_to_string(MODEL_PATH)
+        .expect("the model that generated this crate ships beside it");
+    let model: Value =
+        serde_json::from_str(&model).expect("the model that generated this crate is JSON");
+    let shapes = model["shapes"]
+        .as_object()
+        .expect("a Smithy model declares shapes");
+    let mut operations: Vec<NoContentOperation> = shapes
+        .iter()
+        .filter(|(_, shape)| shape["type"] == "operation")
+        .filter_map(|(id, shape)| {
+            let output = shape["output"]["target"].as_str().unwrap_or_default();
+            let unit_output = output == "smithy.api#Unit";
+            let declares_no_member = unit_output
+                || shapes.get(output).is_some_and(|output| {
+                    output["type"] == "structure"
+                        && output["members"].as_object().is_none_or(Map::is_empty)
+                });
+            declares_no_member.then(|| NoContentOperation {
+                operation: id.rsplit('#').next().unwrap_or(id).to_string(),
+                unit_output,
+                modelled_code: shape["traits"]["smithy.api#http"]["code"].as_u64(),
+            })
+        })
+        .collect();
+    operations.sort_by(|left, right| left.operation.cmp(&right.operation));
+    operations
+}
+
+/// Which kind of resource a row of the no-content table holds its tag set on — the three
+/// kinds the tagging route's `GenericV2ARN` admits
+/// (`smithy_query(query="shape",shape="GenericV2ARN")`: `components`, `deployments`,
+/// `coreDevices`).
+#[derive(Debug)]
+enum TaggedKind {
+    ComponentVersion {
+        component: &'static str,
+        version: &'static str,
+    },
+    Deployment {
+        target: &'static str,
+    },
+    CoreDevice {
+        thing: &'static str,
+    },
+}
+
+/// One row of the no-content table: the resource whose tags are mutated, the tags one
+/// `TagResource` write carries and the keys one `UntagResource` removes, with what the
+/// listing must report after each mutation.
+#[derive(Debug)]
+struct NoContentCase {
+    label: &'static str,
+    kind: TaggedKind,
+    write: &'static [(&'static str, &'static str)],
+    after_write: &'static [(&'static str, &'static str)],
+    remove: &'static [&'static str],
+    after_remove: &'static [(&'static str, &'static str)],
+}
+
+/// The rows differ along what the rule generalises over: the resource KIND the mutation
+/// addresses, how many tags a write carries (one, two, three), whether a value is empty
+/// (`TagValue` is `length 0..256`), and how many of the resource's keys a removal names
+/// (one, several, all, one it does not carry) — not along the names, which the rule says
+/// nothing about.
+const NO_CONTENT_CASES: &[NoContentCase] = &[
+    NoContentCase {
+        label: "a component version, one tag written then removed",
+        kind: TaggedKind::ComponentVersion {
+            component: "com.example.NoContent",
+            version: "1.0.0",
+        },
+        write: &[("env", "prod")],
+        after_write: &[("env", "prod")],
+        remove: &["env"],
+        after_remove: &[],
+    },
+    NoContentCase {
+        label: "a component version, three tags one empty-valued, two removed",
+        kind: TaggedKind::ComponentVersion {
+            component: "com.example.NoContent",
+            version: "2.0.0",
+        },
+        write: &[("env", "prod"), ("note", ""), ("owner", "fleet-team")],
+        after_write: &[("env", "prod"), ("note", ""), ("owner", "fleet-team")],
+        remove: &["env", "note"],
+        after_remove: &[("owner", "fleet-team")],
+    },
+    NoContentCase {
+        label: "a deployment, one tag, a removal naming a key it does not carry",
+        kind: TaggedKind::Deployment {
+            target: "NoContentCoreA",
+        },
+        write: &[("wave", "1")],
+        after_write: &[("wave", "1")],
+        remove: &["absent"],
+        after_remove: &[("wave", "1")],
+    },
+    NoContentCase {
+        label: "a deployment, two tags, every key removed",
+        kind: TaggedKind::Deployment {
+            target: "NoContentCoreB",
+        },
+        write: &[("env", "prod"), ("wave", "2")],
+        after_write: &[("env", "prod"), ("wave", "2")],
+        remove: &["env", "wave"],
+        after_remove: &[],
+    },
+    NoContentCase {
+        label: "a core device, two tags, one removed",
+        kind: TaggedKind::CoreDevice {
+            thing: "NoContentCore",
+        },
+        write: &[("site", "factory-7"), ("tier", "edge")],
+        after_write: &[("site", "factory-7"), ("tier", "edge")],
+        remove: &["site"],
+        after_remove: &[("tier", "edge")],
+    },
+];
+
+/// Assert `answered` — one operation's status, stated `content-length` and parsed body —
+/// carries no content: the no-content status, no body at all, and the length that nothing
+/// has.
+fn assert_no_content(label: &str, operation: &str, answered: &(u16, Option<String>, Value)) {
+    let (status, length, body) = answered;
+    assert_eq!(
+        (*status, body.clone()),
+        (NO_CONTENT, Value::Null),
+        "case {label:?}: {operation} must answer {NO_CONTENT} with no body, and not the \
+         protocol's defaulted {PROTOCOL_DEFAULT_STATUS}, got {status} {body}"
+    );
+    assert_eq!(
+        length.as_deref(),
+        Some("0"),
+        "case {label:?}: {operation}'s no-content answer states the length it has, got \
+         {length:?}"
+    );
+}
+
+/// Assert the tag listing reports exactly `expected` for `arn` after `operation` ran — the
+/// read that shows a no-content answer was backed by a write.
+async fn assert_tags_reported(
+    router: &MultiServiceRouter,
+    label: &str,
+    operation: &str,
+    arn: &str,
+    expected: &[(&str, &str)],
+) {
+    let (status, listed) = list_tags(router, arn).await;
+    assert_eq!(
+        (status, listed["tags"].clone()),
+        (PROTOCOL_DEFAULT_STATUS, tag_object(expected)),
+        "case {label:?}: after {operation} the listing must report {}, got {status} {listed}",
+        tag_object(expected)
+    );
+}
+
+/// RULE: an operation of this surface whose modelled output declares no member answers its
+/// success `204 No Content` with no body at all — not the `200` the protocol defaults an
+/// unstated `@http` code to, and not the empty JSON object a members-less output structure
+/// is otherwise rendered as — while an operation whose output declares members answers its
+/// own modelled status carrying that body.
+///
+/// The set of operations the rule covers is read FROM THE MODEL
+/// ([`no_content_operations`]), which guards the set driven here against the model's own:
+/// the three whose output is `smithy.api#Unit`, where the model states the no-content code
+/// itself, and the two tagging mutations, where it states the protocol's own default and
+/// the surface answers the no-content status regardless.
+#[tokio::test]
+async fn every_operation_whose_output_declares_no_member_answers_no_content() {
+    let modelled = no_content_operations();
+
+    // What the MODEL says about each of them, which is why the two tagging mutations need
+    // the status stated on the operation: the three `smithy.api#Unit` outputs carry the
+    // no-content code in the model, while the tagging mutations carry the code the
+    // protocol defaults to, which the recorded answers contradict.
+    for operation in &modelled {
+        let modelled_status = operation
+            .modelled_code
+            .unwrap_or(u64::from(PROTOCOL_DEFAULT_STATUS));
+        let expected = if operation.unit_output {
+            u64::from(NO_CONTENT)
+        } else {
+            u64::from(PROTOCOL_DEFAULT_STATUS)
+        };
+        assert_eq!(
+            modelled_status, expected,
+            "case {:?}: expected the model to carry {expected} for it, got {modelled_status}",
+            operation.operation
+        );
+    }
+
+    let tagging: Vec<&str> = modelled
+        .iter()
+        .filter(|operation| !operation.unit_output)
+        .map(|operation| operation.operation.as_str())
+        .collect();
+    assert_eq!(
+        tagging,
+        vec!["TagResource", "UntagResource"],
+        "case \"the model's members-less output structures\": the operations this case \
+         drives through the tagging route are the ones the model declares, got {tagging:?}"
+    );
+    let unit: Vec<&str> = modelled
+        .iter()
+        .filter(|operation| operation.unit_output)
+        .map(|operation| operation.operation.as_str())
+        .collect();
+    assert_eq!(
+        unit,
+        vec!["DeleteComponent", "DeleteCoreDevice", "DeleteDeployment"],
+        "case \"the model's `smithy.api#Unit` outputs\": the operations this case drives as \
+         deletes are the ones the model declares, got {unit:?}"
+    );
+
+    // One router over one engine: a core device's own status report has no modelled
+    // operation, so the rows that need one in the fleet write it the way the device's
+    // status update does and drive every assertion through the HTTP front door.
+    let (router, engine) = crate::core_device_fleet::emulator();
+
+    for case in NO_CONTENT_CASES {
+        let label = case.label;
+        let arn = match case.kind {
+            TaggedKind::ComponentVersion { component, version } => {
+                create_component(&router, component, version).await
+            }
+            TaggedKind::Deployment { target } => {
+                deployment_arn(&deploy_to(&router, &thing_target(target)).await)
+            }
+            TaggedKind::CoreDevice { thing } => {
+                // `HEALTHY` is one of the two `CoreDeviceStatus` values
+                // (`smithy_query(query="shape",shape="CoreDeviceStatus")`).
+                crate::core_device_fleet::report(
+                    &engine,
+                    &crate::core_device_fleet::Report::new(thing, "HEALTHY"),
+                );
+                format!("arn:aws:greengrass:{REGION}:{ACCOUNT}:coreDevices:{thing}")
+            }
+        };
+
+        // The write, then the removal: each answers no content, and each is read back
+        // through the operation whose output DOES declare members, because a 204 reports
+        // nothing about what it did.
+        let answered = tag(&router, &arn, case.write).await;
+        assert_no_content(label, "TagResource", &answered);
+        assert_tags_reported(&router, label, "TagResource", &arn, case.after_write).await;
+
+        let answered = untag(&router, &arn, case.remove).await;
+        assert_no_content(label, "UntagResource", &answered);
+        assert_tags_reported(&router, label, "UntagResource", &arn, case.after_remove).await;
+    }
+
+    // The three deletes, whose output is `smithy.api#Unit`: each one answers the same
+    // no-content framing on the resource kind it addresses. A deployment is cancelled
+    // first, which is what its own route requires before a delete.
+    let component = create_component(&router, "com.example.NoContentDeleted", "1.0.0").await;
+    let deployment = deploy_to(&router, &thing_target("NoContentDeletedCore")).await;
+    let (status, cancelled) = cancel_deployment(&router, &deployment).await;
+    assert_eq!(
+        status, 200,
+        "the cancel before the delete must answer 200, got {status} {cancelled}"
+    );
+    crate::core_device_fleet::report(
+        &engine,
+        &crate::core_device_fleet::Report::new("NoContentDeletedDevice", "HEALTHY"),
+    );
+
+    for (operation, path) in [
+        (
+            "DeleteComponent",
+            format!(
+                "/greengrass/v2/components/{}",
+                encoded_label(&component)
+            ),
+        ),
+        (
+            "DeleteDeployment",
+            format!("/greengrass/v2/deployments/{deployment}"),
+        ),
+        (
+            "DeleteCoreDevice",
+            "/greengrass/v2/coreDevices/NoContentDeletedDevice".to_string(),
+        ),
+    ] {
+        let answered = call(&router, "DELETE", &path, Vec::new()).await;
+        assert_no_content("a `smithy.api#Unit` output", operation, &answered);
+    }
+
+    // The other side of the rule: an operation whose output DOES declare members answers
+    // its own modelled status carrying that body, so the 204 above is the members-less
+    // output's answer and not every success's. Driven on a resource no delete above
+    // removed.
+    let surviving = create_component(&router, "com.example.NoContentSurvivor", "1.0.0").await;
+    let answered = tag(&router, &surviving, &[("env", "prod")]).await;
+    assert_no_content("the surviving resource", "TagResource", &answered);
+    let (status, listed) = list_tags(&router, &surviving).await;
+    assert_eq!(
+        status, PROTOCOL_DEFAULT_STATUS,
+        "case \"ListTagsForResource\": an output with members answers its modelled status \
+         carrying a body, got {status} {listed}"
+    );
+    assert!(
+        listed.get("tags").is_some(),
+        "case \"ListTagsForResource\": its body carries the member its output declares, \
+         got {listed}"
     );
 }
