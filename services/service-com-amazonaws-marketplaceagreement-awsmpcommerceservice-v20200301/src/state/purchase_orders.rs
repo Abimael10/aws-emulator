@@ -21,13 +21,24 @@ pub(super) const PURCHASE_ORDERS_MEMBER: &str = "purchaseOrders";
 pub const REASON_DUPLICATE_CHARGES: &str = "DUPLICATE_CHARGES";
 
 /// Why one purchase-order association was refused: the `ValidationException`
-/// `reason` to report, and the dotted request path of the member it is about —
+/// `reason` to report, the dotted request path of the member it is about —
 /// which element of the request's `purchaseOrders` list carried it, and which
-/// member of that element.
+/// member of that element — and the class that member failed in, which is what
+/// the `fields` entry's text states ([`RefusalKind`]).
 #[derive(Debug)]
 pub struct PurchaseOrderRefusal {
     pub reason: String,
     pub path: String,
+    pub kind: RefusalKind,
+}
+
+impl PurchaseOrderRefusal {
+    /// This refusal as the modelled envelope every caller answers it with: the
+    /// reason it carries, one `fields` entry at the member's own path, and that
+    /// entry worded in the class the member failed in.
+    pub fn exception(&self) -> ValidationException {
+        validation_exception_in_kind(&self.reason, &[self.path.as_str()], self.kind)
+    }
 }
 
 /// The dotted request path of one member of the `index`-th element of a
@@ -164,14 +175,19 @@ pub fn validate_purchase_orders(
         let charge_path = purchase_order_member_path(index, "chargeId");
         let Some(target) = charges.get(order.charge_id.as_str()) else {
             return Err(PurchaseOrderRefusal {
-                reason: member_reason(&charge_path, RefusalKind::Invalid),
+                reason: member_reason(&charge_path, RefusalKind::UnresolvedReference),
                 path: charge_path,
+                // The value is well formed and names no charge of the
+                // agreement, so it failed in the unresolved-reference class
+                // rather than by being a value the member does not admit.
+                kind: RefusalKind::UnresolvedReference,
             });
         };
         if !associated.insert(order.charge_id.as_str()) {
             return Err(PurchaseOrderRefusal {
                 reason: REASON_DUPLICATE_CHARGES.to_string(),
                 path: charge_path,
+                kind: RefusalKind::Invalid,
             });
         }
         if order.purchase_order_reference.is_none() {
@@ -179,6 +195,7 @@ pub fn validate_purchase_orders(
             return Err(PurchaseOrderRefusal {
                 reason: member_reason(&reference_path, RefusalKind::Missing),
                 path: reference_path,
+                kind: RefusalKind::Missing,
             });
         }
         // The precondition on the charge being written, in the two ways it can
@@ -190,12 +207,14 @@ pub fn validate_purchase_orders(
             return Err(PurchaseOrderRefusal {
                 reason: member_reason(&revision_path, RefusalKind::Missing),
                 path: revision_path,
+                kind: RefusalKind::Missing,
             });
         };
         if stated != target.revision {
             return Err(PurchaseOrderRefusal {
                 reason: member_reason(&revision_path, RefusalKind::Invalid),
                 path: revision_path,
+                kind: RefusalKind::Invalid,
             });
         }
         // The other member that restates the state of the charge being written:
@@ -212,6 +231,10 @@ pub fn validate_purchase_orders(
             return Err(PurchaseOrderRefusal {
                 reason: member_reason(&agreement_path, RefusalKind::Invalid),
                 path: agreement_path,
+                // The value contradicts the element's own `chargeId` rather
+                // than naming nothing: it is a value this member does not admit
+                // for this element.
+                kind: RefusalKind::Invalid,
             });
         }
     }
@@ -265,6 +288,7 @@ pub fn update_purchase_orders_refusal(orders: &[PurchaseOrder]) -> Option<Purcha
                 PurchaseOrderRefusal {
                     reason: member_reason(&path, RefusalKind::Missing),
                     path,
+                    kind: RefusalKind::Missing,
                 }
             })
     })

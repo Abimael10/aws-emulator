@@ -32,7 +32,9 @@ use crate::agreement_lifecycle::{
     agreement_over, call, emulator, invoiced_agreement, is_next_token, term, Answer,
 };
 use crate::billing_adjustments::{entry, submit};
-use crate::error_bodies::{assert_input_fault, unresolvable_agreement_ids};
+use crate::error_bodies::{
+    assert_input_fault, assert_unresolvable_reference_fault, unresolvable_agreement_ids,
+};
 
 /// The one catalog AWS Marketplace exposes, which every agreement this service
 /// holds was created in — spelled out here rather than imported so a handler
@@ -286,7 +288,12 @@ async fn an_unknown_agreement_is_refused_before_any_page_token_is_read() {
             for (token_case, token) in &tokens {
                 let case = format!("{id_case}, {companion_case}, with {token_case}");
                 let answer = list(&router, request(&absent, companion, *token)).await;
-                assert_input_fault(&case, INVALID_AGREEMENT_ID, "agreementId", &answer);
+                assert_unresolvable_reference_fault(
+                    &case,
+                    INVALID_AGREEMENT_ID,
+                    "agreementId",
+                    &answer,
+                );
             }
         }
     }

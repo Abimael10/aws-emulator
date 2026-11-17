@@ -38,7 +38,7 @@
 use serde_json::{json, Value};
 
 use crate::agreement_lifecycle::{agreement_over, call, emulator, term, Answer};
-use crate::error_bodies::{assert_input_fault, unresolvable_agreement_ids};
+use crate::error_bodies::{assert_unresolvable_reference_fault, unresolvable_agreement_ids};
 use crate::payment_requests::{agreement_with_variable_term, sent, PENDING_APPROVAL};
 
 /// The `ValidationExceptionReason` the model publishes for an `agreementId` the
@@ -228,7 +228,7 @@ async fn an_unresolvable_agreement_id_is_an_input_fault_on_every_payment_request
             );
             let case = format!("{} over {id_case}", under_test.operation);
             let answer = call(&router, under_test.operation, under_test.request(&id)).await;
-            assert_input_fault(&case, INVALID_AGREEMENT_ID, "agreementId", &answer);
+            assert_unresolvable_reference_fault(&case, INVALID_AGREEMENT_ID, "agreementId", &answer);
         }
     }
 }

@@ -282,13 +282,17 @@ impl ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
     /// generic `ResourceId`, and the corpus records that operation serving the
     /// empty page for the same class of value — so it filters where these three
     /// resolve.
+    ///
+    /// The member failed by naming nothing rather than by carrying a value this
+    /// service does not admit, so the `fields` entry is the
+    /// unresolved-reference one ([`unresolved_reference`]).
     pub fn unknown_agreement_refusal(
         &self,
         agreement_id: Option<&str>,
     ) -> Option<ValidationException> {
         match agreement_id {
             Some(id) if !self.agreements.contains_key(id) => {
-                Some(validation_exception("INVALID_AGREEMENT_ID", "agreementId"))
+                Some(unresolved_reference("INVALID_AGREEMENT_ID", "agreementId"))
             }
             _ => None,
         }

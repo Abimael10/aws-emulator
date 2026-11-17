@@ -44,7 +44,9 @@ use crate::agreement_lifecycle::{
     agreement_over, call, emulator, invoiced_agreement, is_next_token, term, Answer,
 };
 use crate::billing_adjustments::{entry, submit};
-use crate::error_bodies::{assert_input_fault, unresolvable_agreement_ids};
+use crate::error_bodies::{
+    assert_input_fault, assert_unresolvable_reference_fault, unresolvable_agreement_ids,
+};
 // The empty page a filter that selects nothing serves is asserted by the suite
 // that owns the selector classes, so the two cannot drift on what it looks like.
 use crate::selector_resolution::assert_empty_page;
@@ -324,7 +326,12 @@ async fn a_paginated_read_resolves_its_agreement_before_its_page_token() {
                         assert_not_about_the_token(&case, &answer);
                     }
                     Refusal::InvalidMember => {
-                        assert_input_fault(&case, INVALID_AGREEMENT_ID, "agreementId", &answer);
+                        assert_unresolvable_reference_fault(
+                            &case,
+                            INVALID_AGREEMENT_ID,
+                            "agreementId",
+                            &answer,
+                        );
                         assert_not_about_the_token(&case, &answer);
                     }
                     // Nothing was resolved, so the only thing that can be wrong

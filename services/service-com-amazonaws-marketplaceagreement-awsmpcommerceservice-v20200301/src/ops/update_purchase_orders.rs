@@ -188,7 +188,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(refusal) = crate::state::update_purchase_orders_refusal(&input.purchase_orders)
         {
             return Err(UpdatePurchaseOrdersErrorModeled::ValidationException(
-                crate::state::validation_exception(&refusal.reason, refusal.path),
+                refusal.exception(),
             )
             .into());
         }

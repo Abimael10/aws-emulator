@@ -58,14 +58,22 @@ const AGREEMENT: &str = "Agreement";
 /// See [`AGREEMENT`].
 const BILLING_ADJUSTMENT_REQUEST: &str = "BillingAdjustmentRequest";
 
-/// What a `ValidationExceptionField` states about a well-formed member value a
-/// rule of the service itself does not accept — an id naming nothing, a page
-/// token of another query, an agreement that is no longer active. Spelled out
-/// here rather than imported, so a change of wording in the service fails this
-/// test instead of agreeing with it. The recorded AWS responses for this service
-/// state this class as one punctuated sentence, whichever part of the service
-/// refused the value.
+/// What a `ValidationExceptionField` states about a member value a rule of the
+/// service itself does not admit — a page token of another query, an agreement
+/// that is no longer active, an amount that is not positive. Spelled out here
+/// rather than imported, so a change of wording in the service fails this test
+/// instead of agreeing with it.
 const FIELD_INVALID: &str = "Member is invalid.";
+
+/// What a `ValidationExceptionField` states about a member whose well-formed
+/// identifier names no resource of the account: its own class, with its own
+/// fixed sentence.
+///
+/// `pub(crate)` because the suites that span an unresolvable identifier
+/// (`payment_request_agreement_ids`, `listing_resolution_order`,
+/// `billing_adjustment_resolution_order`, `validation_field_texts`) assert the
+/// same sentence rather than keeping a second copy of it.
+pub(crate) const FIELD_INVALID_REFERENCE: &str = "Member is invalid";
 
 /// `RequestId`'s modelled constraints: `@length(min: 1, max: 128)` and
 /// `^[A-Za-z0-9-]+$` (`smithy_query(query="shape", shape="RequestId")`),
@@ -132,6 +140,33 @@ pub(crate) fn unresolvable_agreement_ids() -> Vec<(&'static str, String)> {
 /// (`tests/all/inactive_agreement_refusals.rs`) asserts the same envelope rather
 /// than keeping a second copy of it.
 pub(crate) fn assert_input_fault(case: &str, reason: &str, field: &str, answer: &Answer) {
+    assert_input_fault_text(case, reason, field, FIELD_INVALID, answer);
+}
+
+/// The same envelope, for a member refused because the identifier it carried
+/// names no resource of the account: that class states its own fixed sentence.
+///
+/// `pub(crate)` for the suites that span an unresolvable identifier over the
+/// operations resolving one (`payment_request_agreement_ids.rs`,
+/// `listing_resolution_order.rs`, `billing_adjustment_resolution_order.rs`,
+/// `unsettled_store_single_agreement_reads.rs`).
+pub(crate) fn assert_unresolvable_reference_fault(
+    case: &str,
+    reason: &str,
+    field: &str,
+    answer: &Answer,
+) {
+    assert_input_fault_text(case, reason, field, FIELD_INVALID_REFERENCE, answer);
+}
+
+/// The body both classes share, asserted with the `fields` text the class states.
+fn assert_input_fault_text(
+    case: &str,
+    reason: &str,
+    field: &str,
+    field_message: &str,
+    answer: &Answer,
+) {
     assert_eq!(
         answer.status, 400,
         "case {case:?}: an input fault is answered at the modelled HTTP 400, got {} with {:?}",
@@ -157,8 +192,8 @@ pub(crate) fn assert_input_fault(case: &str, reason: &str, field: &str, answer: 
     );
     assert_eq!(
         answer.str_at("/fields/0/message"),
-        FIELD_INVALID,
-        "case {case:?}: the fields entry must state the member is invalid, got {:?}",
+        field_message,
+        "case {case:?}: the fields entry must state {field_message:?}, got {:?}",
         answer.body
     );
     assert!(
@@ -375,7 +410,7 @@ async fn an_agreement_a_payment_request_cannot_be_sent_under_is_an_input_fault()
             "case {case:?}: the id under test must not be the stored agreement"
         );
         let answer = send(&router, send_body(&id, "vpt-send")).await;
-        assert_input_fault(case, "INVALID_AGREEMENT_ID", "agreementId", &answer);
+        assert_unresolvable_reference_fault(case, "INVALID_AGREEMENT_ID", "agreementId", &answer);
     }
 
     // The same member, unusable the other way the operation states ("The
@@ -411,25 +446,29 @@ async fn each_unusable_input_member_of_a_send_names_itself() {
     // can carry a payment request.
     let legal_only = agreement_over(&router, "ap-legal", vec![term("LegalTerm")]).await;
 
-    // (what the row varies, the request, the reason, the member it names)
-    for (case, request, reason, field) in [
+    // (what the row varies, the request, the reason, the member it names, the
+    // fixed sentence of the class that member failed in)
+    for (case, request, reason, field, field_message) in [
         (
             "an agreementId naming no agreement",
             send_body("agmt-nothing-here", "vpt-members"),
             "INVALID_AGREEMENT_ID",
             "agreementId",
+            FIELD_INVALID_REFERENCE,
         ),
         (
             "a termId the agreement does not carry",
             send_body(&agreement, "vpt-not-this-one"),
             "INVALID_TERM_ID",
             "termId",
+            FIELD_INVALID_REFERENCE,
         ),
         (
             "a termId of a term that is not a VariablePaymentTerm",
             send_body(&legal_only, "LegalTerm"),
             "INVALID_TERM_ID",
             "termId",
+            FIELD_INVALID_REFERENCE,
         ),
         (
             "a chargeAmount that is not positive",
@@ -441,10 +480,11 @@ async fn each_unusable_input_member_of_a_send_names_itself() {
             }),
             "INVALID_CHARGE_AMOUNT",
             "chargeAmount",
+            FIELD_INVALID,
         ),
     ] {
         let answer = send(&router, request).await;
-        assert_input_fault(case, reason, field, &answer);
+        assert_input_fault_text(case, reason, field, field_message, &answer);
     }
 
     // The other half of the rule: the same send, with every member usable, is

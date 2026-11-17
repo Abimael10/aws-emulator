@@ -51,7 +51,7 @@ use crate::agreement_lifecycle::{
 };
 use crate::agreement_renewals::renewing_terms;
 use crate::billing_adjustments::{entry, submit};
-use crate::error_bodies::assert_input_fault;
+use crate::error_bodies::assert_unresolvable_reference_fault;
 use crate::purchase_order_updates::{charges, items, references};
 
 /// The resource kinds a not-found refusal names in `resourceType`, from
@@ -691,9 +691,12 @@ async fn an_agreement_id_no_end_date_created_is_still_refused() {
             Unresolvable::NotFound => {
                 assert_not_found(case, AGREEMENT, UNKNOWN_AGREEMENT, &answer)
             }
-            Unresolvable::InputFault => {
-                assert_input_fault(case, INVALID_AGREEMENT_ID, under_test.member, &answer)
-            }
+            Unresolvable::InputFault => assert_unresolvable_reference_fault(
+                case,
+                INVALID_AGREEMENT_ID,
+                under_test.member,
+                &answer,
+            ),
         }
     }
 }

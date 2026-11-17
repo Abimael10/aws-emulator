@@ -228,7 +228,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &crate::state::expected_charge_targets(&request.charge_summary),
         ) {
             return Err(AcceptAgreementRequestErrorModeled::ValidationException(
-                crate::state::validation_exception(&refusal.reason, refusal.path),
+                refusal.exception(),
             )
             .into());
         }

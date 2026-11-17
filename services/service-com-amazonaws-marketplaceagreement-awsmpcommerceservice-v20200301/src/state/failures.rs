@@ -46,13 +46,14 @@ pub const VALIDATION_MESSAGE_FALLBACK: &str =
 
 /// What a `ValidationExceptionField` states about the member it names.
 ///
-/// Both sentences are fixed: `name` already says WHICH member failed and
+/// Every sentence is fixed: `name` already says WHICH member failed and
 /// `reason` says what about it was wrong, and a refusal must not echo a
 /// request-chosen value back into the response (the boundary validator caps its
-/// own echo for the same reason). So the entry states only that the member is
-/// not acceptable — invalid when it carried a value, absent when it carried
-/// none, which is the distinction `ValidationExceptionReason`'s own
-/// `INVALID_…`/`MISSING_…` pairs draw.
+/// own echo for the same reason). So the entry states only HOW the member
+/// failed — it carried a value the service does not accept, it carried an
+/// identifier that resolves to nothing, or it carried no value at all, which is
+/// the distinction `ValidationExceptionReason`'s own `INVALID_…`/`MISSING_…`
+/// pairs draw.
 ///
 /// One sentence per kind, and the SAME sentence whichever member and whichever
 /// operation the entry is about: the machine-readable part a client branches on
@@ -60,16 +61,22 @@ pub const VALIDATION_MESSAGE_FALLBACK: &str =
 /// so there is no per-member wording to guess.
 ///
 /// Each sentence is reproduced as AWS words it for its class, punctuation
-/// included, and the class is decided by WHAT was wrong with the member — it
-/// carried a value this service does not accept, or it carried none — and never
-/// by WHERE the refusal was raised. So ONE invalid-member sentence serves a
-/// value that misses a constraint the model declares (refused by the boundary
-/// walk, before any handler runs) and a well-formed value a rule of the service
-/// itself does not accept (refused inside a handler) alike: both are the same
-/// failure to the caller, and the wording of the entry is not a clue about which
-/// part of the emulator refused the request. The texts are not one template with
-/// a switch: they are fixed strings, so none can be derived from another.
+/// included, and the class is decided by WHAT was wrong with the member and
+/// never by WHERE the refusal was raised: ONE unacceptable-value sentence serves
+/// a value that misses a constraint the model declares (refused by the boundary
+/// walk, before any handler runs) and a well-formed value outside the set a rule
+/// of the service itself admits (refused inside a handler, as an unknown
+/// `catalog`, party type, filter name or sort attribute is) alike. The texts are
+/// not one template with a switch: they are fixed strings, so none can be
+/// derived from another.
 pub const FIELD_INVALID: &str = "Member is invalid.";
+/// See [`FIELD_INVALID`]. The class for a member whose value this service can
+/// read but cannot RESOLVE: a well-formed identifier naming a resource the
+/// account does not hold — the agreement a payment request is sent under, the
+/// term it charges, the charge an association is made against. Nothing about the
+/// VALUE is wrong, so the class states its own sentence, which is how AWS words
+/// it for this service.
+pub const FIELD_INVALID_REFERENCE: &str = "Member is invalid";
 /// See [`FIELD_INVALID`]. The absent-member class is worded as the requirement
 /// the member is under rather than as the value it did not carry, which is how
 /// AWS states it for this service.
@@ -81,15 +88,19 @@ pub const FIELD_MISSING: &str = "Member is required.";
 pub const FIELD_MISSING_FOR_INTENT: &str = "Member must not be null for the provided intent.";
 
 /// How a member was wrong: it carried a value the service does not accept, it
-/// carried none at all, or it carried none and the request's `intent` is what
-/// made it required.
+/// carried an identifier that names no resource of the account, it carried no
+/// value at all, or it carried none and the request's `intent` is what made it
+/// required.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefusalKind {
     /// The member carried a value this service does not accept — one that misses
-    /// a constraint the model declares, or a well-formed one a rule of the
-    /// service itself refuses. ONE kind, because the two are one class of
-    /// failure to the caller.
+    /// a constraint the model declares, or a well-formed one outside the set a
+    /// rule of the service itself admits. ONE kind, because the two are one
+    /// class of failure to the caller.
     Invalid,
+    /// The member carried a well-formed identifier that resolves to no resource
+    /// of the account, so the value names nothing this service can act on.
+    UnresolvedReference,
     /// The member was absent from the request.
     Missing,
     /// The member was absent from a request whose `intent` required it — the
@@ -102,7 +113,7 @@ impl RefusalKind {
     /// The `ValidationExceptionReason` prefix this kind reports under.
     pub(super) fn reason_prefix(self) -> &'static str {
         match self {
-            Self::Invalid => "INVALID",
+            Self::Invalid | Self::UnresolvedReference => "INVALID",
             Self::Missing | Self::MissingForIntent => "MISSING",
         }
     }
@@ -111,6 +122,7 @@ impl RefusalKind {
     pub(super) fn field_message(self) -> &'static str {
         match self {
             Self::Invalid => FIELD_INVALID,
+            Self::UnresolvedReference => FIELD_INVALID_REFERENCE,
             Self::Missing => FIELD_MISSING,
             Self::MissingForIntent => FIELD_MISSING_FOR_INTENT,
         }
@@ -119,6 +131,12 @@ impl RefusalKind {
     /// The kind `reason` reports, read back off the reason a handler chose, so a
     /// refusal raised with an explicit reason states the same field message a
     /// refusal derived from a violation does.
+    ///
+    /// The reason does not tell the two `INVALID_…` classes apart — the same
+    /// `INVALID_AGREEMENT_ID` reports a malformed id and one that resolves to no
+    /// agreement — so a refusal that KNOWS it failed to RESOLVE an identifier
+    /// states its kind itself ([`unresolved_reference`]), and every other
+    /// refusal of a value reads back as [`RefusalKind::Invalid`].
     pub(super) fn of_reason(reason: &str) -> Self {
         if reason.starts_with("MISSING_") {
             Self::Missing
@@ -247,6 +265,22 @@ pub fn validation_message(reason: &str) -> String {
 pub fn validation_exception(reason: &str, path: impl Into<String>) -> ValidationException {
     let path = path.into();
     validation_exception_naming(reason, &[path.as_str()])
+}
+
+/// A `ValidationException` for a member whose well-formed value names no
+/// resource this account holds: the agreement a child was sent under, the term a
+/// charge is requested on, the charge an association is made against.
+///
+/// The envelope is the one [`validation_exception`] builds — the same
+/// `INVALID_<MEMBER>` reason, the same `message`, the same single `fields` entry
+/// naming the member's own path — and only the field text differs, because the
+/// member failed in the unresolved-reference class rather than in the
+/// unacceptable-value one ([`FIELD_INVALID_REFERENCE`]). One writer, so every
+/// operation of this service that RESOLVES an identifier refuses it alike,
+/// whichever resource the identifier names.
+pub fn unresolved_reference(reason: &str, path: impl Into<String>) -> ValidationException {
+    let path = path.into();
+    validation_exception_in_kind(reason, &[path.as_str()], RefusalKind::UnresolvedReference)
 }
 
 /// A `ValidationException` naming SEVERAL members, for a rule that is about the

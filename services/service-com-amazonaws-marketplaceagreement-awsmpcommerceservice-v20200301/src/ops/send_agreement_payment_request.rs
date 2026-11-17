@@ -249,7 +249,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // unusable `agreementId` is exactly that `ValidationException`.
         let Some(agreement) = store.agreements.get(&input.agreement_id).cloned() else {
             return Err(SendAgreementPaymentRequestErrorModeled::ValidationException(
-                crate::state::validation_exception("INVALID_AGREEMENT_ID", "agreementId"),
+                crate::state::unresolved_reference("INVALID_AGREEMENT_ID", "agreementId"),
             )
             .into());
         };
@@ -266,7 +266,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // active `VariablePaymentTerm`, or if the `termId` is invalid."
         let Some(term) = agreement.variable_payment_term(&input.term_id) else {
             return Err(SendAgreementPaymentRequestErrorModeled::ValidationException(
-                crate::state::validation_exception("INVALID_TERM_ID", "termId"),
+                crate::state::unresolved_reference("INVALID_TERM_ID", "termId"),
             )
             .into());
         };
