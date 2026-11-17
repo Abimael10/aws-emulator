@@ -243,6 +243,71 @@ impl SerializableStruct for InvalidFilterKeyMessage {
     }
 }
 
+/// The `Message` member of the synthetic `InvocationDoesNotExist` error shape.
+///
+/// Spelled with a capital `M`, the way this service's own error shapes that DO declare a
+/// message member spell it (`InvalidInstanceId$Message`, `InvalidNextToken$Message`): the
+/// modelled `InvocationDoesNotExist` declares no member at all, yet Run Command words this
+/// refusal, so a client reading it finds it where the service puts it.
+static INVOCATION_DOES_NOT_EXIST_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#InvocationDoesNotExist$Message",
+        "smithy.framework",
+        "Message",
+    ),
+    ShapeType::String,
+    "Message",
+    0,
+)
+.with_xml_name("Message")
+.with_json_name("Message");
+
+/// Schema for the synthetic `InvocationDoesNotExist` error shape.
+///
+/// In the `smithy.framework` namespace for the same reason as the shapes above: this is not
+/// the shape of that name in any service's model — the modelled one carries no members — so
+/// it must not collide with it. The wire `__type` still comes from
+/// [`OperationError::shape_name`] below, which answers the modelled name.
+pub static INVOCATION_DOES_NOT_EXIST_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#InvocationDoesNotExist",
+        "smithy.framework",
+        "InvocationDoesNotExist",
+    ),
+    ShapeType::Structure,
+    &[&INVOCATION_DOES_NOT_EXIST_MESSAGE],
+);
+
+/// The payload of an `InvocationDoesNotExist`: which command and which node the read named.
+#[derive(Debug, Clone)]
+pub struct InvocationDoesNotExistMessage {
+    pub message: String,
+}
+
+impl InvocationDoesNotExistMessage {
+    /// An `InvocationDoesNotExist` carrying `message`.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for InvocationDoesNotExistMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "InvocationDoesNotExist: {}", self.message)
+    }
+}
+
+impl std::error::Error for InvocationDoesNotExistMessage {}
+
+impl SerializableStruct for InvocationDoesNotExistMessage {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&INVOCATION_DOES_NOT_EXIST_MESSAGE, self.message.as_str())?;
+        Ok(())
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -269,6 +334,14 @@ pub enum Scaffolded<E> {
     /// the refusal through it — and the service does word it. Answer this only where
     /// the operation models `InvalidFilterKey`; it is not a general-purpose refusal.
     InvalidFilterKey(InvalidFilterKeyMessage),
+    /// The command and node a read named hold no invocation between them. Renders as
+    /// HTTP 400 with the error code `InvocationDoesNotExist` and a `Message` naming the
+    /// pair that matched none.
+    ///
+    /// Same reason as the variant above: the modelled shape declares no members, and Run
+    /// Command words this refusal. Answer it only where the operation models
+    /// `InvocationDoesNotExist`.
+    InvocationDoesNotExist(InvocationDoesNotExistMessage),
 }
 
 impl<E> Scaffolded<E> {
@@ -304,6 +377,16 @@ impl<E> Scaffolded<E> {
     pub fn validation(message: impl Into<String>) -> Self {
         Self::ValidationException(ValidationException::new(message))
     }
+
+    /// Refuse a read whose command and node hold no invocation between them, with HTTP
+    /// 400 `InvocationDoesNotExist` carrying `message`.
+    ///
+    /// Reach for this only where the operation's own model declares
+    /// `InvocationDoesNotExist`: the error code is that modelled refusal's, and only the
+    /// message member it carries is synthetic.
+    pub fn invocation_does_not_exist(message: impl Into<String>) -> Self {
+        Self::InvocationDoesNotExist(InvocationDoesNotExistMessage::new(message))
+    }
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
@@ -313,6 +396,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
             Self::Modeled(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
             Self::InvalidFilterKey(e) => write!(f, "{e}"),
+            Self::InvocationDoesNotExist(e) => write!(f, "{e}"),
         }
     }
 }
@@ -326,6 +410,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
             Self::Modeled(e) => e.source(),
             Self::ValidationException(e) => e.source(),
             Self::InvalidFilterKey(e) => e.source(),
+            Self::InvocationDoesNotExist(e) => e.source(),
         }
     }
 }
@@ -341,6 +426,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.as_serializable(),
             Self::ValidationException(e) => e,
             Self::InvalidFilterKey(e) => e,
+            Self::InvocationDoesNotExist(e) => e,
         }
     }
 
@@ -350,6 +436,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.variant_schema(),
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
             Self::InvalidFilterKey(_) => &INVALID_FILTER_KEY_SCHEMA,
+            Self::InvocationDoesNotExist(_) => &INVOCATION_DOES_NOT_EXIST_SCHEMA,
         }
     }
 
@@ -363,6 +450,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.shape_name(),
             Self::ValidationException(_) => "ValidationException",
             Self::InvalidFilterKey(_) => "InvalidFilterKey",
+            Self::InvocationDoesNotExist(_) => "InvocationDoesNotExist",
         }
     }
 
@@ -374,7 +462,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
-            Self::ValidationException(_) | Self::InvalidFilterKey(_) => 400,
+            Self::ValidationException(_)
+            | Self::InvalidFilterKey(_)
+            | Self::InvocationDoesNotExist(_) => 400,
         }
     }
 
@@ -386,7 +476,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => None,
             Self::Modeled(e) => e.query_error_code(),
             // Same reason: the synthetic shapes carry no `awsQueryError` trait.
-            Self::ValidationException(_) | Self::InvalidFilterKey(_) => None,
+            Self::ValidationException(_)
+            | Self::InvalidFilterKey(_)
+            | Self::InvocationDoesNotExist(_) => None,
         }
     }
 }

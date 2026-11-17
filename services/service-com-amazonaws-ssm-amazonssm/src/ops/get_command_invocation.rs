@@ -7,9 +7,13 @@
 //! What `SendCommand` persisted is what this reports: both reach the one store in
 //! [`crate::state::commands`], so the command id a send minted resolves here, in the
 //! Region it was sent to, and the nodes it created an invocation for are the nodes this
-//! answers for. A command id the Region holds none of is `InvalidCommandId`; a node the
-//! Region has no registration of is `InvalidInstanceId`; a registered node the command
-//! created no invocation for is `InvocationDoesNotExist`.
+//! answers for. The pair the request names is resolved against the invocations the
+//! command PERSISTED — an invocation is a history record and outlives the node that holds
+//! it, so what a node id is registered as now is no part of resolving one. A command id
+//! the Region holds none of is `InvalidCommandId`; a well-formed node id the command
+//! holds no invocation for is `InvocationDoesNotExist` ("The command ID and managed node
+//! ID you specified didn't match any invocations"), carrying the pair that matched none,
+//! whether or not that id names a node this Region has a registration of.
 //!
 //! Nothing in this emulator delivers a command to a node (see
 //! [`crate::state::commands`]), so an invocation reports the status it was minted with
@@ -251,11 +255,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // whose history is no longer retained.
         store.materialize_due(::std::time::SystemTime::now());
 
-        // A node is registered with the Systems Manager endpoint of one Region, so an id
-        // this Region has no registration under names no managed node reachable here.
-        let registered = store
-            .managed_node(&region, &input.instance_id)
-            .is_some();
         // A command is reached through the endpoint it was sent to, so an id another
         // Region holds names no command here.
         let Some(command) = store.command(&region, &input.command_id) else {
@@ -267,23 +266,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let Some(invocation) = command.invocation(&input.instance_id) else {
             // "The command ID and managed node ID you specified didn't match any
-            // invocations" is what a command holding no invocation for a REGISTERED node
-            // means; an id no node is registered under names no managed node at all,
-            // which is the other refusal.
-            if registered {
-                return Err(GetCommandInvocationErrorModeled::InvocationDoesNotExist(
-                    InvocationDoesNotExist {},
-                )
-                .into());
-            }
-            return Err(GetCommandInvocationErrorModeled::InvalidInstanceId(
-                InvalidInstanceId {
-                    message: Some(
-                        crate::state::commands::NODES_NOT_IN_A_VALID_STATE.to_string(),
-                    ),
-                },
-            )
-            .into());
+            // invocations. Verify the command ID and the managed node ID and try again" —
+            // the pair is resolved against what the command holds, so a node the command
+            // created no invocation for is this refusal however the id stands with the
+            // node inventory. The modelled shape declares no message member, so the
+            // sentence naming the pair that matched none travels through the channel's own
+            // `InvocationDoesNotExist` form.
+            return Err(crate::scaffolded::Scaffolded::invocation_does_not_exist(
+                crate::state::commands::invocation_not_found(
+                    &input.command_id,
+                    &input.instance_id,
+                ),
+            ));
         };
 
         // "The name of the step for which you want detailed results … To find the

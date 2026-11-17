@@ -1199,9 +1199,10 @@ async fn a_read_resolves_a_command_by_the_id_its_send_minted() {
     let first = minted.first().expect("three sends minted three ids").clone();
 
     // One row per way a read names something the store does not hold: a well-formed id no
-    // send minted, the id of a command sent to another Region, a node no node id is
-    // registered under, a registered node the command did not run on, and a step the
-    // document declares nothing of.
+    // send minted, the id of a command sent to another Region, a node id the command holds
+    // no invocation for — whether or not a node is registered under it, since the pair is
+    // resolved against the invocations the command persisted — and a step the document
+    // declares nothing of.
     let rows: Vec<(&str, Value, &str, &str)> = vec![
         (
             "an id no send minted",
@@ -1219,7 +1220,7 @@ async fn a_read_resolves_a_command_by_the_id_its_send_minted() {
             "a node that is not registered",
             json!({"CommandId": first.clone(), "InstanceId": UNREGISTERED}),
             REGION,
-            "InvalidInstanceId",
+            "InvocationDoesNotExist",
         ),
         (
             "a registered node the command did not run on",
@@ -1377,5 +1378,137 @@ async fn the_command_history_the_store_keeps_is_bounded() {
         (status, error_code(&reported).as_str()),
         (400, "InvalidCommandId"),
         "the oldest command's history is the one dropped, got {status} with {reported:?}"
+    );
+}
+
+/// A per-invocation read resolves the pair of ids it is handed against the invocations the
+/// command PERSISTED: a node the command holds no invocation for is `InvocationDoesNotExist`
+/// whatever that id's standing in the node inventory, and an invocation outlives the
+/// registration of the node that holds it.
+#[tokio::test]
+async fn a_read_resolves_a_node_id_against_the_invocations_the_command_holds() {
+    let (router, engine) = service();
+    seed_inventory(&engine);
+
+    // Two commands, differing in how many invocations they hold: one sent to a named node,
+    // and one whose target describes no registered node, which leaves it with none at all.
+    let one = sent(
+        &router,
+        "a send to one named node",
+        &json!({"DocumentName": AGENT, "InstanceIds": [LINUX]}),
+    )
+    .await;
+    let with_one = text(&one, "CommandId");
+    let empty = sent(
+        &router,
+        "a send whose target selects no node",
+        &json!({
+            "DocumentName": AGENT,
+            "Targets": [{"Key": "tag:env", "Values": ["absent"]}],
+        }),
+    )
+    .await;
+    let with_none = text(&empty, "CommandId");
+    assert_eq!(
+        empty["TargetCount"].as_i64(),
+        Some(0),
+        "a target no node meets selects no node, got {empty:?}"
+    );
+    // A command that holds no invocation is a command whose listing is EMPTY, not one whose
+    // read is refused.
+    let (status, listed) = call(
+        &router,
+        "ListCommandInvocations",
+        &json!({"CommandId": with_none.clone()}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "a command holding no invocation is still listed, got {status} with {listed:?}"
+    );
+    assert_eq!(
+        listed["CommandInvocations"].as_array().map(Vec::len),
+        Some(0),
+        "a command holding no invocation lists none, got {listed:?}"
+    );
+
+    // One row per standing a well-formed node id can have in the node inventory: online,
+    // hybrid, no longer reporting, registered in another Region, and registered nowhere in
+    // each of the two id forms the model admits.
+    let rows = vec![
+        ("an online node the command did not run on", WINDOWS),
+        ("a hybrid node the command did not run on", HYBRID),
+        ("a node whose agent has stopped reporting", OFFLINE),
+        ("a node registered only in another Region", OTHER_ONLY),
+        ("an instance id no node is registered under", UNREGISTERED),
+        (
+            "a managed-instance id no node is registered under",
+            "mi-09999999999999999",
+        ),
+    ];
+
+    for (case, node_id) in rows {
+        for (which, command_id) in [
+            ("a command holding one invocation", &with_one),
+            ("a command holding none", &with_none),
+        ] {
+            let (status, refused) = invocation(&router, command_id, node_id).await;
+            assert_eq!(
+                (status, error_code(&refused).as_str()),
+                (400, "InvocationDoesNotExist"),
+                "case {case:?} against {which}: expected InvocationDoesNotExist, got \
+                 {status} with {refused:?}"
+            );
+            // The refusal names the PAIR that matched no invocation, taken from the
+            // request, so it differs per row rather than being one fixed sentence.
+            assert_eq!(
+                error_message(&refused),
+                commands::invocation_not_found(command_id, node_id),
+                "case {case:?} against {which}: the refusal names the command and the \
+                 node the read asked about, got {refused:?}"
+            );
+        }
+    }
+
+    // The sentence spelled out for one pair, so the FIXED text of the refusal is pinned by
+    // the case and not by the helper the handler itself calls.
+    let (status, refused) = invocation(&router, &with_one, WINDOWS).await;
+    assert_eq!(
+        (status, error_message(&refused).as_str()),
+        (
+            400,
+            format!("Invocation not found for {with_one}, {WINDOWS}").as_str()
+        ),
+        "Run Command words this refusal with the command and the node, got {refused:?}"
+    );
+
+    // The node a command DID run on keeps its invocation after its registration is gone:
+    // an invocation is a history record, so it outlives the node that holds it.
+    let ran = sent(
+        &router,
+        "a send to the hybrid node",
+        &json!({"DocumentName": AGENT, "InstanceIds": [HYBRID]}),
+    )
+    .await;
+    let ran_id = text(&ran, "CommandId");
+    let (status, deregistered) = call(
+        &router,
+        "DeregisterManagedInstance",
+        &json!({"InstanceId": HYBRID}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the hybrid node must deregister, got {status} with {deregistered:?}"
+    );
+    let (status, reported) = invocation(&router, &ran_id, HYBRID).await;
+    assert_eq!(
+        status, 200,
+        "a deregistered node's invocation is still reported, got {status} with {reported:?}"
+    );
+    assert_eq!(
+        text(&reported, "InstanceId"),
+        HYBRID,
+        "the reported invocation is the deregistered node's, got {reported:?}"
     );
 }

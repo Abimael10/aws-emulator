@@ -960,3 +960,14 @@ pub const NODE_ID_WITH_PENDING_STATUS: &str =
 /// — it states the refusal for the set of ids the request named, whatever that set was,
 /// so neither the ids nor the account are repeated into it.
 pub const NODES_NOT_IN_A_VALID_STATE: &str = "Instances not in a valid state for account";
+
+/// How Run Command words a read whose command and node hold no invocation between them.
+///
+/// `InvocationDoesNotExist` states the rule in prose — "the command ID and managed node ID
+/// you specified didn't match any invocations" — and the service words the refusal with the
+/// PAIR that matched none: the command the read named and the node it named, in that order,
+/// taken from the request. The modelled shape declares no message member, so this travels
+/// through [`crate::scaffolded::Scaffolded::invocation_does_not_exist`].
+pub fn invocation_not_found(command_id: &str, instance_id: &str) -> String {
+    format!("Invocation not found for {command_id}, {instance_id}")
+}
