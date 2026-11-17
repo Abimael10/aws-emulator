@@ -35,8 +35,17 @@ use crate::ops::types::{
 /// up to that maximum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PublishedEbsPerformance {
-    /// The bandwidth, in Mbps, the type sustains.
-    pub baseline_bandwidth_mbps: i32,
+    /// The bandwidth the type sustains, in HALVES of an Mbps.
+    ///
+    /// The unit is a half because the published figure of a size whose share of its host's
+    /// bandwidth is not a whole number of Mbps carries one — 1,562.5 Mbps is 3,125 halves —
+    /// and the two members that report it relate differently to that half: the integer
+    /// `baselineBandwidthInMbps` cannot hold it and reports the whole Mbps, while
+    /// `baselineThroughputInMBps` carries the megabytes of the UNtruncated figure, which is
+    /// how the published table's Mbps and MB/s columns relate for such a size. Holding the
+    /// figure in this one unit is what keeps the two members, and the per-card shares of
+    /// them, from disagreeing about it.
+    pub baseline_bandwidth_half_mbps: i32,
     /// The I/O operations per second it sustains.
     pub baseline_iops: i32,
     /// The bandwidth, in Mbps, it can reach.
@@ -45,7 +54,28 @@ pub struct PublishedEbsPerformance {
     pub maximum_iops: i32,
 }
 
+/// The halves of an Mbps in one Mbps, the unit
+/// [`PublishedEbsPerformance::baseline_bandwidth_half_mbps`] counts a published sustained
+/// bandwidth in.
+const EBS_HALVES_PER_MBPS: i32 = 2;
+
 impl PublishedEbsPerformance {
+    /// The whole Mbps of a sustained bandwidth of `halves`, as the integer
+    /// `baselineBandwidthInMbps` member reports it: the member cannot hold a half, so a
+    /// published figure that carries one reports the whole Mbps below it.
+    const fn whole_mbps(halves: i32) -> i32 {
+        halves / EBS_HALVES_PER_MBPS
+    }
+
+    /// The megabytes per second of a sustained bandwidth of `halves`, as the
+    /// `baselineThroughputInMBps` member reports it: the megabits of the WHOLE published
+    /// figure, half included, in the other unit.
+    fn megabytes_of_halves(halves: i32) -> f64 {
+        f64::from(halves)
+            / f64::from(EBS_HALVES_PER_MBPS)
+            / EBS_MEGABITS_PER_MEGABYTE
+    }
+
     /// This row as the modelled `EbsOptimizedInfo`.
     ///
     /// The throughput members are the bandwidth ones in the other unit — a megabyte being
@@ -54,8 +84,10 @@ impl PublishedEbsPerformance {
     pub fn to_ebs_optimized_info(self) -> EbsOptimizedInfo {
         let megabytes = |mbps: i32| f64::from(mbps) / EBS_MEGABITS_PER_MEGABYTE;
         EbsOptimizedInfo {
-            baseline_bandwidth_in_mbps: Some(self.baseline_bandwidth_mbps),
-            baseline_throughput_in_m_bps: Some(megabytes(self.baseline_bandwidth_mbps)),
+            baseline_bandwidth_in_mbps: Some(Self::whole_mbps(self.baseline_bandwidth_half_mbps)),
+            baseline_throughput_in_m_bps: Some(Self::megabytes_of_halves(
+                self.baseline_bandwidth_half_mbps,
+            )),
             baseline_iops: Some(self.baseline_iops),
             maximum_bandwidth_in_mbps: Some(self.maximum_bandwidth_mbps),
             maximum_throughput_in_m_bps: Some(megabytes(self.maximum_bandwidth_mbps)),
@@ -68,18 +100,20 @@ impl PublishedEbsPerformance {
     ///
     /// The cards of one instance are identical and the instance's own figures are what its
     /// cards carry together — the same way [`super::network_cards`] reads the network cards of
-    /// an instance — so each card takes an equal share of the four figures.
+    /// an instance — so each card takes an equal share of the four figures. A card's share of
+    /// the sustained bandwidth is taken in the same halves the row holds it in, and reported
+    /// through the same two readings, so a card cannot report that figure differently from the
+    /// instance it belongs to.
     pub fn to_ebs_cards(self, cards: i32) -> Vec<EbsCardInfo> {
         let count = cards.max(1);
         let share = |figure: i32| (figure / count).max(1);
         let megabytes = |mbps: i32| f64::from(mbps) / EBS_MEGABITS_PER_MEGABYTE;
+        let baseline_halves = share(self.baseline_bandwidth_half_mbps);
         (0..count)
             .map(|index| EbsCardInfo {
                 ebs_card_index: Some(index),
-                baseline_bandwidth_in_mbps: Some(share(self.baseline_bandwidth_mbps)),
-                baseline_throughput_in_m_bps: Some(megabytes(share(
-                    self.baseline_bandwidth_mbps,
-                ))),
+                baseline_bandwidth_in_mbps: Some(Self::whole_mbps(baseline_halves)),
+                baseline_throughput_in_m_bps: Some(Self::megabytes_of_halves(baseline_halves)),
                 baseline_iops: Some(share(self.baseline_iops)),
                 maximum_bandwidth_in_mbps: Some(share(self.maximum_bandwidth_mbps)),
                 maximum_throughput_in_m_bps: Some(megabytes(share(
@@ -423,14 +457,31 @@ impl PublishedInstanceTypeFacts {
     /// The four EBS figures of the type's row: sustained bandwidth and IOPS, then the
     /// bandwidth and IOPS it can reach.
     const fn ebs(
-        mut self,
+        self,
         baseline_bandwidth_mbps: i32,
         baseline_iops: i32,
         maximum_bandwidth_mbps: i32,
         maximum_iops: i32,
     ) -> Self {
+        self.ebs_in_half_mbps(
+            baseline_bandwidth_mbps * EBS_HALVES_PER_MBPS,
+            baseline_iops,
+            maximum_bandwidth_mbps,
+            maximum_iops,
+        )
+    }
+
+    /// The same four figures for a type whose published sustained bandwidth is NOT a whole
+    /// number of Mbps, that one given in halves of an Mbps: a published 1,562.5 Mbps is 3,125.
+    const fn ebs_in_half_mbps(
+        mut self,
+        baseline_bandwidth_half_mbps: i32,
+        baseline_iops: i32,
+        maximum_bandwidth_mbps: i32,
+        maximum_iops: i32,
+    ) -> Self {
         self.ebs_performance = Some(PublishedEbsPerformance {
-            baseline_bandwidth_mbps,
+            baseline_bandwidth_half_mbps,
             baseline_iops,
             maximum_bandwidth_mbps,
             maximum_iops,
@@ -1511,6 +1562,221 @@ static PUBLISHED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
         .auto_recovery(true)
         .host_features(true, false)
         .boot_modes(&["legacy-bios"]),
+    // C6id — compute optimized with local NVMe, on the same 128-vCPU 3rd generation Intel
+    // Xeon Scalable (Ice Lake) host as `c6i` and at the same sustained 3.5 GHz, so its four
+    // EBS figures are that host's rows of "Amazon EBS optimized instance types": a baseline
+    // the sizes below the `8xlarge` burst above, up to 10,000 Mbps and 40,000 IOPS, then
+    // dedicated bandwidth from that size up to the host's 40,000 Mbps and 160,000 IOPS. Its
+    // local store is the family's published NVMe ladder — one device per two vCPUs up to the
+    // `8xlarge`, then two and four devices of the published sizes — which is NOT a smooth
+    // function of the size: the `2xlarge` carries 474 GB and the `12xlarge` and `24xlarge`
+    // carry 1,425 GB devices rather than the quarters and halves of a 1,900 GB device the
+    // ladder would otherwise give. The network figures are the family's published ones, the
+    // adapter takes a configurable number of ENA queues on every virtualized size, ENA Express
+    // is offered from the size that carries the family's whole dedicated share up and on the
+    // bare metal size, and the Elastic Fabric Adapter only on the size that holds the whole
+    // host and the bare metal one. Those local devices are what a reboot migration cannot
+    // carry over, so the family is not offered it, and it carries no local PTP hardware clock,
+    // which its hardware generation has none of either. The published core
+    // counts go up in twos from the `2xlarge` while the bare metal size publishes every
+    // count; that size is offered the legacy BIOS boot mode alone and takes the 31 EBS
+    // volumes "Instance volume limits" publishes for a bare metal instance, its local devices
+    // being the host's own hardware rather than attachments.
+    PublishedInstanceTypeFacts::of("c6id.large")
+        .ebs(650, 3_600, 10_000, 40_000)
+        .instance_store(1, 118)
+        .network("Up to 12.5 Gigabit")
+        .flexible_ena_queues(true)
+        .efa(0)
+        .ena_srd(false)
+        .processor("Intel", 3.5)
+        .host_features(false, false),
+    PublishedInstanceTypeFacts::of("c6id.xlarge")
+        .ebs(1_250, 6_000, 10_000, 40_000)
+        .instance_store(1, 237)
+        .network("Up to 12.5 Gigabit")
+        .flexible_ena_queues(true)
+        .efa(0)
+        .ena_srd(false)
+        .processor("Intel", 3.5)
+        .host_features(false, false),
+    PublishedInstanceTypeFacts::of("c6id.2xlarge")
+        .cores_in_steps_of(2)
+        .ebs(2_500, 12_000, 10_000, 40_000)
+        .instance_store(1, 474)
+        .network("Up to 12.5 Gigabit")
+        .flexible_ena_queues(true)
+        .efa(0)
+        .ena_srd(false)
+        .processor("Intel", 3.5)
+        .host_features(false, false),
+    PublishedInstanceTypeFacts::of("c6id.4xlarge")
+        .cores_in_steps_of(2)
+        .ebs(5_000, 20_000, 10_000, 40_000)
+        .instance_store(1, 950)
+        .network("Up to 12.5 Gigabit")
+        .flexible_ena_queues(true)
+        .efa(0)
+        .ena_srd(false)
+        .processor("Intel", 3.5)
+        .host_features(false, false),
+    PublishedInstanceTypeFacts::of("c6id.8xlarge")
+        .cores_in_steps_of(2)
+        .ebs(10_000, 40_000, 10_000, 40_000)
+        .instance_store(1, 1_900)
+        .network("12.5 Gigabit")
+        .flexible_ena_queues(true)
+        .efa(0)
+        .processor("Intel", 3.5)
+        .host_features(false, false),
+    PublishedInstanceTypeFacts::of("c6id.12xlarge")
+        .cores_in_steps_of(2)
+        .ebs(15_000, 60_000, 15_000, 60_000)
+        .instance_store(2, 1_425)
+        .network("18.75 Gigabit")
+        .flexible_ena_queues(true)
+        .efa(0)
+        .processor("Intel", 3.5)
+        .host_features(false, false),
+    PublishedInstanceTypeFacts::of("c6id.16xlarge")
+        .cores_in_steps_of(2)
+        .ebs(20_000, 80_000, 20_000, 80_000)
+        .instance_store(2, 1_900)
+        .network("25 Gigabit")
+        .flexible_ena_queues(true)
+        .efa(0)
+        .processor("Intel", 3.5)
+        .host_features(false, false),
+    PublishedInstanceTypeFacts::of("c6id.24xlarge")
+        .cores_in_steps_of(2)
+        .ebs(30_000, 120_000, 30_000, 120_000)
+        .instance_store(4, 1_425)
+        .network("37.5 Gigabit")
+        .flexible_ena_queues(true)
+        .efa(0)
+        .processor("Intel", 3.5)
+        .host_features(false, false),
+    PublishedInstanceTypeFacts::of("c6id.32xlarge")
+        .cores_in_steps_of(2)
+        .ebs(40_000, 160_000, 40_000, 160_000)
+        .instance_store(4, 1_900)
+        .network("50 Gigabit")
+        .flexible_ena_queues(true)
+        .efa(1)
+        .processor("Intel", 3.5)
+        .host_features(false, false),
+    PublishedInstanceTypeFacts::of("c6id.metal")
+        .ebs(40_000, 160_000, 40_000, 160_000)
+        .ebs_attachments(31)
+        .instance_store(4, 1_900)
+        .network("50 Gigabit")
+        .efa(1)
+        .ena_srd(true)
+        .processor("Intel", 3.5)
+        .boot_modes(&["legacy-bios"]),
+    // C6in — compute optimized built for the network, on the same Ice Lake host at the same
+    // sustained 3.5 GHz and with no local instance store. The family carries up to 200 Gigabit
+    // of network and 100 Gbps of EBS bandwidth on its largest size, each size taking its
+    // published share of both, so its EBS figures are the `n` ladder's rows of "Amazon EBS
+    // optimized instance types": a baseline the sizes below the `8xlarge` burst above, up to
+    // 25,000 Mbps and 100,000 IOPS, then dedicated bandwidth from that size up to 100,000 Mbps
+    // and 400,000 IOPS. The adapter takes a configurable number of ENA queues, ENA Express is
+    // offered from the size that carries the family's whole dedicated share up, and the
+    // Elastic Fabric Adapter only on the two sizes that hold the whole host — which carry TWO
+    // cards and so two Elastic Fabric Adapters, one per card. The family takes no interface
+    // attachment from a secondary network, so no address at all is available on one, and
+    // carries no local PTP hardware clock. Its two largest sizes publish core counts that go
+    // up in twos from four rather than every count up to their default, the sizes below them
+    // publishing every count. Its bare metal size is offered the legacy BIOS boot
+    // mode alone, supports CloudWatch action based recovery and reboot migration — having no
+    // local device whose data either would have to carry over, and the move to another host
+    // being the HOST's to make and not the hypervisor's it has none of — and takes the 31 EBS
+    // volumes published for a bare metal instance.
+    PublishedInstanceTypeFacts::of("c6in.large")
+        // The smallest size's published share of its host is 1,562.5 Mbps — 3,125 halves of
+        // an Mbps — which the integer bandwidth member reports as 1,562 while the throughput
+        // member carries the megabytes of the whole figure.
+        .ebs_in_half_mbps(3_125, 6_250, 25_000, 100_000)
+        .network("Up to 25 Gigabit")
+        .flexible_ena_queues(true)
+        .efa(0)
+        .ena_srd(false)
+        .processor("Intel", 3.5)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("c6in.xlarge")
+        .ebs(3_125, 12_500, 25_000, 100_000)
+        .network("Up to 30 Gigabit")
+        .flexible_ena_queues(true)
+        .efa(0)
+        .ena_srd(false)
+        .processor("Intel", 3.5)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("c6in.2xlarge")
+        .ebs(6_250, 25_000, 25_000, 100_000)
+        .network("Up to 40 Gigabit")
+        .flexible_ena_queues(true)
+        .efa(0)
+        .ena_srd(false)
+        .processor("Intel", 3.5)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("c6in.4xlarge")
+        .ebs(12_500, 50_000, 25_000, 100_000)
+        .network("Up to 50 Gigabit")
+        .flexible_ena_queues(true)
+        .efa(0)
+        .ena_srd(false)
+        .processor("Intel", 3.5)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("c6in.8xlarge")
+        .ebs(25_000, 100_000, 25_000, 100_000)
+        .network("50 Gigabit")
+        .flexible_ena_queues(true)
+        .efa(0)
+        .processor("Intel", 3.5)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("c6in.12xlarge")
+        .ebs(37_500, 150_000, 37_500, 150_000)
+        .network("75 Gigabit")
+        .flexible_ena_queues(true)
+        .efa(0)
+        .processor("Intel", 3.5)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("c6in.16xlarge")
+        .ebs(50_000, 200_000, 50_000, 200_000)
+        .network("100 Gigabit")
+        .flexible_ena_queues(true)
+        .efa(0)
+        .processor("Intel", 3.5)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("c6in.24xlarge")
+        .cores_in_steps_of(2)
+        .cores_from(4)
+        .ebs(75_000, 300_000, 75_000, 300_000)
+        .network("150 Gigabit")
+        .flexible_ena_queues(true)
+        .efa(0)
+        .processor("Intel", 3.5)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("c6in.32xlarge")
+        .cores_in_steps_of(2)
+        .cores_from(4)
+        .ebs(100_000, 400_000, 100_000, 400_000)
+        .network("200 Gigabit")
+        .flexible_ena_queues(true)
+        .efa(2)
+        .processor("Intel", 3.5)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("c6in.metal")
+        .ebs(100_000, 400_000, 100_000, 400_000)
+        .ebs_attachments(31)
+        .network("200 Gigabit")
+        .efa(2)
+        .ena_srd(true)
+        .processor("Intel", 3.5)
+        .auto_recovery(true)
+        .host_features(true, false)
+        .ipv4_per_secondary_interface(0)
+        .boot_modes(&["legacy-bios"]),
     // C7g — compute optimized on AWS Graviton3, at a sustained 2.6 GHz, with no local
     // instance store. Its EBS figures are the Graviton3 compute ladder's rows of "Amazon EBS
     // optimized instance types": the sizes below the `8xlarge` publish a baseline they burst
@@ -1980,6 +2246,127 @@ static PUBLISHED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
         .ipv4_per_interface(50)
         .efa(1)
         .host_features(false, false),
+    // M7gd — general purpose with local NVMe on AWS Graviton3, at a sustained 2.6 GHz. Its
+    // four EBS figures are the Graviton3 ladder's rows of "Amazon EBS optimized instance
+    // types": a baseline the sizes below the `8xlarge` burst above, up to 10,000 Mbps and
+    // 40,000 IOPS, then dedicated bandwidth from that size up to the host's 20,000 Mbps and
+    // 80,000 IOPS. Its local store is the family's published NVMe ladder — one device per two
+    // vCPUs up to the `8xlarge`, then two of the published sizes — which is not a smooth
+    // function of the size: the `2xlarge` carries a 474 GB device and the `12xlarge` two of
+    // 1,425 GB rather than the quarter and the three quarters of a 1,900 GB device the ladder
+    // would give. The network figures are the family's published ones, the Elastic Fabric
+    // Adapter is offered on the size that holds the whole host and on the bare metal size, and
+    // ENA Express only from the size above the one that carries the family's whole dedicated
+    // share. The hardware generation takes no configurable ENA queue count and no interface
+    // attachment from a secondary network — so no address at all is available on one — while a
+    // local PTP hardware clock IS carried, on the bare metal size too, that clock being the
+    // host's own hardware rather than something the hypervisor provides. The local devices are
+    // what a reboot migration cannot carry over, so the family is not offered it. An enclave
+    // is offered from two vCPUs
+    // up on this architecture rather than from the four an x86 type needs, so the `large` size
+    // carries one, and the smallest size takes two interfaces of four private addresses each
+    // rather than the count its step of the size ladder publishes. The bare metal size takes
+    // the 31 EBS volumes published for a bare metal instance.
+    PublishedInstanceTypeFacts::of("m7gd.medium")
+        .ebs(315, 2_500, 10_000, 40_000)
+        .instance_store(1, 59)
+        .network("Up to 12.5 Gigabit")
+        .interfaces(2)
+        .ipv4_per_interface(4)
+        .efa(0)
+        .ena_srd(false)
+        .flexible_ena_queues(false)
+        .processor("AWS", 2.6)
+        .host_features(false, true)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("m7gd.large")
+        .ebs(630, 3_600, 10_000, 40_000)
+        .instance_store(1, 118)
+        .network("Up to 12.5 Gigabit")
+        .efa(0)
+        .ena_srd(false)
+        .flexible_ena_queues(false)
+        .nitro_enclaves(true)
+        .processor("AWS", 2.6)
+        .host_features(false, true)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("m7gd.xlarge")
+        .ebs(1_250, 6_000, 10_000, 40_000)
+        .instance_store(1, 237)
+        .network("Up to 12.5 Gigabit")
+        .efa(0)
+        .ena_srd(false)
+        .flexible_ena_queues(false)
+        .processor("AWS", 2.6)
+        .host_features(false, true)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("m7gd.2xlarge")
+        .ebs(2_500, 12_000, 10_000, 40_000)
+        .instance_store(1, 474)
+        .network("Up to 15 Gigabit")
+        .efa(0)
+        .ena_srd(false)
+        .flexible_ena_queues(false)
+        .processor("AWS", 2.6)
+        .host_features(false, true)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("m7gd.4xlarge")
+        .ebs(5_000, 20_000, 10_000, 40_000)
+        .instance_store(1, 950)
+        .network("Up to 15 Gigabit")
+        .efa(0)
+        .ena_srd(false)
+        .flexible_ena_queues(false)
+        .processor("AWS", 2.6)
+        .host_features(false, true)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("m7gd.8xlarge")
+        .ebs(10_000, 40_000, 10_000, 40_000)
+        .instance_store(1, 1_900)
+        .network("15 Gigabit")
+        .efa(0)
+        .ena_srd(false)
+        .flexible_ena_queues(false)
+        .processor("AWS", 2.6)
+        .host_features(false, true)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("m7gd.12xlarge")
+        .ebs(15_000, 60_000, 15_000, 60_000)
+        .instance_store(2, 1_425)
+        .network("22.5 Gigabit")
+        .efa(0)
+        .flexible_ena_queues(false)
+        .processor("AWS", 2.6)
+        .host_features(false, true)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("m7gd.16xlarge")
+        .ebs(20_000, 80_000, 20_000, 80_000)
+        .instance_store(2, 1_900)
+        .network("30 Gigabit")
+        .efa(1)
+        .flexible_ena_queues(false)
+        .processor("AWS", 2.6)
+        .host_features(false, true)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("m7gd.metal")
+        .ebs(20_000, 80_000, 20_000, 80_000)
+        .ebs_attachments(31)
+        .instance_store(2, 1_900)
+        .network("30 Gigabit")
+        .efa(1)
+        .ena_srd(true)
+        .processor("AWS", 2.6)
+        .host_features(false, true)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0),
     // P6-B200 — accelerated compute carrying EIGHT NVIDIA B200 accelerators of 183,359 MiB
     // each, 2 TiB of system memory, eight 3,800 GB local NVMe devices and the family's 100 Gbps
     // of EBS bandwidth on EBS hardware of its own (so its 64 volume attachments are the EBS

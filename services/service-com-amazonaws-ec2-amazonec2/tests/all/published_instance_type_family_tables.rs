@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The published facts of four instance-type FAMILIES of the catalog, driven over the wire
+//! The published facts of seven instance-type FAMILIES of the catalog, driven over the wire
 //! this service speaks (`ec2Query`, an `application/x-www-form-urlencoded` POST answered with
 //! XML; README.md / OPERATIONS.md "Wire protocol").
 //!
@@ -16,11 +16,13 @@
 //! table says so, the device SIZE of a family's local store changes while the count grows, and
 //! two families at one size agree on nothing.
 //!
-//! Every table spans what the rule generalises over — four families (two Intel, one Graviton
-//! with local NVMe, one with configurable bandwidth), the smallest, a middle, the largest
-//! virtualized and the bare metal size of each, a family with local devices and two without —
-//! so no row is the specification and the sizes any one report happened to name are rows among
-//! many.
+//! Every table spans what the rule generalises over — seven families (four Intel, two
+//! Graviton with local NVMe, one with configurable bandwidth), the smallest, a middle, the
+//! largest virtualized and the bare metal size of each, families with local devices and
+//! families without — so no row is the specification and the sizes any one report happened to
+//! name are rows among many. A published figure that is not a whole number of Mbps is a row
+//! among them too: the integer bandwidth member cannot hold its half while the throughput
+//! member carries the megabytes of the whole figure.
 
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -922,5 +924,559 @@ async fn the_two_compute_families_serve_their_published_adapter_capabilities() {
         required("c6i.16xlarge", &left_network, "networkPerformance"),
         required("c7g.16xlarge", &right_network, "networkPerformance"),
         "two families of one size publish different network performance"
+    );
+}
+
+/// The published row of one size of a family whose sizes carry local NVMe devices, or whose
+/// network is the family's capability letter.
+#[derive(Debug, Clone, Copy)]
+struct LocalAndNetworkRow {
+    /// `c6id.12xlarge` and the like.
+    instance_type: &'static str,
+    /// (sustained Mbps, sustained IOPS, Mbps it reaches, IOPS it reaches).
+    ebs: (i64, i64, i64, i64),
+    /// The EBS volumes it holds attached, and whether that limit is shared with its
+    /// interfaces and local devices or is the volumes' own.
+    ebs_attachments: (i64, &'static str),
+    /// Its local devices as (count, GB each), or `None` where it carries none.
+    instance_store: Option<(i64, i64)>,
+    /// Its network performance as the published table writes it.
+    network_performance: &'static str,
+    /// Its processor's sustained frequency, in GHz.
+    sustained_ghz: f64,
+    /// The core counts it can be configured with: (smallest, step) of its published list,
+    /// which runs up to its default core count.
+    valid_cores: (i64, i64),
+}
+
+/// Three more families of the catalog, one row per size.
+///
+/// The figures are the ones AWS states for each type on its family's instance-type
+/// specification page, in the "Amazon EBS optimized instance types" and "Instance volume
+/// limits" tables, in the "IP addresses per network interface per instance type" table and in
+/// the "CPU cores and threads per CPU core per instance type" table of the EC2 User Guide.
+///
+/// The rows span what the rule generalises over: a compute optimized Intel family with local
+/// NVMe, a compute optimized Intel family built for the network and carrying none, and a
+/// Graviton general purpose family with local NVMe; the smallest size, the sizes whose
+/// published device size is NOT the quarter or the three quarters of the family's largest
+/// device that a smooth ladder would give, a size that carries four devices, the largest
+/// virtualized sizes and the bare metal size of each. So the sizes differ in device count,
+/// in device size, in network performance, in processor frequency, in the attachment limit
+/// they publish and in the core counts they offer.
+const LOCAL_AND_NETWORK_ROWS: [LocalAndNetworkRow; 13] = [
+    LocalAndNetworkRow {
+        instance_type: "c6id.large",
+        ebs: (650, 3_600, 10_000, 40_000),
+        ebs_attachments: (26, "shared"),
+        instance_store: Some((1, 118)),
+        network_performance: "Up to 12.5 Gigabit",
+        sustained_ghz: 3.5,
+        valid_cores: (1, 1),
+    },
+    LocalAndNetworkRow {
+        instance_type: "c6id.2xlarge",
+        ebs: (2_500, 12_000, 10_000, 40_000),
+        ebs_attachments: (26, "shared"),
+        // 474 GB, not the 475 a quarter of the family's largest device would be.
+        instance_store: Some((1, 474)),
+        network_performance: "Up to 12.5 Gigabit",
+        sustained_ghz: 3.5,
+        valid_cores: (2, 2),
+    },
+    LocalAndNetworkRow {
+        instance_type: "c6id.12xlarge",
+        ebs: (15_000, 60_000, 15_000, 60_000),
+        ebs_attachments: (25, "shared"),
+        instance_store: Some((2, 1_425)),
+        network_performance: "18.75 Gigabit",
+        sustained_ghz: 3.5,
+        valid_cores: (2, 2),
+    },
+    LocalAndNetworkRow {
+        instance_type: "c6id.24xlarge",
+        ebs: (30_000, 120_000, 30_000, 120_000),
+        ebs_attachments: (23, "shared"),
+        instance_store: Some((4, 1_425)),
+        network_performance: "37.5 Gigabit",
+        sustained_ghz: 3.5,
+        valid_cores: (2, 2),
+    },
+    LocalAndNetworkRow {
+        instance_type: "c6id.metal",
+        ebs: (40_000, 160_000, 40_000, 160_000),
+        ebs_attachments: (31, "shared"),
+        instance_store: Some((4, 1_900)),
+        network_performance: "50 Gigabit",
+        sustained_ghz: 3.5,
+        valid_cores: (1, 1),
+    },
+    LocalAndNetworkRow {
+        instance_type: "c6in.xlarge",
+        ebs: (3_125, 12_500, 25_000, 100_000),
+        ebs_attachments: (27, "shared"),
+        instance_store: None,
+        network_performance: "Up to 30 Gigabit",
+        sustained_ghz: 3.5,
+        valid_cores: (1, 1),
+    },
+    LocalAndNetworkRow {
+        instance_type: "c6in.8xlarge",
+        ebs: (25_000, 100_000, 25_000, 100_000),
+        ebs_attachments: (27, "shared"),
+        instance_store: None,
+        network_performance: "50 Gigabit",
+        sustained_ghz: 3.5,
+        valid_cores: (1, 1),
+    },
+    LocalAndNetworkRow {
+        instance_type: "c6in.16xlarge",
+        ebs: (50_000, 200_000, 50_000, 200_000),
+        ebs_attachments: (27, "shared"),
+        instance_store: None,
+        network_performance: "100 Gigabit",
+        sustained_ghz: 3.5,
+        valid_cores: (1, 1),
+    },
+    LocalAndNetworkRow {
+        instance_type: "c6in.metal",
+        ebs: (100_000, 400_000, 100_000, 400_000),
+        ebs_attachments: (31, "shared"),
+        instance_store: None,
+        network_performance: "200 Gigabit",
+        sustained_ghz: 3.5,
+        valid_cores: (1, 1),
+    },
+    LocalAndNetworkRow {
+        instance_type: "m7gd.medium",
+        ebs: (315, 2_500, 10_000, 40_000),
+        ebs_attachments: (26, "shared"),
+        instance_store: Some((1, 59)),
+        network_performance: "Up to 12.5 Gigabit",
+        sustained_ghz: 2.6,
+        valid_cores: (1, 1),
+    },
+    LocalAndNetworkRow {
+        instance_type: "m7gd.2xlarge",
+        ebs: (2_500, 12_000, 10_000, 40_000),
+        ebs_attachments: (26, "shared"),
+        // 474 GB here too, on a family of a different architecture and a different ladder.
+        instance_store: Some((1, 474)),
+        network_performance: "Up to 15 Gigabit",
+        sustained_ghz: 2.6,
+        valid_cores: (1, 1),
+    },
+    LocalAndNetworkRow {
+        instance_type: "m7gd.12xlarge",
+        ebs: (15_000, 60_000, 15_000, 60_000),
+        ebs_attachments: (25, "shared"),
+        instance_store: Some((2, 1_425)),
+        network_performance: "22.5 Gigabit",
+        sustained_ghz: 2.6,
+        valid_cores: (1, 1),
+    },
+    LocalAndNetworkRow {
+        instance_type: "m7gd.metal",
+        ebs: (20_000, 80_000, 20_000, 80_000),
+        ebs_attachments: (31, "shared"),
+        instance_store: Some((2, 1_900)),
+        network_performance: "30 Gigabit",
+        sustained_ghz: 2.6,
+        valid_cores: (1, 1),
+    },
+];
+
+/// Rule: every hardware member AWS publishes per instance type is served from that type's own
+/// row — the EBS figures, the attachment limit and its kind, the local devices, the network
+/// performance, the processor frequency and the core counts.
+#[tokio::test]
+async fn the_local_and_network_families_serve_their_published_hardware_rows() {
+    let (router, _engine) = super::ec2_query::emulator();
+
+    for row in LOCAL_AND_NETWORK_ROWS {
+        let case = row.instance_type;
+        let body = described(case, &router, row.instance_type).await;
+
+        let ebs_info = required(case, &body, "ebsInfo");
+        let performance = required(case, &ebs_info, "ebsOptimizedInfo");
+        let (baseline_mbps, baseline_iops, maximum_mbps, maximum_iops) = row.ebs;
+        for (name, expected) in [
+            ("baselineBandwidthInMbps", baseline_mbps),
+            ("baselineIops", baseline_iops),
+            ("maximumBandwidthInMbps", maximum_mbps),
+            ("maximumIops", maximum_iops),
+        ] {
+            let reported = number(case, &performance, name) as i64;
+            assert_eq!(
+                reported, expected,
+                "case {case:?}: expected {name} {expected}, got {reported}"
+            );
+        }
+        // The throughput members are the bandwidth ones in the other unit, which is how the
+        // published table's Mbps and MB/s columns relate.
+        for (name, bandwidth) in [
+            ("baselineThroughputInMBps", baseline_mbps),
+            ("maximumThroughputInMBps", maximum_mbps),
+        ] {
+            let expected = bandwidth as f64 / MEGABITS_PER_MEGABYTE;
+            let reported = number(case, &performance, name);
+            assert!(
+                (reported - expected).abs() < 0.001,
+                "case {case:?}: expected {name} {expected}, got {reported}"
+            );
+        }
+
+        let (attachments, limit_kind) = row.ebs_attachments;
+        let reported = number(case, &ebs_info, "maximumEbsAttachments") as i64;
+        assert_eq!(
+            reported, attachments,
+            "case {case:?}: expected maximumEbsAttachments {attachments}, got {reported}"
+        );
+        let reported = required(case, &ebs_info, "attachmentLimitType");
+        assert_eq!(
+            reported, limit_kind,
+            "case {case:?}: expected attachmentLimitType {limit_kind:?}, got {reported:?}"
+        );
+
+        match row.instance_store {
+            Some((devices, gb_each)) => {
+                let storage = required(case, &body, "instanceStorageInfo");
+                let disks = required(case, &storage, "disks");
+                let reported = number(case, &disks, "count") as i64;
+                assert_eq!(
+                    reported, devices,
+                    "case {case:?}: expected {devices} local devices, got {reported}"
+                );
+                let reported = number(case, &disks, "sizeInGB") as i64;
+                assert_eq!(
+                    reported, gb_each,
+                    "case {case:?}: expected local devices of {gb_each} GB, got {reported}"
+                );
+                let reported = number(case, &storage, "totalSizeInGB") as i64;
+                assert_eq!(
+                    reported,
+                    devices * gb_each,
+                    "case {case:?}: expected totalSizeInGB {}, got {reported}",
+                    devices * gb_each
+                );
+            }
+            None => assert!(
+                element(&body, "instanceStorageInfo").is_none(),
+                "case {case:?}: a type with no local devices reports no instanceStorageInfo, \
+                 got {body}"
+            ),
+        }
+
+        let network_info = required(case, &body, "networkInfo");
+        let reported = required(case, &network_info, "networkPerformance");
+        assert_eq!(
+            reported, row.network_performance,
+            "case {case:?}: expected networkPerformance {:?}, got {reported:?}",
+            row.network_performance
+        );
+
+        let processor_info = required(case, &body, "processorInfo");
+        let reported = number(case, &processor_info, "sustainedClockSpeedInGhz");
+        assert!(
+            (reported - row.sustained_ghz).abs() < 0.001,
+            "case {case:?}: expected sustainedClockSpeedInGhz {}, got {reported}",
+            row.sustained_ghz
+        );
+
+        let v_cpu_info = required(case, &body, "vCpuInfo");
+        let default_cores = number(case, &v_cpu_info, "defaultCores") as i64;
+        let (minimum, step) = row.valid_cores;
+        let expected: Vec<i64> = (1..=default_cores)
+            .filter(|cores| cores % step == 0 && *cores >= minimum)
+            .collect();
+        let reported: Vec<i64> = list(case, &v_cpu_info, "validCores")
+            .iter()
+            .map(|count| {
+                count.parse().unwrap_or_else(|_| {
+                    panic!("case {case:?}: a core count must be a number, got {count:?}")
+                })
+            })
+            .collect();
+        assert_eq!(
+            reported, expected,
+            "case {case:?}: expected validCores {expected:?}, got {reported:?}"
+        );
+    }
+}
+
+/// Rule, the other way round: the published figures of these families are NOT a function of
+/// the size multiplier in the name, so one size of two families agrees on nothing and one
+/// family's ladder does not scale.
+#[tokio::test]
+async fn the_local_and_network_published_figures_do_not_follow_the_size_multiplier() {
+    let (router, _engine) = super::ec2_query::emulator();
+
+    let baseline = |body: &str, case: &str| -> i64 {
+        let ebs_info = required(case, body, "ebsInfo");
+        let performance = required(case, &ebs_info, "ebsOptimizedInfo");
+        number(case, &performance, "baselineBandwidthInMbps") as i64
+    };
+    let total_storage = |body: &str, case: &str| -> i64 {
+        let storage = required(case, body, "instanceStorageInfo");
+        number(case, &storage, "totalSizeInGB") as i64
+    };
+
+    // One size, two families that differ by a capability letter: the family built for the
+    // network sustains eight times the EBS bandwidth of its plain sibling, and carries no
+    // local device where the `d` sibling carries one.
+    let case = "c6in.2xlarge";
+    let network_built = described(case, &router, case).await;
+    let local = described("c6id.2xlarge", &router, "c6id.2xlarge").await;
+    assert!(
+        baseline(&network_built, case) > baseline(&local, "c6id.2xlarge"),
+        "case {case:?}: the network optimized family sustains more EBS bandwidth than the \
+         local-storage one at the same size, got {} against {}",
+        baseline(&network_built, case),
+        baseline(&local, "c6id.2xlarge")
+    );
+    assert!(
+        element(&network_built, "instanceStorageInfo").is_none(),
+        "case {case:?}: a type with no local devices reports no instanceStorageInfo, got \
+         {network_built}"
+    );
+
+    // The device SIZE of a ladder does not scale with the size: the 24xlarge carries four
+    // devices smaller than the one device of the 8xlarge, so the total is not the multiplier
+    // applied to either figure.
+    let eight = described("c6id.8xlarge", &router, "c6id.8xlarge").await;
+    let twenty_four = described("c6id.24xlarge", &router, "c6id.24xlarge").await;
+    let eight_total = total_storage(&eight, "c6id.8xlarge");
+    let twenty_four_total = total_storage(&twenty_four, "c6id.24xlarge");
+    assert_eq!(
+        (eight_total, twenty_four_total),
+        (1_900, 5_700),
+        "expected the published totals 1900 and 5700 GB, got {eight_total} and \
+         {twenty_four_total}"
+    );
+
+    // Two architectures at one size publish different EBS baselines and different network
+    // performance, so neither follows from the size in the name.
+    let intel = described("c6id.2xlarge", &router, "c6id.2xlarge").await;
+    let graviton = described("m7gd.2xlarge", &router, "m7gd.2xlarge").await;
+    let intel_network = required("c6id.2xlarge", &intel, "networkInfo");
+    let graviton_network = required("m7gd.2xlarge", &graviton, "networkInfo");
+    assert_ne!(
+        required("c6id.2xlarge", &intel_network, "networkPerformance"),
+        required("m7gd.2xlarge", &graviton_network, "networkPerformance"),
+        "two families of one size publish different network performance"
+    );
+}
+
+/// Rule: the adapter capabilities, the host features, the Elastic Fabric Adapters and the
+/// interface limits of these families are published per type too — none of them follows from
+/// the family's generation alone.
+#[tokio::test]
+async fn the_local_and_network_families_serve_their_published_capabilities() {
+    let (router, _engine) = super::ec2_query::emulator();
+
+    // Rows: (instance type, member, expected). A member of `networkInfo` is read out of that
+    // block, the rest are the type's own.
+    for (instance_type, member, expected) in [
+        // ENA Express is offered from the size that carries a family's whole dedicated share
+        // up, and on the bare metal size, not below it.
+        ("c6id.large", "enaSrdSupported", "false"),
+        ("c6id.12xlarge", "enaSrdSupported", "true"),
+        ("c6id.metal", "enaSrdSupported", "true"),
+        ("c6in.xlarge", "enaSrdSupported", "false"),
+        ("c6in.8xlarge", "enaSrdSupported", "true"),
+        ("c6in.metal", "enaSrdSupported", "true"),
+        ("m7gd.medium", "enaSrdSupported", "false"),
+        ("m7gd.12xlarge", "enaSrdSupported", "true"),
+        ("m7gd.metal", "enaSrdSupported", "true"),
+        // A configurable ENA queue count is the Intel families' adapter and not the
+        // Graviton one's, and is not offered on a bare metal size of either.
+        ("c6id.12xlarge", "flexibleEnaQueuesSupport", "supported"),
+        ("c6id.metal", "flexibleEnaQueuesSupport", "unsupported"),
+        ("c6in.8xlarge", "flexibleEnaQueuesSupport", "supported"),
+        ("c6in.metal", "flexibleEnaQueuesSupport", "unsupported"),
+        ("m7gd.12xlarge", "flexibleEnaQueuesSupport", "unsupported"),
+        // No size of any of the three takes an interface attachment from a secondary
+        // network; the two families whose rows publish the addresses one such interface
+        // takes report none at all, and the third reports no figure.
+        ("c6id.12xlarge", "secondaryNetworkSupported", "false"),
+        ("c6in.8xlarge", "ipv4AddressesPerSecondaryInterface", "0"),
+        ("m7gd.medium", "ipv4AddressesPerSecondaryInterface", "0"),
+        // The Elastic Fabric Adapter is offered on the sizes the family publishes it for and
+        // on no other, however large.
+        ("c6id.12xlarge", "efaSupported", "false"),
+        ("c6id.metal", "efaSupported", "true"),
+        ("c6in.16xlarge", "efaSupported", "false"),
+        ("c6in.32xlarge", "efaSupported", "true"),
+        ("m7gd.12xlarge", "efaSupported", "false"),
+        ("m7gd.16xlarge", "efaSupported", "true"),
+        // The smallest Graviton size takes the interfaces and addresses its row publishes
+        // rather than the ones its step of the size ladder would give.
+        ("m7gd.medium", "maximumNetworkInterfaces", "2"),
+        ("m7gd.medium", "ipv4AddressesPerInterface", "4"),
+        // The two sizes that hold the whole network optimized host carry two cards.
+        ("c6in.32xlarge", "maximumNetworkCards", "2"),
+        ("c6in.metal", "maximumNetworkCards", "2"),
+        ("c6id.metal", "maximumNetworkCards", "1"),
+    ] {
+        let case = format!("{instance_type} {member}");
+        let body = described(&case, &router, instance_type).await;
+        let network_info = required(&case, &body, "networkInfo");
+        let reported = required(&case, &network_info, member);
+        assert_eq!(
+            reported, expected,
+            "case {case:?}: expected {member} {expected:?}, got {reported:?}"
+        );
+    }
+
+    // The Elastic Fabric Adapters a type carries: one per network card on the sizes that
+    // carry two, one on every other size that is offered any.
+    for (instance_type, interfaces) in [
+        ("c6id.metal", "1"),
+        ("c6in.32xlarge", "2"),
+        ("c6in.metal", "2"),
+        ("m7gd.16xlarge", "1"),
+        ("m7gd.metal", "1"),
+    ] {
+        let case = instance_type;
+        let body = described(case, &router, instance_type).await;
+        let network_info = required(case, &body, "networkInfo");
+        let efa_info = required(case, &network_info, "efaInfo");
+        let reported = required(case, &efa_info, "maximumEfaInterfaces");
+        assert_eq!(
+            reported, interfaces,
+            "case {case:?}: expected maximumEfaInterfaces {interfaces:?}, got {reported:?}"
+        );
+    }
+
+    // The host features are the type's own: a family whose local devices a migration cannot
+    // carry over is offered no reboot migration at any size, while the family that carries
+    // none is — on its bare metal size too, the move there being the host's to make. A local
+    // PTP hardware clock is the Graviton host's own hardware, so its bare metal size has one
+    // as well. Simplified automatic recovery reaches a bare metal size only where no local
+    // device holds data a recovery would have to carry over. An enclave is offered from two
+    // vCPUs up on the Graviton architecture and from four on an x86 one.
+    for (instance_type, member, expected) in [
+        ("c6id.12xlarge", "rebootMigrationSupport", "unsupported"),
+        ("c6id.metal", "rebootMigrationSupport", "unsupported"),
+        ("c6in.8xlarge", "rebootMigrationSupport", "supported"),
+        ("c6in.metal", "rebootMigrationSupport", "supported"),
+        ("m7gd.12xlarge", "rebootMigrationSupport", "unsupported"),
+        ("c6id.12xlarge", "phcSupport", "unsupported"),
+        ("c6in.8xlarge", "phcSupport", "unsupported"),
+        ("m7gd.medium", "phcSupport", "supported"),
+        ("m7gd.metal", "phcSupport", "supported"),
+        ("c6in.metal", "autoRecoverySupported", "true"),
+        ("c6id.metal", "autoRecoverySupported", "false"),
+        ("m7gd.metal", "autoRecoverySupported", "false"),
+        ("m7gd.medium", "nitroEnclavesSupport", "unsupported"),
+        ("m7gd.large", "nitroEnclavesSupport", "supported"),
+        ("c6id.large", "nitroEnclavesSupport", "unsupported"),
+        ("c6id.xlarge", "nitroEnclavesSupport", "supported"),
+    ] {
+        let case = format!("{instance_type} {member}");
+        let body = described(&case, &router, instance_type).await;
+        let reported = required(&case, &body, member);
+        assert_eq!(
+            reported, expected,
+            "case {case:?}: expected {member} {expected:?}, got {reported:?}"
+        );
+    }
+
+    // The boot modes of a bare metal size are its own: the Intel ones are offered the legacy
+    // BIOS mode alone where their virtualized sizes take both, and a Graviton type takes UEFI
+    // at every size.
+    for (instance_type, expected) in [
+        ("c6id.metal", vec!["legacy-bios"]),
+        ("c6in.metal", vec!["legacy-bios"]),
+        ("c6id.12xlarge", vec!["legacy-bios", "uefi"]),
+        ("m7gd.metal", vec!["uefi"]),
+    ] {
+        let case = instance_type;
+        let body = described(case, &router, instance_type).await;
+        let reported = list(case, &body, "supportedBootModes");
+        assert_eq!(
+            reported, expected,
+            "case {case:?}: expected supportedBootModes {expected:?}, got {reported:?}"
+        );
+    }
+}
+
+/// Rule: the two members that report a type's published sustained EBS bandwidth are that ONE
+/// published figure in two units — including where the figure is not a whole number of Mbps,
+/// which the integer member cannot hold while the MB/s member carries the megabytes of the
+/// whole figure — and a card's share of it is reported through the same two readings, so a
+/// card and the instance it belongs to cannot report that figure differently.
+#[tokio::test]
+async fn a_published_sustained_bandwidth_is_reported_in_both_its_units() {
+    let (router, _engine) = super::ec2_query::emulator();
+
+    // Rows: the published figure as each member reports it — the Mbps the integer member
+    // holds, and the megabytes of the WHOLE published figure. The first size's published
+    // share of its host is 1,562.5 Mbps, so the two members do not relate by a division of
+    // the integer one; the rest are whole numbers of Mbps, the last of them with a fractional
+    // megabyte figure. The figures come from the "Amazon EBS optimized instance types" table
+    // of the EC2 User Guide.
+    for (instance_type, bandwidth, throughput) in [
+        ("c6in.large", 1_562_i64, 195.312_5_f64),
+        ("c6in.xlarge", 3_125, 390.625),
+        ("c6id.large", 650, 81.25),
+        ("m7gd.medium", 315, 39.375),
+    ] {
+        let case = instance_type;
+        let body = described(case, &router, instance_type).await;
+        let ebs_info = required(case, &body, "ebsInfo");
+        let performance = required(case, &ebs_info, "ebsOptimizedInfo");
+        let reported = number(case, &performance, "baselineBandwidthInMbps") as i64;
+        assert_eq!(
+            reported, bandwidth,
+            "case {case:?}: expected baselineBandwidthInMbps {bandwidth}, got {reported}"
+        );
+        let reported = number(case, &performance, "baselineThroughputInMBps");
+        assert!(
+            (reported - throughput).abs() < 1e-9,
+            "case {case:?}: expected baselineThroughputInMBps {throughput}, got {reported}"
+        );
+        // These types' volumes are attached out of the pool they share with the instance's
+        // other devices rather than to EBS hardware of the type's own, so there are no cards
+        // to spread the figure over and none is reported.
+        assert!(
+            element(&ebs_info, "ebsCardSet").is_none()
+                && element(&ebs_info, "maximumEbsCards").is_none(),
+            "case {case:?}: a type whose volumes share the host's pool reports no EBS cards, \
+             got {ebs_info}"
+        );
+    }
+
+    // A type whose row DOES publish EBS hardware of its own: its cards carry the instance's
+    // published figure together, each card reporting its share through the same two readings.
+    let case = "c8gb.48xlarge";
+    let body = described(case, &router, case).await;
+    let ebs_info = required(case, &body, "ebsInfo");
+    let performance = required(case, &ebs_info, "ebsOptimizedInfo");
+    let instance_bandwidth = number(case, &performance, "baselineBandwidthInMbps");
+    let cards = list(case, &ebs_info, "ebsCardSet");
+    let reported = number(case, &ebs_info, "maximumEbsCards") as i64;
+    assert_eq!(
+        reported,
+        cards.len() as i64,
+        "case {case:?}: expected maximumEbsCards to be the {} cards reported, got {reported}",
+        cards.len()
+    );
+    let mut carried = 0.0;
+    for (index, card) in cards.iter().enumerate() {
+        let case = format!("{case} card {index}");
+        let bandwidth = number(&case, card, "baselineBandwidthInMbps");
+        let throughput = number(&case, card, "baselineThroughputInMBps");
+        assert!(
+            (throughput - bandwidth / MEGABITS_PER_MEGABYTE).abs() < 1e-9,
+            "case {case:?}: expected baselineThroughputInMBps {}, got {throughput}",
+            bandwidth / MEGABITS_PER_MEGABYTE
+        );
+        carried += bandwidth;
+    }
+    assert!(
+        (carried - instance_bandwidth).abs() < 1e-9,
+        "case {case:?}: expected the cards to carry the instance's {instance_bandwidth} Mbps \
+         together, got {carried}"
     );
 }

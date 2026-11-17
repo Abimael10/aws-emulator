@@ -277,8 +277,11 @@ async fn an_instance_type_reports_the_members_its_name_yields() {
             ebs_attachments: 20,
         },
         TypeCase {
-            case: "a published two-card type",
-            instance_type: "c6in.32xlarge",
+            case: "a two-card type with no published row",
+            // A type of the published multi-card list that the catalog holds no per-type row
+            // for, so every member below is the derivation's: `c6in.32xlarge` carries two
+            // cards too, and its row publishes an adapter answer of its own.
+            instance_type: "m6in.32xlarge",
             cards: 2,
             nitro_clock: "unsupported",
             hypervisor_feature: "supported",
