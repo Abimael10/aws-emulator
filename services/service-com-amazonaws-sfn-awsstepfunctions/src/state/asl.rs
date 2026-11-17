@@ -160,6 +160,12 @@
 //! `PendingOutcome`; the states of a `Map` iteration or a `Parallel` branch run
 //! concurrently on the real service, so a batch's span is its longest member's
 //! rather than the sum.
+//!
+//! That offset is also what ORDERS the work of a `Map` state's items, which run at the
+//! same time up to its `MaxConcurrency`: the iteration that runs is the one whose own
+//! clock is earliest, so one that waits on an effect its siblings commit yields to them
+//! and sees it ([`map_items`]). The order their work is done in is therefore decided by
+//! the definition and never by the host's own speed.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -174,6 +180,7 @@ mod diagnose;
 mod echo;
 mod intrinsics;
 mod jsonpath;
+mod map_items;
 mod walk;
 mod work_events;
 mod work_meter;
@@ -188,6 +195,10 @@ pub use work_meter::*;
 // reachable unqualified from here and from the walk ([`jsonpath`]), exactly as the two
 // below are.
 use jsonpath::*;
+// How the ITEMS of a `Map` state run — concurrently, up to the state's
+// `MaxConcurrency`, each taken up where the clock left it — is one concern in a file of
+// its own too, whose names stay reachable unqualified from here and from the walk.
+use map_items::*;
 // How a document a walk reports is ENCODED, and the intrinsic-function evaluator, are
 // this module's own: each holds one concern in its own file, and the names stay
 // reachable unqualified from here and from the walk, as they were when they lived in
@@ -1884,8 +1895,11 @@ struct Branch {
 /// One unit of a state's CONCURRENT work — a `Parallel` branch, or one iteration of a
 /// `Map` state — as the walk ran it, for [`Interpreter::abort_units`].
 struct Unit {
-    /// Where this unit's own history events begin in the walk's list.
-    from: usize,
+    /// WHERE this unit's own history events sit in the walk's list, in the order it
+    /// recorded them: one run of the list for a `Parallel` branch, which is walked to
+    /// its end in one go, and several for a `Map` iteration, whose events are
+    /// interleaved with its siblings' by the clock ([`map_items`]).
+    steps: Vec<usize>,
     /// Where the Map Runs this unit's work records begin in the walk's list of them,
     /// so a failure that stops these units judges only the Map Runs THEY started and
     /// leaves the ones recorded before they began alone.
@@ -3713,7 +3727,7 @@ impl Interpreter<'_> {
                 false,
             );
             units.push(Unit {
-                from,
+                steps: (from..self.steps.len()).collect(),
                 map_runs_from,
                 aborted: None,
             });

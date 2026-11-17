@@ -14,7 +14,7 @@
 //! ([`super::interpret`]) and `TestState`'s single-state trial drives the same steps,
 //! so both reach them, and nothing outside this module's own tree can.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use serde_json::{Map, Value};
@@ -88,6 +88,24 @@ impl Interpreter<'_> {
         self.timed_out
     }
 
+    /// The failure a nested state list this walk will not run reports: one that would
+    /// nest `Map` iterations and `Parallel` branches more than [`MAX_NESTING_DEPTH`]
+    /// levels deep, so the nesting a definition can ask for is capped rather than left
+    /// to the thread's stack.
+    ///
+    /// Read by every path that walks a nested list: the one that walks it to its end in
+    /// one go ([`Interpreter::nested_walk`]) and the one that walks a `Map` iteration a
+    /// slice at a time ([`super::map_items`]), so both refuse the same definition with
+    /// the same sentence.
+    pub(super) fn too_deeply_nested(&self) -> Option<Failure> {
+        (self.depth >= MAX_NESTING_DEPTH).then(|| {
+            runtime(format!(
+                "the definition nests 'Map' iterations and 'Parallel' branches more than the \
+                 {MAX_NESTING_DEPTH} levels deep this emulator runs, so nothing was run for it"
+            ))
+        })
+    }
+
     /// Walk a NESTED state list — a `Map` iteration or a `Parallel` branch — one
     /// level deeper, refusing a definition that nests past [`MAX_NESTING_DEPTH`].
     ///
@@ -102,12 +120,9 @@ impl Interpreter<'_> {
         scope: &Scope,
         iteration: bool,
     ) -> Branch {
-        if self.depth >= MAX_NESTING_DEPTH {
+        if let Some(failure) = self.too_deeply_nested() {
             return Branch {
-                outcome: Err(runtime(format!(
-                    "the definition nests 'Map' iterations and 'Parallel' branches more than the \
-                     {MAX_NESTING_DEPTH} levels deep this emulator runs, so nothing was run for it"
-                ))),
+                outcome: Err(failure),
                 end: at,
                 suspended: false,
             };
@@ -183,117 +198,140 @@ impl Interpreter<'_> {
         at: Duration,
         scope: &Scope,
     ) -> Branch {
-        let mut name = start_at.to_string();
-        let mut current = input;
-        let mut at = at;
+        let mut cursor = Cursor {
+            name: start_at.to_string(),
+            value: input,
+            at,
+        };
         loop {
-            // The definition's own `TimeoutSeconds` comes FIRST: an execution still
-            // going when it falls due has ENDED there, so it makes no further
-            // transition — and the emulator's own ceilings below never decide the
-            // outcome of a run the definition already bounded.
-            if self.past_timeout(at) {
-                return Branch {
-                    outcome: Err(super::timed_out()),
-                    end: at,
-                    suspended: false,
-                };
+            if let Some(branch) = self.walk_one(states, &mut cursor, scope) {
+                return branch;
             }
-            // A branch of the enclosing `Parallel` state has already FAILED, so the
-            // state is failing and the work that had not begun does not begin: a state
-            // due after that instant is not entered at all.
-            if let Some(stopped) = self.stopped_before_entering(at) {
-                return Branch {
-                    outcome: Err(stopped),
-                    end: at,
-                    suspended: false,
-                };
-            }
-            if let Some(failure) = self.out_of_work() {
-                return Branch {
-                    outcome: Err(failure),
-                    end: at,
-                    suspended: false,
-                };
-            }
-            if self.budget == 0 {
-                return Branch {
-                    outcome: Err(runtime(format!(
-                        "the execution made more than the {MAX_STATE_TRANSITIONS} state \
-                         transitions this emulator runs, so it was stopped"
-                    ))),
-                    end: at,
-                    suspended: false,
-                };
-            }
-            self.budget -= 1;
-            let Some(state) = states.get(&name).and_then(Value::as_object) else {
-                return Branch {
-                    outcome: Err(runtime(format!(
-                        "state '{name}' is not declared by the state machine"
-                    ))),
-                    end: at,
-                    suspended: false,
-                };
-            };
-            // The raw input of the state about to run, kept for the one use a
-            // FAILURE has for it: the step a redrive continues from is that state
-            // with the data it saw ([`Run::stopped_at`]).
-            let raw = current.clone();
-            let step = match self.step(&name, state, current, at, scope) {
-                Ok(step) => step,
-                Err(fault) => {
-                    // "It continues the failed execution from the unsuccessful step
-                    // and uses the same input": the step is the TOP-LEVEL state of
-                    // the definition the execution stopped at, so a failure a nested
-                    // walk reports is recorded as the state that encloses it — the
-                    // frame that is at depth zero.
-                    if self.depth == 0 {
-                        self.failed_at = Some(RedriveStep {
-                            state_name: name.clone(),
-                            state_input: raw.to_string(),
-                        });
-                    }
-                    return Branch {
-                        outcome: Err(fault.failure),
-                        end: fault.at,
-                        suspended: false,
-                    };
+        }
+    }
+
+    /// Run the ONE state a walk of `states` has reached, and say where that leaves it:
+    /// the branch it ended as, and `None` for a walk that carries on — whose `cursor`
+    /// then names the next state, the document it is entered with and the offset it
+    /// begins at.
+    ///
+    /// One state at a time is what lets the iterations of a `Map` state be interleaved
+    /// by the clock, each taken up where it left off ([`super::map_items`]); a walk that
+    /// runs a state list to its end drives this in a loop.
+    pub(super) fn walk_one(
+        &mut self,
+        states: &Map<String, Value>,
+        cursor: &mut Cursor,
+        scope: &Scope,
+    ) -> Option<Branch> {
+        let at = cursor.at;
+        // The definition's own `TimeoutSeconds` comes FIRST: an execution still
+        // going when it falls due has ENDED there, so it makes no further
+        // transition — and the emulator's own ceilings below never decide the
+        // outcome of a run the definition already bounded.
+        if self.past_timeout(at) {
+            return Some(Branch {
+                outcome: Err(super::timed_out()),
+                end: at,
+                suspended: false,
+            });
+        }
+        // A branch of the enclosing `Parallel` state has already FAILED, so the
+        // state is failing and the work that had not begun does not begin: a state
+        // due after that instant is not entered at all.
+        if let Some(stopped) = self.stopped_before_entering(at) {
+            return Some(Branch {
+                outcome: Err(stopped),
+                end: at,
+                suspended: false,
+            });
+        }
+        if let Some(failure) = self.out_of_work() {
+            return Some(Branch {
+                outcome: Err(failure),
+                end: at,
+                suspended: false,
+            });
+        }
+        if self.budget == 0 {
+            return Some(Branch {
+                outcome: Err(runtime(format!(
+                    "the execution made more than the {MAX_STATE_TRANSITIONS} state \
+                     transitions this emulator runs, so it was stopped"
+                ))),
+                end: at,
+                suspended: false,
+            });
+        }
+        self.budget -= 1;
+        let Some(state) = states.get(&cursor.name).and_then(Value::as_object) else {
+            return Some(Branch {
+                outcome: Err(runtime(format!(
+                    "state '{}' is not declared by the state machine",
+                    cursor.name
+                ))),
+                end: at,
+                suspended: false,
+            });
+        };
+        // The raw input of the state about to run, kept for the one use a
+        // FAILURE has for it: the step a redrive continues from is that state
+        // with the data it saw ([`Run::stopped_at`]).
+        let raw = cursor.value.clone();
+        let current = std::mem::take(&mut cursor.value);
+        let step = match self.step(&cursor.name, state, current, at, scope) {
+            Ok(step) => step,
+            Err(fault) => {
+                // "It continues the failed execution from the unsuccessful step
+                // and uses the same input": the step is the TOP-LEVEL state of
+                // the definition the execution stopped at, so a failure a nested
+                // walk reports is recorded as the state that encloses it — the
+                // frame that is at depth zero.
+                if self.depth == 0 {
+                    self.failed_at = Some(RedriveStep {
+                        state_name: cursor.name.clone(),
+                        state_input: raw.to_string(),
+                    });
                 }
-            };
-            at = step.at;
-            current = step.value;
-            // The document this state produced is measured HERE, at the state that
-            // produced it: a definition that grows what it carries is stopped at the
-            // first state past what a state's output may hold, rather than after the
-            // whole run.
-            if let Err(failure) = measure_payload(&current, &name) {
-                return Branch {
-                    outcome: Err(failure),
-                    end: at,
+                return Some(Branch {
+                    outcome: Err(fault.failure),
+                    end: fault.at,
                     suspended: false,
-                };
+                });
             }
-            match step.next {
-                Next::EndBranch => {
-                    return Branch {
-                        outcome: Ok(current),
-                        end: at,
-                        suspended: false,
-                    };
-                }
-                // The state scheduled an activity task, or started the job of a
-                // run-a-job integration: the walk stops here, and `run` reports what
-                // it is waiting for rather than an outcome. A nested list reports the
-                // suspension to the state that encloses it, which is what parks a
-                // `Parallel` branch at the job one of its states started.
-                Next::Suspended => {
-                    return Branch {
-                        outcome: Ok(current),
-                        end: at,
-                        suspended: true,
-                    };
-                }
-                Next::Named(next) => name = next,
+        };
+        cursor.at = step.at;
+        cursor.value = step.value;
+        // The document this state produced is measured HERE, at the state that
+        // produced it: a definition that grows what it carries is stopped at the
+        // first state past what a state's output may hold, rather than after the
+        // whole run.
+        if let Err(failure) = measure_payload(&cursor.value, &cursor.name) {
+            return Some(Branch {
+                outcome: Err(failure),
+                end: cursor.at,
+                suspended: false,
+            });
+        }
+        match step.next {
+            Next::EndBranch => Some(Branch {
+                outcome: Ok(std::mem::take(&mut cursor.value)),
+                end: cursor.at,
+                suspended: false,
+            }),
+            // The state scheduled an activity task, or started the job of a
+            // run-a-job integration: the walk stops here, and `run` reports what
+            // it is waiting for rather than an outcome. A nested list reports the
+            // suspension to the state that encloses it, which is what parks a
+            // `Parallel` branch at the job one of its states started.
+            Next::Suspended => Some(Branch {
+                outcome: Ok(std::mem::take(&mut cursor.value)),
+                end: cursor.at,
+                suspended: true,
+            }),
+            Next::Named(next) => {
+                cursor.name = next;
+                None
             }
         }
     }
@@ -2975,9 +3013,10 @@ impl Interpreter<'_> {
     ///
     /// Items run concurrently on the real service, in batches of `MaxConcurrency`, so
     /// a batch's span is its longest item's rather than the sum: that is what the
-    /// returned offset reports. The ITEMS themselves are interpreted one after the
-    /// other, because the interpreter is a single walk — the result is the same, and
-    /// no iteration can observe another's.
+    /// returned offset reports. The items of one batch really do make progress
+    /// CONCURRENTLY — each is walked a state at a time and yields to the sibling due
+    /// before it ([`super::map_items`]) — so an iteration whose own control flow waits
+    /// on an effect a sibling commits observes that effect.
     ///
     /// `tally` is counted up as the items are run, so it holds what this attempt's
     /// items did however the attempt ended.
@@ -3031,322 +3070,6 @@ impl Interpreter<'_> {
         (0..items.len()).find_map(|position| Some((position, at(position)?)))
     }
 
-    /// [`Interpreter::run_map_items`]' own work, inside the stop it restores.
-    fn walk_map_items(
-        &mut self,
-        plan: &MapPlan<'_>,
-        effective: &Value,
-        context: &Value,
-        at: Duration,
-        tally: &mut MapTally,
-    ) -> Attempt {
-        *tally = MapTally::default();
-        let batch = if plan.concurrency == 0 {
-            plan.items.len().max(1)
-        } else {
-            plan.concurrency
-        };
-        let mut results: Vec<Value> = Vec::new();
-        let mut results_bytes = 0usize;
-        let mut failures: u64 = 0;
-        // The iteration that failed FIRST, with the offset it failed at: the failure
-        // an intolerant state reports, and the instant its other iterations stopped.
-        let mut first_failure: Option<(Failure, Duration)> = None;
-        // Where each iteration's own events begin in this walk's list, so an iteration
-        // the state's failure aborted can be cut back to the instant it failed.
-        let mut units: Vec<Unit> = Vec::new();
-        // "ToleratedFailureCount" and "ToleratedFailurePercentage" are what lets a
-        // state go on iterating past a failed item; a state that declares neither
-        // tolerates none, so the first failure is the state's own and the iterations
-        // that had not finished stop there.
-        let tolerant = plan.distributed || plan.tolerance_declared;
-        // Which of the child executions the attempt being CONTINUED ran have been
-        // claimed by an item of this one, so two items never keep the same execution
-        // ([`Interpreter::kept_child`]).
-        let mut claimed = vec![false; plan.resumed.map_or(0, <[_]>::len)];
-        let mut at = at;
-        let mut index = 0usize;
-        for chunk in plan.items.chunks(batch) {
-            let batch_start = at;
-            let mut batch_end = at;
-            for item in chunk {
-                // Every item's turn is charged to the step budget BEFORE the work it
-                // needs is done, so the per-item work (the context the iteration
-                // reads, the `ItemSelector` it is given) stops with the budget rather
-                // than being done for every remaining item of a long array.
-                if let Some(failure) = self.out_of_work() {
-                    return (Err(failure), batch_end);
-                }
-                if self.budget == 0 {
-                    return (
-                        Err(runtime(format!(
-                            "the execution made more than the {MAX_STATE_TRANSITIONS} state \
-                             transitions this emulator runs, so it was stopped"
-                        ))),
-                        batch_end,
-                    );
-                }
-                // `$$.Map.Item` is what the iteration reads the item and its
-                // position through, both in the `ItemSelector` evaluated here and in
-                // every state of the iteration.
-                let map_item = serde_json::json!({ "Index": index, "Value": item });
-                let item_context = with_map_item(context, &map_item);
-                let scope = Scope {
-                    map_item: Some(map_item),
-                };
-                let item_input = match plan.selector {
-                    Some(template) => match self.render_selector(plan.language, template, effective, &item_context) {
-                        Ok(value) => value,
-                        Err(failure) => return (Err(failure), batch_end),
-                    },
-                    None => item.clone(),
-                };
-                // "Step Functions preserves the results and execution history of the
-                // successful steps, and doesn't rerun these steps when you redrive an
-                // execution": an item whose child workflow execution SUCCEEDED in the
-                // attempt being continued is not run a second time. Its result stands
-                // as this attempt's, the execution it ran as is reported unchanged —
-                // and so is left untouched by the store — and the per-item work it
-                // already did is therefore not repeated.
-                let document = item_input.to_string();
-                if let Some((position, kept)) = self.kept_child(plan, index, &document, &claimed) {
-                    claimed[position] = true;
-                    let value = kept
-                        .output
-                        .as_deref()
-                        .and_then(|output| serde_json::from_str(output).ok())
-                        .unwrap_or(Value::Null);
-                    match measure_payload(&value, UNNAMED_PRODUCER) {
-                        Ok(bytes) => results_bytes = results_bytes.saturating_add(bytes),
-                        Err(failure) => return (Err(failure), batch_end),
-                    }
-                    results.push(value);
-                    tally.items.push(MapItemOutcome {
-                        finished_at: batch_start,
-                        failed: false,
-                    });
-                    tally.children.push(StartedChildExecution {
-                        name: kept.name.clone(),
-                        arn: kept.arn.clone(),
-                        input: kept.input.clone(),
-                        output: kept.output.clone(),
-                        error: None,
-                        cause: None,
-                        status: super::super::EXECUTION_STATUS_SUCCEEDED,
-                        started_at: batch_start,
-                        finished_at: batch_start,
-                        item_count: kept.item_count,
-                        // The dates the execution it ran as already reports, which do
-                        // not move by being kept.
-                        kept: Some((kept.start_date, kept.stop_date)),
-                    });
-                    index += 1;
-                    continue;
-                }
-                // A DISTRIBUTED Map "starts a child workflow execution for each
-                // item", so this item's iteration runs as an execution of its own:
-                // its ARN is minted HERE, before the iteration, because the item's
-                // states read it through `$$.Execution.Id` — and the context they
-                // read is the CHILD's, not the parent's. An inline Map starts no
-                // execution, so its iteration keeps the parent's context.
-                let child = plan.distributed.then(|| {
-                    let name = self.fresh_child_name();
-                    let arn = super::super::execution_arn(
-                        &self.region,
-                        &format!("{}/{}", self.machine_name, plan.label),
-                        &name,
-                    );
-                    (name, arn)
-                });
-                let enclosing_context = child.as_ref().map(|(name, arn)| {
-                    let child_context =
-                        self.child_context(arn, name, &item_input, batch_start);
-                    std::mem::replace(&mut self.base_context, child_context)
-                });
-                // The child's own `input` is the document this iteration was handed,
-                // kept before the walk takes it: "the string that contains the JSON
-                // input data" of that execution.
-                let child_input = child.as_ref().map(|_| item_input.to_string());
-                // One iteration per item: it is STARTED here, carrying the index of
-                // the item it was handed, and records its own outcome below — which is
-                // how a caller observes the fan-out, and how many items ran at once.
-                let from = self.steps.len();
-                self.push_detailed(
-                    super::super::EVENT_MAP_ITERATION_STARTED,
-                    plan.name,
-                    batch_start,
-                    iteration_details(index),
-                );
-                units.push(Unit {
-                    from,
-                    map_runs_from: self.map_runs.len(),
-                    aborted: Some(Step {
-                        event_type: super::super::EVENT_MAP_ITERATION_ABORTED,
-                        state_name: Some(plan.name.to_string()),
-                        after: Duration::ZERO,
-                        terminal: false,
-                        details: iteration_details(index),
-                    }),
-                });
-                let branch = self.nested_walk(
-                    plan.states,
-                    plan.start_at,
-                    item_input,
-                    batch_start,
-                    &scope,
-                    true,
-                );
-                if let Some(enclosing) = enclosing_context {
-                    self.base_context = enclosing;
-                }
-                batch_end = batch_end.max(branch.end);
-                if let Some((name, arn)) = child {
-                    // The child execution this item ran as, as it ended: an item that
-                    // produced a result is an execution that SUCCEEDED with that
-                    // result as its output, and one whose iteration failed is an
-                    // execution that FAILED with that failure's own error and cause.
-                    let (status, output, error, cause) = match &branch.outcome {
-                        Ok(value) => (
-                            super::super::EXECUTION_STATUS_SUCCEEDED,
-                            Some(value.to_string()),
-                            None,
-                            None,
-                        ),
-                        Err(failure) => (
-                            super::super::EXECUTION_STATUS_FAILED,
-                            None,
-                            failure.error.clone(),
-                            failure.cause.clone(),
-                        ),
-                    };
-                    tally.children.push(StartedChildExecution {
-                        name,
-                        arn,
-                        input: child_input.unwrap_or_default(),
-                        output,
-                        error,
-                        cause,
-                        status,
-                        started_at: batch_start,
-                        finished_at: branch.end,
-                        // One item per child, or the batch's own count for a state
-                        // that declares an `ItemBatcher`: see
-                        // [`StartedChildExecution::item_count`].
-                        item_count: match plan.batched {
-                            true => i32::try_from(super::super::item_batcher::item_count(item))
-                                .unwrap_or(i32::MAX),
-                            false => 1,
-                        },
-                        // This item RAN in this attempt, so the execution it ran as is
-                        // one this attempt started.
-                        kept: None,
-                    });
-                }
-                let outcome_event = match &branch.outcome {
-                    Ok(_) => super::super::EVENT_MAP_ITERATION_SUCCEEDED,
-                    Err(_) => super::super::EVENT_MAP_ITERATION_FAILED,
-                };
-                self.push_detailed(
-                    outcome_event,
-                    plan.name,
-                    branch.end,
-                    iteration_details(index),
-                );
-                match branch.outcome {
-                    Ok(value) => {
-                        // The array the iterations are building is a document this
-                        // state will put out, so it is bounded as it grows rather
-                        // than only once it is whole.
-                        match measure_payload(&value, UNNAMED_PRODUCER) {
-                            Ok(bytes) => results_bytes = results_bytes.saturating_add(bytes),
-                            Err(failure) => return (Err(failure), batch_end),
-                        }
-                        // The array the iterations build IS this state's result, so it
-                        // outgrowing the limit is the same quota failure a single
-                        // iteration past it raises, worded the one way the service
-                        // words it: the state being executed is what names itself in
-                        // it ([`result_too_large`], named by [`diagnosed`] or by the
-                        // catcher that takes it over).
-                        if results_bytes > MAX_PAYLOAD_BYTES {
-                            return (
-                                Err(named(DATA_LIMIT_ERROR, result_too_large(UNNAMED_PRODUCER))),
-                                batch_end,
-                            );
-                        }
-                        results.push(value);
-                        tally.items.push(MapItemOutcome {
-                            finished_at: branch.end,
-                            failed: false,
-                        });
-                    }
-                    Err(failure) => {
-                        failures += 1;
-                        tally.items.push(MapItemOutcome {
-                            finished_at: branch.end,
-                            failed: true,
-                        });
-                        if first_failure
-                            .as_ref()
-                            .is_none_or(|(_, when)| branch.end < *when)
-                        {
-                            first_failure = Some((failure, branch.end));
-                        }
-                        // A state that tolerates no failure has already failed, so the
-                        // iterations running BESIDE this one in the same batch are
-                        // stopped at the instant it failed, exactly as the items it had
-                        // not started yet are never started
-                        // ([`Interpreter::stopped_by_a_sibling`]).
-                        if !tolerant {
-                            let stop =
-                                first_failure.as_ref().map_or(branch.end, |(_, when)| *when);
-                            self.cancel_after = Some(
-                                self.cancel_after.map_or(stop, |enclosing| enclosing.min(stop)),
-                            );
-                        }
-                    }
-                }
-                index += 1;
-            }
-            at = batch_end;
-            // A state that tolerates no failure has already failed, so the items it
-            // had not started yet are never started.
-            if failures > 0 && !tolerant {
-                break;
-            }
-        }
-
-        if failures == 0 {
-            return (Ok(Value::Array(results)), at);
-        }
-        if super::super::within_tolerated_failures(
-            i64::try_from(failures).unwrap_or(i64::MAX),
-            i64::try_from(plan.items.len()).unwrap_or(i64::MAX),
-            i64::try_from(plan.tolerated_count).unwrap_or(i64::MAX),
-            plan.tolerated_percentage,
-        ) {
-            return (Ok(Value::Array(results)), at);
-        }
-        // A Distributed Map reports its own tolerated-failure error; an inline Map
-        // has no threshold to exceed, so the iteration's own failure is the state's.
-        if tolerant {
-            return (
-                Err(named(
-                    TOLERATED_FAILURE_ERROR,
-                    format!(
-                        "{failures} of {} items failed, more than this 'Map' state tolerates",
-                        plan.items.len()
-                    ),
-                )),
-                at,
-            );
-        }
-        let Some((failure, when)) = first_failure else {
-            return (Err(runtime("a 'Map' iteration failed".to_string())), at);
-        };
-        self.abort_units(when, &units);
-        (Err(failure), when)
-    }
-
     /// Where the concurrent unit that PARKED carries on from, for a walk continuing
     /// an execution whose job has ended: the next concurrent state down, else the
     /// state that started the job itself.
@@ -3367,30 +3090,42 @@ impl Interpreter<'_> {
     /// A state whose concurrent work has already failed does not go on running the
     /// rest of it: each unit is cut back to the events that were due at or before that
     /// instant, the state it was in when the failure reached it records that type's own
-    /// aborted event, and the unit itself records the one its kind has. `units` is
-    /// where each unit's events begin in this walk's list, in the order they were run,
-    /// so they are cut from the last one back and no earlier unit's position moves.
+    /// aborted event, and the unit itself records the one its kind has. `units` holds
+    /// WHERE each unit's own events sit in this walk's list, in the order that unit
+    /// recorded them — one run of the list for a `Parallel` branch, which is walked to
+    /// its end in one go, and several for a `Map` iteration, whose events are
+    /// interleaved with its siblings' by the clock ([`super::map_items`]).
+    ///
+    /// Every unit is judged against the list as it STANDS and the one cut is applied in
+    /// a single pass, so no unit's positions move while another's are still being read.
     pub(super) fn abort_units(&mut self, when: Duration, units: &[Unit]) {
-        for (position, unit) in units.iter().enumerate().rev() {
-            // Every bound is clamped to the list as it stands: a later unit has
-            // already been cut back by the time this one is, so the span this reads
-            // is the one the list still holds.
-            let until = units
-                .get(position + 1)
-                .map_or(self.steps.len(), |next| next.from)
-                .min(self.steps.len());
-            let from = unit.from.min(until);
-            let Some(cut) = (from..until).find(|index| {
-                self.steps
-                    .get(*index)
-                    .is_some_and(|step| step.after > when)
-            }) else {
+        // Which events of the list no unit keeps, and where the events of a unit's own
+        // stop go: at the first event of its own it does not keep, which is where the
+        // work it was still doing was cut off.
+        let mut dropped: BTreeSet<usize> = BTreeSet::new();
+        let mut stopped_at: BTreeMap<usize, Vec<Step>> = BTreeMap::new();
+        for unit in units {
+            let kept_until = unit
+                .steps
+                .iter()
+                .position(|index| {
+                    self.steps
+                        .get(*index)
+                        .is_some_and(|step| step.after > when)
+                });
+            let Some(kept_until) = kept_until else {
                 continue;
             };
             // The states this unit was still inside when the failure reached it: each
             // one entered and not yet left, innermost last.
             let mut open: Vec<(&'static str, Option<String>)> = Vec::new();
-            for step in self.steps.get(from..cut).unwrap_or_default() {
+            for step in unit
+                .steps
+                .get(..kept_until)
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|index| self.steps.get(*index))
+            {
                 if let Some(entered) = step.event_type.strip_suffix(STATE_ENTERED) {
                     open.push((entered, step.state_name.clone()));
                 } else if let Some(left) = step.event_type.strip_suffix(STATE_EXITED) {
@@ -3416,7 +3151,24 @@ impl Interpreter<'_> {
                 aborted.after = when;
                 stopped.push(aborted);
             }
-            self.steps.splice(cut..until, stopped);
+            let cut = unit.steps.get(kept_until..).unwrap_or_default();
+            if let Some(first) = cut.first() {
+                stopped_at.insert(*first, stopped);
+            }
+            dropped.extend(cut.iter().copied());
+        }
+        if !dropped.is_empty() {
+            self.steps = std::mem::take(&mut self.steps)
+                .into_iter()
+                .enumerate()
+                .flat_map(|(index, step)| {
+                    let mut here = stopped_at.remove(&index).unwrap_or_default();
+                    if !dropped.contains(&index) {
+                        here.push(step);
+                    }
+                    here
+                })
+                .collect();
         }
         // A Map Run one of THESE units only started after the state had already failed
         // never started: the state it belongs to was not entered. The list also holds
