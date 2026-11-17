@@ -622,6 +622,93 @@ async fn a_global_secondary_index_round_trips_through_describe_table() {
     );
 }
 
+/// RULE: a scalable target is a capacity dimension OF A RESOURCE, so a registration resolves
+/// that resource in the service that OWNS it — and a namespace whose owning service this
+/// emulator cannot ask resolves nothing rather than refusing, exactly as a namespace whose
+/// store it cannot reach does.
+///
+/// The two cases differ along what the ESTATE holds: the owning service mounted beside this
+/// one, where the resource the id names is looked for and its absence refuses the
+/// registration, and the same request against an estate that does not hold that service at
+/// all, which is answered on its own terms. The namespaces whose resource is resolved by
+/// calling the owning service are walked as a table by the assembled router's own
+/// `application_autoscaling_resolves_the_owning_services_resource` suite, which mounts every
+/// one of those services.
+#[tokio::test]
+async fn a_resource_is_resolved_where_the_owning_service_is_mounted() {
+    /// (case, the Spot Fleet request id, the resource id it is named by)
+    type Row<'a> = (&'a str, &'a str);
+    let rows: &[Row<'_>] = &[
+        (
+            "a Spot Fleet request id this account holds no fleet for",
+            "spot-fleet-request/sfr-11111111-1111-1111-1111-111111111111",
+        ),
+        (
+            "another well-formed id, also absent",
+            "spot-fleet-request/sfr-22222222-2222-2222-2222-222222222222",
+        ),
+    ];
+    const DIMENSION: &str = "ec2:spot-fleet-request:TargetCapacity";
+
+    for (case, resource_id) in rows {
+        // Amazon EC2 mounted beside this service: the fleet the id names is looked for there,
+        // and an account that holds none cannot carry the target.
+        let emulator = Emulator::with_ec2();
+        let request = json!({
+            "ServiceNamespace": "ec2",
+            "ResourceId": resource_id,
+            "ScalableDimension": DIMENSION,
+            "MinCapacity": 1,
+            "MaxCapacity": 4,
+        });
+        let (status, body) = emulator
+            .call("RegisterScalableTarget", request.clone())
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ValidationException",
+            "case {case:?}: expected a ValidationException, got {body:?}"
+        );
+        assert_eq!(
+            error_message(&body),
+            format!("Spot fleet request doesn't exist: {resource_id}"),
+            "case {case:?}: expected the refusal to name the resource kind and the resource id \
+             the request supplied, got {body:?}"
+        );
+        let (status, described) = emulator
+            .call("DescribeScalableTargets", json!({"ServiceNamespace": "ec2"}))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected DescribeScalableTargets to answer 200, got {described:?}"
+        );
+        assert_eq!(
+            described["ScalableTargets"],
+            json!([]),
+            "case {case:?}: expected a refused registration to persist nothing, got {described:?}"
+        );
+
+        // The same request against an estate that does not hold the owning service at all:
+        // there is nothing to ask, so the resource is UNRESOLVED rather than absent and the
+        // registration is answered on its own terms.
+        let emulator = Emulator::empty();
+        let (status, body) = emulator.call("RegisterScalableTarget", request).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected a registration this emulator cannot resolve to be answered \
+             on its own terms, got {status} {body:?}"
+        );
+        assert!(
+            body["ScalableTargetARN"].as_str().is_some(),
+            "case {case:?}: expected a ScalableTargetARN, got {body:?}"
+        );
+    }
+}
+
 /// What `ItemCount` reports is the METERED figure, not a live count: "DynamoDB updates this
 /// value approximately every six hours. Recent changes might not be reflected in this value"
 /// (`TableDescription$ItemCount`, and the same sentence on an index's `IndexSizeBytes`). The

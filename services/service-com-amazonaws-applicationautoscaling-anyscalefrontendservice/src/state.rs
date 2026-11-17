@@ -53,6 +53,10 @@ pub mod lambda_functions;
 /// registration's precondition.
 pub mod remote_resources;
 
+/// The resource a scalable target names, resolved by CALLING the service that owns it, for
+/// the namespaces whose resource this crate names no state type for.
+pub mod owning_service_resources;
+
 /// The ONE in-process call this service makes to another emulated service.
 pub mod in_process_calls;
 

@@ -9926,6 +9926,8 @@ dependencies = [
  "cron",
  "hex",
  "http",
+ "percent-encoding",
+ "roxmltree",
  "serde_json",
  "service-com-amazonaws-apigateway-backplanecontrolservice",
  "service-com-amazonaws-cloudwatch-graniteserviceversion20100801",

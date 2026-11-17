@@ -28,6 +28,13 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 # Renders that digest, and the opaque `NextToken` payload, as printable text.
 hex = { workspace = true }
+# Percent-encodes a value this service puts in a URI path segment or a form field when it
+# resolves a scaled resource in the service that owns it (an MSK cluster ARN is one path
+# segment; a Query parameter's value is one form field).
+percent-encoding = "2"
+# Reads the error code and the sentence a Query-protocol service answers a refusal with, which
+# that protocol carries as elements of an XML document.
+roxmltree = "0.20"
 # A target-tracking policy's CloudWatch alarms are created in the CloudWatch
 # emulator's own alarm store, a scalable target resolves the DynamoDB table or
 # index it names in the DynamoDB emulator's own table store, and executing a

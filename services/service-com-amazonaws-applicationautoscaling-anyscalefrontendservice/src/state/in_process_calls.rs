@@ -46,6 +46,33 @@ impl Answered {
         (200..300).contains(&self.status)
     }
 
+    /// The code this refusal names itself by, wherever the protocol it came over carries one:
+    /// [`Self::code`] for a protocol that names it in a header or a JSON member, and the
+    /// `<Code>` element of an XML error document for a Query protocol, which names it in
+    /// neither. Read here, beside [`refusal_code`], so the two readings of one refusal cannot
+    /// drift.
+    pub fn named_code(&self) -> String {
+        if !self.code.is_empty() {
+            return self.code.clone();
+        }
+        xml_element_text(&self.payload, "Code")
+    }
+
+    /// The sentence this refusal stated: the `Message` member of a JSON error document, or the
+    /// text of the `<Message>` element of an XML one — the two spellings the protocols an
+    /// in-process call is made over carry one in. Empty for an answer that stated none.
+    pub fn stated_message(&self) -> String {
+        if let Ok(document) = ::serde_json::from_slice::<Value>(&self.payload) {
+            for member in ["Message", "message"] {
+                if let Some(message) = document.get(member).and_then(Value::as_str) {
+                    return message.to_string();
+                }
+            }
+            return String::new();
+        }
+        xml_element_text(&self.payload, "Message")
+    }
+
     /// Whether this is the emulator's own FRONT DOOR refusing a call no mounted service
     /// served, rather than an answer from the service that was addressed
     /// (`::service_common::in_process_refusal`) — which is the answer an engine that does not
@@ -142,6 +169,27 @@ fn refusal_code(error_type: &str, payload: &[u8]) -> String {
         .to_string()
 }
 
+/// The text of the first `<name>` element of an XML document, empty when it carries none.
+///
+/// Read through the maintained XML reader rather than by scanning the bytes: the document
+/// comes from another service's answer, so it is parsed by something that reports a malformed
+/// one instead of guessing at it.
+fn xml_element_text(payload: &[u8], name: &str) -> String {
+    let Ok(document) = ::std::str::from_utf8(payload) else {
+        return String::new();
+    };
+    let Ok(parsed) = ::roxmltree::Document::parse(document) else {
+        return String::new();
+    };
+    parsed
+        .descendants()
+        .find(|node| node.has_tag_name(name))
+        .and_then(|node| node.text())
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,6 +233,74 @@ mod tests {
             assert_eq!(
                 actual, *expected,
                 "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// RULE: a refusal's code is named wherever its protocol carries one — the error-type
+    /// header, the body's `__type`, or the `<Code>` element of an XML error document — and a
+    /// refusal's sentence likewise, in `Message`/`message` or in `<Message>`.
+    #[test]
+    fn a_refusal_names_its_code_and_its_sentence_wherever_its_protocol_carries_them() {
+        /// (case, the error-type header, the body, the code, the sentence)
+        type Row<'a> = (&'a str, &'a str, &'a str, &'a str, &'a str);
+        let rows: &[Row<'_>] = &[
+            (
+                "an awsJson refusal",
+                "",
+                r#"{"__type":"ValidationException","Message":"Could not find endpoint \"e\"."}"#,
+                "ValidationException",
+                "Could not find endpoint \"e\".",
+            ),
+            (
+                "a REST refusal, whose shape is in the header",
+                "NotFoundException",
+                r#"{"message":"The requested resource doesn't exist."}"#,
+                "NotFoundException",
+                "The requested resource doesn't exist.",
+            ),
+            (
+                "an awsQuery error envelope",
+                "",
+                "<ErrorResponse><Error><Type>Sender</Type><Code>DBClusterNotFoundFault</Code>\
+                 <Message>DBCluster absent not found.</Message></Error></ErrorResponse>",
+                "DBClusterNotFoundFault",
+                "DBCluster absent not found.",
+            ),
+            (
+                "an ec2Query error envelope",
+                "",
+                "<Response><Errors><Error><Code>InvalidSpotFleetRequestId.NotFound</Code>\
+                 <Message>absent</Message></Error></Errors></Response>",
+                "InvalidSpotFleetRequestId.NotFound",
+                "absent",
+            ),
+            (
+                "an answer that names neither",
+                "",
+                r#"{"Item":{}}"#,
+                "",
+                "",
+            ),
+            ("no body at all", "", "", "", ""),
+        ];
+        for (case, error_type, body, code, sentence) in rows {
+            let answered = Answered {
+                status: 400,
+                code: refusal_code(error_type, body.as_bytes()),
+                payload: body.as_bytes().to_vec(),
+            };
+            assert_eq!(
+                answered.named_code(),
+                *code,
+                "case {case:?}: expected the code {code:?}, got {:?}",
+                answered.named_code()
+            );
+            assert_eq!(
+                answered.stated_message(),
+                *sentence,
+                "case {case:?}: expected the sentence {sentence:?}, got {:?}",
+                answered.stated_message()
             );
         }
     }

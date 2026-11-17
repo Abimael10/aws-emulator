@@ -5,16 +5,18 @@
 //! subject to.
 //!
 //! Every namespace's resource is resolved before a target on it is persisted — "a scalable
-//! target is a capacity dimension of the underlying service" — and for most of them that is a
-//! read of the owning service's own store ([`super::resolve_target_resource`]). Three
-//! namespaces cannot be read that way, so they are resolved by CALLING the service that owns
-//! the resource, which is what this module does in one place:
+//! target is a capacity dimension of the underlying service" — and for some of them that is a
+//! read of the owning service's own store ([`super::resolve_target_resource`]). The rest
+//! cannot be read that way, so they are resolved by CALLING the service that owns the
+//! resource, which is what this module dispatches in one place:
 //!
 //! * `custom-resource`, whose target IS an endpoint of the caller's own application
 //!   ([`super::custom_resource_endpoint`]) — reaching it is the whole of what scaling such a
 //!   target does, so an endpoint that will not serve the invocation refuses the registration;
-//! * `cassandra`, whose table lives in Amazon Keyspaces ([`super::keyspaces_tables`]); and
-//! * `lambda`, whose version or alias lives in Lambda ([`super::lambda_functions`]).
+//! * `cassandra`, whose table lives in Amazon Keyspaces ([`super::keyspaces_tables`]);
+//! * `lambda`, whose version or alias lives in Lambda ([`super::lambda_functions`]); and
+//! * every remaining namespace, whose resource is resolved in the service that owns it by
+//!   that service's own read ([`super::owning_service_resources`]).
 //!
 //! What each of them answers is the same two things the store-reading resolvers answer: the
 //! capacity the resource holds right now, which is what the registered window is enforced on
@@ -127,7 +129,11 @@ pub async fn resolve_remote_resource(
             )
             .await)
         }
-        _ => Ok(None),
+        _ => super::owning_service_resources::resolve_owning_service_resource(
+            callback, region, target,
+        )
+        .await
+        .map(|()| None),
     }
 }
 
