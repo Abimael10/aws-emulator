@@ -5,12 +5,13 @@
 //! account deliver it, EventBridge matches the rule and SQS holds what arrived.
 //!
 //! RULE: while a trail of the Region is logging management events, each management API call
-//! the account serves that CHANGED it is ALSO published onto the account's DEFAULT event bus,
-//! with `source` `aws.<service>`, `detail-type` `AWS API Call via CloudTrail` and the
-//! CloudTrail record of the call as the event's `detail` — so a rule matching that pair, or
-//! reaching into the record, delivers to its targets. No trail logging, no publication; and a
-//! call that only REPORTS the account (a `Get`/`List`/`Describe`) is published onto no bus at
-//! all, however widely a rule's pattern is written.
+//! the account serves is ALSO published onto the account's DEFAULT event bus, with `source`
+//! `aws.<service>`, `detail-type` `AWS API Call via CloudTrail` and the CloudTrail record of
+//! the call as the event's `detail` — so a rule matching that pair, or reaching into the
+//! record, delivers to its targets. No trail logging, no publication; and a rule in the
+//! default state `ENABLED` is matched against the calls that CHANGED the account alone, never
+//! against a `Get`/`List`/`Describe` of this channel, however widely its pattern is written
+//! (a rule that asks for those too is `cloudtrail_management_event_rule_state`'s subject).
 //!
 //! Only a cross-service suite can pin this: the event is published by the service that
 //! SERVED the call (CloudFront, restXml), the delivery decision belongs to CloudTrail
@@ -21,8 +22,8 @@
 //!
 //! The rows span what the rule generalises over: which envelope field a pattern matches on
 //! (the source, the detail-type, a member reached inside the record), a near miss on each of
-//! those three, and the operation's read/write kind — a reporting call is logged like any
-//! other management call and published nowhere, so a pattern naming one delivers nothing.
+//! those three, and the operation's read/write kind — a reporting call is logged and published
+//! like any other management call, and an `ENABLED` rule naming one delivers nothing.
 //! One further row is the condition itself: with the trail stopped, the same call publishes
 //! nothing.
 //!
@@ -362,10 +363,12 @@ fn rows() -> Vec<Row> {
             expects: Some("CreateDistribution"),
         },
         Row {
-            // A reporting call is recorded in event history and published nowhere, so a
-            // pattern naming one delivers nothing even though the call was served and
-            // logged: the fan-out carries the account's WRITES. The suite that pins the
-            // record of that same read is this crate's `cloudtrail_read_only_api_calls`.
+            // These rules are in the default state, `ENABLED`, which is matched against the
+            // management events of this channel that CHANGED the account alone — so a pattern
+            // naming a reporting call delivers nothing even though the call was served,
+            // logged and published. The suite that pins the record of that same read is this
+            // crate's `cloudtrail_read_only_api_calls`, and the suite that pins which rule
+            // DOES see it is `cloudtrail_management_event_rule_state`.
             case: "a reporting call",
             pattern: json!({
                 "source": [CLOUDFRONT_EVENT_SOURCE],
@@ -739,24 +742,26 @@ struct Selectors {
     configuration: Value,
     /// Whether the WRITE call (`CreateDistribution`) must arrive.
     expects_write: bool,
-    /// Whether the READ call (`ListDistributions`) must arrive — `false` in every row: the
-    /// channel carries the calls that changed the account, whatever the trail logs.
+    /// Whether the READ call (`ListDistributions`) must arrive — `false` in every row: this
+    /// suite's rule is in the default state, `ENABLED`, which is matched against the calls
+    /// that changed the account alone, whatever the trail logs.
     expects_read: bool,
 }
 
-/// What a logging trail's own selectors admit is what is LOGGED, and of what is logged the
-/// channel carries the calls that CHANGED the account: a trail logs the management events
-/// its `IncludeManagementEvents` admits, in the read/write class its `ReadWriteType` names
-/// — "By default, trails created without specific event selectors will be configured to log
-/// all read and write management events" — and the `AWS API Call via CloudTrail` fan-out
-/// publishes those of them that are not reads.
+/// What a logging trail's own selectors admit is what is LOGGED, and of what is logged an
+/// `ENABLED` rule of the channel is matched against the calls that CHANGED the account: a
+/// trail logs the management events its `IncludeManagementEvents` admits, in the read/write
+/// class its `ReadWriteType` names — "By default, trails created without specific event
+/// selectors will be configured to log all read and write management events" — and such a
+/// rule delivers those of them that are not reads.
 ///
 /// The rows span the selector shapes that decide it: both classes, each class alone,
 /// management events excluded altogether, and the ADVANCED form, whose
 /// `eventCategory`/`readOnly` fields say the same two things — including one advanced
 /// selector that admits a category these calls are not in at all. No selector shape makes a
-/// READ reach the channel, a trail whose class is `ReadOnly` included: what its selectors
-/// decide is what the trail logs.
+/// READ reach THIS rule, a trail whose class is `ReadOnly` included: what its selectors
+/// decide is what the trail logs, and what decides whether a logged read is matched is the
+/// rule's own state (`cloudtrail_management_event_rule_state`).
 #[tokio::test]
 async fn a_trails_own_selectors_decide_which_calls_are_published() {
     let rows = [

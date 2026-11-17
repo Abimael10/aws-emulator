@@ -5,20 +5,23 @@
 //!
 //! An account has three readers of its management events. One is CloudTrail's own
 //! `LookupEvents`, which reads the log [`crate::management_events`] holds. The second is
-//! EventBridge: while a trail of the Region is logging management events, each call that
-//! trail logs AND THAT CHANGED THE ACCOUNT is also published onto the account's default
-//! event bus, under the `detail-type` [`API_CALL_DETAIL_TYPE`] with `source`
-//! `aws.<service>` and the CloudTrail record of the call as the event's `detail`. That is
-//! the only path a control-plane call of a service with no event source of its own has to
-//! an event-driven consumer, and it is what a rule like
+//! EventBridge: while a trail of the Region is logging management events, EVERY call that
+//! trail logs is also published onto the account's default event bus, under the
+//! `detail-type` [`API_CALL_DETAIL_TYPE`] with `source` `aws.<service>` and the CloudTrail
+//! record of the call as the event's `detail`. That is the only path a control-plane call of
+//! a service with no event source of its own has to an event-driven consumer, and it is what
+//! a rule like
 //! `{"source":["aws.cloudfront"],"detail-type":["AWS API Call via CloudTrail"]}` matches.
 //! The third reads the trail's own bucket, which is [`crate::trail_log_files`]' leg of the
 //! same delivery and travels with the event here.
 //!
-//! A call that only REPORTED state reaches the first and the third reader and not this one:
-//! a read is recorded in event history and written into each logging trail's bucket, and no
-//! event is published for it ([`DeliveredApiCall::on_default_bus`]). So a consumer wired to
-//! this channel sees the calls that changed the account, never its own polling.
+//! A call that only REPORTED state is published on this channel like any other, carrying
+//! `readOnly` true in its record: WHICH rules such an event reaches is EventBridge's to
+//! decide from the rule's own state, not the publisher's to withhold — so a consumer asking
+//! for all of an account's management events sees the reads too, while one that did not is
+//! driven by the calls that changed the account. The one read nothing is published for is a
+//! read this emulator's own plumbing made ([`is_plumbing_read`]), which in AWS is no API call
+//! of the account at all.
 //!
 //! The publication therefore hangs off the SAME seam the recording does
 //! ([`crate::audited_operation`]): the service that served the call records it, the log
@@ -89,30 +92,59 @@ pub struct DeliveredApiCall {
     /// ([`crate::trail_log_files`]). Empty when no logging trail of the account has a
     /// destination bucket.
     pub log_files: Vec<crate::trail_log_files::DeliveredLogFile>,
-    /// Whether this record is also PUBLISHED onto the account's default event bus.
+    /// Whether the recorded call only REPORTED the account, as its record's `readOnly` says.
     ///
-    /// The fan-out carries the management calls that CHANGED the account. A call that only
-    /// reported state (`readOnly`) is logged and delivered to every logging trail's bucket
-    /// like any other, and no `AWS API Call via CloudTrail` event is published for it — so a
-    /// rule over a service's API-call events is driven by the writes made on its resources
-    /// and not by the reads a client or a console made while watching them.
-    pub on_default_bus: bool,
+    /// Carried because it decides one thing about the delivery: a read an emulated service
+    /// made in-process while serving a call of its own is this emulator's own plumbing and no
+    /// API call of the account, so no event is published for it ([`is_plumbing_read`]).
+    pub read_only: bool,
+}
+
+/// Whether a served management call is one this emulator's own PLUMBING made rather than one
+/// a principal of the account made: a READ one emulated service makes to another through the
+/// in-process callback while serving a call of its own.
+///
+/// In AWS such a read is the serving service's own machinery and no API call of the account
+/// at all — EventBridge reading the policy in force over a target queue before it hands an
+/// event over is the shape — so the account's CloudTrail publishes nothing for it. In this
+/// emulator one service reaches another ONLY through the in-process callback, whose chain
+/// depth the framework stamps on every such request as an EXTENSION
+/// ([`smithy_server_runtime::CallbackRecursionDepth`]), so that stamp is what tells the two
+/// apart: an extension never travels over the wire, so nothing a client sends — on any
+/// socket, signed with any credential — carries one.
+///
+/// It is the READS that are withheld, and only they. A call that CHANGED the account is the
+/// account's change however it was reached (a stack provisioning a resource, a function
+/// writing one), and publishing it is what drives the rules written over an account's
+/// writes. Withholding the reads is also what keeps this channel from feeding itself:
+/// delivering an event reads the documents in force over the targets it is delivered to, and
+/// an event published for each of those reads would be delivered again, read again, without
+/// end.
+#[must_use]
+pub fn is_plumbing_read(parts: &::http::request::Parts, read_only: bool) -> bool {
+    read_only
+        && parts
+            .extensions
+            .get::<::smithy_server_runtime::CallbackRecursionDepth>()
+            .is_some()
 }
 
 impl DeliveredApiCall {
     /// Deliver this record everywhere the account's CloudTrail delivers it: into the bucket
-    /// of each trail that logs the call, and — for a call that changed the account
-    /// ([`Self::on_default_bus`]) — onto the account's default event bus.
+    /// of each trail that logs the call, and onto the account's default event bus.
+    ///
+    /// `parts` is the request of the call being recorded, because one fact about that request
+    /// decides the BUS leg: a read this emulator's own plumbing made is published nowhere
+    /// ([`is_plumbing_read`]). The trail's bucket receives it either way — that leg is
+    /// CloudTrail's record of what the log holds.
     ///
     /// Nothing about the call that produced it changes: a failure is traced and the
     /// operation's own answer stands, for the reason the module docs give.
-    pub async fn deliver(self, callback: &EmbeddedEmulator) {
+    pub async fn deliver(self, parts: &::http::request::Parts, callback: &EmbeddedEmulator) {
         for log_file in self.log_files {
             log_file.deliver(callback).await;
         }
-        if !self.on_default_bus {
-            // A reporting call is recorded and logged, and published nowhere: see
-            // [`Self::on_default_bus`].
+        if is_plumbing_read(parts, self.read_only) {
             return;
         }
         let client = crate::eventbridge_client::eventbridge_client(callback, &self.region);
@@ -153,6 +185,39 @@ impl DeliveredApiCall {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A request carrying the callback stamp `depth`, or none at all.
+    fn request(depth: Option<u8>) -> ::http::request::Parts {
+        let mut request = ::http::Request::builder().method("POST").uri("/");
+        if let Some(depth) = depth {
+            request = request.extension(::smithy_server_runtime::CallbackRecursionDepth(depth));
+        }
+        request
+            .body(())
+            .expect("a well-formed request")
+            .into_parts()
+            .0
+    }
+
+    /// What the publisher withholds is one class of call: a READ that arrived through the
+    /// in-process callback. The rows differ along both facts that decide it.
+    #[test]
+    fn only_a_read_made_through_the_in_process_callback_is_plumbing() {
+        for (case, depth, read_only, expected) in [
+            ("a client's read", None, true, false),
+            ("a client's write", None, false, false),
+            ("a read one service made for another", Some(1), true, true),
+            ("a read made deeper in a chain", Some(7), true, true),
+            ("a write one service made for another", Some(1), false, false),
+        ] {
+            let parts = request(depth);
+            let actual = is_plumbing_read(&parts, read_only);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected is_plumbing_read {expected}, got {actual}"
+            );
+        }
+    }
 
     #[test]
     fn an_event_source_becomes_the_bus_source_of_the_same_service() {

@@ -49,11 +49,12 @@
 //! A management event has two readers, so the wrapper has two sinks for one record: the
 //! log CloudTrail's `LookupEvents` reads, and — while a trail of the Region is logging
 //! calls of this kind — the account's default EventBridge bus, which CloudTrail publishes
-//! each logged call that CHANGED the account onto as `AWS API Call via CloudTrail`
+//! each logged call onto as `AWS API Call via CloudTrail`
 //! ([`crate::api_call_events`]). The record is written once and the event published from
 //! that same record, so a rule matching the fan-out sees exactly what a lookup reports.
-//! A call of [`CallKind::Reporting`] is recorded and logged and published nowhere, so the
-//! reads a client makes while watching a resource drive no rule.
+//! A call of [`CallKind::Reporting`] is published on that channel too, carrying `readOnly`
+//! true: which rules a read-only management event reaches is decided by each rule's state
+//! in EventBridge, not here.
 //!
 //! # The calls of a service's DATA plane
 //!
@@ -694,7 +695,7 @@ impl<W: ErasedOperation, S: AuditedService> ErasedOperation for RecordedCall<W, 
                 // made OUTSIDE the log's lock, after the response the caller gets has been
                 // rendered, so it changes nothing about what this call answers.
                 if let Some(delivered) = self.service.record(call, &answered_as) {
-                    delivered.deliver(ctx.callback()).await;
+                    delivered.deliver(ctx.parts(), ctx.callback()).await;
                 }
             }
             resp

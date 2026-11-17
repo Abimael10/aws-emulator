@@ -1479,6 +1479,15 @@ pub(crate) fn route_within(
 ) -> Option<Vec<MatchedRule>> {
     let mut matched: Vec<MatchedRule> = Vec::new();
     for rule in rules {
+        // The one class of event a rule's STATE decides a match on, ahead of its
+        // pattern: a read-only management event of the CloudTrail channel is
+        // matched only by a rule enabled for all of them.
+        if !crate::state::cloudtrail_management_events::matched_by_state(
+            envelope,
+            rule.admits_read_only_management_events,
+        ) {
+            continue;
+        }
         if crate::state::event_pattern::matches_parsed(&rule.pattern, envelope, budget) {
             matched.push(MatchedRule {
                 name: rule.name.clone(),
@@ -1554,6 +1563,10 @@ pub(crate) struct CompiledRule {
     name: String,
     pattern: ::serde_json::Map<String, ::serde_json::Value>,
     targets: Vec<CompiledTarget>,
+    /// Whether this rule is matched against the READ-ONLY management events
+    /// CloudTrail delivers, which is its `State`'s to decide
+    /// (`crate::state::cloudtrail_management_events`).
+    admits_read_only_management_events: bool,
 }
 
 /// One archive of a bus, ready to capture: its name and the parsed `EventPattern`
@@ -1784,6 +1797,8 @@ impl CompiledRule {
             name: rule.name.clone(),
             pattern,
             targets: compiled_targets(rule, store),
+            admits_read_only_management_events:
+                crate::state::cloudtrail_management_events::admits_read_only(rule),
         })
     }
 }

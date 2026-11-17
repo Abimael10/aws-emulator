@@ -1589,10 +1589,10 @@ impl ManagementEventLog {
     /// management events of the call's read/write class and not otherwise — one log file per
     /// such trail, into the bucket that trail was created with.
     ///
-    /// The two legs part on ONE fact: the `AWS API Call via CloudTrail` fan-out carries the
-    /// calls that CHANGED the account, so a call that only reported state is logged and
-    /// written to every logging trail's bucket while no event is published for it
-    /// ([`crate::api_call_events::DeliveredApiCall::on_default_bus`]).
+    /// Both legs carry every call the trail logs, the reads included: a read-only management
+    /// event is published on the `AWS API Call via CloudTrail` channel exactly as a write is,
+    /// and which RULES it then reaches is decided by each rule's own state in EventBridge
+    /// rather than by withholding the publication ([`crate::api_call_events`]).
     ///
     /// Delivering is the CALLER's: a store holds no transport, and neither the publication
     /// nor the object write must happen under this lock
@@ -1606,6 +1606,9 @@ impl ManagementEventLog {
         request_id: String,
     ) -> Option<crate::api_call_events::DeliveredApiCall> {
         let read_only = call.read_only;
+        // The read/write kind decides what a TRAIL logs (its selectors' class, below); the
+        // record itself carries it as `readOnly`, which is what a consumer of the published
+        // event reads.
         let region = call.aws_region.clone();
         let account_id = call.account_id.clone();
         let source = crate::api_call_events::event_source_of(&call.event_source);
@@ -1646,9 +1649,10 @@ impl ManagementEventLog {
             time_millis: event.event_time_millis(),
             detail: record,
             log_files,
-            // The fan-out is the account's WRITES: a reporting call is logged and not
-            // published.
-            on_default_bus: !read_only,
+            // The record's own kind, which decides whether the BUS leg is made for a call
+            // this emulator's own plumbing made
+            // ([`crate::api_call_events::is_plumbing_read`]).
+            read_only,
         })
     }
 
@@ -1726,9 +1730,9 @@ impl ManagementEventLog {
     }
 
     /// Whether the account's CloudTrail LOGS a management call served in `region`, of the
-    /// given read/write kind — the condition a delivery of any kind hangs off. Whether such
-    /// a call is also published onto the default event bus is its read/write kind again
-    /// ([`crate::api_call_events::DeliveredApiCall::on_default_bus`]).
+    /// given read/write kind — the condition a delivery of any kind hangs off. A call a
+    /// trail logs is delivered on every leg, the default event bus included
+    /// ([`crate::api_call_events`]).
     #[must_use]
     pub fn delivers(&self, region: &str, read_only: bool) -> bool {
         self.delivering_trails
@@ -1865,17 +1869,14 @@ mod tests {
         }
     }
 
-    /// What a logged call's read/write kind decides is the BUS leg alone: a call that
-    /// changed the account is published onto the default event bus, a reporting call is
-    /// not — and either way the call is recorded in event history and written into the
-    /// logging trail's bucket.
+    /// A logged call's read/write kind changes none of the three deliveries: whatever a
+    /// trail logs is recorded in event history, written into that trail's bucket and
+    /// published onto the default event bus, and the record says which kind it was.
     #[test]
-    fn only_a_mutating_call_is_published_onto_the_default_bus() {
-        // The rows differ along the one fact the two legs part on.
-        for (case, read_only, on_default_bus) in [
-            ("a mutating call", false, true),
-            ("a reporting call", true, false),
-        ] {
+    fn every_logged_call_is_published_onto_the_default_bus_carrying_its_kind() {
+        // The rows differ along the read/write kind, the one fact that used to part the
+        // legs and now only travels in the record.
+        for (case, read_only) in [("a mutating call", false), ("a reporting call", true)] {
             let mut log = ManagementEventLog::default();
             log.trails_delivering(vec![logging_trail()]);
             let mut served = call("DescribeTrails");
@@ -1886,9 +1887,11 @@ mod tests {
                     panic!("case {case:?}: a logging trail delivers the call, got nothing")
                 });
             assert_eq!(
-                delivered.on_default_bus, on_default_bus,
-                "case {case:?}: expected on_default_bus {on_default_bus}, got {:?}",
-                delivered.on_default_bus
+                delivered.detail.pointer("/readOnly"),
+                Some(&serde_json::json!(read_only)),
+                "case {case:?}: expected the published record to carry readOnly {read_only}, \
+                 got {:?}",
+                delivered.detail
             );
             assert_eq!(
                 delivered.log_files.len(),

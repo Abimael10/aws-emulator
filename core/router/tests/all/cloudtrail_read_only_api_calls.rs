@@ -1,13 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! What CloudTrail's `AWS API Call via CloudTrail` fan-out carries, and what it does not.
+//! What an `ENABLED` rule of CloudTrail's `AWS API Call via CloudTrail` channel is matched
+//! against, and what it is not.
 //!
 //! RULE: while a trail of the Region is logging management events, CloudTrail records every
 //! management call the account serves in event history — a call that only REPORTS state
-//! with `readOnly` true, one that CHANGES the account with `readOnly` false — but it
-//! publishes onto the account's default event bus only the calls that CHANGED it. So a rule
-//! over a service's API-call events is driven by the writes made on its resources and never
-//! by the `Get` / `List` / `Describe` reads a client or a console made while watching them.
+//! with `readOnly` true, one that CHANGES the account with `readOnly` false — and publishes
+//! each of them onto the account's default event bus. A rule in the default state `ENABLED`
+//! is matched against the calls that CHANGED the account alone: "EventBridge matches events
+//! against the rule, except for Amazon Web Services management events delivered through
+//! CloudTrail" (`PutRule$State`). So such a rule is driven by the writes made on a service's
+//! resources and never by the `Get` / `List` / `Describe` reads a client or a console made
+//! while watching them — while a rule that asks for all of them is matched against the reads
+//! too, which is this crate's `cloudtrail_management_event_rule_state`.
 //!
 //! Only a cross-service suite can pin this: the calls are served by the services that own
 //! them (CloudFront over restXml, Amazon SQS over awsJson1_0), the delivery decision belongs
@@ -21,8 +26,8 @@
 //! service with a JSON one), the FORM of the read (a `List` over a collection, a `Get` of one
 //! resource by id, a `Get` of one resource by name, a `List` of one resource's tags) and the
 //! read/write kind itself — the writes are the control that proves the channel was live, and
-//! the last call made is a write, so its arrival is the barrier after which a suppressed
-//! read would already have been delivered had it been published at all.
+//! the last call made is a write, so its arrival is the barrier after which a read this rule
+//! is not matched against would already have been delivered had it been matched at all.
 //!
 //! CloudFront is a GLOBAL service, so its records are filed in the partition's leader Region;
 //! every request below is signed for that Region so that one bus and one trail cover them
@@ -61,9 +66,9 @@ const POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// Whether a call of a row only REPORTS the account's state or CHANGES it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
-    /// A `Get` / `List` / `Describe` read: recorded, never published.
+    /// A `Get` / `List` read: recorded and published, and matched by no `ENABLED` rule.
     Reporting,
-    /// A call that changes the account: recorded AND published.
+    /// A call that changes the account: recorded, published AND matched.
     Mutating,
 }
 
@@ -386,7 +391,7 @@ fn arrived_names(arrived: &[Value]) -> Vec<String> {
 }
 
 #[tokio::test]
-async fn only_the_calls_that_changed_the_account_reach_the_api_call_channel() {
+async fn only_the_calls_that_changed_the_account_reach_an_enabled_rule() {
     let router = router();
 
     // A trail of the account, logging — the condition any delivery hangs off. Created
@@ -415,8 +420,8 @@ async fn only_the_calls_that_changed_the_account_reach_the_api_call_channel() {
     let (subject_url, _) = create_queue(&router, "read-only-api-call-subject").await;
     let (sink_url, sink_arn) = create_queue(&router, "read-only-api-call-sink").await;
 
-    // One rule over the whole channel: every API-call event of the account, whatever
-    // service served it. What arrives is therefore exactly what was published.
+    // One rule over the whole channel, in the default state — so what arrives is exactly
+    // what such a rule is matched against.
     events(
         &router,
         "setup",
@@ -551,7 +556,7 @@ async fn only_the_calls_that_changed_the_account_reach_the_api_call_channel() {
 
     // Wait for the CONDITION — every write's envelope on the sink — rather than for any
     // span of time. The reads were all made before the last write, so once that write has
-    // arrived, a published read would have arrived too.
+    // arrived, a read this rule was matched against would have arrived too.
     let writes: BTreeSet<&str> = rows
         .iter()
         .filter(|row| row.kind == Kind::Mutating)
@@ -591,8 +596,8 @@ async fn only_the_calls_that_changed_the_account_reach_the_api_call_channel() {
         assert_eq!(
             envelope.pointer("/detail/readOnly"),
             Some(&json!(false)),
-            "case a delivered envelope: only a call that changed the account is published, \
-             got {envelope}"
+            "case a delivered envelope: an ENABLED rule is matched only by a call that \
+             changed the account, got {envelope}"
         );
         assert_eq!(
             envelope["detail-type"],
@@ -602,9 +607,9 @@ async fn only_the_calls_that_changed_the_account_reach_the_api_call_channel() {
         );
     }
 
-    // The suppression is the CHANNEL's, not the recording's: every row — read and write
+    // The absence is the MATCH's, not the recording's: every row — read and write
     // alike — is in event history under its own name, stamped with its read/write kind, so
-    // an audit reader loses nothing the bus does not carry.
+    // an audit reader loses nothing this rule does not carry.
     for row in &rows {
         let records = looked_up(&router, row.event_name).await;
         let read_only = row.kind == Kind::Reporting;

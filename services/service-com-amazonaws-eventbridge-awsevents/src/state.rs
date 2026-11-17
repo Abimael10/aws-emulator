@@ -115,6 +115,14 @@ pub const RULE_STATE_ENABLED: &str = "ENABLED";
 /// (`PutRule$State`).
 pub const RULE_STATE_DISABLED: &str = "DISABLED";
 
+/// The `RuleState` of a rule EventBridge matches EVERY published event against,
+/// the management events CloudTrail delivers included: "The rule is enabled for
+/// all events, including Amazon Web Services management events delivered through
+/// CloudTrail" (`PutRule$State`). What that admits beyond [`RULE_STATE_ENABLED`]
+/// is read in [`cloudtrail_management_events`].
+pub const RULE_STATE_ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS: &str =
+    "ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS";
+
 /// The `RuleState` a rule takes when `PutRule` omits `State`: "Rules are
 /// enabled by default, or based on value of the state" (`PutRule`).
 pub const DEFAULT_RULE_STATE: &str = RULE_STATE_ENABLED;
@@ -381,6 +389,16 @@ impl RuleRecord {
     /// self-triggers on its schedule and is never matched by a published event.
     pub fn matches_published_events(&self) -> bool {
         self.state != RULE_STATE_DISABLED && self.event_pattern.is_some()
+    }
+
+    /// Whether this rule matches the READ-ONLY management events CloudTrail
+    /// delivers: only a rule enabled for ALL of an account's CloudTrail
+    /// management events does
+    /// ([`RULE_STATE_ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS`]), which is
+    /// what [`cloudtrail_management_events`] decides a match against such an
+    /// event by.
+    pub fn matches_cloudtrail_read_only_events(&self) -> bool {
+        self.state == RULE_STATE_ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS
     }
 
     /// The position of the target `id` names, for upsert and removal.
@@ -4802,6 +4820,11 @@ pub mod input_transform;
 /// rather than a sub-document to search, and a leaf of the same name at another
 /// depth is a different field.
 pub mod event_pattern;
+
+/// Which published events a rule's STATE decides a match on, beside its pattern:
+/// the management API calls CloudTrail delivers onto the account's default event
+/// bus, whose READS only a rule enabled for all of them is matched against.
+pub mod cloudtrail_management_events;
 
 /// What an invocation of an API destination CARRIES: the credentials the
 /// connection holds and the parameters the connection and the target each

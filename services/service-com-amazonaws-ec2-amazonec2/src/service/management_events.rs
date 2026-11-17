@@ -392,7 +392,7 @@ pub async fn record_served_call<Eng: Send + Sync + 'static>(
         recording.record_delivered(call, ::std::time::SystemTime::now(), answered_as)
     };
     if let Some(delivered) = delivered {
-        delivered.deliver(ctx.callback()).await;
+        delivered.deliver(ctx.parts(), ctx.callback()).await;
     }
 }
 
