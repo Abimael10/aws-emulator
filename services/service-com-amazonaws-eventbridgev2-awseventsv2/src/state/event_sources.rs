@@ -259,6 +259,16 @@ impl ComAmazonawsEventbridgev2Awseventsv2State {
             .count()
     }
 
+    /// Remove the EventSource at this ARN, reporting whether one was there.
+    ///
+    /// The source IS the record of its own client token, so forgetting it frees
+    /// both its name and that token: a later create may take the name again, and
+    /// a retry carrying the token mints a new source instead of replaying a
+    /// deleted one.
+    pub fn remove_event_source(&mut self, arn: &str) -> bool {
+        self.event_sources.remove(arn).is_some()
+    }
+
     /// Forget the EventSources of a bus that has finished disappearing.
     ///
     /// An EventSource forwards onto one bus, so it cannot outlive that bus: a

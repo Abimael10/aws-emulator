@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateEventSource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateEventSource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateEventSource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies an accepted change to the stored EventSource: every member the request
+//! carries is written onto the source and every member it omits is left as it
+//! stands. Provisioning is synchronous for an EventSource, so the change is in
+//! force by the time this call returns.
 //!
 //! ## Shape of an operation
 //!
@@ -108,10 +104,22 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eventbridgev2-awsevents
 // here — hence the `UpdateEventSourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.eventbridgev2#UpdateEventSource")]
+//
+// `InternalException` and `InvalidInputException` are widened in with
+// `extra_errors`: this service declares both as common errors for every
+// operation, so they are the modelled answers when the engine cannot hand back
+// this service's store and when the request asks for a change the addressed
+// resource cannot take, but the scaffold generated the enum from the OPERATION's
+// own `errors` list only.
+#[smithy_macros::operation_error(
+    "com.amazonaws.eventbridgev2#UpdateEventSource",
+    extra_errors = ["InternalException", "InvalidInputException"]
+)]
 #[derive(Debug)]
 pub enum UpdateEventSourceErrorModeled {
     ConcurrentModificationException(ConcurrentModificationException),
+    InternalException(InternalException),
+    InvalidInputException(InvalidInputException),
     InvalidStateException(InvalidStateException),
     ResourceNotFoundException(ResourceNotFoundException),
 }
@@ -167,18 +175,108 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateEventSource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateEventSourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateEventSource"))
+        // The EventSource is addressed by ARN, which carries its own region and
+        // account, so nothing here is read from the request's credential scope.
+        let _ = ctx;
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateEventSourceErrorModeled::InternalException(
+                InternalException {
+                    message: Some("the event bus store is unavailable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = store.lock();
+        state.settle_lifecycles(now);
+
+        let Some(source) = state.event_source(&input.event_source_arn) else {
+            return Err(UpdateEventSourceErrorModeled::ResourceNotFoundException(
+                crate::state::event_source_not_found(&input.event_source_arn),
+            )
+            .into());
+        };
+
+        // "Mutating operations on a revoked EventSource fail with
+        // InvalidStateException", whatever the request carries: a source the bus
+        // owner has withdrawn takes no further change.
+        if source.revoked {
+            return Err(UpdateEventSourceErrorModeled::InvalidStateException(
+                InvalidStateException {
+                    message: Some(format!(
+                        "event source {} is revoked and cannot be updated",
+                        source.arn
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The origin type is part of the source's identity: `EventSourceArn`
+        // documents that "The type segment is set by the service (aws.service for
+        // AWS service events, aws.partner for partner events)", and the ARN that
+        // addresses this source already carries it, so a configuration of the
+        // other kind would describe a resource this ARN cannot name.
+        if let Some(configuration) = input.configuration.as_ref() {
+            let requested_origin = crate::state::origin_type_of(configuration);
+            if requested_origin != source.origin_type() {
+                return Err(UpdateEventSourceErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(format!(
+                            "event source {} forwards {} events and its Configuration cannot be \
+                             changed to {}",
+                            source.arn,
+                            source.origin_type(),
+                            requested_origin
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Everything above is decided from the source as it stands, so the
+        // refusals are settled before the mutable borrow and there is exactly one
+        // not-found path.
+        let source = state
+            .event_sources
+            .get_mut(&input.event_source_arn)
+            .expect("the event source resolved above is in the store");
+
+        // "Fields omitted from the request are left unchanged": each member the
+        // request carries is written, and a member it omits is not touched. A
+        // member that IS carried replaces the stored value wholesale rather than
+        // being merged into it, which is why a `Configuration` naming no
+        // `Pattern` leaves the source with no pattern at all.
+        let mut modified = false;
+        if let Some(configuration) = input.configuration.clone() {
+            source.configuration = configuration;
+            modified = true;
+        }
+        if let Some(description) = input.description.clone() {
+            source.description = Some(description);
+            modified = true;
+        }
+        // `LastModifiedTime` reports a modification of the resource, so it moves
+        // for an update that carries something to apply and stands still for one
+        // that carries nothing at all.
+        if modified {
+            source.last_modified_time = now;
+        }
+
+        Ok(updated_response(source))
+    }
+}
+
+/// Project a stored EventSource into `UpdateEventSourceResponse`. Every member is
+/// read back out of the store — the source as it stands after the change.
+fn updated_response(source: &crate::state::EventSource) -> UpdateEventSourceOutput {
+    UpdateEventSourceOutput {
+        event_source_arn: Some(source.arn.clone()),
+        name: Some(source.name.clone()),
+        event_bus_arn: Some(source.event_bus_arn.clone()),
+        state: Some(source.state.wire_value().to_string()),
+        last_modified_time: Some(crate::state::to_date_time(source.last_modified_time)),
     }
 }

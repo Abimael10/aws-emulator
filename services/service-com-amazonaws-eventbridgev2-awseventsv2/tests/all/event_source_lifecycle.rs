@@ -25,13 +25,17 @@ use service_com_amazonaws_eventbridgev2_awseventsv2 as eventsv2;
 use eventsv2::ops::create_event_bus::CreateEventBus;
 use eventsv2::ops::create_event_source::CreateEventSource;
 use eventsv2::ops::delete_event_bus::DeleteEventBus;
+use eventsv2::ops::delete_event_source::DeleteEventSource;
 use eventsv2::ops::describe_event_bus::DescribeEventBus;
 use eventsv2::ops::describe_event_source::DescribeEventSource;
+use eventsv2::ops::revoke_resource::RevokeResource;
+use eventsv2::ops::update_event_source::UpdateEventSource;
 use eventsv2::ops::types::{
     AwsServiceEventsSourceConfiguration, CreateEventBusInput, CreateEventSourceInput,
-    CreateEventSourceOutput, DeleteEventBusInput, DescribeEventBusInput, DescribeEventSourceInput,
-    DescribeEventSourceOutput, EventSourceConfiguration, OnFailureConfiguration,
-    PartnerEventsSourceConfiguration,
+    CreateEventSourceOutput, DeleteEventBusInput, DeleteEventSourceInput, DeleteEventSourceOutput,
+    DescribeEventBusInput, DescribeEventSourceInput, DescribeEventSourceOutput,
+    EventSourceConfiguration, OnFailureConfiguration, PartnerEventsSourceConfiguration,
+    RevokeResourceInput, UpdateEventSourceInput, UpdateEventSourceOutput,
 };
 
 /// The account segment every emulated ARN carries.
@@ -216,6 +220,44 @@ impl Harness {
                 &self.ctx(),
             )
             .await
+    }
+
+    async fn update_source(
+        &self,
+        input: UpdateEventSourceInput,
+    ) -> Result<UpdateEventSourceOutput, eventsv2::ops::update_event_source::UpdateEventSourceError>
+    {
+        UpdateEventSource::new(Arc::clone(&self.engine))
+            .handle(input, &self.ctx())
+            .await
+    }
+
+    async fn delete_source(
+        &self,
+        arn: &str,
+    ) -> Result<DeleteEventSourceOutput, eventsv2::ops::delete_event_source::DeleteEventSourceError>
+    {
+        DeleteEventSource::new(Arc::clone(&self.engine))
+            .handle(
+                DeleteEventSourceInput {
+                    event_source_arn: arn.to_string(),
+                },
+                &self.ctx(),
+            )
+            .await
+    }
+
+    /// Withdraw a resource, which is how a source becomes `Revoked`.
+    async fn revoke(&self, arn: &str) {
+        RevokeResource::new(Arc::clone(&self.engine))
+            .handle(
+                RevokeResourceInput {
+                    arn: arn.to_string(),
+                },
+                &self.ctx(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("case {arn:?}: RevokeResource must succeed, got {e:?}"));
     }
 }
 
@@ -1053,4 +1095,456 @@ async fn the_event_source_workflow_runs_over_the_wire() {
         status, 404,
         "case \"create against an absent bus\": expected HTTP 404, got {status}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Updating and deleting an EventSource
+// ---------------------------------------------------------------------------
+
+/// Everything an update can change about an EventSource, as a read reports it:
+/// the description, and the configuration's origin type, origin, filter pattern
+/// and failure destination.
+#[derive(Debug, PartialEq, Eq)]
+struct SourceFacts {
+    description: Option<String>,
+    origin_type: &'static str,
+    origin: String,
+    pattern: Option<String>,
+    dead_letter_queue_arn: Option<String>,
+    state: Option<String>,
+    revoked: Option<bool>,
+}
+
+/// The facts a `DescribeEventSource` response carries.
+fn facts_of_described_source(output: &DescribeEventSourceOutput) -> SourceFacts {
+    let configuration = output
+        .configuration
+        .as_ref()
+        .expect("DescribeEventSource must report a Configuration");
+    let (origin_type, origin, pattern) = origin_of(configuration);
+    SourceFacts {
+        description: output.description.clone(),
+        origin_type,
+        origin,
+        pattern,
+        dead_letter_queue_arn: dead_letter_queue_of(configuration),
+        state: output.state.clone(),
+        revoked: output.revoked,
+    }
+}
+
+/// The `OnFailureConfiguration` destination a configuration carries, whichever
+/// variant it is.
+fn dead_letter_queue_of(configuration: &EventSourceConfiguration) -> Option<String> {
+    match configuration {
+        EventSourceConfiguration::AwsServiceEventsConfiguration(config) => config
+            .on_failure_configuration
+            .as_ref()
+            .and_then(|on_failure| on_failure.arn.clone()),
+        EventSourceConfiguration::PartnerEventsConfiguration(config) => config
+            .on_failure_configuration
+            .as_ref()
+            .and_then(|on_failure| on_failure.arn.clone()),
+    }
+}
+
+/// The whole source a row expects. An EventSource is provisioned synchronously,
+/// so an applied change leaves it ACTIVE and unrevoked.
+fn expected_source(
+    description: Option<&str>,
+    origin: &str,
+    pattern: Option<&str>,
+    dead_letter_queue_arn: Option<&str>,
+) -> SourceFacts {
+    SourceFacts {
+        description: description.map(str::to_string),
+        origin_type: "aws.service",
+        origin: origin.to_string(),
+        pattern: pattern.map(str::to_string),
+        dead_letter_queue_arn: dead_letter_queue_arn.map(str::to_string),
+        state: Some("ACTIVE".to_string()),
+        revoked: None,
+    }
+}
+
+/// RULE: an update writes onto the stored resource exactly the members the
+/// request carries — each replacing the stored value, and a structure or union
+/// member wholesale rather than merged into the stored one, so a member omitted
+/// INSIDE a supplied configuration is cleared — and leaves every member the
+/// request omits as it stands; every later read reports the resource as the
+/// update left it.
+///
+/// The table spans what the rule generalises over: which member is carried (one,
+/// both, none at all), the kind of value (text, the empty text, a union variant
+/// with and without its optional members), and each row is applied to the source
+/// the previous row left, so an expectation names the WHOLE resource rather than
+/// only the members its own row carried.
+#[tokio::test]
+async fn an_update_applies_what_it_carries_and_replaces_the_configuration_wholesale() {
+    let harness = Harness::new();
+    let bus = harness.active_bus("updatable-source-bus").await;
+    let dead_letter_queue = format!("arn:aws:sqs:{REGION}:{ACCOUNT}:source-dlq");
+    let created = harness
+        .create_source(CreateEventSourceInput {
+            name: "updatable-source".to_string(),
+            event_bus_arn: bus.clone(),
+            configuration: aws_service_configuration(
+                "aws.ec2",
+                Some(r#"{"detail-type": ["EC2 Instance State-change Notification"]}"#),
+                Some(&dead_letter_queue),
+            ),
+            description: Some("first description".to_string()),
+            tags: None,
+            client_token: Some("updatable-source-token".to_string()),
+        })
+        .await
+        .expect("CreateEventSource must succeed");
+    let arn = created
+        .event_source_arn
+        .clone()
+        .expect("CreateEventSource must report an EventSourceArn");
+    let created_at = created.creation_time;
+
+    let rows: Vec<(&str, UpdateEventSourceInput, SourceFacts)> = vec![
+        (
+            "description only",
+            UpdateEventSourceInput {
+                event_source_arn: arn.clone(),
+                description: Some("second description".to_string()),
+                ..Default::default()
+            },
+            expected_source(
+                Some("second description"),
+                "aws.ec2",
+                Some(r#"{"detail-type": ["EC2 Instance State-change Notification"]}"#),
+                Some(&dead_letter_queue),
+            ),
+        ),
+        (
+            "configuration only, carrying neither a pattern nor a failure destination",
+            UpdateEventSourceInput {
+                event_source_arn: arn.clone(),
+                configuration: Some(aws_service_configuration("aws.s3", None, None)),
+                ..Default::default()
+            },
+            expected_source(Some("second description"), "aws.s3", None, None),
+        ),
+        (
+            "configuration carrying a pattern again",
+            UpdateEventSourceInput {
+                event_source_arn: arn.clone(),
+                configuration: Some(aws_service_configuration(
+                    "aws.s3",
+                    Some(r#"{"detail-type":["Object Created"]}"#),
+                    None,
+                )),
+                ..Default::default()
+            },
+            expected_source(
+                Some("second description"),
+                "aws.s3",
+                Some(r#"{"detail-type":["Object Created"]}"#),
+                None,
+            ),
+        ),
+        (
+            "description and configuration together",
+            UpdateEventSourceInput {
+                event_source_arn: arn.clone(),
+                configuration: Some(aws_service_configuration(
+                    "aws.lambda",
+                    None,
+                    Some(&dead_letter_queue),
+                )),
+                description: Some(String::new()),
+            },
+            expected_source(Some(""), "aws.lambda", None, Some(&dead_letter_queue)),
+        ),
+        (
+            "no member carried at all",
+            UpdateEventSourceInput {
+                event_source_arn: arn.clone(),
+                ..Default::default()
+            },
+            expected_source(Some(""), "aws.lambda", None, Some(&dead_letter_queue)),
+        ),
+    ];
+
+    for (case, input, expected) in rows {
+        let updated = harness
+            .update_source(input)
+            .await
+            .unwrap_or_else(|e| panic!("case {case:?}: UpdateEventSource must succeed, got {e:?}"));
+        assert_eq!(
+            updated.event_source_arn.as_deref(),
+            Some(arn.as_str()),
+            "case {case:?}: the response must name the source updated, got {:?}",
+            updated.event_source_arn
+        );
+        assert_eq!(
+            updated.event_bus_arn.as_deref(),
+            Some(bus.as_str()),
+            "case {case:?}: the source must still forward onto its bus, got {:?}",
+            updated.event_bus_arn
+        );
+        assert_eq!(
+            updated.state.as_deref(),
+            Some("ACTIVE"),
+            "case {case:?}: State must be ACTIVE, got {:?}",
+            updated.state
+        );
+
+        let described = harness
+            .describe_source(&arn)
+            .await
+            .unwrap_or_else(|e| {
+                panic!("case {case:?}: DescribeEventSource must succeed, got {e:?}")
+            });
+        let read_back = facts_of_described_source(&described);
+        assert_eq!(
+            read_back, expected,
+            "case {case:?}: the read-back source must be the one the update left, got \
+             {read_back:?}"
+        );
+
+        // An update changes the resource's configuration, never its identity.
+        assert_eq!(
+            described.name.as_deref(),
+            Some("updatable-source"),
+            "case {case:?}: the Name must not change, got {:?}",
+            described.name
+        );
+        assert_eq!(
+            described.creation_time, created_at,
+            "case {case:?}: CreationTime must not change, got {:?}",
+            described.creation_time
+        );
+        assert!(
+            described.last_modified_time.is_some(),
+            "case {case:?}: LastModifiedTime must be reported, got {:?}",
+            described.last_modified_time
+        );
+    }
+}
+
+/// RULE: an update that is refused writes nothing — an ARN naming no stored
+/// EventSource is `ResourceNotFoundException` (404); a `Configuration` of the
+/// other variant is not a change this resource can take, because its ARN carries
+/// the origin type the service set, and is refused with the modelled
+/// `InvalidInputException` (400); and a revoked EventSource refuses every
+/// mutating operation with `InvalidStateException` (409).
+#[tokio::test]
+async fn an_update_that_is_refused_leaves_the_event_source_as_it_was() {
+    let harness = Harness::new();
+    let bus = harness.active_bus("refused-update-bus").await;
+    let arn = harness
+        .create_source(CreateEventSourceInput {
+            name: "refused-update-source".to_string(),
+            event_bus_arn: bus.clone(),
+            configuration: aws_service_configuration("aws.ec2", None, None),
+            description: Some("first description".to_string()),
+            tags: None,
+            client_token: Some("refused-update-token".to_string()),
+        })
+        .await
+        .expect("CreateEventSource must succeed")
+        .event_source_arn
+        .expect("CreateEventSource must report an EventSourceArn");
+
+    let unknown = format!(
+        "arn:aws:events:{REGION}:{ACCOUNT}:event-sourcev2/aws.service/absent/\
+         bbbbbbbbbbbbbbbbbbbbbbbbb"
+    );
+    let rows: [(&str, UpdateEventSourceInput, &str, u16); 2] = [
+        (
+            "an ARN naming no stored source",
+            UpdateEventSourceInput {
+                event_source_arn: unknown.clone(),
+                description: Some("nowhere to apply this".to_string()),
+                ..Default::default()
+            },
+            "ResourceNotFoundException",
+            404,
+        ),
+        (
+            "a configuration of the other variant",
+            UpdateEventSourceInput {
+                event_source_arn: arn.clone(),
+                configuration: Some(partner_configuration(
+                    &partner_arn("partner.example", "stream-9"),
+                    None,
+                    None,
+                )),
+                ..Default::default()
+            },
+            "InvalidInputException",
+            400,
+        ),
+    ];
+
+    for (case, input, shape, status) in rows {
+        let refused = harness
+            .update_source(input)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("case {case:?}: UpdateEventSource must be refused"));
+        assert_eq!(
+            refused.shape_name(),
+            shape,
+            "case {case:?}: expected {shape}, got {:?}",
+            refused.shape_name()
+        );
+        assert_eq!(
+            refused.http_status(),
+            status,
+            "case {case:?}: expected HTTP {status}, got {}",
+            refused.http_status()
+        );
+    }
+
+    // Neither refusal wrote anything.
+    let described = harness
+        .describe_source(&arn)
+        .await
+        .expect("DescribeEventSource must succeed");
+    assert_eq!(
+        facts_of_described_source(&described),
+        expected_source(Some("first description"), "aws.ec2", None, None),
+        "case \"after the refusals\": the source must stand exactly as it was created"
+    );
+
+    // Revocation is terminal, and a revoked source takes no further change.
+    harness.revoke(&arn).await;
+    let refused = harness
+        .update_source(UpdateEventSourceInput {
+            event_source_arn: arn.clone(),
+            description: Some("after the revocation".to_string()),
+            ..Default::default()
+        })
+        .await
+        .expect_err("case \"revoked\": UpdateEventSource must be refused");
+    assert_eq!(
+        refused.shape_name(),
+        "InvalidStateException",
+        "case \"revoked\": expected InvalidStateException, got {:?}",
+        refused.shape_name()
+    );
+    assert_eq!(
+        refused.http_status(),
+        409,
+        "case \"revoked\": expected HTTP 409, got {}",
+        refused.http_status()
+    );
+    let described = harness
+        .describe_source(&arn)
+        .await
+        .expect("DescribeEventSource must succeed");
+    assert_eq!(
+        described.description.as_deref(),
+        Some("first description"),
+        "case \"revoked\": the refused update must change nothing, got {:?}",
+        described.description
+    );
+}
+
+/// RULE: `DeleteEventSource` removes the EventSource it addresses, whichever
+/// state it is in, so forwarding from its origin stops: every later read of its
+/// ARN is `ResourceNotFoundException` (404), a repeated delete is refused the
+/// same way, and the name it held is free for a new source.
+#[tokio::test]
+async fn a_deleted_event_source_is_gone_and_frees_what_it_held() {
+    let harness = Harness::new();
+    let bus = harness.active_bus("deletable-source-bus").await;
+
+    // Rows: a plain source, and one the bus owner has revoked — `Revoked`
+    // documents that DeleteEventSource "stays available so a revoked EventSource
+    // can still be cleaned up".
+    for (case, name, revoke_first) in [
+        ("active source", "deletable-source", false),
+        ("revoked source", "revoked-source", true),
+    ] {
+        let arn = harness
+            .create_source(CreateEventSourceInput {
+                name: name.to_string(),
+                event_bus_arn: bus.clone(),
+                configuration: aws_service_configuration("aws.s3", None, None),
+                description: None,
+                tags: None,
+                client_token: Some(format!("{name}-token")),
+            })
+            .await
+            .unwrap_or_else(|e| panic!("case {case:?}: CreateEventSource must succeed, got {e:?}"))
+            .event_source_arn
+            .unwrap_or_else(|| panic!("case {case:?}: an EventSourceArn must be reported"));
+        if revoke_first {
+            harness.revoke(&arn).await;
+        }
+
+        harness
+            .delete_source(&arn)
+            .await
+            .unwrap_or_else(|e| panic!("case {case:?}: DeleteEventSource must succeed, got {e:?}"));
+
+        let gone = harness
+            .describe_source(&arn)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("case {case:?}: the deleted source must not read back"));
+        assert_eq!(
+            gone.shape_name(),
+            "ResourceNotFoundException",
+            "case {case:?}: expected ResourceNotFoundException, got {:?}",
+            gone.shape_name()
+        );
+        assert_eq!(
+            gone.http_status(),
+            404,
+            "case {case:?}: expected HTTP 404, got {}",
+            gone.http_status()
+        );
+
+        let repeated = harness
+            .delete_source(&arn)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("case {case:?}: a repeated delete must be refused"));
+        assert_eq!(
+            repeated.shape_name(),
+            "ResourceNotFoundException",
+            "case {case:?}: a repeated delete must answer ResourceNotFoundException, got {:?}",
+            repeated.shape_name()
+        );
+
+        // The name — and the client token the source carried — are free again.
+        let replacement = harness
+            .create_source(CreateEventSourceInput {
+                name: name.to_string(),
+                event_bus_arn: bus.clone(),
+                configuration: aws_service_configuration("aws.s3", None, None),
+                description: Some("the replacement".to_string()),
+                tags: None,
+                client_token: Some(format!("{name}-token")),
+            })
+            .await
+            .unwrap_or_else(|e| {
+                panic!("case {case:?}: the name must be free for a new source, got {e:?}")
+            });
+        let replacement_arn = replacement
+            .event_source_arn
+            .unwrap_or_else(|| panic!("case {case:?}: an EventSourceArn must be reported"));
+        assert_ne!(
+            replacement_arn, arn,
+            "case {case:?}: the replacement must be a new resource, got {replacement_arn:?}"
+        );
+        let described = harness
+            .describe_source(&replacement_arn)
+            .await
+            .unwrap_or_else(|e| panic!("case {case:?}: the replacement must read back, got {e:?}"));
+        assert_eq!(
+            described.description.as_deref(),
+            Some("the replacement"),
+            "case {case:?}: the replacement is its own resource, got {:?}",
+            described.description
+        );
+    }
 }

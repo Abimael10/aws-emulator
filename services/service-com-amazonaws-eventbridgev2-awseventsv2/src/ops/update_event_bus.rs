@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateEventBus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateEventBus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateEventBus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies an accepted change to the stored bus: every member the request carries
+//! is written onto the bus and every member it omits is left as it stands. The
+//! change is in force, and the bus reports itself ACTIVE, by the time this call
+//! returns — which is what the recorded service answers for a change to a bus's
+//! description, encryption or storage configuration.
 //!
 //! ## Shape of an operation
 //!
@@ -122,10 +119,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eventbridgev2-awsevents
 // here — hence the `UpdateEventBusError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.eventbridgev2#UpdateEventBus")]
+//
+// `InternalException` is widened in with `extra_errors`: this service declares it
+// as a common error for every operation, so it is the modelled answer when the
+// engine cannot hand back this service's store, but the scaffold generated the
+// enum from the OPERATION's own `errors` list only.
+#[smithy_macros::operation_error(
+    "com.amazonaws.eventbridgev2#UpdateEventBus",
+    extra_errors = ["InternalException"]
+)]
 #[derive(Debug)]
 pub enum UpdateEventBusErrorModeled {
     ConcurrentModificationException(ConcurrentModificationException),
+    InternalException(InternalException),
     InvalidStateException(InvalidStateException),
     ResourceNotFoundException(ResourceNotFoundException),
 }
@@ -181,18 +187,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateEventBus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateEventBusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateEventBus"))
+        // The bus is addressed by ARN, which carries its own region and account,
+        // so nothing here is read from the request's credential scope.
+        let _ = ctx;
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateEventBusErrorModeled::InternalException(InternalException {
+                message: Some("the event bus store is unavailable on this engine".to_string()),
+            })
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = store.lock();
+        state.settle_lifecycles(now);
+
+        let Some(bus) = state.bus(&input.event_bus_arn) else {
+            // The same ARN resolution a read performs: an identifier this service
+            // minted names a bus that is not there, and one it never handed out
+            // names no resource of this service at all.
+            return Err(UpdateEventBusErrorModeled::ResourceNotFoundException(
+                state.bus_read_refusal(&input.event_bus_arn),
+            )
+            .into());
+        };
+
+        // A bus that has not finished being provisioned, or is on its way out, is
+        // not in a state that allows a change to it, whatever the request carries:
+        // only an operational bus can take one.
+        if bus.state != crate::state::BusLifecycleState::Active {
+            return Err(UpdateEventBusErrorModeled::InvalidStateException(
+                InvalidStateException {
+                    message: Some(format!(
+                        "event bus {} is in state {} and cannot be updated",
+                        bus.arn,
+                        bus.state.wire_value()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Everything above is decided from the bus as it stands, so the refusals
+        // are settled before the mutable borrow and there is exactly one
+        // not-found path.
+        let bus = state
+            .event_buses
+            .get_mut(&input.event_bus_arn)
+            .expect("the bus resolved above is in the store");
+
+        // "Fields omitted from the request are left unchanged": each member the
+        // request carries is written, and a member it omits is not touched. A
+        // member that IS carried replaces the stored value wholesale rather than
+        // being merged into it, which is why a `StorageConfiguration` carrying no
+        // `RetentionPeriodInDays` leaves the bus on the service default — the
+        // same value a create naming no storage configuration leaves it on.
+        let mut modified = false;
+        if let Some(description) = input.description.clone() {
+            bus.description = Some(description);
+            modified = true;
+        }
+        if let Some(encryption_configuration) = input.encryption_configuration.clone() {
+            bus.encryption_configuration = Some(encryption_configuration);
+            modified = true;
+        }
+        if let Some(storage_configuration) = input.storage_configuration.as_ref() {
+            bus.retention_period_in_days =
+                crate::state::effective_retention_period(Some(storage_configuration));
+            modified = true;
+        }
+        // `LastModifiedTime` reports a modification of the resource, so it moves
+        // for an update that carries something to apply and stands still for one
+        // that carries nothing at all. The change is in force from this instant:
+        // the recorded service answers this call with the bus already ACTIVE and
+        // carrying the new configuration, so the bus owes the clock no later
+        // transition and every read from here on reports what was asked for.
+        if modified {
+            bus.last_modified_time = now;
+        }
+
+        Ok(updated_response(bus, now))
+    }
+}
+
+/// Project a stored bus into `UpdateEventBusResponse`. Every member is read back
+/// out of the store — the bus as it stands after the change, including the
+/// lifecycle state the change left it in.
+fn updated_response(
+    bus: &crate::state::EventBus,
+    now: ::std::time::SystemTime,
+) -> UpdateEventBusOutput {
+    UpdateEventBusOutput {
+        event_bus_arn: Some(bus.arn.clone()),
+        name: Some(bus.name.clone()),
+        // The bus's description, empty when it holds none, as every read of this
+        // bus reports it.
+        description: Some(bus.reported_description()),
+        encryption_configuration: bus.encryption_configuration.clone(),
+        storage_configuration: Some(bus.storage_configuration_output(now)),
+        state: Some(bus.state.wire_value().to_string()),
+        state_reason: bus.state_reason.clone(),
+        last_modified_time: Some(crate::state::to_date_time(bus.last_modified_time)),
     }
 }

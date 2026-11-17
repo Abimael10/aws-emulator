@@ -30,11 +30,13 @@ use eventsv2::ops::delete_event_bus::DeleteEventBus;
 use eventsv2::ops::describe_event_bus::DescribeEventBus;
 use eventsv2::ops::list_event_buses::ListEventBuses;
 use eventsv2::ops::put_events::PutEvents;
+use eventsv2::ops::update_event_bus::UpdateEventBus;
 use eventsv2::ops::types::{
     CreateEventBusInput, CreateEventBusOutput, DeduplicationConfiguration, DeleteEventBusInput,
     DeleteEventBusOutput, DescribeEventBusInput, DescribeEventBusOutput, EncryptionConfiguration,
     ListEventBusesInput, ListEventBusesOutput, PutEventsInput, PutEventsOutput,
-    PutEventsRequestEntry, PutEventsSystemMetadata, StorageConfiguration,
+    PutEventsRequestEntry, PutEventsSystemMetadata, StorageConfiguration, UpdateEventBusInput,
+    UpdateEventBusOutput,
 };
 
 /// The account segment every emulated ARN carries.
@@ -201,6 +203,15 @@ impl Harness {
                 },
                 &self.ctx(),
             )
+            .await
+    }
+
+    async fn update(
+        &self,
+        input: UpdateEventBusInput,
+    ) -> Result<UpdateEventBusOutput, eventsv2::ops::update_event_bus::UpdateEventBusError> {
+        UpdateEventBus::new(Arc::clone(&self.engine))
+            .handle(input, &self.ctx())
             .await
     }
 
@@ -2305,5 +2316,456 @@ async fn the_registry_is_bounded_across_every_region() {
         stored,
         eventsv2::state::MAX_EVENT_BUSES_PER_EMULATOR,
         "case \"past the registry bound\": the refused create must store nothing, got {stored}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Updating a bus
+// ---------------------------------------------------------------------------
+
+/// What a bus reports about the members an update can change, read the same way
+/// out of an `UpdateEventBus` response and out of a later `DescribeEventBus` —
+/// which is what lets one expectation be asserted against both.
+#[derive(Debug, PartialEq, Eq)]
+struct BusFacts {
+    description: Option<String>,
+    retention_period_in_days: Option<i32>,
+    kms_key_identifier: Option<String>,
+    state: Option<String>,
+}
+
+fn facts_of_updated(output: &UpdateEventBusOutput) -> BusFacts {
+    BusFacts {
+        description: output.description.clone(),
+        retention_period_in_days: output
+            .storage_configuration
+            .as_ref()
+            .and_then(|config| config.retention_period_in_days),
+        kms_key_identifier: output
+            .encryption_configuration
+            .as_ref()
+            .and_then(|config| config.kms_key_identifier.clone()),
+        state: output.state.clone(),
+    }
+}
+
+fn facts_of_described(output: &DescribeEventBusOutput) -> BusFacts {
+    BusFacts {
+        description: output.description.clone(),
+        retention_period_in_days: output
+            .storage_configuration
+            .as_ref()
+            .and_then(|config| config.retention_period_in_days),
+        kms_key_identifier: output
+            .encryption_configuration
+            .as_ref()
+            .and_then(|config| config.kms_key_identifier.clone()),
+        state: output.state.clone(),
+    }
+}
+
+/// The whole bus a row expects: the recorded service answers an accepted change
+/// with the bus already ACTIVE, so that is part of every expectation.
+fn expected_bus(description: &str, retention_period_in_days: i32, kms: &str) -> BusFacts {
+    BusFacts {
+        description: Some(description.to_string()),
+        retention_period_in_days: Some(retention_period_in_days),
+        kms_key_identifier: Some(kms.to_string()),
+        state: Some("ACTIVE".to_string()),
+    }
+}
+
+/// RULE: an update writes onto the stored resource exactly the members the
+/// request carries — each replacing the stored value, and a structure member
+/// wholesale rather than merged into the stored one — and leaves every member the
+/// request omits as it stands; every later read reports the resource as the update
+/// left it.
+///
+/// The table spans what the rule generalises over: which member is carried (one,
+/// two together, a structure whose own member is omitted, none at all), and the
+/// kind of value (text, the empty text, an integer at each published bound of
+/// `RetentionPeriodInDays`'s modelled `@range 1..365`). Each row is applied to the
+/// bus the previous row left, so an expectation names the WHOLE resource rather
+/// than only the members its own row carried.
+#[tokio::test]
+async fn an_update_applies_what_it_carries_and_leaves_every_omitted_member_alone() {
+    let harness = Harness::new();
+    let created = harness
+        .create(CreateEventBusInput {
+            name: "updatable-bus".to_string(),
+            description: Some("initial description".to_string()),
+            storage_configuration: Some(StorageConfiguration {
+                retention_period_in_days: Some(3),
+            }),
+            encryption_configuration: Some(EncryptionConfiguration {
+                kms_key_identifier: Some("alias/initial".to_string()),
+            }),
+            ..Default::default()
+        })
+        .await
+        .expect("CreateEventBus must succeed");
+    let arn = created
+        .event_bus_arn
+        .clone()
+        .expect("CreateEventBus must report an EventBusArn");
+    harness.await_bus_state("updatable-bus", &arn, "ACTIVE").await;
+    let created_at = harness
+        .describe(&arn)
+        .await
+        .expect("DescribeEventBus must succeed")
+        .creation_time;
+
+    let rows: Vec<(&str, UpdateEventBusInput, BusFacts)> = vec![
+        (
+            "description only",
+            UpdateEventBusInput {
+                event_bus_arn: arn.clone(),
+                description: Some("updated description".to_string()),
+                ..Default::default()
+            },
+            expected_bus("updated description", 3, "alias/initial"),
+        ),
+        (
+            "retention period only, at the lower bound",
+            UpdateEventBusInput {
+                event_bus_arn: arn.clone(),
+                storage_configuration: Some(StorageConfiguration {
+                    retention_period_in_days: Some(1),
+                }),
+                ..Default::default()
+            },
+            expected_bus("updated description", 1, "alias/initial"),
+        ),
+        (
+            "retention period only, at the upper bound",
+            UpdateEventBusInput {
+                event_bus_arn: arn.clone(),
+                storage_configuration: Some(StorageConfiguration {
+                    retention_period_in_days: Some(365),
+                }),
+                ..Default::default()
+            },
+            expected_bus("updated description", 365, "alias/initial"),
+        ),
+        (
+            "description and retention period together",
+            UpdateEventBusInput {
+                event_bus_arn: arn.clone(),
+                description: Some(String::new()),
+                storage_configuration: Some(StorageConfiguration {
+                    retention_period_in_days: Some(7),
+                }),
+                ..Default::default()
+            },
+            expected_bus("", 7, "alias/initial"),
+        ),
+        (
+            "a storage configuration carrying no retention period replaces the stored one",
+            UpdateEventBusInput {
+                event_bus_arn: arn.clone(),
+                storage_configuration: Some(StorageConfiguration {
+                    retention_period_in_days: None,
+                }),
+                ..Default::default()
+            },
+            expected_bus(
+                "",
+                eventsv2::state::DEFAULT_RETENTION_PERIOD_IN_DAYS,
+                "alias/initial",
+            ),
+        ),
+        (
+            "encryption configuration only",
+            UpdateEventBusInput {
+                event_bus_arn: arn.clone(),
+                encryption_configuration: Some(EncryptionConfiguration {
+                    kms_key_identifier: Some("alias/rotated".to_string()),
+                }),
+                ..Default::default()
+            },
+            expected_bus(
+                "",
+                eventsv2::state::DEFAULT_RETENTION_PERIOD_IN_DAYS,
+                "alias/rotated",
+            ),
+        ),
+        (
+            "no member carried at all",
+            UpdateEventBusInput {
+                event_bus_arn: arn.clone(),
+                ..Default::default()
+            },
+            expected_bus(
+                "",
+                eventsv2::state::DEFAULT_RETENTION_PERIOD_IN_DAYS,
+                "alias/rotated",
+            ),
+        ),
+    ];
+
+    for (case, input, expected) in rows {
+        let updated = harness
+            .update(input)
+            .await
+            .unwrap_or_else(|e| panic!("case {case:?}: UpdateEventBus must succeed, got {e:?}"));
+        let reported = facts_of_updated(&updated);
+        assert_eq!(
+            reported, expected,
+            "case {case:?}: UpdateEventBus must report the bus the change left, got {reported:?}"
+        );
+
+        let described = harness
+            .describe(&arn)
+            .await
+            .unwrap_or_else(|e| panic!("case {case:?}: DescribeEventBus must succeed, got {e:?}"));
+        let read_back = facts_of_described(&described);
+        assert_eq!(
+            read_back, expected,
+            "case {case:?}: the read-back bus must be the one the update left, got {read_back:?}"
+        );
+
+        // An update changes the resource's configuration, never its identity.
+        assert_eq!(
+            described.event_bus_arn.as_deref(),
+            Some(arn.as_str()),
+            "case {case:?}: the ARN must not change, got {:?}",
+            described.event_bus_arn
+        );
+        assert_eq!(
+            described.name.as_deref(),
+            Some("updatable-bus"),
+            "case {case:?}: the Name must not change, got {:?}",
+            described.name
+        );
+        assert_eq!(
+            described.creation_time, created_at,
+            "case {case:?}: CreationTime must not change, got {:?}",
+            described.creation_time
+        );
+        assert!(
+            described.last_modified_time.is_some(),
+            "case {case:?}: LastModifiedTime must be reported, got {:?}",
+            described.last_modified_time
+        );
+    }
+}
+
+/// RULE: an update that is refused writes nothing: an ARN naming no stored bus is
+/// `ResourceNotFoundException` (404), and a bus that has not finished a lifecycle
+/// transition is not in a state that allows a change (`InvalidStateException`,
+/// 409).
+#[tokio::test]
+async fn an_update_that_is_refused_leaves_the_bus_exactly_as_it_was() {
+    let harness = Harness::new();
+    let created = harness
+        .create(CreateEventBusInput {
+            name: "refused-update-bus".to_string(),
+            description: Some("initial description".to_string()),
+            ..Default::default()
+        })
+        .await
+        .expect("CreateEventBus must succeed");
+    let arn = created
+        .event_bus_arn
+        .clone()
+        .expect("CreateEventBus must report an EventBusArn");
+    harness
+        .await_bus_state("refused-update-bus", &arn, "ACTIVE")
+        .await;
+
+    // Each transient state is ARRANGED in the store rather than raced against the
+    // provisioning or deletion span: what the handler must refuse is the STATE,
+    // and a row that waited for one of those spans to be in flight would depend
+    // on how fast the host runs. The stored transition is pushed far enough ahead
+    // that nothing settles it while the row runs.
+    let far_ahead = std::time::SystemTime::now()
+        .checked_add(Duration::from_secs(3600))
+        .expect("an hour ahead of the clock is representable");
+    for (case, state) in [
+        ("CREATING", eventsv2::state::BusLifecycleState::Creating),
+        ("DELETING", eventsv2::state::BusLifecycleState::Deleting),
+    ] {
+        {
+            let store = harness.store();
+            let mut held = store.lock();
+            let bus = held
+                .event_buses
+                .get_mut(&arn)
+                .unwrap_or_else(|| panic!("case {case:?}: the bus must be stored"));
+            bus.state = state;
+            bus.transition_due_at = Some(far_ahead);
+        }
+
+        let refused = harness
+            .update(UpdateEventBusInput {
+                event_bus_arn: arn.clone(),
+                description: Some(format!("while {case}")),
+                ..Default::default()
+            })
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("case {case:?}: UpdateEventBus must be refused"));
+        assert_eq!(
+            refused.shape_name(),
+            "InvalidStateException",
+            "case {case:?}: expected InvalidStateException, got {:?}",
+            refused.shape_name()
+        );
+        assert_eq!(
+            refused.http_status(),
+            409,
+            "case {case:?}: expected HTTP 409, got {}",
+            refused.http_status()
+        );
+
+        let described = harness
+            .describe(&arn)
+            .await
+            .unwrap_or_else(|e| panic!("case {case:?}: DescribeEventBus must succeed, got {e:?}"));
+        assert_eq!(
+            described.description.as_deref(),
+            Some("initial description"),
+            "case {case:?}: the refused update must change nothing, got {:?}",
+            described.description
+        );
+        assert_eq!(
+            described.state.as_deref(),
+            Some(state.wire_value()),
+            "case {case:?}: the refused update must leave the state it found, got {:?}",
+            described.state
+        );
+    }
+
+    // Rows that address no stored bus at all: an identifier this service never
+    // minted, and one minted in another region.
+    let never =
+        format!("arn:aws:events:{REGION}:{ACCOUNT}:event-busv2/never/ddddddddddddddddddddddddd");
+    let other_region = format!(
+        "arn:aws:events:eu-central-1:{ACCOUNT}:event-busv2/refused-update-bus/eeeeeeeeeeeeeeeeeeeeeeeee"
+    );
+    for (case, unknown) in [
+        ("never created", never.as_str()),
+        ("another region", other_region.as_str()),
+    ] {
+        let refused = harness
+            .update(UpdateEventBusInput {
+                event_bus_arn: unknown.to_string(),
+                description: Some("nowhere to apply this".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refused.shape_name(),
+            "ResourceNotFoundException",
+            "case {case:?}: expected ResourceNotFoundException, got {:?}",
+            refused.shape_name()
+        );
+        assert_eq!(
+            refused.http_status(),
+            404,
+            "case {case:?}: expected HTTP 404, got {}",
+            refused.http_status()
+        );
+    }
+}
+
+/// RULE: `RetentionPeriodInDays` is modelled `@range 1..365`, so over the wire an
+/// update naming a value inside the range is applied and one outside it is
+/// refused with this service's modelled `InvalidInputException` (400) before any
+/// handler runs — leaving the bus on the last value that was accepted.
+#[tokio::test]
+async fn the_modelled_retention_range_bounds_an_update_over_the_wire() {
+    let wire = Wire::new();
+    let created = wire
+        .ok::<CreateEventBus<InMemoryEngine>>(
+            &CreateEventBusInput {
+                name: "wire-update-bus".to_string(),
+                client_token: Some("a-wire-update-token".to_string()),
+                ..Default::default()
+            },
+            "create",
+        )
+        .await;
+    let arn = created
+        .event_bus_arn
+        .clone()
+        .expect("case \"create\": CreateEventBus must report an EventBusArn");
+
+    // Provisioning is asynchronous: poll for the CONDITION the update needs — the
+    // bus reporting ACTIVE — rather than waiting a fixed time.
+    let deadline = std::time::Instant::now() + POLL_DEADLINE;
+    loop {
+        let reported = wire
+            .ok::<DescribeEventBus<InMemoryEngine>>(
+                &DescribeEventBusInput {
+                    event_bus_arn: arn.clone(),
+                },
+                "describe while provisioning",
+            )
+            .await
+            .state;
+        if reported.as_deref() == Some("ACTIVE") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case \"provisioning\": the bus never reported ACTIVE, last reported {reported:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+
+    // Each published bound, and one past each: the bounds come from the modelled
+    // `@range` on `RetentionPeriodInDays`. A refused row also pins the error shape
+    // this service words a constraint refusal in, not merely "some 400".
+    for (case, days, expected_status, expected_code) in [
+        ("the lower bound", 1_i32, 200_u16, ""),
+        ("the upper bound", 365, 200, ""),
+        ("one below the lower bound", 0, 400, "InvalidInputException"),
+        ("one past the upper bound", 366, 400, "InvalidInputException"),
+    ] {
+        let (status, body) = wire
+            .call::<UpdateEventBus<InMemoryEngine>>(&UpdateEventBusInput {
+                event_bus_arn: arn.clone(),
+                storage_configuration: Some(StorageConfiguration {
+                    retention_period_in_days: Some(days),
+                }),
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(
+            status, expected_status,
+            "case {case:?}: UpdateEventBus with {days} days must answer {expected_status}, got \
+             {status} with body {body:?}"
+        );
+        if !expected_code.is_empty() {
+            // The CBOR envelope carries the error code as text, so the shape it
+            // names is readable in the body as sent.
+            let rendered = String::from_utf8_lossy(&body);
+            assert!(
+                rendered.contains(expected_code),
+                "case {case:?}: the refusal must name the modelled {expected_code}, got body \
+                 {rendered:?}"
+            );
+        }
+    }
+
+    // The refused rows wrote nothing, so the bus is on the last accepted value.
+    let described = wire
+        .ok::<DescribeEventBus<InMemoryEngine>>(
+            &DescribeEventBusInput {
+                event_bus_arn: arn.clone(),
+            },
+            "read back",
+        )
+        .await;
+    assert_eq!(
+        described
+            .storage_configuration
+            .as_ref()
+            .and_then(|config| config.retention_period_in_days),
+        Some(365),
+        "case \"read back\": the bus must hold the last accepted retention period, got {:?}",
+        described.storage_configuration
     );
 }
