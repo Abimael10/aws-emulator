@@ -4,8 +4,9 @@
 //!
 //! Reports the URL a repository serves ONE package format on — the address a package
 //! manager is pointed at. It is a projection of the repository's identity: the domain and
-//! its owning account, the region the request addressed, the format asked for and the
-//! repository's own name; and its AUTHORITY is the endpoint THIS emulator answers on
+//! its owning account, the region the request addressed, the endpoint type asked for, the
+//! format and the repository's own name; its AUTHORITY is the endpoint THIS emulator
+//! answers on and that identity travels in the PATH beneath it
 //! ([`crate::service::repository_data_plane::announced_repository_endpoint`]), because the
 //! host AWS publishes resolves away from this process. The identity comes from the STORED
 //! repository, so a domain or a repository this service does not hold is answered with

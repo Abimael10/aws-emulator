@@ -14,11 +14,10 @@
 //! 1. A repository's endpoint for a package format is built from the repository's own
 //!    stored identity and the region the request addressed, under the base this emulator is
 //!    reached at:
-//!    `<base>/<domain>-<domainOwner>.d.codeartifact.<region>.amazonaws.com/<format>/<repository>/`,
-//!    on the `on.aws` suffix when `endpointType` is `dualstack` — so it is reported for
-//!    EVERY modelled `PackageFormat` and agrees with what `DescribeRepository` reports
-//!    about the same repository. That the announced URL is an address a client can DIAL is
-//!    `tests/all/announced_repository_endpoint.rs`.
+//!    `<base>/_aws/codeartifact/<region>/<endpointType>/<domain>-<domainOwner>/<format>/<repository>/`
+//!    — so it is reported for EVERY modelled `PackageFormat` and agrees with what
+//!    `DescribeRepository` reports about the same repository. That the announced URL is an
+//!    address a client can DIAL is `tests/all/announced_repository_endpoint.rs`.
 //! 2. `endpointType` is optional and defaults to `ipv4`.
 //! 3. Reporting an endpoint resolves a resource: a domain or a repository the service
 //!    does not hold (including a domain pinned to another `domainOwner`) is
@@ -85,22 +84,11 @@ fn endpoint_of(answer: &Answer) -> String {
         .to_string()
 }
 
-/// The host suffix an `endpointType` selects. `dualstack` is the one documented
-/// alternative; every other legal value (today only `ipv4`) is the standard regional
-/// host.
-fn host_suffix(endpoint_type: &str) -> &'static str {
-    if endpoint_type == "dualstack" {
-        "on.aws"
-    } else {
-        "amazonaws.com"
-    }
-}
-
 /// The endpoint rule, as one string: what this emulator announces for a repository
 /// addressed in `region`. The authority is the base the emulator is reachable at — these
 /// suites drive an unserved router, which reports
-/// [`smithy_server_runtime::UNSERVED_URL_BASE`] — and AWS's own published host travels in
-/// the path ahead of the two documented segments.
+/// [`smithy_server_runtime::UNSERVED_URL_BASE`] — and what AWS's own published host carries
+/// travels in the path ahead of the two documented segments.
 fn expected_endpoint(
     region: &str,
     domain: &str,
@@ -110,9 +98,8 @@ fn expected_endpoint(
     endpoint_type: &str,
 ) -> String {
     format!(
-        "{}/{domain}-{owner}.d.codeartifact.{region}.{}/{format}/{repository}/",
+        "{}/_aws/codeartifact/{region}/{endpoint_type}/{domain}-{owner}/{format}/{repository}/",
         smithy_server_runtime::UNSERVED_URL_BASE,
-        host_suffix(endpoint_type)
     )
 }
 
@@ -208,16 +195,16 @@ async fn every_package_format_reports_the_endpoint_of_the_stored_repository() {
             }
         }
 
-        // A dual-stack endpoint differs from the default one ONLY in its host suffix: the
-        // same repository, the same two path segments.
+        // A dual-stack endpoint differs from the default one ONLY in the `EndpointType` it
+        // names: the same repository, the same two documented path segments.
         let ipv4 = endpoint_of(&get_endpoint(&router, &domain, &repository, "npm", Some("ipv4")).await);
         let dualstack =
             endpoint_of(&get_endpoint(&router, &domain, &repository, "npm", Some("dualstack")).await);
         assert_eq!(
-            ipv4.replace(".amazonaws.com/", ".on.aws/"),
+            ipv4.replace("/ipv4/", "/dualstack/"),
             dualstack,
-            "case {label:?}: dualstack must be the same endpoint on the on.aws suffix, \
-             got {ipv4:?} and {dualstack:?}"
+            "case {label:?}: dualstack must be the same endpoint under the dualstack \
+             endpoint type, got {ipv4:?} and {dualstack:?}"
         );
     }
 }

@@ -11,11 +11,13 @@
 //! not:
 //!
 //! * the three addressings a client reaches an endpoint through ([`resolve`]) — the
-//!   domain's published host carried in the PATH, which is the address this service
-//!   ANNOUNCES ([`announced_repository_endpoint`]) because it is the one a client on this
-//!   machine can dial; that same host as the request's HOST, for a client whose DNS or
-//!   proxy for `<domain>-<account>.d.codeartifact.<region>.<suffix>` points here; and the
-//!   bare `/<format>/<repository>/` path on the emulator's own endpoint;
+//!   endpoint this emulator ANNOUNCES ([`announced_repository_endpoint`]), which is rooted
+//!   on the address this process answers on and carries the domain's identity in the PATH,
+//!   under the reserved namespace segment every data plane served at the front door sits
+//!   beneath, because that is the one address a client on this machine can dial; the host
+//!   AWS publishes (`<domain>-<account>.d.codeartifact.<region>.<suffix>`) as the request's
+//!   HOST, for a client whose DNS or proxy for it points here; and the bare
+//!   `/<format>/<repository>/` path on the emulator's own endpoint;
 //! * the credential: a bearer (or HTTP Basic) presentation of the token
 //!   `GetAuthorizationToken` minted, resolved against the tokens this service remembers
 //!   minting ([`authenticated_principal`]) — a token this service did not mint, one the
@@ -45,9 +47,16 @@ use crate::state::{
 const ENDPOINT_HOST_INFIX: &str = "d.codeartifact.";
 
 /// How many digits an account id carries (`AccountId` is modelled `^[0-9]{12}$`), which is
-/// what makes the domain label of an endpoint host splittable: everything before the last
+/// what makes the domain label of an endpoint address splittable: everything before the last
 /// `-` is the domain name, and those digits are the owning account.
 const ACCOUNT_ID_DIGITS: usize = 12;
+
+/// The segment that names THIS service's data plane behind the reserved path namespace
+/// every data plane this emulator serves on its OWN endpoint sits under
+/// (`service_common::data_plane_addressing::EMULATOR_PATH_NAMESPACE`): the service's own
+/// signing name, so a path under that namespace naming another plane is never read as this
+/// one's.
+const DATA_PLANE_SEGMENT: &str = crate::state::SERVICE_SIGNING_NAME;
 
 /// The media type a JSON document — a packument, a PEP 691 index, every error body — is
 /// served with.
@@ -126,13 +135,12 @@ pub fn resolve<Eng: Send + Sync + 'static>(
     addressed: &Addressed<'_>,
     format: &str,
 ) -> Option<Resolved> {
-    // The first segment is the published endpoint host when the request CARRIES that host
-    // in the path, and the format segment otherwise; the endpoint's own path is whatever
-    // follows it.
-    let (first, rest) = first_segment(addressed.path)?;
-    let named_in_path = endpoint_host_domain(first);
-    let endpoint_path = match named_in_path {
-        Some(_) => rest,
+    // The path begins with the prefix of an ANNOUNCED endpoint when the request carries the
+    // domain's identity there, and with the format segment otherwise; the endpoint's own
+    // path is whatever follows it.
+    let announced = announced_domain_in_path(addressed.path);
+    let endpoint_path = match announced {
+        Some((_, rest)) => rest,
         None => addressed.path,
     };
     let (addressed_format, rest) = first_segment(endpoint_path)?;
@@ -145,18 +153,28 @@ pub fn resolve<Eng: Send + Sync + 'static>(
     }
     let state = service_state(engine)?;
     let store = state.lock();
-    let endpoint_prefix = match named_in_path {
-        Some(_) => format!("/{first}/{format}/{repository}"),
+    let endpoint_prefix = match announced {
+        // The prefix the request itself carried, so a URL a plane publishes back stays under
+        // the very address the client reached — read as the span of the path ahead of the
+        // endpoint's own path rather than recomposed from its parts, and read with
+        // `str::get` so no request-derived length can index out of the path.
+        Some((_, rest)) => format!(
+            "{}/{format}/{repository}",
+            addressed
+                .path
+                .get(..addressed.path.len().saturating_sub(rest.len()))
+                .unwrap_or_default()
+        ),
         None => format!("/{format}/{repository}"),
     };
 
-    // The published endpoint host CARRIED IN THE PATH, which is the addressing this service
-    // announces ([`announced_repository_endpoint`]): a client on this machine resolves none
-    // of AWS's hosts, so it reaches the emulator's own endpoint and carries in the path what
-    // it cannot carry in the host. The host names the domain and the account that owns it,
+    // The ANNOUNCED endpoint, whose PATH carries the domain's identity
+    // ([`announced_repository_endpoint`]): a client on this machine resolves none of AWS's
+    // hosts, so it reaches the emulator's own endpoint and carries in the path what it
+    // cannot carry in the host. That identity names the domain and the account that owns it,
     // so the request addresses exactly that domain's repository whichever address this
     // process was reached at.
-    if let Some((domain, account)) = named_in_path {
+    if let Some(((domain, account), _)) = announced {
         let held = store.domain(domain, Some(account))?;
         if !held.repositories.contains_key(repository) {
             return None;
@@ -226,22 +244,61 @@ pub fn resolve<Eng: Send + Sync + 'static>(
 /// is the `EndpointType` that selects it). This emulator announces its OWN address instead
 /// ([`announced_repository_endpoint`]), because that is the one a client here can dial; the
 /// published form is still resolved so that an operator who points a client's DNS or proxy
-/// for it at this process reaches the repository it names. The account is the last
-/// `-`-separated field of the first label and the domain is everything before it. A
-/// `DomainName` is
-/// modelled `^[a-z][a-z0-9\-]{0,48}[a-z0-9]$` and so may itself contain `-`, which is why
-/// the split is from the RIGHT and why the account field has to be
-/// [`ACCOUNT_ID_DIGITS`] digits to be read as one.
+/// for it at this process reaches the repository it names.
 pub fn endpoint_host_domain(host: &str) -> Option<(&str, &str)> {
     let (label, rest) = host.split_once('.')?;
     let region_and_suffix = rest.strip_prefix(ENDPOINT_HOST_INFIX)?;
     if region_and_suffix.is_empty() {
         return None;
     }
+    domain_label_parts(label)
+}
+
+/// The domain and the owning account the label `<domain>-<account>` names, or `None` for a
+/// label that names neither — the one reading of the identity
+/// [`crate::state::domain_endpoint_label`] composes, whether an address carries it as the
+/// first label of a HOST ([`endpoint_host_domain`]) or as a path SEGMENT
+/// ([`announced_domain_in_path`]).
+///
+/// The account is the last `-`-separated field and the domain is everything before it: a
+/// `DomainName` is modelled `^[a-z][a-z0-9\-]{0,48}[a-z0-9]$` and so may itself contain
+/// `-`, which is why the split is from the RIGHT and why the account field has to be
+/// [`ACCOUNT_ID_DIGITS`] digits (`AccountId` is `^[0-9]{12}$`) to be read as one.
+fn domain_label_parts(label: &str) -> Option<(&str, &str)> {
     let (domain, account) = label.rsplit_once('-')?;
     let account_shaped =
         account.len() == ACCOUNT_ID_DIGITS && account.bytes().all(|byte| byte.is_ascii_digit());
     (!domain.is_empty() && account_shaped).then_some((domain, account))
+}
+
+/// The domain and the owning account the PREFIX of an announced endpoint path names, with
+/// the endpoint's own path that follows it — and `None` for a path that is not one this
+/// service announces.
+///
+/// The inverse of [`announced_endpoint_prefix`], and the reader of the addressing this
+/// service publishes: a request that carried the identity in the path addresses exactly the
+/// domain it names, however the client reached this process. The region and the
+/// `EndpointType` are read as the prefix states them, so a path that names neither — or
+/// names a plane that is not this service's — is no announced endpoint of this service.
+fn announced_domain_in_path(path: &str) -> Option<((&str, &str), &str)> {
+    let (namespace, rest) = first_segment(path)?;
+    if namespace != ::service_common::data_plane_addressing::EMULATOR_PATH_NAMESPACE {
+        return None;
+    }
+    let (plane, rest) = first_segment(rest)?;
+    if plane != DATA_PLANE_SEGMENT {
+        return None;
+    }
+    let (region, rest) = first_segment(rest)?;
+    if region.is_empty() {
+        return None;
+    }
+    let (endpoint_type, rest) = first_segment(rest)?;
+    if !crate::ops::types::ENDPOINT_TYPE_VALUES.contains(&endpoint_type) {
+        return None;
+    }
+    let (label, rest) = first_segment(rest)?;
+    Some((domain_label_parts(label)?, rest))
 }
 
 // ---------------------------------------------------------------------------
@@ -257,12 +314,12 @@ pub fn endpoint_host_domain(host: &str) -> Option<(&str, &str)> {
 /// (`<domain>-<account>.d.codeartifact.<region>.<suffix>`,
 /// [`crate::state::published_endpoint_host`]) resolves away from this process — to public
 /// AWS, where the domain and the repository do not exist, or, with no egress, to nothing at
-/// all. So the authority is the endpoint this emulator is reached at
-/// ([`announced_base`]), and the published host is carried in the PATH ahead of the
-/// `/<format>/<repository>/` segments AWS documents
-/// ([`crate::state::repository_endpoint_path`]) — which is the first addressing [`resolve`]
-/// serves. Every part AWS varies is therefore still in the URL, and the address is a
-/// client's to dial.
+/// all. So the authority is the endpoint this emulator is reached at ([`announced_base`]),
+/// what AWS's host carried travels in the PATH beneath it
+/// ([`announced_endpoint_prefix`]), and the `/<format>/<repository>/` segments AWS documents
+/// ([`crate::state::repository_endpoint_path`]) end it — which is the first addressing
+/// [`resolve`] serves. Every part AWS varies is therefore still in the URL, and the address
+/// is a client's to dial.
 pub fn announced_repository_endpoint(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -273,10 +330,34 @@ pub fn announced_repository_endpoint(
     repository: &str,
 ) -> String {
     format!(
-        "{}/{}{}",
+        "{}{}{}",
         announced_base(ctx),
-        crate::state::published_endpoint_host(region, domain, domain_owner, endpoint_type),
+        announced_endpoint_prefix(region, endpoint_type, domain, domain_owner),
         crate::state::repository_endpoint_path(format, repository)
+    )
+}
+
+/// The path prefix an announced repository endpoint carries ahead of the documented
+/// `/<format>/<repository>/` segments: `/_aws/codeartifact/<region>/<endpointType>` and the
+/// domain's identity ([`crate::state::domain_endpoint_label`]).
+///
+/// It carries what AWS's published host carries — the Region, the endpoint type that host's
+/// suffix selects, the domain and the account that owns it — moved out of a name this
+/// process cannot answer on and into the path, behind the reserved namespace segment every
+/// data plane this emulator serves on its own endpoint sits under
+/// (`service_common::data_plane_addressing::EMULATOR_PATH_NAMESPACE`) and the segment naming
+/// this service's plane. So two domains' endpoints stay distinct addresses, and neither is
+/// a hostname AWS publishes.
+fn announced_endpoint_prefix(
+    region: &str,
+    endpoint_type: &str,
+    domain: &str,
+    domain_owner: &str,
+) -> String {
+    format!(
+        "/{}/{DATA_PLANE_SEGMENT}/{region}/{endpoint_type}/{}",
+        ::service_common::data_plane_addressing::EMULATOR_PATH_NAMESPACE,
+        crate::state::domain_endpoint_label(domain, domain_owner)
     )
 }
 
@@ -832,6 +913,78 @@ mod tests {
             assert_eq!(
                 named, *expected,
                 "case {case:?}: expected {expected:?}, got {named:?}"
+            );
+        }
+    }
+
+    /// RULE: the address this service announces carries the domain's identity in its PATH,
+    /// and the reading of that path is the inverse of the composition — so an endpoint this
+    /// service announced resolves back to exactly the domain and account it names, and a
+    /// path that is not one it announced resolves to none.
+    #[test]
+    fn an_announced_endpoint_path_names_the_domain_and_the_account_that_owns_it() {
+        // The rows span what the prefix generalises over: both modelled `EndpointType`
+        // values, a region other than the default, a domain name that itself carries `-`,
+        // and the endpoint path that follows the prefix.
+        let rows: &[(&str, &str, &str, &str, &str, &str)] = &[
+            (
+                "the IPv4 endpoint of a plain domain",
+                "us-west-2",
+                crate::state::DEFAULT_ENDPOINT_TYPE,
+                "acme",
+                "000000000000",
+                "/npm/releases/",
+            ),
+            (
+                "the dual-stack endpoint",
+                "eu-west-1",
+                crate::state::ENDPOINT_TYPE_DUALSTACK,
+                "acme",
+                "123456789012",
+                "/generic/Releases.one/",
+            ),
+            (
+                "a domain name carrying a hyphen",
+                "ap-south-1",
+                crate::state::DEFAULT_ENDPOINT_TYPE,
+                "sim2real-ca-dom",
+                "123456789012",
+                "/pypi/wheels/simple/",
+            ),
+        ];
+        for (case, region, endpoint_type, domain, account, endpoint_path) in rows {
+            let prefix = announced_endpoint_prefix(region, endpoint_type, domain, account);
+            let path = format!("{prefix}{endpoint_path}");
+            let read = announced_domain_in_path(&path);
+            assert_eq!(
+                read,
+                Some(((*domain, *account), *endpoint_path)),
+                "case {case:?}: expected the domain and account of {path:?}, got {read:?}"
+            );
+        }
+
+        // And the paths that announce no endpoint of this service: another plane's, an
+        // unknown endpoint type, a label naming no account, and the bare endpoint path.
+        let unnamed: &[(&str, &str)] = &[
+            (
+                "another service's plane",
+                "/_aws/s3/us-west-2/ipv4/acme-000000000000/npm/releases/",
+            ),
+            (
+                "an endpoint type outside the modelled set",
+                "/_aws/codeartifact/us-west-2/ipv6/acme-000000000000/npm/releases/",
+            ),
+            (
+                "a label whose last field is not an account id",
+                "/_aws/codeartifact/us-west-2/ipv4/acme-notanaccount/npm/releases/",
+            ),
+            ("no namespace at all", "/npm/releases/"),
+        ];
+        for (case, path) in unnamed {
+            let read = announced_domain_in_path(path);
+            assert!(
+                read.is_none(),
+                "case {case:?}: expected {path:?} to name no announced endpoint, got {read:?}"
             );
         }
     }

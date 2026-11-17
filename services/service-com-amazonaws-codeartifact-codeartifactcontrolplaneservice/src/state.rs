@@ -3100,6 +3100,18 @@ pub const DEFAULT_ENDPOINT_TYPE: &str = "ipv4";
 /// The `EndpointType` value that selects the dual-stack (IPv4/IPv6) host.
 pub const ENDPOINT_TYPE_DUALSTACK: &str = "dualstack";
 
+/// The label a repository endpoint's address carries a DOMAIN's identity in:
+/// `<domain>-<domainOwner>`, the domain's own name and the account that owns it.
+///
+/// It is the first label of the host AWS publishes ([`published_endpoint_host`]) and the
+/// path segment the address this emulator announces carries that identity as
+/// ([`crate::service::repository_data_plane::announced_repository_endpoint`]), so one
+/// composition serves both addressings and the one reading of it
+/// (`crate::service::repository_data_plane::domain_label_parts`) is its inverse.
+pub fn domain_endpoint_label(domain: &str, domain_owner: &str) -> String {
+    format!("{domain}-{domain_owner}")
+}
+
 /// The host AWS publishes a repository endpoint at:
 /// `<domain>-<domainOwner>.d.codeartifact.<region>.<suffix>`, with `amazonaws.com` for the
 /// IPv4 endpoint and `on.aws` for the dual-stack one, which is what `endpointType` selects
@@ -3108,9 +3120,10 @@ pub const ENDPOINT_TYPE_DUALSTACK: &str = "dualstack";
 ///
 /// It is built entirely from the repository's identity — the domain and its owning account
 /// name the first label, the region names the regional endpoint the request was addressed
-/// to. This emulator cannot ANSWER on that name, so the endpoint it announces carries it in
-/// the path instead ([`crate::service::repository_data_plane::announced_repository_endpoint`]),
-/// and the data plane resolves it there and as the request's own host.
+/// to. This emulator cannot ANSWER on that name, so it ANNOUNCES its own endpoint instead
+/// ([`crate::service::repository_data_plane::announced_repository_endpoint`]); this host is
+/// still resolved as a request's own host, for a client whose DNS or proxy for it points
+/// here.
 pub fn published_endpoint_host(
     region: &str,
     domain: &str,
@@ -3122,7 +3135,10 @@ pub fn published_endpoint_host(
     } else {
         "amazonaws.com"
     };
-    format!("{domain}-{domain_owner}.d.codeartifact.{region}.{suffix}")
+    format!(
+        "{}.d.codeartifact.{region}.{suffix}",
+        domain_endpoint_label(domain, domain_owner)
+    )
 }
 
 /// The two path segments a repository's endpoint for one package format is served under,

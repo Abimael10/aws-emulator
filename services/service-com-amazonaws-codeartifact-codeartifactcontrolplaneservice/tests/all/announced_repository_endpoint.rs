@@ -5,17 +5,19 @@
 //! The RULE under test: a URL this emulator hands a client to send later requests to is
 //! rooted on the endpoint THIS emulator answers on — the address the request reached it at,
 //! or the base it is served at — and the resource's own identity travels in the PATH
-//! beneath it. For a repository endpoint that path is the host AWS publishes
-//! (`<domain>-<domainOwner>.d.codeartifact.<region>.<suffix>`, on `on.aws` for the
-//! `dualstack` `EndpointType`) followed by the two documented segments
-//! `/<format>/<repository>/`. A URL on AWS's own authority would resolve away from this
-//! process, so nothing a client then sends to it — an npm publish, a pip install — would
-//! ever arrive.
+//! beneath it, under the reserved namespace segment a data plane served at the front door
+//! sits beneath (`/_aws/<plane>/…`). For a repository endpoint that path carries what AWS's
+//! own published host carries — the region, the `EndpointType` its suffix selects, and the
+//! `<domain>-<domainOwner>` identity of the domain — followed by the two documented
+//! segments `/<format>/<repository>/`. A URL on a hostname AWS publishes would resolve away
+//! from this process, so nothing a client then sends to it — an npm publish, a pip install
+//! — would ever arrive.
 //!
 //! Each case is a TABLE rather than one example, spanning what the rule generalises over:
 //!
 //! 1. the base the emulator is reachable at, the `EndpointType` asked for and every
-//!    modelled `PackageFormat`;
+//!    modelled `PackageFormat` — with no part of the announced URL naming a zone AWS
+//!    publishes its own endpoints in;
 //! 2. the address the REQUEST reached, which is what a client configured with one local
 //!    endpoint URL resolves — against a request that addressed the service's own published
 //!    host, which resolves nothing here and is answered the served base;
@@ -119,18 +121,10 @@ async fn announced_endpoint(
     announced(&answer, &format!("{domain}/{repository}/{format}"))
 }
 
-/// The host suffix an `EndpointType` names: `dualstack` is the one documented alternative,
-/// and every other legal value (today only `ipv4`) is the standard regional host.
-fn host_suffix(endpoint_type: &str) -> &'static str {
-    if endpoint_type == "dualstack" {
-        "on.aws"
-    } else {
-        "amazonaws.com"
-    }
-}
-
-/// The rule, as one string: the base the emulator is reached at, then AWS's published host
-/// for this repository, then the two documented path segments.
+/// The rule, as one string: the base the emulator is reached at, then the reserved
+/// namespace segment and this service's plane, then what AWS's published host carries — the
+/// region, the `EndpointType` and the domain's `<domain>-<domainOwner>` identity — then the
+/// two documented path segments.
 fn expected_endpoint(
     base: &str,
     region: &str,
@@ -140,10 +134,7 @@ fn expected_endpoint(
     repository: &str,
     endpoint_type: &str,
 ) -> String {
-    format!(
-        "{base}/{domain}-{owner}.d.codeartifact.{region}.{}/{format}/{repository}/",
-        host_suffix(endpoint_type)
-    )
+    format!("{base}/_aws/codeartifact/{region}/{endpoint_type}/{domain}-{owner}/{format}/{repository}/")
 }
 
 /// The `(authority, path)` of an announced URL — what a client splits it into to dial it.
@@ -244,6 +235,19 @@ async fn the_announced_endpoint_is_rooted_on_the_base_the_emulator_is_reached_at
                     path.ends_with(&format!("/{format}/{repository}/")),
                     "case {case:?}: expected the documented endpoint path, got {path:?}"
                 );
+
+                // And NO part of the URL names a host AWS publishes an endpoint at: the
+                // domain's identity travels as a path segment, so neither the authority a
+                // client dials nor anything beneath it is a name that resolves away from
+                // this process. The zones are the shared list of AWS's own endpoint zones
+                // (`service_common::data_plane_addressing::AWS_ENDPOINT_DNS_SUFFIXES`).
+                for zone in service_common::data_plane_addressing::AWS_ENDPOINT_DNS_SUFFIXES {
+                    assert!(
+                        !url.contains(zone),
+                        "case {case:?}: the announced URL names the AWS endpoint zone \
+                         {zone:?}, which this emulator does not serve: {url:?}"
+                    );
+                }
             }
         }
     }
@@ -286,9 +290,7 @@ async fn the_announced_endpoint_leads_back_to_the_address_the_request_reached() 
         );
         assert_eq!(
             path,
-            format!(
-                "/{domain}-{ACCOUNT}.d.codeartifact.{REGION}.amazonaws.com/npm/{repository}/"
-            ),
+            format!("/_aws/codeartifact/{REGION}/ipv4/{domain}-{ACCOUNT}/npm/{repository}/"),
             "case {case:?}: expected the documented endpoint path, got {url:?}"
         );
     }
