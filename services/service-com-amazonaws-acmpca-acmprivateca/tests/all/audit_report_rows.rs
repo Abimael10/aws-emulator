@@ -15,13 +15,19 @@
 //! that named none is the one `IssueCertificateRequest$TemplateArn` documents as the
 //! default: a row states what the certificate carries, not what the request spelled out.
 //!
+//! A row records REVOCATION state only for a certificate that has been revoked: `revokedAt`
+//! and `revocationReason` are stated, with the instant and the reason the revocation
+//! carried, for a certificate `RevokeCertificate` was called for, and are absent from the row
+//! of every certificate that was not — presence is what a consumer of the report reads.
+//!
 //! And the absence of a report is refused with the sentence Amazon Web Services Private CA
 //! answers for that class, which is fixed text in full.
 //!
 //! The rows span what the rule generalises over: certificates whose serials are different
-//! numbers, a certificate that has been revoked and one that has not, and a template named
-//! explicitly against one left out. The serial a row is checked against is read off the
-//! certificate PEM the service hands out, never off anything this suite chose.
+//! numbers, certificates that have been revoked — for different reasons — and ones that have
+//! not, and a template named explicitly against one left out. The serial a row is checked
+//! against is read off the certificate PEM the service hands out, never off anything this
+//! suite chose.
 
 use std::time::{Duration, Instant};
 
@@ -69,8 +75,9 @@ struct Issued {
     template_arn: Option<&'static str>,
     /// The `TemplateArn` the row must state.
     stated_template_arn: &'static str,
-    /// Whether the certificate is revoked after it has been issued.
-    revoked: bool,
+    /// The `RevocationReason` the certificate is revoked with after it has been issued, or
+    /// `None` for one that is left alone.
+    revocation_reason: Option<&'static str>,
 }
 
 /// Every certificate the audited CA of this suite issues.
@@ -80,22 +87,33 @@ fn issued() -> Vec<Issued> {
             case: "a certificate issued under the default template",
             template_arn: None,
             stated_template_arn: DEFAULT_TEMPLATE_ARN,
-            revoked: false,
+            revocation_reason: None,
         },
         Issued {
             case: "a certificate issued under a named template",
             template_arn: Some(CLIENT_AUTH_TEMPLATE_ARN),
             stated_template_arn: CLIENT_AUTH_TEMPLATE_ARN,
-            revoked: false,
+            revocation_reason: None,
         },
         Issued {
             case: "a revoked certificate",
             template_arn: Some(DEFAULT_TEMPLATE_ARN),
             stated_template_arn: DEFAULT_TEMPLATE_ARN,
-            revoked: true,
+            revocation_reason: Some("KEY_COMPROMISE"),
+        },
+        // A second revoked row, for another reason: what a row states is the reason the
+        // revocation carried, not one reason the report is written with.
+        Issued {
+            case: "a certificate revoked because its subject ceased operation",
+            template_arn: Some(CLIENT_AUTH_TEMPLATE_ARN),
+            stated_template_arn: CLIENT_AUTH_TEMPLATE_ARN,
+            revocation_reason: Some("CESSATION_OF_OPERATION"),
         },
     ]
 }
+
+/// The two members a row states only for a certificate that has been revoked.
+const REVOCATION_MEMBERS: &[&str] = &["revokedAt", "revocationReason"];
 
 /// The serial a certificate carries, as the octet pairs a client reads off it: the DER
 /// integer's bytes, lower-case hexadecimal, colon-separated — what `openssl x509 -serial`
@@ -279,7 +297,7 @@ async fn a_report_row_states_the_serial_in_the_octet_pairs_a_client_reads() {
         let issued = emulator.ok(row.case, "IssueCertificate", &body).await;
         let certificate_arn = string(&issued, "CertificateArn", row.case);
         let pem = poll_for_certificate(&emulator, row.case, &arn, &certificate_arn).await;
-        if row.revoked {
+        if let Some(reason) = row.revocation_reason {
             emulator
                 .ok(
                     row.case,
@@ -289,7 +307,7 @@ async fn a_report_row_states_the_serial_in_the_octet_pairs_a_client_reads() {
                         // The serial a client holds, in the rendering it read off the
                         // certificate: the same rendering the report states.
                         "CertificateSerial": serial_of(&certificate_of(&pem, row.case)),
-                        "RevocationReason": "KEY_COMPROMISE",
+                        "RevocationReason": reason,
                     }),
                 )
                 .await;
@@ -353,11 +371,12 @@ async fn a_report_row_states_the_serial_in_the_octet_pairs_a_client_reads() {
              got {entry:?}"
         );
 
-        // And the revocation, for the row that has one.
-        if row.revoked {
+        // And the revocation, for the row that has one — a report records the revocation state
+        // of a certificate that HAS one, so the two members are PRESENT only there.
+        if let Some(reason) = row.revocation_reason {
             assert_eq!(
                 string(entry, "revocationReason", case),
-                "KEY_COMPROMISE",
+                reason,
                 "case {case:?}: a revoked certificate's row carries its reason, got {entry:?}"
             );
             assert!(
@@ -365,12 +384,13 @@ async fn a_report_row_states_the_serial_in_the_octet_pairs_a_client_reads() {
                 "case {case:?}: a revoked certificate's row carries when, got {entry:?}"
             );
         } else {
-            assert_eq!(
-                string(entry, "revocationReason", case),
-                "",
-                "case {case:?}: a certificate that was not revoked carries no reason, \
-                 got {entry:?}"
-            );
+            for member in REVOCATION_MEMBERS {
+                assert!(
+                    entry.get(member).is_none(),
+                    "case {case:?}: a certificate that was not revoked states no {member:?}, \
+                     got {entry:?}"
+                );
+            }
         }
     }
 
@@ -394,6 +414,14 @@ async fn a_report_row_states_the_serial_in_the_octet_pairs_a_client_reads() {
          got {:?}",
         own[0]
     );
+    // The CA's own certificate was never revoked either, so its row states no revocation.
+    for member in REVOCATION_MEMBERS {
+        assert!(
+            own[0].get(member).is_none(),
+            "case {suite:?}: the CA's own row states no {member:?}, got {:?}",
+            own[0]
+        );
+    }
 }
 
 /// The rendering itself, over the spellings a serial reaches this service in.

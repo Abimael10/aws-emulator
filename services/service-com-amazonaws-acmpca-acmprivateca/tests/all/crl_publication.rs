@@ -20,6 +20,10 @@
 //! Every call goes over the wire through the two-service harness in
 //! [`super::crl_bucket_resolution`]: the private CA and the object storage it publishes to,
 //! mounted on ONE engine, so what the assertions read is what the CA itself deposited.
+//!
+//! The same configuration decides what the certificates the CA ISSUES say about revocation —
+//! the CRL distribution point and the OCSP responder they name — which is the rule the last
+//! suite below is about.
 
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -31,14 +35,15 @@ use sha2::Digest;
 use x509_cert::crl::CertificateList;
 use x509_cert::der::asn1::{Any, OctetString};
 use x509_cert::der::{Decode, DecodePem};
-use x509_cert::ext::pkix::AuthorityKeyIdentifier;
+use x509_cert::ext::pkix::name::{DistributionPointName, GeneralName};
+use x509_cert::ext::pkix::{AuthorityInfoAccessSyntax, AuthorityKeyIdentifier, CrlDistributionPoints};
 use x509_cert::time::Time;
 use x509_cert::{Certificate, Version};
 
 use crate::crl_bucket_resolution::Emulator;
 use crate::private_ca_lifecycle::{
     blob, ca_certificate_for, csr_pem, root_ca_request, string, subject_common_name,
-    wait_for_the_clock,
+    wait_for_the_clock, REGION,
 };
 
 /// The `cRLNumber` CRL extension (RFC 5280 section 5.2.3).
@@ -49,6 +54,18 @@ const CRL_REASON_OID: &str = "2.5.29.21";
 
 /// The `authorityKeyIdentifier` CRL extension (RFC 5280 section 5.2.1).
 const AUTHORITY_KEY_IDENTIFIER_OID: &str = "2.5.29.35";
+
+/// The `cRLDistributionPoints` certificate extension (RFC 5280 section 4.2.1.13), which is
+/// where a certificate says the CRL covering it is fetched from.
+const CRL_DISTRIBUTION_POINTS_OID: &str = "2.5.29.31";
+
+/// The `authorityInformationAccess` certificate extension (RFC 5280 section 4.2.2.1), which
+/// is where a certificate says its issuer answers status requests.
+const AUTHORITY_INFORMATION_ACCESS_OID: &str = "1.3.6.1.5.5.7.1.1";
+
+/// The access method an `authorityInformationAccess` description names for an OCSP responder
+/// (`id-ad-ocsp`, RFC 5280 section 4.2.2.1).
+const OCSP_ACCESS_METHOD_OID: &str = "1.3.6.1.5.5.7.48.1";
 
 /// The `subjectKeyIdentifier` certificate extension (RFC 5280 section 4.2.1.2), which is
 /// where the identifier the CRL's authority key identifier names is published.
@@ -711,5 +728,287 @@ async fn a_ca_without_enabled_crls_publishes_nothing() {
             status, expected,
             "case {case:?}: expected the CRL object to answer {expected}, got {status}"
         );
+    }
+}
+
+/// One row of the revocation-endpoint table: the configuration a CA is created with, and the
+/// endpoints the certificates it then issues must name.
+struct EndpointRow {
+    /// The case every assertion about this CA names.
+    case: &'static str,
+    /// The CA's subject common name, which is also what its resources are named after.
+    common_name: &'static str,
+    /// The `RevocationConfiguration` the CA is created with, when it is created with one.
+    revocation: Option<Value>,
+    /// The host and the folder the `cRLDistributionPoints` URI must name, or `None` when the
+    /// certificate must carry no such extension. The object's own name is the CA's id.
+    crl: Option<(String, &'static str)>,
+    /// The `id-ad-ocsp` URI the `authorityInformationAccess` extension must name, or `None`
+    /// when the certificate must carry no such extension.
+    ocsp: Option<String>,
+}
+
+/// The URI a `GeneralName` names, when it names one.
+fn uri_of(name: &GeneralName) -> Option<String> {
+    match name {
+        GeneralName::UniformResourceIdentifier(uri) => Some(uri.as_str().to_string()),
+        _ => None,
+    }
+}
+
+/// Every URI the `cRLDistributionPoints` extension of `certificate` names.
+fn crl_distribution_uris(certificate: &Certificate, case: &str) -> Vec<String> {
+    let Some(encoded) = certificate_extension(certificate, CRL_DISTRIBUTION_POINTS_OID) else {
+        return Vec::new();
+    };
+    let points = CrlDistributionPoints::from_der(&encoded).unwrap_or_else(|error| {
+        panic!("case {case:?}: expected DER CRL distribution points, got {error}")
+    });
+    points
+        .0
+        .iter()
+        .filter_map(|point| point.distribution_point.as_ref())
+        .flat_map(|name| match name {
+            DistributionPointName::FullName(names) => names.clone(),
+            _ => Vec::new(),
+        })
+        .filter_map(|name| uri_of(&name))
+        .collect()
+}
+
+/// Every OCSP responder URI the `authorityInformationAccess` extension of `certificate`
+/// names: the access locations of its `id-ad-ocsp` descriptions.
+fn ocsp_responder_uris(certificate: &Certificate, case: &str) -> Vec<String> {
+    let Some(encoded) = certificate_extension(certificate, AUTHORITY_INFORMATION_ACCESS_OID)
+    else {
+        return Vec::new();
+    };
+    let access = AuthorityInfoAccessSyntax::from_der(&encoded).unwrap_or_else(|error| {
+        panic!("case {case:?}: expected DER authority information access, got {error}")
+    });
+    access
+        .0
+        .iter()
+        .filter(|description| description.access_method.to_string() == OCSP_ACCESS_METHOD_OID)
+        .filter_map(|description| uri_of(&description.access_location))
+        .collect()
+}
+
+/// A CA's `RevocationConfiguration` is what the certificates it issues say about revocation:
+/// an enabled `CrlConfiguration` puts the CA's default CRL URL in the certificate's
+/// `cRLDistributionPoints` extension — "Your private CA by default copies the CNAME or the S3
+/// bucket name to the CRL Distribution Points extension of each certificate it issues"
+/// (`CrlConfiguration`) — unless `CrlDistributionPointExtensionConfiguration$OmitExtension`
+/// says otherwise, and an enabled `OcspConfiguration` puts its responder in the
+/// `authorityInformationAccess` extension as an `id-ad-ocsp` description.
+///
+/// The rows differ along what the rule generalises over: which mechanism the CA has enabled
+/// (each alone, both together, neither), whether the CRL URL is the bucket's or a configured
+/// `CustomCname`, the folder a `CustomPath` moves the object to, whether the distribution
+/// point is omitted, and whether the OCSP responder is the injected domain or a configured
+/// `OcspCustomCname`.
+#[tokio::test]
+async fn an_issued_certificate_names_the_revocation_endpoints_its_ca_publishes() {
+    let emulator = Emulator::new();
+    let bucket = "crl-endpoint-extensions";
+    assert_eq!(
+        emulator.create_bucket(bucket).await,
+        200,
+        "the bucket the CRL-enabled rows publish to is created through S3"
+    );
+
+    // The host a certificate names for a CRL in a bucket the configuration does not hide
+    // behind a CNAME: the bucket, addressed in the Region the CA signs in.
+    let bucket_host = format!("{bucket}.s3.{REGION}.amazonaws.com");
+    // The domain Amazon Web Services Private CA injects when no `OcspCustomCname` is
+    // configured ("By default, Amazon Web Services Private CA injects an Amazon Web Services
+    // domain into certificates being validated by the Online Certificate Status Protocol",
+    // `OcspConfiguration$OcspCustomCname`).
+    let injected_ocsp = format!("http://ocsp.acm-pca.{REGION}.amazonaws.com");
+
+    let rows: Vec<EndpointRow> = vec![
+        EndpointRow {
+            case: "CRLs enabled with no distribution-point configuration",
+            common_name: "cdp-default",
+            revocation: Some(crl_configuration(
+                bucket,
+                7,
+                None,
+                Some("BUCKET_OWNER_FULL_CONTROL"),
+            )),
+            crl: Some((bucket_host.clone(), "crl")),
+            ocsp: None,
+        },
+        EndpointRow {
+            case: "CRLs enabled behind a custom CNAME",
+            common_name: "cdp-cname",
+            revocation: Some(json!({
+                "CrlConfiguration": {
+                    "Enabled": true,
+                    "S3BucketName": bucket,
+                    "ExpirationInDays": 30,
+                    "CustomCname": "crl.pca.example.test",
+                }
+            })),
+            crl: Some(("crl.pca.example.test".to_string(), "crl")),
+            ocsp: None,
+        },
+        EndpointRow {
+            case: "CRLs enabled under a custom path",
+            common_name: "cdp-custom-path",
+            revocation: Some(crl_configuration(
+                bucket,
+                7,
+                Some("revocation/crls"),
+                Some("BUCKET_OWNER_FULL_CONTROL"),
+            )),
+            crl: Some((bucket_host.clone(), "revocation/crls")),
+            ocsp: None,
+        },
+        EndpointRow {
+            case: "CRLs enabled with the distribution point omitted",
+            common_name: "cdp-omitted",
+            revocation: Some(json!({
+                "CrlConfiguration": {
+                    "Enabled": true,
+                    "S3BucketName": bucket,
+                    "ExpirationInDays": 7,
+                    "CrlDistributionPointExtensionConfiguration": {"OmitExtension": true},
+                }
+            })),
+            crl: None,
+            ocsp: None,
+        },
+        EndpointRow {
+            case: "no revocation configuration at all",
+            common_name: "cdp-unconfigured",
+            revocation: None,
+            crl: None,
+            ocsp: None,
+        },
+        EndpointRow {
+            case: "both mechanisms disabled",
+            common_name: "cdp-disabled",
+            revocation: Some(json!({
+                "CrlConfiguration": {"Enabled": false},
+                "OcspConfiguration": {"Enabled": false},
+            })),
+            crl: None,
+            ocsp: None,
+        },
+        EndpointRow {
+            case: "OCSP enabled with a custom responder",
+            common_name: "ocsp-cname",
+            revocation: Some(json!({
+                "OcspConfiguration": {
+                    "Enabled": true,
+                    "OcspCustomCname": "ocsp.pca.example.test",
+                }
+            })),
+            crl: None,
+            ocsp: Some("http://ocsp.pca.example.test".to_string()),
+        },
+        EndpointRow {
+            case: "OCSP enabled with the injected responder",
+            common_name: "ocsp-default",
+            revocation: Some(json!({"OcspConfiguration": {"Enabled": true}})),
+            crl: None,
+            ocsp: Some(injected_ocsp.clone()),
+        },
+        EndpointRow {
+            case: "both mechanisms enabled",
+            common_name: "cdp-and-ocsp",
+            revocation: Some(json!({
+                "CrlConfiguration": {
+                    "Enabled": true,
+                    "S3BucketName": bucket,
+                    "ExpirationInDays": 7,
+                },
+                "OcspConfiguration": {"Enabled": true},
+            })),
+            crl: Some((bucket_host.clone(), "crl")),
+            ocsp: Some(injected_ocsp.clone()),
+        },
+    ];
+
+    // Issue every row's leaf first and wait for the clock ONCE, rather than once per row.
+    let csr = csr_pem("an-endpoint-leaf");
+    let mut issued: Vec<(&EndpointRow, String, String)> = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let (arn, _certificate) =
+            active_ca(&emulator, row.case, row.common_name, row.revocation.as_ref()).await;
+        let answered = emulator
+            .ok(
+                row.case,
+                "IssueCertificate",
+                &json!({
+                    "CertificateAuthorityArn": arn,
+                    "Csr": blob(&csr),
+                    "SigningAlgorithm": "SHA256WITHRSA",
+                    "Validity": {"Type": "DAYS", "Value": 30},
+                }),
+            )
+            .await;
+        let certificate_arn = string(&answered, "CertificateArn", row.case);
+        issued.push((row, arn, certificate_arn));
+    }
+    wait_for_the_clock();
+
+    for (row, arn, certificate_arn) in &issued {
+        let case = row.case;
+        let served = emulator
+            .ok(
+                case,
+                "GetCertificate",
+                &json!({"CertificateAuthorityArn": arn, "CertificateArn": certificate_arn}),
+            )
+            .await;
+        let certificate = Certificate::from_pem(string(&served, "Certificate", case).as_bytes())
+            .unwrap_or_else(|error| panic!("case {case:?}: the certificate parses: {error}"));
+
+        let carried = crl_distribution_uris(&certificate, case);
+        let expected: Vec<String> = row
+            .crl
+            .as_ref()
+            .map(|(host, folder)| {
+                vec![format!(
+                    "http://{host}/{folder}/{}.crl",
+                    certificate_authority_id(arn, case)
+                )]
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            carried, expected,
+            "case {case:?}: expected the distribution points {expected:?}, got {carried:?}"
+        );
+
+        let responders = ocsp_responder_uris(&certificate, case);
+        let expected: Vec<String> = row.ocsp.iter().cloned().collect();
+        assert_eq!(
+            responders, expected,
+            "case {case:?}: expected the OCSP responders {expected:?}, got {responders:?}"
+        );
+        // "Conforming CAs MUST mark this extension as non-critical" (RFC 5280 section
+        // 4.2.2.1), which a relying party that does not speak OCSP depends on.
+        if row.ocsp.is_some() {
+            let critical = certificate
+                .tbs_certificate
+                .extensions
+                .as_ref()
+                .and_then(|extensions| {
+                    extensions
+                        .iter()
+                        .find(|extension| {
+                            extension.extn_id.to_string() == AUTHORITY_INFORMATION_ACCESS_OID
+                        })
+                        .map(|extension| extension.critical)
+                });
+            assert_eq!(
+                critical,
+                Some(false),
+                "case {case:?}: expected a non-critical authorityInformationAccess extension, \
+                 got {critical:?}"
+            );
+        }
     }
 }

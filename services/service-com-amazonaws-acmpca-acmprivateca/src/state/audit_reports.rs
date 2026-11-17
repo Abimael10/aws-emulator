@@ -130,7 +130,6 @@ pub fn audit_report_body(ca: &CertificateAuthorityRecord, format: &str) -> Vec<u
         .collect();
     ::serde_json::Value::Array(rows).to_string().into_bytes()
 }
-
 /// The columns of one audit-report entry, in the order a report states them.
 const AUDIT_REPORT_COLUMNS: &[&str] = &[
     "awsAccountId",
@@ -140,10 +139,19 @@ const AUDIT_REPORT_COLUMNS: &[&str] = &[
     "notBefore",
     "notAfter",
     "issuedAt",
-    "revokedAt",
-    "revocationReason",
+    REVOKED_AT_COLUMN,
+    REVOCATION_REASON_COLUMN,
     "templateArn",
 ];
+
+/// The two columns a row states ONLY for a certificate that has been revoked: when it was
+/// revoked and the `RevocationReason` `RevokeCertificate` was given.
+///
+/// A report records the revocation state of a certificate that HAS one, so their presence is
+/// what says a certificate was revoked: a row that carried them empty would report revocation
+/// state for every certificate the CA has ever issued.
+const REVOKED_AT_COLUMN: &str = "revokedAt";
+const REVOCATION_REASON_COLUMN: &str = "revocationReason";
 
 /// One entry per certificate the CA's key has been used for, as the (column, value) pairs
 /// the report states, ordered by the serial the CA allocated.
@@ -161,44 +169,57 @@ fn audited_certificates(ca: &CertificateAuthorityRecord) -> Vec<Vec<(&'static st
         .collect()
 }
 
-/// One certificate as the entry a report states for it.
+/// One certificate as the entry a report states for it: the (column, value) pairs it carries,
+/// in the order [`AUDIT_REPORT_COLUMNS`] states them, LEAVING OUT the revocation columns for a
+/// certificate that has no revocation record.
 fn audited_certificate(
     ca: &CertificateAuthorityRecord,
     certificate: &IssuedCertificate,
 ) -> Vec<(&'static str, String)> {
     let revocation = certificate.revocation.as_ref();
     let subject = certificate_subject(certificate).unwrap_or_default();
-    let values = [
-        ca.owner_account.clone(),
-        certificate.arn.clone(),
+    let values: Vec<(&'static str, String)> = vec![
+        ("awsAccountId", ca.owner_account.clone()),
+        ("certificateArn", certificate.arn.clone()),
         // The row's serial is what joins it to a certificate a client holds, and a client
         // reads a serial off a certificate in the octet-pair rendering X.509 tooling prints
         // ([`serial_octets`]) — the same rendering `RevokeCertificate` takes a serial in.
         // The ARN beside it carries the undelimited form it was minted as, which is the
         // same number spelled the way an ARN spells it.
-        serial_octets(&certificate.serial),
-        subject,
-        format_timestamp(certificate.not_before),
-        format_timestamp(certificate.not_after),
-        format_timestamp(certificate.issued_at),
-        revocation
-            .map(|revocation| format_timestamp(revocation.revoked_at))
-            .unwrap_or_default(),
-        revocation
-            .map(|revocation| revocation.reason.clone())
-            .unwrap_or_default(),
+        ("serial", serial_octets(&certificate.serial)),
+        ("subject", subject),
+        ("notBefore", format_timestamp(certificate.not_before)),
+        ("notAfter", format_timestamp(certificate.not_after)),
+        ("issuedAt", format_timestamp(certificate.issued_at)),
         // The template the certificate was issued UNDER, which for a request that named
         // none is the one the service defaults to (`certificate_template`): a row states
         // what the certificate carries, not what the request spelled out.
-        certificate
-            .template_arn
-            .clone()
-            .unwrap_or_else(default_template_arn),
+        (
+            "templateArn",
+            certificate
+                .template_arn
+                .clone()
+                .unwrap_or_else(default_template_arn),
+        ),
     ];
+    let revocation: Vec<(&'static str, String)> = revocation
+        .map(|revocation| {
+            vec![
+                (REVOKED_AT_COLUMN, format_timestamp(revocation.revoked_at)),
+                (REVOCATION_REASON_COLUMN, revocation.reason.clone()),
+            ]
+        })
+        .unwrap_or_default();
+    // Assembled in the report's own column order, whichever of the two groups a column is in.
     AUDIT_REPORT_COLUMNS
         .iter()
-        .copied()
-        .zip(values)
+        .filter_map(|column| {
+            values
+                .iter()
+                .chain(revocation.iter())
+                .find(|(stated, _)| stated == column)
+                .cloned()
+        })
         .collect()
 }
 
@@ -210,14 +231,25 @@ fn certificate_subject(certificate: &IssuedCertificate) -> Option<String> {
 
 /// The CSV rendering: the column names, then one line per entry, each value quoted so a
 /// value carrying a comma or a quote cannot be read as two columns (RFC 4180 section 2).
+///
+/// A CSV row is read by POSITION, so every column of the header is a field of every row: a
+/// column an entry does not state (the revocation columns of a certificate that was never
+/// revoked) is the empty field, which is how that format says a value is absent.
 fn audit_report_csv(entries: &[Vec<(&'static str, String)>]) -> String {
     let mut out = String::new();
     out.push_str(&AUDIT_REPORT_COLUMNS.join(","));
     out.push('\n');
     for entry in entries {
-        let line: Vec<String> = entry
+        let line: Vec<String> = AUDIT_REPORT_COLUMNS
             .iter()
-            .map(|(_, value)| format!("\"{}\"", value.replace('"', "\"\"")))
+            .map(|column| {
+                let value = entry
+                    .iter()
+                    .find(|(stated, _)| stated == column)
+                    .map(|(_, value)| value.as_str())
+                    .unwrap_or_default();
+                format!("\"{}\"", value.replace('"', "\"\""))
+            })
             .collect();
         out.push_str(&line.join(","));
         out.push('\n');

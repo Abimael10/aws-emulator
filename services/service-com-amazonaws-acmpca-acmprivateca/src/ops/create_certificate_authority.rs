@@ -447,9 +447,10 @@ fn validate_algorithms(
 /// [`crate::state::revocation_configuration_fault`] because `UpdateCertificateAuthority`
 /// carries the same member under the same rules.
 ///
-/// Which stage refuses the configuration is the fault's own classification: a member the
-/// configuration's state requires but the model cannot mark `@required` is refused by the
-/// request-validation stage, in the words that stage states a missing member in
+/// Which stage refuses the configuration is the fault's own classification: a fault in what
+/// the configuration itself states — a member its state requires but the model cannot mark
+/// `@required`, or two members it cannot state together — is refused by the
+/// request-validation stage, in the words that stage states such a fault in
 /// ([`crate::service::missing_member_refusal`]); a combination of members that cannot hold
 /// together is the semantic argument fault this operation models.
 fn validate_revocation_configuration(
@@ -461,6 +462,9 @@ fn validate_revocation_configuration(
                 member,
             )),
         ),
+        Some(crate::state::RevocationConfigurationFault::ConflictingMembers(rule)) => {
+            Err(CreateCertificateAuthorityError::validation(rule))
+        }
         Some(crate::state::RevocationConfigurationFault::Unserviceable(reason)) => {
             Err(invalid_args(reason))
         }

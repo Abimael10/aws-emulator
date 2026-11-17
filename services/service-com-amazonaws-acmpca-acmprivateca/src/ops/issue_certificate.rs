@@ -439,17 +439,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> IssueCertificate<
             }
         }
 
-        // `ValidityNotBefore` customises the start of the window; without one the
-        // window starts at issuance.
-        let not_before = match input.validity_not_before.as_ref() {
+        // `ValidityNotBefore` "specifies a customized starting time for the validity period"
+        // (`IssueCertificateRequest$ValidityNotBefore`). Two instants come out of it: the one
+        // the requested window is measured FROM — that customized start, or the issuance
+        // instant when the request names none — and the start the certificate CARRIES, which
+        // is the customized one verbatim or, when there is none, the issuance instant
+        // BACKDATED by the span the service backdates it
+        // ([`crate::state::ISSUANCE_BACKDATED_BY`]), so the certificate is usable at once on a
+        // relying party whose clock lags.
+        let (issued_from, not_before) = match input.validity_not_before.as_ref() {
             Some(validity) => {
-                crate::state::resolve_validity(now, validity).map_err(invalid_args)?
+                let start =
+                    crate::state::resolve_validity(now, validity).map_err(invalid_args)?;
+                (start, start)
             }
-            None => now,
+            None => (
+                now,
+                now.checked_sub(crate::state::ISSUANCE_BACKDATED_BY)
+                    .unwrap_or(now),
+            ),
         };
-        let not_after =
-            crate::state::resolve_validity(not_before, &input.validity).map_err(invalid_args)?;
-        let window = not_after.duration_since(not_before).map_err(|_| {
+        let not_after = crate::state::resolve_validity(issued_from, &input.validity)
+            .map_err(invalid_args)?;
+        let window = not_after.duration_since(issued_from).map_err(|_| {
             invalid_args(
                 "Validity must resolve to an instant after the start of the certificate's \
                  validity period",
@@ -477,9 +489,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> IssueCertificate<
             && !crate::state::names_ca_certificate_template(input.template_arn.as_deref())
             && window > crate::state::SHORT_LIVED_MAX_VALIDITY
         {
-            return Err(invalid_args(
-                "Validity may not exceed seven days for a certificate authority whose \
-                 UsageMode is SHORT_LIVED_CERTIFICATE",
+            return Err(IssueCertificateError::validation(
+                crate::state::VALIDITY_EXCEEDS_USAGE_MODE_MESSAGE,
             ));
         }
         // "The end of the validity period configured on a certificate must not exceed the
@@ -506,14 +517,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> IssueCertificate<
         // (`crate::state::certificate_template`), and the template the caller named stays
         // readable on the resource as well.
         let template = crate::state::certificate_template(input.template_arn.as_deref());
+        // "An APIPassthrough or APICSRPassthrough template variant must be selected, or else
+        // this parameter is ignored" (`IssueCertificateRequest$ApiPassthrough`), so the
+        // template ARN is also what decides whether the values the request asked to be carried
+        // into the certificate are read at all
+        // ([`crate::state::applied_api_passthrough`]).
+        let passthrough = crate::state::applied_api_passthrough(
+            input.template_arn.as_deref(),
+            input.api_passthrough.as_ref(),
+        );
         let Some(certificate_pem) = crate::state::derive_certificate_pem(
             record,
             &serial,
-            &request.info,
-            &input.signing_algorithm,
-            &template,
-            not_before,
-            not_after,
+            &crate::state::IssuedCertificateContent {
+                request: &request.info,
+                signing_algorithm: &input.signing_algorithm,
+                template: &template,
+                passthrough,
+                not_before,
+                not_after,
+            },
         ) else {
             return Err(invalid_args(
                 "the certificate this request asks for cannot be encoded: the certification \

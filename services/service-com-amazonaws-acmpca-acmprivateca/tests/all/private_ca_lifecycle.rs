@@ -904,7 +904,9 @@ async fn validity_resolves_the_way_each_validity_period_type_is_documented() {
 /// The revocation rules `CreateCertificateAuthority`'s `RevocationConfiguration` member
 /// documents: "A configuration disabling CRLs or OCSP must contain only the
 /// Enabled=False parameter, and will fail if other parameters such as CustomCname or
-/// ExpirationInDays are included."
+/// ExpirationInDays are included.", and the one rule
+/// `CrlDistributionPointExtensionConfiguration$OmitExtension` documents beside it: "This
+/// configuration cannot be enabled with a custom CNAME set."
 ///
 /// Each row states the error code its configuration is refused with, because the two
 /// stages that refuse one answer differently: a member an enabled CRL configuration
@@ -953,6 +955,47 @@ async fn revocation_configurations_are_accepted_only_where_documented() {
                 }
             }),
             None,
+        ),
+        // "Configures whether the CRL Distribution Point extension should be populated with
+        // the default URL to the CRL ... This configuration cannot be enabled with a custom
+        // CNAME set." (`CrlDistributionPointExtensionConfiguration$OmitExtension`.)
+        (
+            "crl enabled with the distribution point omitted",
+            json!({
+                "CrlConfiguration": {
+                    "Enabled": true,
+                    "ExpirationInDays": 7,
+                    "S3BucketName": "crl-bucket",
+                    "CrlDistributionPointExtensionConfiguration": {"OmitExtension": true},
+                }
+            }),
+            None,
+        ),
+        (
+            "crl enabled with the distribution point published behind a cname",
+            json!({
+                "CrlConfiguration": {
+                    "Enabled": true,
+                    "ExpirationInDays": 7,
+                    "S3BucketName": "crl-bucket",
+                    "CustomCname": "crl.example.com",
+                    "CrlDistributionPointExtensionConfiguration": {"OmitExtension": false},
+                }
+            }),
+            None,
+        ),
+        (
+            "crl enabled with the distribution point omitted behind a cname",
+            json!({
+                "CrlConfiguration": {
+                    "Enabled": true,
+                    "ExpirationInDays": 7,
+                    "S3BucketName": "crl-bucket",
+                    "CustomCname": "crl.example.com",
+                    "CrlDistributionPointExtensionConfiguration": {"OmitExtension": true},
+                }
+            }),
+            Some("ValidationException"),
         ),
         ("ocsp disabled alone", json!({"OcspConfiguration": {"Enabled": false}}), None),
         (
@@ -1593,7 +1636,8 @@ async fn a_ca_without_its_certificate_can_neither_issue_nor_serve_one() {
 }
 
 /// A CA whose UsageMode is SHORT_LIVED_CERTIFICATE issues only inside the seven days
-/// its documentation limits it to.
+/// its documentation limits it to, and refuses a longer window as a validation failure
+/// (the sentence itself is asserted in [`super::short_lived_ca_certificate_validity`]).
 #[tokio::test]
 async fn a_short_lived_ca_refuses_a_validity_beyond_seven_days() {
     let emulator = Emulator::new();
@@ -1634,7 +1678,7 @@ async fn a_short_lived_ca_refuses_a_validity_beyond_seven_days() {
             emulator.ok(case, "IssueCertificate", &request).await;
         } else {
             emulator
-                .refused(case, "IssueCertificate", &request, "InvalidArgsException")
+                .refused(case, "IssueCertificate", &request, "ValidationException")
                 .await;
         }
     }

@@ -215,15 +215,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
         // The same classification as on the create, from the one place both operations
-        // read these rules out of: a member an enabled CRL configuration requires is the
-        // request-validation stage's to refuse, naming the member; members that cannot hold
-        // together are the semantic argument fault this operation models.
+        // read these rules out of: a fault in what the configuration itself states is the
+        // request-validation stage's to refuse; members that cannot hold together are the
+        // semantic argument fault this operation models.
         match crate::state::revocation_configuration_fault(input.revocation_configuration.as_ref())
         {
             Some(crate::state::RevocationConfigurationFault::MissingMember(member)) => {
                 return Err(UpdateCertificateAuthorityError::validation(
                     crate::service::missing_member_refusal(member),
                 ));
+            }
+            Some(crate::state::RevocationConfigurationFault::ConflictingMembers(rule)) => {
+                return Err(UpdateCertificateAuthorityError::validation(rule));
             }
             Some(crate::state::RevocationConfigurationFault::Unserviceable(reason)) => {
                 return Err(invalid_args(reason));

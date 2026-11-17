@@ -16,6 +16,13 @@
 //!   `basicConstraints`, critical, with the template's CA flag and the `pathLenConstraint`
 //!   its `PathLenN` portion publishes — plus the subject alternative name the certification
 //!   request asks for;
+//! * an `ApiPassthrough` is applied only under a template variant whose name selects it, and
+//!   where it is, the subject and extensions it supplies take priority over the certification
+//!   request's;
+//! * every certificate the CA writes publishes the identifier of the key it certifies and
+//!   names the identifier of the key that signed it;
+//! * a validity period starts one hour BEFORE the instant the certificate was issued, unless
+//!   the request names a customized start;
 //! * the refusals of this path carry Amazon Web Services Private CA's own fixed sentences,
 //!   with no ARN or status name interpolated into them.
 //!
@@ -26,17 +33,21 @@
 //! [`super::private_ca_lifecycle`].
 
 use std::collections::BTreeSet;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
+use sha2::Digest;
+use x509_cert::der::asn1::OctetString;
 use x509_cert::der::{Decode, Encode};
 use x509_cert::ext::pkix::name::GeneralName;
-use x509_cert::ext::pkix::{BasicConstraints, SubjectAltName};
+use x509_cert::ext::pkix::{AuthorityKeyIdentifier, BasicConstraints, SubjectAltName};
 use x509_cert::ext::Extension;
+use x509_cert::name::Name;
 use x509_cert::Certificate;
 
 use crate::private_ca_lifecycle::{
     active_ca, blob, certificate_of, csr_pem, pem, pem_of_bytes, request_of, root_ca_request,
-    string, wait_for_the_clock, Emulator,
+    string, subject_common_name, wait_for_the_clock, Emulator,
 };
 use crate::resource_policy::error_message;
 
@@ -812,4 +823,489 @@ async fn the_certificate_path_refuses_with_the_services_own_sentences() {
         "DELETED",
         "case {case:?}: a refused import must leave the deleted CA as it was"
     );
+}
+
+// The template kinds this suite names, from the `TemplateArn` catalog
+// `IssueCertificateRequest$TemplateArn` publishes: the `_APIPassthrough` and
+// `_APICSRPassthrough` variants are the ones that apply an `ApiPassthrough`.
+/// The prefix every published template ARN carries.
+const TEMPLATE_PREFIX: &str = "arn:aws:acm-pca:::template/";
+
+/// The `subjectKeyIdentifier` extension, RFC 5280 section 4.2.1.2.
+const SUBJECT_KEY_IDENTIFIER_OID: &str = "2.5.29.14";
+
+/// The `authorityKeyIdentifier` extension, RFC 5280 section 4.2.1.1.
+const AUTHORITY_KEY_IDENTIFIER_OID: &str = "2.5.29.35";
+
+/// The `organizationName` attribute type, RFC 4519 section 2.19.
+const ORGANIZATION_OID: &str = "2.5.4.10";
+
+/// The common name the certification request of the passthrough suite asks for.
+const CSR_SUBJECT: &str = "csr-subject.pca.example.test";
+
+/// The alternative name that request asks for.
+const CSR_ALTERNATIVE_NAME: &str = "csr-san.pca.example.test";
+
+/// The common name the `ApiPassthrough` of the passthrough suite supplies.
+const API_SUBJECT: &str = "api-subject.pca.example.test";
+
+/// The organization it supplies beside that common name — an attribute the certification
+/// request does not carry at all, so a certificate carrying it took the API's subject.
+const API_ORGANIZATION: &str = "Example Passthrough Org";
+
+/// The alternative name it supplies.
+const API_ALTERNATIVE_NAME: &str = "api-san.pca.example.test";
+
+/// The template ARN of `kind`.
+fn template_arn(kind: &str) -> String {
+    format!("{TEMPLATE_PREFIX}{kind}/V1")
+}
+
+/// The value a distinguished name carries for the attribute type `oid`, when it carries one.
+fn subject_attribute(name: &Name, oid: &str) -> Option<String> {
+    name.0
+        .iter()
+        .flat_map(|rdn| rdn.0.iter())
+        .find(|attribute| attribute.oid.to_string() == oid)
+        .map(|attribute| String::from_utf8_lossy(attribute.value.value()).to_string())
+}
+
+/// The alternative names `certificate` carries, as the text each names.
+fn alternative_names(certificate: &Certificate, case: &str) -> Vec<String> {
+    let Some(carried) = extension(certificate, SUBJECT_ALT_NAME_OID) else {
+        return Vec::new();
+    };
+    SubjectAltName::from_der(carried.extn_value.as_bytes())
+        .unwrap_or_else(|error| panic!("case {case:?}: expected a DER subjectAltName: {error}"))
+        .0
+        .iter()
+        .map(rendered)
+        .collect()
+}
+
+/// An `ApiPassthrough` is applied only under a template variant that selects it: "An
+/// APIPassthrough or APICSRPassthrough template variant must be selected, or else this
+/// parameter is ignored" (`IssueCertificateRequest$ApiPassthrough`). Where it IS applied, the
+/// subject and the extensions it supplies take priority over the certification request's.
+///
+/// Every row submits the SAME certification request and the SAME `ApiPassthrough` and differs
+/// only in the `TemplateArn`, so what the assertions see is the template's decision and
+/// nothing else. The rows span the kinds of that catalog: no template at all, plain kinds,
+/// both passthrough variants, a blank kind an `ApiPassthrough` is the only filling of, and a
+/// CA kind.
+#[tokio::test]
+async fn api_passthrough_applies_only_under_a_passthrough_template() {
+    let emulator = Emulator::new();
+    let (arn, _certificate) = active_ca(&emulator, "passthrough-root").await;
+
+    let csr = csr_with_alternative_names(CSR_SUBJECT, &[CSR_ALTERNATIVE_NAME]);
+    let passthrough = json!({
+        "Subject": {"CommonName": API_SUBJECT, "Organization": API_ORGANIZATION},
+        "Extensions": {"SubjectAlternativeNames": [{"DnsName": API_ALTERNATIVE_NAME}]},
+    });
+
+    // (case, the template kind named — or none at all —, whether it applies the passthrough)
+    let rows: Vec<(&str, Option<&str>, bool)> = vec![
+        ("no template at all", None, false),
+        ("the default end-entity kind", Some("EndEntityCertificate"), false),
+        (
+            "the server-authentication kind",
+            Some("EndEntityServerAuthCertificate"),
+            false,
+        ),
+        (
+            "the end-entity kind passing the API through",
+            Some("EndEntityCertificate_APIPassthrough"),
+            true,
+        ),
+        (
+            "the end-entity kind passing the API and the CSR through",
+            Some("EndEntityCertificate_APICSRPassthrough"),
+            true,
+        ),
+        (
+            "the client-authentication kind passing the API through",
+            Some("EndEntityClientAuthCertificate_APIPassthrough"),
+            true,
+        ),
+        (
+            "a blank kind, which an ApiPassthrough is the whole content of",
+            Some("BlankEndEntityCertificate_APIPassthrough"),
+            true,
+        ),
+        (
+            "a subordinate CA kind passing the API through",
+            Some("SubordinateCACertificate_PathLen1_APIPassthrough"),
+            true,
+        ),
+    ];
+
+    // Issue every row first and wait for the clock ONCE, rather than once per row.
+    let mut issued: Vec<(&str, bool, String)> = Vec::with_capacity(rows.len());
+    for (case, kind, applies) in &rows {
+        let mut body = issuance(&arn, &csr, json!({"Type": "DAYS", "Value": 30}));
+        body["ApiPassthrough"] = passthrough.clone();
+        if let Some(kind) = kind {
+            body["TemplateArn"] = json!(template_arn(kind));
+        }
+        let certificate_arn = string(
+            &emulator.ok(case, "IssueCertificate", &body).await,
+            "CertificateArn",
+            case,
+        );
+        issued.push((case, *applies, certificate_arn));
+    }
+    wait_for_the_clock();
+
+    for (case, applies, certificate_arn) in issued {
+        let served = emulator
+            .ok(
+                case,
+                "GetCertificate",
+                &json!({"CertificateAuthorityArn": arn, "CertificateArn": certificate_arn}),
+            )
+            .await;
+        let certificate = certificate_of(&string(&served, "Certificate", case), case);
+        let subject = &certificate.tbs_certificate.subject;
+        let common_name = subject_common_name(subject);
+        let organization = subject_attribute(subject, ORGANIZATION_OID);
+        let names = alternative_names(&certificate, case);
+        if applies {
+            assert_eq!(
+                common_name, API_SUBJECT,
+                "case {case:?}: expected the API-supplied common name, got {common_name:?}"
+            );
+            assert_eq!(
+                organization.as_deref(),
+                Some(API_ORGANIZATION),
+                "case {case:?}: expected the API-supplied organization, got {organization:?}"
+            );
+            assert_eq!(
+                names,
+                vec![API_ALTERNATIVE_NAME.to_string()],
+                "case {case:?}: expected the API-supplied alternative name, got {names:?}"
+            );
+        } else {
+            assert_eq!(
+                common_name, CSR_SUBJECT,
+                "case {case:?}: expected the certification request's common name, got \
+                 {common_name:?}"
+            );
+            assert_eq!(
+                organization, None,
+                "case {case:?}: a template that ignores the ApiPassthrough carries none of \
+                 its attributes, got {organization:?}"
+            );
+            assert_eq!(
+                names,
+                vec![CSR_ALTERNATIVE_NAME.to_string()],
+                "case {case:?}: expected the certification request's alternative name, got \
+                 {names:?}"
+            );
+        }
+    }
+}
+
+/// The identifier of the key `certificate` holds, derived the way RFC 7093 section 2's first
+/// method derives one: the leftmost 160 bits of the SHA-256 digest over its
+/// `subjectPublicKey` BIT STRING. Computed here from the key, not read off anything the
+/// service wrote.
+fn derived_key_identifier(certificate: &Certificate) -> Vec<u8> {
+    sha2::Sha256::digest(
+        certificate
+            .tbs_certificate
+            .subject_public_key_info
+            .subject_public_key
+            .raw_bytes(),
+    )[..20]
+        .to_vec()
+}
+
+/// The key identifier `certificate` publishes as its subject key identifier, when it
+/// publishes one.
+fn published_key_identifier(certificate: &Certificate, case: &str) -> Option<Vec<u8>> {
+    let carried = extension(certificate, SUBJECT_KEY_IDENTIFIER_OID)?;
+    assert!(
+        !carried.critical,
+        "case {case:?}: a subject key identifier is not critical, got {carried:?}"
+    );
+    Some(
+        OctetString::from_der(carried.extn_value.as_bytes())
+            .unwrap_or_else(|error| {
+                panic!("case {case:?}: expected a KeyIdentifier OCTET STRING: {error}")
+            })
+            .as_bytes()
+            .to_vec(),
+    )
+}
+
+/// The key identifier `certificate` names as the authority that signed it, when it names one.
+fn authority_key_identifier(certificate: &Certificate, case: &str) -> Option<Vec<u8>> {
+    let carried = extension(certificate, AUTHORITY_KEY_IDENTIFIER_OID)?;
+    assert!(
+        !carried.critical,
+        "case {case:?}: an authority key identifier is not critical, got {carried:?}"
+    );
+    AuthorityKeyIdentifier::from_der(carried.extn_value.as_bytes())
+        .unwrap_or_else(|error| {
+            panic!("case {case:?}: expected an AuthorityKeyIdentifier: {error}")
+        })
+        .key_identifier
+        .map(|identifier| identifier.as_bytes().to_vec())
+}
+
+/// Every certificate a CA writes publishes the identifier of the key it certifies, and names
+/// the identifier of the key it was signed with: a relying party builds a path, and matches a
+/// CRL to its issuer, by those identifiers (RFC 5280 sections 4.2.1.1 and 4.2.1.2).
+///
+/// The rows span what the rule generalises over: the CA's OWN self-signed certificate, which
+/// certifies the very key it is signed with, and the leaves it then issues under several
+/// template kinds, each over a certification request of its own — so each row's subject key
+/// identifier is the identifier of a different key.
+#[tokio::test]
+async fn every_issued_certificate_binds_its_own_key_and_the_key_that_signed_it() {
+    let emulator = Emulator::new();
+    let case = "a root CA of its own making";
+    // The documented root-CA procedure, so the CA certificate under test is one this service
+    // wrote rather than one the suite handed it.
+    let arn = root_ca_valid_for(
+        &emulator,
+        case,
+        "key-identifier-root",
+        json!({"Type": "YEARS", "Value": 10}),
+    )
+    .await;
+    let own = own_certificate(&emulator, case, &arn).await;
+
+    let own_identifier = published_key_identifier(&own, case).unwrap_or_else(|| {
+        panic!("case {case:?}: expected the CA's certificate to publish a subject key identifier")
+    });
+    assert_eq!(
+        own_identifier,
+        derived_key_identifier(&own),
+        "case {case:?}: expected the identifier of the key the CA's certificate holds"
+    );
+    // A root CA's certificate is signed by the very key it certifies, so the two identifiers
+    // on it are the same value.
+    assert_eq!(
+        authority_key_identifier(&own, case),
+        Some(own_identifier.clone()),
+        "case {case:?}: expected a self-signed root certificate to name its own key as its \
+         authority"
+    );
+
+    // (case, the template kind the leaf is issued under, or none at all)
+    let rows: Vec<(&str, Option<&str>)> = vec![
+        ("a leaf under no template at all", None),
+        ("a leaf under the default kind", Some("EndEntityCertificate")),
+        ("a code-signing leaf", Some("CodeSigningCertificate")),
+        (
+            "a subordinate CA certificate",
+            Some("SubordinateCACertificate_PathLen0"),
+        ),
+    ];
+
+    let mut issued: Vec<(&str, String)> = Vec::with_capacity(rows.len());
+    for (case, kind) in &rows {
+        // A certification request of its own per row, so every row certifies a different key.
+        let csr = csr_pem(&format!("key-identifier-leaf-{}", issued.len()));
+        let mut body = issuance(&arn, &csr, json!({"Type": "DAYS", "Value": 30}));
+        if let Some(kind) = kind {
+            body["TemplateArn"] = json!(template_arn(kind));
+        }
+        let certificate_arn = string(
+            &emulator.ok(case, "IssueCertificate", &body).await,
+            "CertificateArn",
+            case,
+        );
+        issued.push((case, certificate_arn));
+    }
+    wait_for_the_clock();
+
+    let mut identifiers: BTreeSet<Vec<u8>> = BTreeSet::new();
+    for (case, certificate_arn) in issued {
+        let served = emulator
+            .ok(
+                case,
+                "GetCertificate",
+                &json!({"CertificateAuthorityArn": arn, "CertificateArn": certificate_arn}),
+            )
+            .await;
+        let certificate = certificate_of(&string(&served, "Certificate", case), case);
+        let published = published_key_identifier(&certificate, case).unwrap_or_else(|| {
+            panic!("case {case:?}: expected a subjectKeyIdentifier extension, got none")
+        });
+        assert_eq!(
+            published,
+            derived_key_identifier(&certificate),
+            "case {case:?}: expected the identifier of the key the certificate holds"
+        );
+        assert_eq!(
+            authority_key_identifier(&certificate, case),
+            Some(own_identifier.clone()),
+            "case {case:?}: expected the identifier the issuing CA's own certificate publishes"
+        );
+        identifiers.insert(published);
+    }
+    assert_eq!(
+        identifiers.len(),
+        rows.len(),
+        "the rows certify different keys, so each row's identifier is its own: got \
+         {identifiers:?}"
+    );
+}
+
+/// How far before the issuance instant a validity period starts when the request names no
+/// start of its own: one hour, which is what makes a certificate usable the moment it is
+/// issued by a relying party whose clock lags.
+const BACKDATED_BY: u64 = 3600;
+
+/// One row of the validity-start table.
+struct ValidityRow {
+    /// The case every assertion about this row names.
+    case: &'static str,
+    /// The `Validity` the request states.
+    validity: Value,
+    /// The `ValidityNotBefore` the request states, in Unix seconds, when it states one.
+    start: Option<i64>,
+    /// How long after the start of the validity period it ends, when the row's `Validity`
+    /// states a span of whole seconds rather than a calendar one.
+    period: Option<u64>,
+}
+
+/// The Unix second `time` falls in.
+fn unix_seconds(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH)
+        .expect("a time after the epoch")
+        .as_secs()
+}
+
+/// A certificate's validity period starts BEFORE the instant it was issued — the issuance
+/// instant less [`BACKDATED_BY`] — unless the request names "a customized starting time for
+/// the validity period" (`IssueCertificateRequest$ValidityNotBefore`), which is then the start
+/// verbatim. The period the request asked for is measured from the issuance instant either
+/// way.
+///
+/// The rows span what the rule generalises over: the `ValidityPeriodType` the window is stated
+/// in, and whether the request customizes the start.
+#[tokio::test]
+async fn the_validity_period_starts_before_the_issuance_unless_the_request_names_a_start() {
+    let emulator = Emulator::new();
+    let (arn, _certificate) = active_ca(&emulator, "backdated-root").await;
+    let csr = csr_pem("a-backdated-leaf");
+
+    // 1767225600 = 2026-01-01T00:00:00Z, the instant the customizing rows start at.
+    let customized = 1_767_225_600_i64;
+    let rows: Vec<ValidityRow> = vec![
+        ValidityRow {
+            case: "thirty days from the issuance",
+            validity: json!({"Type": "DAYS", "Value": 30}),
+            start: None,
+            period: Some(30 * 86_400),
+        },
+        ValidityRow {
+            case: "one day from the issuance",
+            validity: json!({"Type": "DAYS", "Value": 1}),
+            start: None,
+            period: Some(86_400),
+        },
+        ValidityRow {
+            case: "a calendar year from the issuance",
+            validity: json!({"Type": "YEARS", "Value": 1}),
+            start: None,
+            period: None,
+        },
+        ValidityRow {
+            case: "a calendar month from the issuance",
+            validity: json!({"Type": "MONTHS", "Value": 1}),
+            start: None,
+            period: None,
+        },
+        ValidityRow {
+            case: "thirty days from a customized start",
+            validity: json!({"Type": "DAYS", "Value": 30}),
+            start: Some(customized),
+            period: Some(30 * 86_400),
+        },
+        ValidityRow {
+            case: "a calendar year from a customized start",
+            validity: json!({"Type": "YEARS", "Value": 1}),
+            start: Some(customized),
+            period: None,
+        },
+    ];
+
+    // Each row's issuance is bracketed by the instants around the call, because the start it
+    // must carry is derived from the instant the service issued it.
+    let mut issued: Vec<(&ValidityRow, u64, u64, String)> = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let mut body = issuance(&arn, &csr, row.validity.clone());
+        if let Some(start) = row.start {
+            body["ValidityNotBefore"] = json!({"Type": "ABSOLUTE", "Value": start});
+        }
+        // Every row wants a certificate of its own over the one certification request.
+        body["IdempotencyToken"] = json!(format!("backdated-{}", issued.len()));
+        let before = unix_seconds(SystemTime::now());
+        let certificate_arn = string(
+            &emulator.ok(row.case, "IssueCertificate", &body).await,
+            "CertificateArn",
+            row.case,
+        );
+        let after = unix_seconds(SystemTime::now());
+        issued.push((row, before, after, certificate_arn));
+    }
+    wait_for_the_clock();
+
+    for (row, before, after, certificate_arn) in issued {
+        let case = row.case;
+        let served = emulator
+            .ok(
+                case,
+                "GetCertificate",
+                &json!({"CertificateAuthorityArn": arn, "CertificateArn": certificate_arn}),
+            )
+            .await;
+        let window = certificate_of(&string(&served, "Certificate", case), case)
+            .tbs_certificate
+            .validity;
+        let not_before = window.not_before.to_unix_duration().as_secs();
+        let not_after = window.not_after.to_unix_duration().as_secs();
+
+        match row.start {
+            // A customized start is the start verbatim: nothing is subtracted from it.
+            Some(start) => assert_eq!(
+                i64::try_from(not_before).expect("a representable date"),
+                start,
+                "case {case:?}: expected the customized start {start}, got {not_before}"
+            ),
+            // And without one, the start is the issuance instant less the backdating, so it
+            // lies that far before the instants the call was made between.
+            None => assert!(
+                (before - BACKDATED_BY..=after - BACKDATED_BY).contains(&not_before),
+                "case {case:?}: expected a start in {}..={}, got {not_before}",
+                before - BACKDATED_BY,
+                after - BACKDATED_BY
+            ),
+        }
+        assert!(
+            not_after > not_before,
+            "case {case:?}: expected a period that ends after it starts, got \
+             {not_before}..{not_after}"
+        );
+        // The period the request asked for is measured from the ISSUANCE instant, which is
+        // where the backdated start is measured from too.
+        if let Some(period) = row.period {
+            let issuance_instant = match row.start {
+                Some(_) => not_before,
+                None => not_before + BACKDATED_BY,
+            };
+            assert_eq!(
+                not_after - issuance_instant,
+                period,
+                "case {case:?}: expected the requested period of {period} seconds from the \
+                 issuance, got {}",
+                not_after - issuance_instant
+            );
+        }
+    }
 }

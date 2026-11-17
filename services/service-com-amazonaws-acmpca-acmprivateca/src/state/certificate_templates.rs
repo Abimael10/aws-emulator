@@ -46,6 +46,9 @@
 //!
 //! Beside the extensions a template DEFINES sits the one it passes through: the subject
 //! alternative name the certification request asks for ([`requested_subject_alternative_name`]).
+//! Which SOURCE the rest of the certificate's content is taken from is the other thing a
+//! template's name says ([`applies_api_passthrough`]), and what is then assembled out of those
+//! sources lives in [`super::issued_extensions`].
 
 use super::*;
 
@@ -112,13 +115,12 @@ impl KeyUsageDefinition {
 }
 
 /// The key purposes of `extendedKeyUsage` the published template definitions name, by the
-/// object identifiers RFC 5280 section 4.2.1.12 assigns them (`id-kp-*`).
-const TLS_SERVER_AUTHENTICATION: ObjectIdentifier =
-    ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.1");
-const TLS_CLIENT_AUTHENTICATION: ObjectIdentifier =
-    ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.2");
-const CODE_SIGNING: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.3");
-const OCSP_SIGNING: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.9");
+/// object identifiers RFC 5280 section 4.2.1.12 assigns them (`id-kp-*`), from the one
+/// catalog of those identifiers ([`super::oid`]).
+const TLS_SERVER_AUTHENTICATION: ObjectIdentifier = super::oid::TLS_SERVER_AUTH;
+const TLS_CLIENT_AUTHENTICATION: ObjectIdentifier = super::oid::TLS_CLIENT_AUTH;
+const CODE_SIGNING: ObjectIdentifier = super::oid::CODE_SIGNING;
+const OCSP_SIGNING: ObjectIdentifier = super::oid::OCSP_SIGNING;
 
 /// The template name a request that names none is answered under: "If this parameter is not
 /// provided, Amazon Web Services Private CA defaults to the `EndEntityCertificate/V1`
@@ -216,6 +218,35 @@ pub fn names_ca_certificate_template(template_arn: Option<&str>) -> bool {
     })
 }
 
+/// The portions of a template's name that say the certificate issued under it takes content
+/// from the API: "An APIPassthrough or APICSRPassthrough template variant must be selected,
+/// or else this parameter is ignored" (`IssueCertificateRequest$ApiPassthrough`).
+const API_PASSTHROUGH_SEGMENTS: &[&str] = &["APIPassthrough", "APICSRPassthrough"];
+
+/// The `ApiPassthrough` a request carried, when the template it named is one that applies it
+/// — and `None` otherwise, which is what "this parameter is ignored" means: the certificate is
+/// assembled as if the request had carried none.
+///
+/// The template's NAME is what selects it, as it selects the template's definition: the
+/// `_APIPassthrough` and `_APICSRPassthrough` variants take their subject and extension values
+/// from the API, and every other published kind — including the default a request naming no
+/// template is answered under — takes them from the certification request alone.
+pub fn applied_api_passthrough<'a>(
+    template_arn: Option<&str>,
+    passthrough: Option<&'a ApiPassthrough>,
+) -> Option<&'a ApiPassthrough> {
+    passthrough.filter(|_| applies_api_passthrough(template_arn))
+}
+
+/// Whether the template a request names applies the `ApiPassthrough` it carried.
+pub fn applies_api_passthrough(template_arn: Option<&str>) -> bool {
+    template_arn.and_then(template_name).is_some_and(|name| {
+        API_PASSTHROUGH_SEGMENTS
+            .iter()
+            .any(|segment| name.contains(segment))
+    })
+}
+
 /// The template name the ARN `arn:<partition>:acm-pca:::template/<name>/<version>` carries,
 /// or `None` for an ARN that names no template.
 fn template_name(template_arn: &str) -> Option<&str> {
@@ -274,20 +305,6 @@ fn path_length_in(name: &str) -> Option<u8> {
     let (_, after) = name.split_once(PATH_LENGTH_SEGMENT)?;
     let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
     digits.parse().ok()
-}
-
-/// The DER extensions a certificate issued under `template` for `request` carries: the ones
-/// the template defines, plus the subject alternative name the certification request asks
-/// for ([`requested_subject_alternative_name`]).
-pub fn certificate_extensions(
-    template: &CertificateTemplate,
-    request: &CertificationRequestInfo,
-) -> Option<Extensions> {
-    let mut extensions: Extensions = template_extensions(template).unwrap_or_default();
-    if let Some(alternative_name) = requested_subject_alternative_name(request) {
-        extensions.push(alternative_name);
-    }
-    (!extensions.is_empty()).then_some(extensions)
 }
 
 /// The DER extensions a certificate issued under `template` carries, or `None` for a

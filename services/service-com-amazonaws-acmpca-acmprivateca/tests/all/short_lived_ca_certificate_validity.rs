@@ -21,6 +21,11 @@
 //! supported by Amazon Web Services Private CA, see Understanding Certificate Templates"),
 //! and it is exercised here on kinds beyond the root template the issue cited.
 //!
+//! A request past that limit is refused 400 `ValidationException` with the one sentence
+//! Amazon Web Services Private CA answers for that class ([`VALIDITY_EXCEEDS_USAGE_MODE`]),
+//! which is fixed text in full: it names neither the requested validity, nor the limit, nor
+//! the mode that sets it.
+//!
 //! Every call goes over the wire through the harness in [`super::private_ca_lifecycle`].
 
 use std::time::{Duration, Instant};
@@ -56,6 +61,14 @@ const BLANK_ROOT_CA_TEMPLATE: &str = "arn:aws:acm-pca:::template/\
 
 /// The seven days `UsageMode` limits a short-lived certificate to, in whole days.
 const SHORT_LIVED_MAX_DAYS: u64 = 7;
+
+/// What Amazon Web Services Private CA answers an issuance whose validity runs past the
+/// maximum its CA's usage mode allows: fixed text in full, spelled out here rather than read
+/// off the service's own constant, so a re-authored sentence fails this suite.
+const VALIDITY_EXCEEDS_USAGE_MODE: &str =
+    "The requested certificate validity exceeds the maximum allowed by the usage mode. Reduce \
+     the requested validity period to be equal to or less than that supported by the usage \
+     mode for this CA or use a CA with a different usage mode.";
 
 /// A day, in seconds.
 const SECONDS_PER_DAY: u64 = 86_400;
@@ -501,13 +514,12 @@ async fn a_short_lived_ca_caps_only_the_certificates_it_issues_to_a_subject() {
             );
         } else {
             let refused = emulator
-                .refused(case, "IssueCertificate", &body, "InvalidArgsException")
+                .refused(case, "IssueCertificate", &body, "ValidationException")
                 .await;
             let message = error_message(&refused, case);
-            assert!(
-                message.contains(SHORT_LIVED),
-                "case {case:?}: expected the refusal to name the usage mode that limits the \
-                 window, got {message:?}"
+            assert_eq!(
+                message, VALIDITY_EXCEEDS_USAGE_MODE,
+                "case {case:?}: expected the usage-mode sentence, got {message:?}"
             );
         }
     }

@@ -16,7 +16,8 @@
 //!   and activating a DISABLED one are the whole of what this call performs; every other
 //!   requested status, a request naming nothing to update, and a revocation configuration
 //!   breaking the rules that member documents are all refused with
-//!   `InvalidArgsException`;
+//!   `InvalidArgsException`, while a configuration whose own members cannot be stated
+//!   together is refused by the request-validation stage with `ValidationException`;
 //! * an ARN is judged before any CA is read, so an ARN this service resolves no CA from is
 //!   `InvalidArnException` while a well-formed ARN of a CA that is not there is
 //!   `ResourceNotFoundException`;
@@ -516,6 +517,101 @@ async fn an_update_this_operation_cannot_carry_out_is_refused_with_invalid_args(
             Some(&no_revocation()),
             "case {case:?}: a refused update writes no configuration, got {described:?}"
         );
+    }
+}
+
+/// What this service answers a CRL configuration that both omits the distribution point
+/// extension and names the alias that extension would publish, spelled out here rather than
+/// read off the service's own constant so a re-authored sentence fails this suite.
+const OMITTED_DISTRIBUTION_POINT_WITH_CNAME_MESSAGE: &str =
+    "RevocationConfiguration.CrlConfiguration.CrlDistributionPointExtensionConfiguration \
+     cannot be enabled with a custom CNAME set.";
+
+/// A CRL configuration cannot both omit the distribution point extension and name the alias
+/// that extension would publish: "This configuration cannot be enabled with a custom CNAME
+/// set." (`CrlDistributionPointExtensionConfiguration$OmitExtension`.) The rule is about what
+/// the configuration ITSELF states, so it is the request-validation stage that refuses it,
+/// with `ValidationException` — and either member alone is a configuration this call stores.
+///
+/// The rows span the combinations the rule distinguishes: the extension omitted with and
+/// without an alias, and the alias with the extension published and with no distribution
+/// point configuration at all.
+#[tokio::test]
+async fn a_cname_cannot_be_set_where_the_distribution_point_is_omitted() {
+    let emulator = Emulator::new();
+    let (arn, _) = active_ca(&emulator, "conflicting-crl-members").await;
+
+    // (case, the CRL configuration submitted, whether it is refused)
+    let rows: [(&str, Value, bool); 4] = [
+        (
+            "the distribution point omitted",
+            json!({
+                "Enabled": true,
+                "S3BucketName": "example-crl-bucket",
+                "ExpirationInDays": 7,
+                "CrlDistributionPointExtensionConfiguration": {"OmitExtension": true},
+            }),
+            false,
+        ),
+        (
+            "an alias with no distribution point configuration",
+            json!({
+                "Enabled": true,
+                "S3BucketName": "example-crl-bucket",
+                "ExpirationInDays": 7,
+                "CustomCname": "crl.example.com",
+            }),
+            false,
+        ),
+        (
+            "an alias with the distribution point published",
+            json!({
+                "Enabled": true,
+                "S3BucketName": "example-crl-bucket",
+                "ExpirationInDays": 7,
+                "CustomCname": "crl.example.com",
+                "CrlDistributionPointExtensionConfiguration": {"OmitExtension": false},
+            }),
+            false,
+        ),
+        (
+            "an alias with the distribution point omitted",
+            json!({
+                "Enabled": true,
+                "S3BucketName": "example-crl-bucket",
+                "ExpirationInDays": 7,
+                "CustomCname": "crl.example.com",
+                "CrlDistributionPointExtensionConfiguration": {"OmitExtension": true},
+            }),
+            true,
+        ),
+    ];
+
+    for (case, crl, refused) in rows {
+        let body = update_request(&arn, None, Some(json!({"CrlConfiguration": crl})));
+        // What the CA holds before the row, which is what a refused row must leave it with.
+        let held = describe(&emulator, &arn, case)
+            .await
+            .get("RevocationConfiguration")
+            .cloned();
+        if refused {
+            let answered = emulator
+                .refused(case, "UpdateCertificateAuthority", &body, "ValidationException")
+                .await;
+            let message = error_message(&answered, case);
+            assert_eq!(
+                message, OMITTED_DISTRIBUTION_POINT_WITH_CNAME_MESSAGE,
+                "case {case:?}: expected the conflicting-members sentence, got {message:?}"
+            );
+            let described = describe(&emulator, &arn, case).await;
+            assert_eq!(
+                described.get("RevocationConfiguration").cloned(),
+                held,
+                "case {case:?}: a refused update writes no configuration, got {described:?}"
+            );
+        } else {
+            updated(&emulator, case, &body).await;
+        }
     }
 }
 

@@ -23,6 +23,7 @@ mod certificate_templates;
 mod csr_extensions;
 mod imported_certificate;
 mod issuance_metrics;
+mod issued_extensions;
 mod key_material;
 
 pub use audit_reports::*;
@@ -31,6 +32,7 @@ pub use certificate_templates::*;
 pub use csr_extensions::*;
 pub use imported_certificate::*;
 pub use issuance_metrics::*;
+pub use issued_extensions::*;
 pub use key_material::*;
 
 use std::collections::{HashMap, HashSet};
@@ -210,6 +212,18 @@ pub const MALFORMED_CSR_MESSAGE: &str = "Malformed CSR.";
 /// Wholly fixed text: neither the requested validity nor the CA's appears in it.
 pub const VALIDITY_EXCEEDS_CA_MESSAGE: &str =
     "The certificate validity specified exceeds the certificate authority validity.";
+
+/// What Amazon Web Services Private CA answers when the certificate a request asks for would
+/// be valid for longer than the issuing CA's usage mode allows ("Short-lived certificate
+/// validity is limited to seven days", `CreateCertificateAuthorityRequest$UsageMode`).
+///
+/// Wholly fixed text as well: it states neither the requested validity, nor the limit, nor
+/// the mode that sets it — what it tells the caller is the two ways out, a shorter validity
+/// or a CA of another mode.
+pub const VALIDITY_EXCEEDS_USAGE_MODE_MESSAGE: &str =
+    "The requested certificate validity exceeds the maximum allowed by the usage mode. Reduce \
+     the requested validity period to be equal to or less than that supported by the usage \
+     mode for this CA or use a CA with a different usage mode.";
 
 /// The `CertificateAuthorityType` member of a CA that signs its own certificate: "ROOT"
 /// (`CreateCertificateAuthorityRequest$CertificateAuthorityType`). A `SUBORDINATE` CA's
@@ -392,6 +406,15 @@ pub const DEFAULT_KEY_STORAGE_SECURITY_STANDARD: &str = "FIPS_140_2_LEVEL_3_OR_H
 /// `SHORT_LIVED_CERTIFICATE` usage mode: "Short-lived certificate validity is limited to
 /// seven days." (`CreateCertificateAuthorityRequest$UsageMode` docs).
 pub const SHORT_LIVED_MAX_VALIDITY: Duration = Duration::from_secs(7 * 86_400);
+
+/// How far before the issuance instant the validity period of an issued certificate starts
+/// when the request names no `ValidityNotBefore`: one hour.
+///
+/// Amazon Web Services Private CA backdates that start, so a certificate is usable the
+/// moment it is issued by a relying party whose clock lags. A request that names a
+/// `ValidityNotBefore` has asked for "a customized starting time for the validity period"
+/// (`IssueCertificateRequest$ValidityNotBefore`) and gets that instant verbatim instead.
+pub const ISSUANCE_BACKDATED_BY: Duration = Duration::from_secs(3600);
 
 /// How long a `CreateCertificateAuthority` / `IssueCertificate` idempotency token is
 /// honoured: "Idempotency tokens for CreateCertificateAuthority time out after five
@@ -1446,7 +1469,9 @@ pub fn reported_revocation_configuration(
 /// disabling CRLs or OCSP must contain only the `Enabled=False` parameter, and will fail
 /// if other parameters such as `CustomCname` or `ExpirationInDays` are included." An
 /// enabled CRL configuration conversely needs the bucket it is written to and the period
-/// it expires after.
+/// it expires after, and the two members that decide where its distribution point extension
+/// points cannot both be set: "This configuration cannot be enabled with a custom CNAME set."
+/// (`CrlDistributionPointExtensionConfiguration$OmitExtension`.)
 pub fn revocation_configuration_fault(
     revocation: Option<&RevocationConfiguration>,
 ) -> Option<RevocationConfigurationFault> {
@@ -1485,6 +1510,21 @@ pub fn revocation_configuration_fault(
                     "RevocationConfiguration.CrlConfiguration.CustomPath must designate a \
                      path under the CRL bucket, so it cannot contain a '.' or '..' segment"
                         .to_string(),
+                ));
+            }
+            // "This configuration cannot be enabled with a custom CNAME set."
+            // (`CrlDistributionPointExtensionConfiguration$OmitExtension`.) A custom CNAME is
+            // the alias the distribution point extension names
+            // (`CrlConfiguration$CustomCname`), so a configuration that sets one and leaves
+            // that extension out asks for an alias of nothing.
+            if crl
+                .crl_distribution_point_extension_configuration
+                .as_ref()
+                .is_some_and(|configuration| configuration.omit_extension)
+                && crl.custom_cname.is_some()
+            {
+                return Some(RevocationConfigurationFault::ConflictingMembers(
+                    OMITTED_DISTRIBUTION_POINT_WITH_CNAME_MESSAGE,
                 ));
             }
         } else if let Some((member, _)) = [
@@ -1527,19 +1567,34 @@ pub const CRL_BUCKET_MEMBER: &str = "s3BucketName";
 /// What is wrong with a submitted `RevocationConfiguration`, as the STAGE that refuses it.
 ///
 /// The two stages answer a caller differently, so which one a rule belongs to is part of
-/// the rule. A member the configuration's own state requires is the request-validation
-/// stage's: a schema fault, refused with the generic `ValidationException` naming the
-/// member and the constraint it failed, which a caller can repair from the message alone. A
-/// combination of members that cannot hold together got PAST that stage and is a semantic
-/// argument fault, which each caller lifts into its own modelled `InvalidArgsException`.
+/// the rule. A fault in what the configuration ITSELF states — a member its own state
+/// requires, or two members that cannot be stated together — is the request-validation
+/// stage's: a schema fault, refused with the generic `ValidationException`, which a caller
+/// can repair from the message alone. A combination of members that cannot hold together
+/// because of what the SERVICE would then have to do with it got past that stage and is a
+/// semantic argument fault, which each caller lifts into its own modelled
+/// `InvalidArgsException`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RevocationConfigurationFault {
     /// The configuration carried no value for a member its own state requires, named here
     /// by its wire name.
     MissingMember(&'static str),
+    /// Two members the configuration cannot state together, with the sentence saying which
+    /// published rule they broke.
+    ConflictingMembers(&'static str),
     /// Members that cannot hold together, with the sentence saying which rule they broke.
     Unserviceable(String),
 }
+
+/// What this service answers a CRL configuration that both omits the distribution point
+/// extension and names the alias that extension would publish: "This configuration cannot be
+/// enabled with a custom CNAME set."
+/// (`CrlDistributionPointExtensionConfiguration$OmitExtension`.)
+///
+/// Fixed text, naming the member whose value cannot stand beside the other.
+pub const OMITTED_DISTRIBUTION_POINT_WITH_CNAME_MESSAGE: &str =
+    "RevocationConfiguration.CrlConfiguration.CrlDistributionPointExtensionConfiguration \
+     cannot be enabled with a custom CNAME set.";
 
 /// What Amazon Web Services Private CA answers when an S3 bucket a request names is not
 /// there: one sentence about the bucket, naming no bucket of its own.
@@ -2015,33 +2070,12 @@ fn crl_reason_extension(revocation_reason: &str) -> Option<Extension> {
 }
 
 /// The `authorityKeyIdentifier` extension (RFC 5280 section 5.2.1) of a CRL this CA signs:
-/// the identifier of the key the CRL was signed with, which is the key the CA's OWN
-/// certificate holds.
-///
-/// The identifier is the one that certificate publishes as its subject key identifier,
-/// since that is the value a relying party matches this extension against. A certificate
-/// that publishes none is identified by its key: the leftmost 160 bits of the SHA-256
-/// digest over its `subjectPublicKey` BIT STRING, which is method 1 of RFC 7093 section 2
-/// ("Other methods of generating unique numbers are also acceptable", RFC 5280 section
-/// 4.2.1.2).
+/// the identifier of the key the CRL was signed with ([`issuer_key_identifier`]), which is
+/// the key the CA's OWN certificate holds.
 ///
 /// `None` when the CA holds no certificate this service can read.
 fn authority_key_identifier_extension(ca: &CertificateAuthorityRecord) -> Option<Extension> {
-    let der = parse_pem_block(ca.ca_certificate_pem.as_deref()?, PEM_LABEL_CERTIFICATE)?;
-    let certificate = Certificate::from_der(&der).ok()?;
-    let key_identifier = match published_key_identifier(&certificate) {
-        Some(published) => published,
-        None => OctetString::new(
-            &Sha256::digest(
-                certificate
-                    .tbs_certificate
-                    .subject_public_key_info
-                    .subject_public_key
-                    .raw_bytes(),
-            )[..KEY_IDENTIFIER_BYTES],
-        )
-        .ok()?,
-    };
+    let key_identifier = issuer_key_identifier(ca)?;
     let identifier = ::x509_cert::ext::pkix::AuthorityKeyIdentifier {
         key_identifier: Some(key_identifier),
         authority_cert_issuer: None,
@@ -2058,6 +2092,37 @@ fn authority_key_identifier_extension(ca: &CertificateAuthorityRecord) -> Option
 /// 2 derives from a SHA-256 digest and the length RFC 5280 section 4.2.1.2's own methods
 /// produce.
 const KEY_IDENTIFIER_BYTES: usize = 20;
+
+/// The key identifier the certificates and CRLs this CA signs name as their authority key
+/// identifier: the identifier of the key it signs with.
+///
+/// The one the CA's own certificate publishes as its subject key identifier, since that is
+/// the value a relying party matches the extension against; a certificate that publishes
+/// none is identified by the key it holds ([`derived_key_identifier`]).
+///
+/// `None` when the CA holds no certificate this service can read.
+pub fn issuer_key_identifier(ca: &CertificateAuthorityRecord) -> Option<OctetString> {
+    let der = parse_pem_block(ca.ca_certificate_pem.as_deref()?, PEM_LABEL_CERTIFICATE)?;
+    let certificate = Certificate::from_der(&der).ok()?;
+    match published_key_identifier(&certificate) {
+        Some(published) => Some(published),
+        None => derived_key_identifier(&certificate.tbs_certificate.subject_public_key_info),
+    }
+}
+
+/// The key identifier of `public_key`: the leftmost 160 bits of the SHA-256 digest over its
+/// `subjectPublicKey` BIT STRING, which is method 1 of RFC 7093 section 2 ("Other methods of
+/// generating unique numbers are also acceptable", RFC 5280 section 4.2.1.2).
+///
+/// The ONE derivation of a key identifier in this service, so the identifier a certificate
+/// publishes for a key and the identifier the certificates signed with that key name are the
+/// same value.
+pub fn derived_key_identifier(public_key: &SubjectPublicKeyInfoOwned) -> Option<OctetString> {
+    OctetString::new(
+        &Sha256::digest(public_key.subject_public_key.raw_bytes())[..KEY_IDENTIFIER_BYTES],
+    )
+    .ok()
+}
 
 /// The key identifier `certificate` publishes as its subject key identifier (RFC 5280
 /// section 4.2.1.2), when it publishes one.
@@ -2842,6 +2907,31 @@ mod oid {
         ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.4");
     pub const SM3_WITH_SM2: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.156.10197.1.501");
 
+    // The key purposes `extendedKeyUsage` names, from the `ExtendedKeyUsageType` members
+    // this model publishes: the `id-kp-*` purposes of RFC 5280 section 4.2.1.12, the
+    // smart-card-logon and document-signing purposes of the Microsoft `1.3.6.1.4.1.311` arc,
+    // and the certificate-transparency purpose of RFC 6962 section 3.1.
+    pub const TLS_SERVER_AUTH: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.1");
+    pub const TLS_CLIENT_AUTH: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.2");
+    pub const CODE_SIGNING: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.3");
+    pub const EMAIL_PROTECTION: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.4");
+    pub const TIME_STAMPING: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.8");
+    pub const OCSP_SIGNING: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.9");
+    pub const SMART_CARD_LOGIN: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.3.6.1.4.1.311.20.2.2");
+    pub const DOCUMENT_SIGNING: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.3.6.1.4.1.311.3.10.3.12");
+    pub const CERTIFICATE_TRANSPARENCY: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.3.6.1.4.1.11129.2.4.4");
+
+    // The access method an `authorityInformationAccess` description names for an OCSP
+    // responder (`id-ad-ocsp`, RFC 5280 section 4.2.2.1) and the qualifier a certificate
+    // policy names for a certification practice statement (`id-qt-cps`, section 4.2.1.4).
+    pub const OCSP_ACCESS_METHOD: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.48.1");
+    pub const CPS_QUALIFIER: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.2.1");
+
     // Certificate and CRL extensions: RFC 5280 sections 4.2.1, 5.2 and 5.3 (`2.5.29.*`).
     pub const SUBJECT_KEY_IDENTIFIER: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.14");
     pub const SUBJECT_ALT_NAME: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.17");
@@ -2951,46 +3041,51 @@ pub fn derive_csr_pem(
 ///
 /// A real X.509 `Certificate` (RFC 5280 section 4.1): the serial the CA allocated, the
 /// issuer the CA's own subject, the resolved validity window, and — as a CA does — the
-/// subject and the public key copied out of the certification request being signed.
+/// public key copied out of the certification request being signed.
 ///
 /// The signature is made with the CA's own private key ([`CaKeyPair::signature`]) under the
 /// algorithm the request asked for, so the certificate verifies against the public key the
 /// CA publishes; for a CA holding no key pair it is the stand-in of the right ASN.1 shape.
 ///
-/// The extensions are the ones the `TemplateArn` the request named defines
-/// ([`certificate_template`]), so a certificate issued under a CA-certificate template is
-/// usable as an issuer and one issued under an end-entity template is not.
+/// The subject and the extensions come from the three sources an issuance has, in the order
+/// of priority `issued_extensions` states: the `TemplateArn` the request named defines the
+/// certificate's kind ([`certificate_template`]), an `ApiPassthrough` that applies supplies
+/// the values the caller asked to be carried, and the certification request supplies the
+/// rest — with the issuing CA's own key identifiers and revocation endpoints beside them.
 ///
 /// `None` when the CA's subject, the allocated serial or the validity window cannot be
 /// encoded as the certificate's DER demands.
 pub fn derive_certificate_pem(
     ca: &CertificateAuthorityRecord,
     serial: &str,
-    request: &CertificationRequestInfo,
-    signing_algorithm: &str,
-    template: &CertificateTemplate,
-    not_before: SystemTime,
-    not_after: SystemTime,
+    content: &IssuedCertificateContent<'_>,
 ) -> Option<String> {
-    let algorithm = signature_algorithm_identifier(signing_algorithm)?;
+    let request = content.request;
+    let algorithm = signature_algorithm_identifier(content.signing_algorithm)?;
     let tbs_certificate = TbsCertificate {
         version: Version::V3,
         serial_number: serial_number(serial)?,
         signature: algorithm.clone(),
         issuer: subject_name(&ca.configuration.subject)?,
         validity: CertificateValidity {
-            not_before: certificate_time(not_before)?,
-            not_after: certificate_time(not_after)?,
+            not_before: certificate_time(content.not_before)?,
+            not_after: certificate_time(content.not_after)?,
         },
-        subject: request.subject.clone(),
+        subject: issued_certificate_subject(request, content.passthrough)?,
         subject_public_key_info: request.public_key.clone(),
         issuer_unique_id: None,
         subject_unique_id: None,
-        extensions: certificate_extensions(template, request),
+        extensions: issued_certificate_extensions(
+            ca,
+            content.template,
+            request,
+            content.passthrough,
+            &request.public_key,
+        ),
     };
     let signature = object_signature(
         ca.key_pair.as_ref(),
-        signing_algorithm,
+        content.signing_algorithm,
         &tbs_certificate.to_der().ok()?,
     )?;
     let certificate = Certificate {
