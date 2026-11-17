@@ -3309,15 +3309,16 @@ pub const RESOURCE_IDENTIFIER_EXCLUSIVE_MESSAGE: &str =
     "resourceIdentifier should not be specified with any other log group attributes";
 
 /// The refusal a `DescribeLogGroups` request that names the log groups to report BESIDE another
-/// filter of the same listing is answered with: the rule IN THE MODEL'S OWN WORDS — "use this
-/// array to filter the list of log groups returned. If you specify this parameter, the only
-/// other filter that you can choose to specify is includeLinkedAccounts"
-/// (`smithy_query(query="doc",shape="DescribeLogGroupsRequest",member="logGroupIdentifiers")`),
-/// stated as the refusal of the request it is. Fixed text for the class: it names the member
-/// the rule is about and the one member it admits beside it, and carries nothing of the request.
+/// filter of the same listing is answered with. The rule the refusal enforces is the one the
+/// model documents for the member — "use this array to filter the list of log groups returned.
+/// If you specify this parameter, the only other filter that you can choose to specify is
+/// includeLinkedAccounts"
+/// (`smithy_query(query="doc",shape="DescribeLogGroupsRequest",member="logGroupIdentifiers")`) —
+/// but the SENTENCE is the service's own refusal wording for the class, not that prose: fixed
+/// text that names the member in the spelling the sentence carries it in and interpolates
+/// nothing of the request.
 pub const LOG_GROUP_IDENTIFIERS_EXCLUDE_FILTERS_MESSAGE: &str =
-    "If you specify logGroupIdentifiers, the only other filter that you can choose to specify \
-     is includeLinkedAccounts";
+    "No other input filter parameter can be provided with LogGroupIdentifiers";
 
 /// The refusal an `AssociateKmsKey` / `DisassociateKmsKey` request whose two target members
 /// cannot hold together is refused with, or `None` when exactly one of them names a target.

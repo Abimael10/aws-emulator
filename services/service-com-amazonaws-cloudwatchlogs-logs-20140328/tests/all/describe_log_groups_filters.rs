@@ -8,8 +8,9 @@
 //! (`smithy_query(query="doc",shape="DescribeLogGroupsRequest",member="logGroupIdentifiers")`)
 //! — and the two name filters are mutually exclusive with each other ("logGroupNamePattern and
 //! logGroupNamePrefix are mutually exclusive. Only one of these parameters can be passed"). A
-//! request breaking either is refused with `InvalidParameterException`, and one naming a single
-//! filter is served.**
+//! request breaking either is refused with `InvalidParameterException` carrying the service's
+//! own refusal sentence for that class — fixed text that interpolates nothing of the request —
+//! and one naming a single filter is served.**
 //!
 //! Every call goes over the wire — `POST /` with `X-Amz-Target: Logs_20140328.DescribeLogGroups`
 //! — so what is asserted is what a client observes.
@@ -41,10 +42,11 @@ struct Row {
 }
 
 /// The sentence this service refuses a listing that names its log groups BESIDE another filter
-/// with: the rule as the model states it. Stated here independently of the crate under test.
+/// with. Fixed text for the class: it names the member the rule is about in the spelling the
+/// sentence carries it in, and nothing of the request. Stated here independently of the crate
+/// under test.
 const IDENTIFIERS_EXCLUDE_FILTERS: &str =
-    "If you specify logGroupIdentifiers, the only other filter that you can choose to specify \
-     is includeLinkedAccounts";
+    "No other input filter parameter can be provided with LogGroupIdentifiers";
 
 /// The sentence this service words a pair of filters that cannot be combined with, naming the
 /// two the way the service names them and carrying nothing of the request.
@@ -80,6 +82,31 @@ async fn rows(logs: &Logs) -> Vec<Row> {
         Row {
             case: "identifiers naming a group by NAME beside a name prefix",
             request: json!({"logGroupIdentifiers": [GROUPS[0]], "logGroupNamePrefix": "filters/"}),
+            refusal: Some(IDENTIFIERS_EXCLUDE_FILTERS.to_string()),
+        },
+        Row {
+            case: "identifiers naming TWO groups beside a name prefix",
+            request: json!({
+                "logGroupIdentifiers": [arn.clone(), group_arn(logs, GROUPS[1]).await],
+                "logGroupNamePrefix": "filters/",
+            }),
+            refusal: Some(IDENTIFIERS_EXCLUDE_FILTERS.to_string()),
+        },
+        Row {
+            case: "identifiers naming a group by its logGroupArn beside a class",
+            request: json!({
+                "logGroupIdentifiers": [logs.group_arns(GROUPS[1]).await.1],
+                "logGroupClass": "INFREQUENT_ACCESS",
+            }),
+            refusal: Some(IDENTIFIERS_EXCLUDE_FILTERS.to_string()),
+        },
+        Row {
+            case: "identifiers beside a name prefix AND the one member they admit",
+            request: json!({
+                "logGroupIdentifiers": [arn.clone()],
+                "logGroupNamePrefix": "filters/",
+                "includeLinkedAccounts": true,
+            }),
             refusal: Some(IDENTIFIERS_EXCLUDE_FILTERS.to_string()),
         },
         Row {
@@ -192,4 +219,95 @@ async fn the_log_group_filters_that_cannot_be_combined_are_refused() {
         GROUPS.to_vec(),
         "case \"after the refusals\": the account still holds both groups, got {names:?}"
     );
+}
+
+/// RULE: the sentence that refusal carries is FIXED TEXT for the class — it is the same
+/// sentence however the request named its groups and whichever other filter it named beside
+/// them, and it interpolates nothing of the request.
+///
+/// The rows differ along everything the request can vary that the sentence must not follow:
+/// how many groups are named, which form names them (name, `arn`, `logGroupArn`), which other
+/// filter is named beside them, and what that filter's value is.
+#[tokio::test]
+async fn the_identifier_filter_refusal_is_fixed_text() {
+    let logs = Logs::new();
+    for group in GROUPS {
+        logs.ok("CreateLogGroup", &json!({"logGroupName": group}))
+            .await;
+    }
+    let (arn, log_group_arn) = logs.group_arns(GROUPS[0]).await;
+
+    // Each case: what it varies, the identifiers it names, and the other filter it names
+    // beside them as (member, value).
+    let cases: Vec<(&str, Value, (&str, Value))> = vec![
+        (
+            "one group by name, beside a prefix",
+            json!([GROUPS[0]]),
+            ("logGroupNamePrefix", json!("filters/")),
+        ),
+        (
+            "one group by its logGroupArn, beside a longer prefix",
+            json!([log_group_arn.clone()]),
+            ("logGroupNamePrefix", json!(GROUPS[1])),
+        ),
+        (
+            "one group by logGroupArn, beside a pattern",
+            json!([log_group_arn.clone()]),
+            ("logGroupNamePattern", json!("alpha")),
+        ),
+        (
+            "two groups, beside a class",
+            json!([GROUPS[0], GROUPS[1]]),
+            ("logGroupClass", json!("STANDARD")),
+        ),
+        (
+            "two groups in the other order, beside the other class",
+            json!([GROUPS[1], GROUPS[0]]),
+            ("logGroupClass", json!("INFREQUENT_ACCESS")),
+        ),
+        (
+            "a group this account does not hold, beside a pattern",
+            json!(["filters/never-created"]),
+            ("logGroupNamePattern", json!("never")),
+        ),
+    ];
+
+    for (case, identifiers, (member, value)) in cases {
+        let request = json!({"logGroupIdentifiers": identifiers, member: value});
+        let (status, parsed) = logs.call("DescribeLogGroups", &request).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: {request} must be refused, got {status} {parsed}"
+        );
+        assert_eq!(
+            error_code(&parsed),
+            INVALID_PARAMETER,
+            "case {case:?}: expected {INVALID_PARAMETER}, got {parsed}"
+        );
+        let message = parsed
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("case {case:?}: a refusal carries a message, got {parsed}"));
+        assert_eq!(
+            message, IDENTIFIERS_EXCLUDE_FILTERS,
+            "case {case:?}: expected {IDENTIFIERS_EXCLUDE_FILTERS:?}, got {message:?}"
+        );
+        // Nothing of the request may reach the sentence: not a group it named, not an ARN, not
+        // the value of the filter it named beside them.
+        for carried in [
+            GROUPS[0],
+            GROUPS[1],
+            arn.as_str(),
+            log_group_arn.as_str(),
+            "STANDARD",
+            "INFREQUENT_ACCESS",
+            "alpha",
+        ] {
+            assert!(
+                !message.contains(carried),
+                "case {case:?}: the sentence carries nothing of the request, but {carried:?} is \
+                 in {message:?}"
+            );
+        }
+    }
 }
