@@ -2757,13 +2757,28 @@ pub fn instance_type_info(instance_type: &str) -> Option<InstanceTypeInfo> {
     let manufacturer = facts
         .and_then(|facts| facts.processor_manufacturer)
         .unwrap_or_else(|| processor_manufacturer(&name, &record.architecture));
+    // Whether the type has an EBS-optimized mode: the published answer where the catalog holds
+    // the type's row, else the mode its hardware generation gives. Read once, because it is also
+    // what says whether there is an `EbsInfo$EbsOptimizedInfo` to report at all.
+    let ebs_optimized = facts
+        .and_then(|facts| facts.ebs_optimized_support)
+        .unwrap_or_else(|| ebs_optimized_support(&name));
+    // A list a row publishes is the type's own; `strings` reads it as the modelled member's
+    // values.
+    let strings = |list: &'static [&'static str]| -> Vec<String> {
+        list.iter().map(|value| (*value).to_string()).collect()
+    };
 
     Some(InstanceTypeInfo {
         instance_type: Some(record.instance_type.clone()),
         current_generation: Some(record.current_generation),
         free_tier_eligible: Some(FREE_TIER_INSTANCE_TYPES.contains(&instance_type)),
         supported_usage_classes: Some(supported_usage_classes(&name)),
-        supported_root_device_types: Some(supported_root_device_types(&name)),
+        supported_root_device_types: Some(
+            facts
+                .and_then(|facts| facts.root_device_types)
+                .map_or_else(|| supported_root_device_types(&name), strings),
+        ),
         supported_virtualization_types: Some(supported_virtualization_types(&name)),
         bare_metal: Some(record.bare_metal),
         // A bare metal instance runs the caller's own software on the host with no
@@ -2778,7 +2793,11 @@ pub fn instance_type_info(instance_type: &str) -> Option<InstanceTypeInfo> {
             sustained_clock_speed_in_ghz: facts
                 .and_then(|facts| facts.sustained_clock_speed_ghz)
                 .or_else(|| sustained_clock_speed_ghz(manufacturer, &name)),
-            supported_features: Some(processor_features(&name)),
+            supported_features: Some(
+                facts
+                    .and_then(|facts| facts.processor_features)
+                    .map_or_else(|| processor_features(&name), strings),
+            ),
             manufacturer: Some(manufacturer.to_string()),
         }),
         v_cpu_info: Some(VCpuInfo {
@@ -2797,7 +2816,7 @@ pub fn instance_type_info(instance_type: &str) -> Option<InstanceTypeInfo> {
             .as_ref()
             .map(InstanceStorageFacts::to_instance_storage_info),
         ebs_info: Some(EbsInfo {
-            ebs_optimized_support: Some(ebs_optimized_support(&name).to_string()),
+            ebs_optimized_support: Some(ebs_optimized.to_string()),
             encryption_support: Some(
                 if modern { "supported" } else { "unsupported" }.to_string(),
             ),
@@ -2806,7 +2825,7 @@ pub fn instance_type_info(instance_type: &str) -> Option<InstanceTypeInfo> {
             // EBS-optimized mode, and absent for one whose `EbsOptimizedSupport` is
             // `unsupported`, which has no such performance to describe. The four figures
             // are the type's own where the catalog publishes them.
-            ebs_optimized_info: (ebs_optimized_support(&name) != EBS_OPTIMIZED_UNSUPPORTED)
+            ebs_optimized_info: (ebs_optimized != EBS_OPTIMIZED_UNSUPPORTED)
                 .then(|| match facts.and_then(|facts| facts.ebs_performance) {
                     Some(published) => published.to_ebs_optimized_info(),
                     None => ebs_optimized_info(sixteenths, nitro),
@@ -2961,7 +2980,11 @@ pub fn instance_type_info(instance_type: &str) -> Option<InstanceTypeInfo> {
             .and_then(|facts| facts.fpga_devices)
             .map(PublishedFpgaDevices::to_fpga_info),
         placement_group_info: Some(PlacementGroupInfo {
-            supported_strategies: Some(placement_group_strategies(&name)),
+            supported_strategies: Some(
+                facts
+                    .and_then(|facts| facts.placement_group_strategies)
+                    .map_or_else(|| placement_group_strategies(&name), strings),
+            ),
         }),
         inference_accelerator_info: facts
             .and_then(|facts| facts.inference_devices)
@@ -2989,7 +3012,7 @@ pub fn instance_type_info(instance_type: &str) -> Option<InstanceTypeInfo> {
                 .and_then(|facts| facts.supported_boot_modes)
                 .map_or_else(
                     || supported_boot_modes(&record.architecture, nitro),
-                    |modes| modes.iter().map(|mode| (*mode).to_string()).collect(),
+                    strings,
                 ),
         ),
         // "Indicates whether Nitro Enclaves is supported" (`$NitroEnclavesSupport`): an

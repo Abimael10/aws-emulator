@@ -274,12 +274,14 @@ async fn connection_tracking_and_enclave_support_are_published_per_type() {
     }
 
     // Interface attachments from a secondary network are a published fact of the type too, and
-    // a type that takes none reports no secondary interface limit at all.
+    // a type that takes none reports no secondary interface limit at all. The contrast row is a
+    // type the catalog holds no row for, which keeps its hardware generation's answer — the
+    // families whose published rows say otherwise are the three above it.
     let secondary_rows = [
         ("r8ib.large", "false"),
         ("r8ib.96xlarge", "false"),
         ("c5a.xlarge", "false"),
-        ("m7i.4xlarge", "true"),
+        ("m7g.4xlarge", "true"),
     ];
 
     for (instance_type, expected) in secondary_rows {

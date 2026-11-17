@@ -343,6 +343,25 @@ pub struct PublishedInstanceTypeFacts {
     /// connection by default (`DefaultConnectionTrackingConfiguration$DefaultTcpEstablishedTimeout`),
     /// where the type's own default is not the one every earlier type reports.
     pub default_tcp_established_timeout: Option<i32>,
+    /// Whether the type has an EBS-optimized mode — one value of the modelled
+    /// `EbsOptimizedSupport` — where the published "EBS optimized" column of its row is not
+    /// what its hardware generation gives. A type published as `unsupported` has no
+    /// EBS-optimized performance to report either.
+    pub ebs_optimized_support: Option<&'static str>,
+    /// The placement group strategies the type is offered
+    /// (`PlacementGroupInfo$SupportedStrategies`), where AWS's list for it is its own rather
+    /// than the one its generation gives — one value of the modelled
+    /// `PlacementGroupStrategy` per entry.
+    pub placement_group_strategies: Option<&'static [&'static str]>,
+    /// The root device types the type's AMIs may be backed by
+    /// (`InstanceTypeInfo$SupportedRootDeviceTypes`), where AWS's list for it is its own —
+    /// one value of the modelled `RootDeviceType` per entry.
+    pub root_device_types: Option<&'static [&'static str]>,
+    /// The additional processor features the type publishes
+    /// (`ProcessorInfo$SupportedFeatures`), where AWS's list for it is not the one its
+    /// processor's generation gives — one value of the modelled
+    /// `SupportedAdditionalProcessorFeature` per entry.
+    pub processor_features: Option<&'static [&'static str]>,
     /// Its FPGA accelerators.
     pub fpga_devices: Option<PublishedFpgaDevices>,
     /// Its GPU accelerators.
@@ -388,6 +407,10 @@ impl PublishedInstanceTypeFacts {
             nitro_enclaves_supported: None,
             ebs_cards: None,
             default_tcp_established_timeout: None,
+            ebs_optimized_support: None,
+            placement_group_strategies: None,
+            root_device_types: None,
+            processor_features: None,
             fpga_devices: None,
             gpu_devices: None,
             inference_devices: None,
@@ -653,6 +676,34 @@ impl PublishedInstanceTypeFacts {
         self
     }
 
+    /// Whether the type has an EBS-optimized mode at all, as the published "EBS optimized"
+    /// column of its row says.
+    const fn ebs_optimized(mut self, support: &'static str) -> Self {
+        self.ebs_optimized_support = Some(support);
+        self
+    }
+
+    /// The placement group strategies the type is offered, where AWS's published list for it
+    /// is its own.
+    const fn placement_strategies(mut self, strategies: &'static [&'static str]) -> Self {
+        self.placement_group_strategies = Some(strategies);
+        self
+    }
+
+    /// The root device types the type's AMIs may be backed by, where AWS's published list for
+    /// it is its own.
+    const fn root_devices(mut self, types: &'static [&'static str]) -> Self {
+        self.root_device_types = Some(types);
+        self
+    }
+
+    /// The additional processor features the type publishes, where AWS's list for it is not the
+    /// one its processor's generation gives.
+    const fn processor_features(mut self, features: &'static [&'static str]) -> Self {
+        self.processor_features = Some(features);
+        self
+    }
+
     /// The type's GPU accelerators: `count` whole devices of `memory_mib_each` MiB, offered for
     /// the `workloads` the published inventory names.
     const fn gpus(
@@ -737,6 +788,22 @@ const SHORT_TCP_ESTABLISHED_TIMEOUT: i32 = 350;
 /// towards one or the other publishes: the default split, and one weighting for each side the
 /// extra bandwidth can be given to.
 const CONFIGURABLE_BANDWIDTH_WEIGHTINGS: &[&str] = &["default", "ebs-1", "vpc-1"];
+
+/// The `PlacementGroupStrategy` values a type offered EVERY placement group strategy
+/// publishes, in the order AWS lists them.
+const EVERY_PLACEMENT_STRATEGY: &[&str] = &["cluster", "partition", "spread"];
+
+/// The `RootDeviceType` values a type whose AMIs may be backed by either an EBS volume or its
+/// local instance store publishes.
+const EBS_AND_INSTANCE_STORE_ROOT_DEVICES: &[&str] = &["ebs", "instance-store"];
+
+/// The `SupportedAdditionalProcessorFeature` value of a processor that runs a hypervisor inside
+/// the guest, which is what a type offered nested virtualization publishes.
+const NESTED_VIRTUALIZATION: &[&str] = &["nested-virtualization"];
+
+/// The `BootModeType` value of a type offered the legacy BIOS boot mode alone, which is what a
+/// bare metal size of an x86 family publishes.
+const LEGACY_BIOS_BOOT_MODE: &[&str] = &["legacy-bios"];
 
 /// The Elastic Fabric Adapters (`EfaInfo$MaximumEfaInterfaces`) the newest hardware
 /// generation's whole-host sizes are offered: its adapter carries many more of them than the
@@ -1017,6 +1084,336 @@ static PUBLISHED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
         .host_features(true, false)
         .secondary_network(false)
         .ipv4_per_secondary_interface(0)
+        .traffic_mirroring(false),
+    // C8g — compute optimized on AWS Graviton4, at a sustained 2.8 GHz on the sizes whose cores
+    // sit on ONE processor socket and 2.7 on the two that carry both, with no local instance
+    // store. The family's network and EBS bandwidth is CONFIGURABLE, so every size publishes the
+    // bandwidth weightings a launch may ask for. Its EBS figures are the Graviton4 compute
+    // ladder's rows of "Amazon EBS optimized instance types": the sizes below the `8xlarge`
+    // publish a baseline they burst above, up to 10,000 Mbps and 40,000 IOPS, and the bandwidth
+    // is dedicated from that size up, reaching 40,000 Mbps and 240,000 IOPS on the sizes that
+    // hold the whole host. Those volumes are attached to EBS hardware of the type's own rather
+    // than out of the pool shared with the interfaces, so the limit every size reports is the
+    // EBS devices' own and is of the `dedicated` kind: 32 volumes up to the `12xlarge`, then 48,
+    // 64 and 128 as the size grows, while each bare metal size reports its host's own limit — 79
+    // volumes on the whole host and 39 on the half of it the smaller one holds. The network
+    // figures are the family's published ones, up to 12.5 and up to 15 Gigabit below the
+    // `8xlarge` and its share of the host's 50 from there up; the smallest size takes two
+    // interfaces of four private addresses each rather than the count its step of the size
+    // ladder publishes. The family takes no interface attachment from a secondary network, so no
+    // private address at all is available on one, the number of ENA queues cannot be changed on
+    // its adapter and the packets of a session cannot be copied under its guest. The Elastic
+    // Fabric Adapter is offered on the two sizes that hold the whole host and on both bare metal
+    // ones, which are also offered CloudWatch action based recovery, reboot migration and a
+    // local PTP hardware clock; ENA Express is offered from the `8xlarge` up, the sizes under it
+    // carrying less dedicated network bandwidth than its transport needs. An enclave is offered
+    // from two vCPUs up on this architecture rather than from the four an x86 type needs, so the
+    // `large` size carries one, and the `48xlarge` — the size that holds the whole host — takes
+    // its cores all at once, so the one count it publishes is its default.
+    PublishedInstanceTypeFacts::of("c8g.medium")
+        .ebs(315, 2_500, 10_000, 40_000)
+        .dedicated_ebs_attachments(32)
+        .network("Up to 12.5 Gigabit")
+        .bandwidth_weightings(CONFIGURABLE_BANDWIDTH_WEIGHTINGS)
+        .interfaces(2)
+        .ipv4_per_interface(4)
+        .processor("AWS", 2.8)
+        .ena_srd(false)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false)
+        .traffic_mirroring(false),
+    PublishedInstanceTypeFacts::of("c8g.large")
+        .ebs(630, 3_600, 10_000, 40_000)
+        .dedicated_ebs_attachments(32)
+        .network("Up to 12.5 Gigabit")
+        .bandwidth_weightings(CONFIGURABLE_BANDWIDTH_WEIGHTINGS)
+        .processor("AWS", 2.8)
+        .ena_srd(false)
+        .nitro_enclaves(true)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false)
+        .traffic_mirroring(false),
+    PublishedInstanceTypeFacts::of("c8g.xlarge")
+        .ebs(1_250, 6_000, 10_000, 40_000)
+        .dedicated_ebs_attachments(32)
+        .network("Up to 12.5 Gigabit")
+        .bandwidth_weightings(CONFIGURABLE_BANDWIDTH_WEIGHTINGS)
+        .processor("AWS", 2.8)
+        .ena_srd(false)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false)
+        .traffic_mirroring(false),
+    PublishedInstanceTypeFacts::of("c8g.2xlarge")
+        .ebs(2_500, 12_000, 10_000, 40_000)
+        .dedicated_ebs_attachments(32)
+        .network("Up to 15 Gigabit")
+        .bandwidth_weightings(CONFIGURABLE_BANDWIDTH_WEIGHTINGS)
+        .processor("AWS", 2.8)
+        .ena_srd(false)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false)
+        .traffic_mirroring(false),
+    PublishedInstanceTypeFacts::of("c8g.4xlarge")
+        .ebs(5_000, 20_000, 10_000, 40_000)
+        .dedicated_ebs_attachments(32)
+        .network("Up to 15 Gigabit")
+        .bandwidth_weightings(CONFIGURABLE_BANDWIDTH_WEIGHTINGS)
+        .processor("AWS", 2.8)
+        .ena_srd(false)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false)
+        .traffic_mirroring(false),
+    PublishedInstanceTypeFacts::of("c8g.8xlarge")
+        .ebs(10_000, 40_000, 10_000, 40_000)
+        .dedicated_ebs_attachments(32)
+        .network("15 Gigabit")
+        .bandwidth_weightings(CONFIGURABLE_BANDWIDTH_WEIGHTINGS)
+        .processor("AWS", 2.8)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false)
+        .traffic_mirroring(false),
+    PublishedInstanceTypeFacts::of("c8g.12xlarge")
+        .ebs(15_000, 60_000, 15_000, 60_000)
+        .dedicated_ebs_attachments(32)
+        .network("22.5 Gigabit")
+        .bandwidth_weightings(CONFIGURABLE_BANDWIDTH_WEIGHTINGS)
+        .processor("AWS", 2.8)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false)
+        .traffic_mirroring(false),
+    PublishedInstanceTypeFacts::of("c8g.16xlarge")
+        .ebs(20_000, 80_000, 20_000, 80_000)
+        .dedicated_ebs_attachments(48)
+        .network("30 Gigabit")
+        .bandwidth_weightings(CONFIGURABLE_BANDWIDTH_WEIGHTINGS)
+        .processor("AWS", 2.8)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false)
+        .traffic_mirroring(false),
+    PublishedInstanceTypeFacts::of("c8g.24xlarge")
+        .ebs(30_000, 120_000, 30_000, 120_000)
+        .dedicated_ebs_attachments(64)
+        .network("40 Gigabit")
+        .bandwidth_weightings(CONFIGURABLE_BANDWIDTH_WEIGHTINGS)
+        .efa(1)
+        .processor("AWS", 2.8)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false)
+        .traffic_mirroring(false),
+    PublishedInstanceTypeFacts::of("c8g.48xlarge")
+        .cores_in_steps_of(192)
+        .ebs(40_000, 240_000, 40_000, 240_000)
+        .dedicated_ebs_attachments(128)
+        .network("50 Gigabit")
+        .bandwidth_weightings(CONFIGURABLE_BANDWIDTH_WEIGHTINGS)
+        .efa(1)
+        .processor("AWS", 2.7)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false)
+        .traffic_mirroring(false),
+    PublishedInstanceTypeFacts::of("c8g.metal-24xl")
+        .ebs(30_000, 120_000, 30_000, 120_000)
+        .dedicated_ebs_attachments(39)
+        .network("40 Gigabit")
+        .bandwidth_weightings(CONFIGURABLE_BANDWIDTH_WEIGHTINGS)
+        .efa(1)
+        .processor("AWS", 2.8)
+        .ena_srd(true)
+        .auto_recovery(true)
+        .host_features(true, true)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false)
+        .traffic_mirroring(false),
+    PublishedInstanceTypeFacts::of("c8g.metal-48xl")
+        .ebs(40_000, 240_000, 40_000, 240_000)
+        .dedicated_ebs_attachments(79)
+        .network("50 Gigabit")
+        .bandwidth_weightings(CONFIGURABLE_BANDWIDTH_WEIGHTINGS)
+        .efa(1)
+        .processor("AWS", 2.7)
+        .ena_srd(true)
+        .auto_recovery(true)
+        .host_features(true, true)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false)
+        .traffic_mirroring(false),
+    // C8gd — the same Graviton4 compute hardware as C8g above, carrying local NVMe devices, so
+    // every figure of the C8g rows holds here and the rows add the family's published store: the
+    // share of the host's devices each size holds, which is one device of a size of its own up to
+    // the `8xlarge` and whole or half 1,900 GB devices above it. Because the local data of an
+    // instance store cannot be carried over to another host, no size of the family is offered
+    // CloudWatch action based recovery or reboot migration, the bare metal ones included — while
+    // the PTP hardware clock of this hardware generation is offered on every size.
+    PublishedInstanceTypeFacts::of("c8gd.medium")
+        .ebs(315, 2_500, 10_000, 40_000)
+        .dedicated_ebs_attachments(32)
+        .instance_store(1, 59)
+        .network("Up to 12.5 Gigabit")
+        .bandwidth_weightings(CONFIGURABLE_BANDWIDTH_WEIGHTINGS)
+        .interfaces(2)
+        .ipv4_per_interface(4)
+        .processor("AWS", 2.8)
+        .ena_srd(false)
+        .host_features(false, true)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false)
+        .traffic_mirroring(false),
+    PublishedInstanceTypeFacts::of("c8gd.large")
+        .ebs(630, 3_600, 10_000, 40_000)
+        .dedicated_ebs_attachments(32)
+        .instance_store(1, 118)
+        .network("Up to 12.5 Gigabit")
+        .bandwidth_weightings(CONFIGURABLE_BANDWIDTH_WEIGHTINGS)
+        .processor("AWS", 2.8)
+        .ena_srd(false)
+        .nitro_enclaves(true)
+        .host_features(false, true)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false)
+        .traffic_mirroring(false),
+    PublishedInstanceTypeFacts::of("c8gd.xlarge")
+        .ebs(1_250, 6_000, 10_000, 40_000)
+        .dedicated_ebs_attachments(32)
+        .instance_store(1, 237)
+        .network("Up to 12.5 Gigabit")
+        .bandwidth_weightings(CONFIGURABLE_BANDWIDTH_WEIGHTINGS)
+        .processor("AWS", 2.8)
+        .ena_srd(false)
+        .host_features(false, true)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false)
+        .traffic_mirroring(false),
+    PublishedInstanceTypeFacts::of("c8gd.2xlarge")
+        .ebs(2_500, 12_000, 10_000, 40_000)
+        .dedicated_ebs_attachments(32)
+        .instance_store(1, 474)
+        .network("Up to 15 Gigabit")
+        .bandwidth_weightings(CONFIGURABLE_BANDWIDTH_WEIGHTINGS)
+        .processor("AWS", 2.8)
+        .ena_srd(false)
+        .host_features(false, true)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false)
+        .traffic_mirroring(false),
+    PublishedInstanceTypeFacts::of("c8gd.4xlarge")
+        .ebs(5_000, 20_000, 10_000, 40_000)
+        .dedicated_ebs_attachments(32)
+        .instance_store(1, 950)
+        .network("Up to 15 Gigabit")
+        .bandwidth_weightings(CONFIGURABLE_BANDWIDTH_WEIGHTINGS)
+        .processor("AWS", 2.8)
+        .ena_srd(false)
+        .host_features(false, true)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false)
+        .traffic_mirroring(false),
+    PublishedInstanceTypeFacts::of("c8gd.8xlarge")
+        .ebs(10_000, 40_000, 10_000, 40_000)
+        .dedicated_ebs_attachments(32)
+        .instance_store(1, 1_900)
+        .network("15 Gigabit")
+        .bandwidth_weightings(CONFIGURABLE_BANDWIDTH_WEIGHTINGS)
+        .processor("AWS", 2.8)
+        .host_features(false, true)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false)
+        .traffic_mirroring(false),
+    PublishedInstanceTypeFacts::of("c8gd.12xlarge")
+        .ebs(15_000, 60_000, 15_000, 60_000)
+        .dedicated_ebs_attachments(32)
+        .instance_store(3, 950)
+        .network("22.5 Gigabit")
+        .bandwidth_weightings(CONFIGURABLE_BANDWIDTH_WEIGHTINGS)
+        .processor("AWS", 2.8)
+        .host_features(false, true)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false)
+        .traffic_mirroring(false),
+    PublishedInstanceTypeFacts::of("c8gd.16xlarge")
+        .ebs(20_000, 80_000, 20_000, 80_000)
+        .dedicated_ebs_attachments(48)
+        .instance_store(2, 1_900)
+        .network("30 Gigabit")
+        .bandwidth_weightings(CONFIGURABLE_BANDWIDTH_WEIGHTINGS)
+        .processor("AWS", 2.8)
+        .host_features(false, true)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false)
+        .traffic_mirroring(false),
+    PublishedInstanceTypeFacts::of("c8gd.24xlarge")
+        .ebs(30_000, 120_000, 30_000, 120_000)
+        .dedicated_ebs_attachments(64)
+        .instance_store(3, 1_900)
+        .network("40 Gigabit")
+        .bandwidth_weightings(CONFIGURABLE_BANDWIDTH_WEIGHTINGS)
+        .efa(1)
+        .processor("AWS", 2.8)
+        .host_features(false, true)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false)
+        .traffic_mirroring(false),
+    PublishedInstanceTypeFacts::of("c8gd.48xlarge")
+        .cores_in_steps_of(192)
+        .ebs(40_000, 240_000, 40_000, 240_000)
+        .dedicated_ebs_attachments(128)
+        .instance_store(6, 1_900)
+        .network("50 Gigabit")
+        .bandwidth_weightings(CONFIGURABLE_BANDWIDTH_WEIGHTINGS)
+        .efa(1)
+        .processor("AWS", 2.7)
+        .host_features(false, true)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false)
+        .traffic_mirroring(false),
+    PublishedInstanceTypeFacts::of("c8gd.metal-24xl")
+        .ebs(30_000, 120_000, 30_000, 120_000)
+        .dedicated_ebs_attachments(39)
+        .instance_store(3, 1_900)
+        .network("40 Gigabit")
+        .bandwidth_weightings(CONFIGURABLE_BANDWIDTH_WEIGHTINGS)
+        .efa(1)
+        .processor("AWS", 2.8)
+        .ena_srd(true)
+        .host_features(false, true)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false)
+        .traffic_mirroring(false),
+    PublishedInstanceTypeFacts::of("c8gd.metal-48xl")
+        .ebs(40_000, 240_000, 40_000, 240_000)
+        .dedicated_ebs_attachments(79)
+        .instance_store(6, 1_900)
+        .network("50 Gigabit")
+        .bandwidth_weightings(CONFIGURABLE_BANDWIDTH_WEIGHTINGS)
+        .efa(1)
+        .processor("AWS", 2.7)
+        .ena_srd(true)
+        .host_features(false, true)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false)
         .traffic_mirroring(false),
     // C5 — compute optimized on the AWS Nitro System, Intel Xeon Platinum: the 8124M
     // (Skylake) at a sustained 3.4 GHz on most of the ladder, and the 8275CL (Cascade Lake) at
@@ -2269,6 +2666,102 @@ static PUBLISHED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
         .encryption_in_transit(true)
         .host_features(false, false)
         .fpgas(8, "Virtex UltraScale+ (VU47P)", "Xilinx", 81_920),
+    // I4i — storage optimized, 3rd generation Intel Xeon Scalable (Ice Lake) at a sustained
+    // 3.5 GHz, carrying the AWS Nitro SSD devices the family is built around: the share of the
+    // host's eight 3,750 GB devices each size holds, which is one device of a size of its own up
+    // to the `4xlarge` and whole 3,750 GB devices above it. Its EBS figures are the family's own
+    // rows of "Amazon EBS optimized instance types": the sizes below the `8xlarge` publish a
+    // baseline they burst above, up to 10,000 Mbps and 40,000 IOPS, and the bandwidth is
+    // dedicated from that size up, reaching 40,000 Mbps and 160,000 IOPS on the sizes that hold
+    // the whole host. The EBS volumes share the Nitro attachment pool with the local devices and
+    // the interfaces, so the limit each virtualized size reports is what that pool leaves once
+    // its devices are counted — which the derivation above already does, so those rows leave it
+    // unset — while the bare metal size holds 31 volumes, its local devices being the host's own
+    // hardware. The network figures are the published ones: up to 10, 12.5 and 25 Gigabit below
+    // the `8xlarge`, then the size's share of the host's 75. Neither reboot migration nor a PTP
+    // hardware clock is offered on this hardware generation; ENA Express is offered from the
+    // `8xlarge` up, the sizes under it carrying less than the family's dedicated network share,
+    // and on the bare metal size; Dedicated Hosts are offered except
+    // on the two sizes added later, the `12xlarge` and the `24xlarge`; the Elastic Fabric Adapter
+    // is offered on the size that holds the whole host and on the bare metal one; and the sizes
+    // whose cores sit on two processor sockets publish their core counts one per socket. The
+    // bare metal size is offered the legacy BIOS boot mode alone.
+    PublishedInstanceTypeFacts::of("i4i.large")
+        .ebs(625, 2_500, 10_000, 40_000)
+        .instance_store(1, 468)
+        .network("Up to 10 Gigabit")
+        .processor("Intel", 3.5)
+        .host_features(false, false),
+    PublishedInstanceTypeFacts::of("i4i.xlarge")
+        .ebs(1_250, 5_000, 10_000, 40_000)
+        .instance_store(1, 937)
+        .network("Up to 10 Gigabit")
+        .processor("Intel", 3.5)
+        .host_features(false, false),
+    PublishedInstanceTypeFacts::of("i4i.2xlarge")
+        .ebs(2_500, 10_000, 10_000, 40_000)
+        .instance_store(1, 1_875)
+        .network("Up to 12 Gigabit")
+        .processor("Intel", 3.5)
+        .host_features(false, false),
+    PublishedInstanceTypeFacts::of("i4i.4xlarge")
+        .ebs(5_000, 20_000, 10_000, 40_000)
+        .instance_store(1, 3_750)
+        .network("Up to 25 Gigabit")
+        .processor("Intel", 3.5)
+        .host_features(false, false),
+    PublishedInstanceTypeFacts::of("i4i.8xlarge")
+        .ebs(10_000, 40_000, 10_000, 40_000)
+        .instance_store(2, 3_750)
+        .network("18.75 Gigabit")
+        .processor("Intel", 3.5)
+        .ena_srd(true)
+        .host_features(false, false),
+    PublishedInstanceTypeFacts::of("i4i.12xlarge")
+        .ebs(15_000, 60_000, 15_000, 60_000)
+        .instance_store(3, 3_750)
+        .network("28.12 Gigabit")
+        .processor("Intel", 3.5)
+        .ena_srd(true)
+        .dedicated_hosts(false)
+        .host_features(false, false),
+    PublishedInstanceTypeFacts::of("i4i.16xlarge")
+        .cores_in_steps_of(2)
+        .ebs(20_000, 80_000, 20_000, 80_000)
+        .instance_store(4, 3_750)
+        .network("37.5 Gigabit")
+        .processor("Intel", 3.5)
+        .ena_srd(true)
+        .host_features(false, false),
+    PublishedInstanceTypeFacts::of("i4i.24xlarge")
+        .cores_in_steps_of(2)
+        .ebs(30_000, 120_000, 30_000, 120_000)
+        .instance_store(6, 3_750)
+        .network("56.25 Gigabit")
+        .ipv4_per_interface(30)
+        .processor("Intel", 3.5)
+        .ena_srd(true)
+        .dedicated_hosts(false)
+        .host_features(false, false),
+    PublishedInstanceTypeFacts::of("i4i.32xlarge")
+        .cores_in_steps_of(2)
+        .ebs(40_000, 160_000, 40_000, 160_000)
+        .instance_store(8, 3_750)
+        .network("75 Gigabit")
+        .efa(1)
+        .processor("Intel", 3.5)
+        .ena_srd(true)
+        .host_features(false, false),
+    PublishedInstanceTypeFacts::of("i4i.metal")
+        .ebs(40_000, 160_000, 40_000, 160_000)
+        .ebs_attachments(31)
+        .instance_store(8, 3_750)
+        .network("75 Gigabit")
+        .efa(1)
+        .processor("Intel", 3.5)
+        .ena_srd(true)
+        .boot_modes(LEGACY_BIOS_BOOT_MODE)
+        .host_features(false, false),
     // M6i — general purpose, 3rd generation Intel Xeon Scalable (Ice Lake) at a sustained
     // 3.5 GHz, with NO local instance store and up to 50 Gigabit of network on the sizes that
     // hold the whole host. The family is not the latest generation of its family. Its EBS
@@ -2464,6 +2957,148 @@ static PUBLISHED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
         .ipv4_per_interface(50)
         .efa(1)
         .host_features(false, false),
+    // M7i — general purpose, 4th generation Intel Xeon Scalable (Sapphire Rapids) at a sustained
+    // 3.2 GHz, with no local instance store. Its processor runs a hypervisor inside the guest, so
+    // every size publishes nested virtualization as a processor feature. Its EBS volumes are
+    // attached to EBS hardware of the type's own rather than out of the pool shared with its
+    // interfaces, so every size reports the `dedicated` kind of limit: 32 volumes up to the
+    // `12xlarge`, then 48, 64 and 128 as the size grows, while each bare metal size reports its
+    // host's own — 79 on the whole host and 39 on the half of it the smaller one holds. The EBS
+    // figures are the family's own rows of "Amazon EBS optimized instance types": the sizes below
+    // the `8xlarge` publish a baseline they burst above, up to 10,000 Mbps and 40,000 IOPS, and
+    // the bandwidth is dedicated from that size up, reaching 40,000 Mbps and 240,000 IOPS on the
+    // sizes that hold the whole host. The network figures are the published ones, up to 12.5
+    // Gigabit below the `8xlarge` and the size's share of the host's 50 from there up. The split
+    // between network and EBS bandwidth is fixed on this family, so it publishes no bandwidth
+    // weightings at all; the number of ENA queues cannot be changed on its adapter; and it takes
+    // no interface attachment from a secondary network, so no private address at all is available
+    // on one. ENA Express is offered from the `12xlarge` up, the sizes under it carrying less
+    // than the family's dedicated network share. Dedicated Hosts are offered except on the sizes
+    // that
+    // hold most of the host — the `24xlarge`, the `48xlarge` and the smaller bare metal size — the
+    // Elastic Fabric Adapter only on the `48xlarge` and the bare metal size that holds the whole
+    // host, and the `48xlarge` — the size that holds the whole host — takes its cores all at
+    // once, so the one count it publishes is its default. Both bare metal sizes are
+    // offered CloudWatch action based recovery, reboot migration, a local PTP hardware clock and
+    // ENA Express, and the legacy BIOS boot mode alone.
+    PublishedInstanceTypeFacts::of("m7i.large")
+        .ebs(650, 3_600, 10_000, 40_000)
+        .dedicated_ebs_attachments(32)
+        .network("Up to 12.5 Gigabit")
+        .processor("Intel", 3.2)
+        .processor_features(NESTED_VIRTUALIZATION)
+        .ena_srd(false)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false),
+    PublishedInstanceTypeFacts::of("m7i.xlarge")
+        .ebs(1_250, 6_000, 10_000, 40_000)
+        .dedicated_ebs_attachments(32)
+        .network("Up to 12.5 Gigabit")
+        .processor("Intel", 3.2)
+        .processor_features(NESTED_VIRTUALIZATION)
+        .ena_srd(false)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false),
+    PublishedInstanceTypeFacts::of("m7i.2xlarge")
+        .ebs(2_500, 12_000, 10_000, 40_000)
+        .dedicated_ebs_attachments(32)
+        .network("Up to 12.5 Gigabit")
+        .processor("Intel", 3.2)
+        .processor_features(NESTED_VIRTUALIZATION)
+        .ena_srd(false)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false),
+    PublishedInstanceTypeFacts::of("m7i.4xlarge")
+        .ebs(5_000, 20_000, 10_000, 40_000)
+        .dedicated_ebs_attachments(32)
+        .network("Up to 12.5 Gigabit")
+        .processor("Intel", 3.2)
+        .processor_features(NESTED_VIRTUALIZATION)
+        .ena_srd(false)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false),
+    PublishedInstanceTypeFacts::of("m7i.8xlarge")
+        .ebs(10_000, 40_000, 10_000, 40_000)
+        .dedicated_ebs_attachments(32)
+        .network("12.5 Gigabit")
+        .processor("Intel", 3.2)
+        .processor_features(NESTED_VIRTUALIZATION)
+        .ena_srd(false)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false),
+    PublishedInstanceTypeFacts::of("m7i.12xlarge")
+        .ebs(15_000, 60_000, 15_000, 60_000)
+        .dedicated_ebs_attachments(32)
+        .network("18.75 Gigabit")
+        .processor("Intel", 3.2)
+        .processor_features(NESTED_VIRTUALIZATION)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false),
+    PublishedInstanceTypeFacts::of("m7i.16xlarge")
+        .ebs(20_000, 80_000, 20_000, 80_000)
+        .dedicated_ebs_attachments(48)
+        .network("25 Gigabit")
+        .processor("Intel", 3.2)
+        .processor_features(NESTED_VIRTUALIZATION)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false),
+    PublishedInstanceTypeFacts::of("m7i.24xlarge")
+        .ebs(30_000, 120_000, 30_000, 120_000)
+        .dedicated_ebs_attachments(64)
+        .network("37.5 Gigabit")
+        .processor("Intel", 3.2)
+        .processor_features(NESTED_VIRTUALIZATION)
+        .dedicated_hosts(false)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false),
+    PublishedInstanceTypeFacts::of("m7i.48xlarge")
+        .cores_in_steps_of(96)
+        .ebs(40_000, 240_000, 40_000, 240_000)
+        .dedicated_ebs_attachments(128)
+        .network("50 Gigabit")
+        .efa(1)
+        .processor("Intel", 3.2)
+        .processor_features(NESTED_VIRTUALIZATION)
+        .dedicated_hosts(false)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false),
+    PublishedInstanceTypeFacts::of("m7i.metal-24xl")
+        .ebs(30_000, 120_000, 30_000, 120_000)
+        .dedicated_ebs_attachments(39)
+        .network("37.5 Gigabit")
+        .processor("Intel", 3.2)
+        .processor_features(NESTED_VIRTUALIZATION)
+        .ena_srd(true)
+        .dedicated_hosts(false)
+        .auto_recovery(true)
+        .boot_modes(LEGACY_BIOS_BOOT_MODE)
+        .host_features(true, true)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false),
+    PublishedInstanceTypeFacts::of("m7i.metal-48xl")
+        .ebs(40_000, 240_000, 40_000, 240_000)
+        .dedicated_ebs_attachments(79)
+        .network("50 Gigabit")
+        .efa(1)
+        .processor("Intel", 3.2)
+        .processor_features(NESTED_VIRTUALIZATION)
+        .ena_srd(true)
+        .auto_recovery(true)
+        .boot_modes(LEGACY_BIOS_BOOT_MODE)
+        .host_features(true, true)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .flexible_ena_queues(false),
     // M7gd — general purpose with local NVMe on AWS Graviton3, at a sustained 2.6 GHz. Its
     // four EBS figures are the Graviton3 ladder's rows of "Amazon EBS optimized instance
     // types": a baseline the sizes below the `8xlarge` burst above, up to 10,000 Mbps and
@@ -2614,6 +3249,87 @@ static PUBLISHED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
         .tcp_established_timeout(SHORT_TCP_ESTABLISHED_TIMEOUT)
         .nitro_enclaves(false)
         .gpus(8, "B300", "NVIDIA", 275_040, ML_AI_WORKLOAD),
+    // R3 — memory optimized of a PREVIOUS generation, Intel Xeon E5-2670 v2 (Ivy Bridge) at a
+    // sustained 2.5 GHz on the Xen hypervisor, with local SATA SSD devices: one device of a size
+    // of its own up to the `4xlarge` and two 320 GB devices on the size that holds the whole
+    // host. Its memory is the family's own published figure at every size rather than a whole
+    // number of GiB per vCPU. EBS optimization is an OPTION of the launch on the three middle
+    // sizes, each of which publishes ONE fixed figure — a pre-Nitro instance has no baseline it
+    // bursts above — and is not offered at all on the smallest size nor on the one that holds the
+    // whole host, which has the host's own 10 Gigabit network instead; those two therefore have
+    // no EBS-optimized performance to report. The EBS volumes share their 39 attachments with the
+    // interfaces and the local devices. The network figures are the published words of the "Network
+    // performance" column rather than a figure in Gigabit. Dedicated Hosts and CloudWatch action
+    // based recovery are offered on the family, and so is every placement group strategy,
+    // including the cluster groups the generation introduced; its AMIs may be backed by either an
+    // EBS volume or the local instance store. Copying the packets of a session is done by the
+    // Nitro System, which this generation predates, so Traffic Mirroring is offered on no size of
+    // it, and the cores of the size that spans two processor sockets are configured one per
+    // socket.
+    PublishedInstanceTypeFacts::of("r3.large")
+        // The smallest size is the one place the family's memory is NOT its ratio: the recorded
+        // `DescribeInstanceTypes` page reports a whole 15 GiB for it, where the sizes above it
+        // report the 15.25 GiB per `large` unit the rows below carry.
+        .memory_mib(15_360)
+        .ebs_optimized(EBS_OPTIMIZED_UNSUPPORTED)
+        .shared_ebs_attachments(39)
+        .instance_store(1, 32)
+        .network("Moderate")
+        .processor("Intel", 2.5)
+        .dedicated_hosts(true)
+        .auto_recovery(true)
+        .placement_strategies(EVERY_PLACEMENT_STRATEGY)
+        .root_devices(EBS_AND_INSTANCE_STORE_ROOT_DEVICES)
+        .traffic_mirroring(false),
+    PublishedInstanceTypeFacts::of("r3.xlarge")
+        .memory_mib(31_232)
+        .ebs(500, 4_000, 500, 4_000)
+        .shared_ebs_attachments(39)
+        .instance_store(1, 80)
+        .network("Moderate")
+        .processor("Intel", 2.5)
+        .dedicated_hosts(true)
+        .auto_recovery(true)
+        .placement_strategies(EVERY_PLACEMENT_STRATEGY)
+        .root_devices(EBS_AND_INSTANCE_STORE_ROOT_DEVICES)
+        .traffic_mirroring(false),
+    PublishedInstanceTypeFacts::of("r3.2xlarge")
+        .memory_mib(62_464)
+        .ebs(1_000, 8_000, 1_000, 8_000)
+        .shared_ebs_attachments(39)
+        .instance_store(1, 160)
+        .network("High")
+        .processor("Intel", 2.5)
+        .dedicated_hosts(true)
+        .auto_recovery(true)
+        .placement_strategies(EVERY_PLACEMENT_STRATEGY)
+        .root_devices(EBS_AND_INSTANCE_STORE_ROOT_DEVICES)
+        .traffic_mirroring(false),
+    PublishedInstanceTypeFacts::of("r3.4xlarge")
+        .memory_mib(124_928)
+        .ebs(2_000, 16_000, 2_000, 16_000)
+        .shared_ebs_attachments(39)
+        .instance_store(1, 320)
+        .network("High")
+        .processor("Intel", 2.5)
+        .dedicated_hosts(true)
+        .auto_recovery(true)
+        .placement_strategies(EVERY_PLACEMENT_STRATEGY)
+        .root_devices(EBS_AND_INSTANCE_STORE_ROOT_DEVICES)
+        .traffic_mirroring(false),
+    PublishedInstanceTypeFacts::of("r3.8xlarge")
+        .memory_mib(249_856)
+        .cores_in_steps_of(2)
+        .ebs_optimized(EBS_OPTIMIZED_UNSUPPORTED)
+        .shared_ebs_attachments(39)
+        .instance_store(2, 320)
+        .network("10 Gigabit")
+        .processor("Intel", 2.5)
+        .dedicated_hosts(true)
+        .auto_recovery(true)
+        .placement_strategies(EVERY_PLACEMENT_STRATEGY)
+        .root_devices(EBS_AND_INSTANCE_STORE_ROOT_DEVICES)
+        .traffic_mirroring(false),
     // R5b — memory optimized with the family's EBS-optimized hardware, 2nd generation Intel
     // Xeon Scalable (Cascade Lake) at a sustained 3.1 GHz: up to 60 Gbps of EBS bandwidth and
     // 260,000 IOPS, the highest of the R5 ladder, and 31 EBS volumes whatever the size — more
