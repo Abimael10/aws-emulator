@@ -11,6 +11,8 @@
 //!   last item it returned (swept over every item count × page size in range);
 //! * a role listing is scoped to one account, and an account the presented session is
 //!   not assigned to is reported as absent;
+//! * every account a sign-in's assignments name is reported, whatever the store records
+//!   about the account ITSELF, which only supplies that account's own data;
 //! * role credentials are minted by the emulator, stored, and expire in the future;
 //! * `Logout` invalidates the session in state, so every later call is unauthorized;
 //! * an unusable token is 401, and an authenticated but unreadable request is 400
@@ -331,7 +333,7 @@ async fn walk_pages(
 async fn list_accounts_reports_exactly_the_sessions_assignments() {
     // Rows differ in how many accounts a session is assigned to (none, one, several,
     // all) and include an assignment naming an account the service holds no record of,
-    // which there is nothing to report for.
+    // which is reported by its id alone.
     let cases: &[(&str, &[&str])] = &[
         ("tok-none", &[]),
         ("tok-one", &["222222222222"]),
@@ -352,11 +354,7 @@ async fn list_accounts_reports_exactly_the_sessions_assignments() {
             body_text(&response)
         );
 
-        let mut expected: Vec<&str> = assigned
-            .iter()
-            .copied()
-            .filter(|id| every_account().contains(id))
-            .collect();
+        let mut expected: Vec<&str> = assigned.to_vec();
         expected.sort_unstable();
         let reported = item_ids(&response, "accountList", "accountId");
         assert_eq!(
@@ -370,22 +368,23 @@ async fn list_accounts_reports_exactly_the_sessions_assignments() {
         );
 
         // Every reported account carries the name and email held in state, not a value
-        // derived from the request.
+        // derived from the request — and an account state holds no record of carries
+        // neither, both members being optional.
         let json = body_json(&response);
         let reported_accounts = json["accountList"].as_array().cloned().unwrap_or_default();
         for account in reported_accounts {
             let id = account["accountId"].as_str().unwrap_or_default();
-            let (_, name, email, _) = FIXTURE
-                .iter()
-                .find(|(fixture_id, ..)| *fixture_id == id)
-                .unwrap_or_else(|| panic!("case {token:?}: unseeded account {id:?} reported"));
+            let seeded = FIXTURE.iter().find(|(fixture_id, ..)| *fixture_id == id);
+            let expected = seeded.map(|(_, name, email, _)| (Some(*name), Some(*email)));
+            let expected = expected.unwrap_or((None, None));
+            let got = (
+                account["accountName"].as_str(),
+                account["emailAddress"].as_str(),
+            );
             assert_eq!(
-                (
-                    account["accountName"].as_str().unwrap_or_default(),
-                    account["emailAddress"].as_str().unwrap_or_default()
-                ),
-                (*name, *email),
-                "case {token:?}: account {id:?} must report the seeded name and email, got {account:?}"
+                got, expected,
+                "case {token:?}: account {id:?} must report exactly the name and email state \
+                 holds for it ({expected:?}), got {account:?}"
             );
         }
     }
@@ -1021,5 +1020,288 @@ async fn an_unreadable_request_is_an_invalid_request() {
             response.status(),
             body_text(&response)
         );
+    }
+}
+
+/// What the store records about the account an assignment names: `(case, account id, the
+/// record held, the roles the assignment grants)`.
+///
+/// `None` is "no record of this account at all"; a `Some` record carries whichever of the
+/// account's own members the store was given, which is why the two are separate rows.
+struct Unrecorded {
+    case: &'static str,
+    account_id: &'static str,
+    record: Option<state::AccountRecord>,
+    roles: &'static [&'static str],
+}
+
+/// The rows the rule below is asserted over. They differ in how much of the account's own
+/// data the store holds (nothing at all, the name only, the email only, both), in how many
+/// roles the assignment grants (one, several) and in how those role names spell and sort,
+/// so no assertion can be satisfied by an answer keyed to one seeded account.
+///
+/// The ids are outside [`FIXTURE`], so the record each row describes is the whole of what
+/// the store holds about that account.
+fn unrecorded_rows() -> Vec<Unrecorded> {
+    vec![
+        Unrecorded {
+            case: "no record of the account at all, one role",
+            account_id: "555555555555",
+            record: None,
+            roles: &["ReadOnly"],
+        },
+        Unrecorded {
+            case: "a full record, several roles sorting against the order written",
+            account_id: "666666666666",
+            record: Some(state::AccountRecord {
+                account_name: Some("Recorded".to_string()),
+                email_address: Some("recorded@example.com".to_string()),
+            }),
+            roles: &["ZZZ-Break-Glass", "AdministratorAccess"],
+        },
+        Unrecorded {
+            case: "a record carrying the name only",
+            account_id: "777777777777",
+            record: Some(state::AccountRecord {
+                account_name: Some("Name Only".to_string()),
+                email_address: None,
+            }),
+            roles: &["Audit-Role_1", "ReadOnly"],
+        },
+        Unrecorded {
+            case: "a record carrying the email only",
+            account_id: "888888888888",
+            record: Some(state::AccountRecord {
+                account_name: None,
+                email_address: Some("email-only@example.com".to_string()),
+            }),
+            roles: &["Billing.Audit"],
+        },
+    ]
+}
+
+/// The access token every row's assignment is seeded under: ONE sign-in assigned to every
+/// row's account, so a listing of it is the whole order the rule ranges over.
+const UNRECORDED_TOKEN: &str = "tok-unrecorded";
+
+/// A portal holding exactly the records [`unrecorded_rows`] describes for their accounts,
+/// and one sign-in whose assignments name all of them.
+fn unrecorded_portal() -> Portal {
+    let portal = Portal::new();
+    {
+        let store = portal.state();
+        let mut store = store.lock();
+        for row in unrecorded_rows() {
+            match row.record {
+                Some(record) => {
+                    store.accounts.insert(row.account_id.to_string(), record);
+                }
+                None => {
+                    store.accounts.remove(row.account_id);
+                }
+            }
+        }
+    }
+    let assignments: Vec<(&str, Vec<String>)> = unrecorded_rows()
+        .iter()
+        .map(|row| {
+            (
+                row.account_id,
+                row.roles.iter().map(|role| (*role).to_string()).collect(),
+            )
+        })
+        .collect();
+    portal.sign_in_assigned(UNRECORDED_TOKEN, assignments);
+    portal
+}
+
+/// The roles a row grants, ascending — the order a role listing reports them in.
+fn unrecorded_roles(row: &Unrecorded) -> Vec<String> {
+    let mut roles: Vec<String> = row.roles.iter().map(|role| (*role).to_string()).collect();
+    roles.sort();
+    roles
+}
+
+/// The name and email the store holds for a row's account, as the wire reports them.
+fn unrecorded_own_data(row: &Unrecorded) -> (Option<&str>, Option<&str>) {
+    (
+        row.record
+            .as_ref()
+            .and_then(|record| record.account_name.as_deref()),
+        row.record
+            .as_ref()
+            .and_then(|record| record.email_address.as_deref()),
+    )
+}
+
+/// RULE: `ListAccounts` reports every account the sign-in's assignments name, and reports
+/// an account's own data (`accountName`, `emailAddress` — both optional members) exactly as
+/// far as the store holds a record carrying it.
+#[tokio::test]
+async fn list_accounts_reports_every_assigned_account_and_only_the_data_held_for_it() {
+    let portal = unrecorded_portal();
+    let response = portal
+        .get("/assignment/accounts", Some(UNRECORDED_TOKEN))
+        .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "expected 200, got {} {:?}",
+        response.status(),
+        body_text(&response)
+    );
+    let json = body_json(&response);
+    let reported = json["accountList"].as_array().cloned().unwrap_or_default();
+
+    let mut expected_ids: Vec<&str> = unrecorded_rows()
+        .iter()
+        .map(|row| row.account_id)
+        .collect();
+    expected_ids.sort_unstable();
+    let reported_ids = item_ids(&response, "accountList", "accountId");
+    assert_eq!(
+        reported_ids, expected_ids,
+        "every assigned account must be reported, ascending: expected {expected_ids:?}, \
+         got {reported_ids:?}"
+    );
+
+    for row in unrecorded_rows() {
+        let case = row.case;
+        let account = reported
+            .iter()
+            .find(|account| account["accountId"].as_str() == Some(row.account_id))
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: account {} must be reported, got {json}",
+                    row.account_id
+                )
+            });
+        let expected = unrecorded_own_data(&row);
+        let got = (
+            account["accountName"].as_str(),
+            account["emailAddress"].as_str(),
+        );
+        assert_eq!(
+            got, expected,
+            "case {case:?}: account {} must report exactly the name and email the store \
+             holds for it ({expected:?}), got {account:?}",
+            row.account_id
+        );
+    }
+}
+
+/// RULE: `ListAccountRoles` serves every account the sign-in's assignments name — whatever
+/// the store records about the account itself — and keeps its 404 for an account no
+/// assignment of that sign-in names.
+#[tokio::test]
+async fn list_account_roles_serves_every_assigned_account_whatever_is_recorded_for_it() {
+    let portal = unrecorded_portal();
+    for row in unrecorded_rows() {
+        let case = row.case;
+        let response = portal
+            .get(
+                &format!("/assignment/roles?account_id={}", row.account_id),
+                Some(UNRECORDED_TOKEN),
+            )
+            .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "case {case:?}: an assigned account must be served, got {} {:?}",
+            response.status(),
+            body_text(&response)
+        );
+        let reported = item_ids(&response, "roleList", "roleName");
+        assert_eq!(
+            reported,
+            unrecorded_roles(&row),
+            "case {case:?}: expected roleList {:?}, got {reported:?}",
+            unrecorded_roles(&row)
+        );
+        let json = body_json(&response);
+        for role in json["roleList"].as_array().cloned().unwrap_or_default() {
+            assert_eq!(
+                role["accountId"].as_str(),
+                Some(row.account_id),
+                "case {case:?}: every RoleInfo must carry its own account, got {role:?}"
+            );
+        }
+    }
+
+    // Rows: an account the store DOES record but this sign-in is not assigned to, and one
+    // it neither records nor assigns. Neither exists as far as this sign-in is concerned.
+    for (case, account_id) in [
+        ("recorded but unassigned", "111111111111"),
+        ("neither recorded nor assigned", "999999999999"),
+    ] {
+        let response = portal
+            .get(
+                &format!("/assignment/roles?account_id={account_id}"),
+                Some(UNRECORDED_TOKEN),
+            )
+            .await;
+        assert_eq!(
+            (response.status(), error_code(&response).as_str()),
+            (StatusCode::NOT_FOUND, "ResourceNotFoundException"),
+            "case {case:?}: an unassigned account must be 404 ResourceNotFoundException, \
+             got {} {:?}",
+            response.status(),
+            body_text(&response)
+        );
+    }
+}
+
+/// RULE: `GetRoleCredentials` mints and stores a credential for every role an assignment
+/// grants, whatever the store records about the account itself.
+#[tokio::test]
+async fn get_role_credentials_serves_every_assigned_role_whatever_is_recorded_for_it() {
+    let portal = unrecorded_portal();
+    for row in unrecorded_rows() {
+        for role_name in unrecorded_roles(&row) {
+            let case = format!("{}: {}/{role_name}", row.case, row.account_id);
+            let response = portal
+                .get(
+                    &format!(
+                        "/federation/credentials?account_id={}&role_name={role_name}",
+                        row.account_id
+                    ),
+                    Some(UNRECORDED_TOKEN),
+                )
+                .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "case {case:?}: an assigned role must be served, got {} {:?}",
+                response.status(),
+                body_text(&response)
+            );
+            let credentials = body_json(&response)["roleCredentials"].clone();
+            let stored = portal
+                .state()
+                .lock()
+                .issued_credentials
+                .get(&(
+                    UNRECORDED_TOKEN.to_string(),
+                    row.account_id.to_string(),
+                    role_name.clone(),
+                ))
+                .cloned()
+                .unwrap_or_else(|| panic!("case {case:?}: no credential was stored"));
+            assert_eq!(
+                (
+                    credentials["accessKeyId"].as_str(),
+                    credentials["secretAccessKey"].as_str(),
+                    credentials["sessionToken"].as_str(),
+                    credentials["expiration"].as_i64()
+                ),
+                (
+                    Some(stored.access_key_id.as_str()),
+                    Some(stored.secret_access_key.as_str()),
+                    Some(stored.session_token.as_str()),
+                    Some(stored.expiration_millis)
+                ),
+                "case {case:?}: the response must be the stored record, got {credentials:?}"
+            );
+        }
     }
 }

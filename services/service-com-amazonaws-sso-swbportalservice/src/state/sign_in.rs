@@ -307,8 +307,9 @@ impl ComAmazonawsSsoSwbportalserviceState {
     /// 3. a sign-in this store was GIVEN (one seeded through
     ///    [`Self::put_session`](ComAmazonawsSsoSwbportalserviceState::put_session))
     ///    reports its own assignments — the accounts, and in each the roles assigned to
-    ///    its subject — skipping an assignment whose account this store holds no record
-    ///    of, since there is nothing to report for it.
+    ///    its subject — including an assignment whose account this store holds no record
+    ///    of: the assignment is what makes the account one this sign-in may see, and an
+    ///    account no record is held for simply has no name and no email to report.
     ///
     /// A record this store merely REMEMBERED of a minted sign-in ([`Session::federated`])
     /// never answers in step 3: the mint's record is what says whether such a token still
@@ -358,6 +359,16 @@ impl ComAmazonawsSsoSwbportalserviceState {
     /// Such a sign-in is the record held under the ONE token it was seeded with — no mint
     /// elsewhere holds a chain for it — so that token is what names the sign-in session
     /// ([`SignedIn::sign_in_session`]).
+    ///
+    /// EVERY account the sign-in's assignments name is reported. What makes an account one
+    /// this sign-in may see is the assignment, and an assignment names the account by the
+    /// id that is the one member `AccountInfo` always carries; a record of the ACCOUNT
+    /// itself is only where the account's OWN data lives. So an account this store holds no
+    /// record of is reported with no name and no email address
+    /// ([`Account::account_name`]) — exactly what the other source of a sign-in does for an
+    /// account the organization's records do not carry ([`named_accounts`]) — rather than
+    /// dropped, which would turn an assignment an administrator made into an account that
+    /// does not exist.
     fn seeded_sign_in(&self, access_token: &str, session: &Session) -> SignedIn {
         SignedIn {
             subject: session.subject.clone(),
@@ -366,17 +377,17 @@ impl ComAmazonawsSsoSwbportalserviceState {
             accounts: session
                 .assignments
                 .iter()
-                .filter_map(|(account_id, roles)| {
-                    let record = self.accounts.get(account_id)?;
-                    Some((
+                .map(|(account_id, roles)| {
+                    let record = self.accounts.get(account_id);
+                    (
                         account_id.clone(),
                         Account {
                             account_id: account_id.clone(),
-                            account_name: record.account_name.clone(),
-                            email_address: record.email_address.clone(),
+                            account_name: record.and_then(|record| record.account_name.clone()),
+                            email_address: record.and_then(|record| record.email_address.clone()),
                             roles: roles.clone(),
                         },
-                    ))
+                    )
                 })
                 .collect(),
         }
