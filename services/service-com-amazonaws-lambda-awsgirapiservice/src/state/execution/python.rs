@@ -1875,6 +1875,24 @@ fn host_module(vm: &VirtualMachine, session: &Arc<Session>) -> PyResult<PyRef<Py
                 .into())
         },
     );
+    // What the SDK's own EXCEPTION CLASSES are: the error shapes the called service's model
+    // declares, read out of that service's own model ([`super::sdk_model`]), so a refusal is
+    // raised as the class its service really has for it and a code no shape is declared for is
+    // raised as the SDK's base class. Nothing is dispatched and no service answers, so this
+    // spends neither the call count nor the deadline; what the guest decides is only which
+    // service it asks about.
+    set_function(
+        vm,
+        &module,
+        "error_shapes",
+        move |args: FuncArgs, vm: &VirtualMachine| {
+            let service: String = args.bind(vm)?;
+            Ok(vm
+                .ctx
+                .new_str(super::aws_sdk_guest::error_shapes(&service))
+                .into())
+        },
+    );
     // CHECKED, once for the whole surface: the runtime source is driven through these
     // functions, so one that did not take its place is reported here rather than left for
     // guest code to meet as a missing name.
@@ -1899,6 +1917,7 @@ const HOST_MODULE_FUNCTIONS: &[&str] = &[
     "request",
     "presign",
     "pagination",
+    "error_shapes",
     "net",
     "durable",
 ];
@@ -3101,6 +3120,7 @@ mod tests {
             "aws",
             "db_auth_token",
             "durable",
+            "error_shapes",
             "log",
             "net",
             "pagination",

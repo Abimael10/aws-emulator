@@ -27,7 +27,10 @@
 //! * `client.exceptions.<ShapeName>` is the modelled error class for that name, a subclass
 //!   of `ClientError`, so `except client.exceptions.QueueDoesNotExist` catches exactly that
 //!   refusal and nothing else — the class for the legacy code of that same class and the
-//!   class named after the shape are ONE ([`Client`]'s exception table).
+//!   class named after the shape are ONE ([`Client`]'s exception table). A code the service's
+//!   model declares no error shape for — the AWS-common refusals, which no service's model
+//!   carries — has no class of its own in the SDK, so such a refusal is raised as the base
+//!   `ClientError` itself ([`error_shapes`]).
 //! * DynamoDB's RESOURCE interface is supplied too ([`dynamodb`]), because it is the
 //!   interface an application stores from inside a function through:
 //!   `boto3.resource("dynamodb").Table(name)` carries the table name, its items are plain
@@ -145,6 +148,21 @@ pub fn pagination_config(service: &str, operation: &str) -> String {
         "result_key": paged.result_keys,
     })
     .to_string()
+}
+
+/// The error SHAPES the service `service` declares, as the list a client reads its own
+/// exception classes off — empty for a service this emulator holds no model for.
+///
+/// An SDK has an exception class for each error its service's model declares and for nothing
+/// else, so this is what decides whether a refusal is raised as a class of its own or as the
+/// base [`ClientError`](BOTOCORE_EXCEPTIONS_SOURCE): a code the model declares no error shape
+/// for — the AWS-common refusals every service answers, which no service's model carries — has
+/// no class in the SDK and is raised as that base class. Read from the same reading of that
+/// model every other question about the service is answered from ([`super::sdk_model`]), so the
+/// classes this SDK has for a service are the ones it really declares.
+#[must_use]
+pub fn error_shapes(service: &str) -> String {
+    ::serde_json::json!(super::sdk_model::client_exports(service).errors).to_string()
 }
 
 /// `botocore`: the package the client interface and the exceptions live under.
@@ -863,11 +881,25 @@ class _ClientExceptions:
     def __init__(self, service_name):
         self._service_name = service_name
         self._classes = {"ClientError": ClientError}
+        self._declared = None
 
     def __getattr__(self, name):
         if name.startswith("_"):
             raise AttributeError(name)
         return self.from_code(name)
+
+    def _modelled(self):
+        """The error shapes the called service's own model DECLARES.
+
+        An SDK carries one exception class per error its service declares, so this is what
+        says whether a name has a class of its own at all. Read once per client, from the
+        service's own model.
+        """
+        if self._declared is None:
+            self._declared = frozenset(
+                json.loads(_host.error_shapes(self._service_name))
+            )
+        return self._declared
 
     def from_code(self, code, shape=None):
         """The class for one error code, which is the class the modelled SHAPE names too.
@@ -877,12 +909,24 @@ class _ClientExceptions:
         `except client.exceptions.<Shape>` catches the refusal whose reported code is the
         legacy one. `shape` is the shape the answer named, which is what ties the two
         together; a lookup by either name answers the same class however they are reached.
+
+        A name the service's model declares NO error shape for has no class of its own in the
+        SDK — the AWS-common refusals every service answers are the ones no model carries —
+        so the base class is what it answers and what such a refusal is raised as.
         """
         held = self._classes.get(code)
         if held is None and shape:
             held = self._classes.get(shape)
         if held is None:
-            held = type(str(shape or code), (ClientError,), {})
+            declared = self._modelled()
+            named = None
+            for candidate in (shape, code):
+                if candidate and candidate in declared:
+                    named = candidate
+                    break
+            if named is None:
+                return ClientError
+            held = type(str(named), (ClientError,), {})
         self._classes[code] = held
         if shape:
             self._classes[shape] = held
