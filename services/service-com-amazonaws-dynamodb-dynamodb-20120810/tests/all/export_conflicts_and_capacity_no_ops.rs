@@ -19,8 +19,9 @@
 //!    refused as the ARITY violation it is — the same sentence over `KeyConditions`,
 //!    `QueryFilter` and `ScanFilter`, and independent of which operators the member
 //!    supports;
-//! 5. an index lifecycle action naming an index the table does not carry is the control
-//!    plane's lookup miss, and the table's own indexes are left alone;
+//! 5. an index lifecycle action naming an index the table does not carry asks for work on
+//!    something that is not there, so it is refused as a request defect naming that
+//!    action and index, and the table's own indexes are left alone;
 //! 6. a capacity move that moves NOTHING — the read/write pair already in force — is
 //!    refused, for the table and for one of its indexes alike, and the table is not
 //!    transitioned for it;
@@ -626,15 +627,15 @@ async fn provisioned_table(router: &MultiServiceRouter, name: &str) {
 }
 
 #[tokio::test]
-async fn an_index_lifecycle_action_naming_no_index_of_the_table_is_a_lookup_miss() {
+async fn an_index_lifecycle_action_naming_no_index_of_the_table_is_a_request_defect() {
     let router = emulator();
     provisioned_table(&router, "Lifecycle").await;
 
     // Rows differ in HOW the name misses: a name of its own, one differing only in case,
-    // one with a trailing character, and the two actions that address an index — a
-    // `Delete` and an `Update`, which are the same lookup.
+    // one with a trailing character, and the two actions that name an index — a
+    // `Delete` and an `Update`, each refused in its own verb.
     let names = ["by-nothing", "byowner", "ByOwnerr", "ByOwner.2"];
-    // Which action addresses the index: a `Delete` and an `Update` make the same lookup.
+    // Which action names the index; the refusal states that action's verb.
     type Action = (&'static str, fn(&str) -> Value);
     let actions: [Action; 2] = [
         ("Delete", |index| json!({"Delete": {"IndexName": index}})),
@@ -663,13 +664,15 @@ async fn an_index_lifecycle_action_naming_no_index_of_the_table_is_a_lookup_miss
             .await;
             assert_eq!(
                 (status, error_code(&answered).as_str()),
-                (400, "ResourceNotFoundException"),
-                "case {case:?}: expected the control plane's lookup miss, got {status} with \
-                 {answered}"
+                (400, "ValidationException"),
+                "case {case:?}: expected the request defect, got {status} with {answered}"
             );
             assert_eq!(
                 message(&answered),
-                format!("Requested resource not found: Index {absent} for table Lifecycle"),
+                format!(
+                    "Attempting to {} an index which does not exist: {absent}",
+                    action.to_lowercase()
+                ),
                 "case {case:?}: got {}",
                 message(&answered)
             );

@@ -11,11 +11,14 @@
 //! * every index the table was created with is reported by `DescribeTable`, by name, with
 //!   the key schema and the provisioned capacity it was created with;
 //! * an index name the table does not carry is absent from that list, so a reader cannot
-//!   resolve one that does not exist.
+//!   resolve one that does not exist;
+//! * and an `UpdateTable` entry that asks for lifecycle work on an index the table does
+//!   not carry is refused as the request defect it is, naming the action and the index,
+//!   while the entry naming an index the table does carry is applied.
 
 use serde_json::{json, Value};
 
-use crate::emulator::{call, emulator};
+use crate::emulator::{call, describe_when_active, emulator, error_code, message};
 
 /// One row: the index to create, and the capacity a reader must find on it.
 struct IndexRow {
@@ -162,5 +165,146 @@ async fn a_table_created_without_an_index_reports_none() {
             .get("GlobalSecondaryIndexes")
             .is_none_or(|indexes| indexes.as_array().is_some_and(Vec::is_empty)),
         "case \"describe\": expected a table with no index to report none, got {described}"
+    );
+}
+
+/// The rows an index-lifecycle entry naming no index of the table is asserted over: how
+/// the name misses the names the table does carry.
+///
+/// They differ along what the rule generalises over — a name nothing carries, the name of
+/// an index of ANOTHER kind on this very table (a local secondary index is not one
+/// `GlobalSecondaryIndexUpdates` names), the stored name in another case, and the stored
+/// name with one character added.
+const ABSENT_INDEX_NAMES: &[(&str, &str)] = &[
+    ("a name no index of the table carries", "by-nothing"),
+    ("the name of a local secondary index", "by-rank"),
+    ("the stored name in another case", "BY-OWNER"),
+    ("the stored name with a trailing character", "by-ownerr"),
+];
+
+#[tokio::test]
+async fn an_index_lifecycle_entry_naming_no_index_of_the_table_is_refused_by_its_action() {
+    let router = emulator();
+    let table = "index_lifecycle_refusals";
+    let (status, created) = call(
+        &router,
+        "CreateTable",
+        json!({
+            "TableName": table,
+            "KeySchema": [
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "sk", "KeyType": "RANGE"},
+            ],
+            "AttributeDefinitions": [
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "sk", "AttributeType": "S"},
+                {"AttributeName": "owner", "AttributeType": "S"},
+                {"AttributeName": "rank", "AttributeType": "N"},
+            ],
+            "BillingMode": "PROVISIONED",
+            "ProvisionedThroughput": {"ReadCapacityUnits": 2, "WriteCapacityUnits": 2},
+            "GlobalSecondaryIndexes": [{
+                "IndexName": "by-owner",
+                "KeySchema": [{"AttributeName": "owner", "KeyType": "HASH"}],
+                "Projection": {"ProjectionType": "ALL"},
+                "ProvisionedThroughput": {"ReadCapacityUnits": 3, "WriteCapacityUnits": 4},
+            }],
+            "LocalSecondaryIndexes": [{
+                "IndexName": "by-rank",
+                "KeySchema": [
+                    {"AttributeName": "pk", "KeyType": "HASH"},
+                    {"AttributeName": "rank", "KeyType": "RANGE"},
+                ],
+                "Projection": {"ProjectionType": "KEYS_ONLY"},
+            }],
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case \"create\": expected CreateTable to answer 200, got {status} {created}"
+    );
+    describe_when_active(&router, "create", table).await;
+
+    // The two actions that NAME an index, each refused in its own verb.
+    type Action = (&'static str, &'static str, fn(&str) -> Value);
+    let actions: [Action; 2] = [
+        ("Delete", "delete", |index| {
+            json!({"Delete": {"IndexName": index}})
+        }),
+        ("Update", "update", |index| {
+            json!({"Update": {
+                "IndexName": index,
+                "ProvisionedThroughput": {"ReadCapacityUnits": 9, "WriteCapacityUnits": 9},
+            }})
+        }),
+    ];
+
+    for (action, verb, build) in actions {
+        for (row, absent) in ABSENT_INDEX_NAMES {
+            let case = format!("a {action} of {absent:?} ({row})");
+            let (status, answered) = call(
+                &router,
+                "UpdateTable",
+                json!({
+                    "TableName": table,
+                    "GlobalSecondaryIndexUpdates": [build(absent)],
+                }),
+            )
+            .await;
+            assert_eq!(
+                (status, error_code(&answered)),
+                (400, "ValidationException".to_string()),
+                "case {case:?}: expected the request defect, got {status} with {answered}"
+            );
+            assert_eq!(
+                message(&answered),
+                format!("Attempting to {verb} an index which does not exist: {absent}"),
+                "case {case:?}: got {}",
+                message(&answered)
+            );
+        }
+    }
+
+    // None of those refusals wrote anything: the table is still ACTIVE and still carries
+    // the index it was created with, at the capacity it was created with.
+    let described = describe_when_active(&router, "after the refusals", table).await;
+    assert_eq!(
+        described["GlobalSecondaryIndexes"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or_default(),
+        1,
+        "case \"after the refusals\": expected the created index to be untouched, got \
+         {described}"
+    );
+    assert_eq!(
+        described["GlobalSecondaryIndexes"][0]["ProvisionedThroughput"]["ReadCapacityUnits"],
+        json!(3),
+        "case \"after the refusals\": expected the created capacity to be untouched, got \
+         {described}"
+    );
+
+    // The control: the same entry naming the index the table DOES carry is applied, and
+    // the index is gone once the table settles.
+    let (status, accepted) = call(
+        &router,
+        "UpdateTable",
+        json!({
+            "TableName": table,
+            "GlobalSecondaryIndexUpdates": [{"Delete": {"IndexName": "by-owner"}}],
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case \"a Delete of the stored index\": expected 200, got {status} {accepted}"
+    );
+    let described = describe_when_active(&router, "after the delete", table).await;
+    assert!(
+        described
+            .get("GlobalSecondaryIndexes")
+            .is_none_or(|indexes| indexes.as_array().is_some_and(Vec::is_empty)),
+        "case \"after the delete\": expected the index to be gone, got {described}"
     );
 }

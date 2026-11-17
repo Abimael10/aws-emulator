@@ -5,11 +5,11 @@
 //!
 //! The rules pinned here:
 //!
-//! 1. a `Delete` addresses the vector index AS THE RESOURCE it changes, so a name the
-//!    addressed table carries no vector index for is refused with
-//!    `ResourceNotFoundException` at HTTP 400 over both names, and the refusal writes
-//!    nothing: the table stays `ACTIVE` and every vector index it holds stays present and
-//!    `ACTIVE`;
+//! 1. a `Delete` naming an index the addressed table carries no vector index for asks for
+//!    work on something that is not there, so it is refused as the request defect it is —
+//!    `ValidationException` at HTTP 400 naming the action and the index — and the refusal
+//!    writes nothing: the table stays `ACTIVE` and every vector index it holds stays
+//!    present and `ACTIVE`;
 //! 2. a `Delete` naming a vector index the table does carry removes exactly that index —
 //!    the update is index lifecycle work, so the table is `UPDATING` until the clock
 //!    settles it `ACTIVE`, and the siblings are left searchable while a `SearchVectors`
@@ -228,11 +228,11 @@ async fn a_delete_naming_no_vector_index_of_the_table_is_refused_and_changes_not
             (status, error_code(&body), message(&body)),
             (
                 400,
-                "ResourceNotFoundException".to_string(),
-                format!("Requested resource not found: Index {missing} for table {table}")
+                "ValidationException".to_string(),
+                format!("Attempting to delete an index which does not exist: {missing}")
             ),
-            "case {case:?}: a delete of a vector index the table does not carry is refused over \
-             both names, got {status} with {body}"
+            "case {case:?}: a delete of a vector index the table does not carry is refused as \
+             the request defect it is, got {status} with {body}"
         );
 
         // The refusal wrote nothing: the table never left ACTIVE, and every index it was

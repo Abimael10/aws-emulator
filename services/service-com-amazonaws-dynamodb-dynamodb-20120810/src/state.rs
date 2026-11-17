@@ -3085,20 +3085,45 @@ pub fn index_not_found(table: &str, index: &str) -> RequestError {
     ))
 }
 
-/// The `ResourceNotFoundException` message the INDEX-LIFECYCLE surface refuses an index
-/// the addressed table does not carry with.
+/// Which lifecycle action an `UpdateTable` entry asked for on an index the table does
+/// not carry — the verb its refusal names ([`lifecycle_index_not_found`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexLifecycle {
+    /// A `Delete` entry: the index is to be removed.
+    Delete,
+    /// An `Update` entry: the index's own settings are to be moved.
+    Update,
+}
+
+impl IndexLifecycle {
+    /// The verb the refusal states this action with.
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Delete => "delete",
+            Self::Update => "update",
+        }
+    }
+}
+
+/// How the INDEX-LIFECYCLE surface refuses an action naming an index the addressed table
+/// does not carry.
 ///
-/// Same rule as [`index_not_found`] — "the operation tried to access a nonexistent table
-/// or index" (the `ResourceNotFoundException` doc), named by both the index and the table
-/// it was looked for in — and a different SENTENCE, because the surface that adds and
-/// removes a table's indexes words it with the index name first and the table after it.
-/// `UpdateTable`'s secondary-index and vector-index deletes share it: one index-lifecycle
-/// surface, one sentence. One sentence per surface rather than one shared across all of
-/// them: a message is part of each surface's contract, so the surfaces that answer the
-/// other wording keep it.
-pub fn lifecycle_index_not_found(table: &str, index: &str) -> RequestError {
-    RequestError::NotFound(format!(
-        "Requested resource not found: Index {index} for table {table}"
+/// `UpdateTable` does not ADDRESS an index as the resource it reads — the resource it
+/// addresses is the TABLE, which was found — so an entry naming an index the table does
+/// not carry describes work the request cannot ask for rather than a resource that is
+/// missing: it is a request defect, answered as a `ValidationException`, and the sentence
+/// names the ACTION that was attempted and the index it named, and nothing of the table
+/// (the caller addressed the table itself, so the refusal does not report it back).
+/// `UpdateTable`'s secondary-index and vector-index entries share it, for either action:
+/// one index-lifecycle surface, one sentence, with the verb read off the entry.
+///
+/// The surfaces that ADDRESS an index as their resource — a read served through one, a
+/// describe of one — keep the control plane's lookup miss ([`index_not_found`]), because
+/// there the index IS the resource the request could not find.
+pub fn lifecycle_index_not_found(action: IndexLifecycle, index: &str) -> RequestError {
+    RequestError::Validation(format!(
+        "Attempting to {} an index which does not exist: {index}",
+        action.verb()
     ))
 }
 

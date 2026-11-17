@@ -1216,8 +1216,9 @@ async fn one_update_carries_one_index_lifecycle_action_and_names_the_index_it_de
          {status} with {answered}"
     );
 
-    // Deleting an index the table carries none of addresses the INDEX as the resource it
-    // removes, so it is the control plane's lookup miss over both names.
+    // Deleting an index the table carries none of asks for work on something that is not
+    // there: the resource addressed is the table, which exists, so the entry is a request
+    // defect naming the action and the index.
     for absent in ["by-nothing", "ByRankk"] {
         let (status, answered) = call(
             &router,
@@ -1228,13 +1229,13 @@ async fn one_update_carries_one_index_lifecycle_action_and_names_the_index_it_de
         .await;
         assert_eq!(
             (status, error_code(&answered).as_str()),
-            (400, "ResourceNotFoundException"),
-            "case deleting the absent index {absent:?}: expected 400 ResourceNotFoundException, \
+            (400, "ValidationException"),
+            "case deleting the absent index {absent:?}: expected 400 ValidationException, \
              got {status} with {answered}"
         );
         assert_eq!(
             message(&answered),
-            format!("Requested resource not found: Index {absent} for table {table}"),
+            format!("Attempting to delete an index which does not exist: {absent}"),
             "case deleting the absent index {absent:?}: got {}",
             message(&answered)
         );

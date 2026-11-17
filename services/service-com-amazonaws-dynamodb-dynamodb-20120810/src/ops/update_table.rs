@@ -1608,14 +1608,14 @@ fn resolve_indexes(
             let before = indexes.len();
             indexes.retain(|index| index.name != delete.index_name);
             if indexes.len() == before {
-                // A `Delete` addresses the INDEX as the resource it removes, so a name
-                // the table carries no index under is a lookup miss rather than a
-                // malformed request: the control plane's not-found sentence over both
-                // names, which is what lets a client treat an index it has already
-                // deleted as deleted. The stored indexes are left exactly as they were,
-                // because `handle` writes nothing until this whole list resolves.
+                // The resource this call addresses is the TABLE, which was found: an
+                // entry naming an index the table does not carry asks for work on
+                // something that is not there, which is a defect of the REQUEST rather
+                // than a lookup miss ([`crate::state::lifecycle_index_not_found`]). The
+                // stored indexes are left exactly as they were, because `handle` writes
+                // nothing until this whole list resolves.
                 return Err(crate::state::lifecycle_index_not_found(
-                    &table.name,
+                    crate::state::IndexLifecycle::Delete,
                     &delete.index_name,
                 ));
             }
@@ -1625,11 +1625,11 @@ fn resolve_indexes(
                 .iter_mut()
                 .find(|index| index.name == change.index_name)
             else {
-                // An `Update` addresses the index the same way a `Delete` does, so the
-                // miss is reported with the same sentence: one index-lifecycle surface,
-                // one wording.
+                // An `Update` names the index the same way a `Delete` does, so the defect
+                // is reported with the same sentence, in that entry's own verb: one
+                // index-lifecycle surface, one wording.
                 return Err(crate::state::lifecycle_index_not_found(
-                    &table.name,
+                    crate::state::IndexLifecycle::Update,
                     &change.index_name,
                 ));
             };
@@ -1711,9 +1711,10 @@ fn resolve_indexes(
 /// The table's vector indexes after the update: every one a `Delete` names is gone, and
 /// every one a `Create` names is added, `CREATING` until the clock settles it `ACTIVE`.
 ///
-/// A `Delete` addresses the index AS THE RESOURCE it changes, so a name the table carries
-/// no vector index for is a lookup miss rather than a malformed request: it is refused
-/// with the control plane's not-found sentence over both names
+/// A `Delete` naming a vector index the table does not carry asks for work on something
+/// that is not there, which is a defect of the REQUEST rather than a lookup miss — the
+/// resource the call addresses is the table itself — so it is refused with the
+/// index-lifecycle surface's own sentence
 /// ([`crate::state::lifecycle_index_not_found`]), and because this resolves the whole list
 /// before `handle` writes anything, the stored indexes are left exactly as they were.
 ///
@@ -1754,7 +1755,7 @@ fn resolve_vector_indexes(
         indexes.retain(|index| index.name != delete.index_name);
         if indexes.len() == before {
             return Err(crate::state::lifecycle_index_not_found(
-                &table.name,
+                crate::state::IndexLifecycle::Delete,
                 &delete.index_name,
             ));
         }
