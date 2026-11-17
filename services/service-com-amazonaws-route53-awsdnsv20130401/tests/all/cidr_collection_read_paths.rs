@@ -17,6 +17,15 @@
 //!    where it selects none — a location a change has emptied, a location the collection
 //!    was never given, a collection that holds nothing at all. The 404s the operation
 //!    models are for the collection id itself naming no collection of the account.
+//! 3. The account's collections are read back in PAGES: `MaxResults` ("the maximum number
+//!    of CIDR collections to return in the response") bounds the page and `NextToken`
+//!    ("an opaque pagination token to indicate where the service is to begin enumerating
+//!    results") resumes it, so the pages partition the whole listing in its own stable
+//!    order, carrying each collection's stored summary once, and a token is answered
+//!    exactly when collections remain. A `NextToken` this listing never minted names no
+//!    page of it, so it is the modelled `InvalidInput` (HTTP 400) rather than a page.
+//!    Being a read, repeating it reports the same collections and a refused request
+//!    leaves the listing exactly as it was.
 //!
 //! Every test drives the service through the real router, using the SAME harness the
 //! sibling CIDR-collection suites use, so what is asserted is the HTTP/restXml behaviour a
@@ -24,12 +33,18 @@
 
 use smithy_server_runtime::MultiServiceRouter;
 
+use service_com_amazonaws_route53_awsdnsv20130401::state::DEFAULT_PAGE_SIZE;
+
 use crate::cidr_collection_blocks::{change, change_collection, create_collection, DELETE_IF_EXISTS, PUT};
 use crate::hosted_zone_records::{call, router, Reply};
 
 /// The wire error code of the refusal of a collection id the account does not hold
 /// (`NoSuchCidrCollectionException`, the shape name the model declares).
 const NO_SUCH_COLLECTION: &str = "NoSuchCidrCollectionException";
+
+/// The wire error code this service states every input-level refusal under
+/// (`InvalidInput`, the one input error `ListCidrCollections` models).
+const INVALID_INPUT: &str = "InvalidInput";
 
 /// The partition, service and resource kind a CIDR collection's ARN names, with the
 /// region and the account fields left EMPTY — the layout of a Route 53 resource ARN.
@@ -44,30 +59,29 @@ struct ListedCollection {
     version: String,
 }
 
-/// Every row `ListCidrCollections` reports, in document order.
-async fn listed_collections(router: &MultiServiceRouter) -> (Reply, Vec<ListedCollection>) {
-    let reply = call(router, "GET", "/2013-04-01/cidrcollection", "").await;
-    assert_eq!(
-        reply.status, 200,
-        "expected 200 from ListCidrCollections, got {} with body {}",
-        reply.status, reply.body
-    );
+/// `ListCidrCollections` with the query string `query` (`""` for none):
+/// `GET /2013-04-01/cidrcollection`, as the model binds it.
+async fn list_collections(router: &MultiServiceRouter, query: &str) -> Reply {
+    call(router, "GET", &format!("/2013-04-01/cidrcollection{query}"), "").await
+}
+
+/// The `CollectionSummary` rows a reply carries, in document order.
+fn reported_collections(reply: &Reply, case: &str) -> Vec<ListedCollection> {
     let arns = reply.all("Arn");
     let ids = reply.all("Id");
     let names = reply.all("Name");
     let versions = reply.all("Version");
     assert!(
         arns.len() == ids.len() && ids.len() == names.len() && names.len() == versions.len(),
-        "every reported collection must carry its Arn, Id, Name and Version, got {} Arn(s), \
-         {} Id(s), {} Name(s) and {} Version(s); body {}",
+        "case {case:?}: every reported collection must carry its Arn, Id, Name and Version, got \
+         {} Arn(s), {} Id(s), {} Name(s) and {} Version(s); body {}",
         arns.len(),
         ids.len(),
         names.len(),
         versions.len(),
         reply.body
     );
-    let rows = arns
-        .iter()
+    arns.iter()
         .zip(&ids)
         .zip(&names)
         .zip(&versions)
@@ -77,7 +91,18 @@ async fn listed_collections(router: &MultiServiceRouter) -> (Reply, Vec<ListedCo
             name: (*name).to_string(),
             version: (*version).to_string(),
         })
-        .collect();
+        .collect()
+}
+
+/// Every row `ListCidrCollections` reports, in document order.
+async fn listed_collections(router: &MultiServiceRouter) -> (Reply, Vec<ListedCollection>) {
+    let reply = list_collections(router, "").await;
+    assert_eq!(
+        reply.status, 200,
+        "expected 200 from ListCidrCollections, got {} with body {}",
+        reply.status, reply.body
+    );
+    let rows = reported_collections(&reply, "the whole listing");
     (reply, rows)
 }
 
@@ -398,6 +423,225 @@ async fn an_existing_collection_enumerates_to_an_empty_page_when_no_block_matche
             "case {case:?}: expected {NO_SUCH_COLLECTION}, got {:?}; body {}",
             refused.error_code(),
             refused.body
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The pages the collection listing is read back in
+// ---------------------------------------------------------------------------
+
+/// The collections the paging test seeds the account with, differing in length and in the
+/// character classes `CollectionName` admits (`len 1..64, pattern ^[0-9A-Za-z_\-]+$`), so
+/// the pages are asserted over a listing whose rows are not one renamed collection. There
+/// are enough of them that every page size below takes several pages.
+const PAGED_NAMES: &[&str] = &[
+    "alpha",
+    "Bravo_2",
+    "charlie-3",
+    "d",
+    "ECHO",
+    "foxtrot_golf",
+    "h-9",
+    "india_JULIET-10",
+];
+
+/// The page sizes under test: one row at a time, sizes that leave a remainder, the size
+/// that is exactly the whole listing, one past it, and [`DEFAULT_PAGE_SIZE`] — the page a
+/// request naming no `MaxResults` is served.
+const PAGE_SIZES: &[i32] = &[1, 3, 5, 7, 8, 9, DEFAULT_PAGE_SIZE];
+
+#[tokio::test]
+async fn the_pages_partition_the_collection_listing_in_its_own_order() {
+    let router = router();
+    let mut created: Vec<ListedCollection> = Vec::new();
+    for name in PAGED_NAMES {
+        let id = create_collection(&router, name).await;
+        created.push(ListedCollection {
+            arn: format!("{COLLECTION_ARN_PREFIX}{id}"),
+            id,
+            name: (*name).to_string(),
+            // "A sequential counter that Route 53 sets to 1 when you create a CIDR
+            // collection": no change below moves it.
+            version: "1".to_string(),
+        });
+    }
+
+    // The unpaged listing is the whole of what the pages must partition, and it carries
+    // every collection the account holds, each with the summary the store holds for it.
+    let (reply, whole) = listed_collections(&router).await;
+    assert_eq!(
+        whole.len(),
+        created.len(),
+        "case \"the whole listing\": expected the {} seeded collections, got {whole:?}; body {}",
+        created.len(),
+        reply.body
+    );
+    for row in &created {
+        assert!(
+            whole.contains(row),
+            "case {:?}: the listing must report the stored collection {row:?}, got {whole:?}; \
+             body {}",
+            row.name,
+            reply.body
+        );
+    }
+
+    // It is a read: asking again answers the same rows in the same order, so the order
+    // the pages are asserted against is the listing's own and nothing the first read did
+    // moved it.
+    let (repeated, again) = listed_collections(&router).await;
+    assert_eq!(
+        again, whole,
+        "case \"the listing repeated\": a read must answer the same rows in the same order, \
+         got {again:?} against {whole:?}; body {}",
+        repeated.body
+    );
+
+    for &page_size in PAGE_SIZES {
+        let case = format!("maxresults={page_size}");
+        let mut walked: Vec<ListedCollection> = Vec::new();
+        let mut token: Option<String> = None;
+        // Every page carries at least one collection while any remain, so the walk cannot
+        // take more pages than there are collections; one more iteration than that is a
+        // paging defect rather than a slow test.
+        for _ in 0..=PAGED_NAMES.len() {
+            let query = match &token {
+                Some(token) => format!("?maxresults={page_size}&nexttoken={token}"),
+                None => format!("?maxresults={page_size}"),
+            };
+            let page = list_collections(&router, &query).await;
+            assert_eq!(
+                page.status, 200,
+                "case {case:?}: expected 200 from ListCidrCollections, got {} with body {}",
+                page.status, page.body
+            );
+            let rows = reported_collections(&page, &case);
+            let expected_len = (whole.len() - walked.len()).min(page_size as usize);
+            assert_eq!(
+                rows.len(),
+                expected_len,
+                "case {case:?}: expected a page of {expected_len} after {} walked, got {rows:?}; \
+                 body {}",
+                walked.len(),
+                page.body
+            );
+            walked.extend(rows);
+            token = page.first("NextToken").map(str::to_string);
+            assert_eq!(
+                token.is_some(),
+                walked.len() < whole.len(),
+                "case {case:?}: a token is answered exactly when collections remain, got \
+                 {token:?} after {} of {}",
+                walked.len(),
+                whole.len()
+            );
+            if token.is_none() {
+                break;
+            }
+        }
+        assert_eq!(
+            walked, whole,
+            "case {case:?}: expected the pages to partition the listing {whole:?}, got {walked:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A pagination token this listing never minted
+// ---------------------------------------------------------------------------
+
+/// One row of the token table: the query string sent, and what makes the token name no
+/// page of this listing.
+struct TokenRow {
+    case: &'static str,
+    query: &'static str,
+}
+
+/// The rows differ in HOW the token departs from the ids this listing resumes at (`UUID`,
+/// `pattern ^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$`): not an id at all, a
+/// character no id carries, a field count or field width an id does not have, and the
+/// upper-case spelling of hexadecimal no minted id uses.
+const UNMINTED_TOKEN_ROWS: &[TokenRow] = &[
+    TokenRow {
+        case: "a token that is no id at all",
+        query: "?nexttoken=not-a-token",
+    },
+    TokenRow {
+        case: "a token carrying a character no id does",
+        query: "?nexttoken=%2F11111111-2222-3333-4444-555555555555",
+    },
+    TokenRow {
+        case: "a token one field short of an id",
+        query: "?nexttoken=11111111-2222-3333-555555555555",
+    },
+    TokenRow {
+        case: "a token whose last field is one character short",
+        query: "?nexttoken=11111111-2222-3333-4444-55555555555",
+    },
+    TokenRow {
+        case: "a token spelt in upper-case hexadecimal",
+        query: "?nexttoken=11111111-2222-3333-4444-55555555555A",
+    },
+    TokenRow {
+        case: "an unminted token on a bounded page",
+        query: "?maxresults=1&nexttoken=not-a-token",
+    },
+];
+
+#[tokio::test]
+async fn a_next_token_this_listing_never_minted_names_no_page_of_it() {
+    let router = router();
+    let mut held: Vec<ListedCollection> = Vec::new();
+    for name in ["held-ranges", "other-ranges"] {
+        let id = create_collection(&router, name).await;
+        held.push(ListedCollection {
+            arn: format!("{COLLECTION_ARN_PREFIX}{id}"),
+            id,
+            name: name.to_string(),
+            version: "1".to_string(),
+        });
+    }
+    let (_, before) = listed_collections(&router).await;
+
+    for row in UNMINTED_TOKEN_ROWS {
+        let refused = list_collections(&router, row.query).await;
+        assert_eq!(
+            refused.status, 400,
+            "case {:?}: expected 400, got {} with body {}",
+            row.case, refused.status, refused.body
+        );
+        assert_eq!(
+            refused.error_code(),
+            INVALID_INPUT,
+            "case {:?}: expected {INVALID_INPUT}, got {:?}; body {}",
+            row.case,
+            refused.error_code(),
+            refused.body
+        );
+        assert!(
+            refused.first("CollectionSummary").is_none() && refused.first("Arn").is_none(),
+            "case {:?}: a refused listing must report no collection; body {}",
+            row.case,
+            refused.body
+        );
+    }
+
+    // The refusals changed nothing: the listing still reports exactly the collections the
+    // account holds.
+    let (reply, after) = listed_collections(&router).await;
+    assert_eq!(
+        after, before,
+        "case \"after the refusals\": expected the listing untouched, got {after:?} against \
+         {before:?}; body {}",
+        reply.body
+    );
+    for row in &held {
+        assert!(
+            after.contains(row),
+            "case {:?}: the collection must still be reported as {row:?}, got {after:?}; body {}",
+            row.name,
+            reply.body
         );
     }
 }
