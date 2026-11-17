@@ -57,3 +57,35 @@ Code sightings (orientation only): src/ops/get_microvm_image_build.rs:220-239 (l
    AWS: got == bid exactly (the read echoes the identifier the URI addressed), and the value contains no whitespace (NonBlankString pattern ^[^\s]+$).
    Emulator: the identifier the read answers with is not byte-identical to the recorded identifier for that build at this step, although it renders as the same 'build-<digits>' text — assert with repr()/len() rather than by eye: `assert got == bid, (repr(got), repr(bid), len(got), len(bid))`.
 5. Re-replay fixture lambdamicrovms-customer-image-lifecycle step task#9 to confirm the fix: the step must pass with $.buildId equal on both sides.
+
+## Resolution — Cause 1 DECLINED (a per-run, server-generated identifier), and the rule pinned by tests
+
+The behaviour this cause asks for is already the behaviour: the build read is an echo of the key the
+URI addressed. `GetMicrovmImageBuild` looks a build up by the EXACT `buildId` label
+(`version.builds.get(&input.build_id)`, where the map key IS the stored id) and answers
+`build.build_id` unchanged, and `ListMicrovmImageBuilds` projects that same stored field, so the
+read, the listing row and the id the request carried cannot differ. The id is minted once, in
+`state::next_build_id`, as `build-` plus a fixed-width counter rendered with `format!`: ASCII only,
+no whitespace, 22 characters — a value `NonBlankString` (@length 1..2048, pattern `^[^\s]+$`) may
+hold. Nothing on the path adds padding, whitespace or a non-ASCII character.
+
+What remains between the recording and the emulator is the identifier's TEXT — which digits the
+service's own allocation happened to render — and the model, the operation's documentation ("The
+build request ID.") and the corpus all leave that free; the replay report withholds the recorded
+value, so it is not even knowable. That makes it a per-run, server-generated identifier whose
+modelled type, format and invariants the emulator already satisfies (echoed character for
+character, stable across reads, unique per build, identical in the listing). Serving the recorded
+run's digits would be fitting one recording, not implementing a rule, so this cause is declined
+rather than "made to match": the replay key
+`lambda-microvms|GetMicrovmImageBuild|2xx->2xx|$.buildId` stays open on the withheld text.
+
+The rule is pinned end to end instead, in the owning crate's
+`tests/all/image_build_scope.rs`: `a_build_read_echoes_the_identifier_it_was_addressed_by` (a table
+over three differently configured images, both identifier forms and two reads of every build:
+the read answers the addressed id character for character, the id holds 1..2048 characters with no
+whitespace, and one id names one build) and `a_build_id_carrying_whitespace_addresses_no_build`
+(leading, trailing, embedded and sole whitespace in the label are each refused HTTP 400
+`ValidationException`, so such a value is not addressable at all).
+
+This record is filed here because the read path is correct and now has tests holding it correct —
+not because the replay step passes.

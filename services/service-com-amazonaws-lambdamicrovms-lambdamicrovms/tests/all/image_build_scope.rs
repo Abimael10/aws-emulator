@@ -15,6 +15,8 @@
 //! (`emulator`, `call`, `image_body`, …) is the one `microvm_lifecycle` owns, and the
 //! build-plane helpers are the ones `image_build_read_path` owns.
 
+use std::collections::BTreeMap;
+
 use serde_json::{json, Value};
 use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::{
     image_build_not_found_message, FIRST_IMAGE_VERSION,
@@ -23,7 +25,7 @@ use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::{
 use crate::image_build_read_path::{
     arm64_targets, create_image, get_build, list_builds, page_build_ids, page_items,
 };
-use crate::microvm_lifecycle::emulator;
+use crate::microvm_lifecycle::{as_uri_value, call, emulator};
 
 /// One image under test: the case that describes it, the name it was created under, the
 /// ARN its create minted, and the `buildId`s its own first version holds.
@@ -152,6 +154,168 @@ async fn a_sibling_images_build_is_not_found_under_this_one() {
                 );
             }
         }
+    }
+}
+
+/// RULE: a build is addressed BY its `buildId`, so the single-build read answers the very
+/// identifier the request named — the same characters, on every read, and whichever form of
+/// the image identifier carried it — and that is the identifier the listing reports for the
+/// row, because `GetMicrovmImageBuildOutput$buildId` and `MicrovmImageBuildSummary$buildId`
+/// target ONE shape (`NonBlankString`, `@length` 1..2048, pattern `^[^\s]+$`) holding one
+/// stored value. One id names one build, so the handle a client keeps round-trips: an
+/// equality check against the id it asked for holds, and a map keyed on it keeps one entry
+/// per build.
+#[tokio::test]
+async fn a_build_read_echoes_the_identifier_it_was_addressed_by() {
+    let router = emulator();
+    let images = scoped_images(&router).await;
+
+    // Rows span both forms `MicrovmImageIdentifier` accepts for the image a build belongs
+    // to ("the unique identifier (ARN or ID)"), over every image `scoped_images` created —
+    // each from a different create input, so the ids read back here are minted at several
+    // points of the store's own allocation rather than at its first one only.
+    let mut rows: Vec<(String, String, String)> = Vec::new();
+    for image in &images {
+        rows.push((
+            format!("{:?} addressed by its ARN", image.case),
+            image.image_arn.clone(),
+            image.image_arn.clone(),
+        ));
+        rows.push((
+            format!("{:?} addressed by its name", image.case),
+            image.name.to_string(),
+            image.image_arn.clone(),
+        ));
+    }
+
+    // Which build each id was minted for, so an id two builds of the store shared would
+    // fail here: the id is the only handle a client has on a build.
+    let mut minted_for: BTreeMap<String, String> = BTreeMap::new();
+
+    for (case, identifier, image_arn) in &rows {
+        let (status, body) = list_builds(&router, identifier, FIRST_IMAGE_VERSION, "").await;
+        assert_eq!(
+            status, 200,
+            "case {case}: expected 200 from the listing, got {status} {body}"
+        );
+        let listed = page_build_ids(&body, case);
+        assert!(
+            !listed.is_empty(),
+            "case {case}: the version holds at least one build, got {body}"
+        );
+
+        for build_id in &listed {
+            // A value the member may hold at all: 1..2048 characters, and the pattern
+            // `^[^\s]+$` forbids whitespace ANYWHERE in it — leading and trailing included.
+            let length = build_id.chars().count();
+            assert!(
+                (1..=2048).contains(&length) && !build_id.contains(char::is_whitespace),
+                "case {case}: a build id holds 1..2048 characters and no whitespace, got \
+                 {build_id:?} ({length} characters)"
+            );
+
+            let owner = format!("{image_arn} at {FIRST_IMAGE_VERSION}");
+            match minted_for.get(build_id) {
+                Some(first) => assert_eq!(
+                    first, &owner,
+                    "case {case}: {build_id:?} is the id of ONE build, got it for {first} and \
+                     for {owner}"
+                ),
+                None => {
+                    minted_for.insert(build_id.clone(), owner);
+                }
+            }
+
+            // The read is an ECHO of the key the URI carried, and a second read answers the
+            // same characters — a report, not a mint.
+            for read in ["the first read", "a second read"] {
+                let (status, body) =
+                    get_build(&router, identifier, FIRST_IMAGE_VERSION, build_id).await;
+                assert_eq!(
+                    status, 200,
+                    "case {case}, {read} of {build_id:?}: expected 200, got {status} {body}"
+                );
+                assert_eq!(
+                    body["buildId"].as_str(),
+                    Some(build_id.as_str()),
+                    "case {case}, {read}: the read answers the identifier it was addressed by \
+                     ({build_id:?}), got {:?}",
+                    body["buildId"]
+                );
+            }
+        }
+    }
+
+    assert_eq!(
+        minted_for.len(),
+        images
+            .iter()
+            .map(|image| image.build_ids.len())
+            .sum::<usize>(),
+        "every build of the store carries its own id, got {minted_for:?}"
+    );
+}
+
+/// RULE: `buildId` targets `NonBlankString`, whose pattern `^[^\s]+$` admits no whitespace
+/// anywhere, so a value carrying any is not a value that member may hold — a request that
+/// addresses a build by one can never succeed and is refused with `ValidationException`
+/// (HTTP 400) rather than served or reported missing. This is what makes the echo above
+/// load-bearing: an identifier the read padded or spaced would not be addressable again.
+#[tokio::test]
+async fn a_build_id_carrying_whitespace_addresses_no_build() {
+    let router = emulator();
+    let images = scoped_images(&router).await;
+    let image = &images[0];
+    let held = image
+        .build_ids
+        .first()
+        .expect("the created version holds a build")
+        .clone();
+
+    // Rows span where the whitespace sits in the value — before it, after it, inside it —
+    // and the value that is whitespace alone, each as the percent-encoded path label a
+    // client would have to send to carry it at all. The split is taken on a CHARACTER
+    // boundary, so the row holds whatever characters the minted id is made of.
+    let middle = held
+        .char_indices()
+        .nth(held.chars().count() / 2)
+        .map(|(index, _)| index)
+        .unwrap_or_default();
+    let (head, tail) = held.split_at(middle);
+    assert!(
+        !head.is_empty() && !tail.is_empty(),
+        "the embedded-whitespace row needs a split INSIDE the id, so it stays a different \
+         case from the leading one, got {held:?}"
+    );
+    let rows: Vec<(&str, String)> = vec![
+        ("a leading space", format!("%20{held}")),
+        ("a trailing space", format!("{held}%20")),
+        ("a trailing newline", format!("{held}%0A")),
+        ("an embedded space", format!("{head}%20{tail}")),
+        ("whitespace alone", "%20".to_string()),
+    ];
+
+    for (case, label) in rows {
+        // Only the build label is hand-encoded: the image identifier and the version go
+        // through the harness's own path-value guard, which refuses a value that would
+        // need escaping.
+        let uri = format!(
+            "/2025-09-09/microvm-images/{}/versions/{}/builds/{}",
+            as_uri_value(&image.image_arn),
+            as_uri_value(FIRST_IMAGE_VERSION),
+            label
+        );
+        let (status, body) = call(&router, "GET", &uri, None).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a buildId carrying whitespace is no value this member may hold, \
+             got {status} {body}"
+        );
+        assert_eq!(
+            body["__type"].as_str(),
+            Some("ValidationException"),
+            "case {case:?}: expected ValidationException, got {body}"
+        );
     }
 }
 
