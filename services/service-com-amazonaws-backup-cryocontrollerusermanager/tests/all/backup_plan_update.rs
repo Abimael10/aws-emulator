@@ -17,7 +17,18 @@
 //! * a body AWS does not accept is refused with the error this operation models
 //!   for it and stores nothing: the plan still reports the version it had;
 //! * a `BackupPlanId` naming no live plan — one the account never held, and one
-//!   whose deletion is recorded — is 400 `ResourceNotFoundException`.
+//!   whose deletion is recorded — is 400 `ResourceNotFoundException`;
+//! * a mutation of a stored plan that FOLLOWS the call which created it — each
+//!   update that stores another version, and the delete that records the
+//!   deletion — is published once on the account's default EventBridge bus as
+//!   `source` `aws.backup` / `detail-type` `Backup Plan State Change`, whose
+//!   `detail` names the plan (`backupPlanId`, `versionId`) and the transition
+//!   (`state`: `MODIFIED`, `DELETED`), while the plan a CREATE stored — which is
+//!   what that call's own response reports — and a refused update publish
+//!   nothing. Source for the envelope: the AWS Backup EventBridge
+//!   notifications; the Smithy model describes the control plane only, so every
+//!   `detail` member is asserted against what the SAME mutation's response
+//!   reported for it.
 //!
 //! The rows of each table differ in what the update changes about the stored
 //! body (a rule's copy actions, how many rules there are, the plan's name, the
@@ -27,12 +38,23 @@
 //!
 //! The request harness (`router`, `call`, `error_code`) is the one
 //! `vault_and_backup_job.rs` exposes to this test binary, so there is ONE wire
-//! path for the service's suites.
+//! path for the service's suites; the event cases drive the emulator
+//! `job_state_change_events.rs` exposes — Backup, EventBridge and Amazon SQS on
+//! one engine — because the publication reaches EventBridge through the
+//! in-process callback and a rule on that bus delivers to a queue target.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::vault_and_backup_job::{call, error_code, router, ACCOUNT, REGION};
+
+// The emulator the event cases drive and the bus readers they share, exposed by
+// the suite that pins this service's job state changes: Backup, EventBridge and
+// Amazon SQS on ONE engine, with the queue-and-rule setup and the drains written
+// once rather than per suite.
+use crate::job_state_change_events::{
+    delivered, delivered_at_least, emulator, given_queue, given_rule, EVENT_SOURCE,
+};
 
 /// The error shape a plan body AWS does not accept names (`smithy_query`
 /// operation `UpdateBackupPlan`: `InvalidParameterValueException`, `httpError`
@@ -673,5 +695,208 @@ async fn an_update_of_a_plan_the_account_does_not_hold_is_resource_not_found() {
         updated.get("VersionId"),
         created.get("VersionId"),
         "the accepted update mints a version of its own, got {updated:?}"
+    );
+}
+
+/// The `detail-type` AWS Backup publishes a plan's mutations under, and the two
+/// transitions `detail.state` reports, spelled out here rather than imported from
+/// the service crate so a wrong constant in the implementation cannot make these
+/// cases pass.
+const BACKUP_PLAN_STATE_CHANGE: &str = "Backup Plan State Change";
+const MODIFIED: &str = "MODIFIED";
+const DELETED: &str = "DELETED";
+
+/// The rule the event cases install, with the pattern a client writes for these
+/// envelopes.
+const PLAN_EVENT_RULE: &str = "plan-state-changes";
+
+/// Assert that `envelope` is the plan state change `state` of the plan `answered`
+/// identifies: the identifiers and the version the MUTATION's own response
+/// reported, so the event is the stored plan rather than a second, invented copy
+/// of it.
+fn assert_plan_envelope(case: &str, envelope: &Value, answered: &Value, name: &str, state: &str) {
+    assert_eq!(
+        (
+            envelope["source"].clone(),
+            envelope["detail-type"].clone(),
+            envelope["resources"].clone(),
+        ),
+        (
+            json!(EVENT_SOURCE),
+            json!(BACKUP_PLAN_STATE_CHANGE),
+            json!([text(answered, "BackupPlanArn")]),
+        ),
+        "case {case:?}: expected the {state} envelope of this plan, got {envelope}"
+    );
+    assert_eq!(
+        (
+            envelope["detail"]["backupPlanId"].clone(),
+            envelope["detail"]["versionId"].clone(),
+            envelope["detail"]["backupPlanArn"].clone(),
+            envelope["detail"]["backupPlanName"].clone(),
+            envelope["detail"]["state"].clone(),
+        ),
+        (
+            answered["BackupPlanId"].clone(),
+            answered["VersionId"].clone(),
+            answered["BackupPlanArn"].clone(),
+            json!(name),
+            json!(state),
+        ),
+        "case {case:?}: expected the plan, the version and the state the mutation \
+         reported, got {envelope}"
+    );
+}
+
+/// Every mutation a stored plan is given after its create is published on the
+/// account's default bus, and the create itself publishes nothing.
+///
+/// The rows are the supersession table's: they differ in what the new version
+/// changes about the stored body, which is what "a mutation of the plan is
+/// announced" generalises over, and each row then deletes the plan, so the
+/// deletion's own envelope is read for every shape of plan too.
+#[tokio::test]
+async fn a_plan_mutation_is_published_as_a_backup_plan_state_change() {
+    for (case, body) in update_cases() {
+        // Backup, EventBridge and Amazon SQS on one engine: the publication
+        // reaches EventBridge in process, and the rule delivers to this queue.
+        let router = emulator();
+        let (queue, queue_arn) = given_queue(&router, case, "plan-state-change-events").await;
+        given_rule(
+            &router,
+            case,
+            PLAN_EVENT_RULE,
+            &json!({
+                "source": [EVENT_SOURCE],
+                "detail-type": [BACKUP_PLAN_STATE_CHANGE],
+            }),
+            &[queue_arn],
+        )
+        .await;
+
+        let (status, created) =
+            create_plan(&router, &json!({"BackupPlan": created_plan("event-plan")})).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected CreateBackupPlan 200, got {status} {created:?}"
+        );
+        let plan_id = text(&created, "BackupPlanId");
+        // The plan a create stored is what the create's own response reports, so
+        // the bus carries nothing for it. The publication a mutation owes is made
+        // by the mutating call itself, so a drain taken once that call has
+        // answered is the whole of what it published.
+        let after_create = delivered(&router, case, &queue).await;
+        assert!(
+            after_create.is_empty(),
+            "case {case:?}: a create publishes no plan state change, got {after_create:?}"
+        );
+
+        // The update: ONE envelope, naming the plan and the version this call
+        // answered with.
+        let (status, updated) = update_plan(&router, &plan_id, &body).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected UpdateBackupPlan 200, got {status} {updated:?}"
+        );
+        let updated_name = text(&body, "BackupPlanName");
+        let modified = delivered_at_least(&router, case, &queue, 1).await;
+        assert_eq!(
+            modified.len(),
+            1,
+            "case {case:?}: the update owes exactly one envelope, got {modified:?}"
+        );
+        assert_plan_envelope(case, &modified[0], &updated, &updated_name, MODIFIED);
+
+        // And the delete: one more, carrying the plan's recorded deletion.
+        let (status, deleted) = delete_plan(&router, &plan_id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected DeleteBackupPlan 200, got {status} {deleted:?}"
+        );
+        let removed = delivered_at_least(&router, case, &queue, 1).await;
+        assert_eq!(
+            removed.len(),
+            1,
+            "case {case:?}: the delete owes exactly one envelope, got {removed:?}"
+        );
+        assert_plan_envelope(case, &removed[0], &deleted, &updated_name, DELETED);
+        assert!(
+            removed[0]["detail"]["deletionDate"].is_string(),
+            "case {case:?}: the deletion envelope reports the stored deletion \
+             instant, got {}",
+            removed[0]
+        );
+    }
+}
+
+/// An update this service REFUSES publishes nothing: there is no stored
+/// transition to announce, so the bus carries only the envelope of the update it
+/// ACCEPTED — read on a path the accepted update proves live.
+#[tokio::test]
+async fn a_refused_update_publishes_no_plan_state_change() {
+    let case = "a refused update beside an accepted one";
+    let router = emulator();
+    let (queue, queue_arn) = given_queue(&router, case, "refused-plan-events").await;
+    // Owed EVERY envelope of this source: a rule filtering any of them out could
+    // not tell "withheld" from "filtered".
+    given_rule(
+        &router,
+        case,
+        PLAN_EVENT_RULE,
+        &json!({"source": [EVENT_SOURCE]}),
+        &[queue_arn],
+    )
+    .await;
+
+    let (status, created) =
+        create_plan(&router, &json!({"BackupPlan": created_plan("refused-plan")})).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected CreateBackupPlan 200, got {status} {created:?}"
+    );
+    let plan_id = text(&created, "BackupPlanId");
+
+    // An id the account holds no plan under, and a body AWS does not accept on
+    // the plan it DOES hold: each is refused, and neither stores a version.
+    let (status, refused) =
+        update_plan(&router, UNHELD_PLAN_ID, &created_plan("never-stored")).await;
+    assert_eq!(
+        (status, error_code(&refused).as_str()),
+        (400, NOT_FOUND),
+        "case {case:?}: expected 400 {NOT_FOUND}, got {status} {refused:?}"
+    );
+    let (status, refused) = update_plan(
+        &router,
+        &plan_id,
+        &json!({"BackupPlanName": "no-rules-at-all", "Rules": []}),
+    )
+    .await;
+    assert_eq!(
+        (status, error_code(&refused).as_str()),
+        (400, INVALID_PARAMETER),
+        "case {case:?}: expected 400 {INVALID_PARAMETER}, got {status} {refused:?}"
+    );
+
+    // The accepted update that follows is the first thing the queue is handed,
+    // which is only true if the refusals published nothing.
+    let accepted = created_plan("accepted-after-refusals");
+    let (status, updated) = update_plan(&router, &plan_id, &accepted).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected the accepted UpdateBackupPlan 200, got {status} {updated:?}"
+    );
+    let seen = delivered_at_least(&router, case, &queue, 1).await;
+    assert_eq!(
+        seen.len(),
+        1,
+        "case {case:?}: the accepted update's envelope is the ONE the bus carries, \
+         got {seen:?}"
+    );
+    assert_plan_envelope(
+        case,
+        &seen[0],
+        &updated,
+        &text(&accepted, "BackupPlanName"),
+        MODIFIED,
     );
 }

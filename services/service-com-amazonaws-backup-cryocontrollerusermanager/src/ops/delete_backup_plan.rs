@@ -13,6 +13,14 @@
 //! of its own — while the account stops holding it: its name is free again, and
 //! a second delete of the same plan answers `ResourceNotFoundException`.
 //!
+//! Recording the deletion is a MUTATION of the plan, so this call publishes the plan
+//! state change that mutation owes onto the account's default EventBridge bus —
+//! `DELETED` for the plan it deleted
+//! ([`crate::state::ComAmazonawsBackupCryocontrollerusermanagerState::record_backup_plan_state_changes`]
+//! decides which mutations owe an event, [`crate::state::publish_job_state_changes`]
+//! publishes it). A delete this operation REFUSES records nothing, so it announces
+//! nothing.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -169,52 +177,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
         let now = ::std::time::SystemTime::now();
 
-        let mut store = state.lock();
-        // A plan this account does not hold, and one whose deletion is already
-        // recorded, are the same condition: this delete reads the plan's LATEST
-        // version to supersede it, and there is none to read, which is the
-        // refusal that names the plan it could not read — by the ARN built from
-        // this request's region and the id it carried.
-        if store.live_backup_plan(&input.backup_plan_id).is_none() {
-            return Err(DeleteBackupPlanErrorModeled::ResourceNotFoundException(
-                crate::state::latest_backup_plan_version_unreadable(
-                    &crate::state::backup_plan_arn(&region, &input.backup_plan_id),
-                ),
-            )
-            .into());
-        }
-        // "A backup plan can only be deleted after all associated selections of
-        // resources have been deleted": the plan still assigns resources, so the
-        // refusal is the one its STATE makes rather than an absent resource, and
-        // its sentence states what has to be deleted first — fixed text, naming
-        // neither the plan nor how many selections bar the delete.
-        if !store.backup_selections_of(&input.backup_plan_id).is_empty() {
-            return Err(DeleteBackupPlanErrorModeled::InvalidRequestException(
-                InvalidRequestException {
-                    message: Some(crate::state::MESSAGE_PLAN_SELECTIONS_EXIST.to_string()),
-                    ..Default::default()
-                },
-            )
-            .into());
-        }
+        // Everything this call records happens under the store's lock, which is released
+        // before the publication below: no lock is held across an await.
+        let output = {
+            let mut store = state.lock();
+            // A plan this account does not hold, and one whose deletion is already
+            // recorded, are the same condition: this delete reads the plan's LATEST
+            // version to supersede it, and there is none to read, which is the
+            // refusal that names the plan it could not read — by the ARN built from
+            // this request's region and the id it carried.
+            if store.live_backup_plan(&input.backup_plan_id).is_none() {
+                return Err(DeleteBackupPlanErrorModeled::ResourceNotFoundException(
+                    crate::state::latest_backup_plan_version_unreadable(
+                        &crate::state::backup_plan_arn(&region, &input.backup_plan_id),
+                    ),
+                )
+                .into());
+            }
+            // "A backup plan can only be deleted after all associated selections of
+            // resources have been deleted": the plan still assigns resources, so the
+            // refusal is the one its STATE makes rather than an absent resource, and
+            // its sentence states what has to be deleted first — fixed text, naming
+            // neither the plan nor how many selections bar the delete.
+            if !store.backup_selections_of(&input.backup_plan_id).is_empty() {
+                return Err(DeleteBackupPlanErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(crate::state::MESSAGE_PLAN_SELECTIONS_EXIST.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .into());
+            }
 
-        let Some(plan) = store.backup_plans.get_mut(&input.backup_plan_id) else {
-            // Unreachable: the lookup above resolved the plan under this same
-            // lock. Answered with the same refusal as that lookup rather than
-            // reporting a deletion of a plan nothing holds.
-            return Err(DeleteBackupPlanErrorModeled::ResourceNotFoundException(
-                crate::state::latest_backup_plan_version_unreadable(
-                    &crate::state::backup_plan_arn(&region, &input.backup_plan_id),
-                ),
-            )
-            .into());
+            let Some(plan) = store.backup_plans.get_mut(&input.backup_plan_id) else {
+                // Unreachable: the lookup above resolved the plan under this same
+                // lock. Answered with the same refusal as that lookup rather than
+                // reporting a deletion of a plan nothing holds.
+                return Err(DeleteBackupPlanErrorModeled::ResourceNotFoundException(
+                    crate::state::latest_backup_plan_version_unreadable(
+                        &crate::state::backup_plan_arn(&region, &input.backup_plan_id),
+                    ),
+                )
+                .into());
+            };
+            plan.deletion_date = Some(now);
+            let output = DeleteBackupPlanOutput {
+                backup_plan_id: Some(plan.plan_id.clone()),
+                backup_plan_arn: Some(plan.arn.clone()),
+                deletion_date: Some(::aws_smithy_types::DateTime::from(now)),
+                version_id: Some(plan.current.version_id.clone()),
+            };
+            // Recording the deletion is the plan's last mutation, so it owes the plan
+            // state change the bus is told about: queued under this lock, and published
+            // with the lock released.
+            store.record_backup_plan_state_changes();
+            output
         };
-        plan.deletion_date = Some(now);
-        Ok(DeleteBackupPlanOutput {
-            backup_plan_id: Some(plan.plan_id.clone()),
-            backup_plan_arn: Some(plan.arn.clone()),
-            deletion_date: Some(::aws_smithy_types::DateTime::from(now)),
-            version_id: Some(plan.current.version_id.clone()),
-        })
+        crate::state::publish_job_state_changes(ctx, &*self.engine).await;
+        Ok(output)
     }
 }

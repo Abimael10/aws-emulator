@@ -13,6 +13,12 @@
 //! naming a plan this account already holds is refused with
 //! `AlreadyExistsException`.
 //!
+//! The plan this call stores is what its own response reports, so nothing is published
+//! for it: the account's default EventBridge bus carries the plan state changes that
+//! FOLLOW this call (the update's `MODIFIED`, the delete's `DELETED`), and what this call
+//! records is the baseline the next mutation is compared against
+//! ([`crate::state::ComAmazonawsBackupCryocontrollerusermanagerState::record_backup_plan_state_changes`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -265,6 +271,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let output = plan_created(&record);
         store.backup_plans.insert(plan_id, record);
+        // The plan this call stored is the baseline the plan state changes that FOLLOW it
+        // are compared against, so it is recorded here and nothing is published for it:
+        // the plan a create stored is what this very response reports
+        // (`crate::state::plan_events`).
+        store.record_backup_plan_state_changes();
         Ok(output)
     }
 }

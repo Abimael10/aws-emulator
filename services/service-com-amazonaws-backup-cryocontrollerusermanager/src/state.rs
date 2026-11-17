@@ -89,6 +89,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 mod events;
 pub use events::*;
 
+/// The EventBridge event a BACKUP PLAN mutation publishes — the update and the delete of
+/// a plan — and the diff that decides which mutation owes one. Re-exported for the reason
+/// given on `events`.
+mod plan_events;
+pub use plan_events::*;
+
 /// What a started backup job comes to: whether the backup it was started for can be
 /// performed at all, which is what selects its terminal state. Re-exported for the reason
 /// given on `events`.
@@ -3185,6 +3191,10 @@ pub struct ComAmazonawsBackupCryocontrollerusermanagerState {
     /// waiting to be published — see [`JobEventLog`]. Bounded by
     /// [`MAX_PENDING_EVENTS`] and pruned to the jobs the store still holds.
     pub job_events: JobEventLog,
+    /// What has already been published about each stored backup plan — see
+    /// [`BackupPlanEventLog`]. The changes it queues wait in `job_events` beside the
+    /// jobs', because this service drains ONE queue.
+    pub backup_plan_events: BackupPlanEventLog,
     /// The single clock pump that publishes a transition when it falls due, with no
     /// further call from anybody — see [`drive_job_clock`].
     pub job_clock: JobClock,

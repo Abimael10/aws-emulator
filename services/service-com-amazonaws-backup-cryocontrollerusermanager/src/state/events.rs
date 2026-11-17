@@ -124,10 +124,13 @@ const MAX_PUT_EVENTS_ENTRIES: usize = 10;
 /// for a later call.
 const MAX_PUBLISHED_PER_DRAIN: usize = 50;
 
-/// One job state change waiting to be published.
+/// One state change waiting to be published.
 ///
-/// The `detail` is rendered when the change is RECORDED, so the event reports the job as it
-/// was at that instant rather than as a later drain finds it.
+/// The `detail` is rendered when the change is RECORDED, so the event reports the record as
+/// it was at that instant rather than as a later drain finds it. Every change this service
+/// publishes rides this one queue — a job's and a recovery point's moves, and the mutations
+/// of a backup plan ([`super::plan_events`]) — so there is ONE drain rather than one per
+/// kind of record.
 #[derive(Debug, Clone)]
 pub struct JobStateChange {
     /// The `detail-type` the event carries.
@@ -163,8 +166,9 @@ pub struct JobEventLog {
     /// The `RecoveryPointStatus` last published for each stored recovery point, by
     /// `RecoveryPointArn`.
     recovery_points: BTreeMap<String, String>,
-    /// The changes queued for the next drain, oldest first.
-    pending: VecDeque<JobStateChange>,
+    /// The changes queued for the next drain, oldest first. Written by every recorder of
+    /// a change, this module's and [`super::plan_events`]'s, through [`enqueue`].
+    pub(super) pending: VecDeque<JobStateChange>,
 }
 
 /// The single clock pump of one store: whether one is running, which claim it holds and
@@ -524,7 +528,7 @@ pub fn drive_clock(
 }
 
 /// Append `change` to the queue, dropping the oldest once the queue is full.
-fn enqueue(pending: &mut VecDeque<JobStateChange>, change: JobStateChange) {
+pub(super) fn enqueue(pending: &mut VecDeque<JobStateChange>, change: JobStateChange) {
     while pending.len() >= MAX_PENDING_EVENTS {
         pending.pop_front();
         ::tracing::warn!(
@@ -778,7 +782,7 @@ fn moved_at(completion_date: Option<SystemTime>, creation_date: SystemTime) -> S
 }
 
 /// `time` as the epoch milliseconds an event's `time` carries.
-fn epoch_millis(time: SystemTime) -> i64 {
+pub(super) fn epoch_millis(time: SystemTime) -> i64 {
     ::aws_smithy_types::DateTime::from(time)
         .to_millis()
         .unwrap_or_default()
@@ -786,7 +790,7 @@ fn epoch_millis(time: SystemTime) -> i64 {
 
 /// Insert `at` under `member` as the RFC 3339 instant AWS's event details carry, when there
 /// is an instant to report and it can be expressed as one.
-fn insert_instant(
+pub(super) fn insert_instant(
     detail: &mut ::serde_json::Map<String, ::serde_json::Value>,
     member: &str,
     at: Option<SystemTime>,
@@ -801,8 +805,12 @@ fn insert_instant(
     }
 }
 
-/// Publish every job state change this store has queued onto the account's default
+/// Publish every state change this store has queued onto the account's default
 /// EventBridge bus, and leave the queue empty.
+///
+/// Every recorder's changes are drained here — a job's and a recovery point's moves, and
+/// the mutations of a backup plan ([`super::plan_events`]) — so this service publishes
+/// through one path.
 ///
 /// Called by a handler AFTER it has released the store's lock, so no lock is held across
 /// the await: each batch is taken out in one critical section, so nothing is published

@@ -21,6 +21,14 @@
 //! deletion `DeleteBackupPlan` recorded — is the modelled
 //! `ResourceNotFoundException`: there is no live plan of that id to update.
 //!
+//! Storing another version is a MUTATION of the plan, so this call publishes the plan
+//! state change that mutation owes onto the account's default EventBridge bus —
+//! `MODIFIED` for the plan it updated
+//! ([`crate::state::ComAmazonawsBackupCryocontrollerusermanagerState::record_backup_plan_state_changes`]
+//! decides which mutations owe an event, [`crate::state::publish_job_state_changes`]
+//! publishes it). An update this operation REFUSES stores no version, so it announces
+//! nothing.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -169,7 +177,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         // `BackupPlan` is `@required`, as are each rule's `RuleName` and
         // `TargetBackupVaultName`, so an absent or malformed one is refused
         // before this handler runs.
@@ -201,39 +208,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let mut store = state.lock();
-        // A plan this account does not hold, and one whose deletion is already
-        // recorded, are the same condition: there is no live plan of that id to
-        // update. Resolved BEFORE anything is minted, so a refused update
-        // stores nothing.
-        if store.live_backup_plan(&input.backup_plan_id).is_none() {
-            return Err(UpdateBackupPlanErrorModeled::ResourceNotFoundException(
-                crate::state::backup_plan_not_found(),
-            )
-            .into());
-        }
-        let version = store.minted_backup_plan_version(plan, now);
-        let Some(record) = store.live_backup_plan_mut(&input.backup_plan_id) else {
-            // Unreachable: the lookup above resolved the plan under this same
-            // lock. Answered as the absent resource it would be rather than
-            // reporting a version of a plan nothing holds.
-            return Err(UpdateBackupPlanErrorModeled::ResourceNotFoundException(
-                crate::state::backup_plan_not_found(),
-            )
-            .into());
+        // Everything this call stores happens under the store's lock, which is released
+        // before the publication below: no lock is held across an await.
+        let output = {
+            let mut store = state.lock();
+            // A plan this account does not hold, and one whose deletion is already
+            // recorded, are the same condition: there is no live plan of that id to
+            // update. Resolved BEFORE anything is minted, so a refused update
+            // stores nothing.
+            if store.live_backup_plan(&input.backup_plan_id).is_none() {
+                return Err(UpdateBackupPlanErrorModeled::ResourceNotFoundException(
+                    crate::state::backup_plan_not_found(),
+                )
+                .into());
+            }
+            let version = store.minted_backup_plan_version(plan, now);
+            let Some(record) = store.live_backup_plan_mut(&input.backup_plan_id) else {
+                // Unreachable: the lookup above resolved the plan under this same
+                // lock. Answered as the absent resource it would be rather than
+                // reporting a version of a plan nothing holds.
+                return Err(UpdateBackupPlanErrorModeled::ResourceNotFoundException(
+                    crate::state::backup_plan_not_found(),
+                )
+                .into());
+            };
+            record.supersede_current_version(version);
+            let output = UpdateBackupPlanOutput {
+                backup_plan_id: Some(record.plan_id.clone()),
+                backup_plan_arn: Some(record.arn.clone()),
+                // The instant this version was stored, which is the version's own
+                // creation date: a later read of it reports the same instant.
+                creation_date: Some(::aws_smithy_types::DateTime::from(
+                    record.current.creation_date,
+                )),
+                version_id: Some(record.current.version_id.clone()),
+                advanced_backup_settings: record.current.advanced_backup_settings_view(),
+                scan_settings: record.current.scan_settings_view(),
+            };
+            // The version this update stored is a move of the plan, so it owes the plan
+            // state change the bus is told about: queued under this lock, and published
+            // with the lock released.
+            store.record_backup_plan_state_changes();
+            output
         };
-        record.supersede_current_version(version);
-        Ok(UpdateBackupPlanOutput {
-            backup_plan_id: Some(record.plan_id.clone()),
-            backup_plan_arn: Some(record.arn.clone()),
-            // The instant this version was stored, which is the version's own
-            // creation date: a later read of it reports the same instant.
-            creation_date: Some(::aws_smithy_types::DateTime::from(
-                record.current.creation_date,
-            )),
-            version_id: Some(record.current.version_id.clone()),
-            advanced_backup_settings: record.current.advanced_backup_settings_view(),
-            scan_settings: record.current.scan_settings_view(),
-        })
+        crate::state::publish_job_state_changes(ctx, &*self.engine).await;
+        Ok(output)
     }
 }

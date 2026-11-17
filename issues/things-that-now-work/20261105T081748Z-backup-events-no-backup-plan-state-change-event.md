@@ -38,3 +38,20 @@ Actual (emulator): PutRule, PutTargets, CreateBackupVault, CreateFramework, Desc
 5. backup.update_backup_plan(BackupPlanId=<id>, BackupPlan={... ScheduleExpression:'cron(0 6 * * ? *)', StartWindowMinutes:90, CompletionWindowMinutes:180}).
 6. Poll sqs.receive_message on the queue for up to 90s for an envelope with detail.backupPlanId == <id>. Observed: nothing ever arrives (check times out). Expected: one envelope with detail-type 'Backup Plan State Change' and detail.state 'MODIFIED'.
 7. (Second half, currently unreachable) create a rule matching any framework/compliance detail-type on source aws.backup with its own queue, run CreateFramework + UpdateFramework, and confirm NO message arrives on it.
+
+## Resolution note
+
+Fixed: a plan mutation that FOLLOWS the create — the update that stores another version
+(`state` `MODIFIED`) and the delete that records the deletion (`state` `DELETED`) — now
+publishes one 'Backup Plan State Change' envelope on the default bus, with every `detail`
+member read off the stored plan; a framework's create and update still publish nothing.
+
+Open question for a later recording: whether a plan's CREATE is announced too, with the
+`state` `CREATED` this report's AWS paragraph names. It is NOT published today. The
+recorded check installs its rule and target before `CreateBackupPlan` and waits for the
+FIRST envelope naming the plan, and asserts `MODIFIED` on it; publishing a create envelope
+made that assertion fail on replay with "expected plan event state 'MODIFIED', got
+'CREATED'", so the recorded run cannot have carried one. If a future recording observes a
+create envelope on a rule installed beforehand, the diff in
+`services/service-com-amazonaws-backup-cryocontrollerusermanager/src/state/plan_events.rs`
+has to announce a first-seen plan instead of only seeding its snapshot with it.
