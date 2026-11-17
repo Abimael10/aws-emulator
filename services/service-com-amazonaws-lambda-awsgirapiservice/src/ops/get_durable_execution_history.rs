@@ -200,27 +200,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx);
 
-        // The history IS the execution's data: reporting it decrypts the payloads its
-        // events carry under the key the function's `DurableConfig` names, which is why
+        // "Specifies whether to include execution data such as step results and callback
+        // payloads in the history events. Set to true to include data, or false to
+        // exclude it for a more compact response. The default is true."
+        let include_execution_data = input.include_execution_data.unwrap_or(true);
+
+        // The data a history event CARRIES is the execution's data: reporting it decrypts
+        // those payloads under the key the function's `DurableConfig` names, which is why
         // this operation binds the four KMS failures at 502. The key is asked about at the
         // point of use, with no store guard held (see
-        // [`crate::state::durable_data_key_fault`]).
-        let data_key = {
-            let mut store = state.lock();
-            crate::state::resolve_durable_execution(
-                &mut store,
-                &input.durable_execution_arn,
-                &region,
-                now,
-            )
-            .ok()
-            .and_then(|(record, name)| {
-                record
-                    .durable_executions
-                    .get(&name)
-                    .and_then(|execution| execution.kms_key_arn.clone())
+        // [`crate::state::durable_data_key_fault`]). A request that asks for no data
+        // decrypts nothing and asks about nothing: an event itself is metadata.
+        let data_key = include_execution_data
+            .then(|| {
+                let mut store = state.lock();
+                crate::state::resolve_durable_execution(
+                    &mut store,
+                    &input.durable_execution_arn,
+                    &region,
+                    now,
+                )
+                .ok()
+                .and_then(|(record, name)| {
+                    record
+                        .durable_executions
+                        .get(&name)
+                        .and_then(|execution| execution.kms_key_arn.clone())
+                })
             })
-        };
+            .flatten();
         if let Some(fault) =
             crate::state::durable_data_key_fault(ctx.callback(), &region, data_key.as_deref())
                 .await
@@ -284,10 +292,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let truncated = start + page.len() < events.len();
 
-        // "Specifies whether to include execution data such as step results and callback
-        // payloads in the history events. Set to true to include data, or false to
-        // exclude it for a more compact response. The default is true."
-        let include_execution_data = input.include_execution_data.unwrap_or(true);
+        // Whether the data each event carries is reported was decided above, before the key
+        // was asked about.
         Ok(GetDurableExecutionHistoryOutput {
             events: page
                 .iter()

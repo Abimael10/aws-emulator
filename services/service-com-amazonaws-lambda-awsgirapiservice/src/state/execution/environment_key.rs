@@ -312,12 +312,18 @@ pub async fn environment_key_fault(
     // every such future grows the stack frame of every link in those chains.
     let answer = Box::pin(relayed_key_answer(callback, region, key_arn)).await?;
     let message = invocation_message(invocation_sentence(answer.class), &answer);
-    Some(match answer.class {
+    Some(key_fault(answer.class, message))
+}
+
+/// The fault of class `class` carrying `message`, so the ONE reading of the key service's
+/// answer decides the class while each caller words the message its own refusal states.
+fn key_fault(class: FaultClass, message: String) -> EnvironmentKeyFault {
+    match class {
         FaultClass::Disabled => EnvironmentKeyFault::Disabled(message),
         FaultClass::InvalidState => EnvironmentKeyFault::InvalidState(message),
         FaultClass::NotFound => EnvironmentKeyFault::NotFound(message),
         FaultClass::AccessDenied => EnvironmentKeyFault::AccessDenied(message),
-    })
+    }
 }
 
 /// The sentence an INVOCATION's refusal states the decrypt it could not perform in, for each
@@ -403,19 +409,41 @@ pub async fn report_environment_key_fault(
     });
 }
 
-/// How the refusal of a read of a durable execution's DATA is worded: the operation Lambda
-/// could not perform (decrypting that execution's data), why, and WHICH key it could not
-/// perform it under.
+/// The sentence a refusal of a read of a durable execution's DATA states, for each class of
+/// failure: the operation Lambda could not perform (accessing that execution's data), why,
+/// and where the caller fixes it — the function's DURABLE configuration, which is where the
+/// key that data is encrypted under is named.
 ///
-/// The sentence is the same class of failure [`DISABLED_MESSAGE`] and its siblings word for
-/// the environment-variable decrypt, said of the data this read reports and naming the key
-/// the function's `DurableConfig` names — the one variable part, taken from the stored
-/// configuration.
-fn durable_data_message(why: &str, key_arn: &str) -> String {
-    format!(
-        "Lambda was unable to decrypt the durable execution data because the KMS key \
-         {key_arn} {why}. Please check the function's KMS key settings."
-    )
+/// The four classes are worded as [`invocation_sentence`] and [`report_sentence`] word the
+/// same four for a function's environment variables, said of the data a read reports. Every
+/// word of the sentence is fixed: the only variable part of the whole message is the key the
+/// relayed clause after it names ([`relay_clause`]), which is the key the function's
+/// `DurableConfig` carries.
+///
+/// All four the model binds are worded here, including the one a key the key service holds
+/// no record of would be refused under — which this read does not refuse at all
+/// ([`durable_data_key_fault`]) — so the wording does not depend on which classes that
+/// reading happens to reach.
+fn durable_data_sentence(class: FaultClass) -> &'static str {
+    match class {
+        FaultClass::Disabled => {
+            "Lambda was unable to access your execution data because the KMS key used is \
+             disabled. Check the KMS key configured in the function's durable config."
+        }
+        FaultClass::InvalidState => {
+            "Lambda was unable to access your execution data because the state of the KMS \
+             key used is not valid for Decrypt. Check the KMS key configured in the \
+             function's durable config."
+        }
+        FaultClass::NotFound => {
+            "Lambda was unable to access your execution data because the KMS key was not \
+             found. Check the KMS key configured in the function's durable config."
+        }
+        FaultClass::AccessDenied => {
+            "Lambda was unable to access your execution data because KMS access was denied. \
+             Check the KMS key configured in the function's durable config."
+        }
+    }
 }
 
 /// Why the DATA of a durable execution encrypted under `kms_key_arn` cannot be read, or
@@ -441,49 +469,21 @@ pub async fn durable_data_key_fault(
     kms_key_arn: Option<&str>,
 ) -> Option<EnvironmentKeyFault> {
     let key_arn = kms_key_arn?;
-    let described = kms_client(callback, region)
-        .describe_key()
-        .key_id(key_arn)
-        .send()
-        .await;
-    match described {
-        Ok(answer) => {
-            let state = answer
-                .key_metadata()
-                .and_then(::aws_sdk_kms::types::KeyMetadata::key_state)
-                .map(|state| state.as_str().to_string());
-            match state.as_deref() {
-                None | Some(STATE_ENABLED) => None,
-                Some("Disabled") => Some(EnvironmentKeyFault::Disabled(durable_data_message(
-                    "is disabled",
-                    key_arn,
-                ))),
-                Some(state) if STATES_INVALID_FOR_DECRYPT.contains(&state) => {
-                    Some(EnvironmentKeyFault::InvalidState(durable_data_message(
-                        "is not in a valid state for Decrypt",
-                        key_arn,
-                    )))
-                }
-                Some(_) => None,
-            }
-        }
-        Err(failure) => match failure {
-            ::aws_sdk_kms::error::SdkError::ServiceError(answered) => {
-                match answered.into_err() {
-                    error if is_access_denied(&error) => {
-                        Some(EnvironmentKeyFault::AccessDenied(durable_data_message(
-                            "may not be used",
-                            key_arn,
-                        )))
-                    }
-                    // Every other answer about the key — including one about a key this
-                    // key service holds no record of — establishes nothing.
-                    _ => None,
-                }
-            }
-            _ => None,
-        },
+    // Boxed for the reason [`environment_key_fault`] states.
+    let answer = Box::pin(relayed_key_answer(callback, region, key_arn)).await?;
+    // Every other answer about the key — including one about a key this key service holds
+    // no record of — establishes nothing here.
+    if matches!(answer.class, FaultClass::NotFound) {
+        return None;
     }
+    // The refusal states Lambda's own sentence for the data it could not access and then
+    // RELAYS the key service's answer, with no envelope of one call's own around it: this is
+    // the error the control plane reports about the execution's data rather than one
+    // in-process call's result.
+    Some(key_fault(
+        answer.class,
+        report_message(durable_data_sentence(answer.class), &answer),
+    ))
 }
 
 /// Whether `error` is the key service saying this caller may not use the key.
@@ -635,5 +635,64 @@ mod tests {
             reported.ends_with(" KMS Exception: AccessDeniedException"),
             "case \"an answer with no sentence\": expected the class alone, got {reported:?}"
         );
+    }
+
+    /// A refusal of a read of a durable execution's DATA states Lambda's own sentence for
+    /// the class of failure the key service reported and then relays that service's answer:
+    /// the exception class it stated the refusal under and the sentence it stated about the
+    /// key. One row per class the reads of that data bind — including the two no key state
+    /// reachable through the key service's own operations puts a key in — and each row's
+    /// sentence is written out here rather than read from the implementation, so a wrong
+    /// constant there cannot make this pass.
+    #[test]
+    fn every_durable_data_refusal_states_the_access_it_could_not_perform() {
+        let key_arn = "arn:aws:kms:us-east-1:000000000000:key/a-key";
+        // (the class, the class the key service stated it under, what it said about the key,
+        //  Lambda's own sentence)
+        let rows: &[(FaultClass, &str, &str, &str)] = &[
+            (
+                FaultClass::Disabled,
+                KMS_DISABLED_CODE,
+                "is disabled.",
+                "Lambda was unable to access your execution data because the KMS key used is \
+                 disabled. Check the KMS key configured in the function's durable config.",
+            ),
+            (
+                FaultClass::InvalidState,
+                KMS_INVALID_STATE_CODE,
+                "is pending deletion.",
+                "Lambda was unable to access your execution data because the state of the \
+                 KMS key used is not valid for Decrypt. Check the KMS key configured in the \
+                 function's durable config.",
+            ),
+            (
+                FaultClass::NotFound,
+                "NotFoundException",
+                "was not found.",
+                "Lambda was unable to access your execution data because the KMS key was not \
+                 found. Check the KMS key configured in the function's durable config.",
+            ),
+            (
+                FaultClass::AccessDenied,
+                "AccessDeniedException",
+                "may not be used by this caller.",
+                "Lambda was unable to access your execution data because KMS access was \
+                 denied. Check the KMS key configured in the function's durable config.",
+            ),
+        ];
+        for (class, code, said, sentence) in rows {
+            let reason = format!("{key_arn} {said}");
+            let answered = RelayedKeyAnswer {
+                class: *class,
+                code: (*code).to_string(),
+                reason: Some(reason.clone()),
+            };
+            let message = report_message(durable_data_sentence(answered.class), &answered);
+            assert_eq!(
+                message,
+                format!("{sentence} KMS Exception: {code} KMS Message: {reason}"),
+                "case {class:?}: got {message:?}"
+            );
+        }
     }
 }
