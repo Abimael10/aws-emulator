@@ -22,6 +22,8 @@ mod user_pool;
 /// The resources a pool holds beside its users: hosted domains, replicas and app
 /// clients.
 mod pool_resources;
+/// The order a pool holds the OAuth scopes an app client may authorize in.
+mod scope_order;
 /// The cross-member preconditions a user-pool write has to satisfy before the
 /// pool is stored.
 mod pool_preconditions;
@@ -88,6 +90,7 @@ pub use pool_preconditions::*;
 pub use pool_resources::*;
 pub use refresh_token_jwe::*;
 pub use saml_signing_certificate::*;
+pub use scope_order::*;
 pub use sessions::*;
 pub use software_tokens::*;
 pub use token_validity::*;

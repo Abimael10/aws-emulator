@@ -377,7 +377,14 @@ fn update_cases() -> Vec<UpdateCase> {
             expected: overriding(vec![
                 ("AllowedOAuthFlowsUserPoolClient", json!(true)),
                 ("AllowedOAuthFlows", json!(["code", "implicit"])),
-                ("AllowedOAuthScopes", json!(["openid", "email"])),
+                // An app client's permitted scopes are a SET of scope text, so the
+                // update's own response states the order the pool holds that set in
+                // — the text's own order — rather than the sequence the request wrote
+                // (`scope_collection_order.rs`).
+                (
+                    "AllowedOAuthScopes",
+                    super::scope_collection_order::sorted_scopes_json(&["openid", "email"]),
+                ),
                 (
                     "CallbackURLs",
                     json!(["https://one.example.com/cb", "https://two.example.com/cb"]),

@@ -1178,7 +1178,9 @@ pub struct ResourceServer {
     pub identifier: String,
     pub name: String,
     /// The custom scopes of this resource server, in the order they were
-    /// submitted. A resource server created with no `Scopes` holds none.
+    /// submitted: an ordinary list member, which every read of the resource
+    /// server renders as the request that declared it sequenced it. A resource
+    /// server created with no `Scopes` holds none.
     pub scopes: Vec<ResourceServerScopeType>,
 }
 

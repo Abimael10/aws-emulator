@@ -522,7 +522,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             logout_urls: input.logout_ur_ls,
             default_redirect_uri: input.default_redirect_uri,
             allowed_oauth_flows: input.allowed_o_auth_flows,
-            allowed_oauth_scopes: input.allowed_o_auth_scopes,
+            // The scopes an app client may authorize are a SET of scope text, which
+            // the pool holds in that text's own order
+            // ([`crate::state::held_scopes`]) rather than as the sequence the request
+            // wrote, so every read of this app client states that one order.
+            allowed_oauth_scopes: input
+                .allowed_o_auth_scopes
+                .clone()
+                .map(crate::state::held_scopes),
             allowed_oauth_flows_user_pool_client: input.allowed_o_auth_flows_user_pool_client,
             analytics_configuration: input.analytics_configuration,
             prevent_user_existence_errors: crate::state::effective_prevent_user_existence_errors(
@@ -544,12 +551,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         pool.clients.insert(client_id.clone(), client);
 
-        // Rendered from the STORED client, so the response is what a later read sees.
-        let stored = pool
+        // Rendered from the STORED client, so the response is what a later read sees
+        // but for the one member this create answers its own way, below.
+        let mut stored = pool
             .clients
             .get(&client_id)
             .ok_or_else(internal_error)?
             .to_user_pool_client_type();
+        // The one member of that rendering this create answers its OWN way: this
+        // response is the app-client configuration the REQUEST carried, so the
+        // permitted scopes come back as the sequence it was handed, while the pool
+        // holds that SET in the scope text's own order and every later READ of the
+        // app client states the order it holds it in.
+        stored.allowed_o_auth_scopes = input.allowed_o_auth_scopes;
         Ok(CreateUserPoolClientOutput {
             user_pool_client: Some(stored),
         })

@@ -531,7 +531,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         client.logout_urls = input.logout_ur_ls;
         client.default_redirect_uri = input.default_redirect_uri;
         client.allowed_oauth_flows = input.allowed_o_auth_flows;
-        client.allowed_oauth_scopes = input.allowed_o_auth_scopes;
+        // The scopes an app client may authorize are a SET of scope text, which the
+        // pool holds in that text's own order ([`crate::state::held_scopes`]), the
+        // way the create path stores them, so this update replaces the set and the
+        // response — rendered from the stored client below — states the order the
+        // pool holds it in.
+        client.allowed_oauth_scopes = input.allowed_o_auth_scopes.map(crate::state::held_scopes);
         client.analytics_configuration = input.analytics_configuration;
         client.refresh_token_rotation = input.refresh_token_rotation;
 

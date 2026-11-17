@@ -529,7 +529,11 @@ async fn a_scope_the_pool_has_no_definition_of_is_refused_by_create_and_update()
             let read = described_client(&router, &user_pool_id, &client_id).await;
             assert_eq!(
                 read["AllowedOAuthScopes"],
-                json!(scopes),
+                // An app client's permitted scopes are a SET of scope text, so the
+                // read states the order the pool holds that set in — the text's own
+                // order — rather than the sequence the create carried
+                // (`scope_collection_order.rs`).
+                super::scope_collection_order::sorted_scopes_json(&scopes),
                 "case {case:?}: the stored client must carry the scopes the create set, got {read}"
             );
             assert_eq!(

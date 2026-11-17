@@ -505,7 +505,7 @@ async fn after_a_delete_the_deleted_servers_scopes_no_longer_authorize_a_client_
         .await;
     }
 
-    let allowed_scopes = json!(["https://orders.example.test/place", "urn:billing/invoice.read"]);
+    let allowed_scopes = ["https://orders.example.test/place", "urn:billing/invoice.read"];
     let client = ok(
         &router,
         "CreateUserPoolClient",
@@ -584,7 +584,10 @@ async fn after_a_delete_the_deleted_servers_scopes_no_longer_authorize_a_client_
     )
     .await;
     assert_eq!(
-        described["UserPoolClient"]["AllowedOAuthScopes"], allowed_scopes,
+        described["UserPoolClient"]["AllowedOAuthScopes"],
+        // The client's own configuration, stated in the order the pool holds its
+        // permitted scope SET in (`scope_collection_order.rs`).
+        super::scope_collection_order::sorted_scopes_json(&allowed_scopes),
         "a delete must not touch an app client's own configuration, got {described}"
     );
 }

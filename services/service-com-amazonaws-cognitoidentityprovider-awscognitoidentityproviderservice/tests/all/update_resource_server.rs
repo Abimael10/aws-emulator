@@ -412,18 +412,18 @@ async fn updating_a_resource_server_leaves_every_app_clients_allowed_oauth_scope
     for (label, requested_scopes) in [
         (
             "a client allowing both custom scopes",
-            json!([
+            vec![
                 format!("{identifier}/planets.read"),
                 format!("{identifier}/planets.write"),
-            ]),
+            ],
         ),
         (
             "a client allowing one custom scope beside a standard one",
-            json!(["openid", format!("{identifier}/planets.read")]),
+            vec!["openid".to_string(), format!("{identifier}/planets.read")],
         ),
         (
             "a client allowing only standard scopes",
-            json!(["openid", "email"]),
+            vec!["openid".to_string(), "email".to_string()],
         ),
     ] {
         let created = ok(
@@ -494,7 +494,10 @@ async fn updating_a_resource_server_leaves_every_app_clients_allowed_oauth_scope
             )
             .await;
             assert_eq!(
-                read["UserPoolClient"]["AllowedOAuthScopes"], *requested_scopes,
+                read["UserPoolClient"]["AllowedOAuthScopes"],
+                // The client's own configuration, stated in the order the pool holds
+                // its permitted scope SET in (`scope_collection_order.rs`).
+                super::scope_collection_order::sorted_scopes_json(requested_scopes),
                 "case {label:?} / {client_label:?}: a resource-server update must not change an app client's AllowedOAuthScopes, got {read}"
             );
         }

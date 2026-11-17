@@ -500,6 +500,9 @@ pub struct UserPoolClient {
     pub logout_urls: Option<Vec<String>>,
     pub default_redirect_uri: Option<String>,
     pub allowed_oauth_flows: Option<Vec<String>>,
+    /// The OAuth 2.0 scopes this app client may authorize, in the order the pool
+    /// HOLDS that set — the scope text's own order
+    /// ([`crate::state::held_scopes`]) rather than the sequence a request wrote.
     pub allowed_oauth_scopes: Option<Vec<String>>,
     pub allowed_oauth_flows_user_pool_client: bool,
     pub analytics_configuration: Option<AnalyticsConfigurationType>,

@@ -213,7 +213,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // A request that sets no `Scopes` creates a resource server
                     // with no custom scopes: an empty scope list, not an absent
                     // one.
-                    scopes: input.scopes.clone().unwrap_or_default(),
+                    scopes: input.scopes.unwrap_or_default(),
                 });
                 Ok(CreateResourceServerOutput {
                     resource_server: stored.to_resource_server_type(),
