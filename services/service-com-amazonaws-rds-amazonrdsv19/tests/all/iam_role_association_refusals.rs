@@ -28,6 +28,17 @@
 //!    `InvalidParameterValue` with ONE fixed sentence, whichever resource the request
 //!    addressed and whichever principal the policy names instead: the sentence carries no
 //!    part of the request at all.
+//! 6. A DB CLUSTER carries at most the published number of role associations ("IAM roles per
+//!    DB cluster"). Every association up to that bound is recorded and reported `ACTIVE`;
+//!    the one PAST it is the modelled `DBClusterRoleQuotaExceeded`, whose sentence names the
+//!    cluster and the maximum, and records nothing. The bound is on what the cluster holds
+//!    right now and is the cluster's own: a disassociation frees a slot, and another cluster
+//!    takes the very role the full one refused.
+//! 7. An association CHANGES the cluster's configuration, so a cluster that is not
+//!    `available` refuses it with the modelled `InvalidDBClusterStateFault` carrying the
+//!    sentence that names the STATUS the cluster is in and nothing of the request; the
+//!    refusal leaves the associations as they were, and the same call is taken once the
+//!    cluster is available.
 //!
 //! Every call goes over the wire against this service mounted beside the emulated IAM the
 //! trust decision resolves against, exactly as the assembled router mounts them, and every
@@ -36,7 +47,8 @@
 
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::db_instances::{call, expect_error, expect_ok, text, REGION};
+use crate::db_instances::{call, expect_error, expect_ok, subtrees, text, REGION};
+use crate::lifecycle_poll_loops::poll_until;
 use crate::rds_s3_integration::{
     associated_roles, available_cluster, available_instance_of, emulator, role,
 };
@@ -605,4 +617,430 @@ async fn a_role_rds_cannot_assume_is_refused_with_one_fixed_sentence() {
         reported.is_empty(),
         "expected no association on the cluster, got {reported:?}"
     );
+}
+
+/// How many IAM roles one DB cluster may have associated with it at once: the "IAM roles per
+/// DB cluster" quota Amazon RDS publishes (Quotas and constraints for Amazon RDS), which is
+/// what the modelled quota fault reports having reached. Stated here rather than read from
+/// the code under test, so the table pins the bound as well as the wording.
+const ROLES_PER_CLUSTER: usize = 5;
+
+/// The engine the clusters of rules 6 and 7 run. Aurora PostgreSQL publishes the most
+/// `SupportedFeatureNames` of any engine in the catalogue — `Bedrock`, `Comprehend`,
+/// `Lambda`, `SageMaker`, `s3Export`, `s3Import`, the list
+/// `DBEngineVersion$SupportedFeatureNames` reports for it through
+/// `DescribeDBEngineVersions` — so a table of DISTINCT feature names fits inside the quota.
+const QUOTA_ENGINE: &str = "aurora-postgresql";
+
+/// The status an association needs the cluster to be in.
+const CLUSTER_AVAILABLE: &str = "available";
+
+/// `CreateDBCluster` for one identifier, of the engine the rows below run.
+async fn create_cluster(router: &MultiServiceRouter, identifier: &str) -> (u16, String) {
+    call(
+        router,
+        "CreateDBCluster",
+        &params(&[
+            ("DBClusterIdentifier", identifier),
+            ("Engine", QUOTA_ENGINE),
+        ]),
+    )
+    .await
+}
+
+/// The one `<DBCluster>` subtree a report carries for `identifier`.
+fn the_cluster(case: &str, body: &str) -> String {
+    let reported = subtrees(body, "DBCluster");
+    assert_eq!(
+        reported.len(),
+        1,
+        "case {case:?}: exactly one DBCluster must be reported, got {body}"
+    );
+    reported.into_iter().next().expect("checked just above")
+}
+
+/// Poll `DescribeDBClusters` until the cluster reports `status`: the CONDITION the rows below
+/// wait for, through a REPORTING call and nothing else, rather than for a fixed span.
+async fn poll_cluster_until(
+    router: &MultiServiceRouter,
+    case: &str,
+    identifier: &str,
+    status: &str,
+) {
+    let described = params(&[("DBClusterIdentifier", identifier)]);
+    poll_until(
+        case,
+        &format!("the DB cluster {identifier} reaching {status}"),
+        || call(router, "DescribeDBClusters", &described),
+        |http_status, body| {
+            http_status == 200 && text(&the_cluster(case, body), "Status") == status
+        },
+    )
+    .await;
+}
+
+/// Create a DB cluster and poll until it reports `available`, which is the status an
+/// association needs.
+async fn polled_available_cluster(router: &MultiServiceRouter, identifier: &str) {
+    expect_ok(identifier, create_cluster(router, identifier).await);
+    poll_cluster_until(router, identifier, identifier, CLUSTER_AVAILABLE).await;
+}
+
+/// The `Status` a cluster reports.
+async fn cluster_status(router: &MultiServiceRouter, case: &str, identifier: &str) -> String {
+    let described = expect_ok(
+        case,
+        call(
+            router,
+            "DescribeDBClusters",
+            &params(&[("DBClusterIdentifier", identifier)]),
+        )
+        .await,
+    );
+    text(&the_cluster(case, &described), "Status")
+}
+
+/// `AddRoleToDBCluster` / `RemoveRoleFromDBCluster` for one (cluster, role, feature), with
+/// `FeatureName` left OUT of the request where the row names none — the member is optional
+/// on both cluster-side operations.
+async fn cluster_role_call(
+    router: &MultiServiceRouter,
+    action: &str,
+    identifier: &str,
+    role_arn: &str,
+    feature: Option<&str>,
+) -> (u16, String) {
+    let mut request = params(&[
+        ("DBClusterIdentifier", identifier),
+        ("RoleArn", role_arn),
+    ]);
+    if let Some(feature) = feature {
+        request.push(("FeatureName", feature.to_string()));
+    }
+    call(router, action, &request).await
+}
+
+/// One row of the quota table: the role an association names and the feature it names it for.
+struct QuotaRow {
+    case: &'static str,
+    /// Whether the `RoleArn` names a role this emulator's IAM HOLDS, created trusting
+    /// `rds.amazonaws.com`. An association does not require the role to exist — only a role
+    /// IAM holds whose trust policy excludes Amazon RDS is refused (rule 5) — so both sides
+    /// of that are rows, and both count against the quota.
+    held_by_iam: bool,
+    /// The role NAME, which the created role and the un-held ARN alike carry.
+    name: &'static str,
+    /// The `FeatureName` the association names, or `None` for the cluster-wide association
+    /// that names no feature.
+    feature: Option<&'static str>,
+}
+
+/// The quota table: [`ROLES_PER_CLUSTER`] associations that FIT, then one PAST the bound.
+///
+/// The rows differ along what the rule generalises over — a role IAM holds and an ARN it
+/// holds nothing under, four of the engine's published feature names and an association that
+/// names none — because the quota counts the associations a cluster holds whatever they name.
+const QUOTA_ROWS: &[QuotaRow] = &[
+    QuotaRow {
+        case: "a role IAM holds, for the Bedrock feature",
+        held_by_iam: true,
+        name: "emu-quota-bedrock",
+        feature: Some("Bedrock"),
+    },
+    QuotaRow {
+        case: "a role IAM holds, associated with the cluster itself",
+        held_by_iam: true,
+        name: "emu-quota-cluster-wide",
+        feature: None,
+    },
+    QuotaRow {
+        case: "an ARN IAM holds nothing under, for the S3 import feature",
+        held_by_iam: false,
+        name: "emu-quota-absent-import",
+        feature: Some("s3Import"),
+    },
+    QuotaRow {
+        case: "an ARN IAM holds nothing under, for the S3 export feature",
+        held_by_iam: false,
+        name: "emu-quota-absent-export",
+        feature: Some("s3Export"),
+    },
+    QuotaRow {
+        case: "a role IAM holds, for the SageMaker feature",
+        held_by_iam: true,
+        name: "emu-quota-sagemaker",
+        feature: Some("SageMaker"),
+    },
+    QuotaRow {
+        case: "one association past the published quota, for the Comprehend feature",
+        held_by_iam: true,
+        name: "emu-quota-comprehend",
+        feature: Some("Comprehend"),
+    },
+];
+
+/// The `RoleArn` each quota row names, creating the role in IAM where the row says the value
+/// names a role IAM holds.
+async fn quota_role_arns(router: &MultiServiceRouter) -> Vec<String> {
+    let mut arns = Vec::with_capacity(QUOTA_ROWS.len());
+    for row in QUOTA_ROWS {
+        let arn = if row.held_by_iam {
+            role(router, row.name, "rds.amazonaws.com", None).await
+        } else {
+            format!("arn:aws:iam::{ACCOUNT}:role/{}", row.name)
+        };
+        arns.push(arn);
+    }
+    arns
+}
+
+/// Rule 6: a DB cluster takes the published number of role associations and refuses the one
+/// past it with the modelled quota fault, whose sentence names the cluster and the maximum.
+#[tokio::test]
+async fn a_db_cluster_takes_the_published_number_of_role_associations() {
+    assert_eq!(
+        QUOTA_ROWS.len(),
+        ROLES_PER_CLUSTER + 1,
+        "the table must fill the quota and then name one association past it, got {} row(s)",
+        QUOTA_ROWS.len()
+    );
+    let (router, _engine) = emulator();
+    // Both clusters are created before either is waited for, so the spans they owe run
+    // together; the second one is what shows the quota is the CLUSTER's own.
+    let full = "emu-cluster-role-quota";
+    let other = "emu-cluster-role-quota-second";
+    expect_ok(full, create_cluster(&router, full).await);
+    expect_ok(other, create_cluster(&router, other).await);
+    poll_cluster_until(&router, full, full, CLUSTER_AVAILABLE).await;
+    poll_cluster_until(&router, other, other, CLUSTER_AVAILABLE).await;
+    let arns = quota_role_arns(&router).await;
+
+    // Every association up to the published bound is taken and reported ACTIVE, the last of
+    // them AT the bound.
+    for (index, row) in QUOTA_ROWS.iter().take(ROLES_PER_CLUSTER).enumerate() {
+        expect_ok(
+            row.case,
+            cluster_role_call(&router, "AddRoleToDBCluster", full, &arns[index], row.feature).await,
+        );
+        let reported = cluster_roles(&router, row.case, full).await;
+        assert_eq!(
+            reported.len(),
+            index + 1,
+            "case {:?}: expected {} association(s) after the add, got {reported:?}",
+            row.case,
+            index + 1
+        );
+        let expected = (
+            arns[index].clone(),
+            row.feature.unwrap_or("").to_string(),
+            "ACTIVE".to_string(),
+        );
+        assert!(
+            reported.contains(&expected),
+            "case {:?}: expected the association {expected:?} to be reported, got {reported:?}",
+            row.case
+        );
+    }
+
+    // One past the bound: the modelled quota fault, naming the cluster and the maximum.
+    let past = &QUOTA_ROWS[ROLES_PER_CLUSTER];
+    let past_arn = &arns[ROLES_PER_CLUSTER];
+    let body = expect_error(
+        past.case,
+        cluster_role_call(&router, "AddRoleToDBCluster", full, past_arn, past.feature).await,
+        400,
+        "DBClusterRoleQuotaExceeded",
+    );
+    expect_message(
+        past.case,
+        &body,
+        &format!(
+            "The DB cluster {full} already has {ROLES_PER_CLUSTER} IAM roles associated with \
+             it, which is the maximum."
+        ),
+    );
+
+    // The refusal recorded nothing: the cluster still reports exactly the associations it
+    // held, and the role it refused is none of them.
+    let after = cluster_roles(&router, past.case, full).await;
+    assert_eq!(
+        after.len(),
+        ROLES_PER_CLUSTER,
+        "case {:?}: expected the refused association to record nothing, got {after:?}",
+        past.case
+    );
+    assert!(
+        !after.iter().any(|(arn, _, _)| arn == past_arn),
+        "case {:?}: the refused role {past_arn:?} must not be reported, got {after:?}",
+        past.case
+    );
+
+    // The bound is on what the cluster holds RIGHT NOW: dropping one association frees the
+    // slot, and the very role the quota refused is then taken.
+    let freed = &QUOTA_ROWS[2];
+    expect_ok(
+        freed.case,
+        cluster_role_call(
+            &router,
+            "RemoveRoleFromDBCluster",
+            full,
+            &arns[2],
+            freed.feature,
+        )
+        .await,
+    );
+    let remaining = cluster_roles(&router, freed.case, full).await;
+    assert_eq!(
+        remaining.len(),
+        ROLES_PER_CLUSTER - 1,
+        "case {:?}: expected the disassociation to free a slot, got {remaining:?}",
+        freed.case
+    );
+    expect_ok(
+        past.case,
+        cluster_role_call(&router, "AddRoleToDBCluster", full, past_arn, past.feature).await,
+    );
+    let refilled = cluster_roles(&router, past.case, full).await;
+    assert_eq!(
+        refilled.len(),
+        ROLES_PER_CLUSTER,
+        "case {:?}: expected the freed slot to be filled, got {refilled:?}",
+        past.case
+    );
+    assert!(
+        refilled.iter().any(|(arn, _, _)| arn == past_arn),
+        "case {:?}: expected the role {past_arn:?} to be reported now a slot is free, got \
+         {refilled:?}",
+        past.case
+    );
+
+    // And the quota is the CLUSTER's own: another cluster takes a role the full one is
+    // already at its maximum with, and the full cluster is untouched by it.
+    let second_case = "another cluster while the first one is full";
+    expect_ok(
+        second_case,
+        cluster_role_call(
+            &router,
+            "AddRoleToDBCluster",
+            other,
+            &arns[0],
+            QUOTA_ROWS[0].feature,
+        )
+        .await,
+    );
+    let second_roles = cluster_roles(&router, second_case, other).await;
+    assert_eq!(
+        second_roles.len(),
+        1,
+        "case {second_case:?}: expected the second cluster to report its one association, got \
+         {second_roles:?}"
+    );
+    let unchanged = cluster_roles(&router, second_case, full).await;
+    assert_eq!(
+        unchanged, refilled,
+        "case {second_case:?}: expected the first cluster's associations to be untouched, got \
+         {unchanged:?}"
+    );
+}
+
+/// Assert one state refusal: the modelled fault, the sentence that names the STATUS and
+/// nothing of the request, and that the cluster's associations are left as they were.
+async fn expect_state_refusal(
+    router: &MultiServiceRouter,
+    case: &str,
+    identifier: &str,
+    role_arn: &str,
+    status: &str,
+    held: &[(String, String, String)],
+) {
+    // The refused call is made FIRST, with nothing read in between, because the status a
+    // cluster is in while the clock still owes it a transition is the status of a MOMENT.
+    let body = expect_error(
+        case,
+        cluster_role_call(
+            router,
+            "AddRoleToDBCluster",
+            identifier,
+            role_arn,
+            Some("Lambda"),
+        )
+        .await,
+        400,
+        "InvalidDBClusterStateFault",
+    );
+    expect_message(
+        case,
+        &body,
+        &format!("DB cluster isn't available for modification with status {status}."),
+    );
+    let message = text(&body, "Message");
+    assert!(
+        !message.contains(identifier) && !message.contains(role_arn),
+        "case {case:?}: the refusal must name neither the cluster nor the role, got {message:?}"
+    );
+    let after = cluster_roles(router, case, identifier).await;
+    assert_eq!(
+        after, held,
+        "case {case:?}: expected the refused association to record nothing, got {after:?}"
+    );
+}
+
+/// Rule 7: a cluster that is not `available` refuses an association with the modelled state
+/// fault naming its status, records nothing, and takes the same call once it is available.
+#[tokio::test]
+async fn an_association_is_refused_while_the_cluster_is_not_available() {
+    let (router, _engine) = emulator();
+    let role_arn = role(&router, "emu-cluster-state-role", "rds.amazonaws.com", None).await;
+
+    // A status the clock still owes a transition out of: the association arrives inside the
+    // span `CreateDBCluster` owes, so the cluster is still coming up.
+    let coming_up = "emu-cluster-state-creating";
+    expect_ok(coming_up, create_cluster(&router, coming_up).await);
+    let status = cluster_status(&router, coming_up, coming_up).await;
+    assert_ne!(
+        status, CLUSTER_AVAILABLE,
+        "case {coming_up:?}: the cluster must still be coming up when the association arrives"
+    );
+    expect_state_refusal(&router, coming_up, coming_up, &role_arn, &status, &[]).await;
+
+    // The refusal was about the STATE: once the clock has settled the cluster, the very same
+    // call is taken and the association is reported.
+    poll_cluster_until(&router, coming_up, coming_up, CLUSTER_AVAILABLE).await;
+    expect_ok(
+        coming_up,
+        cluster_role_call(
+            &router,
+            "AddRoleToDBCluster",
+            coming_up,
+            &role_arn,
+            Some("Lambda"),
+        )
+        .await,
+    );
+    let reported = cluster_roles(&router, coming_up, coming_up).await;
+    assert_eq!(
+        reported,
+        vec![(
+            role_arn.clone(),
+            "Lambda".to_string(),
+            "ACTIVE".to_string()
+        )],
+        "case {coming_up:?}: expected the association to be recorded once the cluster is \
+         available, got {reported:?}"
+    );
+
+    // And a SETTLED status that is not `available`: a cluster whose stop has finished.
+    let stopped = "emu-cluster-state-stopped";
+    polled_available_cluster(&router, stopped).await;
+    expect_ok(
+        stopped,
+        call(
+            &router,
+            "StopDBCluster",
+            &params(&[("DBClusterIdentifier", stopped)]),
+        )
+        .await,
+    );
+    poll_cluster_until(&router, stopped, stopped, "stopped").await;
+    expect_state_refusal(&router, stopped, stopped, &role_arn, "stopped", &[]).await;
 }
