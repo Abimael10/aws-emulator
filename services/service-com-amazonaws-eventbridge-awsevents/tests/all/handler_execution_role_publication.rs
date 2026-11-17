@@ -26,33 +26,40 @@
 //! policies say when it calls — a grant of the action over every resource, and no grant at all
 //! beyond the AWS-managed policy a Lambda execution role is created with. Each asserts both
 //! halves: what the handler read back, and what the bus did with the event.
+//!
+//! This module also OWNS the harness every suite of this crate that runs a handler's own SDK
+//! call shares — [`Emulator`], [`package`], [`form_encode`], the ARN helpers and the handler
+//! source itself — the way `target_dispatch` owns the one its own siblings share, so a second
+//! suite states only the inputs it varies. `handler_publication_bus_resource_scope` is that
+//! second suite: it drives the same harness over the forms a grant's `Resource` element takes.
 
 use std::io::Write as _;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use serde_json::{json, Value};
-use service_com_amazonaws_lambda_awsgirapiservice::state::ACTIVATION_DELAY;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The Region every request below is signed for.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
-/// Where `CreateFunction` is bound.
-const FUNCTIONS_URI: &str = "/2015-03-31/functions";
+/// Where `CreateFunction`, the configuration read and `Invoke` are bound.
+pub(crate) const FUNCTIONS_URI: &str = "/2015-03-31/functions";
 
-/// The module and attribute the package below carries its handler as.
-const HANDLER: &str = "lambda_function.lambda_handler";
+/// The module and attribute a package built here carries its handler as.
+pub(crate) const HANDLER: &str = "lambda_function.lambda_handler";
 
-/// How long past a due instant this suite waits before calling. The transition is owed by the
-/// CLOCK, so nothing here sleeps on the emulator's behalf.
-const SLACK: Duration = Duration::from_millis(150);
+/// How long a state the CLOCK owes — a function reaching `Active` — is waited for before
+/// giving up, and how long to wait between looks. The condition is POLLED until it holds, so
+/// nothing sleeps for a fixed span and no outcome depends on how fast the host runs.
+pub(crate) const BUDGET: Duration = Duration::from_secs(60);
+pub(crate) const LOOK_AGAIN: Duration = Duration::from_millis(50);
 
 /// The access-key id standing for the account's own published credential: neither the token
 /// service nor IAM holds a record of it, so it resolves to the account's ambient identity,
 /// which is what every request this suite makes on its own behalf presents.
-const ACCOUNT_KEY: &str = "AKIDEMULATOR";
+pub(crate) const ACCOUNT_KEY: &str = "AKIDEMULATOR";
 
 /// The execution role the function runs as, and the function's own name — the session a
 /// handler's calls are made under is named for both.
@@ -64,7 +71,7 @@ const INLINE_POLICY: &str = "inline";
 
 /// The AWS-managed policy a Lambda execution role is created with: it grants the log writes a
 /// function makes and nothing else, so a role carrying only it has no grant on this service.
-const BASIC_EXECUTION_POLICY: &str =
+pub(crate) const BASIC_EXECUTION_POLICY: &str =
     "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole";
 
 /// The rule that carries this suite's control queue, its target id, and the queue's name.
@@ -78,25 +85,25 @@ const DETAIL_TYPE: &str = "Handler Published";
 
 /// The action a publication onto a bus performs, as a statement names it and as a refusal
 /// reports it.
-const PUT_EVENTS_ACTION: &str = "events:PutEvents";
+pub(crate) const PUT_EVENTS_ACTION: &str = "events:PutEvents";
 
 /// The code EventBridge refuses an unauthorized publication with.
-const ACCESS_DENIED: &str = "AccessDeniedException";
+pub(crate) const ACCESS_DENIED: &str = "AccessDeniedException";
 
 /// The service principal EventBridge delivers to a queue as, which the queue's own policy has
 /// to grant: "for Lambda functions, Amazon SNS topics and Amazon SQS queues, EventBridge
 /// relies on resource-based policies" (`PutTargets`).
-const EVENTS_PRINCIPAL: &str = "events.amazonaws.com";
+pub(crate) const EVENTS_PRINCIPAL: &str = "events.amazonaws.com";
 
 /// EventBridge, Lambda, Amazon SQS, IAM and the token service over ONE shared engine, as
 /// `core/router/src/lib.rs` mounts them: the handler's SDK call is dispatched back into this
 /// same router, so the bus it publishes onto is the bus this suite put a rule on.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // The suite signs nothing: the `Authorization` header carries only the credential
@@ -176,19 +183,19 @@ impl Emulator {
     }
 
     /// One EventBridge call that must be served (`awsJson1_1`, `AWSEvents.<Operation>`).
-    async fn events(&self, case: &str, operation: &str, body: &Value) -> Value {
+    pub(crate) async fn events(&self, case: &str, operation: &str, body: &Value) -> Value {
         self.rpc(case, "events", "AWSEvents", "1.1", operation, body)
             .await
     }
 
     /// One Amazon SQS call that must be served (`awsJson1_0`, `AmazonSQS.<Operation>`).
-    async fn sqs(&self, case: &str, operation: &str, body: &Value) -> Value {
+    pub(crate) async fn sqs(&self, case: &str, operation: &str, body: &Value) -> Value {
         self.rpc(case, "sqs", "AmazonSQS", "1.0", operation, body)
             .await
     }
 
     /// One awsQuery call to IAM, as the account's own credential, which must be served.
-    async fn iam(&self, case: &str, action: &str, params: &[(&str, String)]) {
+    pub(crate) async fn iam(&self, case: &str, action: &str, params: &[(&str, String)]) {
         let mut body = format!("Action={action}&Version=2010-05-08");
         for (name, value) in params {
             body.push('&');
@@ -213,7 +220,12 @@ impl Emulator {
     }
 
     /// One Lambda `restJson1` call, as its status, headers and parsed body.
-    async fn lambda(&self, method: &str, uri: &str, body: &[u8]) -> (u16, http::HeaderMap, Value) {
+    pub(crate) async fn lambda(
+        &self,
+        method: &str,
+        uri: &str,
+        body: &[u8],
+    ) -> (u16, http::HeaderMap, Value) {
         let request = http::Request::builder()
             .method(method)
             .uri(uri)
@@ -233,10 +245,10 @@ impl Emulator {
         (parts.status.as_u16(), parts.headers, parsed)
     }
 
-    /// Create the execution role, trusted by Lambda and carrying the AWS-managed policy a
-    /// Lambda execution role is created with — written with IAM's own operations, so the role
-    /// a session is minted of is the record `iam:CreateRole` wrote.
-    async fn execution_role(&self, case: &str) -> String {
+    /// Create the execution role `role_name`, trusted by Lambda and carrying the AWS-managed
+    /// policy a Lambda execution role is created with — written with IAM's own operations, so
+    /// the role a session is minted of is the record `iam:CreateRole` wrote. Answers its ARN.
+    pub(crate) async fn execution_role(&self, case: &str, role_name: &str) -> String {
         let trust = json!({
             "Version": "2012-10-17",
             "Statement": [{
@@ -250,7 +262,7 @@ impl Emulator {
             case,
             "CreateRole",
             &[
-                ("RoleName", ROLE_NAME.to_string()),
+                ("RoleName", role_name.to_string()),
                 ("AssumeRolePolicyDocument", trust),
             ],
         )
@@ -259,26 +271,33 @@ impl Emulator {
             case,
             "AttachRolePolicy",
             &[
-                ("RoleName", ROLE_NAME.to_string()),
+                ("RoleName", role_name.to_string()),
                 ("PolicyArn", BASIC_EXECUTION_POLICY.to_string()),
             ],
         )
         .await;
-        role_arn()
+        role_arn(role_name)
     }
 
-    /// The inline identity policy in force on the execution role from now on: `document`, or
-    /// none at all — which is what makes the second invocation about the grant in force when
-    /// the handler calls, rather than about the one in force when its credential was minted.
-    async fn role_policy(&self, case: &str, document: Option<&str>) {
+    /// The inline identity policy `policy_name` in force on the role `role_name` from now on:
+    /// `document`, or none at all — which is what makes a later invocation about the grant in
+    /// force when the handler CALLS, rather than the one in force when its credential was
+    /// minted.
+    pub(crate) async fn role_policy(
+        &self,
+        case: &str,
+        role_name: &str,
+        policy_name: &str,
+        document: Option<&str>,
+    ) {
         match document {
             Some(document) => {
                 self.iam(
                     case,
                     "PutRolePolicy",
                     &[
-                        ("RoleName", ROLE_NAME.to_string()),
-                        ("PolicyName", INLINE_POLICY.to_string()),
+                        ("RoleName", role_name.to_string()),
+                        ("PolicyName", policy_name.to_string()),
                         ("PolicyDocument", document.to_string()),
                     ],
                 )
@@ -289,8 +308,8 @@ impl Emulator {
                     case,
                     "DeleteRolePolicy",
                     &[
-                        ("RoleName", ROLE_NAME.to_string()),
-                        ("PolicyName", INLINE_POLICY.to_string()),
+                        ("RoleName", role_name.to_string()),
+                        ("PolicyName", policy_name.to_string()),
                     ],
                 )
                 .await;
@@ -298,21 +317,23 @@ impl Emulator {
         }
     }
 
-    /// Create the function, running as `role_arn`, and wait out the provisioning window.
-    async fn function(&self, case: &str, role_arn: &str) {
+    /// Create the function `name`, running as `role_arn` with `source` as its handler, and look
+    /// again until Lambda reports it `Active` — the provisioning window is owed by the CLOCK, so
+    /// nothing here sleeps on the emulator's behalf.
+    pub(crate) async fn function(&self, case: &str, name: &str, role_arn: &str, source: &str) {
         let (status, _headers, created) = self
             .lambda(
                 "POST",
                 FUNCTIONS_URI,
                 &serde_json::to_vec(&json!({
-                    "FunctionName": FUNCTION_NAME,
+                    "FunctionName": name,
                     "Role": role_arn,
                     "Runtime": "python3.12",
                     "Handler": HANDLER,
                     "Timeout": 30,
                     "Code": {
                         "ZipFile": base64::engine::general_purpose::STANDARD
-                            .encode(package(PUBLISHER_SOURCE)),
+                            .encode(package(source)),
                     },
                 }))
                 .expect("the create body serializes"),
@@ -322,21 +343,34 @@ impl Emulator {
             status, 201,
             "case {case:?}: expected HTTP 201 from CreateFunction, got {status} ({created})"
         );
-        tokio::time::sleep(ACTIVATION_DELAY + SLACK).await;
+        let deadline = Instant::now() + BUDGET;
+        loop {
+            let (_, _, configuration) = self
+                .lambda("GET", &format!("{FUNCTIONS_URI}/{name}/configuration"), &[])
+                .await;
+            if configuration["State"].as_str() == Some("Active") {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "case {case:?}: Lambda never reported {name:?} Active, last read {configuration}"
+            );
+            tokio::time::sleep(LOOK_AGAIN).await;
+        }
     }
 
-    /// `Invoke` the function synchronously, publishing one event carrying `marker`; answers the
+    /// `Invoke` the function `name` synchronously with `event` as its payload; answers the
     /// `FunctionError` signal the invocation carried, if any, and what the handler returned.
-    async fn invoke(&self, case: &str, marker: &str) -> (Option<String>, Value) {
-        let event = json!({
-            "source": SOURCE,
-            "detail_type": DETAIL_TYPE,
-            "detail": {"marker": marker},
-        });
+    pub(crate) async fn invoke(
+        &self,
+        case: &str,
+        name: &str,
+        event: &Value,
+    ) -> (Option<String>, Value) {
         let (status, headers, payload) = self
             .lambda(
                 "POST",
-                &format!("{FUNCTIONS_URI}/{FUNCTION_NAME}/invocations"),
+                &format!("{FUNCTIONS_URI}/{name}/invocations"),
                 event.to_string().as_bytes(),
             )
             .await;
@@ -351,11 +385,11 @@ impl Emulator {
         (signal, payload)
     }
 
-    /// The queue the rule targets, carrying the policy EventBridge's delivery needs, and the
-    /// rule that watches the default bus for the handler's own event; answers the queue's url.
-    async fn control_queue(&self, case: &str) -> String {
+    /// A queue named `queue_name` carrying the resource policy an EventBridge delivery to it
+    /// needs; answers its url and its ARN.
+    pub(crate) async fn events_queue(&self, case: &str, queue_name: &str) -> (String, String) {
         let created = self
-            .sqs(case, "CreateQueue", &json!({ "QueueName": QUEUE }))
+            .sqs(case, "CreateQueue", &json!({ "QueueName": queue_name }))
             .await;
         let url = created["QueueUrl"]
             .as_str()
@@ -389,6 +423,13 @@ impl Emulator {
             &json!({ "QueueUrl": url, "Attributes": { "Policy": policy } }),
         )
         .await;
+        (url, arn)
+    }
+
+    /// The queue the rule targets, carrying the policy EventBridge's delivery needs, and the
+    /// rule that watches the default bus for the handler's own event; answers the queue's url.
+    async fn control_queue(&self, case: &str) -> String {
+        let (url, arn) = self.events_queue(case, QUEUE).await;
         // The rule that carries the queue: it matches exactly the event the handler
         // publishes, so a message on the queue is that event and nothing else.
         let pattern = json!({ "source": [SOURCE], "detail-type": [DETAIL_TYPE] }).to_string();
@@ -416,8 +457,14 @@ impl Emulator {
         url
     }
 
-    /// The `detail.marker` of every message waiting on the queue at `url`, taken off it.
-    async fn drained_markers(&self, case: &str, url: &str) -> Vec<String> {
+    /// The `detail.marker` of every message waiting on the queue at `url`, taken off it and
+    /// sorted; every message is asserted to carry `source`, so nothing else is counted.
+    pub(crate) async fn drained_markers(
+        &self,
+        case: &str,
+        url: &str,
+        source: &str,
+    ) -> Vec<String> {
         let received = self
             .sqs(
                 case,
@@ -433,7 +480,7 @@ impl Emulator {
                 let body: Value = serde_json::from_str(text).unwrap_or(Value::Null);
                 assert_eq!(
                     body["source"].as_str().unwrap_or_default(),
-                    SOURCE,
+                    source,
                     "case {case:?}: expected the handler's own source on the queue, got {body}"
                 );
                 body["detail"]["marker"]
@@ -447,34 +494,43 @@ impl Emulator {
     }
 }
 
-/// The ARN of the execution role, as IAM holds it.
-fn role_arn() -> String {
+/// The ARN of the execution role `role_name`, as IAM holds it.
+pub(crate) fn role_arn(role_name: &str) -> String {
     format!(
-        "arn:aws:iam::{}:role/{ROLE_NAME}",
+        "arn:aws:iam::{}:role/{role_name}",
         engine::emulator_account_id()
     )
 }
 
-/// The assumed-role session ARN a call made by an invocation of the function speaks for: the
-/// session a function's calls are made under is named for the FUNCTION.
-fn session_arn() -> String {
+/// The assumed-role session ARN a call made by an invocation of `function_name` running as
+/// `role_name` speaks for: the session a function's calls are made under is named for the
+/// FUNCTION.
+pub(crate) fn session_arn(role_name: &str, function_name: &str) -> String {
     format!(
-        "arn:aws:sts::{}:assumed-role/{ROLE_NAME}/{FUNCTION_NAME}",
+        "arn:aws:sts::{}:assumed-role/{role_name}/{function_name}",
         engine::emulator_account_id()
     )
 }
 
-/// The ARN of the default event bus in the Region every call here is signed for — the bus an
-/// entry naming none is published onto, and the resource the publication is authorized on.
-fn default_bus_arn() -> String {
+/// The ARN of the event bus `name` in the Region every call here is signed for — the resource
+/// a publication onto it is authorized on.
+pub(crate) fn bus_arn(name: &str) -> String {
     format!(
-        "arn:aws:events:{REGION}:{}:event-bus/default",
+        "arn:aws:events:{REGION}:{}:event-bus/{name}",
         engine::emulator_account_id()
+    )
+}
+
+/// The sentence AWS refuses a call with when no identity-based policy in force allows it.
+pub(crate) fn implicit_deny_message(principal: &str, action: &str, resource: &str) -> String {
+    format!(
+        "User: {principal} is not authorized to perform: {action} on resource: {resource} \
+         because no identity-based policy allows the {action} action"
     )
 }
 
 /// `application/x-www-form-urlencoded` for one awsQuery parameter value.
-fn form_encode(value: &str) -> String {
+pub(crate) fn form_encode(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
         match byte {
@@ -489,7 +545,7 @@ fn form_encode(value: &str) -> String {
 
 /// A .zip deployment package holding `source` as `lambda_function.py`, written in memory the
 /// way a caller uploads one.
-fn package(source: &str) -> Vec<u8> {
+pub(crate) fn package(source: &str) -> Vec<u8> {
     let mut buffer = std::io::Cursor::new(Vec::new());
     {
         let mut writer = zip::ZipWriter::new(&mut buffer);
@@ -505,10 +561,12 @@ fn package(source: &str) -> Vec<u8> {
     buffer.into_inner()
 }
 
-/// The handler this suite runs: it publishes the event it was given and reports what the call
-/// answered, catching the service's refusal itself — so the invocation is a 200 with no
-/// `FunctionError` whichever way the call went, and its payload IS what the SDK gave the guest.
-const PUBLISHER_SOURCE: &str = r#"
+/// The handler these suites run: it publishes the event it was given — onto the bus the event
+/// names, or onto the default bus when it names none, which is what an entry carrying no
+/// `EventBusName` is published onto — and reports what the call answered, catching the
+/// service's refusal itself. So the invocation is a 200 with no `FunctionError` whichever way
+/// the call went, and its payload IS what the SDK gave the guest.
+pub(crate) const PUBLISHER_SOURCE: &str = r#"
 import json
 
 import boto3
@@ -522,6 +580,8 @@ def lambda_handler(event, context):
         "DetailType": event["detail_type"],
         "Detail": json.dumps(event["detail"]),
     }
+    if event.get("bus"):
+        entry["EventBusName"] = event["bus"]
     try:
         answered = client.put_events(Entries=[entry])
     except botocore.exceptions.ClientError as error:
@@ -533,6 +593,16 @@ def lambda_handler(event, context):
     return {"ok": True, "failed_count": answered.get("FailedEntryCount", 0)}
 "#;
 
+/// The payload this suite invokes the handler with: one event carrying `marker`, published onto
+/// the default bus because it names no bus.
+fn publication_event(marker: &str) -> Value {
+    json!({
+        "source": SOURCE,
+        "detail_type": DETAIL_TYPE,
+        "detail": {"marker": marker},
+    })
+}
+
 /// RULE: the call a RUNNING handler makes with the SDK its runtime supplies is signed as a
 /// session of the function's execution role, so this service judges the publication against
 /// the policies in force on that role — serving it where they grant the action and refusing it
@@ -541,9 +611,11 @@ def lambda_handler(event, context):
 #[tokio::test]
 async fn a_running_handlers_publication_is_judged_against_its_execution_roles_policies() {
     let emulator = Emulator::new();
-    let role = emulator.execution_role("setup").await;
+    let role = emulator.execution_role("setup", ROLE_NAME).await;
     let queue = emulator.control_queue("setup").await;
-    emulator.function("setup", &role).await;
+    emulator
+        .function("setup", FUNCTION_NAME, &role, PUBLISHER_SOURCE)
+        .await;
 
     // The role's own policy grants the publication: the handler's call is served, and the
     // event reaches the rule's queue.
@@ -551,6 +623,8 @@ async fn a_running_handlers_publication_is_judged_against_its_execution_roles_po
     emulator
         .role_policy(
             granted,
+            ROLE_NAME,
+            INLINE_POLICY,
             Some(
                 &json!({
                     "Version": "2012-10-17",
@@ -564,7 +638,9 @@ async fn a_running_handlers_publication_is_judged_against_its_execution_roles_po
             ),
         )
         .await;
-    let (signal, payload) = emulator.invoke(granted, "marker-granted").await;
+    let (signal, payload) = emulator
+        .invoke(granted, FUNCTION_NAME, &publication_event("marker-granted"))
+        .await;
     assert_eq!(
         signal, None,
         "case {granted:?}: expected no FunctionError, got {signal:?} with {payload}"
@@ -575,7 +651,7 @@ async fn a_running_handlers_publication_is_judged_against_its_execution_roles_po
         "case {granted:?}: expected the handler's own report of a served publication, got \
          {payload}"
     );
-    let delivered = emulator.drained_markers(granted, &queue).await;
+    let delivered = emulator.drained_markers(granted, &queue, SOURCE).await;
     assert_eq!(
         delivered,
         vec!["marker-granted".to_string()],
@@ -586,8 +662,12 @@ async fn a_running_handlers_publication_is_judged_against_its_execution_roles_po
     // was created with, which grants no action of this service: the publication is refused, the
     // handler reports the refusal's own code, and nothing reaches the queue.
     let denied = "the role carries only the AWS-managed policy it was created with";
-    emulator.role_policy(denied, None).await;
-    let (signal, payload) = emulator.invoke(denied, "marker-denied").await;
+    emulator
+        .role_policy(denied, ROLE_NAME, INLINE_POLICY, None)
+        .await;
+    let (signal, payload) = emulator
+        .invoke(denied, FUNCTION_NAME, &publication_event("marker-denied"))
+        .await;
     assert_eq!(
         signal, None,
         "case {denied:?}: expected no FunctionError, got {signal:?} with {payload}"
@@ -604,18 +684,17 @@ async fn a_running_handlers_publication_is_judged_against_its_execution_roles_po
     );
     // The refusal names the principal the call really spoke for: the session of the function's
     // execution role, named for the function.
-    let expected = format!(
-        "User: {} is not authorized to perform: {PUT_EVENTS_ACTION} on resource: {} because no \
-         identity-based policy allows the {PUT_EVENTS_ACTION} action",
-        session_arn(),
-        default_bus_arn()
+    let expected = implicit_deny_message(
+        &session_arn(ROLE_NAME, FUNCTION_NAME),
+        PUT_EVENTS_ACTION,
+        &bus_arn("default"),
     );
     assert_eq!(
         payload["message"].as_str().unwrap_or_default(),
         expected,
         "case {denied:?}: expected the refusal {expected:?}, got {payload}"
     );
-    let delivered = emulator.drained_markers(denied, &queue).await;
+    let delivered = emulator.drained_markers(denied, &queue, SOURCE).await;
     assert!(
         delivered.is_empty(),
         "case {denied:?}: expected nothing on the rule's queue, got {delivered:?}"
