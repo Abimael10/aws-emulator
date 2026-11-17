@@ -19,7 +19,9 @@
 //!   served again once a delete has cleared it;
 //! * a target naming an AWS Organizations entity is served only to a caller authorized
 //!   for it — the management account of the organization that entity belongs to — and is
-//!   `AccessDeniedException` to anyone else, on the write and on the reads alike.
+//!   `AccessDeniedException` to anyone else, on the write and on the reads alike, which
+//!   includes the caller whose account is in no organization yet: that authority comes
+//!   from `CreateOrganization` having been called and from nothing else.
 //!
 //! The rows differ along what the rules generalise over: which alternative of
 //! `TargetId`'s pattern the target matches (account id, organization id, organizational
@@ -164,7 +166,7 @@ fn assert_not_found(case: &str, reader: &str, answer: &Answer) {
 
 #[tokio::test]
 async fn the_configuration_of_a_target_is_what_the_writes_left_there() {
-    let with = emulator_with_organization();
+    let with = emulator_with_organization().await;
     let router = &with.router;
 
     for (case, request, target_id, scope) in authorized_targets(&with) {
@@ -266,7 +268,7 @@ async fn the_configuration_of_a_target_is_what_the_writes_left_there() {
 /// delete cannot be answering from anything but the per-target records.
 #[tokio::test]
 async fn a_delete_releases_only_the_target_it_names() {
-    let with = emulator_with_organization();
+    let with = emulator_with_organization().await;
     let router = &with.router;
     let cases = authorized_targets(&with);
 
@@ -316,7 +318,7 @@ async fn a_delete_releases_only_the_target_it_names() {
 /// `AccessDeniedException`, and the refused put records nothing for it.
 #[tokio::test]
 async fn an_organizations_target_the_caller_does_not_own_is_denied() {
-    let with = emulator_with_organization();
+    let with = emulator_with_organization().await;
     let router = &with.router;
 
     for (case, target_id) in foreign_targets() {
@@ -366,6 +368,105 @@ async fn an_organizations_target_the_caller_does_not_own_is_denied() {
     );
 }
 
+/// Authority over an `o-`/`r-` target follows the account's MEMBERSHIP of an
+/// organization, which is state a call establishes: with the Organizations control plane
+/// mounted but no organization created from this account, every Organizations-form
+/// target — the very id that control plane later mints included — is denied, and the
+/// same id is served once `CreateOrganization` has made this account the management
+/// account of it.
+///
+/// The rows span both Organizations alternatives of `TargetId`'s pattern and each
+/// published bound of its `@length(min: 12, max: 32)`, plus an organization id that
+/// exists in one emulator and not in the other, so no row can be passing because of an
+/// id's shape.
+#[tokio::test]
+async fn an_organizations_target_is_denied_until_the_organization_is_created() {
+    // Both control planes mounted and nothing else: mounting Organizations establishes
+    // no membership, so this account belongs to no organization yet.
+    let (pending_router, pending_engine) =
+        crate::signin_harness::emulator_with_organizations_mounted();
+
+    // A second emulator where the organization HAS been created, so both halves of the
+    // case can name the one id this control plane mints for the emulated account.
+    let with = emulator_with_organization().await;
+
+    let mut rows: Vec<(String, String)> = foreign_targets()
+        .into_iter()
+        .map(|(case, target_id)| (case.to_string(), target_id))
+        .collect();
+    rows.push((
+        "the id of an organization this account has not created".to_string(),
+        with.organization_id.clone(),
+    ));
+
+    for (case, target_id) in &rows {
+        let request = json!({"targetId": target_id});
+        for (operation, answer) in [
+            (
+                "put",
+                put_configuration(&pending_router, request.clone()).await,
+            ),
+            (
+                "get",
+                get_configuration(&pending_router, request.clone()).await,
+            ),
+            (
+                "delete",
+                delete_configuration(&pending_router, request.clone()).await,
+            ),
+        ] {
+            assert_eq!(
+                (
+                    answer.status,
+                    answer.error_code(),
+                    answer.error_member(),
+                    answer.message()
+                ),
+                (
+                    400,
+                    "AccessDeniedException",
+                    INSUFFICIENT_PERMISSIONS_CODE,
+                    NOT_AUTHORIZED_MESSAGE
+                ),
+                "case {case:?}: with no organization created, the {operation} of \
+                 {target_id:?} must be denied with {NOT_AUTHORIZED_MESSAGE:?}, got {} \
+                 with {:?}",
+                answer.status,
+                answer.body
+            );
+        }
+    }
+
+    assert_eq!(
+        configured_targets(&pending_engine),
+        Vec::<String>::new(),
+        "a denied put must record no configuration at all"
+    );
+
+    // The account's own account-form target names no Organizations entity, so it is
+    // served whether or not this account is in an organization.
+    let own_account = put_configuration(&pending_router, json!({})).await;
+    assert_eq!(
+        own_account.status, 200,
+        "case \"the caller's own account\": an account-form target names no organization \
+         and must be served with none created, got {} with {:?}",
+        own_account.status, own_account.body
+    );
+
+    // The same organization id, in the emulator whose account created it: authority over
+    // it came from that call, and from nothing else.
+    let served =
+        put_configuration(&with.router, json!({"targetId": with.organization_id.clone()})).await;
+    assert_eq!(
+        served.status,
+        200,
+        "case {:?}: the organization this account created must be served, got {} with {:?}",
+        with.organization_id,
+        served.status,
+        served.body
+    );
+}
+
 /// With no Organizations control plane to resolve an entity through, no `o-`/`r-` target
 /// is the caller's: the authorization check fails CLOSED rather than admitting the
 /// request. An account-form target is unaffected — it names no Organizations entity.
@@ -400,7 +501,7 @@ async fn an_organizations_target_is_denied_when_no_organization_is_recorded() {
 /// the target was never configured or was configured and released.
 #[tokio::test]
 async fn a_missing_configuration_is_refused_in_aws_s_own_words() {
-    let with = emulator_with_organization();
+    let with = emulator_with_organization().await;
     let router = &with.router;
 
     for (case, request, target_id, _) in authorized_targets(&with) {

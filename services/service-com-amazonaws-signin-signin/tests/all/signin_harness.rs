@@ -8,13 +8,14 @@
 //! same path a client takes. The two older suites
 //! (`permission_statement_lifecycle.rs`, `oauth2_token_lifecycle.rs`) still carry their
 //! own equivalents, the second because it also holds the engine so a case can seed a
-//! token. Nothing here asserts anything itself: it only builds the request and reads
-//! the answer.
+//! token. Nothing here asserts anything about an operation's answer: it only builds the
+//! request and reads the answer, bar the preconditions [`emulator_with_organization`]
+//! establishes through another control plane's own API.
 
 use std::sync::Arc;
 
 use bytes::Bytes;
-use serde_json::Value;
+use serde_json::{json, Value};
 use service_com_amazonaws_signin_signin::state::PermissionStatement;
 use service_com_amazonaws_signin_signin::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -70,12 +71,16 @@ pub fn router_over(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
 }
 
 /// One emulator carrying this service AND the AWS Organizations control plane over one
-/// shared engine, together with the organization that control plane establishes for the
-/// emulated account.
+/// shared engine, together with the organization the emulated account was made the
+/// management account of.
 ///
-/// Mounting Organizations is what makes an `o-` target one the caller is authorized for,
-/// and the id is MINTED by that control plane — so a test reads it back here instead of
-/// choosing it, and no case can pass against an id this emulator would not have.
+/// Being the management account of an organization is what makes an `o-` target one the
+/// caller is authorized for, and that membership is STATE: mounting the control plane
+/// establishes none of it, because an account belongs to an organization only once one is
+/// created from it. So this harness creates it through that service's own
+/// `CreateOrganization` over the wire, and the id is the one that control plane MINTED —
+/// read back off the answer instead of chosen here, so no case can pass against an id
+/// this emulator would not have.
 pub struct WithOrganization {
     pub router: MultiServiceRouter,
     pub engine: Arc<engine::InMemoryEngine>,
@@ -83,8 +88,18 @@ pub struct WithOrganization {
     pub organization_id: String,
 }
 
-/// Build a [`WithOrganization`] emulator.
-pub fn emulator_with_organization() -> WithOrganization {
+/// The `X-Amz-Target` prefix the AWS Organizations control plane routes by: that
+/// service's shape-name identity (`AWSOrganizationsV20161128`) on its `awsJson1_1`
+/// protocol.
+const ORGANIZATIONS_TARGET_PREFIX: &str = "AWSOrganizationsV20161128";
+
+/// The region the harness addresses both control planes in.
+const HARNESS_REGION: &str = "us-east-1";
+
+/// One emulator carrying this service and the Organizations control plane, with NO
+/// organization established: the emulated account belongs to none until a call creates
+/// one, which is the state a case about that membership starts from.
+pub fn emulator_with_organizations_mounted() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = router_over(Arc::clone(&engine));
     router.register_service(
@@ -92,17 +107,58 @@ pub fn emulator_with_organization() -> WithOrganization {
             Arc::clone(&engine),
         ),
     );
-    let organizations = service_com_amazonaws_organizations_awsorganizationsv20161128::state::service_state(&*engine)
-        .expect("the Organizations store is reachable over the shared engine");
-    let organization_id = {
-        let store = organizations.lock();
-        store
-            .organization
-            .as_ref()
-            .expect("mounting the Organizations control plane establishes an organization")
-            .id
-            .clone()
-    };
+    (router, engine)
+}
+
+/// Call `CreateOrganization` on the Organizations control plane mounted beside this
+/// service, over THAT service's wire protocol. The request names no `FeatureSet`, so
+/// that control plane applies its own default.
+pub async fn create_organization(router: &MultiServiceRouter) -> Answer {
+    let request = ::http::Request::builder()
+        .method("POST")
+        .uri("/")
+        .header(
+            "host",
+            format!("organizations.{HARNESS_REGION}.amazonaws.com"),
+        )
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 \
+                 Credential=AKIDEXAMPLE/20260101/{HARNESS_REGION}/organizations/aws4_request, \
+                 SignedHeaders=host;x-amz-target, Signature=abc"
+            ),
+        )
+        .header("content-type", "application/x-amz-json-1.1")
+        .header(
+            "x-amz-target",
+            format!("{ORGANIZATIONS_TARGET_PREFIX}.CreateOrganization"),
+        )
+        .body(Bytes::from(json!({}).to_string()))
+        .expect("the test request is well formed");
+    answer_of(router, "CreateOrganization", request).await
+}
+
+/// Build a [`WithOrganization`] emulator: both services mounted, and the organization
+/// created through the Organizations control plane's own API.
+pub async fn emulator_with_organization() -> WithOrganization {
+    let (router, engine) = emulator_with_organizations_mounted();
+    let created = create_organization(&router).await;
+    assert_eq!(
+        created.status, 200,
+        "the precondition: CreateOrganization must establish the organization, got {} \
+         with {:?}",
+        created.status, created.body
+    );
+    let organization_id = created.body["Organization"]["Id"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!(
+                "CreateOrganization must report the organization it minted, got {:?}",
+                created.body
+            )
+        })
+        .to_string();
     WithOrganization {
         router,
         engine,
@@ -183,6 +239,16 @@ pub async fn dispatch(
         .body(Bytes::from(payload))
         .expect("the test request is well formed");
 
+    answer_of(router, &format!("POST {uri}"), request).await
+}
+
+/// Dispatch a built request and read the answer off it. `called` names the call in the
+/// panic a non-JSON body earns.
+async fn answer_of(
+    router: &MultiServiceRouter,
+    called: &str,
+    request: ::http::Request<Bytes>,
+) -> Answer {
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
     let headers = response.headers().clone();
@@ -192,7 +258,7 @@ pub async fn dispatch(
     } else {
         serde_json::from_slice(&bytes).unwrap_or_else(|error| {
             panic!(
-                "POST {uri} answered a body that is not JSON ({error}): {:?}",
+                "{called} answered a body that is not JSON ({error}): {:?}",
                 String::from_utf8_lossy(&bytes)
             )
         })
