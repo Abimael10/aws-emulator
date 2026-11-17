@@ -1,15 +1,37 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ResumeSession
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ResumeSession`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reconnect one Session Manager session: "reconnects a session to a managed node after it
+//! has been disconnected … primarily for use by client machines to automatically reconnect
+//! during intermittent network issues". This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ResumeSession::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A reconnect continues the session the request named rather than starting another, so the
+//! session [`crate::state::sessions`] holds keeps its id and the instant it began, and
+//! `DescribeSessions` reports it in the same `Active` set it was already reported in — the
+//! connection is what this call re-establishes, which is what the answer's token and stream
+//! URL are for. The reconnect is performed by THIS call rather than owed by the clock, so
+//! the session is connected from the instant the call arrives.
+//!
+//! ## Which requests are refused, and with which error
+//!
+//! "Connections can be resumed for disconnected sessions, but not terminated sessions", so
+//! a `SessionId` with no session to reconnect behind it is refused: an id this endpoint
+//! holds no session under (a session is reached through the endpoint it was started at, so
+//! an id of another Region's endpoint is one of those), and an id whose session has ended,
+//! which is every session `DescribeSessions` reports under `History`. Both are one refusal,
+//! stating that the session is in no state a reconnect can act on
+//! ([`crate::state::sessions::SESSION_NOT_RESUMABLE_MESSAGE`]), answered as a 400
+//! `ValidationException` — the id is no session this call can act on rather than one of the
+//! resources `DoesNotExistException` speaks for — so it travels through this crate's channel
+//! for a refusal the operation models no error for
+//! ([`crate::scaffolded::Scaffolded::validation`]).
+//!
+//! A session this endpoint still reports as connected is NOT one of those: Session Manager
+//! learns of a client's data channel dropping from nothing this API carries, so the status a
+//! session is reported in says what the service holds of it rather than what the client's
+//! end of the connection is doing — which is why a client that "automatically reconnects
+//! during intermittent network issues" is served
+//! ([`crate::state::sessions::SessionRecord::is_resumable`]).
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +175,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ResumeSession` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ResumeSessionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ResumeSession"))
+        use crate::state::sessions;
+
+        // `SessionId`'s presence and its 1..96 length are MODELLED constraints, so the
+        // centralized walk has already refused anything outside them.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ResumeSessionErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some(
+                        "this service is mounted on an engine that holds no state".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // Session Manager is regional: a session is reconnected through the endpoint it was
+        // started at, which is the Region this request was signed for.
+        let region = crate::state::request_region(ctx.parts());
+        // The one refusal this operation answers, for every request there is no connection
+        // to re-establish behind.
+        let not_resumable =
+            || crate::scaffolded::Scaffolded::validation(sessions::SESSION_NOT_RESUMABLE_MESSAGE);
+        // Whether there is a connection to re-establish at all, READ before anything is
+        // minted or written ([`sessions::SessionRecord::is_resumable`]), so a request this
+        // endpoint refuses leaves the session exactly as it was.
+        if !state
+            .lock()
+            .session(&region, &input.session_id)
+            .is_some_and(sessions::SessionRecord::is_resumable)
+        {
+            return Err(not_resumable());
+        }
+
+        // The token that authenticates the re-established connection, drawn with no store
+        // guard held from the one place every session token of this service is drawn from.
+        // Minted before the reconnect is written, so a request this side cannot serve leaves
+        // the session as it was.
+        let Some(token_value) = sessions::mint_token_value(ctx) else {
+            return Err(ResumeSessionErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some(
+                        "the token minted for this session carries no secret".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // The reconnect itself: the session is connected from the instant this call arrives.
+        // It is read again because the guard was released to mint the token, and a session
+        // ended in between is one this call no longer has a connection to re-establish.
+        if !state
+            .lock()
+            .session_mut(&region, &input.session_id)
+            .is_some_and(sessions::SessionRecord::resume)
+        {
+            return Err(not_resumable());
+        }
+
+        Ok(ResumeSessionOutput {
+            stream_url: Some(sessions::stream_url(
+                &::service_common::data_plane_addressing::emulator_endpoint_authority(ctx),
+                &input.session_id,
+            )),
+            session_id: Some(input.session_id),
+            token_value: Some(token_value),
+        })
     }
 }

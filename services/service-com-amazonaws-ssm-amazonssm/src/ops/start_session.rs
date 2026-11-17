@@ -300,26 +300,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
         drop(store);
 
-        // "An encrypted token value containing session and caller information. This token
-        // is used to authenticate the connection to the managed node": a secret handed to
-        // the caller, so it comes from the one component that generates secrets rather than
-        // being constructed here. It is NOT a credential of this emulator and must never be
-        // accepted as one, so the entry minted for it is removed again. The modelled
-        // `TokenValue` carries 0..300 characters, so that is how much of the generated
-        // secret the token is — a prefix of it, never a value stretched to fill the member.
-        let minted = ctx
-            .credential_store()
-            .create(&::emulator_server::aws_credentials::AWS_SESSION);
-        let token_value = minted
-            .secret(::emulator_server::aws_credentials::SESSION_TOKEN)
-            .map(|secret| {
-                secret
-                    .chars()
-                    .take(sessions::MAX_TOKEN_VALUE_CHARS)
-                    .collect::<String>()
-            });
-        let _ = ctx.credential_store().delete(&minted.id);
-        let Some(token_value) = token_value else {
+        // The token the caller authenticates the connection with, drawn from the one place
+        // every session token of this service is drawn from, with no store guard held.
+        let Some(token_value) = sessions::mint_token_value(ctx) else {
             return Err(StartSessionErrorModeled::InternalServerError(
                 InternalServerError {
                     message: Some(

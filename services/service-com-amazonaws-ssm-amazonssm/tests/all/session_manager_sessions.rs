@@ -38,7 +38,7 @@ use crate::parameter_store::{call_in_region, error_code, error_message, ACCOUNT,
 
 /// Another Region's endpoint, for the row that asks it about a session and a node this
 /// Region holds.
-const OTHER_REGION: &str = "eu-central-1";
+pub(crate) const OTHER_REGION: &str = "eu-central-1";
 
 /// The `AccessType` every session a caller starts directly carries: "`Standard` access type
 /// is the default for Session Manager sessions" (`Session$AccessType`).
@@ -55,14 +55,14 @@ const SESSION_DOCUMENT_CONTENT: &str = r#"{
 }"#;
 
 /// The name that document is created under.
-const SESSION_DOCUMENT: &str = "SSM-SessionManagerRunShell";
+pub(crate) const SESSION_DOCUMENT: &str = "SSM-SessionManagerRunShell";
 
 /// A document name no case creates, so nothing resolves it.
 const ABSENT_DOCUMENT: &str = "SSM-NeverCreated";
 
 /// The instance profile every served row's instance runs as: its role carries the
 /// AWS-managed policy a client attaches so the agent may register the node.
-fn registering_profile() -> Profile {
+pub(crate) fn registering_profile() -> Profile {
     Profile {
         name: "ssm-core",
         trusts: "ec2.amazonaws.com",
@@ -82,7 +82,7 @@ fn silent_profile() -> Profile {
 
 /// Create the `Session` document of the account's own and answer the ARN it is also
 /// addressable by.
-async fn create_session_document(router: &MultiServiceRouter) -> String {
+pub(crate) async fn create_session_document(router: &MultiServiceRouter) -> String {
     let (status, body) = call_in_region(
         router,
         REGION,
@@ -102,7 +102,7 @@ async fn create_session_document(router: &MultiServiceRouter) -> String {
 }
 
 /// Start one session and answer the status and body, whatever it was.
-async fn start_session(
+pub(crate) async fn start_session(
     router: &MultiServiceRouter,
     region: &str,
     request: &Value,
@@ -114,7 +114,7 @@ async fn start_session(
 ///
 /// `Filters` is modelled with a minimum length of one, so a case that narrows by nothing
 /// leaves the member out rather than sending an empty list.
-async fn sessions(
+pub(crate) async fn sessions(
     router: &MultiServiceRouter,
     region: &str,
     state: &str,
@@ -152,7 +152,7 @@ async fn session_ids(router: &MultiServiceRouter, region: &str, state: &str) -> 
 }
 
 /// The one session `session_id` names in `state`, or `None` when that set holds none.
-async fn session_in(
+pub(crate) async fn session_in(
     router: &MultiServiceRouter,
     region: &str,
     state: &str,
@@ -171,7 +171,7 @@ async fn session_in(
 
 /// Launch one instance with `profile` and look again until this endpoint reports it as a
 /// managed node, as the node id a session can be started against.
-async fn registered_node(
+pub(crate) async fn registered_node(
     router: &MultiServiceRouter,
     case: &str,
     image: &str,

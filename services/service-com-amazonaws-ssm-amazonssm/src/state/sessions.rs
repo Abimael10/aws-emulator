@@ -169,6 +169,37 @@ impl SessionRecord {
         self.end_date = Some(at);
     }
 
+    /// Whether a connection to this session can still be re-established: "connections can be
+    /// resumed for disconnected sessions, but not terminated sessions" (`ResumeSession`), so
+    /// every session that has not ended can be, and no session that has.
+    ///
+    /// A session still reported as connected is one of those: this service learns of a
+    /// client's data channel dropping from nothing, so the status a session carries says what
+    /// Session Manager holds of it rather than what the client's end of the connection is
+    /// doing — which is why a client reconnecting "during intermittent network issues" is
+    /// served whatever the session was last reported as.
+    pub fn is_resumable(&self) -> bool {
+        self.state() != SESSION_STATE_HISTORY
+    }
+
+    /// Reconnect this session: "Reconnects a session to a managed node after it has been
+    /// disconnected. Connections can be resumed for disconnected sessions, but not
+    /// terminated sessions" (`ResumeSession`).
+    ///
+    /// Answers whether the session was reconnected: a session no connection can be
+    /// re-established to ([`SessionRecord::is_resumable`]) is not, and nothing about it
+    /// changes. A reconnect continues the session it was asked for rather than starting
+    /// another, so the instant it began is the one its start recorded; what it writes is the
+    /// connected status, which is the status every session this store holds a live connection
+    /// for carries, whichever of the other live statuses it was in.
+    pub fn resume(&mut self) -> bool {
+        if !self.is_resumable() {
+            return false;
+        }
+        self.status = SESSION_STATUS_CONNECTED.to_string();
+        true
+    }
+
     /// Whether a report of this session's own state still reaches it at `now`.
     ///
     /// A session that is still usable is always reported; an ENDED one is reported for
@@ -341,6 +372,44 @@ pub fn stream_url(authority: &str, session_id: &str) -> String {
     format!("wss://{authority}/v1/data-channel/{session_id}?stream=input")
 }
 
+/// The token a call hands the caller of a session it opened or reconnected: "an encrypted
+/// token value containing session and caller information … used to authenticate the
+/// connection to the managed node" (`StartSessionResponse$TokenValue`), or `None` when the
+/// value minted for it carries no secret.
+///
+/// A secret, so it is drawn from the one component that generates secrets rather than
+/// constructed here. It is NOT a credential of this emulator and must never be accepted as
+/// one, so the entry minted for it is removed again. The modelled `TokenValue` carries
+/// 0..300 characters, so the token is a PREFIX of the generated secret
+/// ([`MAX_TOKEN_VALUE_CHARS`]) — never a value stretched to fill the member.
+///
+/// Every call that hands a caller a session token draws it here, so a start and a reconnect
+/// cannot hand out tokens of two different kinds.
+pub fn mint_token_value(ctx: &::smithy_server_runtime::OperationContext<'_>) -> Option<String> {
+    let minted = ctx
+        .credential_store()
+        .create(&::emulator_server::aws_credentials::AWS_SESSION);
+    let token_value = minted
+        .secret(::emulator_server::aws_credentials::SESSION_TOKEN)
+        .map(|secret| secret.chars().take(MAX_TOKEN_VALUE_CHARS).collect::<String>());
+    // Removing the entry again is what keeps the token from being accepted as a credential
+    // of this emulator. The one answer other than success is that the store holds no entry
+    // under that id, which is the state the removal exists to reach, so both answers leave
+    // nothing of this token in the store.
+    let _ = ctx.credential_store().delete(&minted.id);
+    token_value
+}
+
+/// How this service refuses a `SessionId` there is no session to reconnect behind:
+/// "connections can be resumed for disconnected sessions, but not terminated sessions"
+/// (`ResumeSession`), so what the refusal states is that the session is in no state a
+/// reconnect can act on.
+///
+/// One sentence covers every such request — an id this endpoint holds no session under as
+/// much as one whose session has ended — because the refusal is about the state a reconnect
+/// needs and says nothing else of the request: the text is fixed and echoes no id.
+pub const SESSION_NOT_RESUMABLE_MESSAGE: &str = "Session is not in a valid state";
+
 impl super::ComAmazonawsSsmAmazonssmState {
     /// The `ConnectionStatus` this endpoint reports for `target`: "whether it is running and
     /// ready to receive Session Manager connections" (`GetConnectionStatus`).
@@ -368,6 +437,13 @@ impl super::ComAmazonawsSsmAmazonssmState {
     pub fn insert_session(&mut self, region: &str, session: SessionRecord) {
         let key = (region.to_string(), session.session_id.clone());
         self.sessions.insert(key, session);
+    }
+
+    /// The session `session_id` names through `region`'s endpoint, or `None` when that
+    /// Region holds none: a session is reached through the endpoint it was started at.
+    pub fn session(&self, region: &str, session_id: &str) -> Option<&SessionRecord> {
+        self.sessions
+            .get(&(region.to_string(), session_id.to_string()))
     }
 
     /// The session `session_id` names through `region`'s endpoint, to be changed, or `None`
@@ -451,5 +527,63 @@ mod tests {
             "expected the two reported connection statuses to be the modelled \
              ConnectionStatus values, got {reported:?} against {modelled:?}"
         );
+    }
+
+    /// A reconnect is served for a session in EVERY status that is still a connection
+    /// ("connections can be resumed for disconnected sessions, but not terminated
+    /// sessions"), putting it back in the connected status and keeping the instant it began,
+    /// and for no status that has ended — where it changes nothing at all.
+    #[test]
+    fn a_reconnect_serves_every_live_status_and_no_ended_one() {
+        let began = SystemTime::UNIX_EPOCH + ::std::time::Duration::from_secs(1_700_000_000);
+        let ended = began + ::std::time::Duration::from_secs(60);
+        for status in crate::ops::types::SESSION_STATUS_VALUES {
+            let mut session = SessionRecord::started(
+                "a-session".to_string(),
+                "i-0123456789abcdef0".to_string(),
+                "arn:aws:sts::123456789012:assumed-role/role/session".to_string(),
+                None,
+                None,
+                began,
+            );
+            session.status = (*status).to_string();
+            session.end_date = ENDED_SESSION_STATUSES
+                .contains(status)
+                .then_some(ended);
+            let was_ended = session.state() == SESSION_STATE_HISTORY;
+            let before = session.clone();
+
+            assert_eq!(
+                session.is_resumable(),
+                !was_ended,
+                "case {status}: expected a session in this status to be resumable exactly \
+                 when it has not ended"
+            );
+            assert_eq!(
+                session.resume(),
+                !was_ended,
+                "case {status}: expected the reconnect to be served exactly when the session \
+                 has not ended"
+            );
+            if was_ended {
+                assert_eq!(
+                    (session.status.as_str(), session.end_date),
+                    (before.status.as_str(), before.end_date),
+                    "case {status}: expected a refused reconnect to change nothing, got \
+                     {session:?}"
+                );
+                continue;
+            }
+            assert_eq!(
+                session.status, SESSION_STATUS_CONNECTED,
+                "case {status}: expected the session to be connected again, got {session:?}"
+            );
+            assert_eq!(
+                (session.start_date, session.end_date),
+                (before.start_date, None),
+                "case {status}: expected the reconnect to continue the session it was asked \
+                 for, got {session:?}"
+            );
+        }
     }
 }
