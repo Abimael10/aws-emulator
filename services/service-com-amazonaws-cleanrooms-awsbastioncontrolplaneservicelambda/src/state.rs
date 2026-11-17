@@ -2154,11 +2154,16 @@ pub fn membership_not_invited_message(account_id: &str) -> String {
 /// Entirely FIXED text, like [`CREATOR_MEMBERSHIP_ACTIVE_CONFLICT_MESSAGE`]: the refusal
 /// states the rule the call broke — the creator owns the collaboration ("DeleteCollaboration
 /// … can only be called by the collaboration owner" is how the collaboration itself goes),
-/// so it is the one party a removal cannot take out — and names no value of the request.
-/// The resource involved travels in the exception's `resourceId` / `resourceType` members,
-/// which is where a client reads it.
+/// so it is the one party a removal cannot take out — AND the condition that lifts the
+/// refusal, which for this class is the collaboration's own deletion: the creator leaves
+/// the roster only with the collaboration it owns. Both clauses are part of the sentence,
+/// so a client keying remediation off the text is told what to do next, not merely that
+/// the call is impossible. It names no value of the request: the resource involved travels
+/// in the exception's `resourceId` / `resourceType` members, which is where a client reads
+/// it.
 pub const CREATOR_MEMBER_REMOVAL_CONFLICT_MESSAGE: &str =
-    "Cannot delete member for the creator of the collaboration.";
+    "Cannot delete member for the creator of the collaboration until the collaboration is \
+     deleted.";
 
 /// The message `DeleteMember` reports when the `accountId` names no party to the
 /// collaboration in the path.

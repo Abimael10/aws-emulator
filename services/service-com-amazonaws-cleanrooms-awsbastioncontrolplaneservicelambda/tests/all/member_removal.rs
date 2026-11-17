@@ -7,9 +7,10 @@
 //! collaboration — the member listing keeps reporting it, in `REMOVED` status, with its
 //! own `updateTime` moved to the removal, and the membership it had joined with survives
 //! in the `REMOVED` membership status. Only the collaboration's creator may remove a
-//! party, the creator itself is the one party no removal can take out, and an account the
-//! collaboration holds no grant for is not found; a repeat removal is the same success,
-//! because the operation is `@idempotent`.
+//! party, the creator itself is the one party no removal can take out — refused with the
+//! conflict whose fixed sentence states both that rule and the collaboration deletion
+//! that lifts it — and an account the collaboration holds no grant for is not found; a
+//! repeat removal is the same success, because the operation is `@idempotent`.
 //!
 //! The rows vary what the rule generalises over: how many parties the collaboration
 //! declares, which of them is removed (first, middle, last, only), which abilities that
@@ -26,7 +27,9 @@ use super::cleanrooms_collaboration_lifecycle::{
     account_id, collaboration_owned_elsewhere, error_code, error_message, minimal_collaboration,
     Emulator, ALL_LOG_STATUSES, ALL_MEMBER_ABILITIES, REGION,
 };
-use super::collaboration_change_requests::{declared_member, NEWCOMER_ACCOUNT, PARTNER_ACCOUNT};
+use super::collaboration_change_requests::{
+    create_change_request, declared_member, member_change, NEWCOMER_ACCOUNT, PARTNER_ACCOUNT,
+};
 
 /// A further 12-digit `AccountId` (model shape `AccountId`, len 12..12, pattern `^\d+$`),
 /// so a collaboration in these tables can declare three parties beside its creator.
@@ -38,6 +41,14 @@ const NEVER_A_PARTY: [&str; 2] = ["999988887777", "123456789012"];
 /// A well-formed `CollaborationIdentifier` (the model's `UUID` form) that no create here
 /// mints.
 const NEVER_MINTED: &str = "0123456f-89ab-cdef-0123-456789abcdef";
+
+/// The sentence a `DeleteMember` addressed at the collaboration's own creator is refused
+/// with. Entirely FIXED text, spelled out here rather than read from the crate so these
+/// rows pin the wording: it states the rule the call broke AND the condition that lifts
+/// the refusal — the collaboration's own deletion — and interpolates no account id,
+/// collaboration id or display name.
+const CREATOR_REMOVAL_REFUSAL: &str = "Cannot delete member for the creator of the \
+                                       collaboration until the collaboration is deleted.";
 
 /// The message the authorization-failure rule prescribes for a `DeleteMember` the caller
 /// may not perform: the calling principal, this service's IAM action and the ARN of the
@@ -349,34 +360,80 @@ async fn delete_member_moves_the_party_to_removed_and_keeps_the_rest_of_the_rost
     }
 }
 
+/// One row of the creator-removal refusal table.
+struct CreatorRefusalCase {
+    /// The abilities the creator declares for itself.
+    abilities: Vec<&'static str>,
+    /// The parties the collaboration declares beside its creator.
+    members: Vec<&'static str>,
+    /// Whether the creator has joined with a membership.
+    joined: bool,
+    /// An account the row adds to the roster through a change request and then removes
+    /// with this same operation, so the refusal is reached AFTER a removal the very same
+    /// collaboration served.
+    added_then_removed: Option<&'static str>,
+}
+
+/// The rows vary what the rule generalises over: the abilities the creator declared for
+/// itself, how many other parties the collaboration has, whether the creator has joined
+/// with a membership, and whether the collaboration has already served a successful
+/// removal of another party. The rule is about which party the request names, so the
+/// status, the code and the whole sentence are the same in every row.
+fn creator_refusal_cases() -> Vec<CreatorRefusalCase> {
+    vec![
+        CreatorRefusalCase {
+            abilities: vec![ALL_MEMBER_ABILITIES[0]],
+            members: vec![],
+            joined: false,
+            added_then_removed: None,
+        },
+        CreatorRefusalCase {
+            abilities: ALL_MEMBER_ABILITIES.to_vec(),
+            members: vec![PARTNER_ACCOUNT],
+            joined: true,
+            added_then_removed: None,
+        },
+        CreatorRefusalCase {
+            abilities: vec![ALL_MEMBER_ABILITIES[1]],
+            members: vec![PARTNER_ACCOUNT, NEWCOMER_ACCOUNT],
+            joined: false,
+            added_then_removed: None,
+        },
+        CreatorRefusalCase {
+            abilities: vec![ALL_MEMBER_ABILITIES[2], ALL_MEMBER_ABILITIES[3]],
+            members: vec![],
+            joined: true,
+            added_then_removed: Some(PARTNER_ACCOUNT),
+        },
+        CreatorRefusalCase {
+            abilities: ALL_MEMBER_ABILITIES.to_vec(),
+            members: vec![],
+            joined: false,
+            added_then_removed: Some(THIRD_ACCOUNT),
+        },
+    ]
+}
+
 #[tokio::test]
 async fn delete_member_refuses_to_remove_the_collaboration_creator() {
-    // Rows differ in what the creator holds: the abilities it declared for itself, how
-    // many other parties the collaboration has, and whether the creator has joined with
-    // a membership — the rule is about which party the request names, not about any of
-    // those.
-    for (row, (abilities, members, joined)) in [
-        (vec![ALL_MEMBER_ABILITIES[0]], vec![], false),
-        (ALL_MEMBER_ABILITIES.to_vec(), vec![PARTNER_ACCOUNT], true),
-        (
-            vec![ALL_MEMBER_ABILITIES[1]],
-            vec![PARTNER_ACCOUNT, NEWCOMER_ACCOUNT],
-            false,
-        ),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let label = format!("creator holding {abilities:?} with {} parties", members.len());
-        let case = format!("creator-removal-{row}");
+    for (row, case) in creator_refusal_cases().into_iter().enumerate() {
+        let label = format!(
+            "creator holding {:?} with {} declared parties, joined {}, after a removal {}",
+            case.abilities,
+            case.members.len(),
+            case.joined,
+            case.added_then_removed.is_some()
+        );
+        let name = format!("creator-removal-{row}");
         let emulator = Emulator::new();
-        let declared: Vec<Value> = members
+        let declared: Vec<Value> = case
+            .members
             .iter()
-            .map(|account| declared_member(account, &abilities))
+            .map(|account| declared_member(account, &case.abilities))
             .collect();
         let collaboration_id =
-            collaboration_with(&emulator, &case, &abilities, json!(declared)).await;
-        if joined {
+            collaboration_with(&emulator, &name, &case.abilities, json!(declared)).await;
+        if case.joined {
             let (status, body) = emulator
                 .create_membership(json!({
                     "collaborationIdentifier": collaboration_id,
@@ -386,6 +443,40 @@ async fn delete_member_refuses_to_remove_the_collaboration_creator() {
             assert_eq!(
                 status, 200,
                 "case {label:?}: the creator's join must succeed, got {status} with {body}"
+            );
+        }
+
+        // The positive control: a party the creator adds through a change request is
+        // removable by this very operation, so what the row goes on to observe is the
+        // refusal of ONE account and not a removal that never works.
+        if let Some(account) = case.added_then_removed {
+            let (status, created) = create_change_request(
+                &emulator,
+                &collaboration_id,
+                json!([member_change(account, &[ALL_MEMBER_ABILITIES[0]])]),
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {label:?}: the change request adding a party must be accepted, got \
+                 {status} with {created}"
+            );
+            assert_eq!(
+                created["collaborationChangeRequest"]["status"].as_str(),
+                Some("COMMITTED"),
+                "case {label:?}: the creator is the only party whose approval the add needs, \
+                 so it commits at creation, got {created}"
+            );
+            let (status, body) = delete_member(&emulator, &collaboration_id, account).await;
+            assert_eq!(
+                status, 204,
+                "case {label:?}: removing the added party must succeed, got {status} with {body}"
+            );
+            let settled = roster(&emulator, &label, &collaboration_id).await;
+            assert_eq!(
+                summary_of(&label, &settled, account)["status"].as_str(),
+                Some("REMOVED"),
+                "case {label:?}: the removed party stays in the roster as REMOVED, got {settled:?}"
             );
         }
 
@@ -402,11 +493,21 @@ async fn delete_member_refuses_to_remove_the_collaboration_creator() {
         );
         assert_eq!(
             error_message(&refused),
-            "Cannot delete member for the creator of the collaboration.",
-            "case {label:?}: the refusal states the rule in fixed text, interpolating no \
-             account or collaboration id, got {:?}",
+            CREATOR_REMOVAL_REFUSAL,
+            "case {label:?}: the refusal states the rule AND the collaboration deletion that \
+             lifts it, in one fixed sentence, got {:?}",
             error_message(&refused)
         );
+        // Fixed text: nothing the request or the store carries is interpolated into it, so
+        // the sentence is the same in every row even though the ids differ.
+        for value in [collaboration_id.as_str(), account_id()] {
+            assert!(
+                !error_message(&refused).contains(value),
+                "case {label:?}: the sentence interpolates no value, but it carries \
+                 {value:?}: {:?}",
+                error_message(&refused)
+            );
+        }
         assert_eq!(
             refused["reason"].as_str(),
             Some("INVALID_STATE"),
@@ -433,6 +534,67 @@ async fn delete_member_refuses_to_remove_the_collaboration_creator() {
             "case {label:?}: a refused removal must change no party"
         );
     }
+}
+
+/// The remedy the refusal sentence states is the one that works: deleting the
+/// collaboration is what takes the creator out of it, and the sentence names no other.
+#[tokio::test]
+async fn deleting_the_collaboration_is_what_removes_its_creator() {
+    let emulator = Emulator::new();
+    let collaboration_id = collaboration_with(
+        &emulator,
+        "creator-removal-remedy",
+        &ALL_MEMBER_ABILITIES,
+        json!([declared_member(PARTNER_ACCOUNT, &[ALL_MEMBER_ABILITIES[0]])]),
+    )
+    .await;
+    let case = "the creator of a live collaboration";
+    let (status, refused) = delete_member(&emulator, &collaboration_id, account_id()).await;
+    assert_eq!(
+        status, 409,
+        "case {case:?}: expected the modelled 409, got {status} with {refused}"
+    );
+    assert_eq!(
+        error_message(&refused),
+        CREATOR_REMOVAL_REFUSAL,
+        "case {case:?}: expected the refusal sentence, got {:?}",
+        error_message(&refused)
+    );
+
+    let (status, body) = emulator.delete_collaboration(&collaboration_id).await;
+    assert_eq!(
+        status, 204,
+        "case {case:?}: the creator's DeleteCollaboration must succeed, got {status} with {body}"
+    );
+    // With the collaboration deleted the roster it held is gone with it, so the creator is
+    // no party to it any more and the member path no longer resolves for anyone.
+    let (status, body) = emulator
+        .call(
+            "GET",
+            &format!("/collaborations/{collaboration_id}/members"),
+            None,
+        )
+        .await;
+    assert_eq!(
+        status, 403,
+        "case {case:?}: a deleted collaboration has no roster to read, got {status} with {body}"
+    );
+    let (status, after) = delete_member(&emulator, &collaboration_id, account_id()).await;
+    assert_ne!(
+        status, 409,
+        "case {case:?}: once the collaboration is deleted the creator conflict is gone, got \
+         {status} with {after}"
+    );
+    // A collaboration the caller is not the creator of — one nothing is stored under
+    // included, which is what a deleted collaboration is — is the authorization failure
+    // this operation models, the same outcome
+    // `only_the_creator_of_a_collaboration_may_remove_a_party_from_it` pins for an id no
+    // create minted.
+    assert_eq!(
+        status, 403,
+        "case {case:?}: expected the modelled 403 an unresolvable collaboration is refused \
+         with, got {status} with {after}"
+    );
 }
 
 #[tokio::test]

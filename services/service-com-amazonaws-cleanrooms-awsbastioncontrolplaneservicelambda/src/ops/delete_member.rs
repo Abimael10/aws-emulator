@@ -201,8 +201,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // collaboration, so what removes it is deleting the collaboration. The state of
         // the collaboration is what refuses the call — its creator is recorded ON it, which
         // is where this reads it from — so it is the `ConflictException` this operation
-        // models, and the sentence is fixed: the collaboration it is about travels in the
-        // exception's `resourceId` / `resourceType`.
+        // models, and the sentence is fixed — it states both the rule and the deletion of
+        // the collaboration that lifts the refusal: the collaboration it is about travels
+        // in the exception's `resourceId` / `resourceType`.
         if account_id == creator {
             return Err(DeleteMemberErrorModeled::ConflictException(
                 ConflictException {
