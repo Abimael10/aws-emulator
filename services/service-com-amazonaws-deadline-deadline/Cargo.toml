@@ -11,6 +11,10 @@ engine = { workspace = true }
 # The workspace's one home for the `date-time` timestamp wire form every restJson1
 # service of this class shares (`service_common::date_time_json`).
 service-common = { path = "../common" }
+# The account's session registry and its view of the account's IAM records: the one
+# resolution of WHICH PRINCIPAL an access key id speaks for, which is what this service's
+# `createdBy`/`updatedBy` members report (`crate::state::caller_principal`).
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }
@@ -37,6 +41,12 @@ yaml-rust2 = { version = "0.10", default-features = false }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Declares one module per `tests/all/<name>.rs`, so the crate's one integration-test
+# target needs no hand-written list of its suites.
+automod = { workspace = true }
+# The account's IAM records, for the one suite that arranges the user an access key is held
+# for — the record this service's `createdBy` resolution reads a long-term key against.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 # `time` on top of the workspace features, for the one TEST that has to let the clock pass
 # a job's CREATE_IN_PROGRESS -> CREATE_COMPLETE due instant without blocking the runtime.
 # A dev-dependency, so the service's own build keeps the workspace feature set.

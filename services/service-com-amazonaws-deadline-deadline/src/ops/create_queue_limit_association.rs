@@ -204,7 +204,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let created_by = crate::state::caller_principal(ctx);
+        let created_by = crate::state::caller_principal(&*self.engine, ctx);
         let Some(queue) = store.queue_mut(&input.farm_id, &input.queue_id) else {
             return Err(
                 CreateQueueLimitAssociationErrorModeled::ResourceNotFoundException(

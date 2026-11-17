@@ -210,7 +210,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             os_family: input.os_family,
             file_system_locations: input.file_system_locations,
             created_at: ::std::time::SystemTime::now(),
-            created_by: crate::state::caller_principal(ctx),
+            created_by: crate::state::caller_principal(&*self.engine, ctx),
             // Nothing has updated this profile yet, so it reports no update stamp until
             // something does.
             updated_at: None,

@@ -68,10 +68,34 @@ impl Emulator {
             .expect("the deadline store lives in this emulator's engine")
     }
 
+    /// The engine every service mounted on this emulator shares, so a suite can arrange a
+    /// record another service of the account holds (the session an access key id names,
+    /// say) in the very store the handlers resolve it from.
+    pub(crate) fn engine(&self) -> &engine::InMemoryEngine {
+        &self.engine
+    }
+
     /// Dispatch one request and return its status and parsed JSON body (`Value::Null` for
     /// an empty body).
     pub(crate) async fn call(
         &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+        client_token: Option<&str>,
+    ) -> (u16, Value) {
+        self.call_as(DEFAULT_ACCESS_KEY_ID, method, path, body, client_token)
+            .await
+    }
+
+    /// [`Emulator::call`], signed with `access_key_id`.
+    ///
+    /// The ONE request builder of this test target: a suite that has to call as a second
+    /// credential chooses the key id here rather than building a second harness, so every
+    /// call of every suite carries the same headers apart from that id.
+    pub(crate) async fn call_as(
+        &self,
+        access_key_id: &str,
         method: &str,
         path: &str,
         body: Option<Value>,
@@ -84,9 +108,11 @@ impl Emulator {
             // credential scope is this service's signing name.
             .header(
                 "authorization",
-                "AWS4-HMAC-SHA256 \
-                 Credential=AKIDEXAMPLE/20231012/us-east-1/deadline/aws4_request, \
-                 SignedHeaders=host, Signature=0000",
+                format!(
+                    "AWS4-HMAC-SHA256 \
+                     Credential={access_key_id}/20231012/us-east-1/deadline/aws4_request, \
+                     SignedHeaders=host, Signature=0000"
+                ),
             )
             .header("host", "deadline.us-east-1.amazonaws.com");
         if let Some(token) = client_token {
@@ -176,12 +202,19 @@ impl Emulator {
     }
 }
 
-/// The principal every call of this harness is made by: [`Emulator::call`] signs with the
-/// access key id `AKIDEXAMPLE`, and the service reports a caller as an IAM user ARN of it.
+/// The access key id [`Emulator::call`] signs with. No store of the account holds it, which
+/// is the position of the long-term key this emulator publishes at start.
+pub(crate) const DEFAULT_ACCESS_KEY_ID: &str = "AKIDEXAMPLE";
+
+/// The principal every call of this harness is made by: a long-term access key no store of
+/// the account holds speaks for the account's own published identity, the one
+/// `sts:GetCallerIdentity` answers for it, which this tree states in a single place.
 ///
 /// `pub(crate)` so every suite in this test target expects the one principal from the one
 /// place rather than spelling it out again.
-pub(crate) const CALLER: &str = "arn:aws:iam::000000000000:user/AKIDEXAMPLE";
+pub(crate) fn caller() -> String {
+    ::service_common::caller_principal::ambient_user_arn()
+}
 
 pub(crate) fn id_of(body: &Value, member: &str) -> String {
     body.get(member)

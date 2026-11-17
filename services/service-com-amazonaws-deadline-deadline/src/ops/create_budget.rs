@@ -264,7 +264,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // consumed nothing.
             approximate_dollar_usage: 0.0,
             created_at: ::std::time::SystemTime::now(),
-            created_by: crate::state::caller_principal(ctx),
+            created_by: crate::state::caller_principal(&*self.engine, ctx),
             updated_at: None,
             updated_by: None,
             queue_stopped_at: None,

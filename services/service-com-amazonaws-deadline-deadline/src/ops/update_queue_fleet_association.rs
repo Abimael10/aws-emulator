@@ -215,7 +215,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let updated_by = crate::state::caller_principal(ctx);
+        let updated_by = crate::state::caller_principal(&*self.engine, ctx);
         // What each job of this queue was owed while the queue still had the associations
         // it has now.
         store.settle_jobs(&input.farm_id, &input.queue_id);

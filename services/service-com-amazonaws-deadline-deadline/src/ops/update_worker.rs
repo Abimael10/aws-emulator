@@ -168,7 +168,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        let updated_by = crate::state::caller_principal(ctx);
+        let updated_by = crate::state::caller_principal(&*self.engine, ctx);
         let Some(fleet) = store.fleet_mut(&input.farm_id, &input.fleet_id) else {
             return Err(UpdateWorkerErrorModeled::ResourceNotFoundException(
                 crate::state::not_found(crate::state::RESOURCE_TYPE_FLEET, &input.fleet_id),

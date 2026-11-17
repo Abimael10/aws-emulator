@@ -37,7 +37,7 @@ use aws_smithy_types::date_time::Format;
 use aws_smithy_types::DateTime;
 use serde_json::Value;
 
-use crate::farm_queue_job::{absent_id, error_code, string_at, Emulator, CALLER};
+use crate::farm_queue_job::{absent_id, caller, error_code, string_at, Emulator};
 use crate::fleet::create_fleet;
 // An association is reached, created and asked for a status through the helpers the delete
 // suite owns, so every suite in this target drives the same request shapes.
@@ -150,7 +150,7 @@ fn assert_updated(case: &str, document: &Value) -> String {
     instant_at(case, document, "updatedAt");
     assert_eq!(
         string_at(document, "updatedBy"),
-        CALLER,
+        caller(),
         "case {case:?}: expected the update to be recorded as made by the caller, got {document}"
     );
     string_at(document, "updatedAt")
@@ -258,9 +258,9 @@ async fn update_queue_fleet_association_writes_the_status_it_is_asked_for() {
             (
                 queue_id.clone(),
                 fleet_id.clone(),
-                CALLER.to_string(),
+                caller(),
                 stamped,
-                CALLER.to_string(),
+                caller(),
             ),
             "case {case:?}: expected the settled association to keep the update it was \
              stamped with, got {settled}"
@@ -346,7 +346,7 @@ async fn repeating_update_queue_fleet_association_leaves_the_stored_association_
                     string_at(&first, "createdAt"),
                     string_at(&first, "createdBy"),
                     stamped.clone(),
-                    CALLER.to_string(),
+                    caller(),
                 ),
                 "case {case:?}: attempt {attempt} wrote the association again: {first} then \
                  {again}"

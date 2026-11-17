@@ -200,7 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        let updated_by = crate::state::caller_principal(ctx);
+        let updated_by = crate::state::caller_principal(&*self.engine, ctx);
         let Some(budget) = store.budget_mut(&input.farm_id, &input.budget_id) else {
             return Err(UpdateBudgetErrorModeled::ResourceNotFoundException(
                 crate::state::not_found(crate::state::RESOURCE_TYPE_BUDGET, &input.budget_id),

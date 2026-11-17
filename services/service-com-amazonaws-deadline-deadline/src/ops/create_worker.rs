@@ -186,7 +186,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The id and the principal are taken before the fleet is borrowed, so the fleet
         // this worker is stored under is reached exactly once.
         let worker_id = store.mint_id("worker");
-        let created_by = crate::state::caller_principal(ctx);
+        let created_by = crate::state::caller_principal(&*self.engine, ctx);
 
         // A worker joins a fleet of a farm, so an unheld farm or an unheld fleet is a 404
         // naming the level that is missing, and nothing is registered.

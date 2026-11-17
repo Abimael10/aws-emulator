@@ -237,7 +237,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // created, so none of its count is in use.
             current_count: 0,
             created_at: ::std::time::SystemTime::now(),
-            created_by: crate::state::caller_principal(ctx),
+            created_by: crate::state::caller_principal(&*self.engine, ctx),
             // Nothing has updated this limit yet, so it reports no update stamp until
             // something does.
             updated_at: None,

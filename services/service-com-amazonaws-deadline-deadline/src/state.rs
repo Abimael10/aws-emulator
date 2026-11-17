@@ -14,6 +14,11 @@ use std::time::{Duration, Instant, SystemTime};
 
 use sha2::{Digest, Sha256};
 
+/// The account's session registry and its view of the account's IAM records: WHO an access
+/// key id speaks for is a question about the account's identities, and this is the one
+/// place in the tree that answers it (see [`caller_principal`]).
+use ::service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts_state;
+
 /// Reading a name out of the template a request carried, in the language it named.
 mod templates;
 pub use templates::*;
@@ -1301,12 +1306,65 @@ pub fn idempotency_key(operation: &str, parent: &str, client_token: &str) -> Str
     format!("{operation}/{parent}/{client_token}")
 }
 
-/// The principal this request is made by, derived from the caller's own SigV4 access key
-/// id. Stored once at create time, so every later read of the resource reports the same
-/// `createdBy`.
-pub fn caller_principal(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
-    let akid = ::engine::extract_akid(&ctx.parts().headers);
-    ::engine::emulator_arn("iam", "", &format!("user/{akid}"))
+/// The principal this request speaks for, as `sts:GetCallerIdentity` reports it for the
+/// credentials the request was signed with — the value an audit member such as
+/// `createdBy`/`updatedBy` carries.
+///
+/// "The user or system that created this resource" (`CreatedBy`, this service's model) is
+/// an IDENTITY, not credential material, so it is resolved from the account's own records
+/// of who the presented access key id speaks for rather than interpolated from that key
+/// id's text:
+///
+/// * a key that names a live session of the account's session registry speaks for that
+///   session's principal — for an assumed role, the `assumed-role` ARN STS reports;
+/// * a key that names no session is a LONG-TERM key, and it speaks for the IAM user the
+///   account holds it for ([`sts_state::long_term_identity`]);
+/// * a key no store holds at all — including the key this emulator publishes at start, and
+///   a request that presents no credential — speaks for the account's own published
+///   identity.
+///
+/// A session whose expiry the clock has passed resolves to the long-term answer too, and
+/// that same call materialises the expiry; whether a credential verifies is the emulator's
+/// authentication layer's decision, never this service's.
+///
+/// So the principal a resource names as its author is the principal that caller reads as
+/// ITSELF, it does not change when the same principal signs with another credential, and
+/// every later read of the resource reports the value stored once at create time.
+pub fn caller_principal<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+) -> String {
+    let access_key_id = ::service_common::request_access_key_id(ctx.parts());
+    let long_term = long_term_principal(engine, &access_key_id);
+    let Some(sessions) = sts_state::service_state(engine) else {
+        return long_term.arn;
+    };
+    let resolved = sts_state::resolve_request_caller(
+        &mut sessions.lock(),
+        &access_key_id,
+        SystemTime::now(),
+        ctx.credential_store(),
+        long_term.clone(),
+    )
+    .map(|caller| caller.identity);
+    resolved.unwrap_or(long_term).arn
+}
+
+/// The identity a LONG-TERM access key speaks for: STS's own resolution of such a key
+/// against the account's IAM records ([`sts_state::long_term_identity`]) — the user the
+/// account holds the key for, and, for a key no record names, the account's own principal.
+///
+/// The resolution is CALLED rather than reproduced, so a caller reading its identity
+/// through `sts:GetCallerIdentity` and a caller reading an ARN this service recorded for
+/// the same credential see one principal. Two callers that have to be two principals are
+/// two IAM users of the account, each holding its own access key — the records this reads.
+fn long_term_principal<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    access_key_id: &str,
+) -> sts_state::Identity {
+    let iam = sts_state::iam_state(engine);
+    let guard = iam.as_ref().map(|iam| iam.lock());
+    sts_state::long_term_identity(guard.as_deref(), access_key_id)
 }
 
 /// A stored instant as the modeled `date-time` timestamp the response carries.

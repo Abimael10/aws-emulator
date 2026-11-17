@@ -207,7 +207,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             cost_scale_factor: input.cost_scale_factor,
             tags: input.tags.unwrap_or_default(),
             created_at: ::std::time::SystemTime::now(),
-            created_by: crate::state::caller_principal(ctx),
+            created_by: crate::state::caller_principal(&*self.engine, ctx),
             updated_at: None,
             updated_by: None,
             queues: ::std::collections::HashMap::new(),

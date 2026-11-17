@@ -376,7 +376,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             source_job_id: input.source_job_id,
             tags: input.tags.unwrap_or_default(),
             created_at: ::std::time::SystemTime::now(),
-            created_by: crate::state::caller_principal(ctx),
+            created_by: crate::state::caller_principal(&*self.engine, ctx),
             updated_at: None,
             updated_by: None,
             started_at: None,

@@ -26,7 +26,7 @@
 
 use serde_json::{json, Value};
 
-use crate::farm_queue_job::{absent_id, error_code, string_at, Emulator, CALLER};
+use crate::farm_queue_job::{absent_id, caller, error_code, string_at, Emulator};
 use crate::fleet::create_fleet;
 
 /// `PUT /2023-10-12/farms/{farmId}/queue-fleet-associations` — where an association is
@@ -150,7 +150,7 @@ async fn create_queue_fleet_association_stores_every_pair_it_is_asked_for() {
                         queue_id.clone(),
                         fleet_id.clone(),
                         "ACTIVE".to_string(),
-                        CALLER.to_string(),
+                        caller(),
                     ),
                     "case {case:?}: expected the stored pair {queue_id}/{fleet_id} reported as \
                      created and scheduling, got {association}"

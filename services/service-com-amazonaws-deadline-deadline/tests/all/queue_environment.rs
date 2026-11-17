@@ -27,7 +27,7 @@
 use serde_json::{json, Value};
 
 use crate::farm_queue_job::{
-    absent_id, error_code, id_of, is_resource_id, string_at, Emulator, CALLER,
+    absent_id, caller, error_code, id_of, is_resource_id, string_at, Emulator,
 };
 use crate::resource_not_found_wording::not_found_message;
 
@@ -255,7 +255,7 @@ async fn create_queue_environment_then_get_reports_what_was_created() {
                 Some(*priority),
                 (*template_type).to_string(),
                 template.clone(),
-                CALLER.to_string(),
+                caller(),
             ),
             "case {case:?}: expected the stored environment, got {body}"
         );

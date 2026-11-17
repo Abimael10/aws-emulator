@@ -234,7 +234,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The id and the principal are taken before the farm is borrowed, so the farm
         // this fleet is stored under is reached exactly once.
         let fleet_id = store.mint_id("fleet");
-        let created_by = crate::state::caller_principal(ctx);
+        let created_by = crate::state::caller_principal(&*self.engine, ctx);
 
         // A fleet lives under its farm, so an unknown farm is a 404 and nothing is
         // created.
