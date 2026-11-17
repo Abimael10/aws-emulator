@@ -8,10 +8,14 @@
 //!
 //! * a publish COPIES the `DEVELOPMENT` stage of the function its `Name` names into `LIVE`
 //!   ("Publishes a CloudFront function by copying the function code from the DEVELOPMENT
-//!   stage to LIVE"): the stage it writes carries the configuration and the code that stage
-//!   holds, keeps the function's created time, is last modified at the publish and gets a
-//!   FRESH version token of its own, so a later describe and get of `LIVE` answer from that
-//!   record — while the stage the publish READ keeps its own status and version token;
+//!   stage to LIVE"): the stage it writes carries the configuration, the code and the VERSION
+//!   TOKEN that stage holds, keeps the function's created time and is last modified at the
+//!   publish, so a later describe and get of `LIVE` answer from that record — while the stage
+//!   the publish READ keeps its own status and version token;
+//! * a publish MINTS no version: it models no new-version output member, so immediately after
+//!   one both stages report the token the last mutation of `DEVELOPMENT` handed back, and the
+//!   token a caller held across the publish still satisfies a precondition against either
+//!   stage. Only a later update of `DEVELOPMENT` makes the two stages diverge;
 //! * the copy only happens at the version its caller read: `IfMatch` is "The current version
 //!   (ETag value) of the function that you are publishing", so a header that carries no
 //!   version token at all is missing or not valid (`InvalidIfMatchVersion`, HTTP 400), one
@@ -212,9 +216,9 @@ async fn development_etag(router: &MultiServiceRouter, name: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// A publish COPIES the `DEVELOPMENT` stage into `LIVE`: the summary it answers with, and
-/// every later read of the `LIVE` stage, report the stored configuration and code under a
-/// version token of their own — while the stage the publish read keeps its own status and
-/// token. Across the table, no two published stages share a token.
+/// every later read of the `LIVE` stage, report the stored configuration and code under the
+/// version token the stage the publish read stands at — while that stage keeps its own status
+/// and token. Across the table, no two functions share a token.
 #[tokio::test]
 async fn a_publish_copies_development_into_live_and_the_reads_report_it() {
     let router = emulator();
@@ -258,8 +262,8 @@ async fn a_publish_copies_development_into_live_and_the_reads_report_it() {
              {published_created:?}"
         );
 
-        // The LIVE stage answers reads from the record the publish wrote, under a version
-        // token of its own.
+        // The LIVE stage answers reads from the record the publish wrote, under the version
+        // token that record was copied with.
         let live = describe_function(&router, &create.name, Some(STAGE_LIVE)).await;
         assert_eq!(
             live.status, 200,
@@ -278,9 +282,9 @@ async fn a_publish_copies_development_into_live_and_the_reads_report_it() {
             is_version_token(&live_etag),
             "case {case}: expected a version token for the LIVE stage, got {live_etag:?}"
         );
-        assert_ne!(
+        assert_eq!(
             live_etag, created_etag,
-            "case {case}: expected the published stage to carry a version token of its own"
+            "case {case}: expected the publish to copy the version token rather than mint one"
         );
         assert!(
             live_etags.insert(live_etag.clone()),
@@ -669,8 +673,8 @@ fn distribution_xml(reference: &str, arn: &str, attachment: Attachment) -> Strin
 
 /// The status a published stage reports is computed from the stored distributions: a function
 /// a cache behaviour attaches by ARN — the default behaviour's or an ordered one's — is
-/// published as associated, one nothing attaches as unassociated, and each publish mints a
-/// version token of its own for the stage it writes.
+/// published as associated, one nothing attaches as unassociated, and no publish mints a
+/// version token: the stage it writes stands at the version the stage it copied stands at.
 #[tokio::test]
 async fn the_published_status_reports_whether_a_behaviour_attaches_the_function() {
     let router = emulator();
@@ -735,8 +739,8 @@ async fn the_published_status_reports_whether_a_behaviour_attaches_the_function(
              {stored_attachment:?}"
         );
 
-        // So the next publish of that function reports the association, under a fresh version
-        // token.
+        // So the next publish of that function reports the association, under the version
+        // token the stage it copies still stands at — no publish mints one.
         let again = publish_function(&router, &create.name, &created_etag).await;
         assert_eq!(
             again.status, 200,
@@ -757,9 +761,14 @@ async fn the_published_status_reports_whether_a_behaviour_attaches_the_function(
              {live_status:?}"
         );
         let live_etag = live.header("etag").to_string();
-        assert_ne!(
+        assert_eq!(
             live_etag, first_live_etag,
-            "case {case}: expected the second publish to mint a version token of its own"
+            "case {case}: expected the second publish to keep the version token it copied"
+        );
+        assert_eq!(
+            live_etag, created_etag,
+            "case {case}: expected the LIVE stage to stand at the DEVELOPMENT version, got \
+             {live_etag:?}"
         );
     }
 

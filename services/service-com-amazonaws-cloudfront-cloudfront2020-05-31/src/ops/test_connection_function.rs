@@ -266,23 +266,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             "a CloudFront connection function was tested",
         );
 
-        let (connection_function_output, connection_function_error_message) = match run.outcome {
-            // "The connection function output" — the connection the script allowed, as it
-            // left it.
-            crate::state::FunctionOutcome::Returned(output) => (Some(output), None),
-            // "The connection function error message": the script ran and failed, which is
-            // a result this operation reports with the error message of that failure rather
-            // than a server fault.
-            crate::state::FunctionOutcome::Failed(message) => (None, Some(message)),
-            // The script ran to its end and took no decision about the connection. Nothing
-            // failed, so there is no error message to report, and nothing was allowed, so
-            // there is no connection to report either: the result is the summary, the logs
-            // and the time the run spent.
-            crate::state::FunctionOutcome::Unanswered => (None, None),
+        // What the result reports about the run, decided in the ONE place this service decides
+        // it ([`crate::state::FunctionOutcome::reported`]): a result carries BOTH the object
+        // the run produced and the error message it reported, so a client reading either member
+        // finds it on every test that is answered at all.
+        let reported = match run.outcome.reported() {
+            Ok(reported) => reported,
             // The run did not happen at all, so there is no result to report and nothing is
             // known about the code: "The CloudFront function failed" is what the service
             // answers for a test it could not carry out.
-            crate::state::FunctionOutcome::Unavailable(reason) => {
+            Err(reason) => {
                 ::tracing::warn!(
                     detail = %reason,
                     "a CloudFront connection function was not run, so its test could not be \
@@ -307,8 +300,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // "The connection function execution logs" — the lines that run wrote, in the
                 // order it wrote them.
                 connection_function_execution_logs: Some(run.logs),
-                connection_function_error_message,
-                connection_function_output,
+                // "The connection function error message" — the empty string for a run that
+                // reported no error.
+                connection_function_error_message: Some(reported.error_message),
+                // "The connection function output" — the connection the script allowed, as it
+                // left it, and the empty JSON object for a run that allowed none.
+                connection_function_output: Some(reported.output),
             }),
         })
     }

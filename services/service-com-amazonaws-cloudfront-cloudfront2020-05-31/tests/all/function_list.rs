@@ -7,17 +7,19 @@
 //! client takes. The rules under test are the ones CloudFront states for this listing:
 //!
 //! * the listing answers from the STORED functions — "Gets a list of all CloudFront
-//!   functions in your Amazon Web Services account" — each listed ONCE and in name order,
-//!   every item projected from the stage record it reports;
+//!   functions in your Amazon Web Services account" — in name order, every item projected
+//!   from the stage record it reports;
 //! * "You can optionally apply a filter to return only the functions that are in the
-//!   specified stage, either DEVELOPMENT or LIVE": a request that names no stage lists every
-//!   function under the stage a function is created in, and `Stage=LIVE` lists exactly the
-//!   functions a publish has copied into that stage — so a function appears there when, and
-//!   only when, it was published;
-//! * the page contract every CloudFront listing states: `MaxItems` is the page size and is
-//!   echoed, `Marker` resumes after the name the previous page ended at, `NextMarker` arrives
-//!   exactly when matching functions remain, `Quantity` states the length of `Items`, and a
-//!   page that lists nothing carries no `Items` element at all;
+//!   specified stage, either DEVELOPMENT or LIVE": the member is a FILTER, so a request that
+//!   supplies none applies none and lists every stage record each function holds — a
+//!   published function once per stage, an unpublished one once — while `Stage=LIVE` lists
+//!   exactly the functions a publish has copied into that stage and `Stage=DEVELOPMENT` every
+//!   function, each once;
+//! * the page contract every CloudFront listing states: `MaxItems` is "the maximum number of
+//!   functions that you want in the response" and is echoed, `Marker` resumes after the name
+//!   the previous page ended at, `NextMarker` arrives exactly when matching functions remain,
+//!   `Quantity` states the length of `Items`, and a page that lists nothing carries no `Items`
+//!   element at all;
 //! * a `MaxItems` no page size can be taken from is refused with the modelled
 //!   `InvalidArgument`.
 //!
@@ -162,13 +164,68 @@ fn ordered_published_names(table: &[Create]) -> Vec<String> {
     names
 }
 
+/// One expected item of a page: the name of the function it reports, the stage the item is
+/// projected from and the status that stage holds.
+type Item = (String, &'static str, &'static str);
+
+/// The items a listing that applies NO filter serves: every stage record each function holds,
+/// the stage a function is created in first, in name order.
+fn unfiltered_items(table: &[Create]) -> Vec<Item> {
+    let published = ordered_published_names(table);
+    ordered_names(table)
+        .into_iter()
+        .flat_map(|name| {
+            let mut items = vec![(name.clone(), STAGE_DEVELOPMENT, STATUS_UNPUBLISHED)];
+            if published.contains(&name) {
+                items.push((name, STAGE_LIVE, STATUS_UNASSOCIATED));
+            }
+            items
+        })
+        .collect()
+}
+
+/// The items a listing filtered on one stage serves: one per function that holds a record for
+/// it, in name order.
+fn items_of_stage(names: Vec<String>, stage: &'static str, status: &'static str) -> Vec<Item> {
+    names
+        .into_iter()
+        .map(|name| (name, stage, status))
+        .collect()
+}
+
+/// The names, the stages and the statuses of `items`, as the three vectors a [`Page`]
+/// reports.
+fn parts(items: &[Item]) -> (Vec<String>, Vec<String>, Vec<String>) {
+    (
+        items.iter().map(|(name, _, _)| name.clone()).collect(),
+        items.iter().map(|(_, stage, _)| stage.to_string()).collect(),
+        items
+            .iter()
+            .map(|(_, _, status)| status.to_string())
+            .collect(),
+    )
+}
+
+/// The distinct FUNCTIONS `names` carries, in the order they first appear — what `MaxItems`
+/// bounds, since one function contributes one item per stage it holds.
+fn distinct(names: &[String]) -> Vec<String> {
+    let mut distinct: Vec<String> = Vec::new();
+    for name in names {
+        if distinct.last() != Some(name) {
+            distinct.push(name.clone());
+        }
+    }
+    distinct
+}
+
 // ---------------------------------------------------------------------------
 // The rules
 // ---------------------------------------------------------------------------
 
 /// The listing answers from the stored functions, in name order, and the stage filter decides
-/// WHICH record each item is projected from: every function under the stage it is created in,
-/// and exactly the published ones under `LIVE`.
+/// WHICH records each item is projected from: every stage record each function holds when the
+/// request filters on none, every function under the stage it is created in, and exactly the
+/// published ones under `LIVE`.
 #[tokio::test]
 async fn the_listing_reports_the_stored_functions_of_the_stage_asked_for() {
     let router = emulator();
@@ -176,46 +233,36 @@ async fn the_listing_reports_the_stored_functions_of_the_stage_asked_for() {
     let all = ordered_names(&table);
     let published = ordered_published_names(&table);
 
-    for (case, query, expected, stage, status) in [
-        (
-            "no stage at all",
-            String::new(),
-            all.clone(),
-            STAGE_DEVELOPMENT,
-            STATUS_UNPUBLISHED,
-        ),
+    for (case, query, expected) in [
+        ("no stage at all", String::new(), unfiltered_items(&table)),
         (
             "the stage a function is created in",
             format!("?Stage={STAGE_DEVELOPMENT}"),
-            all.clone(),
-            STAGE_DEVELOPMENT,
-            STATUS_UNPUBLISHED,
+            items_of_stage(all.clone(), STAGE_DEVELOPMENT, STATUS_UNPUBLISHED),
         ),
         (
             "the published stage",
             format!("?Stage={STAGE_LIVE}"),
-            published.clone(),
-            STAGE_LIVE,
-            STATUS_UNASSOCIATED,
+            items_of_stage(published.clone(), STAGE_LIVE, STATUS_UNASSOCIATED),
         ),
     ] {
         let answer = list_functions(&router, &query).await;
         let page = page(&answer, case);
+        let (names, stages, statuses) = parts(&expected);
         assert_eq!(
-            page.names, expected,
+            page.names, names,
             "case {case}: expected the stored functions in name order, got {:?}",
             page.names
         );
         assert_eq!(
-            page.stages,
-            vec![stage.to_string(); expected.len()],
-            "case {case}: expected every item in the {stage} stage, got {:?}",
+            page.stages, stages,
+            "case {case}: expected each item projected from the stage record it reports, got \
+             {:?}",
             page.stages
         );
         assert_eq!(
-            page.statuses,
-            vec![status.to_string(); expected.len()],
-            "case {case}: expected every item to report Status {status}, got {:?}",
+            page.statuses, statuses,
+            "case {case}: expected each item to report the status its stage holds, got {:?}",
             page.statuses
         );
         assert_eq!(
@@ -239,8 +286,9 @@ async fn the_listing_reports_the_stored_functions_of_the_stage_asked_for() {
 }
 
 /// A function appears under `LIVE` when, and only when, a publish has copied it there: the
-/// listing of a store in which nothing is published lists nothing at all, and each publish
-/// adds exactly its own function to that listing.
+/// listing of a store in which nothing is published lists nothing at all, each publish adds
+/// exactly its own function to that listing, and the listing that filters on nothing then
+/// reports that function twice — once per stage it holds.
 #[tokio::test]
 async fn the_live_listing_reports_exactly_what_a_publish_promoted() {
     let router = emulator();
@@ -295,12 +343,36 @@ async fn the_live_listing_reports_exactly_what_a_publish_promoted() {
             "case {case}: expected every stored function under {STAGE_DEVELOPMENT}, got {:?}",
             development.names
         );
+
+        // And the listing that filters on NOTHING reports both: every function at the stage
+        // it was created in, and each published one at `LIVE` as well.
+        let unfiltered = list_functions(&router, "").await;
+        let unfiltered = page(&unfiltered, case);
+        let mut expected_items: Vec<(String, String)> = Vec::new();
+        for name in ordered_names(&table) {
+            expected_items.push((name.clone(), STAGE_DEVELOPMENT.to_string()));
+            if expected.contains(&name) {
+                expected_items.push((name, STAGE_LIVE.to_string()));
+            }
+        }
+        let listed: Vec<(String, String)> = unfiltered
+            .names
+            .iter()
+            .cloned()
+            .zip(unfiltered.stages.iter().cloned())
+            .collect();
+        assert_eq!(
+            listed, expected_items,
+            "case {case}: expected the unfiltered listing to report every stage each function \
+             holds, got {listed:?}"
+        );
     }
 }
 
-/// The page contract: `MaxItems` is the page size and is echoed, `Marker` resumes after the
-/// name the previous page ended at, `NextMarker` arrives exactly when matching functions
-/// remain, and walking the pages enumerates every function exactly once, in name order.
+/// The page contract: `MaxItems` is "the maximum number of functions that you want in the
+/// response" and is echoed, `Marker` resumes after the name the previous page ended at,
+/// `NextMarker` arrives exactly when matching functions remain, and walking the pages
+/// enumerates every stage record of every function exactly once, in name order.
 #[tokio::test]
 async fn the_pages_enumerate_every_function_exactly_once() {
     let router = emulator();
@@ -308,17 +380,30 @@ async fn the_pages_enumerate_every_function_exactly_once() {
     let all = ordered_names(&table);
 
     for (stage_case, query, expected) in [
-        ("no stage at all", String::new(), all.clone()),
+        ("no stage at all", String::new(), unfiltered_items(&table)),
+        (
+            "the stage a function is created in",
+            format!("&Stage={STAGE_DEVELOPMENT}"),
+            items_of_stage(all.clone(), STAGE_DEVELOPMENT, STATUS_UNPUBLISHED),
+        ),
         (
             "the published stage",
             format!("&Stage={STAGE_LIVE}"),
-            ordered_published_names(&table),
+            items_of_stage(
+                ordered_published_names(&table),
+                STAGE_LIVE,
+                STATUS_UNASSOCIATED,
+            ),
         ),
     ] {
-        // Every page size from one item up to one past the whole collection.
-        for size in 1..=expected.len() + 1 {
+        let (expected_names, expected_stages, _) = parts(&expected);
+        // The page size bounds FUNCTIONS, and one function contributes an item per stage it
+        // holds, so the walk is driven over every size from one function up to one past the
+        // whole collection of them.
+        let functions = distinct(&expected_names);
+        for size in 1..=functions.len() + 1 {
             let case = format!("{stage_case}, MaxItems {size}");
-            let mut walked: Vec<String> = Vec::new();
+            let mut walked: Vec<(String, String)> = Vec::new();
             let mut seen = BTreeSet::new();
             let mut marker: Option<String> = None;
             let mut pages = 0;
@@ -334,12 +419,12 @@ async fn the_pages_enumerate_every_function_exactly_once() {
                 let page = page(&answer, &case);
                 pages += 1;
                 assert!(
-                    pages <= expected.len() + 2,
+                    pages <= functions.len() + 2,
                     "case {case}: the paging walk does not terminate, got {pages} pages"
                 );
                 assert!(
-                    page.names.len() <= size,
-                    "case {case}: expected at most {size} items on a page, got {:?}",
+                    distinct(&page.names).len() <= size,
+                    "case {case}: expected at most {size} functions on a page, got {:?}",
                     page.names
                 );
                 assert_eq!(
@@ -354,13 +439,13 @@ async fn the_pages_enumerate_every_function_exactly_once() {
                     "case {case}: expected Quantity to state the length of Items, got {:?}",
                     page.quantity
                 );
-                for name in &page.names {
+                for item in page.names.iter().cloned().zip(page.stages.iter().cloned()) {
                     assert!(
-                        seen.insert(name.clone()),
-                        "case {case}: the function {name} was listed twice"
+                        seen.insert(item.clone()),
+                        "case {case}: the item {item:?} was listed twice"
                     );
+                    walked.push(item);
                 }
-                walked.extend(page.names.iter().cloned());
 
                 let remaining = expected.len() > walked.len();
                 match (&page.next_marker, remaining) {
@@ -381,10 +466,18 @@ async fn the_pages_enumerate_every_function_exactly_once() {
                 }
             }
 
+            let walked_names: Vec<String> = walked.iter().map(|(name, _)| name.clone()).collect();
+            let walked_stages: Vec<String> =
+                walked.iter().map(|(_, stage)| stage.clone()).collect();
             assert_eq!(
-                walked, expected,
+                walked_names, expected_names,
                 "case {case}: expected the pages to enumerate every function in name order, got \
-                 {walked:?}"
+                 {walked_names:?}"
+            );
+            assert_eq!(
+                walked_stages, expected_stages,
+                "case {case}: expected the pages to enumerate every stage record, got \
+                 {walked_stages:?}"
             );
         }
     }
@@ -421,10 +514,10 @@ async fn a_max_items_no_page_size_can_be_taken_from_is_refused() {
     let case = "a page size past the whole collection";
     let answer = list_functions(&router, &format!("?MaxItems={}", MAX_ITEMS + 1)).await;
     let page = page(&answer, case);
+    let (names, _, _) = parts(&unfiltered_items(&table));
     assert_eq!(
-        page.names,
-        ordered_names(&table),
-        "case {case}: expected every stored function, got {:?}",
+        page.names, names,
+        "case {case}: expected every stage record of every stored function, got {:?}",
         page.names
     );
     assert_eq!(

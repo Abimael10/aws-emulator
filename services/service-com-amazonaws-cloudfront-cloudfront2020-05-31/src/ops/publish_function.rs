@@ -197,7 +197,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The copy itself, and the projection of the stage it wrote. The record this answers
         // from is the one the store now holds, so a later describe or get of the `LIVE` stage
-        // reports the same configuration, code, status, stage and timestamps.
+        // reports the same configuration, code, status, stage, timestamps and version token.
+        // A publish MINTS no version — it models no new-version output member and copies the
+        // stage it read whole — so the token this caller held names both stages from here on.
         let Some(summary) = store.publish_function(&input.name, now) else {
             return Err(PublishFunctionErrorModeled::NoSuchFunctionExists(
                 crate::state::no_such_function_exists(),

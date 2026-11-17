@@ -11,15 +11,19 @@
 //!   also contains function logs and error messages, if any exist." So the result is
 //!   whatever the STORED code did with the submitted event object: the event object it
 //!   returned (reported under `response` when it carries `statusCode`, under `request`
-//!   otherwise), the lines it logged in the order it logged them, and — when it failed —
-//!   the error message instead of an output;
+//!   otherwise), the lines it logged in the order it logged them, and the error message of a
+//!   run that failed;
+//! * a result that is served at all reports BOTH halves of the run: `FunctionOutput` is
+//!   present on every 200 and carries the empty JSON object for a run that returned none, and
+//!   `FunctionErrorMessage` is present on every 200 and carries the EMPTY STRING for a run
+//!   that reported no error;
 //! * the code that runs is the one the STAGE the request names holds: a request naming no
 //!   stage tests `DEVELOPMENT`, `LIVE` runs what a publish copied there, and a stage no
 //!   stored function has is "The function does not exist" (`NoSuchFunctionExists`, HTTP 404);
 //! * `IfMatch` is "The current version (ETag value) of the function that you are testing",
-//!   checked against the version of the stage being tested, and this operation models no
-//!   failed-precondition error: a header that is no version token at all and one carrying a
-//!   token that is not that stage's are both `InvalidIfMatchVersion` (HTTP 400);
+//!   checked against the version of the stage being tested: a header that is no version token
+//!   at all is `InvalidIfMatchVersion` (HTTP 400), and a well-formed token that is not that
+//!   stage's current one is the failed precondition (`PreconditionFailed`, HTTP 412);
 //! * an event object that is no JSON object describes no event a function can be passed, so
 //!   it is refused with `InvalidArgument` (HTTP 400) and nothing runs;
 //! * a test REPORTS, so it persists nothing: the function, its version tokens and its code
@@ -53,6 +57,17 @@ const STAGE_LIVE: &str = "LIVE";
 /// — but that no function in a fresh emulator holds, so a precondition carrying it is stale
 /// rather than malformed.
 const UNHELD_VERSION_TOKEN: &str = "E1ABCDEFGHIJKL";
+
+/// The document a result reports for a run that returned no event object: the empty JSON
+/// object. A literal here rather than the crate's own constant, so a wrong constant in the
+/// crate cannot make these assertions pass.
+const EMPTY_EVENT_OBJECT: &str = "{}";
+
+/// `PreconditionFailed`'s sentence on the resource-document surface a function belongs to —
+/// fixed text with no variable parts, as a literal for the same reason.
+const PRECONDITION_FAILED_SENTENCE: &str =
+    "The request failed because it didn't meet the preconditions in one or more \
+     request-header fields.";
 
 /// A viewer-request event object, in the shape CloudFront documents for one: the version, the
 /// context, the viewer and the `request` the function may modify.
@@ -169,13 +184,16 @@ struct Run {
     code: &'static str,
     /// The event object the request carries, as the JSON text a client submits.
     event: &'static str,
-    /// The JSON the `FunctionOutput` member must carry, when the run returns one.
+    /// The JSON the `FunctionOutput` member must carry, when the run returns one. A run that
+    /// returns none reports the empty JSON object instead.
     output: Option<&'static str>,
     /// The log lines the result must report, in order.
     logs: Vec<&'static str>,
     /// A fragment the reported error message must contain, or `Some("")` for a run that must
     /// report SOME error message whose wording is the engine's own. `None` where the run
-    /// must report no error at all.
+    /// must report no error at all. A run that RAISED reports the error as the engine
+    /// renders it — its name and its message — so the fragment names both where the kind of
+    /// failure is what the row is about.
     error: Option<&'static str>,
 }
 
@@ -307,7 +325,7 @@ fn run_table() -> Vec<Run> {
             event: VIEWER_REQUEST_EVENT,
             output: None,
             logs: vec!["about to fail"],
-            error: Some("no catalog for /old"),
+            error: Some("Error: no catalog for /old"),
         },
         Run {
             case: "a handler that returns something that is no event object",
@@ -331,7 +349,7 @@ fn run_table() -> Vec<Run> {
             event: VIEWER_REQUEST_EVENT,
             output: None,
             logs: Vec::new(),
-            error: Some(""),
+            error: Some("SyntaxError"),
         },
         Run {
             case: "a handler that never returns, which a bound stops",
@@ -361,9 +379,9 @@ fn run_table() -> Vec<Run> {
 
 /// The result is what the stored code DID with the submitted event object: the event object
 /// it returned, under the member its shape names; the lines it logged, in order; and the
-/// error message of a run that failed, with no output beside it. Every result reports a
-/// compute utilization that is a whole-number percentage of the allowed execution time, and
-/// the summary of the function that was tested.
+/// error message of a run that failed, beside the empty event object such a run produced.
+/// Every result reports both of those members, a compute utilization that is a whole-number
+/// percentage of the allowed execution time, and the summary of the function that was tested.
 #[tokio::test]
 async fn a_test_reports_what_the_stored_code_did_with_the_event_object() {
     let router = emulator();
@@ -414,40 +432,33 @@ async fn a_test_reports_what_the_stored_code_did_with_the_event_object() {
             "case {case}: expected a percentage of the allowed time, got {utilization}"
         );
 
-        match run.output {
-            Some(expected) => {
-                let output = result_text(result, "FunctionOutput").unwrap_or_else(|| {
-                    panic!("case {case}: the result carries no FunctionOutput: {}", answer.raw)
-                });
-                assert_eq!(
-                    json(output, case),
-                    json(expected, case),
-                    "case {case}: expected the event object the function returned, got {output}"
-                );
-            }
-            None => assert_eq!(
-                result_text(result, "FunctionOutput").unwrap_or_default(),
-                "",
-                "case {case}: a failed run reports no event object, got {}",
-                answer.raw
-            ),
-        }
+        // Both halves of the run are reported on every result that is served at all: the
+        // event object it produced — the empty JSON object for a run that produced none — and
+        // the error message, which is the empty string for a run that reported none.
+        let output = result_text(result, "FunctionOutput").unwrap_or_else(|| {
+            panic!("case {case}: the result carries no FunctionOutput: {}", answer.raw)
+        });
+        assert_eq!(
+            json(output, case),
+            json(run.output.unwrap_or(EMPTY_EVENT_OBJECT), case),
+            "case {case}: expected the event object the run produced, got {output}"
+        );
 
-        match run.error {
-            Some(fragment) => {
-                let message = result_text(result, "FunctionErrorMessage").unwrap_or_else(|| {
-                    panic!("case {case}: the result carries no FunctionErrorMessage: {}", answer.raw)
-                });
-                assert!(
-                    !message.is_empty() && message.contains(fragment),
-                    "case {case}: expected an error message carrying {fragment:?}, got {message:?}"
-                );
-            }
-            None => assert_eq!(
-                result_text(result, "FunctionErrorMessage").unwrap_or_default(),
-                "",
-                "case {case}: a run that returned reports no error message, got {}",
+        let message = result_text(result, "FunctionErrorMessage").unwrap_or_else(|| {
+            panic!(
+                "case {case}: the result carries no FunctionErrorMessage: {}",
                 answer.raw
+            )
+        });
+        match run.error {
+            Some(fragment) => assert!(
+                !message.is_empty() && message.contains(fragment),
+                "case {case}: expected an error message carrying {fragment:?}, got {message:?}"
+            ),
+            None => assert_eq!(
+                message, "",
+                "case {case}: a run that reported no error reports the empty string, got \
+                 {message:?}"
             ),
         }
 
@@ -598,10 +609,12 @@ async fn the_stage_the_request_names_decides_which_code_runs() {
 }
 
 /// The test only runs the version its caller read: the precondition is checked against the
-/// version of the STAGE being tested, and this operation models no failed-precondition error,
-/// so a header that is no version token at all and one carrying a version no stage of the
-/// function stands at are both "missing or not valid". The current version of the stage
-/// addressed runs, bare or quoted as an HTTP entity tag.
+/// version of the STAGE being tested, and the two ways a header can fail are different
+/// answers — a value that is no version token at all is "missing or not valid"
+/// (`InvalidIfMatchVersion`, HTTP 400), while a well-formed token that is not that stage's
+/// current one is the failed precondition (`PreconditionFailed`, HTTP 412) with the fixed
+/// sentence its API family states. The current version of the stage addressed runs, bare or
+/// quoted as an HTTP entity tag.
 #[tokio::test]
 async fn a_test_needs_the_current_version_of_the_stage_it_runs() {
     let router = emulator();
@@ -629,25 +642,37 @@ async fn a_test_needs_the_current_version_of_the_stage_it_runs() {
             "a header that is no version token at all",
             None,
             "not-a-version".to_string(),
-            Some("InvalidIfMatchVersion"),
+            Some((400, "InvalidIfMatchVersion")),
         ),
         (
             "an empty header",
             None,
             String::new(),
-            Some("InvalidIfMatchVersion"),
+            Some((400, "InvalidIfMatchVersion")),
+        ),
+        (
+            "a token of the right shape in the wrong case",
+            None,
+            development_etag.to_lowercase(),
+            Some((400, "InvalidIfMatchVersion")),
+        ),
+        (
+            "a token whose body is too short",
+            None,
+            "E123".to_string(),
+            Some((400, "InvalidIfMatchVersion")),
         ),
         (
             "a well-formed token no function holds",
             None,
             UNHELD_VERSION_TOKEN.to_string(),
-            Some("InvalidIfMatchVersion"),
+            Some((412, "PreconditionFailed")),
         ),
         (
             "a well-formed token no function holds, against the LIVE stage",
             Some(STAGE_LIVE),
             UNHELD_VERSION_TOKEN.to_string(),
-            Some("InvalidIfMatchVersion"),
+            Some((412, "PreconditionFailed")),
         ),
     ] {
         let answer =
@@ -665,10 +690,10 @@ async fn a_test_needs_the_current_version_of_the_stage_it_runs() {
                     answer.raw
                 );
             }
-            Some(code) => {
+            Some((status, code)) => {
                 assert_eq!(
-                    answer.status, 400,
-                    "case {case}: expected HTTP 400, got {} with {}",
+                    answer.status, status,
+                    "case {case}: expected HTTP {status}, got {} with {}",
                     answer.status, answer.raw
                 );
                 assert_eq!(
@@ -677,6 +702,14 @@ async fn a_test_needs_the_current_version_of_the_stage_it_runs() {
                     "case {case}: expected {code}, got {}",
                     answer.raw
                 );
+                if code == "PreconditionFailed" {
+                    let message = answer.root().find_text("Message").unwrap_or_default();
+                    assert_eq!(
+                        message, PRECONDITION_FAILED_SENTENCE,
+                        "case {case}: expected the sentence {PRECONDITION_FAILED_SENTENCE:?}, \
+                         got {message:?}"
+                    );
+                }
             }
         }
     }
@@ -831,7 +864,7 @@ async fn one_run_cannot_report_more_than_the_ceilings_allow() {
     }
 
     // An event object past the output ceiling: the run happened, so it is the run that is
-    // reported as failed, with the ceiling named and no output beside it.
+    // reported as failed, with the ceiling named and the empty event object beside it.
     let verbose = format!(
         "function handler(event) {{\n\
          \x20   var request = event.request;\n\
@@ -856,7 +889,7 @@ async fn one_run_cannot_report_more_than_the_ceilings_allow() {
     );
     assert_eq!(
         result_text(answer.root(), "FunctionOutput").unwrap_or_default(),
-        "",
+        EMPTY_EVENT_OBJECT,
         "an event object past the ceiling must not be served: {}",
         answer.raw
     );
@@ -866,4 +899,171 @@ async fn one_run_cannot_report_more_than_the_ceilings_allow() {
         "expected the reported error to name the {MAX_OUTPUT_BYTES} byte ceiling, got \
          {message:?}"
     );
+}
+
+/// One version-gated test of a stage: which stage the request addresses, the token it
+/// carries, and the refusal it must be answered with — `None` for a test that runs.
+struct StageToken {
+    case: &'static str,
+    stage: Option<&'static str>,
+    token: String,
+    refusal: Option<(u16, &'static str)>,
+}
+
+/// Each stage is tested at ITS OWN version, and a publish mints none: right after a publish
+/// the one token the create handed back runs a test of either stage, and once an update has
+/// minted a token for `DEVELOPMENT` the two stages stand at different versions — so each
+/// stage runs at its own token and refuses the other stage's, which is a well-formed token
+/// that is not this stage's current one and so the failed precondition.
+///
+/// The rows span the stage the request addresses (none named, `DEVELOPMENT`, `LIVE`) and
+/// which of the two live tokens the header carries.
+#[tokio::test]
+async fn each_stage_is_tested_at_its_own_version_and_a_publish_mints_none() {
+    let router = emulator();
+    let name = "stage_version_rewrite";
+    let code = "function handler(event) { return event.request; }\n";
+    let created_etag = create_one(&router, name, code).await;
+    let published = publish_function(&router, name, &created_etag).await;
+    assert_eq!(
+        published.status, 200,
+        "the publish must answer HTTP 200, got {} with {}",
+        published.status, published.raw
+    );
+
+    // The publish copied the stage whole, version token included, so both stages report the
+    // version the create handed back and that one token runs a test of either.
+    for stage in [STAGE_DEVELOPMENT, STAGE_LIVE] {
+        let described = describe_function(&router, name, Some(stage)).await;
+        assert_eq!(
+            described.header("etag"),
+            created_etag,
+            "expected the {stage} stage to stand at the version the create handed back, got {:?}",
+            described.header("etag")
+        );
+    }
+    for stage in [None, Some(STAGE_DEVELOPMENT), Some(STAGE_LIVE)] {
+        let answer = test_function(
+            &router,
+            name,
+            stage,
+            VIEWER_REQUEST_EVENT.as_bytes(),
+            &created_etag,
+        )
+        .await;
+        assert_eq!(
+            answer.status, 200,
+            "case {stage:?}: expected the copied version token to run a test of the stage, got \
+             {} with {}",
+            answer.status, answer.raw
+        );
+    }
+
+    // One update of DEVELOPMENT mints a token for THAT stage, so the two stages diverge.
+    let revised = function(
+        name,
+        "function handler(event) {\n\
+         \x20   var request = event.request;\n\
+         \x20   request.uri = '/revised';\n\
+         \x20   return request;\n\
+         }\n",
+    );
+    let updated = update_function(&router, name, &revised, Some(&created_etag)).await;
+    assert_eq!(
+        updated.status, 200,
+        "the update must answer HTTP 200, got {} with {}",
+        updated.status, updated.raw
+    );
+    let development_etag = updated.header(UPDATE_ETAG_HEADER).to_string();
+    assert_ne!(
+        development_etag, created_etag,
+        "expected the update to mint a version token for the stage it edited"
+    );
+    let live_etag = describe_function(&router, name, Some(STAGE_LIVE))
+        .await
+        .header("etag")
+        .to_string();
+    assert_eq!(
+        live_etag, created_etag,
+        "expected the published stage to keep the version it was copied with, got {live_etag:?}"
+    );
+
+    // One version-gated test per row: which stage it addresses, the token it carries, and the
+    // refusal it must be answered with.
+    let rows: [StageToken; 6] = [
+        StageToken {
+            case: "the published stage, at its own version",
+            stage: Some(STAGE_LIVE),
+            token: live_etag.clone(),
+            refusal: None,
+        },
+        StageToken {
+            case: "the published stage, carrying the edited stage's version",
+            stage: Some(STAGE_LIVE),
+            token: development_etag.clone(),
+            refusal: Some((412, "PreconditionFailed")),
+        },
+        StageToken {
+            case: "the edited stage, at its own version",
+            stage: Some(STAGE_DEVELOPMENT),
+            token: development_etag.clone(),
+            refusal: None,
+        },
+        StageToken {
+            case: "the edited stage, carrying the version the update superseded",
+            stage: Some(STAGE_DEVELOPMENT),
+            token: live_etag.clone(),
+            refusal: Some((412, "PreconditionFailed")),
+        },
+        StageToken {
+            case: "no stage named, at the edited stage's version",
+            stage: None,
+            token: development_etag.clone(),
+            refusal: None,
+        },
+        StageToken {
+            case: "no stage named, carrying the version the update superseded",
+            stage: None,
+            token: live_etag.clone(),
+            refusal: Some((412, "PreconditionFailed")),
+        },
+    ];
+
+    for row in rows {
+        let case = row.case;
+        let answer = test_function(
+            &router,
+            name,
+            row.stage,
+            VIEWER_REQUEST_EVENT.as_bytes(),
+            &row.token,
+        )
+        .await;
+        match row.refusal {
+            None => assert_eq!(
+                answer.status, 200,
+                "case {case}: expected the test to run, got {} with {}",
+                answer.status, answer.raw
+            ),
+            Some((status, code)) => {
+                assert_eq!(
+                    answer.status, status,
+                    "case {case}: expected HTTP {status}, got {} with {}",
+                    answer.status, answer.raw
+                );
+                assert_eq!(
+                    answer.error_code(),
+                    code,
+                    "case {case}: expected {code}, got {}",
+                    answer.raw
+                );
+                let message = answer.root().find_text("Message").unwrap_or_default();
+                assert_eq!(
+                    message, PRECONDITION_FAILED_SENTENCE,
+                    "case {case}: expected the sentence {PRECONDITION_FAILED_SENTENCE:?}, got \
+                     {message:?}"
+                );
+            }
+        }
+    }
 }

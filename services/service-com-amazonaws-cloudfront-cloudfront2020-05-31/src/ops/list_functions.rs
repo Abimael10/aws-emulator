@@ -163,15 +163,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // "An optional filter to return only the functions that are in the specified stage":
-        // a request that names no stage lists every function it holds, under the stage a
-        // function is created in — the SAME default the function reads take — while
-        // `Stage=LIVE` lists only the functions a publish has copied into that stage. The
-        // value is constrained to the modelled `FunctionStage` enum, so reaching here means
-        // it names one of the two stages.
-        let stage = input
-            .stage
-            .as_deref()
-            .unwrap_or(crate::state::DEFAULT_FUNCTION_STAGE);
+        // the member is a FILTER, so a request that supplies none applies NONE — every stage
+        // record each function holds is listed, which is one item for a function nothing has
+        // published and one per stage for a published one. A request that names a stage keeps
+        // the single-stage projection. The value is constrained to the modelled
+        // `FunctionStage` enum, so a filter that is there names one of the two stages.
+        let filter = input.stage.as_deref();
 
         // A READ: nothing about a function is owed by the clock — a function reaches its
         // `LIVE` stage through a publish CALL rather than by waiting — so this read
@@ -180,6 +177,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut items: Vec<FunctionSummary> = Vec::new();
         let mut is_truncated = false;
+        // How many FUNCTIONS this page carries, which is what the page size bounds, and the
+        // name of the last of them, which is where a following page resumes.
+        let mut functions_on_page = 0usize;
+        let mut page_ended_at: Option<&str> = None;
         // `Marker` names where the previous page ENDED, so this page starts after it — "The
         // response includes functions in the list that occur after the marker" — and walking
         // the pages enumerates every function exactly once. A function is held under its
@@ -190,17 +191,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => Bound::Unbounded,
         };
         for (_, stored) in store.functions.range::<str, _>((start, Bound::Unbounded)) {
-            // A function with no record for the stage asked for is not in that stage, so it
-            // is not on this page; every item is projected from the STAGE record, so a listed
-            // function reports the configuration and the status that stage holds.
-            let Some(stage_record) = stored.stage(stage) else {
-                continue;
+            // The records this function contributes: the one the filter names, or every stage
+            // it holds when the request filters on none. Every item is projected from a STAGE
+            // record, so a listed function reports the configuration and the status that stage
+            // holds; a function with no record for the stage asked for contributes nothing and
+            // is not on this page at all.
+            let records: Vec<&crate::state::StoredFunctionStage> = match filter {
+                Some(stage) => stored.stage(stage).into_iter().collect(),
+                None => stored.stages().collect(),
             };
-            if items.len() >= page_size {
+            if records.is_empty() {
+                continue;
+            }
+            // "The maximum number of functions that you want in the response": the page is
+            // bounded in FUNCTIONS, so the stages of one function are served together and the
+            // marker — which names a function — never falls between them.
+            if functions_on_page >= page_size {
                 is_truncated = true;
                 break;
             }
-            items.push(stage_record.to_summary(&stored.name, &stored.arn));
+            functions_on_page += 1;
+            page_ended_at = Some(stored.name.as_str());
+            items.extend(
+                records
+                    .into_iter()
+                    .map(|record| record.to_summary(&stored.name, &stored.arn)),
+            );
         }
 
         Ok(ListFunctionsOutput {
@@ -211,13 +227,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // you left off" — the name the page ended at, and nothing at all on a page
                 // that ends the collection.
                 next_marker: if is_truncated {
-                    items.last().map(|summary| summary.name.clone())
+                    page_ended_at.map(str::to_string)
                 } else {
                     None
                 },
                 // "The maximum number of functions requested."
                 max_items,
-                // "The number of functions returned in the response": the length of `Items`.
+                // "The number of functions returned in the response": the length of `Items`,
+                // which is one entry per stage each listed function contributes.
                 quantity: i32::try_from(items.len()).unwrap_or(i32::MAX),
                 // "Contains the functions in the list." A page that lists nothing carries no
                 // `Items` element at all, rather than an empty one — the same form every

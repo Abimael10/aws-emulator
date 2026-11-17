@@ -187,6 +187,77 @@ pub enum FunctionOutcome {
     Unavailable(String),
 }
 
+impl FunctionOutcome {
+    /// What a TEST RESULT reports about this outcome, or the reason the run did not happen at
+    /// all — which is no result, and is answered as the test having failed instead.
+    ///
+    /// A test result that is served at all reports BOTH halves of what a run produced: the
+    /// output document and the error message. A run that returned an event object reports it
+    /// with NO error message — the empty string, which is what "there was no error" is said
+    /// with — and a run that failed reports its error message beside an EMPTY event object
+    /// ([`EMPTY_EVENT_OBJECT`]): the function's result IS the object it returned, so a run
+    /// that returned none produced no object, and nothing it did to the one it was handed
+    /// leaks past the failure. ONE mapping for every function test of this service, so the
+    /// two kinds of function report a run the same way.
+    pub fn reported(self) -> Result<ReportedRun, String> {
+        match self {
+            // "Returns the function's result (the modified event object) in the response."
+            Self::Returned(output) => Ok(ReportedRun::returned(output)),
+            // "If the result of testing the function was an error, this field contains the
+            // error message": the code ran and failed, which is a result the test reports
+            // with the error message of that failure rather than a server fault.
+            Self::Failed(message) => Ok(ReportedRun::failed(message)),
+            // The code ran, came back without answering and failed at nothing: there is no
+            // object it produced to report, and no error either.
+            Self::Unanswered => Ok(ReportedRun::returned(EMPTY_EVENT_OBJECT.to_string())),
+            // The run did not happen at all, so there is no result to report and nothing is
+            // known about the code.
+            Self::Unavailable(reason) => Err(reason),
+        }
+    }
+}
+
+/// What a function test reports about one run that HAPPENED.
+///
+/// Both members are always reported: see [`FunctionOutcome::reported`], the one place they
+/// are decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportedRun {
+    /// The event object the run produced, as the JSON document the result carries
+    /// (`TestResult$FunctionOutput`, "the event object returned by the function").
+    pub output: String,
+    /// The failure the run reported, or the EMPTY STRING for a run that reported none
+    /// (`TestResult$FunctionErrorMessage`, "if the result of testing the function was an
+    /// error, this field contains the error message").
+    pub error_message: String,
+}
+
+impl ReportedRun {
+    /// A run that produced `output` and failed at nothing.
+    fn returned(output: String) -> Self {
+        Self {
+            output,
+            error_message: String::new(),
+        }
+    }
+
+    /// A run that failed with `message`, and so produced no event object of its own.
+    fn failed(message: String) -> Self {
+        Self {
+            output: EMPTY_EVENT_OBJECT.to_string(),
+            error_message: message,
+        }
+    }
+}
+
+/// The event object a run that produced none is reported with: the empty JSON object
+/// document.
+///
+/// A result reports an output document whether or not the run came back with one, so the
+/// document for "the run produced none" is the object with no members in it — never a
+/// fragment of the event object the request carried, which a failed run did not return.
+pub const EMPTY_EVENT_OBJECT: &str = "{}";
+
 /// Everything one run of a function produced.
 #[derive(Debug, Clone)]
 pub struct FunctionRun {
@@ -679,13 +750,30 @@ fn returned_output(text: &str) -> Result<String, String> {
     Ok(text.to_string())
 }
 
-/// The message a raise carries: the error's own, as the code worded it.
+/// The message a raise carries: the error as the ENGINE renders it.
+///
+/// A JavaScript error stringifies as its NAME and its message joined by `": "`
+/// (`Error.prototype.toString`), and the name is what tells a caller which KIND of failure
+/// the run had — a `SyntaxError` from code that does not parse is a different answer from an
+/// `Error` the code threw itself — so both halves are reported, each worded by the engine.
+/// An error carrying only one of them is reported as that one, and a thrown value that is no
+/// error object at all as the engine renders that value.
 fn raised_message(caught: &::rquickjs::CaughtError<'_>) -> String {
     match caught {
-        ::rquickjs::CaughtError::Exception(exception) => exception
-            .message()
-            .filter(|message| !message.is_empty())
-            .unwrap_or_else(|| exception.to_string()),
+        ::rquickjs::CaughtError::Exception(exception) => {
+            let message = exception.message().unwrap_or_default();
+            let name = exception
+                .get::<_, Option<String>>("name")
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            match (name.trim(), message.trim()) {
+                ("", "") => exception.to_string(),
+                ("", message) => message.to_string(),
+                (name, "") => name.to_string(),
+                (name, message) => format!("{name}: {message}"),
+            }
+        }
         other => other.to_string(),
     }
 }
@@ -799,25 +887,29 @@ const CONSOLE_SOURCE: &str = r#"
 /// replace it, and it captures `JSON.stringify` and `String` before any of that code runs, so
 /// code that rebinds either cannot change how its own answer is rendered. A handler that
 /// returned a promise reports through the same channel when that promise settles.
+///
+/// A raise is described the way the ENGINE renders the value that was raised (`String(error)`,
+/// which for an error object is its name and its message joined by `": "`), so the kind of
+/// failure reaches the caller beside its wording; a value whose conversion itself fails falls
+/// back to its `message` and then to one fixed sentence.
 const INVOKER_SOURCE: &str = r#"
 (function () {
     const stringify = JSON.stringify;
     const toText = String;
     const described = function (error) {
-        if (error === null || error === undefined) {
-            return toText(error);
-        }
         try {
-            const message = error.message;
+            const text = toText(error);
+            if (text !== undefined && text !== null && text.length > 0) {
+                return text;
+            }
+        } catch (ignored) { }
+        try {
+            const message = error === null || error === undefined ? null : error.message;
             if (message !== undefined && message !== null && toText(message).length > 0) {
                 return toText(message);
             }
         } catch (ignored) { }
-        try {
-            return toText(error);
-        } catch (ignored) {
-            return "The function raised a value that cannot be read.";
-        }
+        return "The function raised a value that cannot be read.";
     };
     return function (handler, event, settle) {
         const returned = function (value) {

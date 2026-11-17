@@ -13,10 +13,13 @@
 //!   as the JSON of the connection as the script left it, since
 //!   `ConnectionFunctionTestResult$ConnectionFunctionOutput` is a plain string the model
 //!   states no structure for), the lines it logged in the order it logged them, and — when it
-//!   failed — the error message of that failure instead of an output, beside the summary of
+//!   failed — the error message of that failure, beside the summary of
 //!   the stage that ran and the share of the allowed execution time the run took. A script
-//!   that takes no decision and fails at nothing reports neither: no decision is required of
-//!   a connection function, so taking none is not a failure;
+//!   that takes no decision and fails at nothing allowed no connection and reports no error;
+//! * a result that is served at all reports BOTH halves of the run: the output member is
+//!   present on every 200 and carries the empty JSON object for a run that allowed no
+//!   connection, and the error-message member is present on every 200 and carries the EMPTY
+//!   STRING for a run that reported no error;
 //! * the stage decides WHICH stored record runs: a request naming no stage tests the stage a
 //!   connection function is created in, `LIVE` tests what a publish copied there, and a stage
 //!   no stored connection function has — the `LIVE` stage of one nothing published among
@@ -64,6 +67,11 @@ const STAGE_LIVE: &str = "LIVE";
 /// — but that no connection function in a fresh emulator holds, so a precondition carrying
 /// it is stale rather than malformed.
 const UNHELD_VERSION_TOKEN: &str = "E1ABCDEFGHIJKL";
+
+/// The document a result reports for a run that produced none: the empty JSON object. A
+/// literal here rather than the crate's own constant, so a wrong constant in the crate cannot
+/// make these assertions pass.
+const EMPTY_OUTPUT_DOCUMENT: &str = "{}";
 
 /// A connection object a client submits: the connection a connection function decides about,
 /// carrying the viewer and the TLS details of it. Its content is the CALLER's, so what a row
@@ -324,7 +332,7 @@ fn run_table() -> Vec<Run> {
             connection_object: CONNECTION_OBJECT,
             output: None,
             logs: vec!["about to fail"],
-            error: Some("no route for example.com"),
+            error: Some("Error: no route for example.com"),
         },
         Run {
             case: "a script that decides nothing about the connection",
@@ -340,7 +348,7 @@ fn run_table() -> Vec<Run> {
             connection_object: CONNECTION_OBJECT,
             output: None,
             logs: Vec::new(),
-            error: Some(""),
+            error: Some("SyntaxError"),
         },
         Run {
             case: "a script that never returns, which a bound stops",
@@ -429,47 +437,36 @@ async fn a_test_reports_what_the_stored_code_did_with_the_connection_object() {
             "case {case}: expected a percentage of the allowed time, got {utilization}"
         );
 
-        match run.output {
-            Some(expected) => {
-                let output = result_text(result, "ConnectionFunctionOutput").unwrap_or_else(|| {
-                    panic!(
-                        "case {case}: the result carries no ConnectionFunctionOutput: {}",
-                        answer.raw
-                    )
-                });
-                assert_eq!(
-                    json(output, case),
-                    json(expected, case),
-                    "case {case}: expected the connection the script allowed, got {output}"
-                );
-            }
-            None => assert_eq!(
-                result_text(result, "ConnectionFunctionOutput").unwrap_or_default(),
-                "",
-                "case {case}: a failed run reports no output, got {}",
+        // Both halves of the run are reported on every result that is served at all: the
+        // connection it allowed — the empty JSON object for a run that allowed none — and the
+        // error message, which is the empty string for a run that reported none.
+        let output = result_text(result, "ConnectionFunctionOutput").unwrap_or_else(|| {
+            panic!(
+                "case {case}: the result carries no ConnectionFunctionOutput: {}",
                 answer.raw
-            ),
-        }
+            )
+        });
+        assert_eq!(
+            json(output, case),
+            json(run.output.unwrap_or(EMPTY_OUTPUT_DOCUMENT), case),
+            "case {case}: expected the connection the run produced, got {output}"
+        );
 
-        match run.error {
-            Some(fragment) => {
-                let message = result_text(result, "ConnectionFunctionErrorMessage")
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "case {case}: the result carries no ConnectionFunctionErrorMessage: {}",
-                            answer.raw
-                        )
-                    });
-                assert!(
-                    !message.is_empty() && message.contains(fragment),
-                    "case {case}: expected an error message carrying {fragment:?}, got {message:?}"
-                );
-            }
-            None => assert_eq!(
-                result_text(result, "ConnectionFunctionErrorMessage").unwrap_or_default(),
-                "",
-                "case {case}: a run that allowed the connection reports no error message, got {}",
+        let message = result_text(result, "ConnectionFunctionErrorMessage").unwrap_or_else(|| {
+            panic!(
+                "case {case}: the result carries no ConnectionFunctionErrorMessage: {}",
                 answer.raw
+            )
+        });
+        match run.error {
+            Some(fragment) => assert!(
+                !message.is_empty() && message.contains(fragment),
+                "case {case}: expected an error message carrying {fragment:?}, got {message:?}"
+            ),
+            None => assert_eq!(
+                message, "",
+                "case {case}: a run that reported no error reports the empty string, got \
+                 {message:?}"
             ),
         }
 
@@ -881,8 +878,8 @@ async fn a_test_persists_nothing() {
 }
 
 /// One run cannot make an unbounded answer out of a small request: a connection past the
-/// published output ceiling is reported as a run that FAILED, with the ceiling named and no
-/// output beside it.
+/// published output ceiling is reported as a run that FAILED, with the ceiling named and the
+/// empty output document beside it.
 #[tokio::test]
 async fn an_allowed_connection_past_the_output_ceiling_is_a_failed_run() {
     let router = emulator();
@@ -908,7 +905,7 @@ async fn an_allowed_connection_past_the_output_ceiling_is_a_failed_run() {
     );
     assert_eq!(
         result_text(answer.root(), "ConnectionFunctionOutput").unwrap_or_default(),
-        "",
+        EMPTY_OUTPUT_DOCUMENT,
         "a connection past the ceiling must not be served: {}",
         answer.raw
     );

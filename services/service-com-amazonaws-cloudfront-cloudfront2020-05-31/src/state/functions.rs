@@ -197,6 +197,14 @@ impl StoredFunction {
             _ => None,
         }
     }
+
+    /// Every stage record this function holds, the stage it is created in first.
+    ///
+    /// What a read covers when it filters on NO stage rather than addressing one: a function
+    /// nothing has published holds one record, and a published one holds two.
+    pub fn stages(&self) -> impl Iterator<Item = &StoredFunctionStage> + '_ {
+        std::iter::once(&self.development).chain(self.live.as_ref())
+    }
 }
 
 impl ComAmazonawsCloudfrontCloudfront20200531State {
@@ -312,9 +320,7 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         let function_configs = self
             .functions
             .values()
-            .flat_map(|function| {
-                std::iter::once(&function.development).chain(function.live.as_ref())
-            })
+            .flat_map(StoredFunction::stages)
             .map(|stage| &stage.config);
         let connection_function_configs = self
             .connection_functions
@@ -387,16 +393,20 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
 
     /// Copy the `DEVELOPMENT` stage of the function `name` names into its `LIVE` stage, and
     /// report the summary of the stage that was written — or `None` when this store holds no
-    /// function under that name, checked BEFORE the mint so a version token is never spent
-    /// on a resource that is not there.
+    /// function under that name.
     ///
     /// A publish is a COPY — "copying the function code from the DEVELOPMENT stage to LIVE":
-    /// the stage it writes carries the code and the configuration the `DEVELOPMENT` stage
-    /// holds at this instant, keeps the created time of the function the copy was taken from,
-    /// is last modified now, and gets a FRESH version token of its own, so an `If-Match`
-    /// against the `LIVE` stage from before the publish no longer matches. The `DEVELOPMENT`
-    /// stage is left exactly as it was — a publish does not edit the stage it reads, and the
-    /// operation hands back no new token for it.
+    /// the stage it writes carries the code, the configuration and the VERSION TOKEN the
+    /// `DEVELOPMENT` stage holds at this instant, keeps the created time of the function the
+    /// copy was taken from, and is last modified now. The `DEVELOPMENT` stage is left exactly
+    /// as it was — a publish does not edit the stage it reads, and the operation hands back no
+    /// new token for it.
+    ///
+    /// The token is COPIED rather than minted: a publish mints no version, so the two stages
+    /// of a just-published function stand at the one token the last mutation of `DEVELOPMENT`
+    /// handed back, and the version a caller read before the publish still satisfies an
+    /// `If-Match` against either stage after it. Only a later mutation of a stage mints a
+    /// token, and it mints one for THAT stage, which is what makes the two diverge again.
     ///
     /// The status the written stage reports is computed from the stored distributions
     /// ([`Self::function_is_associated`]): republishing a function a distribution already
@@ -409,14 +419,13 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         } else {
             FUNCTION_STATUS_UNASSOCIATED
         };
-        let etag = self.next_etag();
         let function = self.functions.get_mut(name)?;
         let published = StoredFunctionStage {
             stage: FUNCTION_STAGE_LIVE.to_string(),
             config: function.development.config.clone(),
             code: function.development.code.clone(),
             status: status.to_string(),
-            etag,
+            etag: function.development.etag.clone(),
             created_time: function.development.created_time,
             last_modified_time: now,
         };

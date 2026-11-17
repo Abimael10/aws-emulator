@@ -83,9 +83,14 @@
 //! * `TestFunctionFailed` (HTTP 500) — The CloudFront function failed.
 //! * `UnsupportedOperation` (HTTP 400) — This operation is not supported in this Amazon Web
 //!   Services Region.
+//! * `PreconditionFailed` (HTTP 412) — widened in through `extra_errors` (see below): the
+//!   recorded service refuses a well-formed version token that is not the current one with
+//!   the failed precondition, which this operation's own error list omits.
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state::IfMatch;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -98,12 +103,21 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-cloudfront-cloudfront20
 // here — hence the `TestFunctionError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.cloudfront#TestFunction")]
+//
+// `PreconditionFailed` is widened in with `extra_errors`: the recorded service refuses a
+// well-formed version token that is not the current one with the failed precondition (HTTP
+// 412), the way the version-gated siblings of this operation do, and only this operation's
+// error list omits the shape. The shape is this SERVICE's own.
+#[smithy_macros::operation_error(
+    "com.amazonaws.cloudfront#TestFunction",
+    extra_errors = ["PreconditionFailed"]
+)]
 #[derive(Debug)]
 pub enum TestFunctionErrorModeled {
     InvalidArgument(InvalidArgument),
     InvalidIfMatchVersion(InvalidIfMatchVersion),
     NoSuchFunctionExists(NoSuchFunctionExists),
+    PreconditionFailed(PreconditionFailed),
     TestFunctionFailed(TestFunctionFailed),
     UnsupportedOperation(UnsupportedOperation),
 }
@@ -200,18 +214,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `IfMatch` is "The current version (ETag value) of the function that you are
             // testing, which you can get using DescribeFunction", and it is checked against
             // the STORED version of the stage being tested — so a test only runs the code its
-            // caller actually read. This operation models NO failed-precondition error, so
-            // both a header that carries no version token at all and one carrying a token
-            // that is not the current one are "The If-Match version is missing or not valid":
-            // not valid FOR THIS FUNCTION, the way `DeleteContinuousDeploymentPolicy` reads
-            // the same wording.
-            if crate::state::if_match_version(Some(input.if_match.as_str()))
-                != Some(tested.etag.as_str())
-            {
-                return Err(TestFunctionErrorModeled::InvalidIfMatchVersion(
-                    crate::state::invalid_if_match_version(),
-                )
-                .into());
+            // caller actually read. The two ways a header can fail are DIFFERENT answers, as
+            // they are on every other version-gated operation of this surface: a header that
+            // carries no version token at all is "missing or not valid", and a well-formed
+            // token that is not the current one is the failed precondition a caller re-reads
+            // the version and retries on.
+            match crate::state::check_if_match(&tested.etag, Some(input.if_match.as_str())) {
+                IfMatch::Current => {}
+                IfMatch::Invalid => {
+                    return Err(TestFunctionErrorModeled::InvalidIfMatchVersion(
+                        crate::state::invalid_if_match_version(),
+                    )
+                    .into());
+                }
+                IfMatch::Stale => {
+                    return Err(TestFunctionErrorModeled::PreconditionFailed(
+                        crate::state::precondition_failed(),
+                    )
+                    .into());
+                }
             }
 
             // The summary this result reports is the projection of the stage that was
@@ -261,22 +282,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             "a CloudFront function was tested",
         );
 
-        let (function_output, function_error_message) = match run.outcome {
-            // "Returns the function's result (the modified event object) in the response."
-            crate::state::FunctionOutcome::Returned(output) => (Some(output), None),
-            // "If the result of testing the function was an error, this field contains the
-            // error message": the function ran and failed, which is a result this operation
-            // reports with the error message of that failure rather than a server fault.
-            crate::state::FunctionOutcome::Failed(message) => (None, Some(message)),
-            // A run that came back without answering: the handler model has none, because a
-            // handler that produced no event object is a run that FAILED, which the engine
-            // reports as that. Reported all the same as the run it was — the lines it wrote
-            // and the time it spent — rather than as an event object nothing returned.
-            crate::state::FunctionOutcome::Unanswered => (None, None),
+        // What the result reports about the run, decided in the ONE place this service decides
+        // it ([`crate::state::FunctionOutcome::reported`]): a result carries BOTH the event
+        // object the run produced and the error message it reported, so a client reading either
+        // member finds it on every test that is answered at all.
+        let reported = match run.outcome.reported() {
+            Ok(reported) => reported,
             // The run did not happen at all, so there is no result to report and nothing is
             // known about the code: "The CloudFront function failed" is what the service
             // answers for a test it could not carry out.
-            crate::state::FunctionOutcome::Unavailable(reason) => {
+            Err(reason) => {
                 ::tracing::warn!(
                     detail = %reason,
                     "a CloudFront function was not run, so its test could not be answered",
@@ -297,8 +312,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // "Contains the log lines that the function wrote (if any) when running the
                 // test" — the lines that run wrote, in the order it wrote them.
                 function_execution_logs: Some(run.logs),
-                function_error_message,
-                function_output,
+                // "If the result of testing the function was an error, this field contains the
+                // error message" — the empty string for a run that reported no error.
+                function_error_message: Some(reported.error_message),
+                // "The event object returned by the function" — the empty JSON object for a
+                // run that returned none.
+                function_output: Some(reported.output),
             }),
         })
     }
