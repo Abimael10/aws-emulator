@@ -691,11 +691,28 @@ pub fn default_topic_policy(arn: &str, owner: &str) -> TopicPolicyDocument {
     }
 }
 
+/// The action a policy statement of this service may name, which names no API operation
+/// of it at all: it is the permission a principal needs for the NOTIFICATIONS of a topic
+/// it is subscribed to, which no caller of this service ever asks for by name, so the
+/// only place the action can appear is a policy.
+///
+/// It is therefore inside the scope a statement of this service may name even though
+/// [`ACTION_NAMES`]'s other entries are all operations. Recorded evidence: a topic access
+/// policy whose statement allows `SNS:Subscribe`, `SNS:Receive` and
+/// `SNS:GetTopicAttributes` is accepted and takes effect on the topic's authorization
+/// decisions.
+pub const RECEIVE_ACTION: &str = "Receive";
+
 /// Every action name Amazon SNS defines, which is the SERVICE SCOPE a policy statement
 /// this service writes may name: "Valid values: Any Amazon SNS action name, for example
-/// `Publish`" (`AddPermissionInput$ActionName` doc). The list is the operations this
-/// service's model binds, as
-/// `smithy_query(query="list_operations")` reports them.
+/// `Publish`" (`AddPermissionInput$ActionName` doc).
+///
+/// Every entry but one is an operation this service's model binds, as
+/// `smithy_query(query="list_operations")` reports them; the exception is
+/// [`RECEIVE_ACTION`], which this service defines as a policy action alone. An action
+/// name is NOT bounded by the operations a caller can invoke: a policy of a service
+/// names the permissions that service defines, and a permission it defines without an
+/// operation of its own is still one of them.
 pub const ACTION_NAMES: &[&str] = &[
     "AddPermission",
     "CheckIfPhoneNumberIsOptedOut",
@@ -728,6 +745,7 @@ pub const ACTION_NAMES: &[&str] = &[
     "Publish",
     "PublishBatch",
     "PutDataProtectionPolicy",
+    RECEIVE_ACTION,
     "RemovePermission",
     "SetEndpointAttributes",
     "SetPlatformApplicationAttributes",

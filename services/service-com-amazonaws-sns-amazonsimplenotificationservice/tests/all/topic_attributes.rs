@@ -8,6 +8,10 @@
 //! Every call goes over the wire through the router the emulator serves in production,
 //! so nothing but persisted state carries information between calls.
 
+use service_com_amazonaws_sns_amazonsimplenotificationservice::state::{
+    ACTION_NAMES, RECEIVE_ACTION,
+};
+
 use super::topics_subscriptions_publish::{attribute_entries, attribute_map, Answer, Sns};
 
 /// The account id an ARN this emulator minted carries: the fifth field of
@@ -869,4 +873,528 @@ async fn permission_operations_refuse_what_sns_refuses() {
             answer.body
         );
     }
+}
+
+// =============================================================================
+// A grant is decided by its own parameters, not by what the policy already holds
+// =============================================================================
+
+/// `AddPermission` on `arn`, granting `accounts` the `actions` under `label`.
+async fn grant(sns: &Sns, arn: &str, label: &str, accounts: &[&str], actions: &[&str]) -> Answer {
+    let members: Vec<(String, &str)> = accounts
+        .iter()
+        .enumerate()
+        .map(|(at, account)| (format!("AWSAccountId.member.{}", at + 1), *account))
+        .chain(
+            actions
+                .iter()
+                .enumerate()
+                .map(|(at, action)| (format!("ActionName.member.{}", at + 1), *action)),
+        )
+        .collect();
+    let mut params: Vec<(&str, &str)> = vec![("TopicArn", arn), ("Label", label)];
+    for (name, value) in &members {
+        params.push((name.as_str(), value));
+    }
+    sns.call("AddPermission", &params).await
+}
+
+/// The envelope a served `AddPermission` answers with: the operation's output is `Unit`,
+/// so the document carries the response element and its one request id and NO result
+/// element.
+fn served_envelope(case: &str, answer: &Answer) {
+    assert!(
+        answer.body.contains("<AddPermissionResponse"),
+        "case {case:?}: the document must carry the AddPermissionResponse element, got {}",
+        answer.body
+    );
+    // The output is `Unit`, so the envelope carries no member of its own: the result
+    // element the awsQuery protocol wraps a payload in is empty wherever it is written.
+    assert!(
+        answer.body.contains("<AddPermissionResult></AddPermissionResult>")
+            || !answer.body.contains("AddPermissionResult"),
+        "case {case:?}: a Unit output carries no member, got {}",
+        answer.body
+    );
+    let ids = answer.elements("RequestId");
+    assert_eq!(
+        ids.len(),
+        1,
+        "case {case:?}: the envelope carries exactly one request id, got {ids:?} in {}",
+        answer.body
+    );
+    assert!(
+        !ids[0].is_empty(),
+        "case {case:?}: the request id must name the request, got {:?}",
+        ids[0]
+    );
+}
+
+/// The access policy document the topic `arn` reports.
+async fn policy_of(sns: &Sns, case: &str, arn: &str) -> serde_json::Value {
+    let held = attribute_map(&read(sns, case, arn).await);
+    let value = held
+        .get("Policy")
+        .unwrap_or_else(|| panic!("case {case:?}: no Policy attribute was reported, got {held:?}"));
+    json_of(case, "Policy", value)
+}
+
+/// Every statement of `policy`, in document order: the policy grammar admits ONE
+/// statement as a bare object and several as a list, and a caller's document is reported
+/// in the form it was written in.
+fn statements(case: &str, policy: &serde_json::Value) -> Vec<serde_json::Value> {
+    match &policy["Statement"] {
+        serde_json::Value::Array(list) => list.clone(),
+        one @ serde_json::Value::Object(_) => vec![one.clone()],
+        _ => panic!("case {case:?}: a policy document carries a Statement, got {policy}"),
+    }
+}
+
+/// The `Sid` of every statement of `policy`, in document order.
+fn statement_labels(case: &str, policy: &serde_json::Value) -> Vec<String> {
+    statements(case, policy)
+        .iter()
+        .map(|statement| statement["Sid"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// A statement member that holds ONE value bare and several as an array — the shape SNS
+/// writes `Principal` and `Action` in — read as a list either way.
+fn value_list(value: Option<&serde_json::Value>) -> Vec<String> {
+    match value {
+        Some(serde_json::Value::String(one)) => vec![one.clone()],
+        Some(serde_json::Value::Array(many)) => many
+            .iter()
+            .map(|entry| entry.as_str().unwrap_or_default().to_string())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Assert the statement labelled `label` is the `Allow` the grant of `accounts` on
+/// `actions` of the topic `arn` describes.
+fn granted_statement(
+    case: &str,
+    policy: &serde_json::Value,
+    label: &str,
+    arn: &str,
+    accounts: &[&str],
+    actions: &[&str],
+) {
+    let added = statements(case, policy)
+        .into_iter()
+        .find(|statement| statement["Sid"] == serde_json::json!(label))
+        .unwrap_or_else(|| panic!("case {case:?}: no statement labelled {label}: {policy}"));
+    assert_eq!(
+        added.get("Effect"),
+        Some(&serde_json::json!("Allow")),
+        "case {case:?}: the granted statement must allow, got {added}"
+    );
+    // An account id is written as its root user's ARN, the principal form a policy names
+    // a delegated account by.
+    let expected_principals: Vec<String> = accounts
+        .iter()
+        .map(|account| format!("arn:aws:iam::{account}:root"))
+        .collect();
+    assert_eq!(
+        value_list(added.pointer("/Principal/AWS")),
+        expected_principals,
+        "case {case:?}: expected the principals {expected_principals:?}, got {added}"
+    );
+    let expected_actions: Vec<String> = actions
+        .iter()
+        .map(|action| format!("SNS:{action}"))
+        .collect();
+    assert_eq!(
+        value_list(added.get("Action")),
+        expected_actions,
+        "case {case:?}: expected the actions {expected_actions:?}, got {added}"
+    );
+    assert_eq!(
+        added.get("Resource"),
+        Some(&serde_json::json!(arn)),
+        "case {case:?}: the grant must be on this topic alone, got {added}"
+    );
+    // One value is written bare and several as an array, whichever member carries them.
+    assert_eq!(
+        added.pointer("/Principal/AWS").map(serde_json::Value::is_string),
+        Some(accounts.len() == 1),
+        "case {case:?}: one principal is written bare and several as an array, got {added}"
+    );
+    assert_eq!(
+        added.get("Action").map(serde_json::Value::is_string),
+        Some(actions.len() == 1),
+        "case {case:?}: one action is written bare and several as an array, got {added}"
+    );
+}
+
+/// One row of the policy-state table: the case, the document the topic's `Policy`
+/// attribute holds when the grant arrives (`None` for a topic whose owner has set none),
+/// the `Sid` of every statement that document carries, and the accounts and the actions
+/// the grant names.
+///
+/// `<TOPIC>` and `<ACCOUNT>` inside a document stand for the topic's ARN and the account
+/// that owns it, which the create mints and a literal therefore cannot carry.
+type PolicyStateCase<'a> = (
+    &'a str,
+    Option<&'a str>,
+    &'a [&'a str],
+    &'a [&'a str],
+    &'a [&'a str],
+);
+
+/// AddPermission adds one labelled `Allow` statement to the addressed topic's access
+/// policy and answers 200 with the empty response envelope whenever its own parameters
+/// comply with their constraints — WHATEVER document that policy already holds, which is
+/// no parameter of the request. The rows differ along the form of that document, which is
+/// what the rule generalises over: the one SNS generates for a topic with no policy, one
+/// its owner set, one whose `Statement` is a single object rather than a list (both forms
+/// the policy grammar admits), one carrying several statements, one stating neither
+/// `Version` nor `Id`, and one carrying no statement at all — and in how many accounts
+/// and actions one grant names. Every statement the document already held survives the
+/// grant.
+#[tokio::test]
+async fn add_permission_is_served_whatever_policy_document_the_topic_holds() {
+    let sns = Sns::new();
+    let label = "CrossAccountAccess";
+    let rows: &[PolicyStateCase<'_>] = &[
+        (
+            "the document SNS generates for a topic whose owner set none",
+            None,
+            &["__default_statement_ID"],
+            &["111122223333"],
+            &["Publish"],
+        ),
+        (
+            "a document the owner set in place of the default",
+            Some(
+                r#"{"Version":"2008-10-17","Id":"owner-policy","Statement":[{"Sid":"owner-reads",
+                "Effect":"Allow","Principal":{"AWS":"*"},"Action":"SNS:GetTopicAttributes",
+                "Resource":"<TOPIC>","Condition":{"StringEquals":{"AWS:SourceOwner":"<ACCOUNT>"}}}]}"#,
+            ),
+            &["owner-reads"],
+            &["111122223333"],
+            &["Publish", "Subscribe"],
+        ),
+        (
+            "a document whose Statement is one object rather than a list",
+            Some(
+                r#"{"Version":"2008-10-17","Statement":{"Sid":"single-object","Effect":"Allow",
+                "Principal":{"AWS":"arn:aws:iam::444455556666:root"},"Action":"SNS:Publish",
+                "Resource":"<TOPIC>"}}"#,
+            ),
+            &["single-object"],
+            &["111122223333", "444455556666"],
+            &["Publish"],
+        ),
+        (
+            "a document carrying several statements",
+            Some(
+                r#"{"Version":"2008-10-17","Statement":[
+                {"Sid":"first","Effect":"Allow","Principal":{"AWS":"arn:aws:iam::111122223333:root"},
+                 "Action":"SNS:Subscribe","Resource":"<TOPIC>"},
+                {"Sid":"second","Effect":"Allow","Principal":{"AWS":"arn:aws:iam::444455556666:root"},
+                 "Action":["SNS:Publish","SNS:GetTopicAttributes"],"Resource":"<TOPIC>"},
+                {"Sid":"third","Effect":"Allow","Principal":{"AWS":"*"},
+                 "Action":"SNS:ListSubscriptionsByTopic","Resource":"<TOPIC>",
+                 "Condition":{"StringEquals":{"AWS:SourceOwner":"<ACCOUNT>"}}}]}"#,
+            ),
+            &["first", "second", "third"],
+            &["111122223333", "444455556666"],
+            &["Publish", "Subscribe", "GetTopicAttributes"],
+        ),
+        (
+            "a document stating neither Version nor Id",
+            Some(
+                r#"{"Statement":[{"Sid":"bare","Effect":"Allow",
+                "Principal":{"AWS":"arn:aws:iam::111122223333:root"},"Action":"SNS:Publish",
+                "Resource":"<TOPIC>"}]}"#,
+            ),
+            &["bare"],
+            &["999988887777"],
+            &["Publish"],
+        ),
+        (
+            "a document carrying no statement at all",
+            Some(r#"{"Version":"2008-10-17","Statement":[]}"#),
+            &[],
+            &["111122223333"],
+            &["ListSubscriptionsByTopic"],
+        ),
+    ];
+
+    for (index, (case, document, held, accounts, actions)) in rows.iter().enumerate() {
+        let arn = sns.topic(&format!("grant-onto-{index:02}")).await;
+        if let Some(document) = document {
+            let document = document
+                .replace("<TOPIC>", &arn)
+                .replace("<ACCOUNT>", &account_of(&arn));
+            set(&sns, case, &arn, "Policy", &document).await;
+        }
+        // What the policy carries BEFORE the grant, which the grant must leave in place.
+        let before = policy_of(&sns, case, &arn).await;
+        let expected_before: Vec<String> = held.iter().map(|sid| (*sid).to_string()).collect();
+        assert_eq!(
+            statement_labels(case, &before),
+            expected_before,
+            "case {case:?}: the policy the grant lands on must carry the statements it was \
+             given, got {before}"
+        );
+
+        let answer = grant(&sns, &arn, label, accounts, actions).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: AddPermission expected 200, got {} / {}",
+            answer.status, answer.body
+        );
+        served_envelope(case, &answer);
+
+        let granted = policy_of(&sns, case, &arn).await;
+        // Whatever form the document was written in, the one the grant leaves behind
+        // carries its statements as a LIST — the form SNS answers with.
+        assert!(
+            granted["Statement"].is_array(),
+            "case {case:?}: the edited document must carry a Statement list, got {granted}"
+        );
+        let mut expected_after = expected_before.clone();
+        expected_after.push(label.to_string());
+        assert_eq!(
+            statement_labels(case, &granted),
+            expected_after,
+            "case {case:?}: the grant must be added beside the statements the policy held, \
+             got {granted}"
+        );
+        granted_statement(case, &granted, label, &arn, accounts, actions);
+    }
+}
+
+/// One row of the re-grant table: the case, the accounts and actions of the first grant,
+/// and those of the grant made under the SAME label after that one was revoked.
+type RegrantCase<'a> = (
+    &'a str,
+    &'a [&'a str],
+    &'a [&'a str],
+    &'a [&'a str],
+    &'a [&'a str],
+);
+
+/// A `Label` is refused as a duplicate only while the policy carries a DIFFERENT
+/// statement under it: once that statement is revoked the label names no grant, so a
+/// grant under it is served again and writes the statement the new request describes —
+/// and a grant under a label the policy never carried is served beside it. The rows
+/// differ in how the re-grant differs from the grant it follows.
+#[tokio::test]
+async fn a_revoked_label_can_be_granted_again() {
+    let sns = Sns::new();
+    let label = "Delegated";
+    // A grant that differs from every row's, so it conflicts with whichever statement the
+    // label carries at the time.
+    let other_accounts: &[&str] = &["000011112222"];
+    let other_actions: &[&str] = &["ListSubscriptionsByTopic"];
+    let rows: &[RegrantCase<'_>] = &[
+        (
+            "the same grant again",
+            &["111122223333"],
+            &["Publish"],
+            &["111122223333"],
+            &["Publish"],
+        ),
+        (
+            "more accounts than before",
+            &["111122223333"],
+            &["Publish"],
+            &["111122223333", "444455556666"],
+            &["Publish"],
+        ),
+        (
+            "other actions than before",
+            &["111122223333"],
+            &["Publish", "Subscribe"],
+            &["444455556666"],
+            &["GetTopicAttributes"],
+        ),
+    ];
+
+    for (index, (case, first_accounts, first_actions, next_accounts, next_actions)) in
+        rows.iter().enumerate()
+    {
+        let arn = sns.topic(&format!("regrant-{index:02}")).await;
+        let answer = grant(&sns, &arn, label, first_accounts, first_actions).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: the first grant expected 200, got {} / {}",
+            answer.status, answer.body
+        );
+        served_envelope(case, &answer);
+        let granted = policy_of(&sns, case, &arn).await;
+        granted_statement(case, &granted, label, &arn, first_accounts, first_actions);
+
+        // While that statement is there, a DIFFERENT grant under its label is refused and
+        // the policy is left exactly as it was.
+        let conflicting = grant(&sns, &arn, label, other_accounts, other_actions).await;
+        assert_eq!(
+            conflicting.status, 400,
+            "case {case:?}: a different grant under a live label expected 400, got {} / {}",
+            conflicting.status, conflicting.body
+        );
+        assert_eq!(
+            conflicting.code(),
+            "InvalidParameter",
+            "case {case:?}: expected the InvalidParameter code, got {}",
+            conflicting.body
+        );
+        assert_eq!(
+            policy_of(&sns, case, &arn).await,
+            granted,
+            "case {case:?}: the refused grant must leave the policy as it was"
+        );
+
+        let revoked = sns
+            .call("RemovePermission", &[("TopicArn", &arn), ("Label", label)])
+            .await;
+        assert_eq!(
+            revoked.status, 200,
+            "case {case:?}: RemovePermission expected 200, got {} / {}",
+            revoked.status, revoked.body
+        );
+
+        // The label now names no statement, so the grant is served and the policy carries
+        // what THIS request described.
+        let answer = grant(&sns, &arn, label, next_accounts, next_actions).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: the grant after the revoke expected 200, got {} / {}",
+            answer.status, answer.body
+        );
+        served_envelope(case, &answer);
+        let regranted = policy_of(&sns, case, &arn).await;
+        granted_statement(case, &regranted, label, &arn, next_accounts, next_actions);
+
+        // And a label the policy never carried is a grant of its own beside it.
+        let second = "AlsoDelegated";
+        let answer = grant(&sns, &arn, second, other_accounts, other_actions).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: a grant under a second label expected 200, got {} / {}",
+            answer.status, answer.body
+        );
+        let both = policy_of(&sns, case, &arn).await;
+        assert_eq!(
+            statement_labels(case, &both),
+            vec![
+                "__default_statement_ID".to_string(),
+                label.to_string(),
+                second.to_string(),
+            ],
+            "case {case:?}: both grants must stand beside the default statement, got {both}"
+        );
+        granted_statement(case, &both, label, &arn, next_accounts, next_actions);
+        granted_statement(case, &both, second, &arn, other_accounts, other_actions);
+    }
+}
+
+/// One topic's policy takes one statement per granted label: each grant is served and the
+/// document ends up carrying every label beside the statement SNS generated, so an
+/// accumulating policy is not what decides a grant.
+#[tokio::test]
+async fn one_topic_takes_a_statement_per_granted_label() {
+    let sns = Sns::new();
+    let case = "a label per account of a fan-out";
+    let arn = sns.topic("many-grants").await;
+    let accounts: Vec<String> = (0..25).map(|at| format!("1111222233{at:02}")).collect();
+
+    for account in &accounts {
+        let label = format!("Grant-{account}");
+        let answer = grant(&sns, &arn, &label, &[account.as_str()], &["Publish"]).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: AddPermission {label} expected 200, got {} / {}",
+            answer.status, answer.body
+        );
+        served_envelope(case, &answer);
+    }
+
+    let policy = policy_of(&sns, case, &arn).await;
+    let held = statement_labels(case, &policy);
+    assert_eq!(
+        held.len(),
+        accounts.len() + 1,
+        "case {case:?}: expected the default statement and one per label, got {held:?}"
+    );
+    for account in &accounts {
+        let label = format!("Grant-{account}");
+        assert!(
+            held.contains(&label),
+            "case {case:?}: {label} must be a statement of the policy, got {held:?}"
+        );
+        granted_statement(case, &policy, &label, &arn, &[account.as_str()], &["Publish"]);
+    }
+}
+
+/// A grant may name any action of this service's POLICY scope and nothing else: every
+/// operation the model binds, and the one action this service defines as a policy action
+/// alone, which names no operation a caller could ever invoke (`state::ACTION_NAMES`,
+/// read off `smithy_query(query="list_operations")` plus that action). Each is written
+/// into the policy as `SNS:<action>`. A name outside the scope — another service's
+/// action, one cased differently, or a name no action of this service carries — is
+/// refused `400 InvalidParameter` with SNS's own sentence and writes nothing.
+#[tokio::test]
+async fn a_grant_names_an_action_of_this_services_policy_scope() {
+    let sns = Sns::new();
+    let arn = sns.topic("action-scope").await;
+    let account = "111122223333";
+
+    for action in ACTION_NAMES {
+        let answer = grant(&sns, &arn, action, &[account], &[action]).await;
+        assert_eq!(
+            answer.status, 200,
+            "action {action:?}: expected 200, got {} / {}",
+            answer.status, answer.body
+        );
+        served_envelope(action, &answer);
+    }
+    let policy = policy_of(&sns, "the whole policy scope", &arn).await;
+    for action in ACTION_NAMES {
+        granted_statement(action, &policy, action, &arn, &[account], &[action]);
+    }
+    // The action that names no operation of this service: a scope read off the operations
+    // alone would refuse the grant AWS applies.
+    assert!(
+        policy.to_string().contains(&format!("SNS:{RECEIVE_ACTION}")),
+        "the policy-only action must be written into the policy like any other, got {policy}"
+    );
+
+    // (case, the name the grant asks for)
+    let outside: &[(&str, &str)] = &[
+        ("another service's action", "sqs:SendMessage"),
+        ("an action of this service, lower-cased", "publish"),
+        ("a name no action of this service carries", "ReceiveNotifications"),
+        ("a near miss of the policy-only action", "Receives"),
+        ("no name at all", ""),
+    ];
+    for (case, action) in outside {
+        let answer = grant(&sns, &arn, "outside-the-scope", &[account], &[action]).await;
+        assert_eq!(
+            answer.status, 400,
+            "case {case:?}: expected 400, got {} / {}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            answer.code(),
+            "InvalidParameter",
+            "case {case:?}: expected the InvalidParameter code, got {}",
+            answer.body
+        );
+        assert_eq!(
+            answer.element("Message").as_deref(),
+            Some("Invalid parameter: Policy statement action out of service scope!"),
+            "case {case:?}: unexpected sentence, got {}",
+            answer.body
+        );
+    }
+    assert_eq!(
+        policy_of(&sns, "after the refusals", &arn).await,
+        policy,
+        "a refused grant must leave the policy exactly as it was"
+    );
 }
