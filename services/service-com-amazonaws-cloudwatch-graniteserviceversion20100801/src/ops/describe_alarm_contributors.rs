@@ -159,12 +159,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`DescribeAlarmContributorsInput$NextToken`) — an alarm's contributors are reported in
         // one page (see below), so no call of this operation issues a token: every token a
         // request can carry is one this service did not issue, which is the `InvalidNextToken` it
-        // models. Judged on EVERY path, so whether a token is refused never depends on which
-        // alarm the request named.
-        if input.next_token.is_some() {
+        // models. The sentence quotes the value the request carried
+        // ([`crate::state::invalid_next_token_message`]), which is what tells a caller holding
+        // several tokens which of them was not accepted. Judged on EVERY path, so whether a token
+        // is refused never depends on which alarm the request named.
+        if let Some(token) = input.next_token.as_deref() {
             return Err(DescribeAlarmContributorsErrorModeled::InvalidNextToken(
                 InvalidNextToken {
-                    message: Some(INVALID_NEXT_TOKEN_MESSAGE.to_string()),
+                    message: Some(crate::state::invalid_next_token_message(token)),
                 },
             )
             .into());
@@ -222,15 +224,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 ///
 /// A contributor "Represents an individual contributor to a multi-timeseries alarm, containing
 /// information about a specific time series and its contribution to the alarm's state"
-/// (`AlarmContributor`), and the model says where such contributors come from in one place: the
-/// alarm's evaluation criteria carry a query whose "query must return a result of vector type.
-/// Each entry in the vector result represents an alarm contributor."
-/// (`AlarmPromQLCriteria$Query`). So an alarm configured with `EvaluationCriteria` has
-/// contributors, and an alarm graded on ONE series — the single metric its own members name, the
+/// (`AlarmContributor`), so the alarms that have contributors are exactly the ones whose
+/// evaluation grades a vector of series rather than one
+/// ([`crate::state::alarm_evaluation::grades_a_vector_of_series`], which is where that one rule
+/// lives): a query of vector type, or a Metrics Insights query that groups its result into one
+/// series per group. An alarm graded on ONE series — the single metric its own members name, the
 /// one query of its `Metrics` array the evaluation watches, a composite alarm's rule over other
 /// alarms, a log alarm's scheduled query — has none to report at all.
 fn multi_time_series(alarm: &MetricAlarm) -> bool {
-    alarm.evaluation_criteria.is_some()
+    crate::state::alarm_evaluation::grades_a_vector_of_series(alarm)
 }
 
 /// How CloudWatch states that the alarm a request named is not of that kind: one sentence
@@ -244,10 +246,6 @@ fn not_a_multi_time_series_alarm(alarm_name: &str) -> String {
 fn no_alarm_for_name(alarm_name: &str) -> String {
     format!("No alarm for name {alarm_name} was found")
 }
-
-/// How this operation words a refusal of a `NextToken`, the same fixed sentence the other
-/// paginating reads of this service answer with (`crate::ops::list_metric_streams`).
-const INVALID_NEXT_TOKEN_MESSAGE: &str = "Invalid NextToken";
 
 /// The contributors of one multi-time-series alarm: "the current alarm contributors that are in
 /// `ALARM` state" (`DescribeAlarmContributors`).

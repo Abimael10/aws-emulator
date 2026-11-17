@@ -656,31 +656,30 @@ fn coded_member_fault(violations: &[aws_smithy_schema_server::Violation]) -> Opt
 /// The refusal policy of the Contributor Insights REPORT read: a page size below the published
 /// minimum of the member that asks for one, exactly as the rule operations state it
 /// ([`non_positive_page_size_refusal`]), and a required member the request did not supply at
-/// all, worded as the SERVICE-WIDE missing-parameter sentence
-/// ([`crate::state::INPUT_MISSING_REQUIRED_PARAMETER`]) rather than in the rule operations'
-/// coded per-member form.
+/// all, in the coded form those operations state a refusal about one member in, closed by the
+/// clause that names the request the parameter has to be present in
+/// ([`crate::state::missing_report_parameter_message`]).
 ///
-/// Which sentence a missing member earns is a property of the OPERATION: the coded form names
-/// the member, which is what the operations that act on rules BY NAME state, while this read
-/// answers the one sentence CloudWatch states for a request short of a parameter — the same
-/// sentence the detector writers' recorded refusal carries.
+/// Which sentence a missing member earns is a property of the OPERATION: the rule operations name
+/// the member alone, while this read names the member and the contributor query behind it, which
+/// is what its own recorded refusal carries.
 fn report_member_fault(violations: &[aws_smithy_schema_server::Violation]) -> Option<Refused> {
     violations
         .iter()
         .find_map(non_positive_page_size_refusal)
         .or_else(|| {
-            violations
-                .iter()
-                .find_map(|violation| {
-                    matches!(
-                        violation.kind,
-                        aws_smithy_schema_server::ViolationKind::MissingRequiredMember
-                    )
-                    .then(|| Refused {
-                        code: MISSING_PARAMETER.shape_name.to_string(),
-                        message: crate::state::INPUT_MISSING_REQUIRED_PARAMETER.to_string(),
-                    })
+            violations.iter().find_map(|violation| {
+                matches!(
+                    violation.kind,
+                    aws_smithy_schema_server::ViolationKind::MissingRequiredMember
+                )
+                .then(|| Refused {
+                    code: MISSING_PARAMETER.shape_name.to_string(),
+                    message: crate::state::missing_report_parameter_message(
+                        &crate::state::query_parameter_path(&violation.path),
+                    ),
                 })
+            })
         })
 }
 

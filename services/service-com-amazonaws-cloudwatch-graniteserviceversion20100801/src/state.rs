@@ -2614,22 +2614,22 @@ pub fn resumable_page(token: Option<&str>) -> Option<String> {
     requested_page(token).and_then(decode_page_token)
 }
 
-/// How a listing of this service's ALARM HISTORY refuses a `NextToken` it cannot resume from:
-/// the fixed text of the class, then the value the request carried.
+/// How a listing of this service that quotes an unusable `NextToken` refuses one it cannot
+/// resume from: the fixed text of the class, then the value the request carried.
 ///
 /// The token is the one VARIABLE part of the sentence — it is the value at fault, and quoting it
 /// is what tells a caller which of the tokens it is holding was not accepted — so the sentence is
 /// built from the request rather than written out per operation.
 ///
-/// WHICH listings state it this way is a property of the operation, and three of this service's
-/// listings state the same class WITHOUT the token: the metric-stream listing, the alarm mute
-/// rule listing and the alarm contributor listing each carry the bare sentence their own
-/// recordings show (`crate::ops::list_metric_streams`,
-/// `crate::ops::list_alarm_mute_rules`, `crate::ops::describe_alarm_contributors`), the
+/// WHICH listings state it this way is a property of the operation, and two of this service's
+/// listings state the same class WITHOUT the token: the metric-stream listing and the alarm mute
+/// rule listing each carry the bare sentence their own recordings show
+/// (`crate::ops::list_metric_streams`, `crate::ops::list_alarm_mute_rules`), the
 /// Contributor Insights listings their coded one
 /// ([`insight_rule_records::invalid_page_token_message`]), and the alarm listing none at all
 /// because it serves the first page instead ([`resumable_page`]). So this is the sentence of
-/// the listings recorded quoting the token, not a fourth wording of one class.
+/// the reads recorded quoting the token — the alarm HISTORY listing and the alarm CONTRIBUTOR
+/// read (`crate::ops::describe_alarm_contributors`) — not a fourth wording of one class.
 #[must_use]
 pub fn invalid_next_token_message(token: &str) -> String {
     format!("{INVALID_NEXT_TOKEN}{token}")

@@ -534,6 +534,35 @@ fn band_model_metrics(alarm: &MetricAlarm) -> Vec<super::metric_math::SeriesMetr
     metrics
 }
 
+/// Whether `alarm`'s evaluation grades a VECTOR of time series rather than one.
+///
+/// The model names the two configurations whose result is a vector. A PromQL criteria's "query
+/// must return a result of vector type. Each entry in the vector result represents an alarm
+/// contributor." (`AlarmPromQLCriteria$Query`), and a Metrics Insights query that groups its
+/// result returns one series per group ("This field can contain either a Metrics Insights query,
+/// or a metric math expression", `MetricDataQuery$Expression`,
+/// [`super::metric_math::groups_a_metrics_insights_query`]) — so an alarm configured with either
+/// is graded on several series at once.
+///
+/// Every other configuration grades ONE series, whatever identifies it: the single metric the
+/// alarm's own members name, the one query of a `Metrics` array the evaluation watches
+/// ([`watched_query`]), an expression folded from several series, a composite alarm's rule over
+/// other alarms, or a log alarm's scheduled query.
+#[must_use]
+pub fn grades_a_vector_of_series(alarm: &MetricAlarm) -> bool {
+    if alarm.evaluation_criteria.is_some() {
+        return true;
+    }
+    // Only the query the evaluation WATCHES decides it: a grouped query feeding an expression
+    // that folds its groups to one series is graded as that one series.
+    watched_query(
+        alarm.metrics.as_deref().unwrap_or_default(),
+        alarm.threshold_metric_id.as_deref(),
+    )
+    .and_then(|watched| watched.expression.as_deref())
+    .is_some_and(super::metric_math::groups_a_metrics_insights_query)
+}
+
 /// Which query of a `Metrics` array the alarm WATCHES: the one returning data that is not the
 /// query its threshold comes from.
 ///

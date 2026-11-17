@@ -3,7 +3,7 @@
 //! The CLASS and the TEXT this service refuses a request with, across the operations whose
 //! refusals belong to one rule each.
 //!
-//! Five rules, each asserted over a table whose rows differ along what the rule generalises
+//! Six rules, each asserted over a table whose rows differ along what the rule generalises
 //! over rather than repeating one request:
 //!
 //! * **a required member the request did not supply AT ALL is refused by the
@@ -11,6 +11,8 @@
 //!   service answers for the SHAPE of a request — while a member the request DID carry with no
 //!   characters in it, and a member one of the Contributor Insights rule operations was not
 //!   given, are values the service read and are answered under its own parameter faults;
+//! * **the Contributor Insights REPORT read states a required member it was not given in its
+//!   own coded sentence**, naming that member and the contributor query the read is served by;
 //! * **a paginated listing answers a `NextToken` it cannot resume from in ITS OWN terms**: the
 //!   alarm HISTORY refuses it naming the value at fault, the Contributor Insights listings
 //!   refuse it with their coded sentence, and the alarm listing serves the FIRST page, because
@@ -63,6 +65,20 @@ fn rule_definition() -> String {
         "Contribution": {"Keys": ["$.ip"]},
     })
     .to_string()
+}
+
+/// The instant the report window below is measured from: a whole minute past the epoch, so the
+/// window is a whole number of periods wide.
+const REPORT_ANCHOR_SECS: i64 = 1_767_225_600;
+
+/// A `GetInsightRuleReport` request about `name` carrying every member the operation requires.
+fn report_request(name: &str) -> Value {
+    json!({
+        "RuleName": name,
+        "StartTime": REPORT_ANCHOR_SECS,
+        "EndTime": REPORT_ANCHOR_SECS + 300,
+        "Period": 60,
+    })
 }
 
 #[tokio::test]
@@ -140,6 +156,65 @@ async fn a_member_the_request_never_supplied_is_the_request_validation_class() {
         (status, error_code(&body).as_str()),
         (400, "InvalidParameterValueException"),
         "a filter supplied with no characters is an unusable value, got {status} with {body}"
+    );
+}
+
+#[tokio::test]
+async fn the_contributor_insights_report_names_the_member_it_lacks_and_the_request_it_serves() {
+    let router = build_router();
+    ok(
+        &router,
+        "PutInsightRule",
+        &json!({"RuleName": "report-rule", "RuleDefinition": rule_definition()}),
+    )
+    .await;
+
+    // Source for the members: the required input members of the report read
+    // (`smithy_query(query="operation",operation="GetInsightRuleReport")` — `RuleName`,
+    // `StartTime`, `EndTime` and `Period`). Rows differ along WHICH of them the request leaves
+    // out — a name, two instants and a granularity — because the member is what the sentence is
+    // built from, and the recorded case is one row among them.
+    let members = [
+        ("the granularity the report is asked at", "Period", "PERIOD"),
+        ("the rule the report is about", "RuleName", "RULE_NAME"),
+        ("the start of the window", "StartTime", "START_TIME"),
+        ("the end of the window", "EndTime", "END_TIME"),
+    ];
+
+    for (case, member, code) in members {
+        let mut request = report_request("report-rule");
+        request
+            .as_object_mut()
+            .expect("the request is an object")
+            .remove(member);
+        let (status, body) = call(&router, "GetInsightRuleReport", &request).await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, "MissingRequiredParameterException"),
+            "case {case:?}: expected the missing-parameter fault, got {status} with {body}"
+        );
+        let message = error_message(&body);
+        let expected = format!(
+            "MISSING_{code}: The {member} parameter must be present in a GetContributors request."
+        );
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected {expected:?}, got {message:?}"
+        );
+    }
+
+    // The other side of the same rule: with every required member supplied the read answers the
+    // rule's own contribution keys rather than a refusal.
+    let report = ok(
+        &router,
+        "GetInsightRuleReport",
+        &report_request("report-rule"),
+    )
+    .await;
+    assert_eq!(
+        report.get("KeyLabels"),
+        Some(&json!(["$.ip"])),
+        "a request carrying every required member is served, got {report}"
     );
 }
 

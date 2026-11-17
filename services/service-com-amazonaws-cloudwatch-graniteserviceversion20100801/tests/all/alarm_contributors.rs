@@ -8,7 +8,8 @@
 //! multi-timeseries alarm" (`AlarmContributor`) — so a read of such an alarm reports the
 //! contributors that are in `ALARM`, a read of an alarm of any other form is refused for its
 //! TYPE, and a read of a name no alarm carries is refused for its absence. The two refusals are
-//! different classes and are answered as such.
+//! different classes and are answered as such, and a `NextToken` this read never issued is
+//! refused quoting the value the request carried.
 //!
 //! Every table row is a distinct input along what the rule generalises over (the form the alarm's
 //! configuration identifies what it grades in, which kind of alarm it is, which state it is in,
@@ -101,7 +102,8 @@ fn metric_query(id: &str, dimensions: &[(&str, &str)], returns_data: bool) -> Va
 /// The members that make an alarm one whose state comes from a QUERY over several series:
 /// "The PromQL query that the alarm evaluates. The query must return a result of vector type.
 /// Each entry in the vector result represents an alarm contributor."
-/// (`AlarmPromQLCriteria$Query`) — the one configuration of this model that names contributors.
+/// (`AlarmPromQLCriteria$Query`) — one of the two configurations of this model whose result is a
+/// vector of series.
 fn promql_patch(query: &str) -> Value {
     json!({
         "Namespace": null,
@@ -116,6 +118,18 @@ fn promql_patch(query: &str) -> Value {
     })
 }
 
+/// One query of a `Metrics` array stating `expression` — a Metrics Insights query or a metric
+/// math expression ("This field can contain either a Metrics Insights query, or a metric math
+/// expression", `smithy_query(query="doc",shape="MetricDataQuery",member="Expression")`).
+fn expression_query(id: &str, expression: &str, returns_data: bool) -> Value {
+    json!({
+        "Id": id,
+        "Expression": expression,
+        "Period": 60,
+        "ReturnData": returns_data,
+    })
+}
+
 #[tokio::test]
 async fn only_an_alarm_over_several_series_has_contributors_to_report() {
     let router = build_router();
@@ -125,8 +139,9 @@ async fn only_an_alarm_over_several_series_has_contributors_to_report() {
     //
     // Rows differ along the FORM the configuration identifies what the alarm grades in — the
     // alarm's own metric members, a `Metrics` array of a metric, a `Metrics` array computing an
-    // expression, a composite alarm's rule over other alarms, a log alarm's scheduled query, and
-    // a query over a vector of series — because that form is what decides whether the alarm has
+    // expression, a composite alarm's rule over other alarms, a log alarm's scheduled query, a
+    // query over a vector of series, and a Metrics Insights query with and without the clause
+    // that groups its result — because that form is what decides whether the alarm has
     // contributors at all.
     let cases: Vec<(&str, AlarmKind, Value, bool)> = vec![
         (
@@ -172,6 +187,71 @@ async fn only_an_alarm_over_several_series_has_contributors_to_report() {
             "an alarm over a query whose result is a vector of series",
             AlarmKind::Metric,
             promql_patch("avg_over_time(latency[5m])"),
+            true,
+        ),
+        (
+            "an alarm on a Metrics Insights query that groups its result",
+            AlarmKind::Metric,
+            metrics_patch(json!([expression_query(
+                "grouped",
+                "SELECT AVG(Latency) FROM SCHEMA(\"Custom/Alarms\", Service) GROUP BY Service",
+                true,
+            )])),
+            true,
+        ),
+        (
+            "the same query written in lower case",
+            AlarmKind::Metric,
+            metrics_patch(json!([expression_query(
+                "grouped",
+                "select avg(Latency) from schema(\"Custom/Alarms\", Service) group by Service",
+                true,
+            )])),
+            true,
+        ),
+        (
+            "an alarm on a Metrics Insights query that groups nothing",
+            AlarmKind::Metric,
+            metrics_patch(json!([expression_query(
+                "ungrouped",
+                "SELECT AVG(Latency) FROM SCHEMA(\"Custom/Alarms\", Service)",
+                true,
+            )])),
+            false,
+        ),
+        (
+            "an alarm whose expression folds a grouped query to one series",
+            AlarmKind::Metric,
+            metrics_patch(json!([
+                expression_query(
+                    "grouped",
+                    "SELECT AVG(Latency) FROM SCHEMA(\"Custom/Alarms\", Service) GROUP BY Service",
+                    false,
+                ),
+                expression_query("folded", "MAX(grouped)", true),
+            ])),
+            false,
+        ),
+        (
+            "an alarm on a query whose dimension value carries the clause's words",
+            AlarmKind::Metric,
+            metrics_patch(json!([expression_query(
+                "quoted",
+                "SELECT AVG(Latency) FROM SCHEMA(\"Custom/Alarms\", Service) \
+                 WHERE Service = 'group by'",
+                true,
+            )])),
+            false,
+        ),
+        (
+            "an alarm on a grouped query that also carries those words as a value",
+            AlarmKind::Metric,
+            metrics_patch(json!([expression_query(
+                "grouped",
+                "SELECT AVG(Latency) FROM SCHEMA(\"Custom/Alarms\", Service) \
+                 WHERE Service != 'group by' GROUP BY Service",
+                true,
+            )])),
             true,
         ),
     ];
@@ -318,9 +398,10 @@ async fn a_contributor_read_refuses_a_name_no_alarm_carries_and_a_token_it_did_n
             "case {case:?}: expected HTTP 400 InvalidNextToken, got {status} with {body}"
         );
         let got = error_message(&body);
+        let expected = format!("Invalid NextToken : {token}");
         assert_eq!(
-            got, "Invalid NextToken",
-            "case {case:?}: expected the service's own sentence, got {got:?} in {body}"
+            got, expected,
+            "case {case:?}: expected the sentence quoting the token, got {got:?} in {body}"
         );
     }
 

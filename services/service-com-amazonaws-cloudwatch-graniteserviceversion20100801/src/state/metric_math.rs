@@ -410,6 +410,47 @@ pub fn is_metrics_insights_query(expression: &str) -> bool {
         .is_some_and(|start| start.eq_ignore_ascii_case(SELECT_KEYWORD))
 }
 
+/// Whether `expression` is a Metrics Insights query whose result is a VECTOR of time series
+/// rather than one: a `SELECT` statement ([`is_metrics_insights_query`]) carrying a `GROUP BY`
+/// clause, which returns one series per group of the values it groups by.
+///
+/// The clause is read off the statement by the maintained SQL grammar, so it is recognised only
+/// where the language puts a clause — a metric name, a dimension value or a string literal
+/// carrying those words is part of a projection or a predicate, not a grouping. A statement that
+/// grammar cannot read states no grouping this service can see, so the alarm watching it is
+/// graded as the one series an alarm's result otherwise is.
+pub fn groups_a_metrics_insights_query(expression: &str) -> bool {
+    if !is_metrics_insights_query(expression) {
+        return false;
+    }
+    let Ok(statements) = ::sqlparser::parser::Parser::parse_sql(
+        &::sqlparser::dialect::GenericDialect {},
+        expression,
+    ) else {
+        return false;
+    };
+    statements.iter().any(groups_its_result)
+}
+
+/// Whether `statement` is a query whose result is split into one row group per combination of
+/// the values a `GROUP BY` names — and so, for the series a Metrics Insights query returns, one
+/// series per group.
+fn groups_its_result(statement: &::sqlparser::ast::Statement) -> bool {
+    let ::sqlparser::ast::Statement::Query(query) = statement else {
+        return false;
+    };
+    let ::sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+        return false;
+    };
+    match &select.group_by {
+        // `GROUP BY ALL` groups by every value the projection selects, so it groups too.
+        ::sqlparser::ast::GroupByExpr::All(_) => true,
+        ::sqlparser::ast::GroupByExpr::Expressions(expressions, modifiers) => {
+            !expressions.is_empty() || !modifiers.is_empty()
+        }
+    }
+}
+
 /// Append the ids `expression` refers to that `found` does not already carry.
 fn collect_references(expression: &Expression, found: &mut Vec<String>) {
     match expression {
@@ -1017,11 +1058,22 @@ impl<'a> Evaluation<'a> {
     }
 
     /// `transform` over one series' points, dropping what it makes non-finite.
+    ///
+    /// A series reached once the budget is SPENT is not walked and not allocated for: the walk
+    /// of an array stops where the budget does, so the series after the one that spent it cost
+    /// nothing ([`Self::exhausted`], which the evaluation turns into [`BUDGET_SPENT`]).
     fn transform_series(
         &mut self,
         series: MathSeries,
         transform: impl Fn(f64) -> f64,
     ) -> MathSeries {
+        if self.exhausted() {
+            return MathSeries {
+                label: series.label,
+                points: Vec::new(),
+                metric: None,
+            };
+        }
         let mut points = Vec::with_capacity(series.points.len());
         for (timestamp, value) in series.points {
             if !self.charge(1) {
@@ -1077,28 +1129,50 @@ impl<'a> Evaluation<'a> {
             }
             (MathValue::Array(many), MathValue::Series(right)) => {
                 // The other operand is indexed ONCE, before the walk over the array: an index
-                // rebuilt per series would make the work the product of the array's length and
-                // the series' rather than their sum.
+                // rebuilt per series would make the INDEX the product of the array's length and
+                // the series' rather than their sum. Aligning each series against it is per
+                // series, so it is charged per series ([`Self::zip_indexed`]) and the walk stops
+                // where the budget does rather than carrying on over the rest of the array.
                 let aligned = self.index_of(&right)?;
-                Ok(MathValue::Array(
-                    many.into_iter()
-                        .map(|series| self.zip_indexed(operator, series, &aligned, false))
-                        .collect(),
-                ))
+                Ok(MathValue::Array(self.zip_each(
+                    operator, many, &aligned, false,
+                )?))
             }
             (MathValue::Series(left), MathValue::Array(many)) => {
                 let aligned = self.index_of(&left)?;
-                Ok(MathValue::Array(
-                    many.into_iter()
-                        .map(|series| self.zip_indexed(operator, series, &aligned, true))
-                        .collect(),
-                ))
+                Ok(MathValue::Array(self.zip_each(
+                    operator, many, &aligned, true,
+                )?))
             }
             (MathValue::Array(_), MathValue::Array(_)) => Err(MathError::new(
                 "an operator combines a time series or a number with an array of time series, \
                  not two arrays",
             )),
         }
+    }
+
+    /// `operator` over every series of `many` against the series `aligned` indexes, stopping
+    /// where the budget does.
+    ///
+    /// Each series of the array is aligned against the index on its own, so the work is the
+    /// product of the array's length and the index's size: an array reached with the budget
+    /// already spent is refused here rather than walked to its end
+    /// ([`Self::zip_indexed`] charges what aligning ONE series costs before it allocates).
+    fn zip_each(
+        &mut self,
+        operator: Operator,
+        many: Vec<MathSeries>,
+        aligned: &BTreeMap<i64, f64>,
+        indexed_is_left: bool,
+    ) -> Result<Vec<MathSeries>, MathError> {
+        let mut combined = Vec::with_capacity(many.len());
+        for series in many {
+            if self.exhausted() {
+                return Err(MathError::new(BUDGET_SPENT));
+            }
+            combined.push(self.zip_indexed(operator, series, aligned, indexed_is_left));
+        }
+        Ok(combined)
     }
 
     /// One series' points keyed by time stamp, charged: building the index is what aligning
@@ -1134,6 +1208,17 @@ impl<'a> Evaluation<'a> {
         aligned: &BTreeMap<i64, f64>,
         indexed_is_left: bool,
     ) -> MathSeries {
+        // What the alignment is about to visit is charged BEFORE it visits it, as every other
+        // walk of this evaluation charges its own: the union below holds this series' points and
+        // every key the indexed series carries, so building it is what one alignment costs and
+        // a series reached with the budget spent is neither indexed nor allocated for.
+        if !self.charge(series.points.len().saturating_add(aligned.len())) {
+            return MathSeries {
+                label: series.label,
+                points: Vec::new(),
+                metric: None,
+            };
+        }
         // The union of the two sides' time stamps, in time order: this series' own points,
         // plus the keys only the indexed series carries. A `BTreeMap` is what orders them,
         // oldest first, however the two series were spaced.
@@ -1147,9 +1232,6 @@ impl<'a> Evaluation<'a> {
         }
         let mut points = Vec::with_capacity(union.len());
         for (key, value) in union {
-            if !self.charge(1) {
-                break;
-            }
             // The operand with no datapoint in this bucket counts as 0 on either side.
             let own = value.unwrap_or(0.0);
             let other = aligned.get(&key).copied().unwrap_or(0.0);
@@ -1449,6 +1531,11 @@ impl<'a> Evaluation<'a> {
             MathValue::Array(many) => {
                 let mut columns: BTreeMap<i64, Vec<f64>> = BTreeMap::new();
                 for series in &many {
+                    // The walk stops where the budget does: the series after the one that spent
+                    // it are not visited either.
+                    if self.exhausted() {
+                        break;
+                    }
                     for (timestamp, value) in &series.points {
                         if !self.charge(1) {
                             break;
@@ -1507,7 +1594,18 @@ impl<'a> Evaluation<'a> {
     }
 
     /// One series under a function whose value at a point depends on the point before it.
+    ///
+    /// A series reached once the budget is SPENT is not walked and not allocated for, so the
+    /// walk of an array stops where the budget does ([`Self::transform_series`] states the same
+    /// rule for the point-wise functions).
     fn sequence_series(&mut self, name: &str, series: &MathSeries) -> MathSeries {
+        if self.exhausted() {
+            return MathSeries {
+                label: series.label.clone(),
+                points: Vec::new(),
+                metric: None,
+            };
+        }
         let mut points = Vec::with_capacity(series.points.len());
         let mut running = 0.0;
         for (index, (timestamp, value)) in series.points.iter().enumerate() {
@@ -1563,6 +1661,10 @@ impl<'a> Evaluation<'a> {
             MathValue::Array(many) => {
                 let mut counts: BTreeMap<i64, f64> = BTreeMap::new();
                 for series in &many {
+                    // The walk stops where the budget does, as the statistic walk does.
+                    if self.exhausted() {
+                        break;
+                    }
                     for (timestamp, _) in &series.points {
                         if !self.charge(1) {
                             break;

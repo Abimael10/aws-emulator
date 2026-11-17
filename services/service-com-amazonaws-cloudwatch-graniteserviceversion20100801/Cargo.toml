@@ -124,6 +124,13 @@ chrono-tz = { version = "0.10", default-features = false, features = ["std"] }
 # serializer; the codec parses and writes nothing else.
 prost = "0.14"
 
+# `sqlparser`: a Metrics Insights query is a `SELECT` statement in a SQL dialect
+# (`MetricDataQuery$Expression`), so whether one GROUPS its result — and so whether the alarm
+# watching it is graded on several time series — is read off the statement's own GROUP BY clause
+# with the maintained SQL grammar rather than by scanning its text here
+# (`state::metric_math::groups_a_metrics_insights_query`).
+sqlparser = "0.59"
+
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 

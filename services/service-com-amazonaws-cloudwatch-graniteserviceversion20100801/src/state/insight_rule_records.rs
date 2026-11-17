@@ -479,8 +479,29 @@ pub const NON_POSITIVE_MAX_RESULTS: &str = "INVALID_MAX_RESULTS: MaxResults must
 /// out per member: a client branching on the code reads the same form whichever member and
 /// whichever of those operations it submitted.
 pub fn missing_parameter_message(parameter: &str) -> String {
+    missing_parameter_sentence(parameter, "")
+}
+
+/// How CloudWatch states a parameter the Contributor Insights REPORT read needs that the request
+/// did not supply at all: the same coded form ([`missing_parameter_message`]), closed by the
+/// clause naming the request the parameter has to be present in.
+///
+/// That read is served by the contributor query behind it ([`REPORT_REQUEST`]), and its refusal
+/// says where the parameter was looked for, so a caller of the API sees which request of the
+/// service went short. Derived from the member for the same reason the rule operations' sentence
+/// is: `Period` is the recorded member, and every required member of the read is stated alike.
+pub fn missing_report_parameter_message(parameter: &str) -> String {
+    missing_parameter_sentence(parameter, &format!(" in a {REPORT_REQUEST} request"))
+}
+
+/// The request the Contributor Insights report read is served by, as its own refusals name it.
+const REPORT_REQUEST: &str = "GetContributors";
+
+/// The coded sentence both forms are: the fault carrying the member's code, the member, and
+/// `within` — where the parameter has to be present, for the refusal that says so.
+fn missing_parameter_sentence(parameter: &str, within: &str) -> String {
     format!(
-        "MISSING_{}: The {parameter} parameter must be present.",
+        "MISSING_{}: The {parameter} parameter must be present{within}.",
         member_code(parameter)
     )
 }
