@@ -367,7 +367,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::network::SubnetLookup::Unknown => None,
         };
         // An Elastic IP is EC2's resource too, and the allocation id is what names it, so
-        // an address the account holds no allocation for is refused the same way.
+        // an address the account holds no allocation for is refused — with the fault that
+        // lookup ran into relayed whole, the wording this API gives that class
+        // ([`crate::state::network::NetworkRefusal::relayed_message`]), exactly as
+        // `SetSubnets` states it for the mappings that REPLACE these.
         let allocation_ids: Vec<String> = subnet_mappings
             .iter()
             .filter_map(|mapping| mapping.allocation_id.clone())
@@ -378,7 +381,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateLoadBalancerErrorModeled::AllocationIdNotFoundException(
                     AllocationIdNotFoundException {
-                        message: Some(refusal.stated_message()),
+                        message: Some(refusal.relayed_message()),
                     },
                 )
                 .into(),

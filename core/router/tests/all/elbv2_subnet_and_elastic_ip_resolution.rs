@@ -7,9 +7,15 @@
 //! owns what those name: a subnet and an Elastic IP allocation are EC2's resources. So each
 //! resolves them against EC2 through the in-process callback and answers the modelled
 //! refusal — `SubnetNotFound` for an id the account holds no subnet for,
-//! `AllocationIdNotFound` for one it holds no Elastic IP for — stating as its MESSAGE the
-//! error CODE EC2 answered, which is this API's own wording for the class, rather than
-//! placing a load balancer in a subnet that does not exist.
+//! `AllocationIdNotFound` for one it holds no Elastic IP for — rather than placing a load
+//! balancer in a subnet that does not exist.
+//!
+//! What each refusal states as its MESSAGE is per error CLASS: a `SubnetNotFound` states the
+//! error CODE EC2 answered and nothing else, which is this API's own wording for that class,
+//! while an `AllocationIdNotFound` relays the EC2 fault whole — EC2's own sentence about the
+//! allocation id the request pinned, followed by the clause naming the call it came from.
+//! This suite asserts which class a refusal belongs to; the relayed form itself is tabled in
+//! `elbv2_relayed_elastic_ip_allocation_fault.rs`.
 //!
 //! That needs both services on one engine, which is why this suite lives here beside
 //! `elbv2_network_resolution.rs`, whose request plumbing it reuses; the rules that need
@@ -23,6 +29,9 @@ use std::sync::Arc;
 use aws_emulator_router::{build_router, InMemoryEngine};
 
 use crate::elbv2_network_resolution::{attach_internet_gateway, ec2_ok, elbv2, Answer, BOOT_STACK_SIZE};
+use crate::elbv2_relayed_elastic_ip_allocation_fault::{
+    assert_relays_the_ec2_fault, refused_by_ec2,
+};
 use crate::query_wire::{element, opt_element};
 
 /// The EC2 code for an id the account holds no subnet for, which is what Elastic Load
@@ -60,7 +69,7 @@ fn assert_refusal_states_the_inner_code(case: &str, answer: &Answer, code: &str,
 }
 
 /// The refusal EC2 answered for an id it would not resolve: the error code it came under,
-/// which is what the refusing operation states as its message.
+/// which the relayed clause of the refusing operation's message names.
 struct InnerRefusal {
     code: &'static str,
 }
@@ -262,9 +271,6 @@ fn a_placement_naming_a_resource_ec2_does_not_hold_is_refused() {
                 AllocationRow {
                     case: "a value that is not an allocation id",
                     pinned: "not-an-eip".to_string(),
-                    // EC2 tells a value that is no allocation id apart from one that names
-                    // no allocation, and the refusal states the code it answered — so the
-                    // two cases are distinguishable from the message alone.
                     refused: Some(InnerRefusal {
                         code: ALLOCATION_MALFORMED_CODE,
                     }),
@@ -286,12 +292,20 @@ fn a_placement_naming_a_resource_ec2_does_not_hold_is_refused() {
                     ],
                 );
                 if let Some(refused) = &row.refused {
-                    assert_refusal_states_the_inner_code(
-                        case,
-                        &answer,
-                        "AllocationIdNotFound",
-                        refused.code,
+                    // WHICH refusal EC2 answers for this form of value, read from EC2
+                    // itself: it tells a value that is no allocation id apart from one that
+                    // names no allocation, and the relayed clause carries the code it
+                    // answered — so the two cases are distinguishable from the message
+                    // alone. The relayed form itself is read through the one reader for it
+                    // (`crate::elbv2_relayed_elastic_ip_allocation_fault`), which that
+                    // suite tables.
+                    let from_ec2 = refused_by_ec2(&router, &runtime, row.pinned.as_str());
+                    assert_eq!(
+                        from_ec2.code, refused.code,
+                        "case {case:?}: expected EC2 to refuse the read under {:?}, got {:?}",
+                        refused.code, from_ec2.code
                     );
+                    assert_relays_the_ec2_fault(case, &answer, &from_ec2);
                     let read = elbv2(
                         &router,
                         &runtime,

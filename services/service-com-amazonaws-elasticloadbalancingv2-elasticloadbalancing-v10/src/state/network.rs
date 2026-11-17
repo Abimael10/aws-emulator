@@ -205,22 +205,57 @@ impl NetworkRefusal {
             .unwrap_or_else(|| self.code.clone())
     }
 
-    /// What the Elastic Load Balancing v2 API states as the MESSAGE of its OWN refusal for
-    /// an EC2-owned resource it could not resolve: the error CODE EC2 answered, and nothing
-    /// else.
+    /// What the Elastic Load Balancing v2 API states as the MESSAGE of its own
+    /// `SubnetNotFound`: the error CODE EC2 answered, and nothing else.
     ///
-    /// That is this API's own wording for the class — the refusal is its `SubnetNotFound`
-    /// or `AllocationIdNotFound` rather than EC2's, so neither EC2's sentence, nor the
-    /// service and status it answered, nor the id of the call that was made is part of it.
-    /// A caller reads the inner code, which says WHICH kind of resource was not resolved,
-    /// under this API's own error code.
+    /// That is this API's own wording for a SUBNET it could not resolve — the refusal is its
+    /// `SubnetNotFound` rather than EC2's, so neither EC2's sentence, nor the service and
+    /// status it answered, nor the id of the call that was made is part of it. A caller reads
+    /// the inner code, which says WHY the subnet was not resolved, under this API's own error
+    /// code.
     ///
-    /// Which of the two forms a service states is the service's own: the Classic API states
-    /// the inner SENTENCE instead ([`NetworkRefusal::reported_message`]).
+    /// Which form a refusal states is per error CLASS rather than per service: the refusal
+    /// for an Elastic IP allocation states the whole relayed fault instead
+    /// ([`NetworkRefusal::relayed_message`]), and the Classic API states the inner SENTENCE
+    /// for both ([`NetworkRefusal::reported_message`]).
     pub fn stated_message(&self) -> String {
         self.code.clone()
     }
+
+    /// What the Elastic Load Balancing v2 API states as the MESSAGE of its own
+    /// `AllocationIdNotFound`: the EC2 fault the Elastic IP lookup ran into, RELAYED WHOLE.
+    ///
+    /// An Elastic IP allocation is looked up through an EC2 client of this service's own, and
+    /// the refusal that client raised is what reaches the caller: the sentence EC2 worded
+    /// about the allocation id the request supplied, then the clause an SDK renders around a
+    /// failed call — which service answered it, with which HTTP status and error code, and
+    /// under which request id. Neither half alone is the message: the sentence without the
+    /// clause is EC2's refusal passed off as this service's own, and the clause without the
+    /// sentence names nothing the caller sent.
+    ///
+    /// Every part comes from the answer EC2 gave for THIS request, except the relayed call's
+    /// own request id, which is minted per call like every other request id — never derived
+    /// from the request and never stored.
+    pub fn relayed_message(&self) -> String {
+        format!(
+            "{} (Service: {EC2_SERVICE_NAME}; Status Code: {}; Error Code: {}; Request ID: \
+             {}; Proxy: null)",
+            self.reported_message(),
+            self.status.unwrap_or(RELAYED_REFUSAL_STATUS),
+            self.code,
+            ::service_common::query_error_envelope::new_request_id()
+        )
+    }
 }
+
+/// How Amazon EC2 names ITSELF in the fault clause an SDK renders around a call made to it,
+/// which is neither its endpoint prefix nor the casing of its `sdkId`.
+const EC2_SERVICE_NAME: &str = "AmazonEC2";
+
+/// The status a relayed fault clause states when the answer that carried the refusal reached
+/// this service without one: a read of the account's network refused for the ids the caller
+/// sent is a client fault.
+const RELAYED_REFUSAL_STATUS: u16 = 400;
 
 /// What EC2 says about the subnets a request named.
 #[derive(Debug, Clone, PartialEq, Eq)]

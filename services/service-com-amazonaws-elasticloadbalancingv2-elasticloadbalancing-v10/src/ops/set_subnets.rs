@@ -327,10 +327,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(refusal) =
             crate::state::network::absent_allocation_id(ctx, &region, &allocation_ids).await
         {
+            // The modelled `AllocationIdNotFound` RELAYS the fault the Elastic IP lookup
+            // ran into — EC2's sentence about the allocation id this request supplied, and
+            // the clause naming the call it came from — which is this API's own wording
+            // for the class ([`crate::state::network::NetworkRefusal::relayed_message`]).
+            // Nothing has been written yet, so the mapping the load balancer already
+            // carries is left as it was.
             return Err(
                 SetSubnetsErrorModeled::AllocationIdNotFoundException(
                     AllocationIdNotFoundException {
-                        message: Some(refusal.stated_message()),
+                        message: Some(refusal.relayed_message()),
                     },
                 )
                 .into(),
@@ -365,10 +371,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             resolved_subnets.as_deref(),
         );
 
-        // The store's lock lives in this block and is released with it: the registration
-        // recorded below reads another service again (the Availability Zone IDs are
-        // EC2's), and nothing holds this store while it does.
-        let (output, registration) = {
+        // This store's lock lives in the two blocks below and is released with each: the
+        // interfaces reconciled BETWEEN them are the account's own EC2 records, and the
+        // registration recorded after them reads another service again (the Availability
+        // Zone IDs are EC2's), so nothing holds this store while either runs — which is also
+        // what keeps two stores from ever being held at once here.
+        let (record, held) = {
             let mut guard = state.lock();
             // Looked up again because the lock was released for the EC2 read: the load
             // balancer may have been deleted while it ran.
@@ -385,11 +393,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // subnets this call left it with are the subnets its interfaces sit in: a
             // subnet it still has keeps the interface already there, one it has left gives
             // its interface back, and one it has just been given gets an interface of its
-            // own ([`crate::state::service_interfaces`]).
-            let held = ::std::mem::take(&mut load_balancer.network_interface_ids);
-            let record = load_balancer.clone();
-            let placed =
-                crate::state::reconcile_load_balancer_interfaces(&*self.engine, &record, &held);
+            // own ([`crate::state::service_interfaces`]). What it holds TODAY is copied
+            // rather than taken out of the record, so a reader between the two blocks sees
+            // the interfaces it had rather than none.
+            let held = load_balancer.network_interface_ids.clone();
+            (load_balancer.clone(), held)
+        };
+        // Reconciled with NO lock of this service's held: the interfaces live in the EC2
+        // emulator's own inventory, which this reaches through the shared engine.
+        let placed =
+            crate::state::reconcile_load_balancer_interfaces(&*self.engine, &record, &held);
+
+        let (output, registration) = {
+            let mut guard = state.lock();
+            // Looked up again because the lock was released for the reconcile above: the
+            // load balancer may have been deleted while it ran.
             let Some(load_balancer) = guard.load_balancers.get_mut(&input.load_balancer_arn)
             else {
                 return Err(not_found(&input.load_balancer_arn));
