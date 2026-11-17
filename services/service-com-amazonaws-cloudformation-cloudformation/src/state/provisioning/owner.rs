@@ -762,19 +762,22 @@ impl Owner {
             // edits one, so a changed declaration registers a new revision rather than
             // reaching this ([`ecs_task_definition::update`]).
             Self::EcsTaskDefinition => Ok(ecs_task_definition::update()),
-            // Neither an association nor a route table has a property that can change on the
-            // resource that exists (both of an association's are its identity, and a route
-            // table's VPC is create-only), every property of a gateway, of an attachment and
-            // of an Elastic IP address requires the resource to be replaced, and the members
-            // of an endpoint that can change are `ModifyVpcEndpoint`'s, which this emulator
-            // does not serve yet — so a changed declaration is reported as not applied
-            // rather than as a success that dropped the caller's change.
-            Self::Ec2VpcNetwork(_) => Ok(None),
-            // An instance's own properties are either part of the launch that made it or
-            // settings a `ModifyInstanceAttribute` would change, which this emulator does not
-            // serve — so a changed declaration is reported as not applied rather than as a
-            // success that dropped the caller's change.
-            Self::Ec2Instance => Ok(None),
+            // Each of these Amazon EC2 types takes a changed property through the call that
+            // service publishes for changing it on the resource that exists — a gateway
+            // attachment's gateway through the detach and attach pair, a route's target
+            // through `ReplaceRoute`, an endpoint's members through `ModifyVpcEndpoint`, a
+            // rule's description through the update for its direction, and every taggable one's
+            // tags through the tagging calls ([`ec2_vpc_network::update`]) — so the resource
+            // keeps the identity it has. A property no such call carries is create-only and
+            // replaces the resource instead.
+            Self::Ec2VpcNetwork(kind) => {
+                ec2_vpc_network::update(ctx, region, kind, resource, declared).await
+            }
+            // An INSTANCE takes the policies `ModifyInstanceAttribute` writes while it runs,
+            // and its tags ([`ec2_instance::update`]); the properties that are part of the
+            // machine it runs as are either create-only or applied by stopping the instance,
+            // which this deployment does not do.
+            Self::Ec2Instance => ec2_instance::update(ctx, region, resource, declared).await,
             Self::CognitoIdentityPool(kind) => {
                 cognito_identity_pool::update(ctx, region, kind, resource, declared).await
             }
@@ -914,10 +917,17 @@ impl Owner {
             // A task-definition revision's tags are the ones its registration carried, and no
             // deployment changes a revision, so nothing is asked about them.
             Self::EcsTaskDefinition => Ok(()),
-            // The tags of an Amazon EC2 resource that already exists are reconciled by no arm
-            // here yet — as for every other type of that service ([`Provisioner::retag`]'s
-            // own default) — so nothing is asked about them.
-            Self::Ec2VpcNetwork(_) | Self::Ec2Instance => Ok(()),
+            // The tags of an Amazon EC2 resource that already exists are that service's own
+            // `CreateTags` and `DeleteTags`: a create's tagging call applies to the resource it
+            // created and to no resource that already exists, and no call that changes one of
+            // these resources carries a tag — so this is where the set one is to end up
+            // carrying is reconciled ([`ec2_vpc_network::retag`], [`ec2_instance::retag`]).
+            Self::Ec2VpcNetwork(kind) => {
+                ec2_vpc_network::retag(ctx, region, kind, resource, declared, propagated).await
+            }
+            Self::Ec2Instance => {
+                ec2_instance::retag(ctx, region, resource, declared, propagated).await
+            }
             // A pool's tags are replaced by its own update call, which carries the
             // declaration's whole configuration, so nothing is asked about them here.
             Self::CognitoIdentityPool(_) => Ok(()),

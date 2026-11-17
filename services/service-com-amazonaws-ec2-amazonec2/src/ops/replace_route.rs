@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ReplaceRoute
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ReplaceRoute`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ReplaceRoute::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Points the route a route table already holds for one destination at a DIFFERENT target:
+//! "replaces an existing route within a route table in a VPC". The route is addressed by its
+//! destination — the one value that identifies a route inside its table — and the new target
+//! is resolved against the store the same way a create's is
+//! ([`crate::ops::create_route::resolve_target`]), so a replacement can no more point a route
+//! at a resource this account does not hold than a create can. The route keeps its position in
+//! the table and carries no member of the target it used to have
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::replace_route`]), so
+//! `DescribeRouteTables` reports exactly one target for that destination.
+//!
+//! The refusals, in the order this handler makes them: `MissingParameter` for a request naming
+//! no destination or no target, `InvalidParameterCombination` for one naming two of either,
+//! `InvalidParameterValue` for a destination that is not a CIDR block and for the local route
+//! no caller may re-point, `InvalidRouteTableID.NotFound` for a table this account does not
+//! hold, the target's own not-found code for a target it does not hold, `InvalidRoute.NotFound`
+//! for a destination the table holds no route for, and `DryRunOperation` for a dry run of a
+//! request that would have succeeded — which is why the route's own existence is read BEFORE
+//! that verdict.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +184,238 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ReplaceRoute` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ReplaceRouteErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ReplaceRoute"))
+        // `ctx` carries request metadata only; this operation reads none of it — a route is
+        // named by the table it is in. The store is reached through the engine on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        // "You must specify either a destination CIDR block or a prefix list ID"
+        // (`ReplaceRoute`), and a route matches on ONE destination — which is also what
+        // identifies the route this call replaces — so none and two are both refusals, as they
+        // are for the create that stored it.
+        let destinations = [
+            (
+                "destinationCidrBlock",
+                "destination-cidr-block",
+                input.destination_cidr_block.as_deref(),
+            ),
+            (
+                "destinationIpv6CidrBlock",
+                "destination-ipv6-cidr-block",
+                input.destination_ipv6_cidr_block.as_deref(),
+            ),
+            (
+                "destinationPrefixListId",
+                "destination-prefix-list-id",
+                input.destination_prefix_list_id.as_deref(),
+            ),
+        ];
+        let named: Vec<(&str, &str, &str)> = destinations
+            .iter()
+            .filter_map(|(member, filter, value)| {
+                value
+                    .filter(|value| !value.is_empty())
+                    .map(|value| (*member, *filter, value))
+            })
+            .collect();
+        let Some(&(member, destination_name, destination)) = named.first() else {
+            return Err(state::missing_parameter(
+                "The request must contain either the parameter destinationCidrBlock, \
+                 destinationIpv6CidrBlock or destinationPrefixListId",
+            ));
+        };
+        if named.len() > 1 {
+            return Err(state::invalid_parameter_combination(format!(
+                "The parameters {named} cannot be used together",
+                named = named
+                    .iter()
+                    .map(|(member, _, _)| *member)
+                    .collect::<Vec<&str>>()
+                    .join(", "),
+            )));
+        }
+        // "The value that you provide must match the CIDR of an existing route in the table"
+        // (`$DestinationCidrBlock`), and a create stores the block in its canonical form — so
+        // the same block written either way addresses the route that is there rather than one
+        // the table is reported as not holding.
+        let destination = match member {
+            "destinationCidrBlock" => match state::canonical_ipv4_cidr(destination) {
+                Ok(canonical) => canonical,
+                Err(_) => {
+                    return Err(state::invalid_parameter_value(format!(
+                        "Value ({destination}) for parameter destinationCidrBlock is invalid. \
+                         This is not a valid CIDR block."
+                    )))
+                }
+            },
+            "destinationIpv6CidrBlock" => match state::canonical_ipv6_cidr(destination) {
+                Ok(canonical) => canonical,
+                Err(_) => {
+                    return Err(state::invalid_parameter_value(format!(
+                        "Value ({destination}) for parameter destinationIpv6CidrBlock is \
+                         invalid. This is not a valid IPv6 CIDR block."
+                    )))
+                }
+            },
+            _ => destination.to_string(),
+        };
+
+        // "Specifies whether to reset the local route to its default target (local)"
+        // (`$LocalTarget`): that asks for a change to the LOCAL route, which this emulator
+        // never moves off its default target in the first place — no call here points a local
+        // route anywhere else — so there is nothing to reset and the honest answer is that it
+        // is not written rather than a success that changed nothing.
+        if input.local_target == Some(true) {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ReplaceRoute resetting the local route to its default target",
+            ));
+        }
+        // "You must also specify exactly one of the resources from the parameter list, or
+        // reset the local route to its default target": the target members are alternatives,
+        // so none and more than one are both refusals.
+        let targets: Vec<(&str, &str)> = [
+            ("gatewayId", input.gateway_id.as_deref()),
+            ("natGatewayId", input.nat_gateway_id.as_deref()),
+            ("instanceId", input.instance_id.as_deref()),
+            ("networkInterfaceId", input.network_interface_id.as_deref()),
+            ("transitGatewayId", input.transit_gateway_id.as_deref()),
+            ("localGatewayId", input.local_gateway_id.as_deref()),
+            ("carrierGatewayId", input.carrier_gateway_id.as_deref()),
+            (
+                "vpcPeeringConnectionId",
+                input.vpc_peering_connection_id.as_deref(),
+            ),
+            ("vpcEndpointId", input.vpc_endpoint_id.as_deref()),
+            (
+                "egressOnlyInternetGatewayId",
+                input.egress_only_internet_gateway_id.as_deref(),
+            ),
+            ("coreNetworkArn", input.core_network_arn.as_deref()),
+            ("odbNetworkArn", input.odb_network_arn.as_deref()),
+        ]
+        .into_iter()
+        .filter_map(|(member, value)| {
+            value
+                .filter(|value| !value.is_empty())
+                .map(|value| (member, value))
+        })
+        .collect();
+        let Some(&(target_member, target_value)) = targets.first() else {
+            return Err(state::missing_parameter(
+                "The request must contain exactly one of the parameters gatewayId, \
+                 natGatewayId, instanceId, networkInterfaceId, transitGatewayId, \
+                 localGatewayId, carrierGatewayId, vpcPeeringConnectionId, vpcEndpointId, \
+                 egressOnlyInternetGatewayId, coreNetworkArn or odbNetworkArn",
+            ));
+        };
+        if targets.len() > 1 {
+            return Err(state::invalid_parameter_combination(format!(
+                "The parameters {named} cannot be used together",
+                named = targets
+                    .iter()
+                    .map(|(member, _)| *member)
+                    .collect::<Vec<&str>>()
+                    .join(", "),
+            )));
+        }
+        // Two targets this emulator holds no resource for at all, so a 501 ("nobody has
+        // written this yet") is the honest answer rather than a refusal that blames the
+        // caller — the same answer the create of such a route gives.
+        if matches!(target_member, "coreNetworkArn" | "odbNetworkArn") {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                "ReplaceRoute with a {target_member} target"
+            )));
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // Whether a target is available is a question about the CURRENT states, so a
+        // transition the clock already owed is applied before it is asked: the move was due at
+        // that instant whether or not anybody called.
+        store.materialize_due_transitions();
+
+        // "The ID of the route table": an id this account holds no table for is a refusal,
+        // not a route replaced in no table.
+        let Some(route_table) = store.route_tables.get(&input.route_table_id) else {
+            return Err(state::invalid_route_table_id_not_found(&input.route_table_id));
+        };
+        // The VPC the table routes for, which is what a gateway target has to be attached to.
+        let vpc_id = route_table.vpc_id.clone().unwrap_or_default();
+        // "You cannot modify or delete the local route" (Amazon VPC User Guide, "Route
+        // tables"), so a replacement that names its destination is refused rather than
+        // re-pointing the route that carries the VPC's own traffic.
+        let local = route_table.routes.iter().flatten().any(|route| {
+            state::route_is_local(route)
+                && [
+                    route.destination_cidr_block.as_deref(),
+                    route.destination_ipv6_cidr_block.as_deref(),
+                    route.destination_prefix_list_id.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                .any(|held| held == destination.as_str())
+        });
+        if local {
+            return Err(state::invalid_parameter_value(format!(
+                "cannot replace local route {destination} in route table {route_table_id}",
+                route_table_id = input.route_table_id
+            )));
+        }
+
+        // The new target, resolved against the store: a route is only ever stored pointing at
+        // a resource this account holds, so a describe can never report a route to nothing.
+        let target = crate::ops::create_route::resolve_target(
+            &store,
+            target_member,
+            target_value,
+            &input.route_table_id,
+            &vpc_id,
+        )?;
+
+        // "The value that you provide must match the CIDR of an existing route in the table"
+        // (`$DestinationCidrBlock`): a destination the table holds no route for has no route to
+        // replace, which is read HERE — before the dry run below — so a dry run can never
+        // report that a request naming no route would have succeeded.
+        if !store.route_table_holds_destination(&input.route_table_id, &destination) {
+            return Err(state::invalid_route_not_found(
+                destination_name,
+                &destination,
+                &input.route_table_id,
+            ));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you have
+        // the required permissions, the error response is DryRunOperation" (`$DryRun`).
+        // Nothing has been written yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let spec = state::RouteSpec {
+            destination_cidr_block: (member == "destinationCidrBlock")
+                .then(|| destination.clone()),
+            destination_ipv6_cidr_block: (member == "destinationIpv6CidrBlock")
+                .then(|| destination.clone()),
+            destination_prefix_list_id: (member == "destinationPrefixListId")
+                .then(|| destination.clone()),
+            target,
+            // The route is still one a caller added to the table: "`CreateRoute` - the route
+            // was manually added to the route table" (`Route$Origin`) is what a replaced route
+            // goes on reporting, the origin being how the route came to be in the table rather
+            // than which call last wrote it.
+            origin: state::ROUTE_ORIGIN_CREATE_ROUTE,
+        };
+        if !store.replace_route(&input.route_table_id, spec) {
+            // Unreachable: the table was asked for that very destination a moment ago, under
+            // the same lock. Answered rather than unwrapped, so a store that somehow lost the
+            // route can only ever refuse.
+            return Err(state::invalid_route_not_found(
+                destination_name,
+                &destination,
+                &input.route_table_id,
+            ));
+        }
+        // `ReplaceRoute` answers nothing but its status.
+        Ok(ReplaceRouteOutput)
     }
 }

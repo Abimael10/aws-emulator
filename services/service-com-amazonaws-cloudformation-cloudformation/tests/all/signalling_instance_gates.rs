@@ -926,10 +926,16 @@ async fn a_signalled_estate_deploys_and_takes_a_new_launch_template_version() {
         "case {CASE:?}: expected Amazon EC2 to hold the version the stack reports, got \
          {described}"
     );
+    // ...and the template's DEFAULT version is where it was: nothing in an
+    // `AWS::EC2::LaunchTemplate` declaration states which version is the default one, and the
+    // default version is what "applies when a launch template version is not specified"
+    // (`ModifyLaunchTemplate`) — so a deployment that moved it would re-point every launch that
+    // names no version, which the template never asked for.
     assert_eq!(
         xml_text(&described, "defaultVersionNumber").as_deref(),
-        Some(updated_version.as_str()),
-        "case {CASE:?}: expected the new version to be the template's default, got {described}"
+        Some(created_version.as_str()),
+        "case {CASE:?}: expected the template's default version to stay where it was, got \
+         {described}"
     );
 }
 

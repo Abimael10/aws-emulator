@@ -2390,6 +2390,37 @@ pub(crate) fn return_values(
             without_terminal_dot(name).to_string(),
             attributes,
         ),
+        // A ROUTE in a route table. Amazon EC2 mints no identifier for one — every call on a
+        // route addresses it by the table it is in and the destination it matches — so the
+        // physical resource id of one is that PAIR ([`route_identity`]), which is what the
+        // type's `Ref` returns and what its one published attribute carries: "CidrBlock — the
+        // CIDR block used for the destination match", the destination the declaration states.
+        //
+        // Both halves come out of the declaration, so the id carries the stand-in a `Ref` to
+        // the route table resolved to until that table is created; the deployment re-points it
+        // at the `rtb-…` id Amazon EC2 minted, as it re-points every other value built on one
+        // ([`crate::state::provisioning::repoint_identity`]), and a later deployment resolves
+        // the declaration against the id in force.
+        EC2_ROUTE => {
+            let resolved = resolved_members(properties, EC2_ROUTE_IDENTITY_MEMBERS, scope, budget);
+            if let Some(destination) = ec2_route_destination(&resolved) {
+                attributes.insert("CidrBlock".to_string(), destination);
+            }
+            let identity = ec2_route_identity(&resolved).unwrap_or_else(|| name.to_string());
+            (identity, attributes)
+        }
+        // The ATTACHMENT that puts one gateway on one VPC. Amazon EC2 mints no identifier for
+        // one either — both detaches address it by the gateway and the VPC — so "Ref returns
+        // the name of the VPC gateway attachment", which is the KIND of gateway attached and
+        // the VPC it is attached to ([`ec2_gateway_attachment_identity`]). The type publishes
+        // no `Fn::GetAtt` attribute of its own.
+        EC2_VPC_GATEWAY_ATTACHMENT => {
+            let resolved =
+                resolved_members(properties, EC2_ATTACHMENT_IDENTITY_MEMBERS, scope, budget);
+            let identity =
+                ec2_gateway_attachment_identity(&resolved).unwrap_or_else(|| name.to_string());
+            (identity, attributes)
+        }
         _ => (name.to_string(), attributes),
     }
 }

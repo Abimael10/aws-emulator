@@ -92,6 +92,9 @@ use super::{
 // — and a rule declared as a RESOURCE of its own is the same permission under the same member
 // names, so the arms below are built from that reading rather than from a second copy of it.
 use crate::state::provisioner::{
+    ec2_in_place::{
+        applied_in_place, changed_properties, every_change_applied, retag_ec2_resource, UNAPPLIED,
+    },
     security_group_rule_parameters, tags_of, EC2_SECURITY_GROUP_EGRESS_MEMBERS,
     EC2_SECURITY_GROUP_INGRESS_MEMBERS,
 };
@@ -109,6 +112,7 @@ pub(super) const EC2_VPC_GATEWAY_ATTACHMENT: &str = "AWS::EC2::VPCGatewayAttachm
 pub(super) const EC2_EIP: &str = "AWS::EC2::EIP";
 pub(super) const EC2_ROUTE: &str = "AWS::EC2::Route";
 pub(super) const EC2_NAT_GATEWAY: &str = "AWS::EC2::NatGateway";
+pub(super) const EC2_NETWORK_INTERFACE: &str = "AWS::EC2::NetworkInterface";
 
 /// Amazon EC2's signing name and the API version a request names beside the action, from its
 /// model (`sigv4Name: ec2`, `version: 2016-11-15`) — the same pair the VPC and subnet arms of
@@ -158,6 +162,8 @@ pub(in crate::state) enum Kind {
     Route,
     /// `AWS::EC2::NatGateway`.
     NatGateway,
+    /// `AWS::EC2::NetworkInterface`.
+    NetworkInterface,
     /// `AWS::EC2::SecurityGroupIngress`.
     SecurityGroupIngress,
     /// `AWS::EC2::SecurityGroupEgress`.
@@ -176,6 +182,7 @@ pub(super) fn kind_of(resource_type: &str) -> Option<Kind> {
         EC2_EIP => Some(Kind::ElasticIp),
         EC2_ROUTE => Some(Kind::Route),
         EC2_NAT_GATEWAY => Some(Kind::NatGateway),
+        EC2_NETWORK_INTERFACE => Some(Kind::NetworkInterface),
         EC2_SECURITY_GROUP_INGRESS => Some(Kind::SecurityGroupIngress),
         EC2_SECURITY_GROUP_EGRESS => Some(Kind::SecurityGroupEgress),
         _ => None,
@@ -386,12 +393,357 @@ pub(super) async fn create(
         Kind::ElasticIp => allocate_address(ctx, region, resource, propagated).await,
         Kind::Route => create_route(ctx, region, resource).await,
         Kind::NatGateway => create_nat_gateway(ctx, region, resource, propagated).await,
+        Kind::NetworkInterface => {
+            create_network_interface(ctx, region, resource, propagated).await
+        }
         // Neither rule type publishes a `Tags` property, so CloudFormation propagates no tag
         // to one: the rule is the permission its declaration states and nothing else.
         Kind::SecurityGroupIngress | Kind::SecurityGroupEgress => {
             authorize_security_group_rule(ctx, region, kind, resource).await
         }
     }
+}
+
+/// The properties of each of these types a resource that already exists can take a NEW VALUE
+/// for, from AWS's CloudFormation resource reference for the type: the ones it does not publish
+/// with "Update requires: `Replacement`", read against the call Amazon EC2 publishes for
+/// changing one on the resource that exists.
+///
+/// * a ROUTE TABLE, an INTERNET GATEWAY, a VPN GATEWAY, an ELASTIC IP ADDRESS and a NAT GATEWAY
+///   take only their TAG SET: every other property of each is a member of its create that no
+///   call changes afterwards. (A NAT gateway's secondary addresses are updatable on AWS through
+///   the assign and unassign calls for them, which this emulator does not serve yet, so a
+///   change to one is reported as not applied rather than sent to a call that answers 501.)
+/// * an ASSOCIATION takes NONE: both of its properties are the binding it IS, so restating
+///   either asks for a different association.
+/// * a VPC GATEWAY ATTACHMENT takes the ONE GATEWAY it puts on its VPC — swapping it is a
+///   detach of the gateway it had and an attach of the one it now names
+///   ([`update_gateway_attachment`]) — while the VPC is the half of its identity the physical
+///   id carries.
+/// * a ROUTE takes its TARGET, which `ReplaceRoute` "replaces an existing route within a route
+///   table" with, while the table it is in and the destination it matches on are its identity.
+/// * a VPC ENDPOINT takes the members `ModifyVpcEndpoint` carries beside its tags.
+/// * a security group RULE takes its DESCRIPTION, which the
+///   `UpdateSecurityGroupRuleDescriptions…` call for its direction writes; everything else
+///   about a rule is the permission it IS.
+fn updatable_properties(kind: Kind) -> &'static [&'static str] {
+    match kind {
+        Kind::RouteTable
+        | Kind::InternetGateway
+        | Kind::VpnGateway
+        | Kind::ElasticIp
+        | Kind::NatGateway => &["Tags"],
+        // An elastic network INTERFACE takes the two attributes
+        // `ModifyNetworkInterfaceAttribute` writes of the ones this module applies — its
+        // description and the security groups it is in — beside its tag set; the subnet it is
+        // in and the addresses the create gave it are fixed when Amazon EC2 makes it.
+        Kind::NetworkInterface => &["Description", "GroupSet", "Tags"],
+        Kind::SubnetRouteTableAssociation => &[],
+        Kind::VpcGatewayAttachment => &["InternetGatewayId", "VpnGatewayId"],
+        Kind::Route => ROUTE_TARGETS,
+        Kind::VpcEndpoint => VPC_ENDPOINT_UPDATABLE_PROPERTIES,
+        Kind::SecurityGroupIngress | Kind::SecurityGroupEgress => &["Description"],
+    }
+}
+
+/// The `AWS::EC2::Route` properties that are TARGETS: `CreateRoute`'s target members, which
+/// are `ReplaceRoute`'s own under the same names — every property of the type beside the table
+/// it is in and the destination it matches on ([`ROUTE_DESTINATIONS`]).
+const ROUTE_TARGETS: &[&str] = &[
+    "CarrierGatewayId",
+    "CoreNetworkArn",
+    "EgressOnlyInternetGatewayId",
+    "GatewayId",
+    "InstanceId",
+    "LocalGatewayId",
+    "NatGatewayId",
+    "NetworkInterfaceId",
+    "TransitGatewayId",
+    "VpcEndpointId",
+    "VpcPeeringConnectionId",
+];
+
+/// The `AWS::EC2::VPCEndpoint` properties `ModifyVpcEndpoint` carries, beside the tag set:
+/// "modifies attributes of a specified VPC endpoint"
+/// (`smithy_query(query="operation",operation="ModifyVpcEndpoint")`) takes the policy, the
+/// private-DNS switch, the address type and the three lists of resources the endpoint is
+/// reached through — each as the ids to ADD and the ids to REMOVE
+/// ([`modify_vpc_endpoint`]). Its service name, its type and its VPC are create-only.
+const VPC_ENDPOINT_UPDATABLE_PROPERTIES: &[&str] = &[
+    "IpAddressType",
+    "PolicyDocument",
+    "PrivateDnsEnabled",
+    "RouteTableIds",
+    "SecurityGroupIds",
+    "SubnetIds",
+    "Tags",
+];
+
+/// Apply a CHANGED declaration to the resource of one of these types the stack created, so the
+/// resource keeps the identity it has and the logical resource reports the change as applied.
+///
+/// Which properties can be applied is the type's own ([`updatable_properties`]), and a change
+/// to one OUTSIDE that set is reported as not applied — `Ok(None)`, which
+/// [`super::reconcile`] turns into the resource's failure rather than a success that dropped
+/// the caller's change. A property that is create-only never reaches here at all: a
+/// declaration restating one asks for a DIFFERENT resource, which the deployment replaces
+/// ([`crate::state::template::replacement_properties`]).
+///
+/// The TAG SET is applied by no arm here: it is reconciled after the configuration change, by
+/// the one call pair that tags an Amazon EC2 resource that exists ([`retag`]).
+pub(super) async fn update(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    kind: Kind,
+    resource: &StoredResource,
+    declared: &Value,
+) -> Result<Option<Created>, Refusal> {
+    let changed = changed_properties(&resource.properties, declared);
+    if !every_change_applied(&changed, updatable_properties(kind)) {
+        return Ok(UNAPPLIED);
+    }
+    match kind {
+        // Nothing but the tag set can have changed on any of these, and that is reconciled
+        // after the configuration change: the change IS applied, so the resource reports it.
+        Kind::RouteTable
+        | Kind::InternetGateway
+        | Kind::VpnGateway
+        | Kind::ElasticIp
+        | Kind::NatGateway
+        | Kind::SubnetRouteTableAssociation => Ok(applied_in_place()),
+        Kind::VpcGatewayAttachment => {
+            update_gateway_attachment(ctx, region, resource, declared).await
+        }
+        Kind::Route => replace_route(ctx, region, resource, declared).await,
+        Kind::VpcEndpoint => modify_vpc_endpoint(ctx, region, resource, declared).await,
+        Kind::SecurityGroupIngress | Kind::SecurityGroupEgress => {
+            update_rule_description(ctx, region, kind, resource, declared).await
+        }
+        Kind::NetworkInterface => {
+            update_network_interface(ctx, region, resource, declared, &changed).await
+        }
+    }
+}
+
+/// Bring the tags of the resource a record names to the ones this deployment gives it, through
+/// Amazon EC2's own `CreateTags` and `DeleteTags` ([`retag_ec2_resource`]).
+///
+/// Only a TAGGABLE resource has any: neither a route, a subnet route table association, a
+/// gateway attachment nor a security group rule resource publishes a `Tags` property — the
+/// first three are not taggable resources at all and a rule's tags are not CloudFormation's to
+/// set — so nothing is asked of that service about one.
+pub(super) async fn retag(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    kind: Kind,
+    resource: &StoredResource,
+    declared: &Value,
+    propagated: &[(String, String)],
+) -> Result<(), Refusal> {
+    match tagged_id(kind, resource) {
+        Some(resource_id) => {
+            retag_ec2_resource(ctx, region, &resource_id, &tags_of(declared, propagated)).await
+        }
+        None => Ok(()),
+    }
+}
+
+/// The identifier Amazon EC2 holds a resource of this kind's TAGS under, or `None` for a kind
+/// that carries none.
+///
+/// For every taggable kind here it is the resource's own physical id, which IS the identifier
+/// that service assigned — except an ELASTIC IP ADDRESS: "Ref returns the Elastic IP address",
+/// so that type's physical id is the address itself while the taggable resource is its
+/// ALLOCATION, which is the id the create tagged ([`allocate_address`]) and the one the release
+/// names.
+///
+/// `None` for the kinds that have no tags of their own: neither a route, a subnet route table
+/// association nor a gateway attachment is a taggable resource at all — none of them publishes
+/// a `Tags` property — and a security group RULE's tags are not CloudFormation's to set, the
+/// rule types publishing no `Tags` property either.
+fn tagged_id(kind: Kind, resource: &StoredResource) -> Option<String> {
+    match kind {
+        Kind::RouteTable
+        | Kind::InternetGateway
+        | Kind::VpnGateway
+        | Kind::NatGateway
+        | Kind::NetworkInterface
+        | Kind::VpcEndpoint => Some(resource.physical_resource_id.clone()),
+        Kind::ElasticIp => resource.attributes.get("AllocationId").cloned(),
+        Kind::SubnetRouteTableAssociation
+        | Kind::VpcGatewayAttachment
+        | Kind::Route
+        | Kind::SecurityGroupIngress
+        | Kind::SecurityGroupEgress => None,
+    }
+}
+
+/// Put the gateway an `AWS::EC2::VPCGatewayAttachment` now declares on its VPC, in place of the
+/// one it had: the detach of the gateway in force and the attach of the declared one, the two
+/// calls that are the only way a VPC's gateway changes.
+///
+/// The attachment keeps its identity — the pair it is, whose VPC half is create-only — so
+/// everything that references the attachment goes on resolving, and the VPC is never left with
+/// two gateways of one kind: the detach comes first, which is also what makes the attach the
+/// one Amazon EC2 admits.
+async fn update_gateway_attachment(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+) -> Result<Option<Created>, Refusal> {
+    let vpc_id = required(resource, "VpcId")?;
+    let (attach, declared_member, declared_gateway_id) =
+        declared_gateway(declared, &resource.resource_type)?;
+    detach_gateway(ctx, region, resource).await?;
+    call_query(
+        ctx,
+        EC2_SIGNING_NAME,
+        region,
+        EC2_API_VERSION,
+        attach,
+        &[
+            (declared_member.to_string(), declared_gateway_id),
+            ("VpcId".to_string(), vpc_id),
+        ],
+    )
+    .await?;
+    Ok(applied_in_place())
+}
+
+/// Point the route an `AWS::EC2::Route` declares at the target it now names, through
+/// `ReplaceRoute` — "replaces an existing route within a route table in a VPC".
+///
+/// The route is addressed the only way Amazon EC2 lets one be addressed: the table it is in and
+/// the destination it matches on, which are its identity and so cannot have changed. The route
+/// therefore keeps the `<RouteTableId>|<destination>` physical id the type publishes, and the
+/// table goes on holding exactly one route for that destination.
+async fn replace_route(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+) -> Result<Option<Created>, Refusal> {
+    let route_table_id = required(resource, "RouteTableId")?;
+    let (member, destination) =
+        route_destination(resource).ok_or_else(|| missing_destination(resource))?;
+    let mut parameters = vec![
+        ("RouteTableId".to_string(), route_table_id),
+        (member.to_string(), destination),
+    ];
+    for target in ROUTE_TARGETS {
+        if let Some(value) = declared_scalar(declared, target) {
+            parameters.push(((*target).to_string(), value));
+        }
+    }
+    call_query(
+        ctx,
+        EC2_SIGNING_NAME,
+        region,
+        EC2_API_VERSION,
+        "ReplaceRoute",
+        &parameters,
+    )
+    .await?;
+    Ok(applied_in_place())
+}
+
+/// Write the DESCRIPTION an `AWS::EC2::SecurityGroupIngress` or `AWS::EC2::SecurityGroupEgress`
+/// now declares onto the rule it is, through the call that writes one for its direction:
+/// "updates the description of an ingress (inbound) security group rule. You can replace an
+/// existing description, or add a description to a rule that did not have one previously. You
+/// can remove a description for a security group rule by omitting the description parameter".
+///
+/// The rule is addressed by the `sgr-…` id Amazon EC2 minted for it — this resource's physical
+/// id — on the group its declaration names, so it keeps its identity and everything else that
+/// makes it the rule it is.
+async fn update_rule_description(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    kind: Kind,
+    resource: &StoredResource,
+    declared: &Value,
+) -> Result<Option<Created>, Refusal> {
+    let outbound = kind == Kind::SecurityGroupEgress;
+    let action = if outbound {
+        "UpdateSecurityGroupRuleDescriptionsEgress"
+    } else {
+        "UpdateSecurityGroupRuleDescriptionsIngress"
+    };
+    let mut parameters = vec![
+        named_group(resource, outbound)?,
+        (
+            "SecurityGroupRuleDescription.1.SecurityGroupRuleId".to_string(),
+            resource.physical_resource_id.clone(),
+        ),
+    ];
+    // A declaration that no longer states one asks for the rule WITHOUT a description, which
+    // that call spells as the description member omitted.
+    if let Some(description) = declared_scalar(declared, "Description") {
+        parameters.push((
+            "SecurityGroupRuleDescription.1.Description".to_string(),
+            description,
+        ));
+    }
+    call_query(
+        ctx,
+        EC2_SIGNING_NAME,
+        region,
+        EC2_API_VERSION,
+        action,
+        &parameters,
+    )
+    .await?;
+    Ok(applied_in_place())
+}
+
+/// Apply a changed `AWS::EC2::VPCEndpoint` declaration to the endpoint the stack created,
+/// through `ModifyVpcEndpoint` — the one call that changes an endpoint that exists.
+///
+/// That call takes each list of resources the endpoint is reached through as the ids to ADD and
+/// the ids to REMOVE, so each declared list is compared against the one in force and only the
+/// difference travels; the policy, the private-DNS switch and the address type are its own
+/// scalar members. The endpoint keeps the `vpce-…` id Amazon EC2 assigned it.
+async fn modify_vpc_endpoint(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+) -> Result<Option<Created>, Refusal> {
+    let mut parameters = vec![(
+        "VpcEndpointId".to_string(),
+        resource.physical_resource_id.clone(),
+    )];
+    for (property, member) in [
+        ("IpAddressType", "IpAddressType"),
+        ("PrivateDnsEnabled", "PrivateDnsEnabled"),
+        ("PolicyDocument", "PolicyDocument"),
+    ] {
+        if let Some(value) = declared_scalar(declared, property) {
+            parameters.push((member.to_string(), value));
+        }
+    }
+    for (property, element) in VPC_ENDPOINT_LIST_MEMBERS {
+        let held = list(resource, property);
+        let wanted = list_of(declared, property);
+        let added: Vec<&String> = wanted.iter().filter(|id| !held.contains(id)).collect();
+        let removed: Vec<&String> = held.iter().filter(|id| !wanted.contains(id)).collect();
+        for (change, ids) in [("Add", added), ("Remove", removed)] {
+            for (index, id) in ids.into_iter().enumerate() {
+                parameters.push((format!("{change}{element}.{}", index + 1), id.clone()));
+            }
+        }
+    }
+    call_query(
+        ctx,
+        EC2_SIGNING_NAME,
+        region,
+        EC2_API_VERSION,
+        "ModifyVpcEndpoint",
+        &parameters,
+    )
+    .await?;
+    Ok(applied_in_place())
 }
 
 /// Delete the resource a stack created, addressed by the identifier EC2 minted for it — this
@@ -532,6 +884,21 @@ pub(super) async fn delete(
         // resource was created from.
         Kind::Route => delete_route(ctx, region, resource).await,
         Kind::NatGateway => delete_nat_gateway(ctx, region, &id).await,
+        // "You must detach the network interface before you can delete it"
+        // (`DeleteNetworkInterface`), which is the order a teardown already walks a stack's
+        // resources in: an instance that holds the interface goes first.
+        Kind::NetworkInterface => forgiving(
+            call_query(
+                ctx,
+                EC2_SIGNING_NAME,
+                region,
+                EC2_API_VERSION,
+                "DeleteNetworkInterface",
+                &[("NetworkInterfaceId".to_string(), id)],
+            )
+            .await,
+        )
+        .map(|_| ()),
         Kind::SecurityGroupIngress | Kind::SecurityGroupEgress => {
             revoke_security_group_rule(ctx, region, kind, resource).await
         }
@@ -1056,8 +1423,18 @@ async fn detach_gateway(
 /// Read off the declaration rather than kept on the resource, so the attach and the detach
 /// cannot disagree about which gateway the attachment is of.
 fn attached_gateway(resource: &StoredResource) -> Result<(&'static str, &'static str, String), Refusal> {
-    let internet_gateway = scalar(resource, "InternetGatewayId");
-    let vpn_gateway = scalar(resource, "VpnGatewayId");
+    declared_gateway(&resource.properties, &resource.resource_type)
+}
+
+/// The same reading against a property DOCUMENT: the gateway one revision of an attachment's
+/// declaration names, which is what a SWAP of the gateway detaches and attaches
+/// ([`update_gateway_attachment`]).
+fn declared_gateway(
+    properties: &Value,
+    resource_type: &str,
+) -> Result<(&'static str, &'static str, String), Refusal> {
+    let internet_gateway = declared_scalar(properties, "InternetGatewayId");
+    let vpn_gateway = declared_scalar(properties, "VpnGatewayId");
     match (internet_gateway, vpn_gateway) {
         (Some(internet_gateway_id), None) => Ok((
             "AttachInternetGateway",
@@ -1073,9 +1450,8 @@ fn attached_gateway(resource: &StoredResource) -> Result<(&'static str, &'static
         _ => Err(Refusal {
             code: "InvalidRequest".to_string(),
             message: format!(
-                "{} requires exactly one of the InternetGatewayId and VpnGatewayId \
-                 properties",
-                resource.resource_type
+                "{resource_type} requires exactly one of the InternetGatewayId and \
+                 VpnGatewayId properties"
             ),
         }),
     }
@@ -1283,6 +1659,169 @@ async fn create_nat_gateway(
         physical_resource_id: Some(nat_gateway_id),
         attributes,
     })
+}
+
+/// Every property `AWS::EC2::NetworkInterface` publishes that this module applies, from AWS's
+/// CloudFormation resource reference for the type read against `CreateNetworkInterface`'s
+/// member list (`smithy_query(query="operation",operation="CreateNetworkInterface")`).
+///
+/// `GroupSet` is "the security group IDs associated with this network interface", which is that
+/// call's own `Groups` member (`xmlName: SecurityGroupId`); every other entry is a member of it
+/// under the same name. The properties this list LEAVES OUT are each refused rather than
+/// dropped ([`refuse_unmapped_properties`]): the IPv4 and IPv6 prefix members and the
+/// `PrivateIpAddresses` and `Ipv6Addresses` lists are lists of STRUCTURES, which this module
+/// writes no parameters for, a `ConnectionTrackingSpecification` is a structure of its own, and
+/// `SourceDestCheck` is a `ModifyNetworkInterfaceAttribute` the create cannot carry.
+const NETWORK_INTERFACE_PROPERTIES: &[&str] = &[
+    "Description",
+    "EnablePrimaryIpv6",
+    "GroupSet",
+    "InterfaceType",
+    "Ipv6AddressCount",
+    "PrivateIpAddress",
+    "SecondaryPrivateIpAddressCount",
+    "SubnetId",
+    "Tags",
+];
+
+/// The `AWS::EC2::NetworkInterface` properties that are `CreateNetworkInterface`'s own SCALAR
+/// members under the same name.
+const NETWORK_INTERFACE_SCALAR_MEMBERS: &[&str] = &[
+    "Description",
+    "EnablePrimaryIpv6",
+    "InterfaceType",
+    "Ipv6AddressCount",
+    "PrivateIpAddress",
+    "SecondaryPrivateIpAddressCount",
+    "SubnetId",
+];
+
+/// Create the elastic network interface an `AWS::EC2::NetworkInterface` declares, in Amazon EC2
+/// — so a route or an instance of the same template that points at it really reaches an
+/// interface that service holds, rather than an `eni-…` id `DescribeNetworkInterfaces` reports
+/// nothing for.
+///
+/// "Ref returns the ID of the network interface" — the `eni-…` id EC2 assigns, which is what
+/// this answers as the resource's physical id.
+async fn create_network_interface(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    refuse_unmapped_properties(resource, NETWORK_INTERFACE_PROPERTIES)?;
+    let mut parameters = vec![("SubnetId".to_string(), required(resource, "SubnetId")?)];
+    for member in NETWORK_INTERFACE_SCALAR_MEMBERS
+        .iter()
+        .filter(|member| **member != "SubnetId")
+    {
+        if let Some(value) = scalar(resource, member) {
+            parameters.push(((*member).to_string(), value));
+        }
+    }
+    for (index, group_id) in list(resource, "GroupSet").iter().enumerate() {
+        parameters.push((format!("SecurityGroupId.{}", index + 1), group_id.clone()));
+    }
+    let answered = call_query(
+        ctx,
+        EC2_SIGNING_NAME,
+        region,
+        EC2_API_VERSION,
+        "CreateNetworkInterface",
+        &parameters,
+    )
+    .await?;
+    let network_interface_id = reported(&answered, "networkInterface", "networkInterfaceId")?;
+    tag_resource(
+        ctx,
+        region,
+        &network_interface_id,
+        &tags_of(&resource.properties, propagated),
+    )
+    .await?;
+    // The attribute the uniform convention reads off the physical id: "Id — the ID of the
+    // network interface", which IS the id EC2 assigned.
+    let mut attributes = BTreeMap::new();
+    attributes.insert("Id".to_string(), network_interface_id.clone());
+    Ok(Created {
+        physical_resource_id: Some(network_interface_id),
+        attributes,
+    })
+}
+
+/// Apply a changed `AWS::EC2::NetworkInterface` declaration to the interface the stack created,
+/// through `ModifyNetworkInterfaceAttribute` — "modifies the specified network interface
+/// attribute. You can specify only one attribute at a time", so each changed attribute is its
+/// own call.
+///
+/// The interface keeps the `eni-…` id Amazon EC2 assigned it, so an instance it is attached to
+/// and a route pointing at it go on resolving.
+async fn update_network_interface(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+    changed: &[String],
+) -> Result<Option<Created>, Refusal> {
+    let network_interface_id = resource.physical_resource_id.clone();
+    // "A description for the network interface" (`$Description`), which that call takes as an
+    // `AttributeValue` — its value travelling as the member's own `Value`. A declaration that
+    // no longer states one asks for the interface without a description, which is the empty
+    // value of that attribute.
+    if changed.iter().any(|property| property == "Description") {
+        let description = declared_scalar(declared, "Description").unwrap_or_default();
+        modify_network_interface(
+            ctx,
+            region,
+            &network_interface_id,
+            &[("Description.Value".to_string(), description)],
+        )
+        .await?;
+    }
+    // "Changes the security groups for the network interface" (`$Groups`), which that call
+    // takes as the flattened list its own member name spells. A declaration that states none
+    // states a set the call cannot carry — an interface is always in at least one group — so
+    // the interface keeps the groups it is in and the change is reported as one this arm did
+    // not apply.
+    if changed.iter().any(|property| property == "GroupSet") {
+        let groups: Vec<(String, String)> = list_of(declared, "GroupSet")
+            .iter()
+            .enumerate()
+            .map(|(index, group_id)| {
+                (format!("SecurityGroupId.{}", index + 1), group_id.clone())
+            })
+            .collect();
+        if groups.is_empty() {
+            return Ok(UNAPPLIED);
+        }
+        modify_network_interface(ctx, region, &network_interface_id, &groups).await?;
+    }
+    Ok(applied_in_place())
+}
+
+/// Write ONE attribute of an interface that exists: `ModifyNetworkInterfaceAttribute` carrying
+/// the interface and that attribute's own parameters.
+async fn modify_network_interface(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    network_interface_id: &str,
+    attribute: &[(String, String)],
+) -> Result<(), Refusal> {
+    let mut parameters = vec![(
+        "NetworkInterfaceId".to_string(),
+        network_interface_id.to_string(),
+    )];
+    parameters.extend(attribute.iter().cloned());
+    call_query(
+        ctx,
+        EC2_SIGNING_NAME,
+        region,
+        EC2_API_VERSION,
+        "ModifyNetworkInterfaceAttribute",
+        &parameters,
+    )
+    .await
+    .map(|_| ())
 }
 
 /// Delete the NAT gateway a stack created, addressed by the id EC2 minted for it.
@@ -1518,7 +2057,14 @@ fn reported(document: &str, parent: &str, member: &str) -> Result<String, Refusa
 /// a string as written, and a boolean or a number in its own JSON spelling (`true`, `3`),
 /// which is what that protocol's parameters are.
 pub(super) fn scalar(resource: &StoredResource, property: &str) -> Option<String> {
-    let value = resource.properties.get(property)?;
+    declared_scalar(&resource.properties, property)
+}
+
+/// The same reading against a property DOCUMENT rather than a resource record: what an UPDATE
+/// is handed is the document this deployment declares, which is not the one the record carries
+/// ([`update`] compares the two).
+pub(super) fn declared_scalar(properties: &Value, property: &str) -> Option<String> {
+    let value = properties.get(property)?;
     if value.is_null() {
         return None;
     }
@@ -1532,7 +2078,12 @@ pub(super) fn scalar(resource: &StoredResource, property: &str) -> Option<String
 /// The entries of the declared LIST property `property`, each as that parameter's text. A
 /// property that is not a list carries one entry, which is the one value it is.
 pub(super) fn list(resource: &StoredResource, property: &str) -> Vec<String> {
-    match resource.properties.get(property) {
+    list_of(&resource.properties, property)
+}
+
+/// The same reading against a property DOCUMENT, for the reason [`declared_scalar`] records.
+pub(super) fn list_of(properties: &Value, property: &str) -> Vec<String> {
+    match properties.get(property) {
         None | Some(Value::Null) => Vec::new(),
         Some(Value::Array(entries)) => entries
             .iter()

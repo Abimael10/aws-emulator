@@ -443,7 +443,7 @@ pub(super) fn dropped_policy_names(held: &[Value], declared: &[Value]) -> Vec<St
 /// one of them adds, one it drops, and one both state with another value. The union of
 /// both documents' keys, so a property the new revision no longer declares is a change
 /// too, in the order the held revision wrote them and then the declared one.
-pub(super) fn changed_properties(held: &Value, declared: &Value) -> Vec<String> {
+pub(in crate::state) fn changed_properties(held: &Value, declared: &Value) -> Vec<String> {
     let mut changed: Vec<String> = Vec::new();
     for (property, value) in held.as_object().into_iter().flatten() {
         if declared.get(property) != Some(value) {

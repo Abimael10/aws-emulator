@@ -2065,6 +2065,11 @@ pub async fn reconcile(
     // that depend on a failed resource are left alone ([`depends_on_a_failure`]), and the
     // stack-level reason names the whole set rather than the first of it.
     let mut failed: Vec<(String, &'static str)> = Vec::new();
+    // The physical resources this walk took down BEFORE creating what replaced them, for a
+    // type whose replacement cannot hold two resources at once
+    // ([`super::template::replacement_deletes_first`]): each is gone already, so the cleanup
+    // phase that takes down what this deployment replaced owes no call about it.
+    let mut taken_down: BTreeSet<String> = BTreeSet::new();
     let mut declared = declared.into_iter();
     // Every `{{resolve:...}}` DYNAMIC REFERENCE the declarations carry whose store stands
     // OUTSIDE the deployment is resolved by CLOUDFORMATION ITSELF, here, before anything is
@@ -2692,11 +2697,15 @@ pub async fn reconcile(
         // for a value the resource that exists cannot take, and what the deployment does is
         // create a new physical resource for it. That is reported as the UPDATE's own
         // transitions rather than as a first create ([`Reporting`]).
-        let replacing = previous.iter().any(|existing| {
-            already_deployed(existing)
-                && existing.logical_id == resource.logical_id
-                && existing.resource_type == resource.resource_type
-        });
+        let superseded = previous
+            .iter()
+            .find(|existing| {
+                already_deployed(existing)
+                    && existing.logical_id == resource.logical_id
+                    && existing.resource_type == resource.resource_type
+            })
+            .cloned();
+        let replacing = superseded.is_some();
         let reporting = Reporting::of(replacing, stack.express);
         // The deployment is CREATING this resource: the stack records it as one it created
         // once this is through, whether the create reaches an owning service or not, so the
@@ -2706,6 +2715,50 @@ pub async fn reconcile(
             reporting.in_progress,
             reporting.opening_reason,
         ));
+        // ...and for a type whose replacement must be DELETE-BEFORE-CREATE, the resource it
+        // replaces is taken down right after that opening transition, BEFORE the create: the
+        // owning service cannot hold both at once — a subnet has exactly one route-table
+        // association — so a create made while the old resource is still there is one that
+        // service refuses. CloudFormation deletes such a resource whatever its
+        // `UpdateReplacePolicy` says, `Retain` included: there is no window in which both
+        // exist, so the old physical resource cannot be kept while the new one is created
+        // ([`super::template::replacement_deletes_first`]).
+        //
+        // Every other replacement is CREATE-before-delete, and the resource it replaced is
+        // taken down in the update's cleanup phase instead, after the replacement is in force
+        // ([`Policies::Replaced`]).
+        let delete_first = superseded
+            .filter(|_| super::template::replacement_deletes_first(&resource.resource_type));
+        if let Some(mut replaced) = delete_first {
+            match Box::pin(take_down_replaced_resource(
+                ctx,
+                region,
+                &mut replaced,
+                &mut outcome,
+            ))
+            .await
+            {
+                Ok(()) => {
+                    // The old physical resource is gone, so the cleanup phase owes no call
+                    // about it: its record is held out of the walk that takes down what this
+                    // deployment replaced.
+                    taken_down.insert(replaced.physical_resource_id.clone());
+                }
+                // The owning service would not take the old resource down, so the replacement
+                // cannot be created at all: this resource fails carrying that refusal, and the
+                // resource that exists is left exactly as it is.
+                Err(reason) => {
+                    failed.push((resource.logical_id.clone(), reporting.action));
+                    outcome.transitions.push(ResourceTransition::failed(
+                        &resource,
+                        reporting.failed,
+                        reason,
+                    ));
+                    outcome.resources.push(resource);
+                    continue;
+                }
+            }
+        }
         // A physical name identifies ONE resource, and CLOUDFORMATION itself holds the
         // record of which of this stack's resources holds which name: a declaration that
         // resolved to a name another resource of this stack already holds — the one the
@@ -3181,6 +3234,9 @@ pub async fn reconcile(
         .iter()
         .filter(|existing| {
             existing.materialised
+                // One this walk already took down to make room for its replacement is gone
+                // ([`taken_down`]), so there is nothing left to ask its owning service for.
+                && !taken_down.contains(&existing.physical_resource_id)
                 && !outcome
                     .resources
                     .iter()
@@ -3670,6 +3726,68 @@ fn depends_on_a_failure(
     needed_by(dependencies, logical_id)
         .iter()
         .any(|needed| failed.iter().any(|(id, _)| id == needed))
+}
+
+/// Take down the physical resource a REPLACEMENT supersedes, BEFORE the replacement is
+/// created, and report that removal on the resource's own transitions.
+///
+/// For a type whose owning service cannot hold two of the resource at once — a subnet has
+/// exactly one route-table association — a replacement is delete-before-create
+/// ([`super::template::replacement_deletes_first`]): the old resource is deleted first, so the
+/// create that follows is one that service admits and there is never a moment in which both
+/// exist. The deletion is reported as the pair every other removal is reported with — the
+/// `DELETE_IN_PROGRESS` naming the identifier being removed, then `DELETE_COMPLETE` — which is
+/// the order a client reading the stack's events sees it in.
+///
+/// `Err` is the owning service's own refusal of the removal, worded as a handler's failure:
+/// nothing was taken down, so the replacement cannot be created and the caller fails the
+/// resource with it.
+async fn take_down_replaced_resource(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    replaced: &mut StoredResource,
+    outcome: &mut Materialised,
+) -> Result<(), String> {
+    outcome.transitions.push(ResourceTransition::starting(
+        replaced,
+        super::resource_status::DELETE_IN_PROGRESS,
+    ));
+    let owner = owner_for(&replaced.resource_type);
+    let taken_down = match owner {
+        // Boxed for the reason every other provider call of this walk is boxed.
+        Some(provisioner) => Box::pin(super::service_role::on_resource(
+            super::service_role::target_of(replaced),
+            provisioner.delete(ctx, region, replaced, None),
+        ))
+        .await,
+        // Nothing exists in any owning service for this type, so there is nothing to take
+        // down: the stack's own record IS the resource, and the record it is being replaced by
+        // is the one the stack now keeps.
+        None => Ok(()),
+    };
+    match taken_down {
+        Ok(()) => {
+            // The old physical resource is gone, so the record the stack held for it no longer
+            // stands for anything an owning service holds.
+            replaced.materialised = false;
+            outcome.transitions.push(ResourceTransition::finished(
+                replaced,
+                super::resource_status::DELETE_COMPLETE,
+                None,
+            ));
+            Ok(())
+        }
+        Err(refusal) => {
+            let reason =
+                handler_failure_reason(owner, &refusal, &replaced.physical_resource_id);
+            outcome.transitions.push(ResourceTransition::finished(
+                replaced,
+                super::resource_status::DELETE_FAILED,
+                Some(reason.clone()),
+            ));
+            Err(reason)
+        }
+    }
 }
 
 /// Put ONE resource whose change this deployment could not carry through back the way it

@@ -603,6 +603,45 @@ pub(crate) fn content_digest(salt: &str, content: &str, digits: usize) -> String
 /// owning service bounds (see [`naming_rules`]).
 pub(super) const GENERATED_NAME_DIGEST_CHARS: usize = 12;
 
+/// The name CloudFormation generates for the REPLACEMENT of a resource whose name it
+/// generated itself: the name in force with a fresh segment of its own.
+///
+/// A generated name is stable across reads and across an update that does not recreate the
+/// resource ([`generated_name`] derives it from the stack and the logical id), which is what
+/// keeps the identifier of a resource that was not replaced where it is. A REPLACEMENT is the
+/// other case: the resource being replaced still holds the name it was created under while the
+/// replacement is created — and under an `UpdateReplacePolicy` of `Retain` it holds it for good
+/// — and an owning service refuses a second resource under a name it already has (a security
+/// group name is unique in its VPC, a bucket name worldwide). So the replacement is created
+/// under a name of its own.
+///
+/// The segment is derived from the name in force and the declaration being deployed, so the
+/// same deployment asked for twice names the same replacement — nothing here is drawn fresh per
+/// call — while a further deployment that replaces the resource again names another. The result
+/// is fitted to the owning service's own naming rules, exactly as the first generated name was:
+/// the stem gives up the characters the fresh segment and its separator need.
+pub fn replacement_name(resource_type: &str, name_in_force: &str, declared: &Value) -> String {
+    let unique = content_digest(
+        name_in_force,
+        &declared.to_string(),
+        GENERATED_NAME_DIGEST_CHARS,
+    );
+    let rules = naming_rules(resource_type);
+    let limit = rules.map_or(MAX_REPLACEMENT_NAME_CHARS, |rules| rules.max_characters);
+    let room = limit.saturating_sub(unique.chars().count() + 1);
+    let stem: String = name_in_force.chars().take(room).collect();
+    let name = format!("{stem}-{unique}");
+    match rules {
+        Some(rules) => within(name, rules.characters),
+        None => name,
+    }
+}
+
+/// The most characters a [`replacement_name`] carries for a type whose owning service
+/// publishes no bound a generated name could break ([`naming_rules`]): the widest bound in
+/// that catalogue, which every such name is already inside.
+const MAX_REPLACEMENT_NAME_CHARS: usize = 255;
+
 /// A service-generated identifier of the form `<prefix>-<digits hexadecimal characters>`.
 ///
 /// Some resource types do not take a name from the template at all: the owning service

@@ -299,12 +299,16 @@ const IDENTITY_ROWS: &[IdentityRow] = &[
         properties: |_| json!({ "VpcId": "vpc-0a1b2c3d4e5f60718" }),
         supporting: nothing_else,
     },
+    // An elastic network INTERFACE is created in Amazon EC2 itself, so its declaration names a
+    // subnet that service really holds — the subnet of this row's own VPC — rather than an id
+    // nothing was created for: `CreateNetworkInterface` refuses a subnet the account does not
+    // have, which is what the identifier the stack publishes stands for.
     IdentityRow {
         resource_type: "AWS::EC2::NetworkInterface",
         prefix: "eni",
         identifier_attribute: "Id",
-        properties: |_| json!({ "SubnetId": "subnet-0a1b2c3d4e5f60718" }),
-        supporting: nothing_else,
+        properties: |_| json!({ "SubnetId": { "Ref": "Subnet" } }),
+        supporting: supporting_vpc_and_subnet,
     },
     IdentityRow {
         resource_type: "AWS::EC2::VPCEndpoint",

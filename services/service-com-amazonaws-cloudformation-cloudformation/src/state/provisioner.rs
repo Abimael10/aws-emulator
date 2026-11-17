@@ -3156,6 +3156,27 @@ impl Provisioner {
             Self::Ec2LaunchTemplate => {
                 update_ec2_launch_template(ctx, region, resource, declared).await
             }
+            // Each of these Amazon EC2 types takes a changed property through the call that
+            // service publishes for it, so the resource keeps the identifier EC2 minted and
+            // the stack reports the change as applied ([`ec2_in_place`]). A property no such
+            // call carries is create-only and replaces the resource instead
+            // ([`super::template::replacement_properties`]).
+            Self::Ec2Vpc => update_ec2_vpc(ctx, region, resource, declared).await,
+            Self::Ec2Subnet => update_ec2_subnet(ctx, region, resource, declared).await,
+            Self::Ec2SecurityGroup => {
+                update_ec2_security_group(ctx, region, resource, declared).await
+            }
+            // An Amazon EBS VOLUME's own `ModifyVolume` arm is not written here yet, so a
+            // changed declaration of one is reported as not applied rather than as a success
+            // that dropped the caller's change; its tags are reconciled all the same
+            // ([`Self::retag`]), which is the one property a deployment can change without
+            // asking anything of that call.
+            Self::Ec2Volume if changed_properties(&resource.properties, declared)
+                .iter()
+                .all(|property| property == "Tags") =>
+            {
+                Ok(applied_in_place())
+            }
             // `UpdateSpendingLimit` "updates an existing spending limit" by the ARN Amazon
             // Braket minted, taking the limit's amount and its period — every property of
             // the type except the device it caps, which replaces the resource instead — so a
@@ -3436,6 +3457,32 @@ impl Provisioner {
             }
             Self::NeptuneGraphGraphSnapshot => {
                 retag_graph_snapshot(ctx, region, resource, declared, propagated).await
+            }
+            // Every Amazon EC2 resource's tags are that service's own `CreateTags` and
+            // `DeleteTags`: a create's tagging call applies to the resource it created and to
+            // no resource that already exists, and none of these types' update calls carries a
+            // tag — so this is where the set one of them is to end up carrying is reconciled
+            // ([`ec2_in_place::retag_ec2_resource`]). A LAUNCH TEMPLATE states its own tags in
+            // the `TagSpecifications` entry that names the template itself rather than in a
+            // `Tags` property, so its set is read the way its create reads it
+            // ([`launch_template_tags`]).
+            Self::Ec2Vpc | Self::Ec2Subnet | Self::Ec2SecurityGroup | Self::Ec2Volume => {
+                retag_ec2_resource(
+                    ctx,
+                    region,
+                    &resource.physical_resource_id,
+                    &tags_of(declared, propagated),
+                )
+                .await
+            }
+            Self::Ec2LaunchTemplate => {
+                retag_ec2_resource(
+                    ctx,
+                    region,
+                    &resource.physical_resource_id,
+                    &launch_template_tags(declared, propagated),
+                )
+                .await
             }
             // Every other type's re-tagging is its own entry here, for the same reason its
             // create, update and delete are: the tag set is the same for every type, but the
@@ -4782,6 +4829,12 @@ pub(super) mod compute_fleet;
 /// The scaling policies a stack attaches to an Auto Scaling group of [`compute_fleet`]'s.
 pub(in crate::state) mod auto_scaling_policies;
 mod network_and_delivery;
+/// Applying a CHANGED declaration to an Amazon EC2 resource that already exists: the calls
+/// each of that service's types takes a new property value through, and the tag reconciliation
+/// every one of them shares. Visible to the rest of this service's state because the EC2 types
+/// whose arms live beside the deployment algorithm reach the same calls
+/// ([`super::provisioning::ec2_vpc_network`], [`super::provisioning::ec2_instance`]).
+pub(in crate::state) mod ec2_in_place;
 /// The Amazon EKS arms of the two types a stack declares ON a cluster — the add-on and the
 /// managed node group — beside the cluster's own arms in [`network_and_delivery`]: each is a
 /// child resource addressed by the cluster that holds it and its own name, which is a
@@ -4829,6 +4882,10 @@ use auto_scaling_policies::*;
 use batch_job_definitions::*;
 use compute_fleet::*;
 pub(crate) use network_and_delivery::*;
+use ec2_in_place::{
+    applied_in_place, retag_ec2_resource, update_ec2_security_group, update_ec2_subnet,
+    update_ec2_vpc,
+};
 use eks_cluster_workloads::*;
 use s3_table_buckets::*;
 use platform_services::*;

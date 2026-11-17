@@ -41,11 +41,11 @@
 //!
 //! A declared property this module does not apply is REFUSED
 //! ([`refuse_unmapped_properties`]), so an instance is never reported created with less than
-//! its declaration asked for: a block device mapping, a network interface specification, CPU
-//! options, a credit specification, enclave or hibernation options, a license specification, a
-//! launch template, an `SsmAssociations` entry, an attached `Volumes` entry, a
-//! `SourceDestCheck` switch (a `ModifyInstanceAttribute` this emulator does not serve) and an
-//! `Ipv6Addresses` list are each one of those.
+//! its declaration asked for: a block device mapping, CPU options, a credit specification,
+//! enclave or hibernation options, a license specification, a launch template, an
+//! `SsmAssociations` entry, an attached `Volumes` entry, a `SourceDestCheck` switch (a
+//! `ModifyInstanceAttribute` this emulator does not serve) and an `Ipv6Addresses` list are each
+//! one of those.
 //!
 //! ## What the stack waits for
 //!
@@ -66,6 +66,7 @@ use super::ec2_vpc_network::{
     EC2_SIGNING_NAME, NOT_FOUND_SUFFIX,
 };
 use super::{call_query, xml_scalar_children, Created, Readiness, Refusal, Removal};
+use crate::state::provisioner::ec2_in_place::{retag_ec2_resource, update_ec2_instance};
 use crate::state::provisioner::tags_of;
 use crate::state::StoredResource;
 
@@ -93,6 +94,7 @@ const INSTANCE_PROPERTIES: &[&str] = &[
     "KernelId",
     "KeyName",
     "Monitoring",
+    "NetworkInterfaces",
     "PlacementGroupName",
     "PrivateIpAddress",
     "RamdiskId",
@@ -167,14 +169,16 @@ const USER_DATA_ATTRIBUTE: &str = "userData";
 ///
 /// Source: the type's "Return values" section read against the `Instance` shape's own wire
 /// names (`smithy_query(query="shape",shape="Instance")`) — a public IPv4 address travels as
-/// `ipAddress` and a public DNS name as `dnsName`, neither spelled as the property is. The
-/// `AvailabilityZone` the type also publishes is NOT one of them: Amazon EC2 reports it inside
-/// the instance's `placement`, which [`placement_zone`] reads.
+/// `ipAddress` and a public DNS name as `dnsName`, neither spelled as the property is, and the
+/// VPC the instance runs in is its own `vpcId` member. The `AvailabilityZone` the type also
+/// publishes is NOT one of them: Amazon EC2 reports it inside the instance's `placement`,
+/// which [`placement_zone`] reads.
 const INSTANCE_ATTRIBUTE_ELEMENTS: &[(&str, &str)] = &[
     ("PrivateDnsName", "privateDnsName"),
     ("PrivateIp", "privateIpAddress"),
     ("PublicDnsName", "dnsName"),
     ("PublicIp", "ipAddress"),
+    ("VpcId", "vpcId"),
 ];
 
 /// Launch the instance an `AWS::EC2::Instance` declares, in Amazon EC2 — so a client that
@@ -225,6 +229,11 @@ pub(super) async fn create(
     if let Some(profile) = scalar(resource, "IamInstanceProfile") {
         parameters.push(("IamInstanceProfile.Name".to_string(), profile));
     }
+    // "The network interfaces to associate with the instance": each entry is one interface of
+    // `RunInstances`'s own `NetworkInterfaces` list ([`interface_parameters`]), which is how a
+    // template puts an instance on a chosen subnet with chosen security groups and a public
+    // address.
+    parameters.extend(interface_parameters(resource)?);
     let answered = call_query(
         ctx,
         EC2_SIGNING_NAME,
@@ -257,6 +266,41 @@ pub(super) async fn create(
         physical_resource_id: Some(instance_id),
         attributes: published_attributes(&answered),
     })
+}
+
+/// Apply a CHANGED `AWS::EC2::Instance` declaration to the instance the stack launched, so it
+/// keeps the `i-…` id Amazon EC2 assigned it ([`update_ec2_instance`]).
+///
+/// Which properties can be applied is read there; a change to one outside that set is reported
+/// as not applied, and a create-only property replaces the instance instead
+/// ([`crate::state::template::replacement_properties`]).
+pub(super) async fn update(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+) -> Result<Option<Created>, Refusal> {
+    update_ec2_instance(ctx, region, resource, declared).await
+}
+
+/// Bring the instance's tags to the ones this deployment gives it, through Amazon EC2's own
+/// `CreateTags` and `DeleteTags` ([`retag_ec2_resource`]): `RunInstances` tagged the instance it
+/// launched, and no call that changes a live instance carries a tag, so this is where the set an
+/// instance is to end up carrying is reconciled.
+pub(super) async fn retag(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+    propagated: &[(String, String)],
+) -> Result<(), Refusal> {
+    retag_ec2_resource(
+        ctx,
+        region,
+        &resource.physical_resource_id,
+        &tags_of(declared, propagated),
+    )
+    .await
 }
 
 /// Terminate the instance a stack launched, addressed by the id Amazon EC2 minted for it —
@@ -384,6 +428,115 @@ async fn describe(
         Err(refusal) if refusal.code.ends_with(NOT_FOUND_SUFFIX) => Ok(None),
         Err(refusal) => Err(refusal),
     }
+}
+
+/// The published members of an `AWS::EC2::Instance` `NetworkInterface` entry that are SCALAR
+/// members of `RunInstances`'s own `InstanceNetworkInterfaceSpecification`, each against the
+/// parameter name that member travels under.
+///
+/// Source: the type's `NetworkInterface` property type in AWS's resource and property type
+/// reference against
+/// `smithy_query(query="shape",shape="InstanceNetworkInterfaceSpecification")` — every one is
+/// that shape's own member under the same name, which is also its `ec2QueryName` where it
+/// declares one.
+const INTERFACE_SCALAR_MEMBERS: &[&str] = &[
+    "AssociateCarrierIpAddress",
+    "AssociatePublicIpAddress",
+    "DeleteOnTermination",
+    "Description",
+    "DeviceIndex",
+    "NetworkInterfaceId",
+    "PrivateIpAddress",
+    "SecondaryPrivateIpAddressCount",
+    "SubnetId",
+];
+
+/// The published member of such an entry that is a LIST of that shape, against the parameter
+/// name `ec2Query` flattens it under — the member's own `xmlName`, numbered from one.
+///
+/// `GroupSet` is "the IDs of the security groups for the network interface", which is that
+/// shape's `Groups` member (`xmlName: SecurityGroupId`).
+const INTERFACE_LIST_MEMBERS: &[(&str, &str)] = &[("GroupSet", "SecurityGroupId")];
+
+/// Every member of an `AWS::EC2::Instance` `NetworkInterface` entry this module applies: the
+/// two catalogues above. A member outside them is REFUSED rather than dropped, for the reason
+/// [`refuse_unmapped_properties`] records — an interface created without the addresses its
+/// declaration asked for is not the interface the template declared, and both lists this
+/// leaves out (`Ipv6Addresses` and `PrivateIpAddresses`) are lists of STRUCTURES, which this
+/// module writes no parameters for.
+fn interface_parameters(resource: &StoredResource) -> Result<Vec<(String, String)>, Refusal> {
+    /// The parameter name `RunInstances` takes its interface list under: that member's own
+    /// `ec2QueryName` (`NetworkInterface`), numbered from one.
+    const INTERFACE: &str = "NetworkInterface";
+
+    let mut parameters: Vec<(String, String)> = Vec::new();
+    let declared = match resource.properties.get("NetworkInterfaces") {
+        None | Some(Value::Null) => return Ok(parameters),
+        Some(Value::Array(interfaces)) => interfaces.clone(),
+        // A declaration that writes a single interface without the sequence syntax is the
+        // one-entry list of itself, which is how CloudFormation reads a list property.
+        Some(single) => vec![single.clone()],
+    };
+    for (index, interface) in declared.iter().enumerate() {
+        let position = index + 1;
+        let Some(members) = interface.as_object() else {
+            return Err(Refusal {
+                code: "InvalidRequest".to_string(),
+                message: format!(
+                    "a NetworkInterfaces entry of {} is a structure of the members its \
+                     property type publishes",
+                    resource.resource_type
+                ),
+            });
+        };
+        for (member, value) in members {
+            if let Some(scalar) = INTERFACE_SCALAR_MEMBERS
+                .iter()
+                .find(|published| *published == member)
+            {
+                parameters.push((
+                    format!("{INTERFACE}.{position}.{scalar}"),
+                    interface_text(value),
+                ));
+                continue;
+            }
+            if let Some((_, element)) = INTERFACE_LIST_MEMBERS
+                .iter()
+                .find(|(published, _)| *published == member)
+            {
+                let entries = match value {
+                    Value::Array(entries) => entries.clone(),
+                    single => vec![single.clone()],
+                };
+                for (entry_index, entry) in entries.iter().enumerate() {
+                    parameters.push((
+                        format!("{INTERFACE}.{position}.{element}.{}", entry_index + 1),
+                        interface_text(entry),
+                    ));
+                }
+                continue;
+            }
+            return Err(Refusal {
+                code: "NotImplemented".to_string(),
+                message: format!(
+                    "this emulator does not apply the {member} member of a NetworkInterfaces \
+                     entry of {}",
+                    resource.resource_type
+                ),
+            });
+        }
+    }
+    Ok(parameters)
+}
+
+/// One member of an interface entry as the text an `ec2Query` parameter carries: a string as
+/// written, and a boolean or a number in its own JSON spelling, which is the reading every
+/// other declared value of this module goes through ([`scalar`]).
+fn interface_text(value: &Value) -> String {
+    value
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| serde_json::to_string(value).unwrap_or_default())
 }
 
 /// The instance an answer carries, as the scalar members Amazon EC2 reports for it.

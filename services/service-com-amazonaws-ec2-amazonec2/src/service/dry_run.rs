@@ -85,6 +85,7 @@ pub const OPERATIONS_WHOSE_HANDLER_ANSWERS_NOT_IMPLEMENTED: &[&str] = &[
     "CreateVpc",
     "CreateVpcEndpoint",
     "ModifyVpcEndpoint",
+    "ReplaceRoute",
     "RequestSpotFleet",
     "RequestSpotInstances",
     "RunInstances",

@@ -254,7 +254,7 @@ pub(super) async fn create_ec2_launch_template(
 /// Built through [`tags_of`], so the merge of declared and propagated tags is the one every
 /// other arm makes: the entries' own tag lists are collected into the `Tags` spelling that
 /// helper reads.
-fn launch_template_tags(
+pub(super) fn launch_template_tags(
     properties: &Value,
     propagated: &[(String, String)],
 ) -> Vec<(String, String)> {
@@ -678,15 +678,18 @@ pub(super) async fn update_auto_scaling_group(
 
 /// Apply a CHANGED `AWS::EC2::LaunchTemplate` declaration to the template that exists, by
 /// creating a NEW VERSION of it — `CreateLaunchTemplateVersion` "creates a new version of a
-/// launch template" from the launch data the call carries — and making that version the
-/// template's default one, which is what `ModifyLaunchTemplate` does ("you can specify which
-/// version of the launch template to set as the default version").
+/// launch template" from the launch data the call carries.
 ///
 /// That is the change the type publishes: its `LaunchTemplateData` is updatable with no
 /// interruption, a launch template being a versioned document, so the template keeps the
-/// `lt-` id it was created under and the two version numbers the type publishes move —
-/// which is what an Auto Scaling group reading `LatestVersionNumber` launches from next. Both
-/// are read off the answer rather than counted here.
+/// `lt-` id it was created under and its LATEST version moves — which is what an Auto Scaling
+/// group reading `LatestVersionNumber` launches from next.
+///
+/// The template's DEFAULT version is left exactly where it is: nothing in this type's
+/// declaration states it, and the version that is default is what "applies when a launch
+/// template version is not specified" (`ModifyLaunchTemplate`) — so a deployment that moved it
+/// would re-point every launch that names no version, which the template never asked for. Both
+/// numbers are read off the template Amazon EC2 then holds rather than counted here.
 ///
 /// A declaration whose launch DATA and version description are unchanged asks for no new
 /// version: only the template's TAGS can have changed, and those reach EC2 through the one
@@ -717,7 +720,7 @@ pub(super) async fn update_ec2_launch_template(
     // Each call is held in a box of its own, as every call a walk this deep makes is: what the
     // deployment keeps on the stack for this arm is then its own bookkeeping rather than
     // Amazon EC2's whole request chain ([`provisioning::reconcile`]).
-    let answered = Box::pin(call_query(
+    Box::pin(call_query(
         ctx,
         EC2_SIGNING_NAME,
         region,
@@ -726,37 +729,22 @@ pub(super) async fn update_ec2_launch_template(
         &parameters,
     ))
     .await?;
-    // "The version number" of the version just created
-    // (`LaunchTemplateVersion$VersionNumber`), which the template's default version is then
-    // set to.
-    let version_number = ec2_reported(&answered, "launchTemplateVersion")
-        .get("VersionNumber")
-        .and_then(Value::as_str)
-        .filter(|version| !version.is_empty())
-        .ok_or_else(|| Refusal {
-            code: UNIDENTIFIED_FAILURE.to_string(),
-            message: "CreateLaunchTemplateVersion answered no versionNumber".to_string(),
-        })?
-        .to_string();
-    let modified = Box::pin(call_query(
+    // The two version numbers the type publishes, as the template EC2 now holds reports them:
+    // read back from that service, the create of a version answering the VERSION it made
+    // rather than the template's own numbers.
+    let described = Box::pin(call_query(
         ctx,
         EC2_SIGNING_NAME,
         region,
         EC2_API_VERSION,
-        "ModifyLaunchTemplate",
-        &[
-            (
-                "LaunchTemplateId".to_string(),
-                resource.physical_resource_id.clone(),
-            ),
-            // `ModifyLaunchTemplateRequest$DefaultVersion` travels under the `xmlName` the
-            // model declares for it (`SetDefaultVersion`).
-            ("SetDefaultVersion".to_string(), version_number),
-        ],
+        "DescribeLaunchTemplates",
+        &[(
+            "LaunchTemplateId.1".to_string(),
+            resource.physical_resource_id.clone(),
+        )],
     ))
     .await?;
-    // The two version numbers the type publishes, as the template EC2 now holds reports them.
-    let reported = ec2_reported(&modified, "launchTemplate");
+    let reported = ec2_reported_entry(&described, "launchTemplates");
     let mut attributes = BTreeMap::new();
     for attribute in ["DefaultVersionNumber", "LatestVersionNumber"] {
         if let Some(value) = reported

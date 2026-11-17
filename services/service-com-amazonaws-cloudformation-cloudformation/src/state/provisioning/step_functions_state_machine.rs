@@ -285,40 +285,29 @@ async fn replacement(
 }
 
 /// The NAME the replacement is created under: the one the declaration states, and otherwise
-/// the generated name the replaced machine carried with a fresh unique segment.
+/// the generated name the replaced machine carried with a fresh unique segment
+/// ([`crate::state::template::replacement_name`], the one place that name is computed, which
+/// fits it to this type's own `@length(min: 1, max: 80)` bound).
 ///
 /// CloudFormation generates a name for a resource the template does not name, and a
 /// REPLACEMENT gets a new one — the old machine still holds the old name until the
-/// replacement has been created. The segment is derived from the replaced machine's own ARN
-/// and the declaration being deployed, so the same deployment asked for twice names the same
-/// replacement (nothing here is drawn fresh per call) while a declaration that replaces the
-/// machine again names another.
+/// replacement has been created.
 fn replacement_name(resource: &StoredResource, declared: &Value) -> String {
     if let Some(declared_name) = text_property(declared, "StateMachineName") {
         return declared_name;
     }
-    let unique = crate::state::template::content_digest(
-        &resource.physical_resource_id,
-        &declared.to_string(),
-        REPLACEMENT_DIGEST_CHARS,
-    );
-    let replaced = state_machine_name(resource);
-    // The name is `@length 1..80`, so the stem gives up the characters the fresh segment
-    // and its separator need.
-    let room = MAX_STATE_MACHINE_NAME_CHARS.saturating_sub(unique.chars().count() + 1);
-    let stem: String = replaced.chars().take(room).collect();
-    format!("{stem}-{unique}")
+    crate::state::template::replacement_name(
+        &resource.resource_type,
+        &state_machine_name(resource),
+        declared,
+    )
 }
 
-/// How many characters the unique segment of a [`replacement_name`] carries: the width the
-/// generated names of this crate use, which is wide enough that two replacements of one
-/// machine cannot collide.
-const REPLACEMENT_DIGEST_CHARS: usize = 12;
-
-/// The most characters a state machine's name may carry: the modelled `Name` shape's own
-/// `length` maximum (`smithy_query(query="operation",operation="CreateStateMachine")` gives
-/// 1..80).
-const MAX_STATE_MACHINE_NAME_CHARS: usize = 80;
+// How many characters the unique segment of a replacement's name carries, and the most a
+// state machine's name may carry, both live with the naming rules that compute one
+// ([`crate::state::template::replacement_name`]): that is the one place a generated name is
+// fitted to the bound its owning service publishes, which for this type is the modelled
+// `Name` shape's own `length` maximum (1..80).
 
 /// Delete the state machine a stack created, addressed by its ARN — this resource's physical
 /// id, which is what `Ref` returns for the type.

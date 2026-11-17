@@ -23,8 +23,8 @@
 //! like every other primitive there.
 
 use super::{tag_list_bytes, ComAmazonawsEc2Amazonec2State, MAX_STORED_RECORDS_PER_STORE};
-use crate::ops::types::{InternetGateway, InternetGatewayAttachment, Route, RouteTable,
-    RouteTableAssociation, RouteTableAssociationState, Tag};
+use crate::ops::types::{InternetGateway, InternetGatewayAttachment, Route,
+    RouteTable, RouteTableAssociation, RouteTableAssociationState, Tag};
 use crate::scaffolded::Scaffolded;
 
 /// The id prefix of a route table (`RouteTable$RouteTableId`), which EC2 spells `rtb-<hex>`.
@@ -728,8 +728,9 @@ impl ComAmazonawsEc2Amazonec2State {
     /// kept in the order they were added, which puts the local route a table comes with
     /// first — the order `DescribeRouteTables` reports them in.
     ///
-    /// The route is stored [`ROUTE_STATE_ACTIVE`]: a writer resolves the target first and
-    /// refuses a target that is not there, so no route is stored pointing at nothing.
+    /// The route is stored in the state its TARGET's availability decides
+    /// ([`Self::route_target_state`]): a writer resolves the target first and refuses a target
+    /// that is not there, so no route is stored pointing at nothing.
     ///
     /// `false`, with NOTHING written, for a table the store does not hold or one already at
     /// [`MAX_ROUTES_PER_ROUTE_TABLE`] routes — the bound a caller must map onto the refusal
@@ -740,12 +741,52 @@ impl ComAmazonawsEc2Amazonec2State {
         {
             return false;
         }
-        let route = spec.into_route(ROUTE_STATE_ACTIVE);
+        let state = self.route_target_state(&spec.target);
+        let route = spec.into_route(state);
         let Some(route_table) = self.route_tables.get_mut(route_table_id) else {
             return false;
         };
         route_table.routes.get_or_insert_with(Vec::new).push(route);
         true
+    }
+
+    /// The state a route pointing at `target` is reported in AS IT IS WRITTEN: `active` where
+    /// that target is available then, and [`ROUTE_STATE_BLACKHOLE`] where it is not — "the
+    /// `blackhole` state indicates that the route's target isn't available (for example, the
+    /// specified gateway isn't attached to the VPC, or the specified NAT instance has been
+    /// terminated)" (`Route$State`).
+    ///
+    /// The ONE place a stored route's state is decided, so a route a create wrote and one a
+    /// replacement re-pointed cannot be reported differently. Two targets are read: an elastic
+    /// network interface carries traffic only while it is ATTACHED to something, and an
+    /// instance only while it RUNS — the very example that sentence gives. Every other target a
+    /// route can be stored with was resolved against this store as the route was written (a
+    /// gateway target is refused unless it is attached to the table's own VPC), so a route to
+    /// one is active.
+    ///
+    /// The state a route CARRIES is therefore the one its target's availability made it when
+    /// the route was written, which is what the writers that re-read a route's state on a
+    /// change to its target are for (a detach blackholes the routes through the gateway it
+    /// detached); nothing here re-reads it as a route is reported.
+    pub fn route_target_state(&self, target: &RouteTarget) -> &'static str {
+        let available = match target {
+            RouteTarget::NetworkInterface(network_interface_id) => self
+                .network_interfaces
+                .get(network_interface_id)
+                .is_some_and(|interface| interface.attachment.is_some()),
+            RouteTarget::Instance(instance_id) => self
+                .instances
+                .get(instance_id)
+                .is_some_and(|instance| {
+                    instance.state == crate::state::InstanceStateName::Running
+                }),
+            _ => true,
+        };
+        if available {
+            ROUTE_STATE_ACTIVE
+        } else {
+            ROUTE_STATE_BLACKHOLE
+        }
     }
 
     /// Remove the route the route table `route_table_id` holds for `destination`, and answer
@@ -769,6 +810,37 @@ impl ComAmazonawsEc2Amazonec2State {
         let held = routes.len();
         routes.retain(|route| !route_matches_destination(route, destination));
         held != routes.len()
+    }
+
+    /// Point the route the route table `route_table_id` holds for `spec`'s destination at
+    /// what `spec` names instead, and answer whether one was re-pointed.
+    ///
+    /// "Replaces an existing route within a route table in a VPC" (`ReplaceRoute`): the route
+    /// is addressed by its DESTINATION — the one value that identifies a route inside its
+    /// table, read the one way [`Self::route_table_holds_destination`] reads it — and what
+    /// replaces it is a whole route built the one way [`Self::insert_route`] builds one, so a
+    /// re-pointed route carries no member of the target it used to have. It keeps its POSITION
+    /// in the table, a replacement being a change to the route that is there rather than a new
+    /// route added at the end.
+    ///
+    /// `false`, with nothing written, for a table the store does not hold or one that holds no
+    /// route for that destination.
+    pub fn replace_route(&mut self, route_table_id: &str, spec: RouteSpec) -> bool {
+        let state = self.route_target_state(&spec.target);
+        let Some(route_table) = self.route_tables.get_mut(route_table_id) else {
+            return false;
+        };
+        let Some(routes) = route_table.routes.as_mut() else {
+            return false;
+        };
+        let Some(position) = routes
+            .iter()
+            .position(|route| route_matches_destination(route, spec.destination()))
+        else {
+            return false;
+        };
+        routes[position] = spec.into_route(state);
+        true
     }
 
     /// Record that the subnet `subnet_id` is associated with the route table

@@ -2,6 +2,24 @@
 
 use super::*;
 
+/// Whether a REPLACEMENT of this type must delete the resource it replaces BEFORE creating the
+/// one that replaces it.
+///
+/// It is for a type whose owning service cannot hold two of the resource at once: "each subnet
+/// in your VPC must be associated with a route table" and with exactly one, so Amazon EC2
+/// refuses a second association for a subnet that already has one — on AWS the create-then-
+/// delete order is not merely unusual there, it is impossible. CloudFormation therefore deletes
+/// such a resource first, whatever its `UpdateReplacePolicy` states: there is no window in
+/// which both exist, so the old physical resource cannot be kept while the new one is created.
+///
+/// Every other type's replacement is create-before-delete, which is the order that keeps the
+/// resource it replaces serving its clients until the new one is in force — and the order the
+/// deployment's cleanup phase takes the old one down in
+/// ([`crate::state::provisioning::reconcile`]).
+pub fn replacement_deletes_first(resource_type: &str) -> bool {
+    resource_type == EC2_SUBNET_ROUTE_TABLE_ASSOCIATION
+}
+
 /// The properties of this type a resource cannot take a NEW VALUE for while it goes on
 /// existing — the ones the resource and property types reference publishes with "Update
 /// requires: `Replacement`" — BESIDE the name, which is in that position for every type
@@ -310,6 +328,151 @@ pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
             "SourceRegion",
             "StorageEncrypted",
             "Timezone",
+        ],
+        // ---------------------------------------------------------------------------
+        // Amazon EC2
+        // ---------------------------------------------------------------------------
+        //
+        // Source for every row below: AWS's CloudFormation resource reference for the type —
+        // the properties it publishes with "Update requires: `Replacement`" — read against the
+        // calls Amazon EC2 publishes for changing a resource that exists
+        // (`crate::state::provisioner::ec2_in_place`,
+        // `crate::state::provisioning::ec2_vpc_network`). Each is a value fixed when that
+        // service makes the resource: no call of it changes the block a VPC or a subnet is
+        // addressed on, the zone a subnet is in, the VPC a subnet, a route table, a security
+        // group or an endpoint belongs to, the description or the name a security group was
+        // created with, the service an endpoint reaches, or the AMI, the key pair and the
+        // placement an instance was launched with. So a declaration restating one asks for a
+        // DIFFERENT resource, which CloudFormation replaces; every property NOT named here is
+        // one the owning service takes a new value for on the resource that exists, which the
+        // deployment applies in place.
+        EC2_VPC => &["CidrBlock", "Ipv4IpamPoolId", "Ipv4NetmaskLength"],
+        EC2_SUBNET => &[
+            "AvailabilityZone",
+            "AvailabilityZoneId",
+            "CidrBlock",
+            "Ipv4IpamPoolId",
+            "Ipv4NetmaskLength",
+            "Ipv6CidrBlock",
+            "Ipv6CidrBlocks",
+            "Ipv6IpamPoolId",
+            "Ipv6Native",
+            "Ipv6NetmaskLength",
+            "OutpostArn",
+            "VpcId",
+        ],
+        EC2_SECURITY_GROUP => &["GroupDescription", "GroupName", "VpcId"],
+        EC2_ROUTE_TABLE => &["VpcId"],
+        EC2_VPN_GATEWAY => &["AmazonSideAsn", "Type"],
+        EC2_NAT_GATEWAY => &[
+            "AllocationId",
+            "ConnectivityType",
+            "PrivateIpAddress",
+            "SubnetId",
+        ],
+        EC2_EIP => &[
+            "Address",
+            "Domain",
+            "IpamPoolId",
+            "NetworkBorderGroup",
+            "PublicIpv4Pool",
+            "TransferAddress",
+        ],
+        EC2_VPC_ENDPOINT => &["ServiceName", "VpcEndpointType", "VpcId"],
+        // An attachment IS the pair of a VPC and a gateway, and its physical id is built from
+        // the VPC half ([`vpc_gateway_attachment_identity`]) — so a declaration naming another
+        // VPC names a different attachment, while the GATEWAY it puts on that VPC is swapped on
+        // the attachment that exists.
+        EC2_VPC_GATEWAY_ATTACHMENT => &["VpcId"],
+        // A ROUTE is identified by the table it is in and the ONE destination it matches on,
+        // which is what its physical id is built from ([`route_identity`]): restating either
+        // names a different route, while the TARGET is `ReplaceRoute`'s to change on the route
+        // that exists.
+        EC2_ROUTE => &[
+            "DestinationCidrBlock",
+            "DestinationIpv6CidrBlock",
+            "DestinationPrefixListId",
+            "RouteTableId",
+        ],
+        // An ASSOCIATION is the binding between one subnet and one route table, and Amazon EC2
+        // publishes no call that re-points one — `ReplaceRouteTableAssociation` makes a new
+        // association, with a new id — so restating either side asks for a different
+        // association.
+        EC2_SUBNET_ROUTE_TABLE_ASSOCIATION => &["RouteTableId", "SubnetId"],
+        // A security group RULE is the ONE permission it is: everything about it but its
+        // DESCRIPTION is fixed when the authorize adds it, the only call that changes a rule
+        // that exists being the one that writes its description.
+        EC2_SECURITY_GROUP_INGRESS => &[
+            "CidrIp",
+            "CidrIpv6",
+            "FromPort",
+            "GroupId",
+            "GroupName",
+            "IpProtocol",
+            "SourcePrefixListId",
+            "SourceSecurityGroupId",
+            "SourceSecurityGroupName",
+            "SourceSecurityGroupOwnerId",
+            "ToPort",
+        ],
+        EC2_SECURITY_GROUP_EGRESS => &[
+            "CidrIp",
+            "CidrIpv6",
+            "DestinationPrefixListId",
+            "DestinationSecurityGroupId",
+            "FromPort",
+            "GroupId",
+            "IpProtocol",
+            "ToPort",
+        ],
+        // A launch template is a versioned document: its launch DATA reaches the template that
+        // exists as a new version of it, and only the name the template is known by is fixed.
+        // (That name is also in this position through [`name_is_create_only`].)
+        EC2_LAUNCH_TEMPLATE => &["LaunchTemplateName"],
+        // An INSTANCE keeps the machine it was launched as: the image it boots, the subnet and
+        // the zone it was placed in, the addresses and interfaces the launch gave it, the key
+        // pair it admits and the placement it runs under are each a member of `RunInstances`
+        // that no call changes afterwards.
+        EC2_INSTANCE => &[
+            "AdditionalInfo",
+            "Affinity",
+            "AvailabilityZone",
+            "HostId",
+            "HostResourceGroupArn",
+            "ImageId",
+            "Ipv6AddressCount",
+            "Ipv6Addresses",
+            "KeyName",
+            "NetworkInterfaces",
+            "PlacementGroupName",
+            "PrivateIpAddress",
+            "SecurityGroups",
+            "SubnetId",
+            "Tenancy",
+        ],
+        // An elastic network INTERFACE is created in Amazon EC2 itself
+        // ([`crate::state::provisioning::ec2_vpc_network`]), and the ids a declaration states
+        // for the resources it names — its subnet, its security groups — are the ones those
+        // services minted. Its own create-only properties are the ones no call of that service
+        // changes on the interface that exists: the subnet it is in, the addresses the create
+        // gave it and the kind of interface it is.
+        EC2_NETWORK_INTERFACE => &[
+            "EnablePrimaryIpv6",
+            "InterfaceType",
+            "Ipv6AddressCount",
+            "PrivateIpAddress",
+            "SecondaryPrivateIpAddressCount",
+            "SubnetId",
+        ],
+        // An Amazon EBS VOLUME keeps the zone it is in, what it was created FROM and how it is
+        // encrypted; its size, its performance and its attachment settings are `ModifyVolume`'s
+        // to change.
+        EC2_VOLUME => &[
+            "AvailabilityZone",
+            "Encrypted",
+            "KmsKeyId",
+            "OutpostArn",
+            "SnapshotId",
         ],
         _ => composite_identity_properties(resource_type),
     }

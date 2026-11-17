@@ -379,13 +379,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 ///
 /// `member` is one of the member names the handler collected, and `value` the id it carried;
 /// `route_table_id` and `vpc_id` are the table the route goes in and the VPC it routes for.
-fn resolve_target(
+///
+/// Shared with [`crate::ops::replace_route`], which resolves a route's new target by exactly
+/// this rule: a replacement points the route at a resource this account holds, so the two
+/// operations cannot disagree about which targets are reachable from a table. Generic over the
+/// error channel for that reason — every refusal it answers is one of this service's own codes,
+/// which each operation's channel carries ([`crate::scaffolded::Scaffolded`]).
+pub(crate) fn resolve_target<E>(
     store: &crate::state::ComAmazonawsEc2Amazonec2State,
     member: &str,
     value: &str,
     route_table_id: &str,
     vpc_id: &str,
-) -> Result<crate::state::RouteTarget, CreateRouteError> {
+) -> Result<crate::state::RouteTarget, crate::scaffolded::Scaffolded<E>> {
     use crate::state::{self, RouteTarget};
     match member {
         "gatewayId" => {
@@ -506,10 +512,10 @@ fn resolve_target(
             }
             Ok(RouteTarget::EgressOnlyInternetGateway(value.to_string()))
         }
-        // Unreachable: the handler collected these member names itself and answered the
-        // three it holds no store for before reaching here.
+        // Unreachable: each handler collects these member names itself and answers the ones
+        // it holds no store for before reaching here.
         _ => Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
-            "CreateRoute with a {member} target"
+            "a route with a {member} target"
         ))),
     }
 }

@@ -103,29 +103,33 @@ const LAUNCH_REFERENCE_MEMBERS: &[&str] = &[
 /// specification, never a hundred levels inside one.
 const MAX_LAUNCH_REFERENCE_NESTING: usize = 16;
 
-/// How many characters the fresh segment of a [`replacement_name`] carries: the width of the
-/// unique segment of a generated name, wide enough that two replacements of one group cannot
-/// collide.
-const REPLACEMENT_DIGEST_CHARS: usize = 12;
+// How many characters the fresh segment of a replacement's name carries, and the longest name
+// the owning service takes, both live with the naming rules that compute one
+// ([`template::replacement_name`]): that is the one place a generated name is fitted to the
+// bound its owning service publishes.
 
-/// The most characters an Auto Scaling group's name may carry:
-/// `CreateAutoScalingGroup$AutoScalingGroupName` is `XmlStringMaxLen255`,
-/// `@length(min: 1, max: 255)` in that service's own model.
-const MAX_GROUP_NAME_CHARS: usize = 255;
-
-/// Give every record of this deployment that an `UpdatePolicy` asks to REPLACE a physical name
+/// Give every record of this deployment that is REPLACED rather than changed a physical name
 /// of its OWN, so the deployment creates the replacement beside the resource the stack has.
+///
+/// Two deployments reach this. One is the `UpdatePolicy` above: an Auto Scaling group the
+/// policy asks to be replaced is replaced even though every property of it could be changed in
+/// place. The other is every ORDINARY replacement of a resource whose name CloudFormation
+/// GENERATED: the record no longer carries the identity in force, because the declaration
+/// states a create-only property differently, so the deployment creates a new physical resource
+/// for it — and the resource being replaced still holds the name it was created under, which is
+/// a name its owning service will not give to a second resource. Both are the same question
+/// ([`template::replacement_name`] answers it), which is why they are decided here together.
 ///
 /// `declared` is the template being deployed — where the `UpdatePolicy` resource attribute
 /// lives, a stored record carrying the evaluated `Properties` alone — `resources` the records
 /// that deployment computed, and `in_force` the records the stack has right now
 /// ([`super::StoredStack::current_resources`]).
 ///
-/// Nothing is renamed for a deployment that does not CHANGE the group's launch configuration,
-/// for a group the stack does not have yet (there is nothing to replace: that deployment
-/// creates the group), or for a declaration that states the group's name itself — a name the
-/// template asks for is the name the resource has, and CloudFormation replaces such a resource
-/// only when the template renames it.
+/// Nothing is renamed for a resource the stack does not have yet (there is nothing to replace:
+/// that deployment creates it), for a declaration that states the resource's name itself — a
+/// name the template asks for is the name the resource has, and CloudFormation replaces such a
+/// resource only when the template renames it — or for a type that takes no name at all, whose
+/// create carries none.
 pub(super) fn rename_replacements(
     declared: &template::Template,
     resources: &mut [StoredResource],
@@ -144,8 +148,8 @@ pub(super) fn rename_replacements(
             })
         })
         .collect();
-    // Whether each group is replaced is decided over the records as they stand, before any of
-    // them is renamed, so one group's new name cannot change another's answer.
+    // Whether each resource is replaced is decided over the records as they stand, before any
+    // of them is renamed, so one resource's new name cannot change another's answer.
     let renamed: Vec<(String, String)> = resources
         .iter()
         .filter_map(|resource| {
@@ -154,22 +158,43 @@ pub(super) fn rename_replacements(
                     && existing.logical_id == resource.logical_id
                     && existing.resource_type == resource.resource_type
             })?;
-            let declaration = declared
-                .resources
-                .iter()
-                .find(|declaration| declaration.logical_id == resource.logical_id)?;
-            if !will_replace(declaration) {
-                return None;
-            }
             if super::stack::declared_name(resource).is_some() {
                 return None;
             }
-            if !launch_configuration_changed(resource, existing, &changed) {
+            let declaration = declared
+                .resources
+                .iter()
+                .find(|declaration| declaration.logical_id == resource.logical_id);
+            let replaced = match declaration.filter(|declaration| will_replace(declaration)) {
+                // The `UpdatePolicy` asks for the group to be replaced when the update
+                // changes its launch configuration.
+                Some(_) => launch_configuration_changed(resource, existing, &changed),
+                // ...and every other resource is replaced when the record no longer carries
+                // the identity in force: the identities a deployment takes over are already
+                // settled by the time this runs ([`super::StoredStack::deploy_template`]), so
+                // a record whose identity differs from the one the stack holds is one this
+                // deployment creates a new physical resource for.
+                //
+                // Only where the GENERATED NAME itself did not move: a declaration whose
+                // change gives the resource another generated name (a queue whose variant
+                // changes the suffix its name carries) already names the replacement something
+                // the resource it replaces does not hold, so there is nothing to make unique.
+                None => {
+                    takes_a_name(&resource.resource_type)
+                        && existing.physical_resource_id != resource.physical_resource_id
+                        && name_in_force(existing) == name_in_force(resource)
+                }
+            };
+            if !replaced {
                 return None;
             }
             Some((
                 resource.logical_id.clone(),
-                replacement_name(existing, &resource.properties),
+                template::replacement_name(
+                    &resource.resource_type,
+                    &name_in_force(existing),
+                    &resource.properties,
+                ),
             ))
         })
         .collect();
@@ -178,18 +203,44 @@ pub(super) fn rename_replacements(
             .iter_mut()
             .find(|resource| resource.logical_id == logical_id)
         {
-            // Through the one step that takes an identifier over, so the `Id` attributes the
-            // record reports and the id its `Ref` resolves to cannot drift apart — and the
-            // `Name` attributes the record carries with it, because for this type the physical
-            // id IS the name the group is created under ([`template::name_attributes`]).
+            // The `Name` attributes the record carries, which is where the create reads the
+            // name the resource is made under from
+            // (`crate::state::provisioner::declared_name`).
             for (attribute, value) in template::name_attributes(&resource.resource_type, &name) {
                 if let Some(held) = resource.attributes.get_mut(&attribute) {
                     *held = value;
                 }
             }
-            template::adopt_identity(resource, name);
+            // ...and the physical id too, for a type whose physical id IS that name: through
+            // the one step that takes an identifier over, so the `Id` attributes the record
+            // reports and the id its `Ref` resolves to cannot drift apart. For a type whose
+            // identity its OWNING SERVICE assigns, the id the record carries is the stand-in a
+            // reference is resolved against until that service answers the create, and the
+            // name is only what the create is made under — so the identity is left alone.
+            if !template::identity_is_service_assigned(&resource.resource_type) {
+                template::adopt_identity(resource, name);
+            }
         }
     }
+}
+
+/// Whether a resource of this type is created under a NAME at all: its type publishes a
+/// property a declaration states one in ([`template::name_property_candidates`]).
+///
+/// A type that publishes none takes no name on its create — an Amazon EC2 VPC, a route table —
+/// so there is no name a replacement could collide under, and nothing to rename.
+fn takes_a_name(resource_type: &str) -> bool {
+    !template::name_property_candidates(resource_type).is_empty()
+}
+
+/// The name the resource a replacement supersedes was created under: the `Name` its record
+/// carries, or its physical id where that IS the name.
+///
+/// The same reading the create makes of the record it is handed
+/// (`crate::state::provisioner::declared_name`), so the name a replacement is derived from is
+/// the name the resource it replaces really holds.
+fn name_in_force(existing: &StoredResource) -> String {
+    crate::state::provisioner::declared_name(existing)
 }
 
 /// Whether the declaration's `UpdatePolicy` asks for the resource to be REPLACED by an update:
@@ -277,31 +328,4 @@ fn names(declared: &Value, identifier: &str, depth: usize) -> bool {
         // caller already matched.
         scalar => super::scalar_text(scalar).is_some_and(|text| text == identifier),
     }
-}
-
-/// The NAME the replacement group is created under: the generated name the replaced group
-/// carries with a fresh segment of its own.
-///
-/// CloudFormation generates a name for a resource the template does not name, and a
-/// REPLACEMENT gets one of its own: the group being replaced still holds its name while the
-/// replacement is created, and Amazon EC2 Auto Scaling refuses a second group under a name it
-/// already holds. The segment is derived from the replaced group's own name and the declaration
-/// being deployed, so the same deployment asked for twice names the same replacement — nothing
-/// here is drawn fresh per call — while a further deployment that replaces the group again
-/// names another.
-fn replacement_name(existing: &StoredResource, declared: &Value) -> String {
-    let unique = template::content_digest(
-        &existing.physical_resource_id,
-        &declared.to_string(),
-        REPLACEMENT_DIGEST_CHARS,
-    );
-    // The stem gives up the characters the fresh segment and its separator need, so the name
-    // stays inside the bound the owning service publishes for it.
-    let room = MAX_GROUP_NAME_CHARS.saturating_sub(unique.chars().count() + 1);
-    let stem: String = existing
-        .physical_resource_id
-        .chars()
-        .take(room)
-        .collect();
-    format!("{stem}-{unique}")
 }

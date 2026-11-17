@@ -212,6 +212,11 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         EC2_SECURITY_GROUP => &["GroupId"],
         EC2_INTERNET_GATEWAY => &["InternetGatewayId"],
         EC2_ROUTE_TABLE => &["RouteTableId"],
+        // Source: `AWS::EC2::Route`'s own "Return values" section — "CidrBlock: the CIDR block
+        // used for the destination match", which is the destination the declaration states
+        // ([`ec2_route_destination`]). Its `Ref` is the route's own composite id rather than
+        // one of these attributes.
+        EC2_ROUTE => &["CidrBlock"],
         EC2_EIP => &["AllocationId"],
         EC2_NAT_GATEWAY => &["NatGatewayId"],
         EC2_DHCP_OPTIONS => &["DhcpOptionsId"],
@@ -230,15 +235,16 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
             "LaunchTemplateId",
         ],
         // Source: `AWS::EC2::Instance`'s own "Return values" section — the zone the instance
-        // was placed in, its private DNS name and IPv4 address, and its public ones. "Ref
-        // returns the ID of the instance", which is the resource's physical id rather than one
-        // of these attributes.
+        // was placed in, its private DNS name and IPv4 address, its public ones, and the VPC it
+        // runs in. "Ref returns the ID of the instance", which is the resource's physical id
+        // rather than one of these attributes.
         EC2_INSTANCE => &[
             "AvailabilityZone",
             "PrivateDnsName",
             "PrivateIp",
             "PublicDnsName",
             "PublicIp",
+            "VpcId",
         ],
         ECS_SERVICE => &["Name"],
         ELB_LISTENER => &["ListenerArn"],
@@ -821,6 +827,11 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         || resource_type == EC2_VPN_GATEWAY
         || resource_type == EC2_NAT_GATEWAY
         || resource_type == EC2_EIP
+        // An elastic network INTERFACE is one more: `CreateNetworkInterface` takes the subnet
+        // the interface goes in and no identifier for the interface itself, Amazon EC2 assigns
+        // the `eni-` id, and "Ref returns the ID of the network interface" — so the identifier
+        // in force is the one that service answered the create with.
+        || resource_type == EC2_NETWORK_INTERFACE
         // The two types that declare ONE security-group rule as a resource of its own are in
         // the same position: neither create takes an identifier for the rule — the declaration
         // states the group it is on and the permission it grants — Amazon EC2 mints the
@@ -1022,6 +1033,13 @@ pub fn composite_identity_properties(resource_type: &str) -> &'static [&'static 
 /// pair at all, so the resource keeps the identity the naming rules computed and the owning
 /// service's own validation of the missing member is what judges it.
 pub fn composite_identity(resource_type: &str, properties: &Value) -> Option<String> {
+    // The two Amazon EC2 bindings whose identifier is a composition of their parts rather
+    // than the plain join of a fixed property list.
+    match resource_type {
+        EC2_ROUTE => return ec2_route_identity(properties),
+        EC2_VPC_GATEWAY_ATTACHMENT => return ec2_gateway_attachment_identity(properties),
+        _ => {}
+    }
     let parts = composite_identity_properties(resource_type);
     if parts.is_empty() {
         return None;
@@ -1032,6 +1050,115 @@ pub fn composite_identity(resource_type: &str, properties: &Value) -> Option<Str
         .map(|part| properties.get(*part).and_then(scalar_text))
         .collect();
     Some(values?.join(COMPOSITE_IDENTITY_SEPARATOR))
+}
+
+/// `AWS::EC2::Route`: ONE route of one route table. "Ref returns the ID of the resource",
+/// which for this type is the pair that identifies a route — Amazon EC2 mints no identifier
+/// for one, every call on a route addressing it by the table it is in and the destination it
+/// matches on ([`ec2_route_identity`]).
+pub const EC2_ROUTE: &str = "AWS::EC2::Route";
+
+/// `AWS::EC2::VPCGatewayAttachment`: the attachment of ONE gateway to ONE VPC. "Ref returns
+/// the name of the VPC gateway attachment", which is that pair for the same reason
+/// ([`ec2_gateway_attachment_identity`]).
+pub const EC2_VPC_GATEWAY_ATTACHMENT: &str = "AWS::EC2::VPCGatewayAttachment";
+
+/// The properties of `AWS::EC2::Route` its identity and its one published attribute are read
+/// off: the table the route is in, and the three a route may state its ONE destination in.
+pub(super) const EC2_ROUTE_IDENTITY_MEMBERS: &[&str] = &[
+    "RouteTableId",
+    "DestinationCidrBlock",
+    "DestinationIpv6CidrBlock",
+    "DestinationPrefixListId",
+];
+
+/// The properties of `AWS::EC2::VPCGatewayAttachment` its identity is read off: the VPC, and
+/// the two an attachment may name its ONE gateway in.
+pub(super) const EC2_ATTACHMENT_IDENTITY_MEMBERS: &[&str] =
+    &["VpcId", "InternetGatewayId", "VpnGatewayId"];
+
+/// The ONE destination an `AWS::EC2::Route` declaration matches on, which is also the type's
+/// one published attribute: "CidrBlock — the CIDR block used for the destination match".
+///
+/// A route matches on exactly one of the three destination properties, so the one it states is
+/// the destination; `None` for a declaration that states none, which identifies no route at
+/// all and is what the owning service's own validation refuses.
+pub fn ec2_route_destination(properties: &Value) -> Option<String> {
+    EC2_ROUTE_IDENTITY_MEMBERS
+        .iter()
+        .skip(1)
+        .find_map(|member| properties.get(*member).and_then(scalar_text))
+}
+
+/// The physical resource id of an `AWS::EC2::Route`: `<RouteTableId>|<destination>`, the pair
+/// every Amazon EC2 call on a route addresses one by, joined the way CloudFormation joins the
+/// parts of a composite identifier ([`COMPOSITE_IDENTITY_SEPARATOR`]).
+///
+/// `None` for a declaration that does not state both halves: such a declaration names no route,
+/// so the resource keeps the identity the naming rules computed and that service's own refusal
+/// of the create is what judges it.
+pub fn ec2_route_identity(properties: &Value) -> Option<String> {
+    let route_table_id = properties.get("RouteTableId").and_then(scalar_text)?;
+    let destination = ec2_route_destination(properties)?;
+    Some(format!(
+        "{route_table_id}{COMPOSITE_IDENTITY_SEPARATOR}{destination}"
+    ))
+}
+
+/// The KIND of gateway a `AWS::EC2::VPCGatewayAttachment` puts on its VPC, as the physical
+/// resource id of the attachment names it: an internet gateway and a virtual private gateway
+/// are attached by calls of their own, and the attachment's identifier says which of the two
+/// it is.
+const EC2_INTERNET_GATEWAY_ATTACHMENT: &str = "IGW";
+const EC2_VPN_GATEWAY_ATTACHMENT: &str = "VGW";
+
+/// The physical resource id of an `AWS::EC2::VPCGatewayAttachment`: the kind of gateway
+/// attached and the VPC it is attached to (`IGW|vpc-…`), the pair both detaches address the
+/// attachment by, joined the way every other composite identifier is.
+///
+/// `None` for a declaration that names no VPC, or that names neither gateway or both: one
+/// attachment attaches ONE gateway, so such a declaration names no attachment and the owning
+/// service's own refusal is what judges it.
+pub fn ec2_gateway_attachment_identity(properties: &Value) -> Option<String> {
+    let vpc_id = properties.get("VpcId").and_then(scalar_text)?;
+    let internet_gateway = properties
+        .get("InternetGatewayId")
+        .and_then(scalar_text)
+        .is_some();
+    let vpn_gateway = properties
+        .get("VpnGatewayId")
+        .and_then(scalar_text)
+        .is_some();
+    let kind = match (internet_gateway, vpn_gateway) {
+        (true, false) => EC2_INTERNET_GATEWAY_ATTACHMENT,
+        (false, true) => EC2_VPN_GATEWAY_ATTACHMENT,
+        _ => return None,
+    };
+    Some(format!("{kind}{COMPOSITE_IDENTITY_SEPARATOR}{vpc_id}"))
+}
+
+/// The members `names` of one declaration, each EVALUATED: the document the identity rules
+/// above read, built where the declaration is still the template's own text.
+///
+/// A member that cannot be evaluated — a reference to a resource this scope does not carry —
+/// is left out, exactly as [`resolve_properties`] leaves it out of the document the owning
+/// service is asked with.
+pub(super) fn resolved_members(
+    properties: &Value,
+    names: &[&str],
+    scope: &Scope<'_>,
+    budget: &mut Budget,
+) -> Value {
+    let mut resolved = serde_json::Map::new();
+    for name in names {
+        if let Some(value) = properties
+            .get(*name)
+            .and_then(|declared| text(declared, scope, 0, budget))
+        {
+            resolved.insert((*name).to_string(), Value::String(value));
+        }
+    }
+    Value::Object(resolved)
 }
 
 /// Give a resource the physical id its type's composite primary identifier makes it, where
