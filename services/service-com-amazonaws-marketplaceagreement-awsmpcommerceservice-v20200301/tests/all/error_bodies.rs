@@ -63,9 +63,9 @@ const BILLING_ADJUSTMENT_REQUEST: &str = "BillingAdjustmentRequest";
 /// token of another query, an agreement that is no longer active. Spelled out
 /// here rather than imported, so a change of wording in the service fails this
 /// test instead of agreeing with it. The recorded AWS responses for this service
-/// carry this class unpunctuated, unlike the absent-member class ("Member is
-/// required.").
-const FIELD_INVALID: &str = "Member is invalid";
+/// state this class as one punctuated sentence, whichever part of the service
+/// refused the value.
+const FIELD_INVALID: &str = "Member is invalid.";
 
 /// `RequestId`'s modelled constraints: `@length(min: 1, max: 128)` and
 /// `^[A-Za-z0-9-]+$` (`smithy_query(query="shape", shape="RequestId")`),

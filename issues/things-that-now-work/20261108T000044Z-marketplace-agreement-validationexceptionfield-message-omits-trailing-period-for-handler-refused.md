@@ -63,3 +63,22 @@ Source of the divergence in the checkout: services/service-com-amazonaws-marketp
 3. Cause 2: call SearchAgreements with a request that passes the modelled constraints on catalog/filters/sort/maxResults/nextToken but is refused by one of the service's own rules (an unknown or unsupported filter name, an unsupported filter combination, an unacceptable sortBy, or a catalog this service does not expose). Observe HTTP 400 ValidationException and compare fields[0].message: again "Member is invalid" instead of "Member is invalid.". This is fixture marketplace-agreement-validation-error-paths step task#3.
 4. For contrast, trigger a refusal from the modelled constraint walk instead (e.g. a partyType of length 0 or containing a digit, violating @length/@pattern): that path already answers the punctuated "Member is invalid.", which shows the two texts are chosen by where the refusal was raised rather than by what AWS states.
 5. After fixing, re-replay marketplace-agreement-validation-error-paths steps task#1 AND task#3 — both causes must pass.
+
+## Resolution note
+
+Both causes are closed: the invalid-member field-message class is now the single
+punctuated sentence for every member this service refuses for carrying a value it
+does not accept, whether a rule inside a handler or a constraint the model
+declares raised the refusal, and the unsupported-filter-combination body takes
+its entry text from the same class mapping instead of hard-coding it.
+
+One consequence to keep on record, so it is not lost: step task#2 of the same
+fixture (ListAgreementCancellationRequests, an unacceptable `partyType`) records
+the UNPUNCTUATED sentence for exactly the class task#1 records punctuated on the
+sibling listing, so that step now diverges on
+`$.fields[name="partyType"].message`. The two recorded bodies state contradictory
+fixed texts for one error class, so no single wording satisfies both, and a
+wording keyed to the operation of the recorded call would be fitting the
+recording rather than implementing the rule. The rule implemented is the one this
+report states and the rest of the recorded bodies carry (ListAgreementPaymentRequests,
+SearchAgreements, and every boundary-raised refusal: punctuated).

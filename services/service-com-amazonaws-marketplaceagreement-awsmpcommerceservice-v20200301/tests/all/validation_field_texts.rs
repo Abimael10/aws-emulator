@@ -3,39 +3,41 @@
 //! What a `ValidationExceptionField` entry SAYS about the member it names.
 //!
 //! The rule under test: `ValidationExceptionField$message` is the fixed text of
-//! the class the member failed in, reproduced exactly — one text for a value
-//! that misses a constraint the model declares, one for a well-formed value a
-//! rule of the service itself does not accept, one for a member that was absent
-//! and is required of every request, and one for a member that was absent and
-//! became required only through the `intent` the request stated. The variable
+//! the class the member failed in, reproduced exactly — one text for a member
+//! that carried a value this service does not accept, one for a member that was
+//! absent and is required of every request, and one for a member that was absent
+//! and became required only through the `intent` the request stated. The variable
 //! part of the entry is `name`, the rejected member's dotted request path taken
-//! from the request. So the text depends on WHAT refused the member and not on
-//! which member, which operation or which depth it sits at, and each text keeps
-//! its own punctuation.
+//! from the request. So the text depends on WHAT was wrong with the member and
+//! not on which member, which operation, which depth it sits at, or whether the
+//! modelled constraint walk or a rule inside a handler is what refused it.
 //!
 //! Each row differs from the others in what the rule generalises over: the class
-//! of the failure, the constraint missed, the member, the depth (top level, a
-//! member of a list element), the operation, and whether the boundary walk or the
-//! handler refused the request. The recorded cases — a present-but-
-//! unacceptable member on `SendAgreementPaymentRequest` and on
-//! `ListAgreementCancellationRequests`, the absent per-element agreement
-//! identifier on `UpdatePurchaseOrders`, and the intent-conditional proposal
-//! identifier on `CreateAgreementRequest` — are four rows among them.
+//! of the failure, the constraint missed or the rule broken, the member, the
+//! depth (top level, inside a structure, a member of a list element), the
+//! operation, the reason, and whether the boundary walk or a rule inside a
+//! handler refused the request — including the SAME member refused both ways, so
+//! the sentence is shown not to report where the refusal was raised. The
+//! recorded cases — an unacceptable party type on `ListAgreementPaymentRequests`
+//! and on `ListAgreementCancellationRequests`, a `SearchAgreements` filter
+//! refusal, a present-but-unacceptable member on
+//! `SendAgreementPaymentRequest`, the absent per-element agreement identifier on
+//! `UpdatePurchaseOrders`, and the intent-conditional proposal identifier on
+//! `CreateAgreementRequest` — are rows among them.
 //!
-//! The harness (`emulator`, `call`, `term`) is the one `agreement_lifecycle`
-//! already owns.
+//! The harness (`emulator`, `call`, `term`, `agreement_type_filter`) is the one
+//! `agreement_lifecycle` already owns.
 
 use serde_json::{json, Value};
 
-use crate::agreement_lifecycle::{call, emulator, term, Answer};
+use crate::agreement_lifecycle::{agreement_type_filter, call, emulator, term, Answer};
 
-/// The fixed text for a well-formed value a rule of the service itself does not
-/// accept. Spelled out here rather than imported, so a change of wording in the
-/// service fails this test instead of silently agreeing with it.
-const FIELD_INVALID: &str = "Member is invalid";
-/// The fixed text for a value that misses a constraint the model declares, which
-/// the boundary walk refuses before any handler runs.
-const FIELD_INVALID_CONSTRAINT: &str = "Member is invalid.";
+/// The fixed text for a member that carried a value this service does not
+/// accept, whichever part of the service refused it: a constraint the model
+/// declares, or a rule of the service itself. Spelled out here rather than
+/// imported, so a change of wording in the service fails this test instead of
+/// silently agreeing with it.
+const FIELD_INVALID: &str = "Member is invalid.";
 /// The fixed text for a member that was absent from a request every one of which
 /// has to carry it.
 const FIELD_MISSING: &str = "Member is required.";
@@ -59,8 +61,9 @@ enum Class {
 impl Class {
     fn text(self) -> &'static str {
         match self {
-            Self::InvalidConstraint => FIELD_INVALID_CONSTRAINT,
-            Self::Unacceptable => FIELD_INVALID,
+            // ONE text for both: a member that carried an unacceptable value is
+            // one class of failure however the service came to refuse it.
+            Self::InvalidConstraint | Self::Unacceptable => FIELD_INVALID,
             Self::Absent => FIELD_MISSING,
             Self::AbsentForIntent => FIELD_MISSING_FOR_INTENT,
         }
@@ -335,6 +338,173 @@ fn rows() -> Vec<Row> {
             field: "sourceAgreementIdentifier",
             class: Class::AbsentForIntent,
         },
+        // A member that carried a value a RULE OF THE SERVICE does not accept,
+        // on the operations whose refusals are almost entirely of that kind:
+        // the party type naming neither role, the selectors whose value sets
+        // this service fixes, the sort attribute, the filter name, the filter
+        // value, the two filter-combination rules, and a page token minted for
+        // another query.
+        Row {
+            case: "a party type naming neither role, on the payment-request listing",
+            operation: "ListAgreementPaymentRequests",
+            request: json!({"partyType": "Bystander"}),
+            reason: "INVALID_PARTY_TYPE",
+            message: "Provided party type is invalid.",
+            field: "partyType",
+            class: Class::Unacceptable,
+        },
+        Row {
+            case: "a catalog this marketplace does not expose, on a listing",
+            operation: "ListAgreementPaymentRequests",
+            request: json!({"partyType": "Acceptor", "catalog": "AnotherCatalog"}),
+            reason: "INVALID_CATALOG",
+            message: "Provided catalog is invalid.",
+            field: "catalog",
+            class: Class::Unacceptable,
+        },
+        Row {
+            // `agreementType` is documented as `PurchaseAgreement` or
+            // `VendorInsightsAgreement` (`smithy_query(query="doc",
+            // shape="DescribeAgreementOutput", member="agreementType")`) and is
+            // a plain `^[A-Za-z]+$` string in the model, so a third word is a
+            // rule of the service to refuse.
+            case: "an agreement type outside the documented pair",
+            operation: "ListAgreementPaymentRequests",
+            request: json!({"partyType": "Proposer", "agreementType": "SubscriptionAgreement"}),
+            reason: "INVALID_AGREEMENT_TYPE",
+            message: "Provided agreement type is invalid.",
+            field: "agreementType",
+            class: Class::Unacceptable,
+        },
+        Row {
+            case: "a sort attribute this service does not sort on",
+            operation: "SearchAgreements",
+            request: json!({
+                "filters": [agreement_type_filter()],
+                "sort": {"sortBy": "Whatever"},
+            }),
+            reason: "INVALID_SORT_BY",
+            message: "Provided sort by is invalid.",
+            field: "sort.sortBy",
+            class: Class::Unacceptable,
+        },
+        Row {
+            case: "a filter name this service does not publish",
+            operation: "SearchAgreements",
+            request: json!({"filters": [{"name": "NotAFilter", "values": ["x"]}]}),
+            reason: "INVALID_FILTER_NAME",
+            message: "Provided filter name is invalid.",
+            field: "filters.1.member.name",
+            class: Class::Unacceptable,
+        },
+        Row {
+            case: "a filter value outside the set its attribute publishes",
+            operation: "SearchAgreements",
+            request: json!({"filters": [{"name": "PartyType", "values": ["Bystander"]}]}),
+            reason: "INVALID_PARTY_TYPE",
+            message: "Provided party type is invalid.",
+            field: "filters.1.member.values.1.member",
+            class: Class::Unacceptable,
+        },
+        Row {
+            case: "a catalog this marketplace does not expose, on a search",
+            operation: "SearchAgreements",
+            request: json!({
+                "catalog": "AnotherCatalog",
+                "filters": [agreement_type_filter()],
+            }),
+            reason: "INVALID_CATALOG",
+            message: "Provided catalog is invalid.",
+            field: "catalog",
+            class: Class::Unacceptable,
+        },
+        Row {
+            // The unsupported-combination refusal has a body of its own, which
+            // states the combination in `message` because no single member of
+            // such a request is the wrong one — its `fields` entry is still the
+            // invalid-member sentence.
+            case: "a filter combination the acceptor party type does not support",
+            operation: "SearchAgreements",
+            request: json!({
+                "filters": [
+                    agreement_type_filter(),
+                    {"name": "PartyType", "values": ["Acceptor"]},
+                    {"name": "AcceptorAccountId", "values": ["000000000000"]},
+                ],
+            }),
+            reason: "UNSUPPORTED_FILTERS",
+            message: "Provided combination of filters is not supported.",
+            field: "filters",
+            class: Class::Unacceptable,
+        },
+        Row {
+            case: "a sort attribute the search's party type does not support",
+            operation: "SearchAgreements",
+            request: json!({
+                "filters": [
+                    agreement_type_filter(),
+                    {"name": "PartyType", "values": ["Acceptor"]},
+                ],
+                "sort": {"sortBy": "StartTime"},
+            }),
+            reason: "UNSUPPORTED_FILTERS",
+            message: "Provided combination of filters is not supported.",
+            field: "sort.sortBy",
+            class: Class::Unacceptable,
+        },
+        Row {
+            case: "a page token no search of this kind minted",
+            operation: "SearchAgreements",
+            request: json!({
+                "filters": [agreement_type_filter()],
+                "nextToken": "bm90LWEtdG9rZW4=",
+            }),
+            reason: "INVALID_NEXT_TOKEN",
+            message: "Provided next token is invalid.",
+            field: "nextToken",
+            class: Class::Unacceptable,
+        },
+        // The same members refused by a constraint the MODEL declares instead,
+        // at the boundary: the same sentence, so the wording does not report
+        // where the refusal was raised.
+        Row {
+            case: "a party type outside the pattern its shape declares, on the same listing",
+            operation: "ListAgreementPaymentRequests",
+            request: json!({"partyType": "Party1"}),
+            reason: "INVALID_PARTY_TYPE",
+            message: "Provided party type is invalid.",
+            field: "partyType",
+            class: Class::InvalidConstraint,
+        },
+        Row {
+            case: "a page size one past the range its member admits",
+            operation: "SearchAgreements",
+            request: json!({"filters": [agreement_type_filter()], "maxResults": 51}),
+            reason: "INVALID_MAX_RESULTS",
+            message: "Provided max results is invalid.",
+            field: "maxResults",
+            class: Class::InvalidConstraint,
+        },
+        Row {
+            case: "a filter list one past the length its shape admits",
+            operation: "SearchAgreements",
+            request: json!({"filters": vec![agreement_type_filter(); 11]}),
+            reason: "INVALID_FILTERS",
+            message: "Provided filters is invalid.",
+            field: "filters",
+            class: Class::InvalidConstraint,
+        },
+        Row {
+            case: "a nested filter value outside the pattern its shape declares",
+            operation: "SearchAgreements",
+            request: json!({
+                "filters": [{"name": "Status", "values": ["not a filter value!"]}],
+            }),
+            reason: "INVALID_FILTER_VALUES",
+            message: "Provided filter values is invalid.",
+            field: "filters.1.member.values.1.member",
+            class: Class::InvalidConstraint,
+        },
     ]
 }
 
@@ -385,11 +555,12 @@ async fn a_field_entry_states_the_fixed_text_of_its_class() {
     }
 }
 
-/// The texts are each other's contrast: ONE member, refused in three classes,
-/// is worded in the three texts of those classes — so the wording belongs to
-/// what refused the member, not to the member.
+/// The texts are each other's contrast: ONE member, refused in three ways, reads
+/// in the text of the CLASS it failed in — the same invalid-member sentence
+/// whether a constraint the model declares or a rule of the service refused the
+/// value, and the absent-member sentence when it carried no value at all.
 #[tokio::test]
-async fn one_member_refused_in_three_classes_reads_in_three_texts() {
+async fn one_member_refused_in_three_ways_reads_the_text_of_its_class() {
     let router = emulator();
     let member = "agreementId";
 
@@ -419,7 +590,7 @@ async fn one_member_refused_in_three_classes_reads_in_three_texts() {
             .unwrap_or_default()
     };
     for (case, answer, expected) in [
-        ("a constraint the model declares", &constraint, FIELD_INVALID_CONSTRAINT),
+        ("a constraint the model declares", &constraint, FIELD_INVALID),
         ("a rule of the service", &unacceptable, FIELD_INVALID),
         ("a member left out", &absent, FIELD_MISSING),
     ] {
@@ -436,14 +607,15 @@ async fn one_member_refused_in_three_classes_reads_in_three_texts() {
         text_of(&unacceptable),
         text_of(&absent),
     ];
-    assert!(
-        texts[0] != texts[1] && texts[1] != texts[2] && texts[0] != texts[2],
-        "case {member:?}: the three classes must each have their own text, got {texts:?}"
+    assert_eq!(
+        texts[0], texts[1],
+        "case {member:?}: a value a rule of the service refuses states the same sentence as a \
+         value that misses a modelled constraint, got {texts:?}"
     );
     assert_ne!(
-        texts[1], FIELD_INVALID_CONSTRAINT,
-        "case {member:?}: a value a rule of the service refuses must not read as a missed \
-         modelled constraint, got {:?}",
-        texts[1]
+        texts[1], texts[2],
+        "case {member:?}: an unacceptable value and an absent member are different classes and \
+         keep different sentences, got {texts:?}"
     );
 }
+

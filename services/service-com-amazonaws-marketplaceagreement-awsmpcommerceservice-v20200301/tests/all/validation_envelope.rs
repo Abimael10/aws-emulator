@@ -49,14 +49,10 @@ const SIGNED_FOR_US_EAST_1: &str = "AWS4-HMAC-SHA256 \
 /// here rather than imported, so a change of wording in the service fails this
 /// test instead of silently agreeing with it.
 ///
-/// The present-but-unacceptable class is worded by WHAT refused the value: a
-/// constraint the model declares is missed before any handler runs
-/// ([`FIELD_INVALID_CONSTRAINT`]), while a well-formed value a rule of the
-/// service itself does not accept reads unpunctuated.
-const FIELD_INVALID: &str = "Member is invalid";
-/// See [`FIELD_INVALID`]. The class the boundary walk raises for a value that
-/// misses a `@length`, `@range`, `@pattern` or enumerated value set.
-const FIELD_INVALID_CONSTRAINT: &str = "Member is invalid.";
+/// The present-but-unacceptable class is ONE class with ONE text: a value that
+/// misses a constraint the model declares and a well-formed value a rule of the
+/// service itself refuses state the same sentence.
+const FIELD_INVALID: &str = "Member is invalid.";
 /// See [`FIELD_INVALID`]. The absent-member class states the requirement the
 /// member is under, not the value it did not carry.
 const FIELD_MISSING: &str = "Member is required.";
@@ -163,8 +159,9 @@ enum Member {
 impl Member {
     fn field_message(self) -> &'static str {
         match self {
-            Self::Invalid => FIELD_INVALID_CONSTRAINT,
-            Self::Unacceptable => FIELD_INVALID,
+            // ONE text for both: a member that carried an unacceptable value
+            // is one class of failure however the service came to refuse it.
+            Self::Invalid | Self::Unacceptable => FIELD_INVALID,
             Self::Absent => FIELD_MISSING,
             Self::AbsentForIntent => FIELD_MISSING_FOR_INTENT,
         }
@@ -604,7 +601,7 @@ async fn a_member_no_reason_names_reports_the_modelled_catch_all() {
         answer.body
     );
     assert_eq!(
-        fields[0].1, FIELD_INVALID_CONSTRAINT,
+        fields[0].1, FIELD_INVALID,
         "expected the invalid-member sentence, got {:?}",
         answer.body
     );
@@ -642,7 +639,7 @@ async fn every_offending_member_of_one_request_is_reported() {
         answer
             .fields()
             .iter()
-            .all(|(_, message)| message == FIELD_INVALID_CONSTRAINT),
+            .all(|(_, message)| message == FIELD_INVALID),
         "every entry states the member is invalid, got {:?}",
         answer.body
     );

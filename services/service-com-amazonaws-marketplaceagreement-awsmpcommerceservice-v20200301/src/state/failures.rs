@@ -60,19 +60,16 @@ pub const VALIDATION_MESSAGE_FALLBACK: &str =
 /// so there is no per-member wording to guess.
 ///
 /// Each sentence is reproduced as AWS words it for its class, punctuation
-/// included, and the classes are told apart by WHAT refused the member rather
-/// than by which member or which operation it was: a value that misses a
-/// constraint the model declares is refused before any handler runs and is
-/// stated punctuated ([`FIELD_INVALID_CONSTRAINT`]), while a well-formed value a
-/// rule of the service itself does not accept is stated unpunctuated. The texts
-/// are not one template with a switch: they are fixed strings, so none can be
-/// derived from another.
-pub const FIELD_INVALID: &str = "Member is invalid";
-/// See [`FIELD_INVALID`]. What the entry states about a member whose value
-/// misses a constraint the MODEL declares (`@length`, `@range`, `@pattern`, an
-/// enumerated value set, at any depth of the input) — the class the boundary
-/// walk raises, before any handler of this service sees the request.
-pub const FIELD_INVALID_CONSTRAINT: &str = "Member is invalid.";
+/// included, and the class is decided by WHAT was wrong with the member — it
+/// carried a value this service does not accept, or it carried none — and never
+/// by WHERE the refusal was raised. So ONE invalid-member sentence serves a
+/// value that misses a constraint the model declares (refused by the boundary
+/// walk, before any handler runs) and a well-formed value a rule of the service
+/// itself does not accept (refused inside a handler) alike: both are the same
+/// failure to the caller, and the wording of the entry is not a clue about which
+/// part of the emulator refused the request. The texts are not one template with
+/// a switch: they are fixed strings, so none can be derived from another.
+pub const FIELD_INVALID: &str = "Member is invalid.";
 /// See [`FIELD_INVALID`]. The absent-member class is worded as the requirement
 /// the member is under rather than as the value it did not carry, which is how
 /// AWS states it for this service.
@@ -88,11 +85,11 @@ pub const FIELD_MISSING_FOR_INTENT: &str = "Member must not be null for the prov
 /// made it required.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefusalKind {
-    /// The member carried a value a rule of this service does not accept.
+    /// The member carried a value this service does not accept — one that misses
+    /// a constraint the model declares, or a well-formed one a rule of the
+    /// service itself refuses. ONE kind, because the two are one class of
+    /// failure to the caller.
     Invalid,
-    /// The member carried a value that misses a constraint the model declares,
-    /// which the boundary walk raises before any handler runs.
-    InvalidConstraint,
     /// The member was absent from the request.
     Missing,
     /// The member was absent from a request whose `intent` required it — the
@@ -105,7 +102,7 @@ impl RefusalKind {
     /// The `ValidationExceptionReason` prefix this kind reports under.
     pub(super) fn reason_prefix(self) -> &'static str {
         match self {
-            Self::Invalid | Self::InvalidConstraint => "INVALID",
+            Self::Invalid => "INVALID",
             Self::Missing | Self::MissingForIntent => "MISSING",
         }
     }
@@ -114,7 +111,6 @@ impl RefusalKind {
     pub(super) fn field_message(self) -> &'static str {
         match self {
             Self::Invalid => FIELD_INVALID,
-            Self::InvalidConstraint => FIELD_INVALID_CONSTRAINT,
             Self::Missing => FIELD_MISSING,
             Self::MissingForIntent => FIELD_MISSING_FOR_INTENT,
         }
@@ -453,7 +449,7 @@ pub fn validation_exception_for(
 pub(super) fn violation_kind(violation: &::smithy_server_runtime::Violation) -> RefusalKind {
     match violation.kind {
         ::smithy_server_runtime::ViolationKind::MissingRequiredMember => RefusalKind::Missing,
-        _ => RefusalKind::InvalidConstraint,
+        _ => RefusalKind::Invalid,
     }
 }
 
@@ -520,7 +516,7 @@ pub fn unsupported_filter_combination(path: impl Into<String>) -> ValidationExce
         reason: Some(REASON_UNSUPPORTED_FILTERS.to_string()),
         fields: Some(vec![ValidationExceptionField {
             name: path.into(),
-            message: FIELD_INVALID.to_string(),
+            message: RefusalKind::Invalid.field_message().to_string(),
         }]),
     }
 }
