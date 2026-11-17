@@ -14,6 +14,13 @@
 //! device under, and a device the named user does not hold, are both the entity that does not
 //! exist (`NoSuchEntityException`, HTTP 404), and neither deactivates anything.
 //!
+//! The USER is resolved first, as every operation addressing one of a user's own sub-resources
+//! resolves it (`EnableMFADevice`, `ResyncMFADevice`, `ListMFADevices`, the access-key and
+//! certificate writes): a name the account holds no user under names no device-holder either,
+//! so "the error message describes the resource" (`NoSuchEntityException`) describes the USER,
+//! and the device-scoped sentence is kept for the one case it is true of — the user is held and
+//! the serial is not one of that user's devices.
+//!
 //! The serial is resolved among the account's VIRTUAL MFA devices, which is every device a
 //! caller can have enabled: a FIDO security key is enrolled by the key itself through the
 //! browser's WebAuthn ceremony, and IAM's API binds no operation that enrolls one, so no
@@ -216,6 +223,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &resource,
             &format!("user {named_user}"),
         )?;
+
+        // The association cleared is one an IAM user holds, so the USER is resolved before the
+        // serial is: a name the account holds no user under holds no device either, and the
+        // entity that does not exist is that user — reported in this service's one wording for
+        // an absent user, naming it as the request named it. Only once the user IS held can a
+        // refusal be about the device.
+        if !store.users.contains_key(&user_key) {
+            return Err(DeactivateMFADeviceErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!("The user with name {named_user} cannot be found.")),
+                },
+            )
+            .into());
+        }
 
         // The device the serial number names, among the account's virtual devices: a serial
         // naming none of them references an entity that does not exist, which is what the
