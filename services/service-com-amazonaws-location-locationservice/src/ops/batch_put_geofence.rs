@@ -204,7 +204,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     geofence_id: entry.geofence_id,
                     error: BatchItemError {
                         code: Some(crate::state::BATCH_VALIDATION_ERROR.to_string()),
-                        message: Some(why),
+                        // A per-entry error carries the sentence only: the member
+                        // the refusal is about is reported in a `FieldList`, which
+                        // `BatchItemError` has no member for.
+                        message: Some(why.message),
                     },
                 }),
             }

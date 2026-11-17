@@ -12,8 +12,8 @@
 //! service's own checks and live here, beside [`super::wgs84_position`], shared by
 //! every operation that writes a geofence.
 //!
-//! Each refusal states the member path it concerns, in single quotes, then what that
-//! member has to satisfy — `'Geometry.Polygon[0]' must be oriented
+//! Each refusal names the member path it concerns and states it, in single quotes,
+//! then what that member has to satisfy — `'Geometry.Polygon[0]' must be oriented
 //! counter-clockwise.` names the geometry's first linear ring. The one exception is a
 //! coordinate outside its axis's WGS 84 domain, which keeps the fixed sentence this
 //! service already refuses one with ([`super::wgs84_position`]), so a client matches
@@ -80,12 +80,39 @@ pub const MIN_RING_VERTICES: usize = 4;
 /// "all vertices from all component `Polygons`".
 pub const MAX_GEOMETRY_VERTICES: usize = 1_000;
 
+/// What a geometry check refuses: the member path it concerns, and the sentence
+/// about it.
+///
+/// Both, rather than only the text, because a refusal of one member is reported as
+/// that pair — a per-entry `BatchItemError` states the sentence, and a
+/// `ValidationException`'s `FieldList` entry names the member AND repeats the
+/// sentence — so the member a check is about is carried out of the check rather
+/// than re-derived from its wording.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeometryRefusal {
+    /// The member path, as the sentence names it (`Geometry.Polygon[0]`).
+    pub member: String,
+    /// The sentence stating what that member has to satisfy.
+    pub message: String,
+}
+
+impl GeometryRefusal {
+    /// One refusal: the member path it concerns and the sentence about it.
+    fn new(member: impl Into<String>, message: String) -> Self {
+        Self {
+            member: member.into(),
+            message,
+        }
+    }
+}
+
 /// `Ok` when `geometry` names exactly one geometry and that geometry satisfies the
-/// service's own constraints, otherwise the sentence the refusal states.
+/// service's own constraints, otherwise the member the refusal concerns and the
+/// sentence it states.
 ///
 /// The caller decides how a refusal is reported: a batch write reports it per entry
 /// inside a 200, a single write refuses the whole request.
-pub fn validate_geofence_geometry(geometry: &GeofenceGeometry) -> Result<(), String> {
+pub fn validate_geofence_geometry(geometry: &GeofenceGeometry) -> Result<(), GeometryRefusal> {
     match named_members(geometry) {
         0 => return Err(must_name_one_geometry("must specify one of")),
         1 => {}
@@ -127,23 +154,32 @@ fn named_members(geometry: &GeofenceGeometry) -> usize {
 /// The sentence a geometry naming no member, or more than one, is refused with: the
 /// member path, what it has to satisfy, and the members it may name — no value from
 /// the request.
-fn must_name_one_geometry(requirement: &str) -> String {
-    format!(
-        "'{GEOMETRY_PATH}' {requirement} [{}].",
-        GEOMETRY_MEMBERS.join(", ")
+fn must_name_one_geometry(requirement: &str) -> GeometryRefusal {
+    GeometryRefusal::new(
+        GEOMETRY_PATH,
+        format!(
+            "'{GEOMETRY_PATH}' {requirement} [{}].",
+            GEOMETRY_MEMBERS.join(", ")
+        ),
     )
 }
 
 /// `Ok` when the circle's centre is a WGS 84 coordinate and its radius is a usable
 /// one.
-fn validate_circle(circle: &Circle) -> Result<(), String> {
-    super::wgs84_position(&circle.center)?;
+fn validate_circle(circle: &Circle) -> Result<(), GeometryRefusal> {
+    super::wgs84_position(&circle.center).map_err(|why| {
+        GeometryRefusal::new(format!("{GEOMETRY_PATH}.{CIRCLE}.Center"), why)
+    })?;
     // Written as a refutation so a radius that is not a number (neither greater
     // than zero nor within the bound) is refused rather than silently stored.
     if !(circle.radius > 0.0 && circle.radius <= MAX_CIRCLE_RADIUS_METRES) {
-        return Err(format!(
-            "'{GEOMETRY_PATH}.Circle.Radius' must be greater than 0 and no larger than \
-             {MAX_CIRCLE_RADIUS_METRES}."
+        let member = format!("{GEOMETRY_PATH}.{CIRCLE}.Radius");
+        return Err(GeometryRefusal::new(
+            member.clone(),
+            format!(
+                "'{member}' must be greater than 0 and no larger than \
+                 {MAX_CIRCLE_RADIUS_METRES}."
+            ),
         ));
     }
     Ok(())
@@ -194,19 +230,25 @@ fn validate_polygon(
     path: &PolygonPath,
     rings: &[Vec<Vec<f64>>],
     vertices: &mut usize,
-) -> Result<(), String> {
+) -> Result<(), GeometryRefusal> {
     if rings.len() > MAX_RINGS_PER_POLYGON {
-        return Err(format!(
-            "'{}' must have no more than {MAX_RINGS_PER_POLYGON} linear rings.",
-            path.polygon
+        return Err(GeometryRefusal::new(
+            path.polygon.clone(),
+            format!(
+                "'{}' must have no more than {MAX_RINGS_PER_POLYGON} linear rings.",
+                path.polygon
+            ),
         ));
     }
     let mut checked: Vec<LineString<f64>> = Vec::with_capacity(rings.len());
     for (index, ring) in rings.iter().enumerate() {
         if ring.len() < MIN_RING_VERTICES {
-            return Err(format!(
-                "'{}' must have at least {MIN_RING_VERTICES} vertices.",
-                path.ring(index)
+            return Err(GeometryRefusal::new(
+                path.ring(index),
+                format!(
+                    "'{}' must have at least {MIN_RING_VERTICES} vertices.",
+                    path.ring(index)
+                ),
             ));
         }
         // The budget is checked BEFORE this ring's vertices are read, so the work
@@ -214,14 +256,18 @@ fn validate_polygon(
         // length of a ring the caller chose (`LinearRing` has no maximum).
         *vertices += ring.len();
         if *vertices > MAX_GEOMETRY_VERTICES {
-            return Err(format!(
-                "'{}' must have no more than {MAX_GEOMETRY_VERTICES} vertices.",
-                path.geometry
+            return Err(GeometryRefusal::new(
+                path.geometry.clone(),
+                format!(
+                    "'{}' must have no more than {MAX_GEOMETRY_VERTICES} vertices.",
+                    path.geometry
+                ),
             ));
         }
         let mut coords = Vec::with_capacity(ring.len());
         for vertex in ring {
-            let [longitude, latitude] = super::wgs84_position(vertex)?;
+            let [longitude, latitude] = super::wgs84_position(vertex)
+                .map_err(|why| GeometryRefusal::new(path.ring(index), why))?;
             coords.push(Coord {
                 x: longitude,
                 y: latitude,
@@ -229,9 +275,12 @@ fn validate_polygon(
         }
         // "the first and last vertex are the same (to form a closed boundary)".
         if coords.first() != coords.last() {
-            return Err(format!(
-                "'{}' must be closed: its first and last vertex must be the same.",
-                path.ring(index)
+            return Err(GeometryRefusal::new(
+                path.ring(index),
+                format!(
+                    "'{}' must be closed: its first and last vertex must be the same.",
+                    path.ring(index)
+                ),
             ));
         }
         validate_meridian_span(&path.ring(index), &coords)?;
@@ -243,9 +292,12 @@ fn validate_polygon(
     let Some(exterior) = listed.next() else {
         // Unreachable through the request boundary (`len 1..250`), stated rather
         // than assumed so nothing below reads an empty list.
-        return Err(format!(
-            "'{}' must have at least one linear ring, the exterior ring.",
-            path.polygon
+        return Err(GeometryRefusal::new(
+            path.polygon.clone(),
+            format!(
+                "'{}' must have at least one linear ring, the exterior ring.",
+                path.polygon
+            ),
         ));
     };
     let interiors: Vec<LineString<f64>> = listed.collect();
@@ -289,12 +341,15 @@ const INTERIOR_WINDING: WindingOrder = WindingOrder::Clockwise;
 
 /// The sentence a polygon whose rings intersect, touch, nest wrongly or enclose no
 /// area at all is refused with: the member's note list in one sentence.
-fn rings_must_not_intersect(path: &PolygonPath) -> String {
-    format!(
-        "'{}' rings must not intersect themselves, must not touch or cross each other, \
-         and every interior ring must be fully contained within the exterior ring and \
-         within no other interior ring.",
-        path.polygon
+fn rings_must_not_intersect(path: &PolygonPath) -> GeometryRefusal {
+    GeometryRefusal::new(
+        path.polygon.clone(),
+        format!(
+            "'{}' rings must not intersect themselves, must not touch or cross each other, \
+             and every interior ring must be fully contained within the exterior ring and \
+             within no other interior ring.",
+            path.polygon
+        ),
     )
 }
 
@@ -307,12 +362,15 @@ fn validate_winding(
     ring: &LineString<f64>,
     required: WindingOrder,
     path: &PolygonPath,
-) -> Result<(), String> {
+) -> Result<(), GeometryRefusal> {
     match ring.winding_order() {
         Some(order) if order == required => Ok(()),
-        Some(_) => Err(format!(
-            "'{ring_path}' must be oriented {}.",
-            winding_name(required)
+        Some(_) => Err(GeometryRefusal::new(
+            ring_path,
+            format!(
+                "'{ring_path}' must be oriented {}.",
+                winding_name(required)
+            ),
         )),
         None => Err(rings_must_not_intersect(path)),
     }
@@ -337,12 +395,15 @@ const MAX_EDGE_LONGITUDE_SPAN: f64 = LONGITUDE_DOMAIN_WIDTH / 2.0;
 ///
 /// Source: the `GeofenceGeometry` doc's note — "Amazon Location doesn't currently
 /// support polygons that cross the antimeridian."
-fn validate_meridian_span(ring_path: &str, ring: &[Coord<f64>]) -> Result<(), String> {
+fn validate_meridian_span(ring_path: &str, ring: &[Coord<f64>]) -> Result<(), GeometryRefusal> {
     let crosses = ring
         .windows(2)
         .any(|edge| (edge[1].x - edge[0].x).abs() > MAX_EDGE_LONGITUDE_SPAN);
     if crosses {
-        return Err(format!("'{ring_path}' must not cross the antimeridian."));
+        return Err(GeometryRefusal::new(
+            ring_path,
+            format!("'{ring_path}' must not cross the antimeridian."),
+        ));
     }
     Ok(())
 }
@@ -357,11 +418,14 @@ fn validate_meridian_span(ring_path: &str, ring: &[Coord<f64>]) -> Result<(), St
 fn validate_multi_polygon(
     polygons: &[Vec<Vec<Vec<f64>>>],
     vertices: &mut usize,
-) -> Result<(), String> {
+) -> Result<(), GeometryRefusal> {
     if polygons.len() > MAX_POLYGONS_PER_MULTI_POLYGON {
-        return Err(format!(
-            "'{GEOMETRY_PATH}.{MULTI_POLYGON}' must have no more than \
-             {MAX_POLYGONS_PER_MULTI_POLYGON} polygons."
+        return Err(GeometryRefusal::new(
+            format!("{GEOMETRY_PATH}.{MULTI_POLYGON}"),
+            format!(
+                "'{GEOMETRY_PATH}.{MULTI_POLYGON}' must have no more than \
+                 {MAX_POLYGONS_PER_MULTI_POLYGON} polygons."
+            ),
         ));
     }
     for (index, polygon) in polygons.iter().enumerate() {
@@ -380,10 +444,11 @@ fn validate_multi_polygon(
 /// the geometry format used when the geofence was created"), so nothing this service
 /// answers depends on its contents. An EMPTY blob names no geometry, which is the
 /// one thing a write can tell.
-fn validate_geobuf(geobuf: &[u8]) -> Result<(), String> {
+fn validate_geobuf(geobuf: &[u8]) -> Result<(), GeometryRefusal> {
     if geobuf.is_empty() {
-        return Err(format!(
-            "'{GEOMETRY_PATH}.{GEOBUF}' must carry a Geobuf-encoded geometry."
+        return Err(GeometryRefusal::new(
+            format!("{GEOMETRY_PATH}.{GEOBUF}"),
+            format!("'{GEOMETRY_PATH}.{GEOBUF}' must carry a Geobuf-encoded geometry."),
         ));
     }
     Ok(())

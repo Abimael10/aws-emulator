@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 /// The geometry checks a geofence write makes, kept beside this module rather than
 /// in one operation's file because every geofence write shares them.
 mod geofence_geometry;
-pub use geofence_geometry::validate_geofence_geometry;
+pub use geofence_geometry::{validate_geofence_geometry, GeometryRefusal};
 
 /// The resource a tag operation's `ResourceArn` names, and the tag map it reads and
 /// writes on it, kept beside this module because the three tag operations and the

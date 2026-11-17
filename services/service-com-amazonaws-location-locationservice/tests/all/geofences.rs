@@ -1,26 +1,33 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Geofences: the batch write and the read that proves what it stored.
+//! Geofences: the writes and the read that proves what they stored.
 //!
-//! RULE: a geofence write stores every entry whose `Geometry` satisfies the
-//! service's own geometry constraints and reports each entry that does not as a
-//! per-entry `BatchItemError` with `Code` `"ValidationError"` inside a 200, storing
-//! nothing for it; an entry is stored under its `GeofenceId` in the named
-//! collection, so a put for an id the collection already holds UPDATES that
-//! geofence (its `CreateTime` stays, its `UpdateTime` moves) instead of adding a
-//! second one. The geometry constraints come from the model
+//! RULE: a geofence write — one geofence through `PutGeofence`, or a batch of them
+//! through `BatchPutGeofence` — STORES every geofence whose `Geometry` satisfies the
+//! service's own geometry constraints under its `GeofenceId` in the named
+//! collection, so the write is readable afterwards by `GetGeofence` (its geometry
+//! byte for byte, `Status` `ACTIVE`, the `CreateTime` it was first stored with and
+//! the `UpdateTime` of the last write) and a put for an id the collection already
+//! holds UPDATES that geofence (its `CreateTime` stays, its `UpdateTime` moves)
+//! instead of adding a second one. A geometry that does not satisfy them stores
+//! nothing and is refused where the write reports a failure: per entry as a
+//! `BatchItemError` with `Code` `"ValidationError"` inside a 200 for the batch
+//! write, and as a 400 `ValidationException` naming the member in its `fieldList`
+//! for the single write, which has no per-entry channel. The geometry constraints
+//! come from the model
 //! (`smithy_query(query="shape",shape="GeofenceGeometry")`): exactly one of
 //! `Polygon`, `Circle`, `MultiPolygon` or `Geobuf` names the geometry, every linear
 //! ring is closed and holds at least 4 vertices, no geometry holds more than 1,000
 //! vertices, every vertex is a WGS 84 coordinate, and a `Circle`'s radius is
 //! greater than zero and no larger than 100,000 metres.
 //!
-//! The tables span what the rule generalises over: the geometry member a geofence
-//! is defined with (circle, single-ring polygon, polygon with an interior ring,
-//! multipolygon, Geobuf blob), how many properties it carries (0..3, the modelled
-//! bound), which constraint an entry violates, and where the violating entry sits
-//! in the batch. The request the issue report replays — one valid entry beside one
-//! invalid one — is one row of the partial-failure table.
+//! The tables span what the rule generalises over: the write the geofence arrives
+//! through (single or batch), the geometry member a geofence is defined with
+//! (circle, single-ring polygon, polygon with an interior ring, multipolygon,
+//! Geobuf blob), how many properties it carries (0..3, the modelled bound), which
+//! constraint an entry violates, and where the violating entry sits in the batch.
+//! The request the issue report replays — one valid entry beside one invalid one —
+//! is one row of the partial-failure table.
 //!
 //! Every call goes through the shared harness (`crate::harness`), so each one is a
 //! separate HTTP request against one shared engine: a geometry the read reports
@@ -68,6 +75,29 @@ async fn get_geofence(router: &MultiServiceRouter, collection: &str, geofence: &
         "GET",
         &format!("/geofencing/v0/collections/{collection}/geofences/{geofence}"),
         None,
+    )
+    .await
+}
+
+/// One geofence written through `PutGeofence`: the single-write binding the model
+/// declares (`PUT /geofencing/v0/collections/{CollectionName}/geofences/{GeofenceId}`,
+/// with `Geometry` and `GeofenceProperties` in the body).
+async fn put_geofence(
+    router: &MultiServiceRouter,
+    collection: &str,
+    geofence: &str,
+    geometry: Value,
+    properties: Option<Value>,
+) -> Answer {
+    let mut body = json!({ "Geometry": geometry });
+    if let Some(properties) = properties {
+        body["GeofenceProperties"] = properties;
+    }
+    call(
+        router,
+        "PUT",
+        &format!("/geofencing/v0/collections/{collection}/geofences/{geofence}"),
+        Some(body),
     )
     .await
 }
@@ -378,12 +408,16 @@ async fn one_batch_stores_every_entry_it_carries() {
     }
 }
 
-/// One rejected entry: the geometry it carries and the sentence the service refuses
-/// it with, written out as a LITERAL so the wording is pinned by text rather than
-/// re-derived from the implementation's own template.
+/// One rejected entry: the geometry it carries, the member a refusal about it names
+/// and the sentence the service refuses it with, the last two written out as
+/// LITERALS so the wording is pinned by text rather than re-derived from the
+/// implementation's own template.
 struct RejectedCase {
     case: &'static str,
     geometry: fn() -> Value,
+    /// The member path the refusal is about, as the request-level
+    /// `ValidationException`'s `fieldList` entry names it.
+    member: &'static str,
     message: &'static str,
 }
 
@@ -400,6 +434,7 @@ fn rejected_cases() -> Vec<RejectedCase> {
         RejectedCase {
             case: "no geometry member at all",
             geometry: || json!({}),
+            member: "Geometry",
             message: "'Geometry' must specify one of [Polygon, Circle, MultiPolygon, Geobuf].",
         },
         RejectedCase {
@@ -410,26 +445,31 @@ fn rejected_cases() -> Vec<RejectedCase> {
                     "Polygon": square(-122.4, 47.6),
                 })
             },
+            member: "Geometry",
             message: "'Geometry' must specify only one of [Polygon, Circle, MultiPolygon, Geobuf].",
         },
         RejectedCase {
             case: "a radius of zero",
             geometry: || json!({ "Circle": { "Center": [-122.33, 47.60], "Radius": 0.0 } }),
+            member: RADIUS_MEMBER,
             message: RADIUS_REQUIREMENT,
         },
         RejectedCase {
             case: "a negative radius",
             geometry: || json!({ "Circle": { "Center": [-122.33, 47.60], "Radius": -1.0 } }),
+            member: RADIUS_MEMBER,
             message: RADIUS_REQUIREMENT,
         },
         RejectedCase {
             case: "a radius one metre past the published bound",
             geometry: || json!({ "Circle": { "Center": [-122.33, 47.60], "Radius": 100_001.0 } }),
+            member: RADIUS_MEMBER,
             message: RADIUS_REQUIREMENT,
         },
         RejectedCase {
             case: "a circle centred outside the coordinate domain",
             geometry: || json!({ "Circle": { "Center": [-200.0, 47.60], "Radius": 500.0 } }),
+            member: "Geometry.Circle.Center",
             message: "longitude must be between -180 and 180 degrees",
         },
         RejectedCase {
@@ -444,6 +484,7 @@ fn rejected_cases() -> Vec<RejectedCase> {
                     ]]
                 })
             },
+            member: "Geometry.Polygon[0]",
             message:
                 "'Geometry.Polygon[0]' must be closed: its first and last vertex must be the same.",
         },
@@ -459,11 +500,13 @@ fn rejected_cases() -> Vec<RejectedCase> {
                     ]]
                 })
             },
+            member: "Geometry.Polygon[0]",
             message: "latitude must be between -90 and 90 degrees",
         },
         RejectedCase {
             case: "a polygon past the vertex budget",
             geometry: || json!({ "Polygon": [too_many_vertices()] }),
+            member: "Geometry.Polygon",
             message: "'Geometry.Polygon' must have no more than 1000 vertices.",
         },
         RejectedCase {
@@ -481,11 +524,13 @@ fn rejected_cases() -> Vec<RejectedCase> {
                     ]
                 })
             },
+            member: "Geometry.MultiPolygon[1][0]",
             message: "'Geometry.MultiPolygon[1][0]' must be closed: its first and last vertex must be the same.",
         },
         RejectedCase {
             case: "a multipolygon past the vertex budget",
             geometry: || json!({ "MultiPolygon": [[too_many_vertices()]] }),
+            member: "Geometry.MultiPolygon",
             message: "'Geometry.MultiPolygon' must have no more than 1000 vertices.",
         },
         RejectedCase {
@@ -502,6 +547,7 @@ fn rejected_cases() -> Vec<RejectedCase> {
                     ]]
                 })
             },
+            member: "Geometry.Polygon[0]",
             message: "'Geometry.Polygon[0]' must be oriented counter-clockwise.",
         },
         RejectedCase {
@@ -516,12 +562,14 @@ fn rejected_cases() -> Vec<RejectedCase> {
                     ]
                 })
             },
+            member: "Geometry.Polygon[1]",
             message: "'Geometry.Polygon[1]' must be oriented clockwise.",
         },
         RejectedCase {
             case: "a ring that intersects itself",
             // "No ring is permitted to intersect itself."
             geometry: || json!({ "Polygon": [[[0.0, 0.0], [0.01, 0.01], [0.01, 0.0], [0.0, 0.01], [0.0, 0.0]]] }),
+            member: RING_MEMBER,
             message: RING_REQUIREMENT,
         },
         RejectedCase {
@@ -536,6 +584,7 @@ fn rejected_cases() -> Vec<RejectedCase> {
                     ]
                 })
             },
+            member: RING_MEMBER,
             message: RING_REQUIREMENT,
         },
         RejectedCase {
@@ -550,6 +599,7 @@ fn rejected_cases() -> Vec<RejectedCase> {
                     ]
                 })
             },
+            member: RING_MEMBER,
             message: RING_REQUIREMENT,
         },
         RejectedCase {
@@ -566,11 +616,13 @@ fn rejected_cases() -> Vec<RejectedCase> {
                     ]]
                 })
             },
+            member: "Geometry.Polygon[0]",
             message: "'Geometry.Polygon[0]' must not cross the antimeridian.",
         },
         RejectedCase {
             case: "an empty geobuf blob",
             geometry: || json!({ "Geobuf": "" }),
+            member: "Geometry.Geobuf",
             message: "'Geometry.Geobuf' must carry a Geobuf-encoded geometry.",
         },
     ]
@@ -584,11 +636,18 @@ fn rejected_cases() -> Vec<RejectedCase> {
 /// as a LITERAL so the wording is pinned by text.
 const RING_REQUIREMENT: &str = "'Geometry.Polygon' rings must not intersect themselves, must not touch or cross each other, and every interior ring must be fully contained within the exterior ring and within no other interior ring.";
 
+/// The member a ring requirement is about: the polygon as a whole, since the
+/// requirement is about how its rings sit relative to each other.
+const RING_MEMBER: &str = "Geometry.Polygon";
+
 /// The sentence an unusable `Circle` radius is refused with: the member path and
 /// the bound the `Circle$Radius` doc publishes ("Must be greater than zero and no
 /// larger than 100,000 (100 kilometers)"), written out as a LITERAL.
 const RADIUS_REQUIREMENT: &str =
     "'Geometry.Circle.Radius' must be greater than 0 and no larger than 100000.";
+
+/// The member an unusable radius refusal is about.
+const RADIUS_MEMBER: &str = "Geometry.Circle.Radius";
 
 /// A closed ring of 1,002 in-domain vertices: one past the 1,000-vertex budget the
 /// `Polygon` and `MultiPolygon` members document, with the ring itself closed so the
@@ -988,5 +1047,420 @@ async fn a_read_does_not_change_what_a_later_reader_sees() {
         geofence_count(&router, "fences").await,
         1,
         "the reads must not change what the collection holds"
+    );
+}
+
+#[tokio::test]
+async fn a_single_put_then_get_round_trips_every_geometry_kind() {
+    // The issue's recorded workflow, generalised: PutGeofence for one geofence,
+    // then GetGeofence for the same collection and id, over every geometry member
+    // and property count the write-then-read table spans.
+    let router = emulator();
+    create_collection(&router, "fences").await;
+
+    for case in geofence_cases() {
+        let written = put_geofence(
+            &router,
+            "fences",
+            case.geofence_id,
+            (case.geometry)(),
+            case.properties.clone(),
+        )
+        .await;
+        assert_eq!(
+            written.status, 200,
+            "case {:?}: PutGeofence must answer 200, got {} {:?}",
+            case.case, written.status, written.body
+        );
+        let written = written.json();
+        assert_eq!(
+            written.get("GeofenceId").and_then(Value::as_str),
+            Some(case.geofence_id),
+            "case {:?}: the write must report the id it stored, got {written}",
+            case.case
+        );
+        let put_create = millis_of(&written, "CreateTime");
+        let put_update = millis_of(&written, "UpdateTime");
+        assert_eq!(
+            put_create, put_update,
+            "case {:?}: a first put's CreateTime and UpdateTime must be the same instant, got {written}",
+            case.case
+        );
+
+        let read = get_geofence(&router, "fences", case.geofence_id).await;
+        assert_eq!(
+            read.status, 200,
+            "case {:?}: the geofence the put stored must be readable, got {} {:?}",
+            case.case, read.status, read.body
+        );
+        let read = read.json();
+        assert_eq!(
+            read.get("GeofenceId").and_then(Value::as_str),
+            Some(case.geofence_id),
+            "case {:?}: GetGeofence must report the stored id, got {read}",
+            case.case
+        );
+        let expected_geometry = normalized(&(case.geometry)());
+        let reported_geometry = normalized(
+            read.get("Geometry")
+                .unwrap_or_else(|| panic!("case {:?}: expected a Geometry, got {read}", case.case)),
+        );
+        assert_eq!(
+            reported_geometry, expected_geometry,
+            "case {:?}: expected the geometry it was put with {expected_geometry}, got {reported_geometry}",
+            case.case
+        );
+        assert_eq!(
+            read.get("Status").and_then(Value::as_str),
+            Some("ACTIVE"),
+            "case {:?}: a stored geofence is one the system has indexed, got {read}",
+            case.case
+        );
+        assert_eq!(
+            read.get("GeofenceProperties").map(normalized),
+            case.properties.as_ref().map(normalized),
+            "case {:?}: expected GeofenceProperties {:?}, got {read}",
+            case.case,
+            case.properties
+        );
+        assert_eq!(
+            millis_of(&read, "CreateTime"),
+            put_create,
+            "case {:?}: GetGeofence must report the CreateTime the put stored, got {read}",
+            case.case
+        );
+        assert_eq!(
+            millis_of(&read, "UpdateTime"),
+            put_update,
+            "case {:?}: GetGeofence must report the UpdateTime the put stored, got {read}",
+            case.case
+        );
+    }
+
+    // Every row was stored under its own id, so the collection holds them all.
+    let expected = i64::try_from(geofence_cases().len()).expect("the table fits in an i64");
+    assert_eq!(
+        geofence_count(&router, "fences").await,
+        expected,
+        "the collection must report one geofence per geofence the single write stored"
+    );
+}
+
+#[tokio::test]
+async fn a_single_put_with_a_rejected_geometry_refuses_the_request_and_stores_nothing() {
+    // The single write has no per-entry channel, so the same geometry a batch
+    // reports per entry inside a 200 refuses the WHOLE request here: a 400
+    // `ValidationException` whose fieldList names the member the sentence is about.
+    let router = emulator();
+    create_collection(&router, "fences").await;
+
+    for (index, rejected) in rejected_cases().into_iter().enumerate() {
+        let geofence_id = format!("rejected-{index}");
+        let refused = put_geofence(
+            &router,
+            "fences",
+            &geofence_id,
+            (rejected.geometry)(),
+            None,
+        )
+        .await;
+        assert_eq!(
+            refused.status, 400,
+            "case {:?}: a geometry the service refuses must be a 400, got {} {:?}",
+            rejected.case, refused.status, refused.body
+        );
+        assert_eq!(
+            refused.error_code(),
+            "ValidationException",
+            "case {:?}: expected ValidationException, got {:?}",
+            rejected.case,
+            refused.body
+        );
+        assert_eq!(
+            refused.message(),
+            rejected.message,
+            "case {:?}: expected message {:?}, got {:?}",
+            rejected.case,
+            rejected.message,
+            refused.message()
+        );
+        let body = refused.json();
+        assert_eq!(
+            body.get("reason").and_then(Value::as_str),
+            Some("FieldValidationFailed"),
+            "case {:?}: expected reason FieldValidationFailed, got {body}",
+            rejected.case
+        );
+        assert_eq!(
+            body.get("fieldList")
+                .and_then(Value::as_array)
+                .map(|entries| entries
+                    .iter()
+                    .map(|entry| (
+                        entry.get("name").and_then(Value::as_str).unwrap_or_default(),
+                        entry
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                    ))
+                    .collect::<Vec<_>>()),
+            Some(vec![(rejected.member, rejected.message)]),
+            "case {:?}: fieldList must name the member the sentence is about and repeat the sentence, got {body}",
+            rejected.case
+        );
+
+        let read = get_geofence(&router, "fences", &geofence_id).await;
+        assert_eq!(
+            read.status, 404,
+            "case {:?}: a refused write must store nothing, got {} {:?}",
+            rejected.case, read.status, read.body
+        );
+        let expected = format!("Geofence not found: {geofence_id}.");
+        assert_eq!(
+            read.message(),
+            expected,
+            "case {:?}: expected message {expected:?}, got {:?}",
+            rejected.case,
+            read.message()
+        );
+    }
+
+    assert_eq!(
+        geofence_count(&router, "fences").await,
+        0,
+        "a collection every write was refused for must hold no geofence"
+    );
+}
+
+#[tokio::test]
+async fn re_putting_one_geofence_replaces_it_and_keeps_its_create_time() {
+    let router = emulator();
+    create_collection(&router, "fences").await;
+
+    let first = put_geofence(
+        &router,
+        "fences",
+        "moving",
+        json!({ "Circle": { "Center": [-122.33, 47.60], "Radius": 500.0 } }),
+        Some(json!({ "generation": "first" })),
+    )
+    .await;
+    assert_eq!(
+        first.status, 200,
+        "the first put must succeed, got {} {:?}",
+        first.status, first.body
+    );
+    let stored_create = millis_of(&first.json(), "CreateTime");
+
+    // Each row re-puts the SAME id with a different geometry member and a
+    // different number of properties, so the update replaces what is stored
+    // whatever the geofence was defined with — including dropping the properties
+    // when the new write carries none.
+    for (case, geometry, properties) in [
+        (
+            "circle to polygon",
+            json!({ "Polygon": square(-122.4, 47.6) }),
+            Some(json!({ "generation": "second" })),
+        ),
+        (
+            "polygon to multipolygon",
+            json!({ "MultiPolygon": [square(1.0, 1.0)] }),
+            Some(json!({ "generation": "third", "note": "updated" })),
+        ),
+        (
+            "multipolygon to geobuf, no properties",
+            json!({ "Geobuf": "Z2VvYnVm" }),
+            None,
+        ),
+    ] {
+        let again = put_geofence(&router, "fences", "moving", geometry.clone(), properties.clone())
+            .await;
+        assert_eq!(
+            again.status, 200,
+            "case {case:?}: the update must succeed, got {} {:?}",
+            again.status, again.body
+        );
+        let answered = again.json();
+        assert_eq!(
+            millis_of(&answered, "CreateTime"),
+            stored_create,
+            "case {case:?}: an update must keep the CreateTime the geofence was first stored with, got {answered}"
+        );
+        let updated = millis_of(&answered, "UpdateTime");
+        assert!(
+            updated >= stored_create,
+            "case {case:?}: expected an UpdateTime at or after the CreateTime {stored_create}, got {updated}"
+        );
+
+        let read = get_geofence(&router, "fences", "moving").await;
+        assert_eq!(
+            read.status, 200,
+            "case {case:?}: the updated geofence must be readable, got {} {:?}",
+            read.status, read.body
+        );
+        let read = read.json();
+        assert_eq!(
+            read.get("Geometry").map(normalized),
+            Some(normalized(&geometry)),
+            "case {case:?}: GetGeofence must report the geometry the update stored, got {read}"
+        );
+        assert_eq!(
+            read.get("GeofenceProperties").map(normalized),
+            properties.as_ref().map(normalized),
+            "case {case:?}: GetGeofence must report the properties the update stored, got {read}"
+        );
+        assert_eq!(
+            millis_of(&read, "CreateTime"),
+            stored_create,
+            "case {case:?}: GetGeofence must keep reporting the first CreateTime, got {read}"
+        );
+        assert_eq!(
+            millis_of(&read, "UpdateTime"),
+            updated,
+            "case {case:?}: GetGeofence must report the UpdateTime the update stored, got {read}"
+        );
+        assert_eq!(
+            geofence_count(&router, "fences").await,
+            1,
+            "case {case:?}: re-putting an id must update the geofence, not add a second one"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_single_put_into_a_collection_that_was_never_created_is_not_found() {
+    let router = emulator();
+    // One collection exists; the names below satisfy `^[-._\w]+$` but were never
+    // created, including case variants of the one that was.
+    create_collection(&router, "Exists").await;
+
+    for name in ["missing", "exists", "EXISTS", "Exists.2"] {
+        let answered = put_geofence(
+            &router,
+            name,
+            "orphan",
+            json!({ "Circle": { "Center": [-122.33, 47.60], "Radius": 500.0 } }),
+            None,
+        )
+        .await;
+        assert_eq!(
+            answered.status, 404,
+            "case {name:?}: an unknown collection must be 404, got {} {:?}",
+            answered.status, answered.body
+        );
+        assert_eq!(
+            answered.error_code(),
+            "ResourceNotFoundException",
+            "case {name:?}: expected ResourceNotFoundException, got {:?}",
+            answered.body
+        );
+        let expected = format!("Geofence collection not found: {name}.");
+        assert_eq!(
+            answered.message(),
+            expected,
+            "case {name:?}: expected message {expected:?}, got {:?}",
+            answered.message()
+        );
+    }
+
+    assert_eq!(
+        geofence_count(&router, "Exists").await,
+        0,
+        "a write addressed to another name must not store a geofence here"
+    );
+    assert_eq!(
+        get_geofence(&router, "Exists", "orphan").await.status,
+        404,
+        "a refused write must persist nothing"
+    );
+}
+
+#[tokio::test]
+async fn the_single_write_and_the_batch_write_store_into_one_keyspace() {
+    // Both writes key a geofence by collection name and geofence id, so whichever
+    // wrote it last is what the read reports, and the geofence the other write
+    // created is UPDATED rather than duplicated.
+    let router = emulator();
+    create_collection(&router, "fences").await;
+
+    let single = put_geofence(
+        &router,
+        "fences",
+        "shared",
+        json!({ "Circle": { "Center": [-122.33, 47.60], "Radius": 500.0 } }),
+        Some(json!({ "written-by": "put" })),
+    )
+    .await;
+    assert_eq!(
+        single.status, 200,
+        "the single write must succeed, got {} {:?}",
+        single.status, single.body
+    );
+    let stored_create = millis_of(&single.json(), "CreateTime");
+
+    let batched = batch_put(
+        &router,
+        "fences",
+        json!([{
+            "GeofenceId": "shared",
+            "Geometry": { "Polygon": square(-122.4, 47.6) },
+            "GeofenceProperties": { "written-by": "batch" },
+        }]),
+    )
+    .await;
+    assert_eq!(
+        batched.status, 200,
+        "the batch write must succeed, got {} {:?}",
+        batched.status, batched.body
+    );
+    let success = list("batch over a single write", &batched.json(), "Successes")[0].clone();
+    assert_eq!(
+        millis_of(&success, "CreateTime"),
+        stored_create,
+        "the batch must keep the CreateTime the single write stored, got {success}"
+    );
+
+    let read = get_geofence(&router, "fences", "shared").await.json();
+    assert_eq!(
+        read.get("Geometry").map(normalized),
+        Some(normalized(&json!({ "Polygon": square(-122.4, 47.6) }))),
+        "the read must report the geometry the last write stored, got {read}"
+    );
+    assert_eq!(
+        read.get("GeofenceProperties").map(normalized),
+        Some(normalized(&json!({ "written-by": "batch" }))),
+        "the read must report the properties the last write stored, got {read}"
+    );
+
+    // And the other way round: the single write updates what the batch stored.
+    let again = put_geofence(
+        &router,
+        "fences",
+        "shared",
+        json!({ "MultiPolygon": [square(5.0, 5.0)] }),
+        None,
+    )
+    .await;
+    assert_eq!(
+        again.status, 200,
+        "the second single write must succeed, got {} {:?}",
+        again.status, again.body
+    );
+    assert_eq!(
+        millis_of(&again.json(), "CreateTime"),
+        stored_create,
+        "the single write must keep the CreateTime the geofence was first stored with, got {:?}",
+        again.body
+    );
+    let read = get_geofence(&router, "fences", "shared").await.json();
+    assert_eq!(
+        read.get("Geometry").map(normalized),
+        Some(normalized(&json!({ "MultiPolygon": [square(5.0, 5.0)] }))),
+        "the read must report the geometry the last write stored, got {read}"
+    );
+    assert_eq!(
+        geofence_count(&router, "fences").await,
+        1,
+        "one id written by both writes is one geofence"
     );
 }

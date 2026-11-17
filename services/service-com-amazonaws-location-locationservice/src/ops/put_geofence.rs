@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutGeofence
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutGeofence`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: stores one geofence under the named collection in
+//! [`crate::state::GeofenceCollection::geofences`], keyed by its `GeofenceId`, and
+//! reports the `CreateTime` the geofence was first stored at beside the `UpdateTime`
+//! this write stamped. A put for an id the collection already holds REPLACES that
+//! geofence's geometry and properties and keeps its `CreateTime`. The geometry is
+//! checked with the service's own geometry checks
+//! ([`crate::state::validate_geofence_geometry`]) — the same ones the batch write
+//! makes — and a geometry that fails them refuses the whole request with a
+//! `ValidationException`; an unknown collection is a `ResourceNotFoundException`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutGeofence::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! NOT done here, and scoped to its own gap issue: nothing evaluates a stored
+//! geofence against a device position, so no geofence event is raised by a write.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +170,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutGeofence` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutGeofenceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutGeofence"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutGeofenceErrorModeled::InternalServerException(InternalServerException {
+                message: "the Amazon Location state store is unavailable".to_string(),
+            })
+        })?;
+
+        // The geometry's own semantics are the service's check, shared with the
+        // batch write. A single write has no per-entry channel to report a refusal
+        // in, so a geometry that fails refuses the whole request, naming the member
+        // the sentence is about in the refusal's `FieldList` — the same shape every
+        // other member refusal of this service states.
+        crate::state::validate_geofence_geometry(&input.geometry).map_err(|why| {
+            PutGeofenceErrorModeled::ValidationException(crate::state::field_validation_exception(
+                &why.member,
+                why.message,
+            ))
+        })?;
+
+        // The instant this write happened, read from the clock once.
+        let written_at = crate::state::now_millis();
+
+        let mut store = state.lock();
+        let collection = store
+            .geofence_collections
+            .get_mut(&input.collection_name)
+            .ok_or_else(|| {
+                PutGeofenceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: crate::state::resource_not_found(
+                        crate::state::GEOFENCE_COLLECTION_RESOURCE,
+                        &input.collection_name,
+                    ),
+                })
+            })?;
+
+        // "or updates the geometry of an existing geofence if a geofence ID is
+        // included in the request": a put for an id the collection already holds is
+        // an UPDATE, so the geofence keeps the `CreateTime` it was first stored with
+        // and only its `UpdateTime` moves.
+        let create_time = collection
+            .geofences
+            .get(&input.geofence_id)
+            .map_or(written_at, |stored| stored.create_time);
+        let geofence = crate::state::Geofence {
+            geofence_id: input.geofence_id.clone(),
+            geometry: input.geometry,
+            status: crate::state::GEOFENCE_STATUS_ACTIVE.to_string(),
+            create_time,
+            update_time: written_at,
+            properties: input
+                .geofence_properties
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+        };
+        // `record_geofence` applies the per-collection bound, so the stored
+        // collection cannot grow without limit however many puts arrive.
+        collection.record_geofence(geofence);
+
+        // `UpdateTime` on the collection RESOURCE tracks when the collection itself
+        // was last updated (the `DescribeGeofenceCollectionResponse$UpdateTime`
+        // doc), which storing a geofence under it is not, so it is left alone.
+        Ok(PutGeofenceOutput {
+            geofence_id: input.geofence_id,
+            create_time: crate::state::to_date_time(create_time),
+            update_time: crate::state::to_date_time(written_at),
+        })
     }
 }
