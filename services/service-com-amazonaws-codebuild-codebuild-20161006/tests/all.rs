@@ -23,6 +23,8 @@ mod batch_delete_builds;
 mod batch_get_reports;
 #[path = "all/build_artifacts_destination.rs"]
 mod build_artifacts_destination;
+#[path = "all/build_batch_configuration_source.rs"]
+mod build_batch_configuration_source;
 #[path = "all/build_batch_fan_out.rs"]
 mod build_batch_fan_out;
 #[path = "all/build_batch_projection.rs"]

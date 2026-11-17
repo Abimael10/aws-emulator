@@ -232,6 +232,45 @@ pub(crate) fn listed_ids(body: &Value) -> Vec<String> {
     }
 }
 
+/// The batch build ids `ListBuildBatchesForProject` reports for `project` — the reader
+/// every suite whose subject is a started BATCH reads its result back through, so the
+/// list call is written once.
+pub(crate) async fn listed_batches(router: &MultiServiceRouter, project: &str) -> Vec<String> {
+    let (status, body) = call(
+        router,
+        "ListBuildBatchesForProject",
+        json!({"projectName": project}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "ListBuildBatchesForProject {project:?}: expected 200, got {status} with {body}"
+    );
+    listed_ids(&body)
+}
+
+/// The batch build `id`, through `BatchGetBuildBatches` — the implemented reader a suite
+/// whose subject is a started batch reads its result back through.
+pub(crate) async fn stored_build_batch(router: &MultiServiceRouter, id: &str) -> Value {
+    let (status, body) = call(router, "BatchGetBuildBatches", json!({"ids": [id]})).await;
+    assert_eq!(
+        status, 200,
+        "BatchGetBuildBatches {id:?}: expected 200, got {status} with {body}"
+    );
+    body["buildBatches"][0].clone()
+}
+
+/// The stored project `name`, through `BatchGetProjects` — the implemented reader a
+/// suite asserting what a write left behind reads it back through.
+pub(crate) async fn stored_project(router: &MultiServiceRouter, name: &str) -> Value {
+    let (status, body) = call(router, "BatchGetProjects", json!({"names": [name]})).await;
+    assert_eq!(
+        status, 200,
+        "BatchGetProjects {name:?}: expected 200, got {status} with {body}"
+    );
+    body["projects"][0].clone()
+}
+
 pub(crate) fn expected_arn(resource: &str) -> String {
     format!(
         "arn:aws:codebuild:{REGION}:{}:{resource}",

@@ -16,7 +16,8 @@ use service_com_amazonaws_codebuild_codebuild_20161006::state;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::project_build_lifecycle::{
-    batch_enabled, call, create_project, emulator, error_type, PAST_THE_SETTLE_SPAN, REGION,
+    batch_enabled, call, create_project, emulator, error_type, stored_build_batch as read_back,
+    PAST_THE_SETTLE_SPAN, REGION,
 };
 
 /// Start one batch build of `project` and hand back its id.
@@ -30,16 +31,6 @@ async fn start_build_batch(router: &MultiServiceRouter, project: &str) -> String
         .as_str()
         .unwrap_or_else(|| panic!("StartBuildBatch {project:?} must report an id, got {body}"))
         .to_string()
-}
-
-/// The batch build `id` reads as, through `BatchGetBuildBatches`.
-async fn read_back(router: &MultiServiceRouter, id: &str) -> Value {
-    let (status, body) = call(router, "BatchGetBuildBatches", json!({"ids": [id]})).await;
-    assert_eq!(
-        status, 200,
-        "BatchGetBuildBatches {id}: expected 200, got {status} with {body}"
-    );
-    body["buildBatches"][0].clone()
 }
 
 /// Which batch build the stop call names, and so what it must answer.

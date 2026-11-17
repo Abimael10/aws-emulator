@@ -28,11 +28,10 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_codebuild_codebuild_20161006::state;
-use smithy_server_runtime::MultiServiceRouter;
 
 use crate::project_build_lifecycle::{
-    batch_enabled, call, create_project, create_project_body, emulator, error_type, listed_ids,
-    merged,
+    batch_enabled, call, create_project, create_project_body, emulator, error_type, listed_batches,
+    merged, stored_project,
 };
 
 /// The sentence CodeBuild states for a `timeoutInMins` outside the window — its text
@@ -42,8 +41,10 @@ use crate::project_build_lifecycle::{
 const TIMEOUT_WINDOW_SENTENCE: &str = "TimeoutInMins must be between 5 and 2160";
 
 /// The sentence CodeBuild states for a project that carries no batch build options,
-/// pinned the same way.
-const NOT_BATCH_ENABLED_SENTENCE: &str =
+/// pinned the same way. `pub(crate)`: this suite owns the wording, so the suite that
+/// drives the same refusal from the other side reads it from here rather than declaring
+/// its own copy.
+pub(crate) const NOT_BATCH_ENABLED_SENTENCE: &str =
     "BatchConfig must be configured on the project to use the BuildBatch feature";
 
 /// The published window the sentence above states, as the service holds a request to
@@ -59,31 +60,6 @@ fn the_published_window_is_the_one_the_sentence_states() {
         "the batch timeout window must be the 5..2160 minutes the model publishes on \
          BuildTimeOut"
     );
-}
-
-/// The batch build ids `ListBuildBatchesForProject` reports for `project`.
-async fn listed_batches(router: &MultiServiceRouter, project: &str) -> Vec<String> {
-    let (status, body) = call(
-        router,
-        "ListBuildBatchesForProject",
-        json!({"projectName": project}),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "ListBuildBatchesForProject {project:?}: expected 200, got {status} with {body}"
-    );
-    listed_ids(&body)
-}
-
-/// The stored project `name`, through `BatchGetProjects`.
-async fn stored_project(router: &MultiServiceRouter, name: &str) -> Value {
-    let (status, body) = call(router, "BatchGetProjects", json!({"names": [name]})).await;
-    assert_eq!(
-        status, 200,
-        "BatchGetProjects {name:?}: expected 200, got {status} with {body}"
-    );
-    body["projects"][0].clone()
 }
 
 /// RULE: a batch build needs batch build options, which EITHER the project's own
