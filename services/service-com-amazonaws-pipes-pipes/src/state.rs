@@ -306,38 +306,15 @@ fn length_requirements(bound: &std::ops::RangeInclusive<usize>) -> String {
     )
 }
 
-/// One refused request as the validation envelope states it: how many clauses, then the
-/// clause. The writes below refuse one tag at a time, so the envelope states one clause.
+/// One refused request as request validation states it: how many clauses, then the
+/// clause. The writes below refuse one tag at a time, so one clause is stated.
+///
+/// This sentence IS the whole message such a refusal carries. The protocol's error
+/// envelope already holds a refusal's message under its own member, so the sentence is
+/// what a client reads there — a document of its own around it would make the client's
+/// message that document instead of the sentence.
 fn one_validation_error(clause: String) -> String {
     format!("1 validation error detected: {clause}")
-}
-
-/// The member a refusal of the resource-tagging layer carries its validation sentence
-/// under. The layer's message is a JSON DOCUMENT naming this one member rather than the
-/// sentence itself, so the sentence is never the whole text a client reads.
-const TAG_REFUSAL_DOCUMENT_MEMBER: &str = "message";
-
-/// A validation clause as the resource-tagging layer puts it on the wire: the
-/// [`one_validation_error`] sentence as the single member of a JSON document, which is what
-/// that layer's message is.
-///
-/// The sentence is quoted twice over. It goes through `serde_json` first, so a character
-/// the echoed value carries that a JSON string cannot hold literally is escaped as JSON
-/// requires and a caller-influenced echo cannot break the document; then every APOSTROPHE
-/// is backslash-escaped too — the quotes the sentence itself puts around a value and a
-/// member name included.
-///
-/// That second pass is the recorded wording of this layer, deliberately kept: a backslash
-/// before an apostrophe is not one of the escapes a JSON string defines, so the document
-/// is the layer's own quoting rather than a strictly decodable one, and a client reading
-/// the sentence out of it has to undo this escaping. Dropping it would state a message
-/// this layer does not state.
-fn tag_validation_document(clause: String) -> String {
-    let quoted = ::serde_json::Value::String(one_validation_error(clause)).to_string();
-    format!(
-        r#"{{"{TAG_REFUSAL_DOCUMENT_MEMBER}": {}}}"#,
-        quoted.replace('\'', "\\'"),
-    )
 }
 
 /// The tags a request carried, as a validation message echoes the member's value: every
@@ -361,17 +338,17 @@ pub fn echoed_tags<'a>(tags: impl IntoIterator<Item = (&'a str, &'a str)>) -> St
 ///
 /// A violated published BOUND is stated as request validation states one — the member,
 /// its value, and the bounds that value had to satisfy, all from this request and the
-/// model — inside the JSON document the layer's message is ([`tag_validation_document`]).
-/// The character-set and reserved-prefix rules are not modelled constraints and no
+/// model — and that sentence is the whole message ([`one_validation_error`]). The
+/// character-set and reserved-prefix rules are not modelled constraints and no
 /// validation sentence states them: each is the documented rule itself, stated bare.
 pub fn tag_refusal(member: &str, violation: TagViolation, tags_shown: &str) -> String {
     match violation {
-        TagViolation::KeyLength => tag_validation_document(format!(
+        TagViolation::KeyLength => one_validation_error(format!(
             "Value '{tags_shown}' at '{member}' failed to satisfy constraint: \
              Map keys must satisfy constraint: [{}]",
             length_requirements(&TAG_KEY_LENGTH),
         )),
-        TagViolation::ValueLength => tag_validation_document(format!(
+        TagViolation::ValueLength => one_validation_error(format!(
             "Value '{tags_shown}' at '{member}' failed to satisfy constraint: \
              Map value must satisfy constraint: [{}]",
             length_requirements(&TAG_VALUE_LENGTH),
@@ -382,14 +359,14 @@ pub fn tag_refusal(member: &str, violation: TagViolation, tags_shown: &str) -> S
 }
 
 /// The message the tagging layer refuses a tag KEY named for REMOVAL with when it is
-/// outside `TagKey`'s bound: the same envelope as [`tag_refusal`], with the key list as
+/// outside `TagKey`'s bound: the same sentence as [`tag_refusal`], with the key list as
 /// the value request validation echoes for a list member.
 ///
 /// `key` is interpolated as given: a key named for removal travels as a list ELEMENT,
 /// which the boundary validator does walk, so it reaches this wording already bounded by
 /// that validator's own rendering.
 pub fn tag_key_refusal(member: &str, key: &str) -> String {
-    tag_validation_document(format!(
+    one_validation_error(format!(
         "Value '[{key}]' at '{member}' failed to satisfy constraint: \
          Member must satisfy constraint: [{}]",
         length_requirements(&TAG_KEY_LENGTH),

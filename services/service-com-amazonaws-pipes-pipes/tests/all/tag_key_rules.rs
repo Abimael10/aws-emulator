@@ -24,9 +24,9 @@
 //! refusals the SERVICE itself states (how many tags a pipe may carry, which
 //! `tests/all/pipe_tagging.rs` pins). Each row below also spells out the message the
 //! broken rule is stated by, independently of the handler that built it: a broken
-//! `@length` is the request-validation sentence inside the JSON document that layer's
-//! message is, and a rule the model expresses nowhere is the documented sentence itself —
-//! `tests/all/tagging_refusal_wording.rs` owns that rule and its envelope.
+//! `@length` is the request-validation sentence itself, and a rule the model expresses
+//! nowhere is the documented sentence itself —
+//! `tests/all/tagging_refusal_wording.rs` owns that rule.
 //!
 //! Every assertion goes through `MultiServiceRouter::dispatch`, reusing the harness
 //! `pipe_lifecycle` owns and the tagging helpers `pipe_tagging` owns, and every refused
@@ -40,7 +40,6 @@ use crate::pipe_lifecycle::{create, describe, router};
 use crate::pipe_tagging::{
     assert_tags_agree, create_body, pipe_arn, tag, tag_map, TAG_MUTATION_STATUS,
 };
-use crate::tagging_refusal_wording::tag_refusal_document;
 
 /// `TagKey`'s published maximum (128) and minimum (1), and `TagValue`'s (256 and 0).
 /// Source: the `TagKey` / `TagValue` shapes of
@@ -91,24 +90,23 @@ enum Broken {
 impl Broken {
     /// The message this refusal carries for a write whose tags arrived on `member`.
     ///
-    /// A broken `@length` is stated as request validation states one, inside the JSON
-    /// document the tagging layer's message is (`tagging_refusal_wording`, which owns that
-    /// envelope and the rule behind it); a rule the model expresses nowhere is the
-    /// documented sentence itself, stated bare.
+    /// A broken `@length` is stated as request validation states one, and that sentence is
+    /// the whole message (`tagging_refusal_wording` owns that rule); a rule the model
+    /// expresses nowhere is the documented sentence itself, stated bare.
     fn message(&self, member: &str) -> String {
         match self {
-            Self::KeyBound(shown) => tag_refusal_document(&format!(
+            Self::KeyBound(shown) => format!(
                 "1 validation error detected: Value '{shown}' at '{member}' failed to \
                  satisfy constraint: Map keys must satisfy constraint: [Member must have \
                  length less than or equal to {MAX_TAG_KEY_LEN}, Member must have length \
                  greater than or equal to {MIN_TAG_KEY_LEN}]"
-            )),
-            Self::ValueBound(shown) => tag_refusal_document(&format!(
+            ),
+            Self::ValueBound(shown) => format!(
                 "1 validation error detected: Value '{shown}' at '{CREATE_TAGS}' failed to \
                  satisfy constraint: Map value must satisfy constraint: [Member must have \
                  length less than or equal to {MAX_TAG_VALUE_LEN}, Member must have length \
                  greater than or equal to {MIN_TAG_VALUE_LEN}]"
-            )),
+            ),
             Self::ReservedPrefix => RESERVED_PREFIX_SENTENCE.to_string(),
             Self::CharacterSet => CHARACTER_SET_SENTENCE.to_string(),
         }
@@ -427,10 +425,10 @@ async fn a_refused_tag_names_the_input_member_it_arrived_on() {
         (400, TAG_RULE_CODE),
         "TagResource must refuse an over-long key with 400 {TAG_RULE_CODE}, got {refused:?}"
     );
-    // Inside the document the layer's message is, the apostrophes the sentence quotes the
-    // member name with are backslash-escaped.
+    // The sentence is the message itself, so the apostrophes it quotes the member name
+    // with reach the client as apostrophes.
     assert!(
-        refused.message().contains(&format!(r"at \'{ADDED_TAGS}\'")),
+        refused.message().contains(&format!("at '{ADDED_TAGS}'")),
         "TagResource's refusal must name its own validation member, got {refused:?}"
     );
     assert_eq!(
@@ -452,7 +450,7 @@ async fn a_refused_tag_names_the_input_member_it_arrived_on() {
          got {refused_create:?}"
     );
     assert!(
-        refused_create.message().contains(&format!(r"at \'{CREATE_TAGS}\'")),
+        refused_create.message().contains(&format!("at '{CREATE_TAGS}'")),
         "CreatePipe's refusal must name its own member, got {refused_create:?}"
     );
 

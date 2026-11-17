@@ -33,7 +33,6 @@ use crate::pipe_tagging::{
     assert_tags_agree, create_body, list_tags, pipe_arn, tag, tag_map, untag,
     TAG_MUTATION_STATUS,
 };
-use crate::tagging_refusal_wording::tag_refusal_document;
 
 /// The sentence the ARN-addressed tagging operations report an unresolvable `resourceArn`
 /// with. Recorded behaviour: a constant, not built from the request.
@@ -348,12 +347,12 @@ async fn untag_resource_refuses_a_key_outside_the_published_bound() {
                 );
                 assert_eq!(
                     reply.message(),
-                    tag_refusal_document(&format!(
+                    format!(
                         "1 validation error detected: Value '[{key}]' at 'removedTagKeys' \
                          failed to satisfy constraint: Member must satisfy constraint: \
                          [Member must have length less than or equal to {MAX_TAG_KEY_LEN}, \
                          Member must have length greater than or equal to {MIN_TAG_KEY_LEN}]"
-                    )),
+                    ),
                     "case {case:?}: expected the member-and-bound sentence, got {reply:?}"
                 );
             }

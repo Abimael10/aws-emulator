@@ -71,10 +71,10 @@
 //! its own code — [`TAG_RULE_REFUSAL_CODE`], which no operation of this model declares,
 //! because the layer is not the service. `crate::state::tag_refusal` states the same
 //! sentences for the rules the handlers enforce themselves, so one tag rule is worded one
-//! way whichever layer catches it. Its message is not a bare sentence: a rule the model
-//! states as a `@length` is reported as the request-validation sentence wrapped in the JSON
-//! document that layer's message IS, while a rule the model states nowhere is the
-//! documented sentence itself — see `crate::state::tag_refusal` for both.
+//! way whichever layer catches it. Its message is the sentence alone: a rule the model
+//! states as a `@length` is reported as the request-validation sentence itself, while a
+//! rule the model states nowhere is the documented sentence itself — see
+//! `crate::state::tag_refusal` for both.
 //!
 //! # How an answer that carries no content is framed
 //!
