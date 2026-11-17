@@ -11872,6 +11872,7 @@ dependencies = [
  "md-5 0.10.6",
  "roxmltree",
  "serde_json",
+ "service-com-amazonaws-cloudwatch-graniteserviceversion20100801",
  "service-com-amazonaws-cloudwatchlogs-logs-20140328",
  "service-com-amazonaws-ecr-amazonec2containerregistry-v20150921",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",

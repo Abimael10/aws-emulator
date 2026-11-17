@@ -94,10 +94,16 @@ pub async fn settle_due_builds<Eng: Send + Sync + 'static>(
     region: &str,
 ) {
     let claimed = state.lock().claim_due_build_runs(now_millis());
+    let mut completed = Vec::new();
     for run in claimed {
         let recorded = perform(callback, engine, region, &run).await;
-        state.lock().record_build_run(&run, region, recorded);
+        completed.extend(state.lock().record_build_run(&run, region, recorded));
     }
+    // What each build that ENDED here is metered by goes into the CloudWatch store of the
+    // SAME engine, with this service's own store no longer held: a client watching build
+    // health over time reads that series rather than the build record
+    // ([`super::build_metrics`]).
+    super::build_metrics::publish_completed_builds(engine, &completed);
 }
 
 /// What one build's run came to, as the store records it.

@@ -65,6 +65,11 @@ md-5 = "0.10"
 # answered by the service that owns them rather than by a copy kept here. No cycle: that
 # crate does not depend on this one.
 service-com-amazonaws-secretsmanager-secretsmanager = { workspace = true }
+# The CloudWatch store holds the `AWS/CodeBuild` series this service publishes about the
+# builds it ran (`state::build_metrics`): the datapoints are appended to the very store
+# `GetMetricStatistics` and `ListMetrics` read, because CloudWatch refuses a publish into an
+# `AWS/` namespace over `PutMetricData`. No cycle: that crate does not depend on this one.
+service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
 # The AWS SDK for Secrets Manager, driven over the in-process callback: the VALUE a
 # `SECRETS_MANAGER` variable is substituted with is read through that service's own
 # `GetSecretValue` before the build's first command runs, so what the build's shell sees is

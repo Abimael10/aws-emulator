@@ -64,6 +64,8 @@ mod build_cache;
 mod build_image;
 /// WHERE one build's output went: the log group and stream it reports.
 mod build_logs;
+/// The CloudWatch metrics a build that ENDED publishes about itself.
+pub mod build_metrics;
 /// The REPORTS a build produces: the report runs its buildspec declared, read from the
 /// result files its own commands wrote.
 mod build_reports;
@@ -105,6 +107,7 @@ pub use batchspec::*;
 pub use build_cache::*;
 pub use build_image::*;
 pub use build_logs::*;
+pub use build_metrics::{publish_completed_builds, CompletedBuild};
 pub use build_reports::*;
 pub use build_run::*;
 pub use build_secrets::*;
@@ -2287,18 +2290,30 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
     /// produced ([`build_reports::record_build_reports`]), and the instant the cache it saved
     /// was written at, which is what a later build restores against the project's last cache
     /// reset.
+    ///
+    /// Answers the build this call COMPLETED, for the metrics CodeBuild publishes about a
+    /// build that ended ([`build_metrics`]) — `None` when the record had already reached its
+    /// outcome, so one build is metered once however many runs are recorded for it.
     pub fn record_build_run(
         &mut self,
         claimed: &build_run::ClaimedRun,
         region: &str,
         recorded: build_run::RecordedRun,
-    ) {
+    ) -> Option<CompletedBuild> {
+        let mut completed = None;
         if let Some(stored) = self.builds.get_mut(&claimed.id) {
+            let was_complete = stored.build.build_complete;
             stored.record_run(
                 recorded.run,
                 recorded.artifacts,
                 &recorded.secondary_artifacts,
             );
+            if !was_complete && stored.build.build_complete {
+                completed = Some(stored.completed_build(
+                    &claimed.project_name,
+                    stored.settle_due_millis,
+                ));
+            }
         }
         // The reports the build produced go in with it: they are what its own commands
         // wrote, read in the format its buildspec declared.
@@ -2308,6 +2323,7 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
                 project.cache_saved_millis = Some(saved);
             }
         }
+        completed
     }
 
     /// Read a batch build, first materialising the transition the clock already
@@ -2877,6 +2893,24 @@ impl StoredBuild {
                     *reported = uploaded.clone();
                 }
             }
+        }
+    }
+
+    /// What this build, now that it has ENDED, is metered by ([`build_metrics`]): the
+    /// project its series are dimensioned on, the status it ended in, and the instants it
+    /// started and ended at.
+    ///
+    /// `project_name` is the project the build belongs to, as the caller resolved it — off
+    /// the record, or off the id the store keys the build by. `end_millis` is the instant
+    /// the call that ended the build recorded as its `endTime`, so the duration published
+    /// is the span the record itself reports.
+    #[must_use]
+    pub fn completed_build(&self, project_name: &str, end_millis: i64) -> CompletedBuild {
+        CompletedBuild {
+            project_name: project_name.to_string(),
+            status: self.build.build_status.clone().unwrap_or_default(),
+            start_millis: self.start_millis,
+            end_millis,
         }
     }
 }

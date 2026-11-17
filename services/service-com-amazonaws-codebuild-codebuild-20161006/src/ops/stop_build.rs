@@ -164,16 +164,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is only possible while it is still in progress, and the run the clock owed it
         // was performed above.
         let now = crate::state::now_millis();
+        let mut stopped = None;
         if !stored.build.build_complete {
             stored.build.build_status = Some("STOPPED".to_string());
             stored.build.current_phase = Some("COMPLETED".to_string());
             stored.build.build_complete = true;
             stored.build.end_time = Some(crate::state::datetime(now));
             stored.build.phases = Some(crate::state::stopped_phases(stored.start_millis, now));
+            stopped = Some(stored.completed_build(
+                // A build is keyed by `<projectName>:<uuid>`, so the project it belongs to
+                // is known from the key even for a record that states none.
+                &stored
+                    .build
+                    .project_name
+                    .clone()
+                    .or_else(|| {
+                        crate::state::project_name_from_resource_id(&input.id).map(str::to_string)
+                    })
+                    .unwrap_or_default(),
+                now,
+            ));
         }
 
-        Ok(StopBuildOutput {
-            build: Some(stored.build.clone()),
-        })
+        let build = stored.build.clone();
+        // The store's guard is released before the metrics this stopped build is counted in
+        // are published: the publication takes the CloudWatch store's own lock.
+        drop(guard);
+        crate::state::publish_completed_builds(&*self.engine, stopped.as_slice());
+
+        Ok(StopBuildOutput { build: Some(build) })
     }
 }
