@@ -589,15 +589,19 @@ pub fn absent_member_clause(member_path: &str, requirement: &str) -> String {
 
 /// The AWS `ValidationException` envelope over one or more clauses: how many
 /// constraints were violated, then the clauses.
+///
+/// The envelope's own words — the count word and what separates two clauses — are the
+/// FRAMEWORK's, read back out of its own rendering by the shared renderer rather than
+/// spelled here, for the same reason [`requirement_text`] reads the requirement half of
+/// a clause off that rendering: the boundary refusals this wording is deliberately kept
+/// in step with are rendered by the framework, so a framework that re-words the
+/// envelope re-words a handler-stated refusal with it.
+///
+/// No clause is nothing to put in an envelope, which the shared renderer answers `None`
+/// for; every caller here states at least one, so this never renders a count of no
+/// violations.
 pub fn validation_envelope(clauses: &[String]) -> String {
-    match clauses {
-        [clause] => format!("1 validation error detected: {clause}"),
-        many => format!(
-            "{} validation errors detected: {}",
-            many.len(),
-            many.join("; ")
-        ),
-    }
+    ::service_common::validation_message::envelope_over(clauses).unwrap_or_default()
 }
 
 /// The whole `ValidationException` message for ONE member that failed ONE
