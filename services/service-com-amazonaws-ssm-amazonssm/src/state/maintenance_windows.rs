@@ -585,7 +585,12 @@ impl WindowSchedule {
 /// `SystemTime` holds spans no calendar date exists for, and a schedule's period is
 /// caller-supplied, so an instant past the calendar has to answer "no date" instead of
 /// ending the process.
-fn calendar_instant(at: SystemTime) -> Option<::chrono::DateTime<::chrono::Utc>> {
+///
+/// `pub(super)`, so the other slices of this state module that read a clock as a calendar
+/// date — the monthly releases a published patch catalogue holds
+/// ([`super::patch_catalog`]) — read it through this one conversion rather than a second
+/// copy of it.
+pub(super) fn calendar_instant(at: SystemTime) -> Option<::chrono::DateTime<::chrono::Utc>> {
     let (seconds, nanos) = match at.duration_since(::std::time::UNIX_EPOCH) {
         Ok(since) => (i64::try_from(since.as_secs()).ok()?, since.subsec_nanos()),
         // Before the epoch: the span back to it, as a negative second count.

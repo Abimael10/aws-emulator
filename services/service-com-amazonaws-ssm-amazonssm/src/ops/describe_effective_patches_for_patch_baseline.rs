@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeEffectivePatchesForPatchBaseline
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeEffectivePatchesForPatchBaseline`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Report the patches one patch baseline makes effective, with the approval state it gives
+//! each of them. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeEffectivePatchesForPatchBaseline::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The patches come from the catalogue Patch Manager publishes for the baseline's
+//! operating system and the approval state is computed from the baseline's own record —
+//! both in [`crate::state::patch_catalog`] — so what a write of the baseline persisted is
+//! what decides every status this reports, together with each patch's own release date.
+//! "Applies to patch baselines for Windows only", so a baseline of another operating
+//! system is refused with `UnsupportedOperatingSystem`; a well formed `BaselineId` that
+//! names no baseline whose approval configuration is held here is refused with
+//! `DoesNotExistException`, and a value that could never name one — an ARN of another
+//! service, account or Region — with `InvalidResourceId`.
+//!
+//! A read: the store is only read, so a later caller sees exactly what this one saw.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +158,108 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeEffectivePatchesForPatchBaseline` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeEffectivePatchesForPatchBaselineErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeEffectivePatchesForPatchBaseline"))
+        use crate::state::patch_baselines::PATCH_BASELINE_NOT_FOUND;
+        use crate::state::patch_catalog::{effective_patch_page_size, effective_patches};
+        use crate::state::{request_region, INVALID_NEXT_TOKEN};
+
+        // `BaselineId` is required and its length and pattern, and the `MaxResults` range,
+        // are MODELLED constraints the centralized walk has already refused anything
+        // outside of.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeEffectivePatchesForPatchBaselineErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some("the patch baseline store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        let page_size = effective_patch_page_size(input.max_results)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        let region = request_region(ctx.parts());
+        let store = state.lock();
+
+        // A value that could never name a baseline held at this endpoint — an ARN of
+        // another service, of another account or of another Region, or one whose resource
+        // is not a patch baseline at all — is not an id this service can look anything up
+        // by, the way every baseline read of this service refuses one.
+        let Some(baseline_id) = store.patch_baseline_query(&region, &input.baseline_id) else {
+            return Err(DescribeEffectivePatchesForPatchBaselineErrorModeled::InvalidResourceId(
+                InvalidResourceId {},
+            )
+            .into());
+        };
+
+        // A baseline the account created here holds the approval configuration this read
+        // computes from. A baseline Systems Manager predefines is reachable through the
+        // same endpoint, and what Patch Manager approves in its own baseline is Patch
+        // Manager's own and is held nowhere here, so neither resolves to an approval
+        // configuration this read could project — both are reported the way every
+        // operation of this service reports a baseline it cannot read.
+        let Some(baseline) = store.patch_baseline(&region, &baseline_id) else {
+            return Err(
+                DescribeEffectivePatchesForPatchBaselineErrorModeled::DoesNotExistException(
+                    DoesNotExistException {
+                        message: Some(PATCH_BASELINE_NOT_FOUND.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "Applies to patch baselines for Windows only": a baseline of another operating
+        // system has effective patches, but not ones this operation reports, so it is
+        // refused through the modelled error for an operation an operating system does not
+        // support rather than answered with an empty list.
+        if baseline.operating_system != crate::state::patch_catalog::EFFECTIVE_PATCH_OPERATING_SYSTEM
+        {
+            return Err(
+                DescribeEffectivePatchesForPatchBaselineErrorModeled::UnsupportedOperatingSystem(
+                    UnsupportedOperatingSystem {
+                        message: Some(crate::state::patch_catalog::unsupported_operating_system(
+                            &baseline.operating_system,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "The current effective patches (the patch and the approval state) for the
+        // specified patch baseline": the patches Patch Manager publishes for the
+        // baseline's operating system, each with the approval state the baseline's own
+        // stored filters, rules and patch lists give it as of now. A READ — nothing is
+        // written, so a later caller sees the same baseline.
+        let effective = effective_patches(baseline, ::std::time::SystemTime::now());
+
+        // "The token for the next set of items to return. (You received this token from a
+        // previous call.)": a page hands out the id of the patch the next page starts at,
+        // so a token naming no patch of this result is not a page of it to resume. This
+        // operation models no `InvalidNextToken`, so such a token is refused as the invalid
+        // request it is rather than answered with an arbitrary page.
+        let start = match input.next_token.as_deref() {
+            None | Some("") => 0,
+            Some(token) => effective
+                .iter()
+                .position(|record| record.patch.id == token)
+                .ok_or_else(|| crate::scaffolded::Scaffolded::validation(INVALID_NEXT_TOKEN))?,
+        };
+        // `start` is a position in `effective`, so the page is a suffix of it; `get` keeps
+        // that in-bounds without indexing on a value the request steers.
+        let page = effective.get(start..).unwrap_or_default();
+        let effective_patches = page
+            .iter()
+            .take(page_size)
+            .map(crate::state::patch_catalog::EffectivePatchRecord::to_effective_patch)
+            .collect();
+        // A patch is still waiting past this page: hand the caller the id it resumes at.
+        // "If there are no additional items to return, the string is empty" — reported as
+        // no token at all, which is how this protocol spells an absent member.
+        let next_token = page.get(page_size).map(|record| record.patch.id.clone());
+
+        Ok(DescribeEffectivePatchesForPatchBaselineOutput {
+            effective_patches: Some(effective_patches),
+            next_token,
+        })
     }
 }

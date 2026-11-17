@@ -123,7 +123,11 @@
 //! the patches available for an operating system carry, which exist in every account and
 //! Region without anybody creating them and which `DescribePatchProperties` reports
 //! ([`ComAmazonawsSsmAmazonssmState::patch_property_values`]) — so what that read answers
-//! is a projection of the one catalogue, the same for every caller.
+//! is a projection of the one catalogue, the same for every caller. The PATCHES that
+//! metadata describes are the same catalogue one patch at a time ([`patch_catalog`]): one
+//! patch per published product per monthly release, which is what
+//! `DescribeEffectivePatchesForPatchBaseline` pairs with the approval state a baseline's
+//! own stored filters, rules and patch lists give each of them.
 //!
 //! Then the **resource data sync configurations** ([`resource_data_syncs`]), keyed by
 //! `(region, sync name)`: `CreateResourceDataSync` persists one,
@@ -283,6 +287,11 @@ pub mod instance_patch_states;
 /// product families, classifications and severities its available patches carry — which
 /// `DescribePatchProperties` reports.
 pub mod patch_properties;
+
+/// The individual patches Patch Manager publishes for an operating system, and which of
+/// them one patch baseline makes effective, with the approval state that baseline gives
+/// each of them.
+pub mod patch_catalog;
 
 /// The inventory this service holds about the managed nodes of a Region — the
 /// `AWS:InstanceInformation` item every registered node has — and how a query filters and
