@@ -44,7 +44,8 @@ use service_com_amazonaws_iam_awsidentitymanagementv20100508::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::experiment_lifecycle::{
-    create_template, poll_until_final, send, start_experiment, token, Answer, FALLBACK_REGION,
+    create_template, poll_until_final, poll_until_resolution_ends, send, start_experiment, token,
+    Answer, FALLBACK_REGION,
 };
 
 /// The Region the experiment is started in, and the one its resources have to be in.
@@ -735,10 +736,15 @@ async fn experiment(router: &MultiServiceRouter, label: &str, rows: &[Row]) -> S
         "expected the start to be accepted, got {} with {:?}",
         started.status, started.body
     );
-    started.member("experiment")["id"]
+    let experiment_id = started.member("experiment")["id"]
         .as_str()
         .unwrap_or_else(|| panic!("no experiment id in {:?}", started.body))
-        .to_string()
+        .to_string();
+    // A started experiment RESOLVES its targets while it is starting up, and a read of a
+    // resolution that has not ended is refused, so the cases below read the resolution the
+    // way a client does: once the experiment has moved off `initiating`.
+    poll_until_resolution_ends(router, &experiment_id, TERMINAL_BUDGET).await;
+    experiment_id
 }
 
 /// One page of `ListExperimentResolvedTargets`, optionally narrowed to one `targetName`.

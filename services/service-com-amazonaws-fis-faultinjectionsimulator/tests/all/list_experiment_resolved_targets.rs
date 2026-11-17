@@ -20,6 +20,10 @@
 //!   and following that token enumerates the resolution exactly once at any page size —
 //!   in one and the same order, whatever the page size and however often it is read;
 //! * `targetName` narrows the page to that one target and nothing else;
+//! * a read taken while the experiment is still RESOLVING its targets — the window it
+//!   reports `initiating` for — is refused with `ValidationException` (HTTP 400) and the
+//!   sentence FIS words that refusal in, and the same read once the resolution has ended is
+//!   answered with the resolution;
 //! * a `nextToken` the operation never issued is refused with `ValidationException`
 //!   (HTTP 400), and a `maxResults` outside `@range(min: 1, max: 100)` with HTTP 400;
 //! * an `experimentId` naming no experiment answers `ResourceNotFoundException`
@@ -31,11 +35,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_fis_faultinjectionsimulator::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
+
+use crate::experiment_lifecycle::{poll_until_resolution_ends, RESOLUTION_BUDGET};
 
 /// `ListExperimentResolvedTargetsMaxResults`'s published bounds
 /// (`@range(min: 1, max: 100)`), spelled out here rather than imported from the crate so a
@@ -43,6 +50,16 @@ use smithy_server_runtime::MultiServiceRouter;
 const MAX_RESULTS_FLOOR: i32 = 1;
 /// See [`MAX_RESULTS_FLOOR`].
 const MAX_RESULTS_CEILING: i32 = 100;
+
+/// The sentence FIS refuses a read of a resolution that has not ENDED with. Spelled out
+/// here rather than imported from the crate so a change to the wording fails this suite.
+const TARGET_RESOLUTION_ONGOING: &str =
+    "Target resolution is ongoing. Retry after target resolution ends.";
+
+/// How far out a case that reads a resolution IN FLIGHT pushes the transition the clock
+/// owes the experiment, so the window the resolution is in flight for stays open across the
+/// reads the case takes inside it however slowly a loaded host gets to them.
+const RESOLUTION_HELD_OPEN: Duration = Duration::from_secs(3_600);
 
 /// The region an ARN names when the request's credential scope offers none usable.
 const FALLBACK_REGION: &str = "us-east-1";
@@ -73,11 +90,51 @@ fn signed_for(region: &str) -> String {
 
 /// One emulator: a router carrying only this service, over one shared engine.
 fn emulator() -> MultiServiceRouter {
+    emulator_and_engine().0
+}
+
+/// [`emulator`], with the shared engine it was built over — the engine whose FIS store the
+/// cases that drive an experiment's CLOCK reach ([`hold_resolution_open`]).
+fn emulator_and_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
-    router
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    (router, engine)
+}
+
+/// Hold the experiment `experiment_id` in the window its targets are being RESOLVED in, by
+/// pushing the transition the clock owes it out by `RESOLUTION_HELD_OPEN`.
+///
+/// This is how a case reads a resolution that is still in flight without racing the clock:
+/// a resolution is in flight for as long as the experiment has not finished starting up, so
+/// moving that instant is what decides the window rather than how quickly the host gets
+/// from the start to the read. [`end_resolution`] is the other half.
+fn hold_resolution_open(engine: &Arc<engine::InMemoryEngine>, experiment_id: &str) {
+    set_transition_due(
+        engine,
+        experiment_id,
+        SystemTime::now() + RESOLUTION_HELD_OPEN,
+    );
+}
+
+/// End the resolution of the experiment `experiment_id`: the transition the clock owes it
+/// is due as of now, so the experiment has finished starting up and its resolution is
+/// readable. See [`hold_resolution_open`].
+fn end_resolution(engine: &Arc<engine::InMemoryEngine>, experiment_id: &str) {
+    set_transition_due(engine, experiment_id, SystemTime::now());
+}
+
+/// Put the instant the transition this experiment owes the clock falls due at `due`.
+fn set_transition_due(engine: &Arc<engine::InMemoryEngine>, experiment_id: &str, due: SystemTime) {
+    let state = service_com_amazonaws_fis_faultinjectionsimulator::state::service_state(&**engine)
+        .expect("the engine carries this service's store");
+    let mut store = state.lock();
+    let record = store
+        .experiments
+        .get_mut(experiment_id)
+        .unwrap_or_else(|| panic!("the store holds the experiment {experiment_id}"));
+    record.transition_due = Some(due);
 }
 
 /// What the emulator answered: the HTTP status and the JSON body.
@@ -342,9 +399,21 @@ fn template_body(label: &str, rows: &[Row]) -> Value {
     })
 }
 
-/// Create a template holding `rows` and start an experiment from it, reporting the
-/// experiment's minted id.
+/// Create a template holding `rows`, start an experiment from it and wait until that
+/// experiment has finished RESOLVING its targets, reporting the experiment's minted id.
 async fn experiment(router: &MultiServiceRouter, label: &str, rows: &[Row]) -> String {
+    let experiment_id = started_experiment(router, label, rows).await;
+    // A started experiment resolves its targets while it is starting up, and a read of a
+    // resolution that has not ended is refused, so the cases that read one do what a client
+    // does: they read it once the resolution has ended. The wait is the shared poll of that
+    // CONDITION.
+    poll_until_resolution_ends(router, &experiment_id, RESOLUTION_BUDGET).await;
+    experiment_id
+}
+
+/// Create a template holding `rows` and start an experiment from it, reporting the
+/// experiment's minted id WITHOUT waiting for its targets to be resolved.
+async fn started_experiment(router: &MultiServiceRouter, label: &str, rows: &[Row]) -> String {
     let created = send(
         router,
         "POST",
@@ -971,6 +1040,240 @@ async fn a_token_resumes_where_the_previous_page_ended_whatever_the_filter() {
             "case {case:?}: expected the entries of {name:?} from the resumed position on, \
              got {:?}",
             answer.body
+        );
+    }
+}
+
+/// One case of the in-flight rule: which targets the experiment carries, and what the read
+/// taken while its resolution is still in flight asks for.
+struct InFlightCase {
+    case: &'static str,
+    /// The names of the [`rows`] the experiment's template carries as its targets — empty
+    /// for a template that carries no target at all.
+    targets: &'static [&'static str],
+    max_results: Option<i32>,
+    target_name: Option<&'static str>,
+}
+
+/// RULE: an experiment RESOLVES its targets while it is starting up, so a read of that
+/// resolution taken before the resolution has ENDED is refused with `ValidationException`
+/// (HTTP 400) and the sentence FIS words that refusal in — whatever the read asks for and
+/// whatever the resolution turns out to hold — while the same read, once the resolution has
+/// ended, is answered with the resolution itself.
+#[tokio::test]
+async fn a_resolution_read_is_refused_until_the_resolution_has_ended() {
+    // The rows differ along what the read asks for (no query at all, a page size at the
+    // published floor, a page size at the published ceiling, one target by name, a
+    // `targetName` no target of the experiment carries) and along what the experiment will
+    // resolve to (several resources, one, none at all, and an experiment carrying no target
+    // whatsoever): the refusal is the same for every one of them, because it is about the
+    // resolution not having ended rather than about what it holds.
+    let cases = [
+        InFlightCase {
+            case: "no-query-over-three-resolved-resources",
+            targets: &["allInstances"],
+            max_results: None,
+            target_name: None,
+        },
+        InFlightCase {
+            case: "a-page-size-at-the-published-floor",
+            targets: &["allInstances"],
+            max_results: Some(MAX_RESULTS_FLOOR),
+            target_name: None,
+        },
+        InFlightCase {
+            case: "a-page-size-at-the-published-ceiling",
+            targets: &["allInstances", "countOneInstance"],
+            max_results: Some(MAX_RESULTS_CEILING),
+            target_name: None,
+        },
+        InFlightCase {
+            case: "one-target-by-name",
+            targets: &["allInstances", "countOneInstance"],
+            max_results: None,
+            target_name: Some("countOneInstance"),
+        },
+        InFlightCase {
+            case: "a-target-name-no-target-of-the-experiment-carries",
+            targets: &["allInstances"],
+            max_results: None,
+            target_name: Some("absentTarget"),
+        },
+        InFlightCase {
+            case: "a-target-that-resolves-to-nothing",
+            targets: &["taggedInstances"],
+            max_results: None,
+            target_name: None,
+        },
+        InFlightCase {
+            case: "an-experiment-carrying-no-target-at-all",
+            targets: &[],
+            max_results: None,
+            target_name: None,
+        },
+    ];
+
+    for case in cases {
+        // One emulator per case: a case holds its experiment in the window its targets are
+        // being resolved in, and an account holds only so many experiments at once.
+        let (router, engine) = emulator_and_engine();
+        let targets: Vec<Row> = rows()
+            .into_iter()
+            .filter(|row| case.targets.contains(&row.name))
+            .collect();
+        assert_eq!(
+            targets.len(),
+            case.targets.len(),
+            "case {:?}: the case names targets this suite's rows do not hold: {:?}",
+            case.case,
+            case.targets
+        );
+        // What the answered read must carry: what the targets the read asks about resolve
+        // to, cut to the page size the read asked for.
+        let resolvable: usize = targets
+            .iter()
+            .filter(|row| case.target_name.is_none_or(|name| row.name == name))
+            .map(|row| row.expected)
+            .sum();
+        let page_size = case.max_results.map_or(usize::MAX, |size| {
+            usize::try_from(size).expect("a published page size is positive")
+        });
+        let expected = resolvable.min(page_size);
+
+        let experiment_id = started_experiment(&router, case.case, &targets).await;
+        // The experiment is HELD in the window its targets are being resolved in, so what
+        // the reads below are taken inside is decided by the experiment's clock rather than
+        // by how quickly this host gets from the start to the read.
+        hold_resolution_open(&engine, &experiment_id);
+
+        // Two reads taken while the resolution is in flight: the refusal is what the state
+        // of the resolution says, so it is not spent by being reported once.
+        for read in ["the-first-read", "the-read-after-it"] {
+            let refused = list(
+                &router,
+                &experiment_id,
+                case.max_results,
+                None,
+                case.target_name,
+            )
+            .await;
+            assert_eq!(
+                refused.status, 400,
+                "case {:?}/{read}: expected HTTP 400 while the resolution is in flight, \
+                 got {} with {:?}",
+                case.case, refused.status, refused.body
+            );
+            assert_eq!(
+                refused.error_code(),
+                "ValidationException",
+                "case {:?}/{read}: expected ValidationException while the resolution is in \
+                 flight, got {:?}",
+                case.case,
+                refused.body
+            );
+            assert_eq!(
+                refused.member("message").as_str(),
+                Some(TARGET_RESOLUTION_ONGOING),
+                "case {:?}/{read}: expected the message {TARGET_RESOLUTION_ONGOING:?}, \
+                 got {:?}",
+                case.case,
+                refused.body
+            );
+        }
+
+        // An `experimentId` that names no record is still reported MISSING rather than as a
+        // resolution in flight: the experiment the path names is resolved before anything
+        // about its resolution is.
+        let missing = list(
+            &router,
+            "EXP000000000099",
+            case.max_results,
+            None,
+            case.target_name,
+        )
+        .await;
+        assert_eq!(
+            missing.status, 404,
+            "case {:?}: expected HTTP 404 for an experiment that does not exist, \
+             got {} with {:?}",
+            case.case, missing.status, missing.body
+        );
+        assert_eq!(
+            missing.error_code(),
+            "ResourceNotFoundException",
+            "case {:?}: expected ResourceNotFoundException for an experiment that does not \
+             exist, got {:?}",
+            case.case,
+            missing.body
+        );
+
+        // Once the resolution has ENDED — the transition the clock owes the experiment is
+        // due, and the experiment has moved off `initiating` — the SAME read is answered
+        // with the resolution.
+        end_resolution(&engine, &experiment_id);
+        poll_until_resolution_ends(&router, &experiment_id, RESOLUTION_BUDGET).await;
+        let answered = list(
+            &router,
+            &experiment_id,
+            case.max_results,
+            None,
+            case.target_name,
+        )
+        .await;
+        assert_eq!(
+            answered.status, 200,
+            "case {:?}: expected HTTP 200 once the resolution has ended, got {} with {:?}",
+            case.case, answered.status, answered.body
+        );
+        let entries = answered.resolved(case.case);
+        assert_eq!(
+            entries.len(),
+            expected,
+            "case {:?}: expected {expected} resolved target(s) once the resolution has \
+             ended, got {entries:?}",
+            case.case
+        );
+        for entry in &entries {
+            let name = entry["targetName"].as_str().unwrap_or_default();
+            let row = targets
+                .iter()
+                .find(|row| row.name == name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "case {:?}: an entry names a target the experiment does not carry: \
+                         {entry:?}",
+                        case.case
+                    )
+                });
+            assert_eq!(
+                entry["resourceType"].as_str(),
+                Some(row.resource_type),
+                "case {:?}: every entry carries its target's resourceType, got {entry:?}",
+                case.case
+            );
+        }
+
+        // The refusal consumed nothing and the answered read moved nothing: the same read
+        // reports the same page again.
+        let again = list(
+            &router,
+            &experiment_id,
+            case.max_results,
+            None,
+            case.target_name,
+        )
+        .await;
+        assert_eq!(
+            again.status, 200,
+            "case {:?}: expected HTTP 200 from the repeated read, got {} with {:?}",
+            case.case, again.status, again.body
+        );
+        assert_eq!(
+            again.resolved(case.case),
+            entries,
+            "case {:?}: expected the repeated read to report the same page, got {:?}",
+            case.case,
+            again.body
         );
     }
 }

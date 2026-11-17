@@ -28,7 +28,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::experiment_lifecycle::{
-    create_template, emulator, send, token, Answer, FALLBACK_REGION,
+    create_template, emulator, poll_until_resolution_ends, send, token, Answer, FALLBACK_REGION,
+    RESOLUTION_BUDGET,
 };
 
 /// A well-formed IAM role ARN: no row here is about the execution role.
@@ -135,10 +136,15 @@ async fn experiment(router: &MultiServiceRouter, label: &str) -> String {
         "case {label:?}: expected HTTP 200 from StartExperiment, got {} with {:?}",
         answer.status, answer.body
     );
-    answer.member("experiment")["id"]
+    let experiment_id = answer.member("experiment")["id"]
         .as_str()
         .unwrap_or_else(|| panic!("case {label:?}: no experiment id in {:?}", answer.body))
-        .to_string()
+        .to_string();
+    // A started experiment resolves its targets while it is starting up, and a read of a
+    // resolution that has not ended is refused, so a case that reads one waits for the
+    // experiment to move off `initiating` first.
+    poll_until_resolution_ends(router, &experiment_id, RESOLUTION_BUDGET).await;
+    experiment_id
 }
 
 /// RULE: a `resourceType` is judged against the catalog FIS publishes as INPUT, so a value

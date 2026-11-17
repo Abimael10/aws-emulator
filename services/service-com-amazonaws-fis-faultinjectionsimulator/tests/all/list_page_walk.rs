@@ -41,8 +41,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::experiment_lifecycle::{
-    create_template, emulator, send, start_experiment, token, Answer, FALLBACK_REGION,
-    WAIT_DURATION,
+    create_template, emulator, poll_until_resolution_ends, send, start_experiment, token, Answer,
+    FALLBACK_REGION, RESOLUTION_BUDGET, WAIT_DURATION,
 };
 
 /// The published bounds every `maxResults` of these lists declares
@@ -365,6 +365,9 @@ async fn fixture() -> (MultiServiceRouter, Vec<Listing>) {
         .as_str()
         .unwrap_or_else(|| panic!("case resolved-targets: no experiment id in {:?}", started.body))
         .to_string();
+    // The resolution of an experiment that is still starting up is not readable yet, so the
+    // collection this suite pages is read once the experiment has moved off `initiating`.
+    poll_until_resolution_ends(&router, &experiment_id, RESOLUTION_BUDGET).await;
 
     let listings = vec![
         Listing {

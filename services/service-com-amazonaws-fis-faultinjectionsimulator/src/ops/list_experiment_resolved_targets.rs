@@ -10,6 +10,11 @@
 //! target's `filters`), so this operation only reads, filters and paginates
 //! it: two reads at any instant report the same page.
 //!
+//! Resolving is work the experiment's START sets going, so a read taken before that
+//! resolution has ENDED is refused with `ValidationException` rather than answered with a
+//! resolution that is not final yet — see
+//! `crate::state::ExperimentRecord::target_resolution_in_flight`.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -166,6 +171,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .map_err(ListExperimentResolvedTargetsErrorModeled::ValidationException)?;
 
         let page_size = crate::state::page_size(input.max_results);
+        // Whether the resolution of an experiment that is still starting up has ended is
+        // decided by the clock alone, so the instant this read is taken at is read before
+        // the store.
+        let now = ::std::time::SystemTime::now();
         // A pure read: the resolution was computed when the experiment was started, so
         // this call settles, mints and moves nothing.
         let store = state.lock();
@@ -180,6 +189,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
+
+        // An experiment that is still starting up is still RESOLVING its targets, and a
+        // resolution that has not ended is not a resolution to report: the read is refused
+        // in the words FIS refuses it in, and the caller retries once the resolution ends.
+        if experiment.target_resolution_in_flight(now) {
+            return Err(
+                ListExperimentResolvedTargetsErrorModeled::ValidationException(
+                    crate::state::target_resolution_ongoing(),
+                )
+                .into(),
+            );
+        }
 
         // The page walk itself is the shared one, so this operation pages by the same rule
         // as every other list of this service; what belongs to this operation is that its

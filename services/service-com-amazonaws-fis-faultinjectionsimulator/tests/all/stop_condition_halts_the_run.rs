@@ -27,7 +27,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::experiment_lifecycle::{
-    create_template, get_experiment, poll_until_final, start_experiment, token,
+    create_template, poll_until_final, poll_until_resolution_ends, start_experiment, token,
 };
 
 /// The `source` of a stop condition that watches a CloudWatch alarm, and the one that
@@ -265,20 +265,14 @@ fn stop_conditions(row: &Row, alarm_arns: &[String]) -> Value {
 
 /// Poll `GetExperiment` until the experiment reports `running`, and report the status it
 /// was last read in.
+///
+/// The wait itself is the shared one — a resolution ends and a run begins at the same
+/// instant, when the experiment stops being `initiating` — so there is one copy of it.
 async fn poll_until_running(router: &MultiServiceRouter, id: &str) -> String {
-    const INTERVAL: Duration = Duration::from_millis(25);
-    let deadline = std::time::Instant::now() + RUNNING_BUDGET;
-    loop {
-        let experiment = get_experiment(router, id).await.member("experiment").clone();
-        let status = experiment["state"]["status"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
-        if status != "initiating" || std::time::Instant::now() >= deadline {
-            return status;
-        }
-        tokio::time::sleep(INTERVAL).await;
-    }
+    poll_until_resolution_ends(router, id, RUNNING_BUDGET).await["state"]["status"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
 }
 
 #[tokio::test]

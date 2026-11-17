@@ -228,6 +228,37 @@ pub(crate) async fn poll_until_final(router: &MultiServiceRouter, id: &str, budg
     }
 }
 
+/// How long a suite gives a started experiment to finish starting up: the wait ends on the
+/// CONDITION ([`poll_until_resolution_ends`]), so this only has to be generous enough for a
+/// loaded host.
+pub(crate) const RESOLUTION_BUDGET: Duration = Duration::from_secs(30);
+
+/// Poll `GetExperiment` until the experiment has finished starting up — the window it
+/// RESOLVES its targets in, and so the window a read of that resolution is refused in — or
+/// `budget` runs out, and report the experiment as it was last read.
+///
+/// The condition is polled rather than timed, so the wait ends as soon as the experiment
+/// reports a status past `initiating` and the budget only has to be generous.
+pub(crate) async fn poll_until_resolution_ends(
+    router: &MultiServiceRouter,
+    id: &str,
+    budget: Duration,
+) -> Value {
+    const INTERVAL: Duration = Duration::from_millis(25);
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        let experiment = get_experiment(router, id).await.member("experiment").clone();
+        let status = experiment["state"]["status"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if status != "initiating" || std::time::Instant::now() >= deadline {
+            return experiment;
+        }
+        tokio::time::sleep(INTERVAL).await;
+    }
+}
+
 /// Assert that every member `expected` carries appears in `actual` with an equal value.
 ///
 /// This is the round-trip rule, applied to the whole nested request body at once: a

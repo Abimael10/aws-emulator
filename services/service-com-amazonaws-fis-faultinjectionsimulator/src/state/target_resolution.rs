@@ -27,6 +27,12 @@
 //! nothing about it: a target that NAMED such a resource identifies it as it always did,
 //! because a filter can only narrow what something can be read from — the same reading the
 //! privileges gate takes of a role the account's IAM store does not hold.
+//!
+//! Resolving is work an experiment's START sets going rather than something a reader of the
+//! experiment does, so there is a window in which it has not ENDED: the one the experiment
+//! reports `initiating` for ([`ExperimentRecord::target_resolution_in_flight`]). A read of
+//! the resolution taken inside that window is refused ([`target_resolution_ongoing`])
+//! instead of being answered with a resolution that is not final yet.
 
 use ::service_com_amazonaws_ec2_amazonec2::state as ec2;
 
@@ -420,6 +426,38 @@ fn attributes<const N: usize>(
 fn in_arn_order(mut resources: Vec<TargetableResource>) -> Vec<TargetableResource> {
     resources.sort_by(|left, right| left.arn.cmp(&right.arn));
     resources
+}
+
+/// The message FIS refuses a read of a resolution that has not ENDED yet with: resolving an
+/// experiment's targets is work the start sets going, and the resolution only becomes
+/// readable once it is over. Fixed text — it names neither the experiment nor a target.
+pub const TARGET_RESOLUTION_ONGOING: &str =
+    "Target resolution is ongoing. Retry after target resolution ends.";
+
+/// The `ValidationException` payload a read of a resolution taken before that resolution
+/// ENDED is refused with ([`TARGET_RESOLUTION_ONGOING`]).
+pub fn target_resolution_ongoing() -> ValidationException {
+    invalid_input(TARGET_RESOLUTION_ONGOING)
+}
+
+impl ExperimentRecord {
+    /// Whether this experiment's targets are still being RESOLVED at `now`.
+    ///
+    /// An experiment resolves its targets while it is starting up — the window it reports
+    /// `initiating` for, before the clock moves it on ([`TRANSITION_DELAY`]) — so the
+    /// resolution has ENDED from the instant that transition fell due, whether or not
+    /// anybody looked, and for every later status the run reaches. A read taken inside that
+    /// window is refused rather than answered with a resolution that is not final yet
+    /// ([`target_resolution_ongoing`]).
+    ///
+    /// An experiment that is `initiating` and owes the clock NO transition has not finished
+    /// starting up and has no instant at which it will, so its resolution is in flight too:
+    /// the rule is read off the status first, and the instant only decides a start-up the
+    /// clock has already moved past.
+    pub fn target_resolution_in_flight(&self, now: SystemTime) -> bool {
+        self.status == ExperimentStatus::Initiating
+            && self.transition_due.is_none_or(|due| now < due)
+    }
 }
 
 /// What `targets` RESOLVE to: one `ResolvedTarget` per resource a target identifies,
