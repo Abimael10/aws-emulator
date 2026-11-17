@@ -8,6 +8,9 @@
 //! * a not-found refusal of a build-addressed read carries AWS's own sentence for that
 //!   error class, built from the ADDRESS the request carried — its `imageIdentifier`,
 //!   `imageVersion` and `buildId` path labels;
+//! * a not-found refusal of a VERSION-addressed call carries AWS's own sentence for that
+//!   error class — the missing version named first, with the resolved image's own ARN and
+//!   the `imageVersion` the request carried — whichever operation resolved the version;
 //! * a paginated child enumeration of an image (`ListMicrovmImageVersions`,
 //!   `ListMicrovmImageBuilds`) REPORTS what this region's store holds at the address the
 //!   request named and refuses nothing past the authorization verdict: an address this
@@ -30,17 +33,21 @@ use serde_json::{json, Value};
 use service_com_amazonaws_lambdamicrovms_lambdamicrovms::ops::types::MICROVM_IMAGE_STATE_VALUES;
 use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::{
     image_not_updatable_message, invalid_arn_format_message,
-    managed_base_image_arn, service_state, FIRST_IMAGE_VERSION, IMAGE_STATE_CREATE_FAILED,
-    MANAGED_BASE_IMAGE_IDS,
+    managed_base_image_arn, service_state, version_address_image_not_found_message,
+    FIRST_IMAGE_VERSION, IMAGE_STATE_CREATE_FAILED, MANAGED_BASE_IMAGE_IDS,
+    VERSION_STATUS_INACTIVE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::image_build_outcome::get_version;
 use crate::image_build_read_path::{get_build, list_builds, page_build_ids};
+use crate::image_version_deletion::{delete_version, image_with_versions, poll_until_version_gone};
 use crate::image_version_listing::list_versions;
+use crate::image_version_status_publication::publish_status;
 use crate::microvm_image_and_instance_paths::{delete_image, get_image};
 use crate::microvm_lifecycle::{
     as_uri_value, call, emulator, emulator_with_engine, expected_image_arn, image_body, poll_until,
-    ACCOUNT, PAST_THE_SPAN, REGION,
+    run_microvm, ACCOUNT, PAST_THE_SPAN, REGION,
 };
 
 /// A build role ARN: `RoleArn`, pattern
@@ -89,6 +96,19 @@ fn expected_build_not_found(identifier: &str, image_version: &str, build_id: &st
          BuildID: {build_id}"
     )
 }
+
+/// AWS's sentence for a version-addressed not-found, spelled out here rather than read
+/// from the crate so a change to the wording fails this suite: the fixed text `MicroVM
+/// image version not found: ` and `, version: `, with the resolved image's own ARN and the
+/// `imageVersion` the request carried.
+fn expected_version_not_found(image_arn: &str, image_version: &str) -> String {
+    format!("MicroVM image version not found: {image_arn}, version: {image_version}")
+}
+
+/// A `buildId` in the form this service mints that no build of any version carries, so a
+/// build-addressed row of the version-not-found table misses on its VERSION rather than
+/// reaching the build lookup at all.
+const UNHELD_BUILD_ID: &str = "build-ffffffffffffffff";
 
 /// The state the store holds for the image `name`, as the image's own read reports it.
 async fn image_state(router: &MultiServiceRouter, name: &str) -> String {
@@ -168,6 +188,176 @@ async fn a_build_the_version_does_not_hold_is_refused_in_awss_words() {
         assert_eq!(
             status, 200,
             "case {form}: the held build is readable, got {status} {body}"
+        );
+    }
+}
+
+/// RULE: a call addressed at an `imageVersion` the image it resolved does not hold is
+/// refused with the modelled `ResourceNotFoundException` (HTTP 404) whose message is AWS's
+/// own sentence for that class — the missing VERSION named first, then the resolved
+/// image's own ARN and the `imageVersion` the request carried — so the one discriminator
+/// the service offers tells a client which half of the address failed. The sentence is the
+/// same whichever operation resolved the version and whichever form of
+/// `MicrovmImageIdentifier` the request addressed the image by; a call whose IMAGE half
+/// resolves to nothing has no ARN to name and reports the whole address it was given
+/// instead.
+#[tokio::test]
+async fn a_version_the_image_does_not_hold_is_refused_in_awss_words() {
+    let router = emulator();
+    // Two settled versions, so the delete below is accepted (an image always holds at
+    // least one version) and the version it takes is one this image HELD and no longer
+    // does — the address a client racing a delete is left holding.
+    let image_arn = image_with_versions(&router, "the versioned image", "versioned", 2).await;
+    let (status, deleted) = delete_version(&router, &image_arn, FIRST_IMAGE_VERSION).await;
+    assert_eq!(
+        status, 200,
+        "deleting {FIRST_IMAGE_VERSION} expected 200, got {status} {deleted}"
+    );
+    poll_until_version_gone(
+        &router,
+        "the deleted version",
+        &image_arn,
+        FIRST_IMAGE_VERSION,
+    )
+    .await;
+
+    // Rows differ along what the sentence's version part generalises over: a version the
+    // image held until a delete took it, one in this service's own `major.minor` form it
+    // never held, one in no form this service mints at all, and one at the published
+    // maximum length of `imageVersion` (`NonBlankString`, `@length(1..2048)`).
+    let versions: [(&str, String); 4] = [
+        (
+            "a version a delete has taken",
+            FIRST_IMAGE_VERSION.to_string(),
+        ),
+        ("a version this image never held", "9.9".to_string()),
+        (
+            "a version in no form this service mints",
+            "latest".to_string(),
+        ),
+        (
+            "a version at the published maximum length",
+            "9".repeat(2048),
+        ),
+    ];
+    let identifiers = [
+        ("the image name", "versioned".to_string()),
+        ("the image ARN", image_arn.clone()),
+    ];
+
+    for (version_form, image_version) in &versions {
+        for (id_form, identifier) in &identifiers {
+            // Every operation that resolves an `imageVersion` through the one address.
+            // `DeleteMicrovmImageVersion` is the documented idempotent one, so a version
+            // an earlier delete took is reported in its settled deletion state there and
+            // only a version the image NEVER held is refused through it.
+            let mut answers = vec![
+                (
+                    "GetMicrovmImageVersion",
+                    get_version(&router, identifier, image_version).await,
+                ),
+                (
+                    "UpdateMicrovmImageVersion",
+                    publish_status(&router, identifier, image_version, VERSION_STATUS_INACTIVE)
+                        .await,
+                ),
+                (
+                    "GetMicrovmImageBuild",
+                    get_build(&router, identifier, image_version, UNHELD_BUILD_ID).await,
+                ),
+                (
+                    "RunMicrovm",
+                    run_microvm(
+                        &router,
+                        json!({"imageIdentifier": identifier, "imageVersion": image_version}),
+                    )
+                    .await,
+                ),
+            ];
+            if image_version != FIRST_IMAGE_VERSION {
+                answers.push((
+                    "DeleteMicrovmImageVersion",
+                    delete_version(&router, identifier, image_version).await,
+                ));
+            }
+
+            let expected = expected_version_not_found(&image_arn, image_version);
+            for (operation, (status, body)) in answers {
+                let case = format!("{version_form} addressed by {id_form} on {operation}");
+                assert_eq!(
+                    status, 404,
+                    "case {case:?}: expected 404, got {status} {body}"
+                );
+                assert_eq!(
+                    body["__type"].as_str(),
+                    Some("ResourceNotFoundException"),
+                    "case {case:?}: expected ResourceNotFoundException, got {body}"
+                );
+                assert_eq!(
+                    body["message"].as_str(),
+                    Some(expected.as_str()),
+                    "case {case:?}: expected {expected:?}, got {:?}",
+                    body["message"]
+                );
+            }
+        }
+    }
+
+    // The positive control: the version the image DOES hold is served through the same
+    // paths, so the rows above miss on the version they named and not on a dead read. The
+    // surviving version is read out of the listing rather than written down here, so the
+    // control does not depend on the form this service mints version labels in.
+    let (status, surviving) = list_versions(&router, &image_arn, "").await;
+    assert_eq!(
+        status, 200,
+        "listing the surviving versions got {status} {surviving}"
+    );
+    let held = surviving["items"]
+        .as_array()
+        .and_then(|items| items.first())
+        .and_then(|item| item["imageVersion"].as_str())
+        .unwrap_or_else(|| panic!("the image still holds a version, got {surviving}"))
+        .to_string();
+    assert_ne!(
+        held, FIRST_IMAGE_VERSION,
+        "the surviving version is not the one the delete took, got {surviving}"
+    );
+    for (id_form, identifier) in &identifiers {
+        let (status, body) = get_version(&router, identifier, &held).await;
+        assert_eq!(
+            status, 200,
+            "case {id_form:?}: the held version is readable, got {status} {body}"
+        );
+        assert_eq!(
+            body["imageVersion"].as_str(),
+            Some(held.as_str()),
+            "case {id_form:?}: the read reports the version it resolved, got {body}"
+        );
+    }
+
+    // The OTHER half of the address: with no image resolved there is no ARN to name a
+    // version against, so a launch pinned to a version of an image this account holds no
+    // record of reports the whole address it was given — the same sentence the
+    // version-addressed reads answer for an unresolvable image
+    // (`version_address_image_not_found_message`), not the version sentence above.
+    let absent = expected_image_arn("never-created");
+    for (version_form, image_version) in &versions {
+        let (status, body) = run_microvm(
+            &router,
+            json!({"imageIdentifier": absent.clone(), "imageVersion": image_version}),
+        )
+        .await;
+        let case = format!("{version_form} of an image this account does not hold");
+        assert_eq!(
+            status, 404,
+            "case {case:?}: expected 404, got {status} {body}"
+        );
+        assert_eq!(
+            body["message"].as_str(),
+            Some(version_address_image_not_found_message(&absent, image_version).as_str()),
+            "case {case:?}: a launch with no image resolved names the address it was given, \
+             got {:?}",
+            body["message"]
         );
     }
 }

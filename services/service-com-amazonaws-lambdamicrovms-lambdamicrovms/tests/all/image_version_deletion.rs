@@ -43,7 +43,7 @@ const BUILD_ROLE_ARN: &str = "arn:aws:iam::123456789012:role/microvm-version-del
 const CODE_ARTIFACT_URI: &str = "s3://artifacts/app.zip";
 
 /// `DELETE /2025-09-09/microvm-images/{imageIdentifier}/versions/{imageVersion}`.
-async fn delete_version(
+pub(crate) async fn delete_version(
     router: &MultiServiceRouter,
     identifier: &str,
     image_version: &str,
@@ -101,7 +101,7 @@ async fn poll_until_version_settled(
 
 /// Look at the version `image_version` of the image `identifier` until the deletion the
 /// clock owes has taken it, so the read misses.
-async fn poll_until_version_gone(
+pub(crate) async fn poll_until_version_gone(
     router: &MultiServiceRouter,
     case: &str,
     identifier: &str,
@@ -120,7 +120,7 @@ async fn poll_until_version_gone(
 
 /// Create the image `name` and give it `generations` settled versions — the create mints
 /// the first and an update mints each further one — and hand back its ARN.
-async fn image_with_versions(
+pub(crate) async fn image_with_versions(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,

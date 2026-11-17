@@ -10,8 +10,8 @@
 use serde_json::{json, Value};
 
 use super::microvm_lifecycle::{
-    as_uri_value, built_image, call, emulator, expected_image_arn, image_body, run_microvm, ACCOUNT,
-    PAST_THE_SPAN, REGION,
+    as_uri_value, built_image, call, emulator, expected_image_arn, image_body, poll_until,
+    run_microvm, ACCOUNT, REGION,
 };
 
 /// RULE: `imageIdentifier` / `imageVersion` are FILTERS on a list operation, so a filter
@@ -181,7 +181,7 @@ async fn run_microvm_refuses_a_launch_with_no_active_image_version() {
         (
             "a version the image does not carry",
             json!({"imageIdentifier": "building", "imageVersion": "9.9"}),
-            format!("MicroVM image {image_arn} has no version 9.9"),
+            format!("MicroVM image version not found: {image_arn}, version: 9.9"),
         ),
     ];
 
@@ -217,8 +217,24 @@ async fn run_microvm_refuses_a_launch_with_no_active_image_version() {
     );
 
     // Once the build has made a version active, the same requests launch — and the
-    // launch reports the version it resolved.
-    tokio::time::sleep(PAST_THE_SPAN).await;
+    // launch reports the version it resolved. The build settling is clock-owed, so this
+    // waits for the CONDITION — the image reporting an active version — rather than for a
+    // span of time, and a loaded host only makes it look again.
+    poll_until(
+        "the build the create started",
+        "the image reports an active version",
+        || async {
+            let (status, image) = call(
+                &router,
+                "GET",
+                &format!("/2025-09-09/microvm-images/{}", as_uri_value("building")),
+                None,
+            )
+            .await;
+            status == 200 && image["latestActiveImageVersion"].as_str() == Some("1.0")
+        },
+    )
+    .await;
     for (case, body) in [
         ("image by name", json!({"imageIdentifier": "building"})),
         (

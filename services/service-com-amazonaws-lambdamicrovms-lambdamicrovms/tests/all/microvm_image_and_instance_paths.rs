@@ -16,8 +16,8 @@ use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::microvm_lifecycle::{
-    as_uri_value, built_image, call, emulator, expected_image_arn, image_body, run_microvm,
-    PAST_THE_SPAN,
+    as_uri_value, built_image, call, emulator, expected_image_arn, image_body, poll_until,
+    run_microvm, PAST_THE_SPAN,
 };
 
 /// `TokenParts`'s value shape `AuthTokenValue` is `@length(max: 8000)`
@@ -244,7 +244,15 @@ async fn every_not_found_carries_only_the_request_derived_message() {
     let gone_arn = built_image(&router, "gone").await;
     let (status, deleted) = delete_image(&router, &gone_arn).await;
     assert_eq!(status, 200, "delete the gone image: got {status} {deleted}");
-    tokio::time::sleep(PAST_THE_SPAN).await;
+    // The removal is clock-owed, so this waits for the CONDITION — the record reported
+    // gone through its own ARN — rather than for a span of time, and a loaded host only
+    // makes it look again.
+    poll_until(
+        "a record this account deleted",
+        "the deleted image's record is gone",
+        || async { get_image(&router, &gone_arn).await.0 == 404 },
+    )
+    .await;
 
     // Rows span every operation on these paths that resolves an identifier, both
     // identifier forms, and the two message templates: an image lookup, a MicroVM
@@ -295,7 +303,7 @@ async fn every_not_found_carries_only_the_request_derived_message() {
             "/2025-09-09/microvms".to_string(),
             Some(json!({"imageIdentifier": "present", "imageVersion": "9.9"})),
             format!(
-                "MicroVM image {} has no version 9.9",
+                "MicroVM image version not found: {}, version: 9.9",
                 expected_image_arn("present")
             ),
         ),

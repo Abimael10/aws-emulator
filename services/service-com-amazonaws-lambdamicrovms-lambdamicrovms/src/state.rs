@@ -958,10 +958,18 @@ pub fn no_image_build_message(image_arn: &str, image_version: &str) -> String {
 }
 
 /// The `message` of the 404 a version-addressed call answers when the image it resolved
-/// carries no such `imageVersion`, built from the image the request named and that
-/// version.
+/// carries no such `imageVersion`.
+///
+/// The sentence is AWS's own for this error class: the fixed text `MicroVM image version
+/// not found: ` and `, version: `, with the two variable parts the image the call resolved
+/// — named by the ARN this service minted for it, the one identity of the record whichever
+/// form `MicrovmImageIdentifier` the request addressed it by — and the `imageVersion` the
+/// request carried (recorded AWS behaviour). Naming the MISSING VERSION first is what
+/// tells a client which half of the address failed, since a missing image and a missing
+/// version are the same code and the same status
+/// ([`version_address_image_not_found_message`], [`image_not_found_message`]).
 pub fn image_version_not_found_message(image: &str, image_version: &str) -> String {
-    format!("MicroVM image {image} has no version {image_version}")
+    format!("MicroVM image version not found: {image}, version: {image_version}")
 }
 
 /// The `message` of the 404 a build-addressed call answers when the image version it

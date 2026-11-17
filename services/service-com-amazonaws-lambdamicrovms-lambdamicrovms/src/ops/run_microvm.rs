@@ -274,7 +274,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 Some(requested) => {
                     let Some(image) = store.image(&region, &input.image_identifier) else {
-                        return Err(version_not_found(&input.image_identifier, requested));
+                        // No image resolved, so there is no ARN to name the version
+                        // against: a call addressed at BOTH an image and one version of
+                        // it reports the whole address it was given, which is the
+                        // sentence the version-addressed reads answer for an image this
+                        // account holds no record of
+                        // (`crate::state::version_address_image_not_found_message`).
+                        return Err(version_address_image_not_found(
+                            &input.image_identifier,
+                            requested,
+                        ));
                     };
                     let image_arn = image.image_arn.clone();
                     match image.versions.get(requested) {
@@ -501,9 +510,25 @@ fn no_active_version(image: &str) -> RunMicrovmError {
 }
 
 /// 404: the request named an `imageVersion` the image does not carry.
+///
+/// The sentence names the image by the ARN this service minted for it — the one identity
+/// of the record whichever form `MicrovmImageIdentifier` the request addressed it by — so
+/// every caller is told which version is missing from which record.
 fn version_not_found(image: &str, image_version: &str) -> RunMicrovmError {
     RunMicrovmErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
         message: crate::state::image_version_not_found_message(image, image_version),
+        resource_type: None,
+        resource_id: None,
+    })
+    .into()
+}
+
+/// 404: the launch pinned a version of an image this account holds no record of, so the
+/// refusal reports the whole address it was given — the identifier the request carried and
+/// the version — rather than a version of a record that does not exist.
+fn version_address_image_not_found(identifier: &str, image_version: &str) -> RunMicrovmError {
+    RunMicrovmErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: crate::state::version_address_image_not_found_message(identifier, image_version),
         resource_type: None,
         resource_id: None,
     })

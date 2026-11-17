@@ -48,7 +48,7 @@ const SERVED_KEY: &str = "app.zip";
 const UNFETCHABLE_URI: &str = "s3://mvm-status-no-such-bucket/app.zip";
 
 /// `PATCH /2025-09-09/microvm-images/{imageIdentifier}/versions/{imageVersion}`.
-async fn publish_status(
+pub(crate) async fn publish_status(
     router: &MultiServiceRouter,
     identifier: &str,
     image_version: &str,
