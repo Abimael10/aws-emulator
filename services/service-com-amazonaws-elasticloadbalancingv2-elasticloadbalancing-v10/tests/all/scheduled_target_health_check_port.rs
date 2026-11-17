@@ -34,10 +34,17 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::listener_rules::{create_listener, create_load_balancer};
 use crate::provisioning_loop::{action, call, emulator, first_text, members, p, REGION};
 
-/// How long a row waits for the checks the emulator's accelerated schedule performs, and how
-/// often it looks. The deadline is only here so a failure is a failure rather than a hang.
-const DEADLINE: Duration = Duration::from_secs(20);
+/// How long a row waits for the verdict the group's own health-check cadence reaches, and how
+/// often it looks. Generous on purpose — many times the cadence below — because the deadline
+/// is only here so a failure is a failure rather than a hang.
+const DEADLINE: Duration = Duration::from_secs(90);
 const POLL: Duration = Duration::from_millis(50);
+
+/// The health-check cadence every target group below is created with: a verdict takes
+/// `UnhealthyThresholdCount` consecutive failing checks, each one interval after the last, so
+/// the shortest interval `HealthCheckIntervalSeconds` admits ("the range is 5-300") is what a
+/// suite that waits for one asks for.
+const INTERVAL_SECONDS: &str = "5";
 
 /// The VPC the target groups below are created in. The account's EC2 inventory holds nothing
 /// for it, so the only thing a check of these registrations can observe is the port: the
@@ -155,6 +162,7 @@ async fn target_group(router: &MultiServiceRouter, row: &Row) -> String {
     form.push(p("Port", &TRAFFIC_PORT.to_string()));
     form.push(p("TargetType", "ip"));
     form.push(p("VpcId", VPC));
+    form.push(p("HealthCheckIntervalSeconds", INTERVAL_SECONDS));
     if let Some(port) = row.health_check_port {
         form.push(p("HealthCheckPort", port));
     }

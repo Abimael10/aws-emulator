@@ -94,7 +94,7 @@ pub use source_ip_conditions::{
 pub mod target_health;
 
 pub use target_health::{
-    deregistration_delay, SchedulerRegistration, ServedPorts, TargetProbe,
+    deregistration_delay, health_check_interval, SchedulerRegistration, ServedPorts, TargetProbe,
     DEREGISTRATION_DELAY_ATTRIBUTE,
 };
 
@@ -2664,6 +2664,18 @@ pub fn check_health_check_port(value: &str) -> Result<(), String> {
     ))
 }
 
+/// How Elastic Load Balancing refuses a write that would turn the health checks of a
+/// target group whose target type is not `lambda` OFF.
+///
+/// The model: "If the target type is `instance`, `ip`, or `alb`, health checks are always
+/// enabled and can't be disabled." The fixed text states the rule; the one variable part
+/// is the target type the group has, which is the member the caller has to act on. Read by
+/// every operation that writes a health check — the create that first stores one and the
+/// modify that changes it — so one rule is refused in one wording.
+pub fn health_check_enabled_message(target_type: &str) -> String {
+    format!("Health check enabled must be true for target groups with target type '{target_type}'")
+}
+
 /// The published maximum length of a target group name, from `CreateTargetGroup`'s
 /// `Name` documentation: "can have a maximum of 32 characters".
 pub const TARGET_GROUP_NAME_MAX_LENGTH: usize = 32;
@@ -3146,6 +3158,15 @@ pub struct RegisteredTarget {
     /// registration `DeregisterTargets` put in `draining`; `None` for one nothing has
     /// deregistered ([`target_health`]).
     pub draining_until: Option<SystemTime>,
+    /// When the next health check of this registration that COUNTS toward a verdict comes
+    /// due: the instant health checking on it began, or its last counted check, plus the
+    /// target group's own `HealthCheckIntervalSeconds`
+    /// ([`target_health::health_check_interval`]).
+    ///
+    /// What holds a verdict to the schedule the caller configured: a verdict is a number of
+    /// consecutive checks away, so it is never reached sooner than that many intervals
+    /// ([`target_health::TargetProbe`]).
+    pub checks_due_at: SystemTime,
     /// Where the periodic health check of this registration has got to, and the verdict it
     /// has reached ([`target_health::TargetProbe`]).
     pub probe: TargetProbe,

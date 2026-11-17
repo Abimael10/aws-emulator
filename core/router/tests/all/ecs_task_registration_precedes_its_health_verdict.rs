@@ -74,11 +74,17 @@ const SUBNET_CIDRS: [(&str, &str); 2] = [
 ];
 
 /// How long a row waits for the clock-owed moves it depends on — its tasks' starts, the
-/// registration those starts owe, and the checks the emulator's accelerated schedule
-/// performs — and how often it looks. The deadline is only here so a failure is a failure
-/// rather than a hang.
-const DEADLINE: Duration = Duration::from_secs(60);
+/// registration those starts owe, and the health checks the target group's own cadence runs
+/// ([`HEALTH_CHECK_INTERVAL_SECONDS`]) — and how often it looks. Generous on purpose: the
+/// deadline is only here so a failure is a failure rather than a hang.
+const DEADLINE: Duration = Duration::from_secs(120);
 const POLL: Duration = Duration::from_millis(100);
+
+/// The `HealthCheckIntervalSeconds` every target group below is created with: a verdict takes
+/// `UnhealthyThresholdCount` consecutive failing checks, each one interval after the last, so
+/// a suite that waits for one asks for the shortest interval the member admits ("the range is
+/// 5-300").
+const HEALTH_CHECK_INTERVAL_SECONDS: &str = "5";
 
 /// The `TargetHealthReasonEnum` values `TargetHealth$State` gives the `unhealthy` state for a
 /// check that was never answered: "`Target.Timeout` - The health check requests timed out"
@@ -433,6 +439,10 @@ async fn target_group(router: &MultiServiceRouter, network: &Network, row: &Row)
             ("VpcId", network.vpc.as_str()),
             ("HealthCheckProtocol", "HTTP"),
             ("HealthCheckPath", "/"),
+            (
+                "HealthCheckIntervalSeconds",
+                HEALTH_CHECK_INTERVAL_SECONDS,
+            ),
         ],
     )
     .await;

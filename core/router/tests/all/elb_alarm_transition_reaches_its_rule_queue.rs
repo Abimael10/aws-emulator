@@ -71,7 +71,13 @@ const CLOUDWATCH_SIGNING_NAME: &str = "monitoring";
 
 /// How long a row waits for a publication and its delivery before giving up. Generous: what is
 /// asserted is that the envelope arrives, never how fast the host runs.
-const DELIVERY_WAIT: Duration = Duration::from_secs(60);
+const DELIVERY_WAIT: Duration = Duration::from_secs(180);
+
+/// The `HealthCheckIntervalSeconds` the target group below is created with: a verdict takes
+/// `UnhealthyThresholdCount` consecutive failing checks, each one interval after the last, so
+/// a suite that waits for one asks for the shortest interval the member admits ("the range is
+/// 5-300").
+const HEALTH_CHECK_INTERVAL_SECONDS: &str = "5";
 
 /// How often it looks meanwhile.
 const LOOK_INTERVAL: Duration = Duration::from_millis(100);
@@ -282,6 +288,10 @@ async fn given_balanced(router: &MultiServiceRouter, case: &str, suffix: &str) -
             ("Port", "80"),
             ("TargetType", "ip"),
             ("VpcId", vpc.as_str()),
+            (
+                "HealthCheckIntervalSeconds",
+                HEALTH_CHECK_INTERVAL_SECONDS,
+            ),
         ],
     )
     .await;

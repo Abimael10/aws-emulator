@@ -62,10 +62,17 @@ const VPC_CIDR: &str = "10.90.0.0/16";
 const SUBNET_CIDRS: [(&str, &str); 2] = [("10.90.1.0/24", "us-east-1a"), ("10.90.2.0/24", "us-east-1b")];
 
 /// How long a row waits for the clock-owed moves it depends on — a task's start, and the
-/// checks the emulator's accelerated schedule performs — and how often it looks. The
-/// deadline is only here so a failure is a failure rather than a hang.
-const DEADLINE: Duration = Duration::from_secs(45);
+/// health checks the target group's own cadence runs ([`HEALTH_CHECK_INTERVAL_SECONDS`]) —
+/// and how often it looks. Generous on purpose: the deadline is only here so a failure is a
+/// failure rather than a hang.
+const DEADLINE: Duration = Duration::from_secs(90);
 const POLL: Duration = Duration::from_millis(100);
+
+/// The `HealthCheckIntervalSeconds` every target group below is created with: a verdict takes
+/// `UnhealthyThresholdCount` consecutive failing checks, each one interval after the last, so
+/// a suite that waits for one asks for the shortest interval the member admits ("the range is
+/// 5-300").
+const HEALTH_CHECK_INTERVAL_SECONDS: &str = "5";
 
 /// The source an inbound rule of a row's task group names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -450,6 +457,10 @@ async fn target_group(router: &MultiServiceRouter, network: &Network, row: &Row)
             ("VpcId", network.vpc.as_str()),
             ("HealthCheckProtocol", "HTTP"),
             ("HealthCheckPath", "/"),
+            (
+                "HealthCheckIntervalSeconds",
+                HEALTH_CHECK_INTERVAL_SECONDS,
+            ),
         ],
     )
     .await;

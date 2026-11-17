@@ -225,10 +225,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and can't be disabled" — the same rule `CreateTargetGroup` enforces, on the
         // target type the group was created with.
         if !group.is_lambda() && input.health_check_enabled == Some(false) {
-            return Err(invalid_configuration(format!(
-                "Health checks cannot be disabled for a target group whose target type is {}",
-                group.target_type
-            )));
+            return Err(invalid_configuration(
+                crate::state::health_check_enabled_message(&group.target_type),
+            ));
         }
         // The protocol rules of `HealthCheckProtocol`: "The GENEVE, TLS, UDP, TCP_UDP,
         // QUIC, and TCP_QUIC protocols are not supported for health checks", and "the

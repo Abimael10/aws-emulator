@@ -275,10 +275,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // always enabled and can't be disabled." The model cannot express that, so
         // the handler refuses the combination rather than discarding the input.
         if !lambda && input.health_check_enabled == Some(false) {
-            return Err(invalid_configuration(format!(
-                "Health checks cannot be disabled for a target group whose target type is \
-                 {target_type}"
-            )));
+            return Err(invalid_configuration(
+                crate::state::health_check_enabled_message(&target_type),
+            ));
         }
         // What the target group's members ARE and how traffic reaches them are not
         // independent members: a target of a given kind is only reachable over a protocol

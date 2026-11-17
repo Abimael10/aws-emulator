@@ -1,21 +1,35 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! What one HEALTH CHECK of a registered target observes, and the host counts it is counted
-//! into — driven over the wire exactly as a client drives it.
+//! What one HEALTH CHECK of a registered target observes, WHEN the verdict those checks reach
+//! is in, and the host counts it is counted into — driven over the wire exactly as a client
+//! drives it.
 //!
-//! The rule asserted here: **a load balancer CHECKS the registrations of every target group
+//! Two rules are asserted here, both about the same periodic check.
+//!
+//! **WHAT one check observes**: a load balancer CHECKS the registrations of every target group
 //! it routes to, and a registration is reported healthy only while the emulator holds
 //! something that stands behind it — an address a network interface of the account holds, a
 //! running instance — while one it holds nothing behind is reported `unhealthy` with the
 //! reason its check failed for; a registration nothing could be observed about keeps the
 //! health the clock owes it. The counts those verdicts add up to are published as the
 //! `HealthyHostCount` / `UnHealthyHostCount` series of the `(target group, load balancer)`
-//! pair, and a target group no listener forwards to publishes neither.**
+//! pair, and a target group no listener forwards to publishes neither.
 //!
-//! The rows differ along what the rule generalises over: whether the account's inventory
-//! holds something behind the registered address, how many registrations the group holds,
-//! whether the inventory knows the group's network at all, and whether a listener forwards
-//! to the group. The recorded configuration an issue happens to mention is a single row.
+//! **WHEN the verdict is in**: a verdict is a number of consecutive CHECKS away, and the
+//! checks of one registration are `HealthCheckIntervalSeconds` apart ("the approximate amount
+//! of time, in seconds, between health checks of an individual target"), so a registration
+//! nothing answers for is reported `unhealthy` — with the reason its check failed for and a
+//! description — no sooner than `UnhealthyThresholdCount` ("the number of consecutive health
+//! check failures required before considering a target unhealthy") times that interval after
+//! health checking on it began, and is `initial` rather than `healthy` for the whole of that
+//! time.
+//!
+//! The rows of each table differ along what its rule generalises over: whether the account's
+//! inventory holds something behind the registered address, how many registrations the group
+//! holds, whether the inventory knows the group's network at all, and whether a listener
+//! forwards to the group, for the first; the interval configured, the threshold configured and
+//! whether anything answers, for the second. The recorded configuration an issue happens to
+//! mention is a single row of each.
 //!
 //! The inventory is seeded through the EC2 store's own writer seam, and the series is read
 //! out of the CloudWatch store those datapoints live in — the two stores this service
@@ -37,10 +51,17 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::listener_rules::{create_listener, create_load_balancer};
 use crate::provisioning_loop::{action, call, emulator, first_text, members, p};
 
-/// How long a row waits for the checks the emulator's accelerated schedule performs, and how
-/// often it looks. The deadline is only here so a failure is a failure rather than a hang.
-const DEADLINE: Duration = Duration::from_secs(20);
+/// How long a row waits for the verdict the group's own health-check cadence reaches, and how
+/// often it looks. Generous on purpose — many times the longest cadence a row configures —
+/// because the deadline is only here so a failure is a failure rather than a hang.
+const DEADLINE: Duration = Duration::from_secs(120);
 const POLL: Duration = Duration::from_millis(50);
+
+/// The health-check cadence the groups below are created with unless a row names its own: a
+/// verdict takes `UnhealthyThresholdCount` consecutive failing checks, each one interval after
+/// the last, so the shortest interval `HealthCheckIntervalSeconds` admits ("the range is
+/// 5-300") is what a suite that waits for one asks for.
+const INTERVAL_SECONDS: i32 = 5;
 
 /// The VPC the seeded inventory holds, and the subnet of it the interface sits in.
 const VPC: &str = "vpc-0c0un70000000001";
@@ -103,6 +124,10 @@ async fn ip_target_group(router: &MultiServiceRouter, name: &str, vpc: &str) -> 
     form.push(p("Port", "80"));
     form.push(p("TargetType", "ip"));
     form.push(p("VpcId", vpc));
+    form.push(p(
+        "HealthCheckIntervalSeconds",
+        &INTERVAL_SECONDS.to_string(),
+    ));
     let reply = call(router, &form).await;
     assert_eq!(
         reply.status, 200,
@@ -425,5 +450,283 @@ async fn a_registration_is_healthy_only_while_the_emulator_holds_something_behin
             break;
         }
         ::tokio::time::sleep(POLL).await;
+    }
+}
+
+/// The `TargetHealthReasonEnum` values `TargetHealth$Reason` documents for the `unhealthy`
+/// state: "`Target.ResponseCodeMismatch`", "`Target.Timeout`", "`Target.FailedHealthChecks`",
+/// "`Elb.InternalError`" — of which a check nothing answered at all is one of the middle two.
+const UNANSWERED_REASONS: [&str; 2] = ["Target.Timeout", "Target.FailedHealthChecks"];
+
+/// The state a registration is in while its checks have not decided its health yet, which is
+/// what it is reported as for the whole of the span before its verdict is due.
+const INITIAL: &str = "initial";
+const HEALTHY: &str = "healthy";
+const UNHEALTHY: &str = "unhealthy";
+
+/// One row of the CADENCE table: the schedule a target group is created with, what the
+/// emulator holds behind the address registered with it, and the verdict that implies.
+struct CadenceRow {
+    case: &'static str,
+    /// The target group's name.
+    name: &'static str,
+    /// `HealthCheckIntervalSeconds`, the span between two checks of one registration.
+    interval_seconds: u64,
+    /// `UnhealthyThresholdCount`, how many consecutive failing checks the verdict takes.
+    unhealthy_threshold: u32,
+    /// The address registered with the group: one no network interface of the account holds,
+    /// so every check of it is answered by nothing, or the one an interface does hold.
+    address: &'static str,
+    /// The `TargetHealth$State` the registration must settle on.
+    reaches: &'static str,
+}
+
+impl CadenceRow {
+    /// The shortest span this row's schedule can reach its verdict in: one check per
+    /// interval, and the threshold of them before the verdict moves.
+    fn soonest_verdict(&self) -> Duration {
+        Duration::from_secs(self.interval_seconds).saturating_mul(self.unhealthy_threshold)
+    }
+}
+
+const CADENCE_ROWS: [CadenceRow; 4] = [
+    CadenceRow {
+        case: "the recorded schedule: a threshold of two checks five seconds apart",
+        name: "cadence-two-by-five",
+        interval_seconds: 5,
+        unhealthy_threshold: 2,
+        address: DEAD[0],
+        reaches: UNHEALTHY,
+    },
+    CadenceRow {
+        case: "a threshold of three checks at the same cadence",
+        name: "cadence-three-by-five",
+        interval_seconds: 5,
+        unhealthy_threshold: 3,
+        address: DEAD[0],
+        reaches: UNHEALTHY,
+    },
+    CadenceRow {
+        case: "a cadence one second longer, at the same threshold",
+        name: "cadence-two-by-six",
+        interval_seconds: 6,
+        unhealthy_threshold: 2,
+        address: DEAD[0],
+        reaches: UNHEALTHY,
+    },
+    CadenceRow {
+        case: "an address a network interface of the account holds",
+        name: "cadence-served",
+        interval_seconds: 5,
+        unhealthy_threshold: 2,
+        address: SERVED,
+        reaches: HEALTHY,
+    },
+];
+
+/// Create the `ip` target group one cadence row describes and answer its ARN, having asserted
+/// the create reports back the schedule it was asked for: what this table then times the
+/// verdict against is the target group's own.
+async fn cadence_target_group(router: &MultiServiceRouter, row: &CadenceRow) -> String {
+    let mut form = action("CreateTargetGroup");
+    form.push(p("Name", row.name));
+    form.push(p("Protocol", "HTTP"));
+    form.push(p("Port", "80"));
+    form.push(p("TargetType", "ip"));
+    form.push(p("VpcId", VPC));
+    form.push(p("HealthCheckProtocol", "HTTP"));
+    form.push(p("HealthCheckPath", "/"));
+    form.push(p(
+        "HealthCheckIntervalSeconds",
+        &row.interval_seconds.to_string(),
+    ));
+    form.push(p(
+        "UnhealthyThresholdCount",
+        &row.unhealthy_threshold.to_string(),
+    ));
+    let reply = call(router, &form).await;
+    assert_eq!(
+        reply.status, 200,
+        "case {:?}: expected 200 from CreateTargetGroup, got {} body {}",
+        row.case, reply.status, reply.body
+    );
+    for (member, expected) in [
+        (
+            "HealthCheckIntervalSeconds",
+            row.interval_seconds.to_string(),
+        ),
+        (
+            "UnhealthyThresholdCount",
+            row.unhealthy_threshold.to_string(),
+        ),
+    ] {
+        let reported = reply.text(member);
+        assert_eq!(
+            reported.as_deref(),
+            Some(expected.as_str()),
+            "case {:?}: expected {member} {expected}, got {reported:?}",
+            row.case
+        );
+    }
+    reply
+        .text("TargetGroupArn")
+        .unwrap_or_else(|| panic!("case {:?}: no TargetGroupArn in {}", row.case, reply.body))
+}
+
+/// What one cadence row settled on: the first health it reported that was no longer
+/// `initial`, how long after `started` that reading was taken, and every state it reported on
+/// the way there.
+struct Settled {
+    reported: Vec<(String, String, String)>,
+    after: Duration,
+    seen: Vec<String>,
+}
+
+/// Look at `arn`'s health until it reports something other than `initial`, or [`DEADLINE`]
+/// passes — the CONDITION, never a fixed wait.
+async fn settling(
+    router: &MultiServiceRouter,
+    case: &str,
+    arn: &str,
+    started: Instant,
+) -> Settled {
+    let deadline = Instant::now() + DEADLINE;
+    let mut seen: Vec<String> = Vec::new();
+    loop {
+        let reported = health(router, case, arn).await;
+        let after = started.elapsed();
+        for (state, _, _) in &reported {
+            if seen.last().map(String::as_str) != Some(state.as_str()) {
+                seen.push(state.clone());
+            }
+        }
+        let settled = !reported.is_empty() && reported.iter().all(|(state, _, _)| state != INITIAL);
+        if settled || Instant::now() >= deadline {
+            assert!(
+                settled,
+                "case {case:?}: expected every registration to leave {INITIAL}, got {reported:?} \
+                 (states seen: {seen:?})"
+            );
+            return Settled {
+                reported,
+                after,
+                seen,
+            };
+        }
+        ::tokio::time::sleep(POLL).await;
+    }
+}
+
+/// The span each row asserts is a MINIMUM, which is what the rule states: a loaded or slow
+/// host takes longer to reach the verdict and the assertion holds all the more easily, and
+/// nothing here asserts an upper bound on it — the deadline the polls give up after is many
+/// times the longest cadence a row configures.
+#[tokio::test]
+async fn a_verdict_takes_its_threshold_of_checks_at_the_configured_interval() {
+    let (router, engine) = emulator();
+    seed_inventory(&engine);
+    let load_balancer = create_load_balancer(&router, "cadence-alb").await;
+
+    // Every row's group is attached before any verdict is waited for, so the one clock drives
+    // all of their checks over the same span rather than one row's span after another's.
+    let mut attached: Vec<(String, Instant)> = Vec::new();
+    for (index, row) in CADENCE_ROWS.iter().enumerate() {
+        let group = cadence_target_group(&router, row).await;
+        register(&router, row.case, &group, &[row.address]).await;
+        // The listener forwarding to the group is what starts the health checks, so the span
+        // a verdict is owed runs from here. Taken BEFORE the request, so the span measured
+        // can only be shorter than the real one and the minimum asserted below can never be
+        // met by the emulator being quick.
+        let started = Instant::now();
+        create_listener(
+            &router,
+            &load_balancer,
+            &group,
+            90 + i32::try_from(index).expect("the row count fits an i32"),
+        )
+        .await;
+        attached.push((group, started));
+    }
+
+    for (row, (group, started)) in CADENCE_ROWS.iter().zip(&attached) {
+        let settled = settling(&router, row.case, group, *started).await;
+        assert_eq!(
+            settled.reported.len(),
+            1,
+            "case {:?}: expected one description per registration, got {:?}",
+            row.case,
+            settled.reported
+        );
+        for (state, reason, description) in &settled.reported {
+            assert_eq!(
+                state, row.reaches,
+                "case {:?}: expected {}, got {state}/{reason}",
+                row.case, row.reaches
+            );
+            if row.reaches == UNHEALTHY {
+                // The verdict carries the reason the model names for a check nothing
+                // answered, and the detail a non-healthy state is described by.
+                assert!(
+                    UNANSWERED_REASONS.contains(&reason.as_str()),
+                    "case {:?}: expected one of {UNANSWERED_REASONS:?}, got {reason:?}",
+                    row.case
+                );
+                assert!(
+                    !description.is_empty(),
+                    "case {:?}: a non-healthy state carries a description, got \
+                     {state}/{reason}/{description:?}",
+                    row.case
+                );
+                // The span the schedule takes: a verdict cannot be in before the threshold of
+                // checks is, and the checks are one interval apart.
+                assert!(
+                    settled.after >= row.soonest_verdict(),
+                    "case {:?}: a verdict takes {:?} at this cadence, got it after {:?}",
+                    row.case,
+                    row.soonest_verdict(),
+                    settled.after
+                );
+                // Nothing answered this registration from its first check on, so it was never
+                // reported healthy on the way to the verdict.
+                assert!(
+                    !settled.seen.iter().any(|state| state == HEALTHY),
+                    "case {:?}: a registration whose checks fail must never be reported \
+                     {HEALTHY}, got the states {:?}",
+                    row.case,
+                    settled.seen
+                );
+                continue;
+            }
+            // "If the target state is healthy, a reason code is not provided", and no
+            // description comes with it either.
+            assert!(
+                reason.is_empty() && description.is_empty(),
+                "case {:?}: a healthy registration is reported without a reason or a \
+                 description, got {reason:?}/{description:?}",
+                row.case
+            );
+            assert!(
+                !settled.seen.iter().any(|state| state == UNHEALTHY),
+                "case {:?}: a registration whose checks are answered must never be reported \
+                 {UNHEALTHY}, got the states {:?}",
+                row.case,
+                settled.seen
+            );
+        }
+    }
+
+    // The registration whose checks ARE answered is still healthy once every other row has
+    // reached its verdict — many checks of it later, each one answered.
+    let row = &CADENCE_ROWS[CADENCE_ROWS.len() - 1];
+    let (group, _) = &attached[CADENCE_ROWS.len() - 1];
+    let reported = health(&router, row.case, group).await;
+    for (state, reason, description) in &reported {
+        assert_eq!(
+            (state.as_str(), reason.as_str(), description.as_str()),
+            (HEALTHY, "", ""),
+            "case {:?}: expected the answered registration to stay {HEALTHY} with no reason, \
+             got {state}/{reason}/{description}",
+            row.case
+        );
     }
 }

@@ -28,12 +28,15 @@
 //! `unhealthy` once the group's `UnhealthyThresholdCount` consecutive checks failed, and the
 //! second `initial` (`Elb.InitialHealthChecking`) while a check has failed and that threshold
 //! is not reached yet — so a registration whose checks are failing is never reported healthy
-//! on the way to its verdict. What one check observes is decided in [`super::host_counts`],
-//! against the effective health-check port and the ports the workload behind the registration
-//! serves ([`ServedPorts`]). A registration whose checks pass, and one no check observed
-//! anything about, keep the `healthy` the clock owes them.
+//! on the way to its verdict. The checks come one `HealthCheckIntervalSeconds` apart
+//! ([`health_check_interval`]), the cadence the caller configured, so that verdict is reached
+//! no sooner than the threshold times that interval: a registration is never declared
+//! unhealthy faster than the schedule asked for could have decided it. What one check observes
+//! is decided in [`super::host_counts`], against the effective health-check port and the ports
+//! the workload behind the registration serves ([`ServedPorts`]). A registration whose checks
+//! pass, and one no check observed anything about, keep the `healthy` the clock owes them.
 //!
-//! Both spans are stored as the instant they come due, never slept for; a read
+//! Every span is stored as the instant it comes due, never slept for; a read
 //! materialises what the clock already owes ([`TargetGroupRecord::settle_draining`]) and
 //! writes nothing else.
 
@@ -92,6 +95,36 @@ pub fn deregistration_delay(group: &TargetGroupRecord) -> Duration {
             Duration::from_secs(ceiling.map_or(seconds, |ceiling| seconds.min(ceiling)))
         })
 }
+
+/// The span between two health checks of one registration of `group`: the group's own
+/// `HealthCheckIntervalSeconds` — "the approximate amount of time, in seconds, between
+/// health checks of an individual target".
+///
+/// A DURATION the caller configures, so it keeps the value the target group reports for it
+/// rather than being shortened to a span this emulator chooses: the whole point of the
+/// member is that a client can ask for the cadence it needs and then observe exactly it, and
+/// the cadence is what decides when a verdict is in — `UnhealthyThresholdCount` consecutive
+/// failing checks cannot be before that many intervals have passed.
+///
+/// BOUNDED by the member's own documented range ("the range is 5-300"), which is the range a
+/// write of it is refused outside: the span is arithmetic on the clock, so it is held to what
+/// a target group could legitimately carry rather than to whatever a stored number says. A
+/// group carrying no interval at all is checked at the shortest cadence the member allows.
+pub fn health_check_interval(group: &TargetGroupRecord) -> Duration {
+    let configured = group.health_check.interval_seconds.clamp(
+        MIN_HEALTH_CHECK_INTERVAL_SECONDS,
+        MAX_HEALTH_CHECK_INTERVAL_SECONDS,
+    );
+    Duration::from_secs(configured.unsigned_abs().into())
+}
+
+/// The shortest cadence `HealthCheckIntervalSeconds` may be written at ("the range is
+/// 5-300").
+const MIN_HEALTH_CHECK_INTERVAL_SECONDS: i32 = 5;
+
+/// The longest cadence that member may be written at; see
+/// [`MIN_HEALTH_CHECK_INTERVAL_SECONDS`].
+const MAX_HEALTH_CHECK_INTERVAL_SECONDS: i32 = 300;
 
 /// The instant a span that starts `now` comes due.
 ///
@@ -189,15 +222,26 @@ pub const UNHEALTHY_STATE: &str = "unhealthy";
 /// before considering a target unhealthy" and `HealthyThresholdCount` "the number of
 /// consecutive health check successes required before considering an unhealthy target
 /// healthy", so the verdict only MOVES once that many consecutive checks disagree with it —
-/// which is what [`TargetProbe::observed`] folds an observation into. A registration no check
-/// has observed anything about carries the verdict it started with, which is the one the
-/// clock owes it ([`TargetGroupRecord::health_of`]).
+/// which is what [`TargetProbe::counted`] folds an observation into. Those checks are the ones
+/// the group's own cadence makes due ([`health_check_interval`]), so a verdict is never
+/// reached sooner than the threshold times that interval. A registration no check has
+/// observed anything about carries the verdict it started with, which is the one the clock
+/// owes it ([`TargetGroupRecord::health_of`]).
 #[derive(Debug, Clone, Default)]
 pub struct TargetProbe {
     /// Consecutive failing checks since the last passing one.
     failures: u32,
     /// Consecutive passing checks since the last failing one.
     passes: u32,
+    /// What the LAST look at this registration found, whether or not it was a check the
+    /// group's cadence had made due ([`TargetProbe::saw`]), and `None` for a registration
+    /// nothing has observed anything about.
+    ///
+    /// What keeps a registration nothing answers for out of `healthy` while its verdict is
+    /// still a number of checks away: the load balancer has not determined its health yet,
+    /// which is the `initial` the model words as the minimum number of checks still being
+    /// sent, and never the health a registration whose checks pass is owed.
+    last_observed: Option<bool>,
     /// What the runs have DECIDED: `Some(true)` once as many consecutive checks passed as
     /// the group's `HealthyThresholdCount`, `Some(false)` once as many failed as its
     /// `UnhealthyThresholdCount`, and `None` while neither threshold has been reached.
@@ -205,12 +249,25 @@ pub struct TargetProbe {
 }
 
 impl TargetProbe {
+    /// Keep what one look at this registration found, WITHOUT counting it toward a verdict:
+    /// what this emulator can see about a registration it looks at more often than the
+    /// group's cadence runs a check.
+    ///
+    /// A verdict is a number of consecutive CHECKS away, and the checks are the ones the
+    /// configured interval makes due ([`TargetProbe::counted`]), so a look taken between two
+    /// of them moves no verdict. It still decides that a registration nothing answers for is
+    /// not reported healthy on its way to one.
+    pub fn saw(&mut self, observed: bool) {
+        self.last_observed = Some(observed);
+    }
+
     /// Fold one check's observation into the verdict: `observed` is whether the check
     /// passed, and the two thresholds are the target group's own.
     ///
     /// A threshold the group reports as less than one still takes one check, so a verdict is
     /// never reached by no check at all.
-    pub fn observed(&mut self, observed: bool, healthy_threshold: i32, unhealthy_threshold: i32) {
+    pub fn counted(&mut self, observed: bool, healthy_threshold: i32, unhealthy_threshold: i32) {
+        self.saw(observed);
         let threshold = |configured: i32| configured.max(1).unsigned_abs();
         if observed {
             self.failures = 0;
@@ -232,36 +289,20 @@ impl TargetProbe {
         self.verdict == Some(false)
     }
 
-    /// Whether the checks have FAILED without reaching a verdict yet: at least one check
-    /// since the last passing one found nothing answering, and not as many consecutive ones
-    /// as the group's `UnhealthyThresholdCount` takes.
+    /// Whether what was last observed about this registration FAILED without a verdict being
+    /// reached yet: nothing answered the last look at it, and not as many consecutive checks
+    /// of the group's own cadence have failed as its `UnhealthyThresholdCount` takes.
     ///
     /// Which is the `initial` the model words as "the load balancer is still sending the
     /// target the minimum number of health checks required to determine its health status":
-    /// nothing has found this registration healthy, so it is not reported healthy on its way
+    /// nothing has found this registration healthy, so it is not reported healthy on the way
     /// to the unhealthy verdict. A registration whose checks are passing, and one no check
     /// observed anything about, are not this: neither is contradicted by a failing check, so
     /// both keep the health the clock owes them. A registration that already HAS a verdict
     /// keeps it until as many consecutive checks disagree with it as its threshold takes,
-    /// which is what [`Self::observed`] folds.
+    /// which is what [`Self::counted`] folds.
     pub fn is_failing(&self) -> bool {
-        self.verdict.is_none() && self.failures > 0
-    }
-
-    /// Whether the checks since the last one that agreed with this registration's verdict
-    /// DISAGREE with it, and the threshold that would change it is not reached yet — a
-    /// registration part-way between two verdicts, in either direction.
-    ///
-    /// A verdict is a number of CHECKS away, never a span: `UnhealthyThresholdCount`
-    /// consecutive failures take a healthy registration to `unhealthy`, and
-    /// `HealthyThresholdCount` consecutive successes take an unhealthy one back, so what
-    /// decides how long such a registration sits on its old verdict is how fast the next
-    /// checks come ([`super::host_counts`] runs them closer together while this holds). A
-    /// registration whose checks agree with its verdict, and one no check has observed
-    /// anything about, are not this.
-    pub fn is_transitioning(&self) -> bool {
-        (self.failures > 0 && self.verdict != Some(false))
-            || (self.passes > 0 && self.verdict != Some(true))
+        self.verdict.is_none() && self.last_observed == Some(false)
     }
 }
 
@@ -336,19 +377,85 @@ impl RegisteredTarget {
 
 impl TargetGroupRecord {
     /// Health checking on this group's registrations BEGINS now: every registration it
-    /// already holds owes its move out of `initial` a settling span from this instant.
+    /// already holds owes its move out of `initial` a settling span from this instant, and
+    /// its first check one health-check interval from it.
     ///
     /// Called where a target group becomes one a load balancer forwards to, which is what
     /// starts the health checks: before that nothing is checking these targets, so their
     /// reported state is `unused` rather than a health, and the `initial` their first
     /// check runs under has not started. A registration that is DRAINING is not checked
-    /// again — it is leaving the group — so its span is left alone.
+    /// again — it is leaving the group — so its spans are left alone.
     pub fn begin_health_checking(&mut self, now: SystemTime) {
+        let interval = health_check_interval(self);
         for target in self.targets.values_mut() {
             if target.draining_until.is_none() {
                 target.healthy_at = due_at(now, SETTLE_AFTER);
+                target.checks_due_at = due_at(now, interval);
             }
         }
+    }
+
+    /// Fold what ONE look at the registration `key` names observed into its probe, and move
+    /// that registration on to its next check.
+    ///
+    /// A look taken once the group's own cadence has made a check due IS that check: its next
+    /// one comes due one `HealthCheckIntervalSeconds` later ([`health_check_interval`]), so
+    /// `UnhealthyThresholdCount` consecutive failures take that many intervals to be in, and
+    /// what the check observed is counted toward the verdict. A look taken between two checks
+    /// counts toward no verdict and only keeps what was seen ([`TargetProbe::saw`]), which is
+    /// what keeps a registration nothing answers for out of `healthy` while its verdict is
+    /// still due.
+    ///
+    /// `observed` is `None` for a check that observed NOTHING — a registration this emulator
+    /// holds no fact about either way ([`super::host_counts`]). The check still ran, so the
+    /// cadence moves on; the probe keeps the verdict it has, because nothing is failed on
+    /// silence.
+    ///
+    /// A key this group no longer holds is skipped: the look ran with no guard held, so a
+    /// deregistration may have taken that registration out in the meantime.
+    pub fn observed_check(&mut self, key: &TargetKey, observed: Option<bool>, now: SystemTime) {
+        let interval = health_check_interval(self);
+        let (healthy_threshold, unhealthy_threshold) = (
+            self.health_check.healthy_threshold,
+            self.health_check.unhealthy_threshold,
+        );
+        let Some(target) = self.targets.get_mut(key) else {
+            return;
+        };
+        let due = now >= target.checks_due_at;
+        if due {
+            target.checks_due_at = due_at(now, interval);
+        }
+        let Some(observed) = observed else {
+            return;
+        };
+        if due {
+            target
+                .probe
+                .counted(observed, healthy_threshold, unhealthy_threshold);
+        } else {
+            target.probe.saw(observed);
+        }
+    }
+
+    /// When the next check of one of this group's registrations comes due, as the span from
+    /// `now` — `None` for a group holding no registration to check.
+    ///
+    /// What the one publisher clock reads so that it wakes for a check rather than sleeping
+    /// past it ([`super::host_counts`]): a verdict is a number of checks away, so a check
+    /// that is due has to be taken for the verdict to arrive on the cadence the caller
+    /// configured. A check already past its due instant is owed at once, which is a span of
+    /// no time.
+    pub fn next_check_in(&self, now: SystemTime) -> Option<Duration> {
+        self.targets
+            .values()
+            .map(|target| {
+                target
+                    .checks_due_at
+                    .duration_since(now)
+                    .unwrap_or(Duration::ZERO)
+            })
+            .min()
     }
 
     /// Deregister the registration `key` names: the state transition
@@ -426,6 +533,7 @@ impl TargetGroupRecord {
         if self.targets.len() >= targets_per_target_group(self) {
             return false;
         }
+        let interval = health_check_interval(self);
         self.targets.insert(
             key.clone(),
             RegisteredTarget {
@@ -433,8 +541,11 @@ impl TargetGroupRecord {
                 port: key.1,
                 availability_zone: declared.availability_zone.clone(),
                 registered_at: now,
-                healthy_at: now + SETTLE_AFTER,
+                healthy_at: due_at(now, SETTLE_AFTER),
                 draining_until: None,
+                // The first check of it is one health-check interval away, as every later
+                // one is one interval after the last.
+                checks_due_at: due_at(now, interval),
                 probe: TargetProbe::default(),
                 registered_for: Some(declared.workload.clone()),
                 serves_ports: ServedPorts::clone(&declared.serves_ports),

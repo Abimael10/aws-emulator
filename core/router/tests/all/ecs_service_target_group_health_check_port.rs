@@ -61,10 +61,17 @@ const SECOND_SUBNET: &str = "subnet-0123456789abcdef1";
 const VPC: &str = "vpc-0123456789abcdef0";
 
 /// How long a row waits for the clock-owed moves it depends on — a task's start, and the
-/// checks the emulator's accelerated schedule performs — and how often it looks. The
-/// deadline is only here so a failure is a failure rather than a hang.
-const DEADLINE: Duration = Duration::from_secs(30);
+/// health checks the target group's own cadence runs ([`HEALTH_CHECK_INTERVAL_SECONDS`]) —
+/// and how often it looks. Generous on purpose: the deadline is only here so a failure is a
+/// failure rather than a hang.
+const DEADLINE: Duration = Duration::from_secs(90);
 const POLL: Duration = Duration::from_millis(100);
+
+/// The `HealthCheckIntervalSeconds` every target group below is created with: a verdict takes
+/// `UnhealthyThresholdCount` consecutive failing checks, each one interval after the last, so
+/// a suite that waits for one asks for the shortest interval the member admits ("the range is
+/// 5-300").
+const HEALTH_CHECK_INTERVAL_SECONDS: &str = "5";
 
 /// One row: how the target group's health check is pointed, and the verdict that implies for
 /// the task registered into it.
@@ -259,6 +266,10 @@ async fn target_group(router: &MultiServiceRouter, row: &Row) -> String {
         ("VpcId", VPC),
         ("HealthCheckProtocol", "HTTP"),
         ("HealthCheckPath", "/"),
+        (
+            "HealthCheckIntervalSeconds",
+            HEALTH_CHECK_INTERVAL_SECONDS,
+        ),
     ];
     if let Some(port) = row.health_check_port {
         params.push(("HealthCheckPort", port));

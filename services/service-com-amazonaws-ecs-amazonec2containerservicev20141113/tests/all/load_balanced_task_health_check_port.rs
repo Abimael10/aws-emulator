@@ -63,10 +63,16 @@ const SECOND_CONTAINER_PORT: i64 = 8081;
 const UNSERVED_PORT: &str = "8888";
 
 /// How often a poll re-reads a surface it is waiting on, and how long it keeps trying: the
-/// whole start of an `awsvpc` task plus the checks the emulator's accelerated schedule
-/// performs, with margin for a loaded test machine.
+/// whole start of an `awsvpc` task plus the health checks the target group's own cadence runs
+/// ([`HEALTH_CHECK_INTERVAL_SECONDS`]), with margin for a loaded test machine.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
-const POLL_BUDGET: Duration = AWSVPC_START.saturating_add(Duration::from_secs(20));
+const POLL_BUDGET: Duration = AWSVPC_START.saturating_add(Duration::from_secs(90));
+
+/// The `HealthCheckIntervalSeconds` every target group below is created with: a verdict takes
+/// `UnhealthyThresholdCount` consecutive failing checks, each one interval after the last, so
+/// a suite that waits for one asks for the shortest interval the member admits ("the range is
+/// 5-300").
+const HEALTH_CHECK_INTERVAL_SECONDS: &str = "5";
 
 /// One row: how the target group's health check is pointed, and the verdict that implies for
 /// the task registered into it.
@@ -151,6 +157,10 @@ async fn target_group(router: &MultiServiceRouter, row: &Row) -> String {
         ("VpcId", VPC),
         ("HealthCheckProtocol", "HTTP"),
         ("HealthCheckPath", "/"),
+        (
+            "HealthCheckIntervalSeconds",
+            HEALTH_CHECK_INTERVAL_SECONDS,
+        ),
     ];
     if let Some(port) = row.health_check_port {
         params.push(("HealthCheckPort", port));
@@ -269,6 +279,10 @@ async fn a_revision_declaring_more_port_ranges_than_a_registration_carries_keeps
             ("HealthCheckProtocol", "HTTP"),
             ("HealthCheckPath", "/"),
             ("HealthCheckPort", UNSERVED_PORT),
+            (
+                "HealthCheckIntervalSeconds",
+                HEALTH_CHECK_INTERVAL_SECONDS,
+            ),
         ],
     )
     .await;

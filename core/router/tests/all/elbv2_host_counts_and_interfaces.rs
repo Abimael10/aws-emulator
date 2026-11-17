@@ -59,11 +59,18 @@ const UNHEALTHY_HOST_COUNT: &str = "UnHealthyHostCount";
 /// The period one datapoint of that series occupies: these counts are published per minute.
 const PERIOD: i64 = 60;
 
-/// How long a row waits for what the emulator's accelerated schedule publishes, and how
-/// often it looks. Generous on purpose: what is waited for takes a second or two, and the
+/// How long a row waits for the verdicts the target groups' own health-check cadence reaches
+/// ([`HEALTH_CHECK_INTERVAL_SECONDS`]) and the per-minute datapoints they are counted into,
+/// and how often it looks. Generous on purpose — several times both spans — because the
 /// deadline is only here so a failure is a failure rather than a hang.
-const DEADLINE: Duration = Duration::from_secs(30);
+const DEADLINE: Duration = Duration::from_secs(180);
 const POLL: Duration = Duration::from_millis(100);
+
+/// The `HealthCheckIntervalSeconds` every target group below is created with: a verdict takes
+/// `UnhealthyThresholdCount` consecutive failing checks, each one interval after the last, so
+/// a suite that waits for one asks for the shortest interval the member admits ("the range is
+/// 5-300").
+const HEALTH_CHECK_INTERVAL_SECONDS: &str = "5";
 
 /// The VPC and the subnets every row runs in.
 const VPC_CIDR: &str = "10.70.0.0/16";
@@ -265,6 +272,10 @@ async fn ip_target_group(router: &MultiServiceRouter, name: &str, vpc: &str) -> 
                 ("Port", "80"),
                 ("TargetType", "ip"),
                 ("VpcId", vpc),
+                (
+                    "HealthCheckIntervalSeconds",
+                    HEALTH_CHECK_INTERVAL_SECONDS,
+                ),
             ],
         )
         .await,

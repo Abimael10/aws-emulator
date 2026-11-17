@@ -32,11 +32,17 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::listener_rules::create_listener;
 use crate::provisioning_loop::{action, call, encode, first_text, members, p, REGION};
 
-/// How long a row waits for the checks the emulator's accelerated schedule performs, and how
-/// often it looks. Generous on purpose: the deadline is only here so a failure is a failure
-/// rather than a hang.
-const DEADLINE: Duration = Duration::from_secs(60);
+/// How long a row waits for the verdict the group's own health-check cadence reaches, and how
+/// often it looks. Generous on purpose — many times the cadence below — because the deadline
+/// is only here so a failure is a failure rather than a hang.
+const DEADLINE: Duration = Duration::from_secs(120);
 const POLL: Duration = Duration::from_millis(50);
+
+/// The health-check cadence every target group below is created with: a verdict takes a
+/// threshold of consecutive checks, each one interval after the last, so a suite that waits
+/// for one asks for the shortest interval `HealthCheckIntervalSeconds` admits ("the range is
+/// 5-300").
+const INTERVAL_SECONDS: &str = "5";
 
 /// The API version an ec2Query request carries.
 const EC2_API_VERSION: &str = "2016-11-15";
@@ -351,6 +357,7 @@ async fn target_group(
     form.push(p("Port", &TRAFFIC_PORT.to_string()));
     form.push(p("TargetType", target_type));
     form.push(p("VpcId", vpc));
+    form.push(p("HealthCheckIntervalSeconds", INTERVAL_SECONDS));
     let reply = call(router, &form).await;
     assert_eq!(
         reply.status, 200,

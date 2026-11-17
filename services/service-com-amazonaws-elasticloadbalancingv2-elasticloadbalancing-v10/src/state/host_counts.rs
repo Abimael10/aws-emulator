@@ -61,7 +61,11 @@
 //! consecutive health check failures required before considering a target unhealthy"
 //! (`CreateTargetGroup$UnhealthyThresholdCount`) and its healthy counterpart — which
 //! [`super::target_health::TargetProbe`] folds the observations into, and a registration whose
-//! checks have failed without reaching that threshold is still `initial`.
+//! checks have failed without reaching that threshold is still `initial`. Those checks come
+//! one `HealthCheckIntervalSeconds` apart, the cadence the caller configured
+//! ([`super::target_health::health_check_interval`]), so a verdict is never reached sooner
+//! than the threshold times that interval; a pass that looks at a registration between two of
+//! its checks keeps what it saw and counts toward no verdict.
 //!
 //! # The clock the series is published on
 //!
@@ -336,7 +340,7 @@ pub fn check_registrations<Eng: Send + Sync + 'static>(
         named_registrations(&store, registrations)
     };
     let observations = observe_all(engine, &checked);
-    fold_observations(&mut state.lock(), &observations);
+    fold_observations(&mut state.lock(), &observations, SystemTime::now());
 }
 
 /// Publish every host-count datapoint the clock has already made due, and start the one
@@ -433,22 +437,16 @@ fn next_wait_or_release(store: &mut ElbState, generation: u64) -> Option<Duratio
         .values()
         .map(|series| series.next_check_at)
         .min();
-    // A registration whose checks have started to DISAGREE with the verdict it is reported
-    // under, in either direction, is checked again at the ACCELERATED spacing, however far
-    // off the next datapoint of the series it is counted into is: the next verdict is a
-    // number of CHECKS away (`UnhealthyThresholdCount` failures, or `HealthyThresholdCount`
-    // successes for a target that is reachable again), so it is the check spacing that
-    // decides how long such a registration keeps its old verdict rather than the publish
-    // schedule.
-    let transitioning = a_registration_is_transitioning(store);
+    // The next CHECK of a registration, which is a different schedule from the next datapoint
+    // of the series it is counted into: a verdict is a number of checks away, each one
+    // `HealthCheckIntervalSeconds` after the last, so the clock wakes for a check that is due
+    // however far off that datapoint is — otherwise a verdict the cadence has already reached
+    // would wait for the publish schedule.
+    let next_check = earliest_check_due(store, SystemTime::now());
     match earliest {
         Some(due) => {
             let wait = due.saturating_duration_since(now);
-            let wait = if transitioning {
-                wait.min(ACCELERATED_SPACING)
-            } else {
-                wait
-            };
+            let wait = next_check.map_or(wait, |next_check| wait.min(next_check));
             Some(wait.clamp(MIN_PUBLISH_WAIT, MAX_PUBLISH_WAIT))
         }
         None => {
@@ -458,16 +456,18 @@ fn next_wait_or_release(store: &mut ElbState, generation: u64) -> Option<Duratio
     }
 }
 
-/// Whether some registration a load balancer of this store checks is part-way between two
-/// health verdicts ([`super::TargetProbe::is_transitioning`]).
-fn a_registration_is_transitioning(store: &ElbState) -> bool {
-    store.target_groups.values().any(|group| {
-        !group.load_balancer_arns.is_empty()
-            && group
-                .targets
-                .values()
-                .any(|target| target.probe.is_transitioning())
-    })
+/// When the next health check any load balancer of this store owes comes due, as the span
+/// from `now` ([`super::TargetGroupRecord::next_check_in`]).
+///
+/// Only the groups a load balancer FORWARDS to: nothing checks the registrations of a group
+/// nothing routes to, so none of them is a check this clock owes.
+fn earliest_check_due(store: &ElbState, now: SystemTime) -> Option<Duration> {
+    store
+        .target_groups
+        .values()
+        .filter(|group| !group.load_balancer_arns.is_empty())
+        .filter_map(|group| group.next_check_in(now))
+        .min()
 }
 
 /// Check every registration of a routed target group, fold what the checks observed into the
@@ -497,7 +497,7 @@ fn publish_due_checks<Eng: Send + Sync + 'static>(engine: &Eng) {
     let observations = observe_all(engine, &checked);
     let published = {
         let mut store = state.lock();
-        fold_observations(&mut store, &observations);
+        fold_observations(&mut store, &observations, now);
         due_datapoints(&mut store, now, instant)
     };
     append_datapoints(engine, published, now);
@@ -632,7 +632,9 @@ fn checked_registration(
     }
 }
 
-/// What one check of each registration in `checked` observed.
+/// What one check of each registration in `checked` observed, one entry per registration the
+/// pass CHECKED — including the ones nothing could be observed about, because the check still
+/// ran and the registration's next one is therefore an interval away.
 ///
 /// The account's EC2 inventory is read ONCE for the whole pass — the VPCs it holds, the
 /// addresses its network interfaces hold and the instances it reports running — so the cost
@@ -640,7 +642,7 @@ fn checked_registration(
 fn observe_all<Eng: Send + Sync + 'static>(
     engine: &Eng,
     checked: &[Checked],
-) -> Vec<(String, TargetKey, bool)> {
+) -> Vec<(String, TargetKey, Observation)> {
     if checked.is_empty() {
         return Vec::new();
     }
@@ -712,14 +714,12 @@ fn observe_all<Eng: Send + Sync + 'static>(
     });
     checked
         .iter()
-        .filter_map(|target| {
-            observe(target, held.as_ref()).map(|observed| {
-                (
-                    target.target_group_arn.clone(),
-                    target.key.clone(),
-                    observed,
-                )
-            })
+        .map(|target| {
+            (
+                target.target_group_arn.clone(),
+                target.key.clone(),
+                observe(target, held.as_ref()),
+            )
         })
         .collect()
 }
@@ -902,24 +902,23 @@ fn instance_is_running(instance: &ec2::InstanceRecord) -> bool {
     instance.state == ec2::InstanceStateName::Running
 }
 
-/// Fold what the checks observed into the registrations they were about.
+/// Fold what the checks of this pass observed into the registrations they were about.
 ///
 /// A registration the store no longer holds is skipped: the pass ran with no guard held, so a
-/// deregistration may have taken it out in the meantime.
-fn fold_observations(store: &mut ElbState, observations: &[(String, TargetKey, bool)]) {
+/// deregistration may have taken it out in the meantime. Whether a look counts as one of the
+/// group's own scheduled checks, and what an observation of nothing leaves behind, are decided
+/// per registration against the cadence it is checked at
+/// ([`super::TargetGroupRecord::observed_check`]).
+fn fold_observations(
+    store: &mut ElbState,
+    observations: &[(String, TargetKey, Observation)],
+    now: SystemTime,
+) {
     for (target_group_arn, key, observed) in observations {
         let Some(group) = store.target_groups.get_mut(target_group_arn) else {
             continue;
         };
-        let (healthy_threshold, unhealthy_threshold) = (
-            group.health_check.healthy_threshold,
-            group.health_check.unhealthy_threshold,
-        );
-        if let Some(target) = group.targets.get_mut(key) {
-            target
-                .probe
-                .observed(*observed, healthy_threshold, unhealthy_threshold);
-        }
+        group.observed_check(key, *observed, now);
     }
 }
 
