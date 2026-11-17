@@ -2000,10 +2000,13 @@ pub fn materialise_definition(
     Ok(())
 }
 
-/// Refuse a definition whose paths would grow the store past a bound.
+/// Refuse a definition whose paths, or the operations on them, would grow the store past a
+/// bound.
 ///
 /// Called BEFORE the store lock is taken, so an over-sized definition never reaches the
-/// records. Each bound is this emulator's resource guard from `crate::state`.
+/// records. Each bound is this emulator's resource guard from `crate::state`, and every
+/// caller-sized member a definition writes has one: the API's own members here, and each
+/// operation's in [`bound_imported_method`].
 pub fn bound_definition(definition: &ImportedDefinition) -> Result<(), String> {
     use crate::state::{
         bound_chars, bound_entries, MAX_COLLECTION_ENTRIES, MAX_PATH_CHARS, MAX_PATH_PART_CHARS,
@@ -2056,6 +2059,192 @@ pub fn bound_definition(definition: &ImportedDefinition) -> Result<(), String> {
                 segment,
                 MAX_PATH_PART_CHARS,
             )?;
+        }
+        // A path's operations become `Method` records on the resource it becomes, so what
+        // they carry is bounded here too: the paths above are only the resources.
+        bound_entries(
+            "the operations of a path of the API definition",
+            imported.methods.len(),
+            MAX_COLLECTION_ENTRIES,
+        )?;
+        for method in &imported.methods {
+            bound_imported_method(method)?;
+        }
+    }
+    Ok(())
+}
+
+/// Refuse an imported operation whose records would grow the store past a bound.
+///
+/// An imported operation becomes the same records `PutMethod`, `PutMethodResponse`,
+/// `PutIntegration` and `PutIntegrationResponse` write, so it is bounded by exactly those
+/// operations' limits, member for member and under their member names: whichever call
+/// writes a method, what is stored for it is the same size. Called from
+/// [`bound_definition`], before the store lock is taken, so an over-sized definition never
+/// reaches the records.
+fn bound_imported_method(method: &MethodEntry) -> Result<(), String> {
+    use super::put_integration::MAX_TEMPLATE_CHARS;
+    use crate::state::{bound_chars, bound_entries, MAX_COLLECTION_ENTRIES, MAX_STRING_CHARS};
+
+    // What `PutMethod` bounds on the method itself.
+    bound_chars(
+        "authorizationType",
+        &method.authorization_type,
+        MAX_STRING_CHARS,
+    )?;
+    for (member, value) in [
+        ("operationName", &method.operation_name),
+        ("authorizerId", &method.authorizer_id),
+        ("requestValidatorId", &method.request_validator_id),
+    ] {
+        if let Some(value) = value {
+            bound_chars(member, value, MAX_STRING_CHARS)?;
+        }
+    }
+    bound_entries(
+        "requestParameters",
+        method.request_parameters.len(),
+        MAX_COLLECTION_ENTRIES,
+    )?;
+    for key in method.request_parameters.keys() {
+        bound_chars("a requestParameters key", key, MAX_STRING_CHARS)?;
+    }
+    bound_entries(
+        "requestModels",
+        method.request_models.len(),
+        MAX_COLLECTION_ENTRIES,
+    )?;
+    for (key, value) in &method.request_models {
+        bound_chars("a requestModels key", key, MAX_STRING_CHARS)?;
+        bound_chars("a requestModels value", value, MAX_STRING_CHARS)?;
+    }
+    bound_entries(
+        "authorizationScopes",
+        method.authorization_scopes.len(),
+        MAX_COLLECTION_ENTRIES,
+    )?;
+    for scope in &method.authorization_scopes {
+        bound_chars("authorizationScopes", scope, MAX_STRING_CHARS)?;
+    }
+
+    // What `PutMethodResponse` bounds on each response of the method.
+    bound_entries(
+        "the responses of an operation of the API definition",
+        method.method_responses.len(),
+        MAX_COLLECTION_ENTRIES,
+    )?;
+    for (key, response) in &method.method_responses {
+        // The key is what the response is STORED under, so it is bounded like the key of
+        // every other caller-sized map here, and before its members.
+        bound_chars("a methodResponses key", key, MAX_STRING_CHARS)?;
+        if let Some(status_code) = &response.status_code {
+            bound_chars("statusCode", status_code, MAX_STRING_CHARS)?;
+        }
+        if let Some(parameters) = &response.response_parameters {
+            bound_entries(
+                "responseParameters",
+                parameters.len(),
+                MAX_COLLECTION_ENTRIES,
+            )?;
+            for key in parameters.keys() {
+                bound_chars("a responseParameters key", key, MAX_STRING_CHARS)?;
+            }
+        }
+        if let Some(models) = &response.response_models {
+            bound_entries("responseModels", models.len(), MAX_COLLECTION_ENTRIES)?;
+            for (key, value) in models {
+                bound_chars("a responseModels key", key, MAX_STRING_CHARS)?;
+                bound_chars("a responseModels value", value, MAX_STRING_CHARS)?;
+            }
+        }
+    }
+
+    // What `PutIntegration` bounds on the method's integration, and
+    // `PutIntegrationResponse` on each response of that integration.
+    let Some(integration) = &method.integration else {
+        return Ok(());
+    };
+    for (member, value) in [
+        ("type", &integration.r#type),
+        ("integrationHttpMethod", &integration.http_method),
+        ("uri", &integration.uri),
+        ("connectionType", &integration.connection_type),
+        ("connectionId", &integration.connection_id),
+        ("credentials", &integration.credentials),
+        ("passthroughBehavior", &integration.passthrough_behavior),
+        ("contentHandling", &integration.content_handling),
+        ("cacheNamespace", &integration.cache_namespace),
+        ("responseTransferMode", &integration.response_transfer_mode),
+        ("integrationTarget", &integration.integration_target),
+    ] {
+        if let Some(value) = value {
+            bound_chars(member, value, MAX_STRING_CHARS)?;
+        }
+    }
+    if let Some(parameters) = &integration.request_parameters {
+        bound_entries(
+            "requestParameters",
+            parameters.len(),
+            MAX_COLLECTION_ENTRIES,
+        )?;
+        for (key, value) in parameters {
+            bound_chars("a requestParameters key", key, MAX_STRING_CHARS)?;
+            bound_chars("a requestParameters value", value, MAX_STRING_CHARS)?;
+        }
+    }
+    if let Some(templates) = &integration.request_templates {
+        bound_entries("requestTemplates", templates.len(), MAX_COLLECTION_ENTRIES)?;
+        for (key, value) in templates {
+            bound_chars("a requestTemplates key", key, MAX_STRING_CHARS)?;
+            bound_chars("a requestTemplates value", value, MAX_TEMPLATE_CHARS)?;
+        }
+    }
+    if let Some(parameters) = &integration.cache_key_parameters {
+        bound_entries(
+            "cacheKeyParameters",
+            parameters.len(),
+            MAX_COLLECTION_ENTRIES,
+        )?;
+        for value in parameters {
+            bound_chars("cacheKeyParameters", value, MAX_STRING_CHARS)?;
+        }
+    }
+    let Some(responses) = &integration.integration_responses else {
+        return Ok(());
+    };
+    bound_entries(
+        "the responses of the integration of an operation of the API definition",
+        responses.len(),
+        MAX_COLLECTION_ENTRIES,
+    )?;
+    for (key, response) in responses {
+        bound_chars("an integrationResponses key", key, MAX_STRING_CHARS)?;
+        for (member, value) in [
+            ("statusCode", &response.status_code),
+            ("selectionPattern", &response.selection_pattern),
+            ("contentHandling", &response.content_handling),
+        ] {
+            if let Some(value) = value {
+                bound_chars(member, value, MAX_STRING_CHARS)?;
+            }
+        }
+        if let Some(parameters) = &response.response_parameters {
+            bound_entries(
+                "responseParameters",
+                parameters.len(),
+                MAX_COLLECTION_ENTRIES,
+            )?;
+            for (key, value) in parameters {
+                bound_chars("a responseParameters key", key, MAX_STRING_CHARS)?;
+                bound_chars("a responseParameters value", value, MAX_STRING_CHARS)?;
+            }
+        }
+        if let Some(templates) = &response.response_templates {
+            bound_entries("responseTemplates", templates.len(), MAX_COLLECTION_ENTRIES)?;
+            for (key, value) in templates {
+                bound_chars("a responseTemplates key", key, MAX_STRING_CHARS)?;
+                bound_chars("a responseTemplates value", value, MAX_TEMPLATE_CHARS)?;
+            }
         }
     }
     Ok(())

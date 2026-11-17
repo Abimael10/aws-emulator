@@ -16,7 +16,10 @@
 //! * a definition document that PARSED and declares neither version member is refused as a
 //!   version that could not be determined, which is a different refusal from a body no
 //!   reader could read as a document at all and from a VERSIONED document that cannot be
-//!   read as that format — those two share the other sentence.
+//!   read as that format — those two share the other sentence;
+//! * a readable definition whose operations carry more than this emulator's resource guards
+//!   store is refused by the same guards that bound the operations which write those
+//!   records one at a time, and stores nothing.
 
 use crate::rest_api_create_from_import::api_count;
 use crate::rest_api_lifecycle::{create_api, page_items, Answer, Gateway};
@@ -50,6 +53,13 @@ const EMPTY_DEFINITION: &str = "Invalid swagger definition - request body was em
 ///
 /// Source: `crate::ops::put_rest_api::UNDETERMINED_VERSION`.
 const UNDETERMINED_VERSION: &str = "Unable to determine OAS/Swagger version";
+
+/// The sentence both definition imports state for a body that is not a readable API
+/// definition: one no reader could parse, and one that parsed and declares its version but
+/// cannot be read as that format.
+///
+/// Source: `crate::ops::put_rest_api::INVALID_DEFINITION`.
+const INVALID_DEFINITION: &str = "Invalid OAS input";
 
 /// The `message` an answer carries, or a panic naming the case.
 fn message(answer: &Answer, case: &str) -> String {
@@ -207,13 +217,14 @@ fn definition_with_version(title: &str) -> String {
 ///
 /// The two members are the OpenAPI Specification's own root fields: `swagger` (2.0 and
 /// before) and `openapi` (3.0 on). The refused rows differ along WHY no version was found
-/// — what a readable document carries instead (nothing but an `info`, paths as well, a
+/// — what the parsed document carries instead (nothing but an `info`, paths as well, a
 /// member whose name merely resembles the version field in Swagger 1.2's `swaggerVersion`,
 /// an `info.version`, which is the API's own version and not the format's) and the shape it
 /// parsed to (a mapping, a sequence, a scalar) — and along the spelling, JSON and the YAML
 /// the same document is written in. A body that never parsed at all earns the OTHER
-/// sentence, which the sibling
-/// [`a_document_that_did_not_read_keeps_the_invalid_input_sentence`] pins. The served rows
+/// sentence, which the siblings
+/// [`a_document_that_did_not_read_keeps_the_invalid_input_sentence`] and
+/// [`a_body_no_reader_could_parse_is_refused_as_an_invalid_definition`] pin. The served rows
 /// are the same documents carrying each of the two members, which must NOT earn this
 /// sentence.
 #[tokio::test]
@@ -337,9 +348,6 @@ async fn a_definition_whose_version_cannot_be_determined_is_refused_as_that() {
 /// request creates no API, which the count below checks.
 #[tokio::test]
 async fn a_document_that_did_not_read_keeps_the_invalid_input_sentence() {
-    // Source: `crate::ops::put_rest_api::INVALID_DEFINITION`.
-    const INVALID_DEFINITION: &str = "Invalid OAS input";
-
     let gateway = Gateway::new();
     let (api, _root) = create_api(&gateway, "unreadable-definitions").await;
     let before = api_count(&gateway, "before the unreadable bodies").await;
@@ -403,6 +411,258 @@ async fn a_document_that_did_not_read_keeps_the_invalid_input_sentence() {
         "case after the unreadable bodies: a refused import must create no API, expected \
          {before}, got {after}"
     );
+}
+
+/// RULE: a body no reader could PARSE at all — bytes that are not text, or text that is
+/// neither a JSON nor a YAML document — is refused as a body that is not an API definition,
+/// which is a DIFFERENT refusal from a document that parsed and declares neither version
+/// member: nothing a reader says about what a document declares applies to a body it never
+/// read, so the version-detection step is never reached for one.
+///
+/// Rows differ along WHERE the body stops being parseable (a flow mapping, a flow sequence
+/// or a quoted scalar that never closes, a document cut off mid-member, bytes that are no
+/// document at all), along the spelling the body starts out as (JSON and YAML), along
+/// which version member the truncated prefix happens to carry, and along whether the body
+/// is text in the first place. The control rows are the two neighbouring classes, which
+/// keep their own sentences: a document that PARSED and declares no version, and a
+/// well-formed document, which is served.
+#[tokio::test]
+async fn a_body_no_reader_could_parse_is_refused_as_an_invalid_definition() {
+    let gateway = Gateway::new();
+    let (api, _root) = create_api(&gateway, "unparseable-definitions").await;
+    let before = api_count(&gateway, "before the refusals").await;
+
+    // (case, body bytes)
+    let refused: Vec<(&str, Vec<u8>)> = vec![
+        (
+            "a JSON object cut off mid-member",
+            b"{\"openapi\": \"3.0.1\", \"info\": {\"title\": \"cut off\" NOT A DOCUMENT !!!".to_vec(),
+        ),
+        (
+            "an unterminated flow mapping",
+            b"{\"openapi\": \"3.0.1\", \"paths\": {".to_vec(),
+        ),
+        (
+            "an unterminated flow sequence",
+            b"{\"swagger\": \"2.0\", \"schemes\": [\"https\"".to_vec(),
+        ),
+        ("text that is no document at all", b"}not a document{".to_vec()),
+        (
+            "an unterminated quoted scalar, written as YAML",
+            b"openapi: \"3.0.1\ninfo:\n  title: x\n".to_vec(),
+        ),
+        (
+            "a YAML document whose flow mapping never closes",
+            b"swagger: '2.0'\npaths: {\"/pets\": {\n".to_vec(),
+        ),
+        (
+            "bytes that are not text",
+            vec![0xff, 0xfe, 0x00, 0x9c, 0x01],
+        ),
+    ];
+
+    for (case, body) in &refused {
+        let imported = gateway
+            .call_bytes(
+                "POST",
+                "/restapis?mode=import",
+                bytes::Bytes::from(body.clone()),
+            )
+            .await;
+        assert_refusal(
+            &imported,
+            BAD_REQUEST,
+            INVALID_DEFINITION,
+            &format!("ImportRestApi with {case}"),
+        );
+        let put = gateway
+            .call_bytes(
+                "PUT",
+                &format!("/restapis/{api}?mode=overwrite"),
+                bytes::Bytes::from(body.clone()),
+            )
+            .await;
+        assert_refusal(
+            &put,
+            BAD_REQUEST,
+            INVALID_DEFINITION,
+            &format!("PutRestApi with {case}"),
+        );
+    }
+
+    let after = api_count(&gateway, "after the refusals").await;
+    assert_eq!(
+        after, before,
+        "case after the refusals: a refused import must create no API, expected {before}, \
+         got {after}"
+    );
+
+    // The neighbouring class: a body that DID parse and declares neither version member
+    // keeps the version-detection sentence, so the two refusals stay apart.
+    let parsed_without_version = import_rest_api(&gateway, "{\"info\": {\"title\": \"x\"}}").await;
+    assert_refusal(
+        &parsed_without_version,
+        BAD_REQUEST,
+        UNDETERMINED_VERSION,
+        "ImportRestApi with a parsed document declaring no version",
+    );
+
+    // And a body that parses into a versioned document is still served: the sentence above
+    // is about the body that could not be read and nothing else.
+    let served = import_rest_api(&gateway, &definition_with_version("parsed import")).await;
+    assert_eq!(
+        served.status, 201,
+        "case ImportRestApi with a well-formed document: expected 201, got {} with {:?}",
+        served.status, served.body
+    );
+}
+
+/// RULE: every caller-sized member an imported operation writes into the store is bounded
+/// by the same resource guard as the same member of the operation that writes it one at a
+/// time — so a definition carrying more than a guard allows is refused with the operation's
+/// own `BadRequestException` and stores nothing, however it was imported.
+///
+/// The guards are `crate::state::MAX_COLLECTION_ENTRIES` (entries of a caller-sized map or
+/// list) and `crate::ops::put_integration::MAX_TEMPLATE_CHARS` (one mapping template), which
+/// is what `PutMethod`, `PutMethodResponse` and `PutIntegration` bound the same members by,
+/// and which this test reads from the crate rather than re-typing.
+/// The rows differ along WHICH member of the operation is over its bound — the method's
+/// request parameters, a response's headers, an integration's request templates, one
+/// template's length — and the served rows are the same documents exactly AT each bound,
+/// which must still import.
+#[tokio::test]
+async fn an_imported_operation_is_bounded_like_the_operations_that_write_it_one_at_a_time() {
+    // The guards themselves, imported rather than re-typed, so a row at the bound is at the
+    // bound the code enforces.
+    use service_com_amazonaws_apigateway_backplanecontrolservice::ops::put_integration::MAX_TEMPLATE_CHARS;
+    use service_com_amazonaws_apigateway_backplanecontrolservice::state::MAX_COLLECTION_ENTRIES as MAX_ENTRIES;
+
+    /// An OpenAPI 3 document declaring one GET operation with `parameters` header
+    /// parameters, a 200 response carrying `headers`, and a MOCK integration whose
+    /// `requestTemplates` map holds `templates` entries of `template_chars` characters each.
+    fn definition(
+        title: &str,
+        parameters: usize,
+        headers: usize,
+        templates: usize,
+        template_chars: usize,
+    ) -> String {
+        let parameters: Vec<String> = (0..parameters)
+            .map(|index| {
+                format!("{{\"name\": \"h{index}\", \"in\": \"header\", \"required\": false}}")
+            })
+            .collect();
+        let headers: Vec<String> = (0..headers)
+            .map(|index| format!("\"x-h{index}\": {{\"schema\": {{\"type\": \"string\"}}}}"))
+            .collect();
+        let templates: Vec<String> = (0..templates)
+            .map(|index| {
+                format!(
+                    "\"application/t{index}\": \"{}\"",
+                    "t".repeat(template_chars)
+                )
+            })
+            .collect();
+        format!(
+            "{{\"openapi\": \"3.0.1\", \"info\": {{\"title\": \"{title}\", \"version\": \"1\"}}, \
+             \"paths\": {{\"/pets\": {{\"get\": {{\"parameters\": [{}], \"responses\": \
+             {{\"200\": {{\"description\": \"ok\", \"headers\": {{{}}}}}}}, \
+             \"x-amazon-apigateway-integration\": {{\"type\": \"mock\", \
+             \"requestTemplates\": {{{}}}}}}}}}}}}}",
+            parameters.join(", "),
+            headers.join(", "),
+            templates.join(", ")
+        )
+    }
+
+    let gateway = Gateway::new();
+    let (api, _root) = create_api(&gateway, "definition-guards").await;
+    let before = api_count(&gateway, "before the refusals").await;
+
+    // (case, document) — each one member past its bound, the rest at or under it.
+    let refused: Vec<(String, String)> = vec![
+        (
+            format!("{} request parameters", MAX_ENTRIES + 1),
+            definition("too many parameters", MAX_ENTRIES + 1, 0, 0, 0),
+        ),
+        (
+            format!("{} response headers", MAX_ENTRIES + 1),
+            definition("too many headers", 0, MAX_ENTRIES + 1, 0, 0),
+        ),
+        (
+            format!("{} request templates", MAX_ENTRIES + 1),
+            definition("too many templates", 0, 0, MAX_ENTRIES + 1, 1),
+        ),
+        (
+            format!("a request template of {} characters", MAX_TEMPLATE_CHARS + 1),
+            definition("an oversized template", 0, 0, 1, MAX_TEMPLATE_CHARS + 1),
+        ),
+    ];
+
+    for (case, body) in &refused {
+        let imported = import_rest_api(&gateway, body).await;
+        assert_eq!(
+            imported.status, 400,
+            "case ImportRestApi with {case}: expected 400, got {} with {:?}",
+            imported.status, imported.body
+        );
+        assert_eq!(
+            imported.error.as_deref(),
+            Some(BAD_REQUEST),
+            "case ImportRestApi with {case}: expected {BAD_REQUEST:?}, got {:?}",
+            imported.error
+        );
+        let stated = message(&imported, case);
+        assert!(
+            stated.contains("at most"),
+            "case ImportRestApi with {case}: expected a refusal naming the bound it broke, \
+             got {stated:?}"
+        );
+        let put = gateway
+            .call_raw("PUT", &format!("/restapis/{api}?mode=overwrite"), body)
+            .await;
+        assert_eq!(
+            put.status, 400,
+            "case PutRestApi with {case}: expected 400, got {} with {:?}",
+            put.status, put.body
+        );
+    }
+
+    let after = api_count(&gateway, "after the refusals").await;
+    assert_eq!(
+        after, before,
+        "case after the refusals: a refused import must create no API, expected {before}, \
+         got {after}"
+    );
+
+    // The same documents exactly AT each bound are imported: the guard refuses what is past
+    // it, not what reaches it.
+    let served: Vec<(String, String)> = vec![
+        (
+            format!("{MAX_ENTRIES} request parameters"),
+            definition("parameters at the bound", MAX_ENTRIES, 0, 0, 0),
+        ),
+        (
+            format!("{MAX_ENTRIES} response headers"),
+            definition("headers at the bound", 0, MAX_ENTRIES, 0, 0),
+        ),
+        (
+            format!("{MAX_ENTRIES} request templates"),
+            definition("templates at the bound", 0, 0, MAX_ENTRIES, 1),
+        ),
+        (
+            format!("a request template of {MAX_TEMPLATE_CHARS} characters"),
+            definition("a template at the bound", 0, 0, 1, MAX_TEMPLATE_CHARS),
+        ),
+    ];
+    for (case, body) in &served {
+        let imported = import_rest_api(&gateway, body).await;
+        assert_eq!(
+            imported.status, 201,
+            "case ImportRestApi with {case}: expected 201, got {} with {:?}",
+            imported.status, imported.body
+        );
+    }
 }
 
 /// `ImportRestApi` with `body` sent verbatim.

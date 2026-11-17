@@ -75,7 +75,13 @@ impl Gateway {
     /// blob rather than a JSON structure (`PutRestApi`'s OpenAPI definition, which AWS
     /// documents as a JSON *or* YAML file).
     pub(crate) async fn call_raw(&self, method: &str, uri: &str, payload: &str) -> Answer {
-        let payload = payload.to_owned();
+        self.call_bytes(method, uri, Bytes::from(payload.to_owned()))
+            .await
+    }
+
+    /// The same request with the body sent as BYTES, for a payload that is not text at all
+    /// — which is one of the bodies a definition reader has to refuse.
+    pub(crate) async fn call_bytes(&self, method: &str, uri: &str, payload: Bytes) -> Answer {
         let request = http::Request::builder()
             .method(method)
             .uri(uri)
@@ -87,7 +93,7 @@ impl Gateway {
                  SignedHeaders=host, Signature=0",
             )
             .header("content-type", "application/json")
-            .body(Bytes::from(payload))
+            .body(payload)
             .expect("the test request is well formed");
         let response = self.router.dispatch(request).await;
         let status = response.status().as_u16();
