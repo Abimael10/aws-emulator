@@ -6,8 +6,9 @@
 //!
 //! Every quota request TEMPLATE operation passes one gate first
 //! ([`crate::state::template_gate`]), because a template is an ORGANIZATION-wide object:
-//! a call from outside the plane's Region, from an account in no AWS Organization, or
-//! from one whose organization is not in all-features mode is refused there.
+//! a call from outside the plane's Region, from an account in no AWS Organization, from
+//! an account that does not MANAGE the organization it is in, or from one whose
+//! organization is not in all-features mode is refused there.
 //!
 //! Past the gate the entry is STORED, keyed by the `(ServiceCode, AwsRegion, QuotaCode)`
 //! triple that identifies it, and the stored entry is what is returned — so
@@ -293,6 +294,15 @@ fn template_refusal(
         crate::state::TemplateRefusal::NoAvailableOrganization => {
             PutServiceQuotaIncreaseRequestIntoTemplateErrorModeled::NoAvailableOrganizationException(
                 NoAvailableOrganizationException {
+                    message: Some(crate::state::template_refusal_message(refusal, region)),
+                },
+            )
+        }
+        // The template is the ORGANIZATION's object, so a caller that does not manage the
+        // organization is denied it.
+        crate::state::TemplateRefusal::NotManagementAccount => {
+            PutServiceQuotaIncreaseRequestIntoTemplateErrorModeled::AccessDeniedException(
+                AccessDeniedException {
                     message: Some(crate::state::template_refusal_message(refusal, region)),
                 },
             )

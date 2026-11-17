@@ -12,6 +12,8 @@
 //!   `TemplatesNotAvailableInRegionException`;
 //! * a call made by an account that belongs to no AWS Organization ->
 //!   `NoAvailableOrganizationException`;
+//! * a call made by an account that does not MANAGE the organization it belongs to ->
+//!   `AccessDeniedException`;
 //! * a call made by an account whose organization is not in all-features mode ->
 //!   `OrganizationNotInAllFeaturesModeException`.
 //!
@@ -172,6 +174,13 @@ fn template_refusal(
         crate::state::TemplateRefusal::NoAvailableOrganization => {
             AssociateServiceQuotaTemplateErrorModeled::NoAvailableOrganizationException(
                 NoAvailableOrganizationException { message },
+            )
+        }
+        // The template is the ORGANIZATION's object, so a caller that does not manage the
+        // organization is denied it.
+        crate::state::TemplateRefusal::NotManagementAccount => {
+            AssociateServiceQuotaTemplateErrorModeled::AccessDeniedException(
+                AccessDeniedException { message },
             )
         }
         // This operation is the one that models the all-features condition, so it states

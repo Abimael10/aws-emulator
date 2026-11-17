@@ -16,10 +16,10 @@
 //! no `fieldList`) having recorded nothing.
 //!
 //! The rows span the worlds the rule generalises over: no Organizations control
-//! plane on the engine at all, one whose store holds no organization, an
-//! organization established by mounting that control plane, one created through its
-//! own `CreateOrganization` over the wire, and an organization some OTHER account
-//! manages (two ids, at both ends of the account-id range) — each against both
+//! plane on the engine at all, one whose store holds no organization (which is what
+//! mounting it leaves, since membership is established by a request), one created
+//! through its own `CreateOrganization` over the wire, and an organization some OTHER
+//! account manages (two ids, at both ends of the account-id range) — each against both
 //! `HeritageStatus` values.
 //!
 //! The one world with no wire path is the organization another account manages:
@@ -55,10 +55,9 @@ const ORGANIZATIONS_TARGET_PREFIX: &str = "AWSOrganizationsV20161128";
 /// How the organization the emulated account belongs to is established, if at all.
 #[derive(Debug, Clone, Copy)]
 enum Organization {
-    /// No organization at all: the account is a standalone one.
+    /// No organization at all: the account is a standalone one, which is the state a
+    /// freshly mounted control plane holds.
     None,
-    /// The one mounting the Organizations control plane establishes.
-    EstablishedByMount,
     /// One created through that control plane's own `CreateOrganization`, over the
     /// wire.
     CreatedOverTheWire,
@@ -98,19 +97,12 @@ impl Emulator {
         let emulator = Self { engine, router };
 
         match world.organization {
-            // Mounting the control plane establishes the organization the emulated
-            // account belongs to, so a world that holds none takes it away again —
-            // and so does one that establishes its own organization below. A world
-            // with no control plane mounted has nothing to take away: nothing has
-            // established an organization on that engine.
-            Organization::None => {
-                if world.control_plane {
-                    emulator.forget_the_organization();
-                }
-            }
-            Organization::EstablishedByMount => {}
+            // A freshly mounted control plane establishes no organization, and an engine
+            // with none mounted holds no Organizations surface for the account to belong
+            // to one through: both are the state the engine starts in, so this world
+            // arranges nothing.
+            Organization::None => {}
             Organization::CreatedOverTheWire => {
-                emulator.forget_the_organization();
                 emulator.create_organization(world.case).await;
             }
             Organization::ManagedBy(account_id) => {
@@ -212,12 +204,6 @@ const WORLDS: &[World] = &[
         control_plane: true,
         organization: Organization::None,
         served: false,
-    },
-    World {
-        case: "mounting the control plane established the organization",
-        control_plane: true,
-        organization: Organization::EstablishedByMount,
-        served: true,
     },
     World {
         case: "the organization was created over the wire",

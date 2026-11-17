@@ -17,11 +17,11 @@
 //! wire a client uses: `restJson1` for this service, `awsJson1_1` for Organizations.
 //!
 //! The rows span the class the rule generalises over: WHO Organizations reports as the
-//! management account (nobody, because the account is in no organization; another account;
-//! an account one digit from the caller's; the caller itself, both as the emulator mounts
-//! it and as a client creates it over the wire), and WHICH operation this service gates on
-//! that account (`CreateApprovalTeam` and `CreateIdentitySource`, the creates that set an
-//! organization's multi-party approval up).
+//! management account (nobody, because the account is in no organization — which is what a
+//! freshly mounted emulator holds; another account; an account one digit from the
+//! caller's; the caller itself, as a client creates it over the wire), and WHICH operation
+//! this service gates on that account (`CreateApprovalTeam` and `CreateIdentitySource`,
+//! the creates that set an organization's multi-party approval up).
 
 use std::sync::Arc;
 
@@ -55,8 +55,8 @@ struct Emulator {
 
 impl Emulator {
     /// Both services as the emulator mounts them: mounting the Organizations control
-    /// plane establishes the organization the emulated account is the management account
-    /// of, before any request is served.
+    /// plane establishes NO organization, so the presented account starts out standalone
+    /// — membership comes from a request.
     fn new() -> Self {
         let engine = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
@@ -72,17 +72,11 @@ impl Emulator {
         Self { router, engine }
     }
 
-    /// Both services, with the Organizations store put back into the state of an account
-    /// that belongs to NO organization.
-    ///
-    /// Mounting that control plane establishes the organization the emulated account
-    /// belongs to, and this model declares no operation that removes one, so the
-    /// in-no-organization state is reached by clearing that store after both services are
-    /// mounted — the only reach into a store in this suite, and into the OTHER service's.
+    /// Both services, with the Organizations store in the state of an account that belongs
+    /// to NO organization — which is the state mounting them leaves it in, because
+    /// membership is established by a `CreateOrganization` request and by nothing else.
     fn without_organization() -> Self {
-        let emulator = Self::new();
-        *emulator.organizations_store().lock() = OrganizationsState::default();
-        emulator
+        Self::new()
     }
 
     /// The AWS Organizations store, which holds the organization under test.
@@ -366,11 +360,6 @@ fn organization_cases() -> Vec<OrganizationCase> {
             permitted: false,
         },
         OrganizationCase {
-            case: "the caller is the management account, as the emulator mounts it",
-            emulator: Emulator::new,
-            permitted: true,
-        },
-        OrganizationCase {
             case: "the caller is the management account of an organization it created",
             emulator: || Emulator::with_management_account(engine::emulator_account_id()),
             permitted: true,
@@ -481,7 +470,7 @@ async fn the_gate_follows_the_organization_aws_organizations_records() {
 /// caller is told.
 #[tokio::test]
 async fn consulting_the_gate_leaves_the_organization_record_unchanged() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::with_management_account(engine::emulator_account_id());
     let policy_arn = emulator.policy_reference().await;
 
     let before = emulator

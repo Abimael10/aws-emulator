@@ -16,9 +16,9 @@
 //! plus one past it, pagination over the modelled `MaxResults` bounds plus one outside
 //! each, and "not in use" over every operation of the slice.
 //!
-//! Every case here starts from a store put back into the state of an account that
-//! belongs to NO organization: mounting this control plane establishes the organization
-//! the emulated account belongs to, and THAT is asserted by the
+//! Every case here starts from the store a freshly mounted control plane holds: an
+//! account that belongs to NO organization, because membership is established by a
+//! `CreateOrganization` request and by nothing else. THAT default is asserted by the
 //! `default_organization_membership` suite.
 
 use std::collections::BTreeSet;
@@ -27,7 +27,6 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use service_com_amazonaws_organizations_awsorganizationsv20161128::ops::types::ORGANIZATION_FEATURE_SET_VALUES;
 use service_com_amazonaws_organizations_awsorganizationsv20161128::state::{
-    ComAmazonawsOrganizationsAwsorganizationsv20161128State as OrganizationsState,
     MAX_ORGANIZATIONAL_UNIT_DEPTH, MAX_PAGE_SIZE, MAX_TAGS_PER_RESOURCE,
 };
 use smithy_server_runtime::MultiServiceRouter;
@@ -50,28 +49,20 @@ pub(crate) fn account_id() -> &'static str {
 
 /// A router carrying only this service, over one shared engine — what
 /// `core/router/src/lib.rs` builds, narrowed to the service under test, over the store
-/// mounting it establishes. Request authentication is off so the suite needs no signing
-/// keys; routing still goes through the SigV4 credential scope on the `authorization`
-/// header below.
+/// mounting it establishes: one holding no organization. Request authentication is off so
+/// the suite needs no signing keys; routing still goes through the SigV4 credential scope
+/// on the `authorization` header below.
 ///
 /// `pub(crate)` so a sibling suite drives the booted emulator through this harness.
-pub(crate) fn seeded_router() -> MultiServiceRouter {
+pub(crate) fn mounted_router() -> MultiServiceRouter {
     router_over(Arc::new(engine::InMemoryEngine::new()))
 }
 
-/// [`seeded_router`], with the store put back into the state of an account that belongs
-/// to NO organization.
-///
-/// Mounting the Organizations control plane establishes the organization the emulated
-/// account belongs to (`service::EmulatedService::new`), so every case BELOW — each of
-/// which is about creating an organization, or about what an operation answers while none
-/// exists — clears that store AFTER the service is mounted. The organization that is
-/// there by default is asserted by the `default_organization_membership` suite.
+/// [`mounted_router`]: a freshly mounted control plane, which is the state of an account
+/// that belongs to NO organization — every case BELOW is about creating an organization,
+/// or about what an operation answers while none exists.
 fn router() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let router = router_over(Arc::clone(&engine));
-    *engine.state::<OrganizationsState>().lock() = OrganizationsState::default();
-    router
+    mounted_router()
 }
 
 /// This service mounted on a router over `engine`, the way `core/router/src/lib.rs`

@@ -32,7 +32,7 @@ use service_com_amazonaws_organizations_awsorganizationsv20161128::state::{
     AccountRecord as OrganizationsAccountRecord, ChildRef,
     ComAmazonawsOrganizationsAwsorganizationsv20161128State as OrganizationsState,
     ACCOUNT_JOINED_METHOD_CREATED, ACCOUNT_STATUS_ACTIVE, ARN_REGION, ARN_SERVICE,
-    CHILD_TYPE_ACCOUNT,
+    CHILD_TYPE_ACCOUNT, DEFAULT_FEATURE_SET as ORGANIZATIONS_DEFAULT_FEATURE_SET,
 };
 
 /// Keep this at or above `boot_serve.rs`'s stack: the same assembly runs here.
@@ -61,9 +61,16 @@ const LINKED_ACCOUNT: &str = "000000000001";
 /// emulated account's family comes from. The record is the one that store keeps for a
 /// member account, including the root's child edge, so the roster this links into is the
 /// same one `ListAccounts` would report.
+///
+/// The organization itself is established first, through Organizations' own single
+/// organization writer: membership comes from a `CreateOrganization` request and not from
+/// mounting that control plane, so a store nobody has asked holds none.
 fn link_account_to_the_organization(engine: &InMemoryEngine, account_id: &str) {
     let state = engine.state::<OrganizationsState>();
     let mut store = state.lock();
+    if store.organization.is_none() {
+        store.create_organization(ORGANIZATIONS_DEFAULT_FEATURE_SET);
+    }
     let organization_id = store
         .organization
         .as_ref()

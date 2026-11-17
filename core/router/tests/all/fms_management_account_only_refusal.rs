@@ -84,7 +84,26 @@ async fn call(
 
 /// The account AWS Organizations reports as the management account of the
 /// organization this account belongs to.
+///
+/// The organization is created first, through Organizations' own
+/// `CreateOrganization`: membership is established by a REQUEST — "the account whose
+/// user is calling the CreateOrganization operation automatically becomes the
+/// management account of the new organization" — and not by mounting that control
+/// plane, so until a client makes that request the caller belongs to none.
 async fn management_account(router: &MultiServiceRouter) -> String {
+    let (status, body) = call(
+        router,
+        "organizations",
+        "AWSOrganizationsV20161128",
+        "CreateOrganization",
+        "us-east-1",
+        &json!({}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "CreateOrganization must establish the organization, got {status} with {body}"
+    );
     let (status, body) = call(
         router,
         "organizations",

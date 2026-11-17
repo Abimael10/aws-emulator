@@ -21,6 +21,14 @@
 //! organization, and an emulator serving no Organizations at all holds no organization
 //! the account could belong to either. Both are [`Membership::None`], which is the
 //! standalone-account case the template gate refuses.
+//!
+//! An organization the caller belongs to but does not MANAGE is the third case: the
+//! template is the organization's own object, written for the accounts created in it, so
+//! it belongs to the account that manages the organization — "the account whose user is
+//! calling the `CreateOrganization` operation automatically becomes the management
+//! account of the new organization" — and a member account that is not that one is
+//! [`Membership::NotManagementAccount`]. Which account that is comes from the same read:
+//! the organization's own `MasterAccountId`.
 
 use ::aws_sdk_organizations::types::OrganizationFeatureSet;
 
@@ -36,10 +44,14 @@ const ORGANIZATIONS_HOME_REGION: &str = "us-east-1";
 pub enum Membership {
     /// The account belongs to no organization.
     None,
-    /// The account belongs to an organization with ALL features enabled — the mode the
+    /// The account belongs to an organization it does not MANAGE: the organization's
+    /// management account is another account, so the organization-wide object is not
+    /// this caller's to read or write.
+    NotManagementAccount,
+    /// The account MANAGES an organization with ALL features enabled — the mode the
     /// organization-wide features of other services are served behind.
     AllFeatures,
-    /// The account belongs to an organization that enables only part of the feature set
+    /// The account MANAGES an organization that enables only part of the feature set
     /// (consolidated billing).
     PartialFeatures,
 }
@@ -56,6 +68,14 @@ pub async fn membership(ctx: &smithy_server_runtime::OperationContext<'_>) -> Me
     let Some(organization) = answer.organization else {
         return Membership::None;
     };
+    // The organization-wide object belongs to the account that MANAGES the organization,
+    // which is the one the organization itself records as its management account. A
+    // member account that is not that one is in an organization it does not manage; an
+    // organization reporting no management account at all names nobody who manages it,
+    // so no caller is that account either.
+    if organization.master_account_id.as_deref() != Some(caller_account_id()) {
+        return Membership::NotManagementAccount;
+    }
     // A membership whose feature set is not ALL is a partial one, including an
     // organization that reports no feature set: the all-features mode is only what
     // Organizations positively says it is.
@@ -63,6 +83,12 @@ pub async fn membership(ctx: &smithy_server_runtime::OperationContext<'_>) -> Me
         Some(OrganizationFeatureSet::All) => Membership::AllFeatures,
         _ => Membership::PartialFeatures,
     }
+}
+
+/// The account every request this emulator serves is made by, which is the account a
+/// membership is judged for.
+fn caller_account_id() -> &'static str {
+    ::engine::emulator_account_id()
 }
 
 /// An AWS Organizations client over the in-process callback.

@@ -620,7 +620,11 @@ impl ComAmazonawsOrganizationsAwsorganizationsv20161128State {
 
 /// The `AWSOrganizationsNotInUseException` message every operation uses for a request
 /// made while this account is in no organization.
-pub const NOT_IN_USE_MESSAGE: &str = "Your account is not a member of an organization. To make this request, you must use the credentials of an account that belongs to an organization.";
+///
+/// The sentence the error itself states, word for word
+/// (`smithy_query(query="doc",shape="AWSOrganizationsNotInUseException")`): entirely
+/// fixed text, carrying nothing of the request.
+pub const NOT_IN_USE_MESSAGE: &str = "Your account isn't a member of an organization. To make this request, you must use the credentials of an account that belongs to an organization.";
 
 /// The `AlreadyInOrganizationException` message `CreateOrganization` uses for a second
 /// create.

@@ -179,6 +179,19 @@ fn router_with_mpa() -> MultiServiceRouter {
             Arc::clone(&engine),
         ),
     );
+    // MPA reserves its creates to the organization's MANAGEMENT account, and membership is
+    // established by a request rather than by mounting a control plane, so the
+    // organization the caller manages is recorded here — through Organizations' own single
+    // organization writer, the one its `CreateOrganization` takes.
+    if let Some(organizations) =
+        service_com_amazonaws_organizations_awsorganizationsv20161128::state::service_state(
+            &*engine,
+        )
+    {
+        organizations.lock().create_organization(
+            service_com_amazonaws_organizations_awsorganizationsv20161128::state::DEFAULT_FEATURE_SET,
+        );
+    }
     router
 }
 

@@ -488,6 +488,20 @@ impl Emulator {
             .map(|member| (member.name.clone(), member.email.clone()))
     }
 
+    /// Put the emulated account in an organization, so AWS Organizations holds the roster
+    /// the portal reports an account's name and email out of.
+    ///
+    /// Membership is established by a `CreateOrganization` request and by nothing else —
+    /// mounting that control plane establishes none — so it is written here through that
+    /// service's own single organization writer, the one its `CreateOrganization` takes.
+    fn create_organization(&self) {
+        let state = organizations::state::service_state(&*self.engine)
+            .expect("the Organizations store is reachable");
+        state
+            .lock()
+            .create_organization(organizations::state::DEFAULT_FEATURE_SET);
+    }
+
     /// The Identity Center subject the role credential `access_key_id` speaks for, as the
     /// portal's store resolves it — what a service behind the portal authorizes a request
     /// by.
@@ -616,6 +630,7 @@ pub(crate) struct Assigned {
 /// Set an emulator up with every row of `rows` assigned and its grant complete.
 pub(crate) async fn assigned_emulator(rows: &[Granted]) -> Assigned {
     let emulator = Emulator::new();
+    emulator.create_organization();
     let (instance_arn, identity_store_id) = emulator.instance().await;
     let mut permission_sets: Vec<Vec<String>> = Vec::new();
     for row in rows {

@@ -2272,6 +2272,9 @@ pub enum TemplateRefusal {
     /// The calling account belongs to no AWS Organization:
     /// `NoAvailableOrganizationException`.
     NoAvailableOrganization,
+    /// The calling account belongs to an organization it does not MANAGE, so the
+    /// organization-wide template is another account's: `AccessDeniedException`.
+    NotManagementAccount,
     /// The calling account's organization does not have all features enabled, so the
     /// organization-wide template feature is not available to it:
     /// `OrganizationNotInAllFeaturesModeException` where the operation models it, and
@@ -2291,9 +2294,11 @@ pub enum TemplateRefusal {
 ///
 /// 1. the plane is served from one Region only ([`TEMPLATE_HOME_REGION`]), so a call
 ///    anywhere else is refused with [`TemplateRefusal::NotAvailableInRegion`];
-/// 2. the calling account must be in an organization with ALL features enabled: an
+/// 2. the calling account must MANAGE an organization with ALL features enabled: an
 ///    account in none has no template to read, write or associate
-///    ([`TemplateRefusal::NoAvailableOrganization`]), and one whose organization enables
+///    ([`TemplateRefusal::NoAvailableOrganization`]), one that is a member of an
+///    organization another account manages is asking for that organization's object
+///    ([`TemplateRefusal::NotManagementAccount`]), and one whose organization enables
 ///    only part of the feature set cannot have the organization-wide feature
 ///    ([`TemplateRefusal::OrganizationNotInAllFeaturesMode`]).
 ///
@@ -2313,6 +2318,9 @@ pub async fn template_gate(
         organization::Membership::PartialFeatures => {
             Err(TemplateRefusal::OrganizationNotInAllFeaturesMode)
         }
+        organization::Membership::NotManagementAccount => {
+            Err(TemplateRefusal::NotManagementAccount)
+        }
         organization::Membership::None => Err(TemplateRefusal::NoAvailableOrganization),
     }
 }
@@ -2329,6 +2337,11 @@ pub fn template_refusal_message(refusal: TemplateRefusal, region: &str) -> Strin
         }
         TemplateRefusal::NoAvailableOrganization => {
             "The Amazon Web Services account making this call is not a member of an organization."
+                .to_string()
+        }
+        TemplateRefusal::NotManagementAccount => {
+            "The request was called by a member account. To make this request, you must use the \
+             organization's master account."
                 .to_string()
         }
         TemplateRefusal::OrganizationNotInAllFeaturesMode => {

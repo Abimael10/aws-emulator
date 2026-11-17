@@ -132,29 +132,32 @@ pub(crate) struct Harness {
 impl Harness {
     /// The harness these lifecycle tables use: the emulator as it is mounted, with the
     /// caller's own account the management account of the organization AWS Organizations
-    /// records — the only state in which `CreateApprovalTeam` is permitted. These tables
-    /// are about what the lifecycle operations DO once the caller may create a team; the
-    /// gate itself is tested in `authorization_gate.rs` and
+    /// records — the only state in which `CreateApprovalTeam` is permitted. Membership is
+    /// established by a REQUEST and by nothing else (mounting a control plane establishes
+    /// none), so this harness records it before the table runs. These tables are about
+    /// what the lifecycle operations DO once the caller may create a team; the gate
+    /// itself is tested in `authorization_gate.rs` and
     /// `management_account_from_organizations.rs`.
     pub(crate) fn new() -> Self {
-        Self::mounted()
+        let harness = Self::mounted();
+        harness.record_management_account(engine::emulator_account_id());
+        harness
     }
 
-    /// Both services mounted in a router over one engine, with the Organizations store
-    /// put back into the state of an account that belongs to NO organization — and so
-    /// is the management account of none.
+    /// Both services mounted in a router over one engine, with the Organizations store in
+    /// the state of an account that belongs to NO organization — and so is the management
+    /// account of none.
     pub(crate) fn without_organization() -> Self {
-        let harness = Self::mounted();
-        *harness.organizations_store().lock() = Default::default();
-        harness
+        Self::mounted()
     }
 
     /// This service mounted in a router beside AWS Organizations, both over ONE engine.
     ///
     /// Organizations is mounted because the organization whose MANAGEMENT ACCOUNT the
     /// gated creates are restricted to is that service's record, which this service reads
-    /// over the in-process callback; mounting that control plane establishes the
-    /// organization the emulated account belongs to, exactly as the running emulator does.
+    /// over the in-process callback; mounting that control plane establishes no
+    /// organization, exactly as the running emulator does — membership comes from a
+    /// request ([`Harness::record_management_account`]).
     fn mounted() -> Self {
         let engine = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
