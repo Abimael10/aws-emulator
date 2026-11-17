@@ -417,8 +417,16 @@ async fn a_name_already_owned_by_a_completed_create_is_a_duplicate_request() {
             "case {operation}: the stored namespace is untouched, got {read}"
         );
 
-        // Deleting it frees the name, so the identical call succeeds.
-        ok(&router, "DeleteNamespace", json!({ "Id": namespace_id })).await;
+        // The delete frees the name when its operation lands, and the identical call then
+        // succeeds.
+        ok(
+            &router,
+            "DeleteNamespace",
+            json!({ "Id": namespace_id.clone() }),
+        )
+        .await;
+        crate::async_namespace_operations::deleted_namespace(&router, operation, &namespace_id)
+            .await;
         let (_, recreated) = created_namespace(&router, operation, body.clone()).await;
         assert_ne!(
             recreated, namespace_id,
@@ -688,12 +696,7 @@ async fn a_resource_that_still_has_children_is_refused_with_resource_in_use() {
             (&json!("DELETE_NAMESPACE"), &json!(namespace_id)),
             "case {case:?}: the filed operation records the delete, got {filed}"
         );
-        let (status, code) = failure(&router, "GetNamespace", json!({ "Id": namespace_id })).await;
-        assert_eq!(
-            (status, code.as_str()),
-            (400, "NamespaceNotFound"),
-            "case {case:?}: a deleted namespace is gone from the store"
-        );
+        crate::async_namespace_operations::deleted_namespace(&router, case, &namespace_id).await;
     }
 }
 
@@ -935,8 +938,11 @@ async fn list_namespaces_refuses_every_filter_combination_it_does_not_support() 
         }
     }
 
-    // The remaining filter rules: a condition takes exactly one value, an omitted
-    // condition means `EQ`, and TYPE/RESOURCE_OWNER accept only their documented values.
+    // The remaining filter rules: a condition takes exactly one value, and an omitted
+    // condition means `EQ`. A filter VALUE is not checked against any enumeration —
+    // `NamespaceFilter$Values` is modelled as an unconstrained string list — so a term
+    // naming no namespace type or owner is accepted and matches nothing, which
+    // `list_filter_values_are_opaque` asserts.
     let rules: Vec<(&str, Value, bool)> = vec![
         (
             "an omitted Condition, which means EQ",
@@ -951,16 +957,6 @@ async fn list_namespaces_refuses_every_filter_combination_it_does_not_support() 
         (
             "no values at all",
             json!([{ "Name": "NAME", "Values": [] }]),
-            false,
-        ),
-        (
-            "a TYPE value outside NamespaceType",
-            json!([{ "Name": "TYPE", "Values": ["DNS"] }]),
-            false,
-        ),
-        (
-            "a RESOURCE_OWNER value outside SELF/OTHER_ACCOUNTS",
-            json!([{ "Name": "RESOURCE_OWNER", "Values": ["ME"] }]),
             false,
         ),
         (

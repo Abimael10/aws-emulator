@@ -23,6 +23,11 @@
 //! instead (`MAX_RETAINED_OPERATIONS`, `MAX_RETAINED_IDEMPOTENCY_TOKENS`,
 //! `MAX_DEREGISTERED_INSTANCES_PER_SERVICE`).
 
+/// What a service's `DnsConfig` may declare, and the instance attributes those records
+/// require.
+pub mod dns_records;
+/// The Amazon VPC a private DNS namespace is visible inside, resolved in Amazon EC2.
+pub mod namespace_vpc;
 /// The Route 53 hosted zone a DNS namespace is backed by, and the record sets Cloud Map
 /// publishes into it for the namespace's services and instances.
 pub mod route53_zone;
@@ -218,6 +223,15 @@ pub const UNREACHABLE_STATE_MESSAGE: &str =
 pub const OPERATION_STATUS_SUBMITTED: &str = "SUBMITTED";
 /// The terminal success status an operation reaches once its due instant passes.
 pub const OPERATION_STATUS_SUCCESS: &str = "SUCCESS";
+/// The terminal failure status an operation whose asynchronous work could not complete
+/// reaches once its due instant passes. `Operation$ErrorCode` and `Operation$ErrorMessage`
+/// say why, and are reported with it.
+pub const OPERATION_STATUS_FAIL: &str = "FAIL";
+
+/// The `Operation$ErrorCode` for an asynchronous step that could not create the Route 53
+/// hosted zone a DNS namespace is: one of the values that member documents
+/// (`CANNOT_CREATE_HOSTED_ZONE`).
+pub const ERROR_CODE_CANNOT_CREATE_HOSTED_ZONE: &str = "CANNOT_CREATE_HOSTED_ZONE";
 
 /// `HealthStatus` reported for an instance no health checker has reported on.
 pub const HEALTH_STATUS_UNKNOWN: &str = "UNKNOWN";
@@ -746,6 +760,41 @@ pub struct OperationRecord {
     pub error_message: Option<String>,
     /// `OperationTargetType` -> resource id (`NAMESPACE`, `SERVICE`, `INSTANCE`).
     pub targets: HashMap<String, String>,
+    /// Why this operation's asynchronous work cannot complete, settled by the call that
+    /// filed it: the terminal status the clock owes it is `FAIL` carrying this code and
+    /// message rather than `SUCCESS`.
+    pub failure: Option<OperationFailure>,
+    /// The change to this service's records the operation's terminal status carries with
+    /// it, applied by [`ComAmazonawsServicediscoveryRoute53autonamingV20170314State::advance`]
+    /// when the clock reaches the due instant — never at request time.
+    pub effect: Option<OperationEffect>,
+}
+
+/// The `ErrorCode`/`ErrorMessage` pair an operation that lands `FAIL` reports.
+#[derive(Debug, Clone)]
+pub struct OperationFailure {
+    /// One of the values `Operation$ErrorCode` documents.
+    pub code: String,
+    /// "The error message provided for an operation" (`Operation$ErrorMessage`).
+    pub message: String,
+}
+
+/// The change to this service's records an asynchronous operation applies when it settles.
+///
+/// Cloud Map's mutating calls answer with an `OperationId` rather than with the resource:
+/// the work happens while the operation is still `SUBMITTED`, and the resource tree a
+/// caller reads only changes when the operation reaches its terminal status. Each variant
+/// names the status it is applied in, so the clock applies a delete when the delete
+/// SUCCEEDS and rolls a half-made create back when the create FAILS.
+#[derive(Debug, Clone)]
+pub enum OperationEffect {
+    /// Remove this namespace once the `DELETE_NAMESPACE` operation succeeds: until then
+    /// `GetNamespace` still answers with it, which is what lets a caller poll the
+    /// operation and see the record disappear only when it reports `SUCCESS`.
+    RemoveDeletedNamespace(String),
+    /// Remove this namespace if the `CREATE_NAMESPACE` operation fails: a create whose
+    /// asynchronous step could not complete leaves no namespace behind.
+    RemoveUncreatedNamespace(String),
 }
 
 /// A resource one of this service's tagging operations addresses, identified by the
@@ -867,12 +916,24 @@ impl ComAmazonawsServicediscoveryRoute53autonamingV20170314State {
     /// File an operation record and return its `OperationId`.
     ///
     /// The record starts `SUBMITTED` with its success due [`OPERATION_SUCCESS_SPAN`]
-    /// later; [`Self::operation`] materialises the transition when the clock reaches it.
+    /// later; [`Self::advance`] materialises the transition when the clock reaches it.
     pub fn record_operation(
         &mut self,
         operation_type: &str,
         now: SystemTime,
         targets: impl IntoIterator<Item = (String, String)>,
+    ) -> String {
+        self.record_operation_with_effect(operation_type, now, targets, None)
+    }
+
+    /// File an operation record that carries a change to this service's records, applied
+    /// when the clock owes the operation its terminal status rather than now.
+    pub fn record_operation_with_effect(
+        &mut self,
+        operation_type: &str,
+        now: SystemTime,
+        targets: impl IntoIterator<Item = (String, String)>,
+        effect: Option<OperationEffect>,
     ) -> String {
         let id = self.next_operation_id();
         self.operations.insert(
@@ -887,15 +948,52 @@ impl ComAmazonawsServicediscoveryRoute53autonamingV20170314State {
                 error_code: None,
                 error_message: None,
                 targets: targets.into_iter().collect(),
+                failure: None,
+                effect,
             },
         );
         self.evict_oldest_operations();
         id
     }
 
+    /// Record that the asynchronous work of the operation `id` cannot complete, so the
+    /// terminal status the clock owes it is `FAIL` carrying `code` and `message`.
+    ///
+    /// The status does NOT move here while the operation is still owed its transition: it
+    /// stays `SUBMITTED` until its due instant, exactly as a succeeding one does, so a
+    /// caller that polls immediately sees the same non-terminal status either way.
+    ///
+    /// A record the clock has ALREADY settled — the call that reports the failure is still
+    /// running, and another request advanced the store in the meantime — is settled again
+    /// here, with the change its new terminal status carries, because nothing else reads a
+    /// failure recorded onto a terminal record.
+    pub fn fail_when_due(&mut self, id: &str, code: &str, message: String) {
+        let failure = OperationFailure {
+            code: code.to_string(),
+            message,
+        };
+        let Some(record) = self.operations.get_mut(id) else {
+            return;
+        };
+        record.failure = Some(failure.clone());
+        if record.status == OPERATION_STATUS_SUBMITTED {
+            return;
+        }
+        record.status = OPERATION_STATUS_FAIL.to_string();
+        record.error_code = Some(failure.code);
+        record.error_message = Some(failure.message);
+        let settled = record.effect.clone();
+        if let Some(effect) = settled {
+            self.apply(effect, OPERATION_STATUS_FAIL);
+        }
+    }
+
     /// Keep [`Self::operations`] within [`MAX_RETAINED_OPERATIONS`], dropping the
     /// oldest record that has already reached a terminal status first so a caller
     /// polling a fresh operation can still resolve it.
+    ///
+    /// A record that still owes a change to this service's records ([`OperationEffect`])
+    /// is the last to go, so no eviction can drop a delete the clock has not applied yet.
     ///
     /// A token remembered for an evicted operation is forgotten with it, so a replay
     /// never hands back an id `GetOperation` can no longer resolve.
@@ -905,7 +1003,10 @@ impl ComAmazonawsServicediscoveryRoute53autonamingV20170314State {
                 .operations
                 .values()
                 .min_by_key(|record| {
+                    let owes_a_change =
+                        record.effect.is_some() && record.status == OPERATION_STATUS_SUBMITTED;
                     (
+                        owes_a_change,
                         record.status == OPERATION_STATUS_SUBMITTED,
                         record.create_date,
                     )
@@ -927,38 +1028,100 @@ impl ComAmazonawsServicediscoveryRoute53autonamingV20170314State {
         }
     }
 
-    /// Apply the status transition the clock already owes `record`.
+    /// Apply every status transition and record change the clock already owes.
     ///
-    /// Writing here is what a reporting call may do: the operation was due to succeed
-    /// at `success_due_at` whether or not anybody asked, and `update_date` is the
-    /// instant it became due rather than the instant somebody noticed, so two readers
-    /// of the same record report the same dates.
-    fn materialise(record: &mut OperationRecord, now: SystemTime) {
-        if record.status == OPERATION_STATUS_SUBMITTED && now >= record.success_due_at {
-            record.status = OPERATION_STATUS_SUCCESS.to_string();
+    /// Writing here is what a reporting call may do: an operation was due to settle at
+    /// `success_due_at` whether or not anybody asked, and so was the change its terminal
+    /// status carries — the removal of a namespace a `DELETE_NAMESPACE` operation was
+    /// filed for, the roll-back of one whose create could not complete. `update_date` is
+    /// the instant the operation became due rather than the instant somebody noticed, so
+    /// two readers of the same record report the same dates.
+    ///
+    /// Called at the top of every handler that reads or writes this store, so what a
+    /// caller sees never depends on whether some other caller polled the operation first.
+    pub fn advance(&mut self, now: SystemTime) {
+        let mut owed: Vec<(OperationEffect, String)> = Vec::new();
+        for record in self.operations.values_mut() {
+            if record.status != OPERATION_STATUS_SUBMITTED || now < record.success_due_at {
+                continue;
+            }
+            match record.failure.as_ref() {
+                Some(failure) => {
+                    record.status = OPERATION_STATUS_FAIL.to_string();
+                    record.error_code = Some(failure.code.clone());
+                    record.error_message = Some(failure.message.clone());
+                }
+                None => record.status = OPERATION_STATUS_SUCCESS.to_string(),
+            }
             record.update_date = record.success_due_at;
+            // The effect STAYS on the record: it is what that operation's terminal status
+            // carries, and a failure reported for an operation the clock has already
+            // settled ([`Self::fail_when_due`]) still has to apply it.
+            if let Some(effect) = record.effect.clone() {
+                owed.push((effect, record.status.clone()));
+            }
+        }
+        for (effect, status) in owed {
+            self.apply(effect, &status);
         }
     }
 
-    /// The operation `id`, with any status transition the clock already owes it
-    /// applied first.
+    /// Apply the change an operation's terminal `status` carries with it.
+    ///
+    /// The ONE place an [`OperationEffect`] is read, so the status each variant is applied
+    /// in cannot differ between the clock's own pass ([`Self::advance`]) and the call that
+    /// settles a record the clock has already moved ([`Self::fail_when_due`]). Applying one
+    /// twice changes nothing the first application did not already do: a namespace is
+    /// removed by the id its own create minted, and its name index entry only where that
+    /// entry still names it, so a namespace created later under the same name is untouched.
+    fn apply(&mut self, effect: OperationEffect, status: &str) {
+        match effect {
+            OperationEffect::RemoveDeletedNamespace(namespace_id)
+                if status == OPERATION_STATUS_SUCCESS =>
+            {
+                self.remove_namespace(&namespace_id);
+            }
+            OperationEffect::RemoveUncreatedNamespace(namespace_id)
+                if status == OPERATION_STATUS_FAIL =>
+            {
+                self.remove_namespace(&namespace_id);
+            }
+            // The other terminal status: a delete that failed removes nothing, and a
+            // create that succeeded keeps what it created.
+            _ => {}
+        }
+    }
+
+    /// Drop the namespace `namespace_id` and the name index entry that reached it, so the
+    /// name stops resolving with the record: a later create of the same name is a create,
+    /// not a conflict with a namespace nobody can read any more.
+    pub fn remove_namespace(&mut self, namespace_id: &str) -> Option<NamespaceRecord> {
+        let removed = self.namespaces.remove(namespace_id)?;
+        if self
+            .namespace_ids_by_name
+            .get(&removed.name)
+            .is_some_and(|indexed| indexed == namespace_id)
+        {
+            self.namespace_ids_by_name.remove(&removed.name);
+        }
+        Some(removed)
+    }
+
+    /// The operation `id`, with every transition the clock already owes applied first.
     pub fn operation(&mut self, id: &str, now: SystemTime) -> Option<&OperationRecord> {
-        let record = self.operations.get_mut(id)?;
-        Self::materialise(record, now);
-        Some(record)
+        self.advance(now);
+        self.operations.get(id)
     }
 
     /// Every stored operation in one stable total order — oldest first, `OperationId`
-    /// breaking a tie — each with the status transition the clock already owes it
-    /// applied first, exactly as [`Self::operation`] applies it to a single record.
+    /// breaking a tie — with every transition the clock already owes applied first,
+    /// exactly as [`Self::operation`] applies it to a single record.
     ///
     /// The order is a property of the records themselves (create instant, then id), not
     /// of the map's iteration order, so the page boundary a `ListOperations`
     /// `NextToken` names stays put as later operations are filed.
     pub fn operations_in_order(&mut self, now: SystemTime) -> Vec<OperationRecord> {
-        for record in self.operations.values_mut() {
-            Self::materialise(record, now);
-        }
+        self.advance(now);
         let mut ordered: Vec<OperationRecord> = self.operations.values().cloned().collect();
         ordered
             .sort_by(|left, right| (left.create_date, &left.id).cmp(&(right.create_date, &right.id)));
@@ -1532,4 +1695,152 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsServicediscoveryRoute53autonamingV20170314State>)
+}
+
+#[cfg(test)]
+mod tests {
+    //! The operation store's half of a clock-owed transition: which terminal status a
+    //! record lands in, and the change that status carries with it.
+    //!
+    //! The wire behaviour these tests sit under is asserted end to end in
+    //! `tests/all/async_namespace_operations.rs`; what is checked here is the ONE case no
+    //! request sequence can drive from outside — a failure reported for an operation the
+    //! clock has already settled, which happens when the call that resolves the
+    //! asynchronous work is still running while another request advances the store.
+
+    use super::*;
+
+    /// A namespace record of the kind a create stages, and the operation that created it
+    /// carrying the roll-back its failure applies.
+    fn staged_create(
+        state: &mut ComAmazonawsServicediscoveryRoute53autonamingV20170314State,
+        now: SystemTime,
+    ) -> (String, String) {
+        let id = state.next_id("ns", RESOURCE_ID_DIGITS);
+        let operation_id = state.record_operation_with_effect(
+            "CREATE_NAMESPACE",
+            now,
+            [("NAMESPACE".to_string(), id.clone())],
+            Some(OperationEffect::RemoveUncreatedNamespace(id.clone())),
+        );
+        let record = NamespaceRecord {
+            id: id.clone(),
+            arn: service_arn("us-west-2", &format!("namespace/{id}")),
+            name: "staged.internal".to_string(),
+            namespace_type: "DNS_PRIVATE".to_string(),
+            description: None,
+            create_date: now,
+            creator_request_id: None,
+            http_name: Some("staged.internal".to_string()),
+            hosted_zone_id: None,
+            soa_ttl: None,
+            create_operation_id: Some(operation_id.clone()),
+            tags: Vec::new(),
+        };
+        state
+            .namespace_ids_by_name
+            .insert(record.name.clone(), id.clone());
+        state.namespaces.insert(id.clone(), record);
+        (id, operation_id)
+    }
+
+    /// A failure reported while the transition is still owed lands `FAIL` when the clock
+    /// reaches the due instant, and the roll-back goes with it.
+    #[test]
+    fn a_failure_reported_before_the_due_instant_lands_fail_and_rolls_back() {
+        let mut state = ComAmazonawsServicediscoveryRoute53autonamingV20170314State::default();
+        let now = SystemTime::now();
+        let (namespace_id, operation_id) = staged_create(&mut state, now);
+
+        state.fail_when_due(
+            &operation_id,
+            ERROR_CODE_CANNOT_CREATE_HOSTED_ZONE,
+            "the asynchronous step could not complete".to_string(),
+        );
+        let still_running = state
+            .operation(&operation_id, now)
+            .expect("the operation is on file")
+            .clone();
+        assert_eq!(
+            still_running.status, OPERATION_STATUS_SUBMITTED,
+            "a failure reported before the due instant must not move the status, got \
+             {still_running:?}"
+        );
+        assert!(
+            state.namespaces.contains_key(&namespace_id),
+            "the staged namespace is readable while the create is still running"
+        );
+
+        let settled = state
+            .operation(&operation_id, now + OPERATION_SUCCESS_SPAN)
+            .expect("the operation is on file")
+            .clone();
+        assert_eq!(
+            (
+                settled.status.as_str(),
+                settled.error_code.as_deref(),
+                settled.error_message.as_deref()
+            ),
+            (
+                OPERATION_STATUS_FAIL,
+                Some(ERROR_CODE_CANNOT_CREATE_HOSTED_ZONE),
+                Some("the asynchronous step could not complete")
+            ),
+            "the clock owes this operation its FAIL and the error it carries, got {settled:?}"
+        );
+        assert!(
+            !state.namespaces.contains_key(&namespace_id)
+                && !state.namespace_ids_by_name.contains_key("staged.internal"),
+            "a create that failed leaves no namespace and frees its name"
+        );
+    }
+
+    /// The race the handler cannot hold a lock across: the clock settled the operation
+    /// SUCCESS while the call resolving its asynchronous work was still running. The
+    /// failure it then reports still lands `FAIL`, with the roll-back that status carries.
+    #[test]
+    fn a_failure_reported_after_the_clock_settled_it_still_fails_and_rolls_back() {
+        let mut state = ComAmazonawsServicediscoveryRoute53autonamingV20170314State::default();
+        let now = SystemTime::now();
+        let (namespace_id, operation_id) = staged_create(&mut state, now);
+
+        // Another request advances the store first: with no failure recorded yet, the
+        // operation succeeds and the staged namespace is kept.
+        state.advance(now + OPERATION_SUCCESS_SPAN);
+        assert_eq!(
+            state
+                .operation(&operation_id, now + OPERATION_SUCCESS_SPAN)
+                .expect("the operation is on file")
+                .status,
+            OPERATION_STATUS_SUCCESS,
+            "the clock settles an operation no failure was recorded for as SUCCESS"
+        );
+        assert!(
+            state.namespaces.contains_key(&namespace_id),
+            "a create that succeeded keeps what it created"
+        );
+
+        state.fail_when_due(
+            &operation_id,
+            ERROR_CODE_CANNOT_CREATE_HOSTED_ZONE,
+            "the asynchronous step could not complete".to_string(),
+        );
+        let settled = state
+            .operation(&operation_id, now + OPERATION_SUCCESS_SPAN)
+            .expect("the operation is on file")
+            .clone();
+        assert_eq!(
+            (settled.status.as_str(), settled.error_code.as_deref()),
+            (
+                OPERATION_STATUS_FAIL,
+                Some(ERROR_CODE_CANNOT_CREATE_HOSTED_ZONE)
+            ),
+            "a failure reported for a settled operation still lands FAIL, got {settled:?}"
+        );
+        assert!(
+            !state.namespaces.contains_key(&namespace_id)
+                && !state.namespace_ids_by_name.contains_key("staged.internal"),
+            "the roll-back the FAIL carries is applied however late the failure arrives"
+        );
+    }
 }

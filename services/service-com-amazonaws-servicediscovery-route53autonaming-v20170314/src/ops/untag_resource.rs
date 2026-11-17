@@ -163,6 +163,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut state = state.lock();
+        // Every transition the clock already owes, including the removal a settled
+        // `DELETE_NAMESPACE` operation carries, before the ARN is resolved.
+        state.advance(std::time::SystemTime::now());
 
         let Some(resource) = state.resolve_tagged_resource(&input.resource_arn) else {
             return Err(not_found());

@@ -151,9 +151,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // A pure read: it resolves the ARN and reports what the resource carries,
-        // writing nothing.
-        let state = state.lock();
+        // A pure read: it resolves the ARN and reports what the resource carries, writing
+        // nothing of its own — only what the clock already owes, so a namespace whose
+        // delete operation has settled is gone here too.
+        let mut state = state.lock();
+        state.advance(std::time::SystemTime::now());
+
         let Some(resource) = state.resolve_tagged_resource(&input.resource_arn) else {
             return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
                 // This read carries no message: it reports the class in the error code

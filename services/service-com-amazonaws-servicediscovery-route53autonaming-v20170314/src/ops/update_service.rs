@@ -207,6 +207,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Route 53 below.
         let (operation_id, publication) = {
             let mut state = store.lock();
+            // Every transition the clock already owes, before anything is resolved.
+            state.advance(now);
 
             // `Id` is modelled as an `Arn` and documented as "the ID or Amazon Resource
             // Name (ARN) of the service that you want to update", so either form resolves
@@ -355,6 +357,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // on which call wrote the record.
                 Some(crate::state::stored_dns_config(config, &namespace_id))
             });
+            // The configuration this change would leave the service with must be one
+            // `DnsRecord$Type` documents, exactly as the create's must: the record types
+            // of a service cannot be changed here, so what this reaches is the sentence
+            // about a `CNAME` record and a health check — "You can't specify both CNAME
+            // for Type and settings for HealthCheckConfig" — against the records the
+            // service keeps.
+            let resulting_config = new_dns_config.as_ref().or(stored_dns_config.as_ref());
+            let resulting_types: Vec<&str> = resulting_config
+                .iter()
+                .flat_map(|config| config.dns_records.iter())
+                .map(|record| record.r#type.as_str())
+                .collect();
+            if let Some(message) = crate::state::dns_records::dns_config_violation(
+                &resulting_types,
+                resulting_config
+                    .and_then(|config| config.routing_policy.as_deref())
+                    .unwrap_or(crate::state::DEFAULT_ROUTING_POLICY),
+                input.service.health_check_config.is_some(),
+            ) {
+                return Err(UpdateServiceErrorModeled::InvalidInput(InvalidInput {
+                    message: Some(message),
+                })
+                .into());
+            }
             let health_check_changed = !same_health_check(
                 stored_health_check.as_ref(),
                 input.service.health_check_config.as_ref(),

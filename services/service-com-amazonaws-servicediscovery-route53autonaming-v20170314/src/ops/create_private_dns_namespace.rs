@@ -5,7 +5,9 @@
 //! Route 53 private hosted zone the namespace is backed by — associated with the requested
 //! `Vpc` — mints a `DNS_PRIVATE` namespace record carrying THAT zone's id, and files the
 //! `CREATE_NAMESPACE` operation whose id is this call's only output — the namespace id
-//! reaches the caller through that operation's `Targets` map.
+//! reaches the caller through that operation's `Targets` map. A `Vpc` Amazon EC2 holds no
+//! VPC for leaves that association impossible, so the operation lands `FAIL` and the
+//! staged namespace is rolled back with it.
 //!
 //! ## Shape of an operation
 //!
@@ -211,6 +213,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this service's state is held while the hop into Route 53 below runs.
         let (id, operation_id, name, arn) = {
             let mut state = store.lock();
+            // Every transition the clock already owes, including the removal a settled
+            // `DELETE_NAMESPACE` operation carries, so a name freed by a delete that has
+            // settled is creatable here and one whose delete is still running is not.
+            state.advance(now);
 
             // A replayed `CreatorRequestId` for the SAME name returns the operation the
             // first call filed rather than creating a second namespace — but only while
@@ -262,11 +268,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let id = state.next_id("ns", crate::state::RESOURCE_ID_DIGITS);
             let arn = crate::state::service_arn(&region, &format!("namespace/{id}"));
             // The operation is filed first because the namespace record carries its id:
-            // that is what a later create of the same name is refused with.
-            let operation_id = state.record_operation(
+            // that is what a later create of the same name is refused with. It carries the
+            // ROLL-BACK of the namespace below with it, so a create whose asynchronous
+            // step cannot complete leaves nothing behind once it lands `FAIL`.
+            let operation_id = state.record_operation_with_effect(
                 "CREATE_NAMESPACE",
                 now,
                 [("NAMESPACE".to_string(), id.clone())],
+                Some(crate::state::OperationEffect::RemoveUncreatedNamespace(
+                    id.clone(),
+                )),
             );
             let namespace = crate::state::NamespaceRecord {
                 arn: arn.clone(),
@@ -316,6 +327,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             (id, operation_id, name, arn)
         };
+
+        // A private namespace is "visible only inside a specified Amazon VPC", so its
+        // asynchronous step associates its hosted zone with the VPC the request named: a
+        // `Vpc` the account holds no VPC for leaves that step nothing to associate, and the
+        // operation this call already answered with lands `FAIL` carrying the documented
+        // `CANNOT_CREATE_HOSTED_ZONE` code rather than `SUCCESS`. The synchronous call
+        // still succeeds — the failure is reported through `GetOperation`, which is the
+        // channel this operation publishes its outcome on — and the namespace record the
+        // create staged is rolled back with that terminal status. EC2 answering nothing
+        // resolves nothing and the create goes on.
+        if crate::state::namespace_vpc::resolve(ctx, &region, &input.vpc).await
+            == crate::state::namespace_vpc::VpcPresence::Absent
+        {
+            store.lock().fail_when_due(
+                &operation_id,
+                crate::state::ERROR_CODE_CANNOT_CREATE_HOSTED_ZONE,
+                crate::state::namespace_vpc::absent_vpc_message(&input.vpc, &region),
+            );
+            return Ok(CreatePrivateDnsNamespaceOutput {
+                operation_id: Some(operation_id),
+            });
+        }
 
         // "When you create a private DNS namespace, Cloud Map automatically creates an
         // Amazon Route 53 private hosted zone that has the same name as the namespace"

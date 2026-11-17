@@ -267,6 +267,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         service.health_check_config.is_some(),
                     )
                 });
+
+            // The records the target service declares are what the registration has to
+            // carry a value for: each record type names the attribute Route 53 answers a
+            // query from ("This value is required if the service specified by ServiceId
+            // includes settings for an A record", and so on for the other types). Refused
+            // before anything is stored, so no instance is registered that no declared
+            // record could ever represent.
+            let declared_records: Vec<&str> = state
+                .services
+                .get(&service_id)
+                .and_then(|service| service.dns_config.as_ref())
+                .into_iter()
+                .flat_map(|config| config.dns_records.iter())
+                .map(|record| record.r#type.as_str())
+                .collect();
+            if let Some(message) = crate::state::dns_records::missing_required_attributes(
+                &declared_records,
+                &input.attributes,
+            ) {
+                return Err(RegisterInstanceErrorModeled::InvalidInput(InvalidInput {
+                    message: Some(message),
+                })
+                .into());
+            }
             let initial = input.attributes.get(INIT_HEALTH_STATUS_ATTRIBUTE);
             let health_status = if custom_health_check {
                 match initial.map(String::as_str) {

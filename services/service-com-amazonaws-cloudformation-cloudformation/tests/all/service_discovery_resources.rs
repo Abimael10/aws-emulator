@@ -31,8 +31,8 @@ use serde_json::Value;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
-    call, create_stack, member, router, settled_stack, stack_event_reasons, xml_text, xml_texts,
-    REGION,
+    call, create_stack, member, router, router_with_engine, settled_stack, stack_event_reasons,
+    xml_text, xml_texts, REGION,
 };
 
 /// How long one poll waits before the next, and how many are made, for the wait on a resource
@@ -54,6 +54,14 @@ const CLOUD_MAP_TARGET_PREFIX: &str = "Route53AutoNaming_v20170314";
 const NAMESPACE_NOT_FOUND: &str = "NamespaceNotFound";
 /// See [`NAMESPACE_NOT_FOUND`].
 const SERVICE_NOT_FOUND: &str = "ServiceNotFound";
+
+/// What a row's template writes where the VPC a private DNS namespace is created for goes.
+///
+/// A private namespace IS an association between a Route 53 private hosted zone and a VPC of
+/// the account, so Cloud Map resolves that VPC in Amazon EC2 when it creates the namespace.
+/// The id substituted here is read from EC2's own store rather than invented, so the
+/// declaration names a VPC that is really there.
+const VPC_ID_PLACEHOLDER: &str = "VPC_ID_OF_THIS_ACCOUNT";
 
 /// One AWS Cloud Map call over the `awsJson1_1` wire its model declares, signed for
 /// `servicediscovery` — that model's own `sigv4Name` — in the Region the stack's resources live
@@ -269,7 +277,8 @@ const ROWS: &[Row] = &[
             r#"{"Type":"A","TTL":"60"},{"Type":"AAAA","TTL":90}]}}},"#,
             r#""Instance":{"Type":"AWS::ServiceDiscovery::Instance","Properties":{"#,
             r#""InstanceId":"checkout-1","ServiceId":{"Fn::GetAtt":["Service","Id"]},"#,
-            r#""InstanceAttributes":{"AWS_INSTANCE_IPV4":"10.1.2.3"}}}},"#,
+            r#""InstanceAttributes":{"AWS_INSTANCE_IPV4":"10.1.2.3","#,
+            r#""AWS_INSTANCE_IPV6":"2001:db8::1"}}}},"#,
             r#""Outputs":{"#,
             r#""NamespaceRef":{"Value":{"Ref":"Namespace"}},"#,
             r#""NamespaceId":{"Value":{"Fn::GetAtt":["Namespace","Id"]}},"#,
@@ -288,7 +297,10 @@ const ROWS: &[Row] = &[
         service_type: "DNS_HTTP",
         dns_records: &[("A", 60), ("AAAA", 90)],
         instance_id: "checkout-1",
-        instance_attributes: &[("AWS_INSTANCE_IPV4", "10.1.2.3")],
+        instance_attributes: &[
+            ("AWS_INSTANCE_IPV4", "10.1.2.3"),
+            ("AWS_INSTANCE_IPV6", "2001:db8::1"),
+        ],
         tag: ("tier", "edge"),
     },
     Row {
@@ -300,7 +312,7 @@ const ROWS: &[Row] = &[
             "    Type: AWS::ServiceDiscovery::PrivateDnsNamespace\n",
             "    Properties:\n",
             "      Name: billing.internal\n",
-            "      Vpc: vpc-0123456789abcdef0\n",
+            "      Vpc: VPC_ID_OF_THIS_ACCOUNT\n",
             "      Properties:\n",
             "        DnsProperties:\n",
             "          SOA:\n",
@@ -363,11 +375,23 @@ const ROWS: &[Row] = &[
 /// and deleting the stack takes each of them away again.
 #[tokio::test]
 async fn a_stack_provisions_the_cloud_map_resources_it_declares() {
-    let router = router();
+    let (router, engine) = router_with_engine();
+    // The account's own VPC in the Region these stacks are deployed in, read from the Amazon
+    // EC2 store Cloud Map resolves a private namespace's `Vpc` against.
+    let held_vpc = {
+        let ec2 = engine
+            .state::<service_com_amazonaws_ec2_amazonec2::state::ComAmazonawsEc2Amazonec2State>();
+        let held = ec2
+            .lock()
+            .ensure_default_network(REGION)
+            .expect("the account holds a default VPC in this Region");
+        held
+    };
 
     for row in ROWS {
         let case = row.case;
-        let (status, body) = create_stack(&router, row.stack, row.template, &[]).await;
+        let template = row.template.replace(VPC_ID_PLACEHOLDER, &held_vpc);
+        let (status, body) = create_stack(&router, row.stack, &template, &[]).await;
         assert_eq!(
             status, 200,
             "case {case:?}: expected HTTP 200 from CreateStack, got {status} with body {body}"

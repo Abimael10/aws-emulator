@@ -20193,6 +20193,7 @@ dependencies = [
 name = "service-com-amazonaws-servicediscovery-route53autonaming-v20170314"
 version = "0.1.0"
 dependencies = [
+ "automod",
  "aws-emulator-build-support",
  "aws-emulator-emulator-telemetry",
  "aws-emulator-engine",
@@ -20200,6 +20201,7 @@ dependencies = [
  "aws-emulator-smithy-macros",
  "aws-emulator-smithy-schema-server",
  "aws-emulator-smithy-server-runtime",
+ "aws-sdk-ec2",
  "aws-sdk-route53",
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.1",
@@ -20209,6 +20211,7 @@ dependencies = [
  "hex",
  "http",
  "serde_json",
+ "service-com-amazonaws-ec2-amazonec2",
  "service-com-amazonaws-route53-awsdnsv20130401",
  "service-common",
  "sha2 0.10.9",

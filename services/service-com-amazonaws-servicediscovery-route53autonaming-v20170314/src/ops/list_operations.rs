@@ -266,6 +266,12 @@ fn unix_date(value: &str) -> Result<std::time::SystemTime, String> {
 /// a resource id, `EQ` for a date range — is refused over every filter of the request
 /// before this runs ([`unsupported_conditions`]), so what is left here is the value rules
 /// for a filter whose condition that matrix admits.
+///
+/// Those rules are the ones about HOW MANY values a condition takes, and the `UPDATE_DATE`
+/// range's two dates, which are read as instants to compare against. A value is NOT checked
+/// against an enumeration: `OperationFilter$Values` is modelled as `FilterValues`, an
+/// unconstrained list of strings, so a `STATUS` or `TYPE` term outside the model's enum
+/// MATCHES NOTHING and the listing answers an empty page rather than a client error.
 fn compile(filter: &OperationFilter) -> Result<Matcher, String> {
     let name = filter.name.as_str();
     let condition = filter.condition.as_deref().unwrap_or(CONDITION_EQ);
@@ -286,20 +292,6 @@ fn compile(filter: &OperationFilter) -> Result<Matcher, String> {
         ));
     }
 
-    /// Whether every filter value is one the named model enum accepts.
-    fn modelled(values: &[String], allowed: &[&str], shape: &str) -> Result<(), String> {
-        match values
-            .iter()
-            .find(|value| !allowed.contains(&value.as_str()))
-        {
-            Some(rejected) => Err(format!(
-                "{rejected} isn't a valid {shape}; valid values are {}.",
-                allowed.join(", ")
-            )),
-            None => Ok(()),
-        }
-    }
-
     match name {
         FILTER_NAMESPACE_ID => Ok(Matcher::Target {
             target_type: TARGET_NAMESPACE,
@@ -309,14 +301,8 @@ fn compile(filter: &OperationFilter) -> Result<Matcher, String> {
             target_type: TARGET_SERVICE,
             values: filter.values.clone(),
         }),
-        FILTER_STATUS => {
-            modelled(&filter.values, OPERATION_STATUS_VALUES, "OperationStatus")?;
-            Ok(Matcher::Status(filter.values.clone()))
-        }
-        FILTER_TYPE => {
-            modelled(&filter.values, OPERATION_TYPE_VALUES, "OperationType")?;
-            Ok(Matcher::Type(filter.values.clone()))
-        }
+        FILTER_STATUS => Ok(Matcher::Status(filter.values.clone())),
+        FILTER_TYPE => Ok(Matcher::Type(filter.values.clone())),
         // `UPDATE_DATE`, the only name left, and only with `BETWEEN`.
         _ => {
             if filter.values.len() != 2 {

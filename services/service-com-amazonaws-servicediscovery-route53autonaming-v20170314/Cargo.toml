@@ -40,6 +40,11 @@ aws-sdk-route53 = { version = "1", default-features = false }
 # Route 53 minted, through the shared engine, so this crate needs the owning service's state
 # TYPE — the same way Route 53 reaches the Amazon EC2 and CloudWatch stores.
 service-com-amazonaws-route53-awsdnsv20130401 = { workspace = true }
+# `state::namespace_vpc`: the in-process Amazon EC2 client that resolves the VPC a private
+# DNS namespace is visible inside, so a create naming a VPC the account does not hold fails
+# its asynchronous step instead of reporting success. Only the generated client is needed:
+# the emulator supplies the transport.
+aws-sdk-ec2 = { version = "1", default-features = false }
 
 # The constraint-refusal wording this service answers with, and the renaming of the
 # member an error body carries its text in: the shared collecting walk, the shared
@@ -50,6 +55,14 @@ service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
+
+[dev-dependencies]
+# `tests/all/main.rs` declares one module per suite file under `tests/all/`.
+automod = { workspace = true }
+# `tests/all/async_namespace_operations.rs`: the VPC a private DNS namespace is created
+# for is resolved in Amazon EC2, so the test mounts EC2 beside this service on the one
+# shared engine, exactly as the assembled emulator does.
+service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 
 [lints]
 workspace = true

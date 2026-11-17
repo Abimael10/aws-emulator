@@ -135,12 +135,6 @@ impl From<ListNamespacesErrorModeled> for ListNamespacesError {
 /// another paginated read is not honoured here.
 const NEXT_TOKEN_SCOPE: &str = "ListNamespaces";
 
-/// The values `NamespaceFilter$Values` documents for `RESOURCE_OWNER`: "Specify one of
-/// `SELF` or `OTHER_ACCOUNTS`." The other filter names compare against a namespace
-/// member rather than an enumeration, and `TYPE`'s values are the generated
-/// `NAMESPACE_TYPE_VALUES`.
-const RESOURCE_OWNERS: [&str; 2] = ["SELF", "OTHER_ACCOUNTS"];
-
 /// The filter name whose values name an account rather than a namespace field.
 const FILTER_RESOURCE_OWNER: &str = "RESOURCE_OWNER";
 
@@ -197,12 +191,16 @@ fn invalid_input(message: String) -> ListNamespacesError {
 
 /// Why `filter` cannot be applied, or `Ok(())` when it can.
 ///
-/// Every rule here comes from the documentation on `NamespaceFilter`: the filter names
-/// are the modelled `NamespaceFilterName` enum, each filter takes exactly one value
-/// ("you can specify only one value"), and the values an equality comparison accepts
-/// for `TYPE` and `RESOURCE_OWNER` are the enumerated ones. The `Condition` itself is
-/// checked over EVERY filter first ([`unsupported_conditions`]), because the refusal
-/// reports all of them together.
+/// Every rule here comes from the model and the documentation on `NamespaceFilter`: the
+/// filter names are the modelled `NamespaceFilterName` enum, and each filter takes exactly
+/// one value ("you can specify only one value"). The `Condition` itself is checked over
+/// EVERY filter first ([`unsupported_conditions`]), because the refusal reports all of them
+/// together.
+///
+/// `Values` is NOT checked against any catalog: the member is modelled as `FilterValues`, an
+/// unconstrained list of strings, so a well-formed filter whose value names no namespace
+/// type, account or name simply MATCHES NOTHING and the listing answers an empty page —
+/// a value outside an enumeration is a term that selects no record, not a bad request.
 fn filter_rejection(filter: &NamespaceFilter) -> Result<(), String> {
     if !NAMESPACE_FILTER_NAME_VALUES.contains(&filter.name.as_str()) {
         return Err(format!(
@@ -211,30 +209,10 @@ fn filter_rejection(filter: &NamespaceFilter) -> Result<(), String> {
             NAMESPACE_FILTER_NAME_VALUES.join(", ")
         ));
     }
-    let condition = filter.condition.as_deref().unwrap_or(CONDITION_EQ);
     if filter.values.len() != 1 {
         return Err(format!(
             "Filters.Values must contain exactly one value, but {} were specified.",
             filter.values.len()
-        ));
-    }
-    let value = filter.values[0].as_str();
-    // Only an equality comparison names a whole enumerated value; a `BEGINS_WITH`
-    // value is a PREFIX of one (`DNS_` matches both DNS types), so the catalog does
-    // not apply to it.
-    if condition == CONDITION_EQ
-        && filter.name == "TYPE"
-        && !NAMESPACE_TYPE_VALUES.contains(&value)
-    {
-        return Err(format!(
-            "Filters.Values {value} isn't a valid namespace type. Valid values are {}.",
-            NAMESPACE_TYPE_VALUES.join(", ")
-        ));
-    }
-    if filter.name == FILTER_RESOURCE_OWNER && !RESOURCE_OWNERS.contains(&value) {
-        return Err(format!(
-            "Filters.Values {value} isn't a valid resource owner. Valid values are {}.",
-            RESOURCE_OWNERS.join(", ")
         ));
     }
     Ok(())
@@ -350,7 +328,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        let state = state.lock();
+        let mut state = state.lock();
+        // A namespace whose delete operation the clock has already settled is gone
+        // whether or not anybody polled that operation, so this listing applies what is
+        // owed before it reads the record map. Nothing else is written here.
+        state.advance(std::time::SystemTime::now());
         // The namespace id is this listing's stable order: a token names the first id
         // NOT returned, so a resumed call continues at the first id at or after it even
         // if that namespace was deleted between the two calls.

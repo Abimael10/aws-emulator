@@ -146,10 +146,6 @@ const CONDITION_EQ: &str = "EQ";
 const FILTER_NAMESPACE_ID: &str = "NAMESPACE_ID";
 const FILTER_RESOURCE_OWNER: &str = "RESOURCE_OWNER";
 
-/// The values `ServiceFilter$Values` documents for `RESOURCE_OWNER`: "Specify one of
-/// `SELF` or `OTHER_ACCOUNTS`."
-const RESOURCE_OWNERS: [&str; 2] = ["SELF", "OTHER_ACCOUNTS"];
-
 /// The conditions each service filter supports, from `ServiceFilter$Condition`: `EQ` is
 /// the only one it lists, for either filter name. `None` for a name this filter does not
 /// declare, which is refused as a bad filter NAME rather than for its condition.
@@ -215,12 +211,15 @@ impl Matcher {
 
 /// Compile one request filter into a [`Matcher`], or say why the request is invalid.
 ///
-/// Every rule here comes from the documentation on `ServiceFilter`: the filter names are
-/// the modelled `ServiceFilterName` enum, `EQ` takes exactly one value ("When you specify
-/// `EQ`, specify one value"), a `NAMESPACE_ID` value is "one namespace ID or ARN", and a
-/// `RESOURCE_OWNER` value is one of `SELF` or `OTHER_ACCOUNTS`. The `Condition` itself is
-/// checked over EVERY filter first ([`unsupported_conditions`]), because the refusal
-/// reports all of them together.
+/// Every rule here comes from the model and the documentation on `ServiceFilter`: the filter
+/// names are the modelled `ServiceFilterName` enum, `EQ` takes exactly one value ("When you
+/// specify `EQ`, specify one value"), and a `NAMESPACE_ID` value is "one namespace ID or
+/// ARN". The `Condition` itself is checked over EVERY filter first
+/// ([`unsupported_conditions`]), because the refusal reports all of them together.
+///
+/// `Values` is NOT checked against any catalog: the member is modelled as `FilterValues`, an
+/// unconstrained list of strings, so a value naming no namespace or no documented resource
+/// owner MATCHES NOTHING and the listing answers an empty page.
 fn compile(
     filter: &ServiceFilter,
     state: &crate::state::ComAmazonawsServicediscoveryRoute53autonamingV20170314State,
@@ -245,15 +244,11 @@ fn compile(
                 .resolve_namespace_id(value)
                 .unwrap_or_else(|| value.to_string()),
         )),
-        // `RESOURCE_OWNER`, the only name left.
+        // `RESOURCE_OWNER`, the only name left. Every resource this emulator holds was
+        // created through this account, so `SELF` selects all of them and any other value
+        // — `OTHER_ACCOUNTS`, or a term naming no owner at all — selects none.
         _ => {
             debug_assert_eq!(filter.name.as_str(), FILTER_RESOURCE_OWNER);
-            if !RESOURCE_OWNERS.contains(&value) {
-                return Err(format!(
-                    "Filters.Values {value} isn't a valid resource owner. Valid values are {}.",
-                    RESOURCE_OWNERS.join(", ")
-                ));
-            }
             Ok(Matcher::OwnedBySelf(value == RESOURCE_OWNER_SELF))
         }
     }
@@ -328,7 +323,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         };
 
-        let state = state.lock();
+        let mut state = state.lock();
+        // A namespace whose delete operation the clock has already settled is gone
+        // whether or not anybody polled that operation, so a `NAMESPACE_ID` filter
+        // resolves against the namespaces that are really there. Nothing else is written.
+        state.advance(std::time::SystemTime::now());
 
         // "If you specify more than one filter, an operation must match all filters to
         // be returned by ListServices." Every filter is compiled BEFORE any record is

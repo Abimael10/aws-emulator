@@ -74,12 +74,24 @@ fn ids(response: &Value) -> BTreeSet<String> {
         .collect()
 }
 
-/// Longer than [`cloudmap::state::OPERATION_SUCCESS_SPAN`], so every operation filed
-/// before the sleep has reached its terminal status by the time the list is read.
-fn settle() {
-    // Blocking is fine here: the test owns the runtime, and the service never sleeps
-    // for this span — it stores the due instant and materialises it on read.
-    std::thread::sleep(cloudmap::state::OPERATION_SUCCESS_SPAN + Duration::from_millis(50));
+/// Wait until every operation filed so far has reached its terminal status.
+///
+/// The service stores each operation's due instant and materialises the transition on
+/// read rather than sleeping for it, so this waits for the CONDITION — no record still
+/// `SUBMITTED` — instead of for a duration; the deadline only keeps a test that will
+/// never see it from hanging.
+async fn settle(router: &MultiServiceRouter) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let listed = ok(router, "ListOperations", json!({})).await;
+        let owed = summaries(&listed)
+            .into_iter()
+            .any(|(_, status)| status == "SUBMITTED");
+        if !owed || std::time::Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 /// Every operation a mutating call files is reported by `ListOperations`, with the same
@@ -102,7 +114,7 @@ async fn list_operations_reports_every_record_the_mutating_calls_filed() {
         .as_str()
         .expect("DeregisterInstance returns an OperationId")
         .to_string();
-    settle();
+    settle(&router).await;
 
     let expected: BTreeSet<String> = [
         create_namespace.clone(),
@@ -154,7 +166,7 @@ async fn every_filter_name_and_condition_selects_the_matching_operations() {
     let service_b = service(&router, &namespace_b, "filters-svc-b").await;
     let register_a = register(&router, &service_a, "i-a").await;
     let register_b = register(&router, &service_b, "i-b").await;
-    settle();
+    settle(&router).await;
     // One record whose success the clock does not owe yet, so the two STATUS rows
     // below are decided by the stored due instant rather than by how long the test's
     // own requests take.
@@ -368,16 +380,9 @@ async fn an_unsupported_filter_is_refused_with_invalid_input() {
             "no values at all",
             json!({ "Filters": [{ "Name": "TYPE", "Values": [] }] }),
         ),
-        (
-            // `OperationStatus` is `SUBMITTED`/`PENDING`/`SUCCESS`/`FAIL`; the prose
-            // spelling "SUCCEED" is not a value the enum accepts.
-            "a STATUS value outside the model's enum",
-            json!({ "Filters": [{ "Name": "STATUS", "Values": ["SUCCEED"] }] }),
-        ),
-        (
-            "a TYPE value outside the model's enum",
-            json!({ "Filters": [{ "Name": "TYPE", "Values": ["CREATE_SERVICE"] }] }),
-        ),
+        // A filter VALUE outside an enumeration is not refused: `OperationFilter$Values`
+        // is modelled as an unconstrained string list, so such a filter matches nothing
+        // and the listing answers an empty page — see `list_filter_values_are_opaque`.
         (
             "a NextToken this operation never minted",
             json!({ "NextToken": "not-a-token-from-this-emulator" }),

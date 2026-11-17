@@ -144,7 +144,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let state = state.lock();
+        let mut state = state.lock();
+        // A namespace whose delete operation the clock has already settled is gone
+        // whether or not anybody polled that operation, so this read applies what is
+        // owed before it resolves the reference. Nothing else is written here.
+        state.advance(std::time::SystemTime::now());
         let Some(namespace) = state
             .resolve_namespace_id(&input.id)
             .and_then(|id| state.namespaces.get(&id).cloned())

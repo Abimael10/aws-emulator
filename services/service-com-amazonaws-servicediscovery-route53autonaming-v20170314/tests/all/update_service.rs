@@ -43,6 +43,11 @@ const MAX_FAILURE_THRESHOLD: i64 = 10;
 
 /// Create a service in `namespace_id` from the extra request members a row needs,
 /// returning its id.
+///
+/// A `DnsConfig` whose records include a `CNAME` is created `WEIGHTED`: "You must specify
+/// `WEIGHTED` for the value of `RoutingPolicy`" (`DnsRecord$Type`, under `CNAME`), so a row
+/// that states no policy would otherwise ask for one the service refuses. Every other row
+/// keeps the policy it stated, or the default when it stated none.
 async fn dns_service(
     router: &MultiServiceRouter,
     namespace_id: &str,
@@ -54,6 +59,13 @@ async fn dns_service(
         for (key, value) in members {
             body[key.as_str()] = value;
         }
+    }
+    let records = body["DnsConfig"]["DnsRecords"].clone();
+    let cnamed = records
+        .as_array()
+        .is_some_and(|records| records.iter().any(|record| record["Type"] == json!("CNAME")));
+    if cnamed && body["DnsConfig"]["RoutingPolicy"].is_null() {
+        body["DnsConfig"]["RoutingPolicy"] = json!("WEIGHTED");
     }
     let created = ok(router, "CreateService", body).await;
     created["Service"]["Id"]

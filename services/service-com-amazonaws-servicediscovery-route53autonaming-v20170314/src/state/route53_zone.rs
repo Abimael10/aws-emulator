@@ -42,22 +42,10 @@ use super::{ComAmazonawsServicediscoveryRoute53autonamingV20170314State, Service
 /// passed separately, where a zone association needs it.
 const ROUTE53_SIGNING_REGION: &str = "us-east-1";
 
-/// The `AWS_INSTANCE_IPV4` attribute: "If the service configuration includes an `A` record,
-/// the IPv4 address that you want Route 53 to return in response to DNS queries"
-/// (`RegisterInstanceRequest$Attributes`).
-const ATTRIBUTE_IPV4: &str = "AWS_INSTANCE_IPV4";
-
-/// The `AWS_INSTANCE_IPV6` attribute, which carries an `AAAA` record's address for the same
-/// reason.
-const ATTRIBUTE_IPV6: &str = "AWS_INSTANCE_IPV6";
-
-/// The `AWS_INSTANCE_CNAME` attribute: "If the service configuration includes a `CNAME`
-/// record, the domain name that you want Route 53 to return in response to DNS queries".
-const ATTRIBUTE_CNAME: &str = "AWS_INSTANCE_CNAME";
-
-/// The `AWS_INSTANCE_PORT` attribute: "If the service includes an `SRV` record, the value
-/// that you want Route 53 to return for the port".
-const ATTRIBUTE_PORT: &str = "AWS_INSTANCE_PORT";
+/// The instance attributes a record's value is read from, and the record types a service
+/// declares: `super::dns_records` is the one home for both, so the keys this module reads an
+/// instance's address out of are the keys `RegisterInstance` requires it to carry.
+use super::dns_records::{ATTRIBUTE_CNAME, ATTRIBUTE_IPV4, ATTRIBUTE_IPV6, ATTRIBUTE_PORT};
 
 /// The `RoutingPolicy` value under which each instance's record set is one answer among
 /// several ("Route 53 returns the applicable value for up to eight instances").

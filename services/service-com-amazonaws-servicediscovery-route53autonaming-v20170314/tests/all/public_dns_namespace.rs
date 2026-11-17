@@ -331,12 +331,14 @@ async fn a_token_is_not_replayed_once_its_namespace_is_deleted() {
         json!({ "Id": first_namespace.clone() }),
     )
     .await;
-    let (status, code) = failure(&router, "GetNamespace", json!({ "Id": first_namespace.clone() })).await;
-    assert_eq!(
-        (status, code.as_str()),
-        (400, "NamespaceNotFound"),
-        "the deleted namespace must stop resolving"
-    );
+    // The removal is the change the delete's operation carries, so the token goes stale
+    // when that operation lands.
+    crate::async_namespace_operations::deleted_namespace(
+        &router,
+        "a token whose namespace was deleted",
+        &first_namespace,
+    )
+    .await;
 
     let again = create(&router, body).await;
     assert_ne!(

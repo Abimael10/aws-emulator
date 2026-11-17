@@ -334,9 +334,12 @@ async fn every_service_reports_a_dns_config_whichever_records_it_registers() {
             json!([{ "Type": "SRV", "TTL": 10 }]),
         ),
         (
+            // `DnsRecord$Type`, under `CNAME`: "You must specify WEIGHTED for the value of
+            // RoutingPolicy", so this is the policy a CNAME service is created under.
             "a CNAME record an update deleted again",
             dns_namespace_id.as_str(),
-            json!({ "DnsRecords": [{ "Type": "CNAME", "TTL": 120 }] }),
+            json!({ "RoutingPolicy": "WEIGHTED",
+                    "DnsRecords": [{ "Type": "CNAME", "TTL": 120 }] }),
             true,
             json!([]),
         ),

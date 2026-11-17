@@ -42,6 +42,7 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+mod enum_value_sets;
 mod error_message_member;
 mod submitted_collections;
 mod submitted_map;
@@ -124,13 +125,17 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // so every operation of this service answers a boundary refusal with the code
         // its own model declares, the way a handler does for the rules the model
         // cannot express. The framework's message is kept: it already names the member
-        // and the constraint it failed, in the envelope AWS itself uses.
+        // and the constraint it failed, in the envelope AWS itself uses. What this service
+        // states of its own is the ORDER an enumerated type's admissible set is listed in
+        // ([`enum_value_sets`]), a fact of the front door holding those values in a table
+        // rather than of the model's declaration.
         match refusal {
             Refusal::Invalid(violations) => Some(Refused {
                 code: "InvalidInput".to_string(),
-                message: aws_smithy_schema_server::envelope(violations).unwrap_or_else(|| {
-                    "One or more specified values aren't valid.".to_string()
-                }),
+                message: aws_smithy_schema_server::envelope(
+                    &enum_value_sets::as_this_service_states(violations),
+                )
+                .unwrap_or_else(|| "One or more specified values aren't valid.".to_string()),
             }),
             // Authentication is the emulator's, not this service's: its model declares
             // no shape for a refused caller, so the framework's 403 stands.

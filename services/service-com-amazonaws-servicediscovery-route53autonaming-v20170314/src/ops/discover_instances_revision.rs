@@ -165,8 +165,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Reporting only: the revision is read off the stored service record, so this
-        // call changes nothing a later caller sees.
-        let state = state.lock();
+        // call changes nothing a later caller sees. What the clock already owes — a
+        // namespace whose delete operation has settled — is applied first, so the
+        // resolution sees the namespaces that are really there.
+        let mut state = state.lock();
+        state.advance(std::time::SystemTime::now());
 
         // `NamespaceName` is the namespace's `HttpName` (which equals its `Name`
         // unless a reused name forced a hash onto it), never its id — the same

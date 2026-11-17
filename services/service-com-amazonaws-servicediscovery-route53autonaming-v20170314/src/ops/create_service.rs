@@ -4,7 +4,8 @@
 //! Implemented: a synchronous create that returns the full `Service` computed from the
 //! record it just persisted, and keeps the owning namespace's `ServiceCount` true. A
 //! `DnsConfig` against a namespace that holds no hosted zone is refused with
-//! `InvalidInput`.
+//! `InvalidInput`, as is one whose record types, routing policy and health check are not
+//! a combination `DnsRecord$Type` documents.
 //!
 //! ## Shape of an operation
 //!
@@ -245,6 +246,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             declared.push(record_type);
         }
 
+        // The rest of what `DnsRecord$Type` documents about a record configuration: which
+        // type combinations Cloud Map registers records for, and the routing policy and
+        // health check a `CNAME` record admits. Applied to the configuration as it would be
+        // STORED — the routing policy a request that named none gets is the one the records
+        // would be served under — so the refusal follows from what the service would do,
+        // not from which members the request happened to carry.
+        if let Some(message) = crate::state::dns_records::dns_config_violation(
+            &declared,
+            input
+                .dns_config
+                .as_ref()
+                .and_then(|dns_config| dns_config.routing_policy.as_deref())
+                .unwrap_or(crate::state::DEFAULT_ROUTING_POLICY),
+            input.health_check_config.is_some(),
+        ) {
+            return Err(CreateServiceErrorModeled::InvalidInput(InvalidInput {
+                message: Some(message),
+            })
+            .into());
+        }
+
         // The namespace is named either directly or by the (deprecated)
         // `DnsConfig.NamespaceId`; one of the two must be present.
         let Some(namespace_reference) = input
@@ -269,6 +291,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
         let now = std::time::SystemTime::now();
         let mut state = state.lock();
+        // Every transition the clock already owes, including the removal a settled
+        // `DELETE_NAMESPACE` operation carries, before the namespace is resolved.
+        state.advance(now);
 
         // The message is the namespace reference the request named and nothing else:
         // this create reports which namespace it could not resolve, with no sentence

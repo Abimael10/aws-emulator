@@ -6,7 +6,9 @@
 //! `DELETE_NAMESPACE` operation record `GetOperation` reads back. The namespace is
 //! addressed by its id or its ARN (the member is modelled as `Arn`), a namespace that
 //! still holds services is refused with `ResourceInUse`, and a delete still in progress
-//! for the same namespace is refused with `DuplicateRequest`.
+//! for the same namespace is refused with `DuplicateRequest`. The removal is the change
+//! that operation's SUCCESS carries, so the namespace is still readable while the
+//! operation is non-terminal.
 //!
 //! ## Shape of an operation
 //!
@@ -166,28 +168,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this service's state is held while the hop into Route 53 below runs.
         let (operation_id, hosted_zone_id) = {
             let mut state = store.lock();
+            // Every transition the clock already owes — including the removal an earlier
+            // delete's operation carries — is applied before this request resolves
+            // anything, so what it sees never depends on who polled last.
+            state.advance(now);
 
             let Some(namespace_id) = state.resolve_namespace_id(&input.id) else {
-                // No record under this reference. While a delete already filed for it is
-                // still owed its terminal status, this request is the one the model calls
-                // `DuplicateRequest` ("the operation is already in progress"), and it
-                // carries the id of that operation so the caller polls it rather than
-                // filing a second delete. Once that operation settles the same request is
-                // a plain `NamespaceNotFound`.
-                if let Some(in_progress) =
-                    delete_in_progress(&state, referenced_namespace_id(&input.id), now)
-                {
-                    return Err(DeleteNamespaceErrorModeled::DuplicateRequest(
-                        DuplicateRequest {
-                            message: Some(format!(
-                                "The deletion of namespace {} is already in progress.",
-                                input.id
-                            )),
-                            duplicate_operation_id: Some(in_progress),
-                        },
-                    )
-                    .into());
-                }
                 return Err(DeleteNamespaceErrorModeled::NamespaceNotFound(
                     // The message is the namespace reference the request named and nothing
                     // else: this delete reports which reference it could not resolve, with
@@ -200,6 +186,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             };
 
+            // A delete of this namespace that the clock has not settled yet is the
+            // operation already in progress, so a second request is the modelled
+            // `DuplicateRequest` naming it rather than a second delete of one namespace.
+            if let Some(in_progress) = delete_in_progress(&state, &namespace_id, now) {
+                return Err(DeleteNamespaceErrorModeled::DuplicateRequest(
+                    DuplicateRequest {
+                        message: Some(format!(
+                            "The deletion of namespace {} is already in progress.",
+                            input.id
+                        )),
+                        duplicate_operation_id: Some(in_progress),
+                    },
+                )
+                .into());
+            }
+
             // "If the namespace still contains one or more services, the request fails."
             // The count is derived from the service map, so it can never disagree with the
             // `ServiceCount` `GetNamespace` reports.
@@ -210,34 +212,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
 
-            let removed = state
-                .namespaces
-                .remove(&namespace_id)
-                .expect("the resolved namespace id is present");
-            // The name index is maintained beside the record map, so the deleted name
-            // stops resolving here too: a later create of the same name is a create, not
-            // a conflict with a namespace nobody can read any more.
-            if state
-                .namespace_ids_by_name
-                .get(&removed.name)
-                .is_some_and(|indexed| *indexed == namespace_id)
-            {
-                state.namespace_ids_by_name.remove(&removed.name);
-            }
-
             // Like every other mutating call in this service, the delete files an
             // `Operation` record that starts `SUBMITTED` and reaches `SUCCESS` when the
-            // clock owes it; `GetOperation` reads it back.
-            let operation_id = state.record_operation(
+            // clock owes it; `GetOperation` reads it back. The REMOVAL rides on that
+            // record: it is the change the operation's success carries, so the namespace
+            // stays readable — the pre-success invariant a client polling the operation
+            // relies on — until the operation reports `SUCCESS`.
+            let hosted_zone_id = state
+                .namespaces
+                .get(&namespace_id)
+                .and_then(|namespace| namespace.hosted_zone_id.clone());
+            let operation_id = state.record_operation_with_effect(
                 "DELETE_NAMESPACE",
                 now,
-                [("NAMESPACE".to_string(), namespace_id)],
+                [("NAMESPACE".to_string(), namespace_id.clone())],
+                Some(crate::state::OperationEffect::RemoveDeletedNamespace(
+                    namespace_id,
+                )),
             );
-            (operation_id, removed.hosted_zone_id)
+            (operation_id, hosted_zone_id)
         };
         // The hosted zone belongs to the namespace, so it goes away with it: a namespace
         // holds no services by the time it can be deleted, so the zone holds nothing but
-        // its own delegation records by then.
+        // its own delegation records by then. Route 53 is asked as the delete is requested,
+        // which is where this service can make the hop at all — the namespace record itself
+        // goes when the operation settles, and keeps reporting the zone it was created with
+        // until then, as a client reading a namespace mid-delete sees.
         if let Some(hosted_zone_id) = hosted_zone_id.as_deref() {
             crate::state::route53_zone::delete_namespace_zone(ctx.callback(), hosted_zone_id).await;
         }
@@ -246,15 +246,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             operation_id: Some(operation_id),
         })
     }
-}
-
-/// The namespace id a reference names: an id is itself, and an ARN's resource id is the
-/// segment after its last `/` (`arn:…:servicediscovery:…:namespace/ns-…`).
-///
-/// Only needed once the record is gone, where `resolve_namespace_id` has no stored ARN
-/// left to match against.
-fn referenced_namespace_id(reference: &str) -> &str {
-    reference.rsplit('/').next().unwrap_or(reference)
 }
 
 /// The id of a `DELETE_NAMESPACE` operation for `namespace_id` that the clock has not

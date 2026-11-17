@@ -195,6 +195,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
         let now = std::time::SystemTime::now();
         let mut state = state.lock();
+        // Every transition the clock already owes, including the removal a settled
+        // `DELETE_NAMESPACE` operation carries, so a name freed by a delete that has
+        // settled is creatable here and one whose delete is still running is not.
+        state.advance(now);
 
         // A replayed `CreatorRequestId` for the SAME name returns the operation the
         // first call filed rather than creating a second namespace — but only while

@@ -358,10 +358,9 @@ async fn an_unusable_filter_or_foreign_token_is_refused_as_invalid_input() {
             "no value at all",
             json!({ "Filters": [{ "Name": "NAMESPACE_ID", "Values": [] }] }),
         ),
-        (
-            "a RESOURCE_OWNER value that names no owner",
-            json!({ "Filters": [{ "Name": "RESOURCE_OWNER", "Values": ["EVERYONE"] }] }),
-        ),
+        // A filter VALUE outside an enumeration is not refused: `ServiceFilter$Values` is
+        // modelled as an unconstrained string list, so such a filter matches nothing and
+        // the listing answers an empty page — see `list_filter_values_are_opaque`.
         (
             "a NextToken this service never issued",
             json!({ "NextToken": "not-a-token" }),

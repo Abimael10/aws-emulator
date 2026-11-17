@@ -12,8 +12,6 @@
 //! Every request goes through `MultiServiceRouter::dispatch`, the same path the emulator
 //! serves in production; the harness lives in `cloud_map_core`.
 
-use std::time::{Duration, Instant};
-
 use serde_json::{json, Value};
 use service_com_amazonaws_servicediscovery_route53autonaming_v20170314 as cloudmap;
 use smithy_server_runtime::MultiServiceRouter;
@@ -127,7 +125,9 @@ async fn a_delete_removes_the_namespace_it_names_and_files_its_operation() {
              status, got {operation}"
         );
 
-        // The record is gone under BOTH the forms that used to reach it.
+        // The removal is the change the delete's operation carries, so it lands when that
+        // operation does — under BOTH the forms that used to reach the record.
+        crate::async_namespace_operations::deleted_namespace(&router, case, &namespace_id).await;
         for (form, named) in [("id", &namespace_id), ("ARN", &namespace_arn)] {
             let (status, code) = failure(&router, "GetNamespace", json!({ "Id": named })).await;
             assert_eq!(
@@ -225,12 +225,12 @@ async fn a_namespace_that_still_holds_services_is_refused_and_left_alone() {
             deleted["OperationId"].is_string(),
             "case {service_count} service(s): an emptied namespace deletes, got {deleted}"
         );
-        let (status, code) = failure(&router, "GetNamespace", json!({ "Id": namespace_id })).await;
-        assert_eq!(
-            (status, code.as_str()),
-            (400, "NamespaceNotFound"),
-            "case {service_count} service(s): the emptied namespace is gone"
-        );
+        crate::async_namespace_operations::deleted_namespace(
+            &router,
+            &format!("{service_count} service(s)"),
+            &namespace_id,
+        )
+        .await;
     }
 }
 
@@ -278,6 +278,14 @@ async fn a_create_token_is_not_replayed_once_its_namespace_is_deleted() {
         json!({ "Id": namespace_id.clone() }),
     )
     .await;
+    // The delete's removal lands when its operation settles, and only then is the token
+    // stale: until the namespace is gone the same token is still a replay.
+    crate::async_namespace_operations::deleted_namespace(
+        &router,
+        "token replayed once the namespace is deleted",
+        &namespace_id,
+    )
+    .await;
 
     let recreated = ok(
         &router,
@@ -319,7 +327,7 @@ async fn a_create_token_is_not_replayed_once_its_namespace_is_deleted() {
 /// operation.
 #[tokio::test]
 async fn a_delete_in_progress_is_a_duplicate_and_a_settled_one_is_not_found() {
-    let router = emulator();
+    let (router, engine) = emulator_with_engine();
 
     for case in ["nothing was ever created under this id", "an ARN nothing minted"] {
         let named = if case.contains("ARN") {
@@ -338,7 +346,6 @@ async fn a_delete_in_progress_is_a_duplicate_and_a_settled_one_is_not_found() {
     }
 
     let (_, namespace_id) = namespace(&router, "duplicate-ns").await;
-    let started = Instant::now();
     let deleted = ok(
         &router,
         "DeleteNamespace",
@@ -350,6 +357,10 @@ async fn a_delete_in_progress_is_a_duplicate_and_a_settled_one_is_not_found() {
         .expect("an OperationId")
         .to_string();
 
+    // Whether the retry is a duplicate is decided by the STORED due instant, not by how
+    // long this test's own requests take: while the clock does not owe the first delete
+    // its terminal status, the retry is the duplicate and names the operation running.
+    crate::async_namespace_operations::set_operation_due(&engine, &delete_operation, false);
     let (status, retry) = call(
         &router,
         "DeleteNamespace",
@@ -363,37 +374,20 @@ async fn a_delete_in_progress_is_a_duplicate_and_a_settled_one_is_not_found() {
         .next()
         .unwrap_or_default()
         .to_string();
-    if started.elapsed() < cloudmap::state::OPERATION_SUCCESS_SPAN {
-        // The first delete is still owed its terminal status, so the retry is the
-        // duplicate — and it names the operation already running.
-        assert_eq!(
-            (status, code.as_str()),
-            (400, "DuplicateRequest"),
-            "a retry inside the operation's span is a duplicate, got {retry}"
-        );
-        assert_eq!(
-            retry["DuplicateOperationId"],
-            json!(delete_operation),
-            "DuplicateRequest names the delete already in progress, got {retry}"
-        );
-    } else {
-        assert_eq!(
-            (status, code.as_str()),
-            (400, "NamespaceNotFound"),
-            "past the span the retry is a plain not-found, got {retry}"
-        );
-    }
+    assert_eq!(
+        (status, code.as_str()),
+        (400, "DuplicateRequest"),
+        "a retry while the first delete is still running is a duplicate, got {retry}"
+    );
+    assert_eq!(
+        retry["DuplicateOperationId"],
+        json!(delete_operation),
+        "DuplicateRequest names the delete already in progress, got {retry}"
+    );
 
-    // Blocking is fine here: the test owns the runtime, and the service never sleeps for
-    // this span — it stores the due instant and materialises it on read.
-    std::thread::sleep(cloudmap::state::OPERATION_SUCCESS_SPAN + Duration::from_millis(50));
-
-    let settled = ok(
-        &router,
-        "GetOperation",
-        json!({ "OperationId": delete_operation }),
-    )
-    .await;
+    crate::async_namespace_operations::set_operation_due(&engine, &delete_operation, true);
+    let settled =
+        crate::async_namespace_operations::settled_operation(&router, &delete_operation).await;
     assert_eq!(
         settled["Operation"]["Status"],
         json!("SUCCESS"),

@@ -161,6 +161,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = std::time::SystemTime::now();
         let mut state = state.lock();
+        // Every transition the clock already owes, including the removal a settled
+        // `DELETE_NAMESPACE` operation carries, before the reference is resolved.
+        state.advance(now);
 
         // `Id` is modelled as an `Arn` and documented as "the ID or Amazon Resource Name
         // (ARN) of the namespace", so either form resolves to the one stored record.
