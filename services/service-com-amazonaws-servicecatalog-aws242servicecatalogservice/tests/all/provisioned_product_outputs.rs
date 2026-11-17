@@ -10,6 +10,11 @@
 //!   CloudFormation stack and its underlying resources": the launch stands up the stack
 //!   AWS names `SC-<account id>-<provisioned product id>`, submitting the product
 //!   version's template with the provisioning parameters the request carried;
+//! * what the provisioning request passes on to CloudFormation is what that stack is
+//!   created with: one stack parameter per key its `ProvisioningParameters` name (the last
+//!   value winning for a key named more than once, the template's own `Default` in force
+//!   for a key the request does not name) and the SNS topics its `NotificationArns` name,
+//!   "passed to CloudFormation ... to which to publish stack-related events";
 //! * the outputs of a provisioned product ARE that stack's outputs — every key, value and
 //!   description is the one CloudFormation holds, and a launch whose template declares
 //!   none reports none;
@@ -29,7 +34,8 @@
 //! declares (none, one, several), where an output's value comes from (a literal, a
 //! parameter the request supplied, a resource the stack stood up), whether an output
 //! carries a description, how the provisioned product is addressed (id, name), how many
-//! keys are selected and how large a page is.
+//! keys are selected and how large a page is, and — for what a launch submits — how many
+//! topics and parameters the request carries and whether it names one key twice.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -118,6 +124,52 @@ fn xml_value(body: &str, tag: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The `<member>` entries of the first `tag` list of an XML body, each as the XML it holds,
+/// in wire order — the list form of [`xml_value`], which reads a leaf.
+fn list_members(body: &str, tag: &str) -> Vec<String> {
+    let Some(block) = body
+        .split(&format!("<{tag}>"))
+        .nth(1)
+        .and_then(|rest| rest.split(&format!("</{tag}>")).next())
+    else {
+        return Vec::new();
+    };
+    block
+        .split("<member")
+        .skip(1)
+        // The first entry of a list carries the envelope's `xmlns`, so the element is
+        // matched by name and what it holds starts after its opening tag.
+        .filter_map(|entry| entry.split_once('>'))
+        .filter_map(|(_, held)| held.split("</member>").next())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The parameters one stack carries, as `key -> value`, read out of the `<Parameters>`
+/// block of a `DescribeStacks` answer
+/// (`<Parameters><member><ParameterKey/><ParameterValue/></member></Parameters>`).
+fn stack_parameters(case: &str, described: &str) -> BTreeMap<String, String> {
+    list_members(described, "Parameters")
+        .iter()
+        .map(|member| {
+            let key = xml_value(member, "ParameterKey").unwrap_or_else(|| {
+                panic!("case {case:?}: a stack parameter has no ParameterKey: {member}")
+            });
+            let value = xml_value(member, "ParameterValue").unwrap_or_else(|| {
+                panic!("case {case:?}: the stack parameter {key} has no ParameterValue: {member}")
+            });
+            (key, value)
+        })
+        .collect()
+}
+
+/// The ARN of one SNS topic of this account, which is the form `NotificationArns` takes:
+/// its member is an ARN (`smithy_query query="shape" shape="NotificationArns"`, pattern
+/// `^arn:[a-z0-9-\.]{1,63}:...`), so a topic is named by ARN rather than by a bare name.
+fn topic_arn(topic: &str) -> String {
+    format!("arn:aws:sns:{DEFAULT_REGION}:{ACCOUNT_ID}:{topic}")
+}
+
 /// The `StackStatus` CloudFormation reports for `stack`, or `None` when it holds no such
 /// stack at all.
 async fn stack_status(router: &MultiServiceRouter, stack: &str) -> Option<String> {
@@ -187,6 +239,10 @@ struct Launch<'a> {
     template: String,
     /// The provisioning parameters the launch request carries.
     parameters: &'a [(&'a str, &'a str)],
+    /// The SNS topic ARNs the launch request carries under `NotificationArns`, in request
+    /// order: "passed to CloudFormation. The SNS topic ARNs to which to publish
+    /// stack-related events."
+    notification_arns: &'a [String],
 }
 
 /// What a launch left behind: the provisioned product's id and the stack it stood up.
@@ -211,6 +267,7 @@ async fn launch(router: &MultiServiceRouter, launch: &Launch<'_>) -> Launched {
         name,
         template,
         parameters,
+        notification_arns,
     } = launch;
     let key = format!("{name}.template.json");
     stage_template(router, &key, template).await;
@@ -239,6 +296,9 @@ async fn launch(router: &MultiServiceRouter, launch: &Launch<'_>) -> Launched {
                 .map(|(key, value)| json!({"Key": key, "Value": value}))
                 .collect(),
         );
+    }
+    if !notification_arns.is_empty() {
+        request["NotificationArns"] = json!(notification_arns);
     }
     let (status, provisioned) = call(router, "ProvisionProduct", &request).await;
     assert_eq!(
@@ -436,6 +496,7 @@ async fn the_outputs_reported_are_the_outputs_of_the_stack_the_launch_stood_up()
                     row.declared_outputs.clone(),
                 ),
                 parameters: row.parameters,
+                notification_arns: &[],
             },
         )
         .await;
@@ -520,6 +581,7 @@ async fn output_keys_select_and_the_page_size_bounds_what_is_reported() {
                 }),
             ),
             parameters: &[],
+            notification_arns: &[],
         },
     )
     .await;
@@ -815,6 +877,7 @@ async fn terminating_a_provisioned_product_tears_its_stack_down() {
                     json!({"BucketName": {"Value": {"Ref": "Data"}}}),
                 ),
                 parameters: &[],
+                notification_arns: &[],
             },
         )
         .await;
@@ -877,5 +940,229 @@ async fn terminating_a_provisioned_product_tears_its_stack_down() {
                 launched.stack
             );
         }
+    }
+}
+
+/// One row of the submitted-launch table: what the provisioning request passes on to
+/// CloudFormation, and what the stack it stands up must then report.
+struct SubmittedCase {
+    case: &'static str,
+    /// The provisioned product's name, which also names the staged template object and the
+    /// product it is created from.
+    name: &'static str,
+    /// The bucket the template's one resource is created under, so two rows collide over
+    /// nothing.
+    bucket: &'static str,
+    /// The topics the request names under `NotificationArns`, in request order.
+    topics: &'static [&'static str],
+    /// The `ProvisioningParameters` the request carries, in request order.
+    parameters: &'static [(&'static str, &'static str)],
+    /// The parameters the stack must then report: one entry per key the template declares,
+    /// carrying the value in force for it.
+    expected: &'static [(&'static str, &'static str)],
+}
+
+/// What the provisioning request passes on to CloudFormation is what the stack the launch
+/// stands up is created with: one stack parameter per key the request's
+/// `ProvisioningParameters` name — the last value winning for a key named more than once,
+/// the template's own `Default` in force for a key the request does not name — and, in
+/// request order, the SNS topics its `NotificationArns` name, which are "passed to
+/// CloudFormation" as the topics that stack's events are published to.
+#[tokio::test]
+async fn the_launch_submits_the_requests_parameters_and_topics_to_the_stack() {
+    // The `Parameters` every row's template declares, each with the `Default` — "a value
+    // of the appropriate type for the template to use if no value is specified" — a
+    // request that names it nothing leaves in force.
+    let declared = json!({
+        "Environment": {"Type": "String", "Default": "dev"},
+        "Retention": {"Type": "String", "Default": "7"}
+    });
+
+    // Rows differ along what the rule generalises over: how many topics the request names
+    // (none, one, several, the five `NotificationArns` admits at most), how many of the
+    // declared parameters it supplies, in which order it supplies them, and whether it
+    // names one key twice.
+    let cases = [
+        SubmittedCase {
+            case: "neither topics nor parameters supplied",
+            name: "launch-submitting-nothing",
+            bucket: "launched-submitting-nothing",
+            topics: &[],
+            parameters: &[],
+            expected: &[("Environment", "dev"), ("Retention", "7")],
+        },
+        SubmittedCase {
+            case: "one topic and one of the two parameters supplied",
+            name: "launch-submitting-one-of-each",
+            bucket: "launched-submitting-one-of-each",
+            topics: &["launch-events"],
+            parameters: &[("Environment", "prod")],
+            expected: &[("Environment", "prod"), ("Retention", "7")],
+        },
+        SubmittedCase {
+            case: "three topics and both parameters, supplied in the other order",
+            name: "launch-submitting-three-topics",
+            bucket: "launched-submitting-three-topics",
+            topics: &["launch-events", "audit-events", "ops-events"],
+            parameters: &[("Retention", "30"), ("Environment", "stage")],
+            expected: &[("Environment", "stage"), ("Retention", "30")],
+        },
+        SubmittedCase {
+            case: "five topics — the modelled maximum — and a parameter key named twice",
+            name: "launch-submitting-five-topics",
+            bucket: "launched-submitting-five-topics",
+            topics: &[
+                "launch-events",
+                "audit-events",
+                "ops-events",
+                "finance-events",
+                "security-events",
+            ],
+            parameters: &[
+                ("Environment", "first"),
+                ("Retention", "14"),
+                ("Environment", "last"),
+            ],
+            expected: &[("Environment", "last"), ("Retention", "14")],
+        },
+    ];
+
+    for row in cases {
+        let router = emulator_with_template_services();
+        create_template_bucket(&router).await;
+        let topics: Vec<String> = row.topics.iter().map(|topic| topic_arn(topic)).collect();
+        let launched = launch(
+            &router,
+            &Launch {
+                case: row.case,
+                name: row.name,
+                template: template_with_outputs(row.bucket, declared.clone(), Value::Null),
+                parameters: row.parameters,
+                notification_arns: &topics,
+            },
+        )
+        .await;
+
+        // The stack is read through CloudFormation's own wire: what it reports is what the
+        // launch submitted to it, not anything Service Catalog echoed back.
+        let (status, described) = cloudformation(
+            &router,
+            "DescribeStacks",
+            &[("StackName", &launched.stack)],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: expected CloudFormation to hold the stack {}, got {status} with \
+             {described}",
+            row.case, launched.stack
+        );
+
+        let reported_topics: Vec<String> = list_members(&described, "NotificationARNs")
+            .iter()
+            .map(|entry| entry.trim().to_string())
+            .collect();
+        assert_eq!(
+            reported_topics, topics,
+            "case {:?}: expected the stack to be created with the topics {topics:?}, got \
+             {reported_topics:?}",
+            row.case
+        );
+
+        let wanted: BTreeMap<String, String> = row
+            .expected
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        let reported = stack_parameters(row.case, &described);
+        assert_eq!(
+            reported, wanted,
+            "case {:?}: expected the stack to carry the parameters {wanted:?}, got {reported:?}",
+            row.case
+        );
+        // A stack holds each parameter key ONCE, so a key the request named twice reaches
+        // it as one parameter rather than as two entries disagreeing about its value.
+        let submitted = list_members(&described, "Parameters").len();
+        assert_eq!(
+            submitted,
+            wanted.len(),
+            "case {:?}: expected one stack parameter per declared key ({}), got {submitted}",
+            row.case,
+            wanted.len()
+        );
+    }
+}
+
+/// `NotificationArns` is modelled as a list of at most five entries
+/// (`smithy_query query="shape" shape="NotificationArns"`: `@length(min: 0, max: 5)`), so a
+/// provisioning request naming more is refused with HTTP 400 `ValidationException` and
+/// nothing is provisioned — the launch above having shown that a request at the bound is
+/// served.
+#[tokio::test]
+async fn a_launch_naming_more_topics_than_the_model_admits_is_refused() {
+    let router = emulator_with_template_services();
+    create_template_bucket(&router).await;
+    let name = "launch-with-too-many-topics";
+    let key = format!("{name}.template.json");
+    stage_template(
+        &router,
+        &key,
+        &template_with_outputs("launched-with-too-many-topics", Value::Null, Value::Null),
+    )
+    .await;
+    let portfolio = create_portfolio(&router, "too-many-topics", "acme", &[], "too-many").await;
+    let product = create_product_with_info(
+        &router,
+        name,
+        CFN_PRODUCT,
+        &json!({"LoadTemplateFromURL": staged_template_url(&key)}),
+        name,
+    )
+    .await;
+    let version = first_provisioning_artifact_id(&router, &product).await;
+    associate_product_with_portfolio(&router, &product, &portfolio).await;
+
+    // Rows: one past the bound, and well past it. Everything else about the request
+    // resolves, so the refusal can only be about how many topics it names.
+    for (case, count) in [("one past the maximum", 6), ("well past the maximum", 9)] {
+        let topics: Vec<String> = (0..count)
+            .map(|index| topic_arn(&format!("launch-events-{index}")))
+            .collect();
+        let (status, refused) = call(
+            &router,
+            "ProvisionProduct",
+            &json!({
+                "ProductId": product,
+                "ProvisioningArtifactId": version,
+                "ProvisionedProductName": name,
+                "ProvisionToken": format!("{name}-{count}"),
+                "NotificationArns": topics,
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected {count} topics to be refused, got {status} with {refused}"
+        );
+        assert_eq!(
+            error_code(&refused),
+            "ValidationException",
+            "case {case:?}: expected the modelled bound to refuse the request, got {refused}"
+        );
+
+        // A refused request provisions nothing: the name it asked for is held by no
+        // provisioned product at all.
+        let (status, described) = call(&router, "DescribeProvisionedProduct", &json!({"Name": name}))
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the refusal to have provisioned nothing, got {status} with \
+             {described}"
+        );
+        assert_eq!(
+            error_code(&described),
+            "ResourceNotFoundException",
+            "case {case:?}: expected no provisioned product named {name}, got {described}"
+        );
     }
 }
