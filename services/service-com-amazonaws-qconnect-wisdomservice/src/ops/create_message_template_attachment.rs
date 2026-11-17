@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateMessageTemplateAttachment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateMessageTemplateAttachment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateMessageTemplateAttachment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Uploads one attachment file to the WORKING COPY of a message template — the copy the
+//! `$LATEST` qualifier names — and reports it with the locator it is downloaded from.
+//!
+//! The file itself is stored (`crate::state::MessageTemplateAttachmentFile`), because the
+//! `url` this operation answers with is "a pre-signed Amazon S3 URL that can be used to
+//! download the attachment file": the download plane in `crate::service` serves those
+//! bytes, so the URL a caller is handed can be followed. An attachment is part of what the
+//! template's content checksum is calculated over, so uploading one changes the template's
+//! `messageTemplateContentSha256` and re-stamps when it was last written.
 //!
 //! ## Shape of an operation
 //!
@@ -101,6 +102,59 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::MessageTemplateAttachmentFile;
+
+/// The modelled `ResourceNotFoundException` (HTTP 404), naming the resource the request
+/// addressed — the member the model provides for exactly that.
+fn not_found(message: &str, resource_name: &str) -> CreateMessageTemplateAttachmentError {
+    CreateMessageTemplateAttachmentErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: Some(message.to_string()),
+            resource_name: Some(resource_name.to_string()),
+        },
+    )
+    .into()
+}
+
+/// The modelled `ConflictException` (HTTP 409).
+fn conflict(message: &str) -> CreateMessageTemplateAttachmentError {
+    CreateMessageTemplateAttachmentErrorModeled::ConflictException(ConflictException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// The modelled `ValidationException` (HTTP 400).
+fn validation(message: String) -> CreateMessageTemplateAttachmentError {
+    CreateMessageTemplateAttachmentErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled `ServiceQuotaExceededException` (HTTP 402).
+fn quota_exceeded(message: String) -> CreateMessageTemplateAttachmentError {
+    CreateMessageTemplateAttachmentErrorModeled::ServiceQuotaExceededException(
+        ServiceQuotaExceededException {
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// The digest of the attachment file as ONE part of a
+/// [`crate::state::request_fingerprint`]: a fixed-size rendering of bytes of any size, so
+/// a remembered `clientToken` entry does not carry the file itself.
+fn file_digest(file: &[u8]) -> String {
+    use ::sha2::Digest;
+
+    ::hex::encode(::sha2::Sha256::digest(file))
+}
+
+/// The request members a refusal names, as a caller names them.
+const MEMBER_MESSAGE_TEMPLATE_ID: &str = "messageTemplateId";
+const MEMBER_BODY: &str = "body";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -175,18 +229,196 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateMessageTemplateAttachment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateMessageTemplateAttachmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
+        // Modelled constraints — `name`'s length and pattern, `contentDisposition`'s value
+        // set, `body`'s `len 1..`, the label patterns — are already refused BEFORE this
         // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateMessageTemplateAttachment"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable in this emulator: the router builds one `InMemoryEngine` and
+            // hands it to every service.
+            crate::scaffolded::Scaffolded::not_implemented("CreateMessageTemplateAttachment")
+        })?;
+        let region = crate::state::request_region(&ctx.parts().headers);
+        let host = crate::state::request_endpoint_host(&ctx.parts().headers, &region);
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // A message template is reachable only through the knowledge base it was created
+        // under, so the parent is resolved first and a knowledge base this account does
+        // not hold is reported as the resource that is missing.
+        let Some(knowledge_base) = store.knowledge_base(&input.knowledge_base_id) else {
+            return Err(not_found(
+                crate::state::MESSAGE_KNOWLEDGE_BASE_NOT_FOUND,
+                &input.knowledge_base_id,
+            ));
+        };
+        let knowledge_base_id = knowledge_base.knowledge_base_id.clone();
+
+        // The attachment is uploaded to the template "referenced by the $LATEST
+        // qualifier", so the label names the TEMPLATE whose working copy is written.
+        let (message_template_id, qualifier) =
+            crate::state::resolve_qualified_id(&input.message_template_id);
+        let Some(message_template) = store.message_template(&knowledge_base_id, message_template_id)
+        else {
+            return Err(not_found(
+                crate::state::MESSAGE_MESSAGE_TEMPLATE_NOT_FOUND,
+                &input.message_template_id,
+            ));
+        };
+        // The label "cannot contain any qualifier": one that carries a qualifier is refused
+        // rather than read as naming a version to upload to, since a published version is
+        // immutable.
+        if qualifier.is_some() {
+            return Err(validation(crate::state::message_qualifier_not_accepted(
+                MEMBER_MESSAGE_TEMPLATE_ID,
+            )));
+        }
+        let message_template_id = message_template.message_template_id.clone();
+
+        // "The body of the attachment file should be encoded using base64 encoding", so a
+        // body that is no base64 encoding carries no file and is refused instead of being
+        // stored as its own text. The DECODED file is what the store holds and what the
+        // download plane serves. The text is measured against the file ceiling FIRST, so a
+        // body past it is refused rather than decoded into this process's heap and then
+        // refused.
+        if input.body.len() > crate::state::max_message_template_attachment_body_len() {
+            return Err(validation(crate::state::message_attachment_too_large(
+                MEMBER_BODY,
+            )));
+        }
+        let Ok(file) = ::aws_smithy_types::base64::decode(&input.body) else {
+            return Err(validation(crate::state::message_attachment_body_not_base64(
+                MEMBER_BODY,
+            )));
+        };
+        if file.len() > crate::state::MAX_MESSAGE_TEMPLATE_ATTACHMENT_BYTES {
+            return Err(validation(crate::state::message_attachment_too_large(
+                MEMBER_BODY,
+            )));
+        }
+
+        // What this upload's `@idempotencyToken` identifies: every member the record below
+        // is built from. The file goes in as its DIGEST rather than its bytes, so the
+        // remembered fingerprint is a fixed size whatever the file's.
+        let fingerprint = crate::state::request_fingerprint(&[
+            input.name.clone(),
+            input.content_disposition.clone(),
+            file_digest(&file),
+        ]);
+
+        // A replayed `@idempotencyToken` answers with the attachment it already uploaded
+        // to THIS template rather than storing a second one, while the same token carrying
+        // a DIFFERENT request is the modelled idempotency conflict. The token is scoped to
+        // this operation and this parent, so the same token on another upload is another
+        // attachment.
+        let token_scope = format!("{}/{knowledge_base_id}/{message_template_id}", Self::NAME);
+        match store.replayed_create(&token_scope, input.client_token.as_deref(), &fingerprint) {
+            crate::state::Replay::Conflict => {
+                return Err(conflict(crate::state::MESSAGE_IDEMPOTENCY_CONFLICT))
+            }
+            crate::state::Replay::Retry(created) => {
+                if let Some(attachment) = store.message_template_attachment(
+                    &knowledge_base_id,
+                    &message_template_id,
+                    &created,
+                ) {
+                    return Ok(CreateMessageTemplateAttachmentOutput {
+                        attachment: Some(attachment.to_attachment()),
+                    });
+                }
+                // The token names an attachment this template no longer holds, so there is
+                // nothing to replay: the upload runs as a fresh one.
+            }
+            crate::state::Replay::Fresh => {}
+        }
+
+        // This operation's own documentation states the rule — "The name of the message
+        // template attachment has to be unique for each message template referenced by
+        // the $LATEST qualifier" — so an upload under a name the working copy already
+        // holds is the modelled conflict (HTTP 409) rather than a second file, and the
+        // refusal leaves the first attachment untouched.
+        let Some(message_template) =
+            store.message_template(&knowledge_base_id, &message_template_id)
+        else {
+            // Unreachable: the lookup above found this record while the lock is held.
+            return Err(not_found(
+                crate::state::MESSAGE_MESSAGE_TEMPLATE_NOT_FOUND,
+                &input.message_template_id,
+            ));
+        };
+        if message_template.holds_attachment_named(&input.name) {
+            return Err(conflict(crate::state::MESSAGE_NAME_IN_USE));
+        }
+        // The template's attachment bound and the store's aggregate byte bound, which are
+        // what keep this store finite; the model declares this refusal for exactly that.
+        if message_template.attachments.len()
+            >= crate::state::MAX_ATTACHMENTS_PER_MESSAGE_TEMPLATE
+            || store.stored_message_template_attachment_bytes() + file.len()
+                > crate::state::MAX_STORED_MESSAGE_TEMPLATE_ATTACHMENT_BYTES
+        {
+            return Err(quota_exceeded(
+                crate::state::message_message_template_attachment_quota(),
+            ));
+        }
+
+        let Some(attachment_id) = store.mint_message_template_attachment_id() else {
+            return Err(validation(
+                "could not mint a unique attachmentId; retry the request".to_string(),
+            ));
+        };
+        let url = crate::state::message_template_attachment_url(
+            &host,
+            &knowledge_base_id,
+            &message_template_id,
+            &attachment_id,
+        );
+        let Some(stored) = store.message_template_mut(&knowledge_base_id, &message_template_id)
+        else {
+            // Unreachable: the lookups above found this record while the lock is held.
+            return Err(not_found(
+                crate::state::MESSAGE_MESSAGE_TEMPLATE_NOT_FOUND,
+                &input.message_template_id,
+            ));
+        };
+        stored.attachments.push(MessageTemplateAttachmentFile {
+            attachment_id: attachment_id.clone(),
+            name: input.name.clone(),
+            content_disposition: input.content_disposition.clone(),
+            uploaded_at: now,
+            url,
+            url_expiry: now
+                + ::std::time::Duration::from_secs(
+                    crate::state::DEFAULT_PRESIGNED_URL_TIME_TO_LIVE_MINUTES * 60,
+                ),
+            body: file,
+        });
+        // The attachments are part of what the template's content checksum is calculated
+        // over, so the working copy CHANGED: it was last written now, and by whoever made
+        // this call.
+        stored.last_modified_at = now;
+        stored.last_modified_by = crate::state::caller_principal();
+        store.remember_create(
+            &token_scope,
+            input.client_token.as_deref(),
+            &fingerprint,
+            &attachment_id,
+        );
+
+        // Render out of the STORED record rather than out of the request: what this call
+        // answers is what a later `GetMessageTemplate` reports for the same attachment.
+        let Some(attachment) = store.message_template_attachment(
+            &knowledge_base_id,
+            &message_template_id,
+            &attachment_id,
+        ) else {
+            // Unreachable: the push above put this attachment on the record while the lock
+            // is held.
+            return Err(not_found(
+                crate::state::MESSAGE_MESSAGE_TEMPLATE_ATTACHMENT_NOT_FOUND,
+                &attachment_id,
+            ));
+        };
+        Ok(CreateMessageTemplateAttachmentOutput {
+            attachment: Some(attachment.to_attachment()),
+        })
     }
 }

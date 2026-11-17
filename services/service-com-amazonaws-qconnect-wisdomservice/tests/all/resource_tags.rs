@@ -88,6 +88,15 @@ impl Reply {
     }
 }
 
+/// One answer to a URL this service handed out, kept as the bytes it came as: a
+/// published URL serves a file, not this endpoint's JSON envelope.
+#[derive(Debug)]
+pub(crate) struct Followed {
+    pub(crate) status: u16,
+    pub(crate) headers: BTreeMap<String, String>,
+    pub(crate) bytes: Vec<u8>,
+}
+
 /// An emulator with just this service mounted on a fresh engine, driven in-process
 /// through the production router.
 pub(crate) struct Emulator {
@@ -150,6 +159,37 @@ impl Emulator {
     pub(crate) async fn list_tags(&self, resource_arn: &str) -> Reply {
         self.send("GET", &format!("/tags/{}", label(resource_arn)), None)
             .await
+    }
+
+    /// Follow a URL this service handed out exactly as a client does: `method` against
+    /// the absolute URL, with NO credential of any kind.
+    ///
+    /// The answer is kept as the BYTES it came as, with its headers: what a published URL
+    /// serves is a file rather than this endpoint's JSON envelope, so nothing here parses
+    /// it.
+    pub(crate) async fn follow(&self, method: &str, url: &str) -> Followed {
+        let request = http::Request::builder()
+            .method(method)
+            .uri(url)
+            .body(Bytes::new())
+            .expect("build request");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let headers = response
+            .headers()
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_string(),
+                    value.to_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        Followed {
+            status,
+            headers,
+            bytes: response.into_body().to_vec(),
+        }
     }
 
     pub(crate) async fn create_assistant(

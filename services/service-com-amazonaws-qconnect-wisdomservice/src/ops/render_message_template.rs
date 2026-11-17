@@ -260,8 +260,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // else the template holds.
             source_configuration_summary: rendered_template.source_configuration_summary(),
             attributes_not_interpolated: Some(rendered.attributes_not_interpolated),
-            attachments: (!rendered_template.attachments.is_empty())
-                .then(|| rendered_template.attachments.clone()),
+            attachments: rendered_template.attachments_out(),
         })
     }
 }

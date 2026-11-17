@@ -41,7 +41,10 @@
 //! * the tags a create persisted on a template are what `ListTagsForResource` reports for
 //!   its ARN;
 //! * one knowledge base holds at most the store's message-template ceiling, past which a
-//!   create is the modelled `ServiceQuotaExceededException` (HTTP 402).
+//!   create is the modelled `ServiceQuotaExceededException` (HTTP 402);
+//! * `CreateMessageTemplateAttachment` uploads one attachment file to the template's
+//!   WORKING COPY and the url it reports serves that file — the rules, and the tables they
+//!   are asserted over, are stated where that section begins below.
 //!
 //! This model serves the shared `wisdom` endpoint identity (see `src/service.rs`), which is
 //! what every request below is signed for.
@@ -49,7 +52,10 @@
 use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_qconnect_wisdomservice::state::MAX_MESSAGE_TEMPLATES_PER_KNOWLEDGE_BASE;
+use service_com_amazonaws_qconnect_wisdomservice::state::{
+    DEFAULT_PRESIGNED_URL_TIME_TO_LIVE_MINUTES, MAX_ATTACHMENTS_PER_MESSAGE_TEMPLATE,
+    MAX_MESSAGE_TEMPLATES_PER_KNOWLEDGE_BASE, MAX_MESSAGE_TEMPLATE_ATTACHMENT_BYTES,
+};
 
 use super::resource_tags::{label, wisdom_arn, Emulator, Reply, ABSENT_UUID, OTHER_ACCOUNT, REGION};
 
@@ -1561,5 +1567,925 @@ async fn a_create_past_the_message_template_ceiling_is_refused() {
             .contains(&MAX_MESSAGE_TEMPLATES_PER_KNOWLEDGE_BASE.to_string()),
         "case \"one past the ceiling\": the refusal must state the ceiling, got {:?}",
         over.string("/message")
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// `CreateMessageTemplateAttachment`: uploading one attachment file to a template's working
+// copy.
+//
+// The rules under test, each asserted over a TABLE of inputs rather than the one recorded
+// request:
+//
+// * an upload PERSISTS the attachment on the template the `$LATEST` qualifier names and
+//   answers out of the stored record: a minted `attachmentId` of the modelled `Uuid` form,
+//   the `name` and `contentDisposition` the request carried, an `uploadedTime`, and a
+//   `url`/`urlExpiry` pair that addresses the file at the endpoint the caller reached — and
+//   every later read of the template reports exactly that attachment, in upload order,
+//   while the template's content checksum changes, since the model says attachments are
+//   part of what it is calculated over;
+// * that `url` is FOLLOWABLE: an unsigned `GET` answers the bytes the base64 body decoded
+//   to, presented as the attachment the `contentDisposition` asked for, and the plane
+//   serves nothing else;
+// * an attachment `name` identifies one file on one working copy: a second upload claiming
+//   it is `ConflictException` (HTTP 409) and leaves the first file untouched, while another
+//   template may hold the same name;
+// * a `body` that is no base64 encoding is `ValidationException` (HTTP 400) and persists
+//   nothing;
+// * a replayed `clientToken` answers with the attachment that token already uploaded,
+//   while the same token carrying a different request is the modelled idempotency conflict;
+// * a label that names no template of this knowledge base is `ResourceNotFoundException`
+//   (HTTP 404), and one that carries a version qualifier is refused — the operation
+//   documents the label as one that "cannot contain any qualifier";
+// * one working copy holds at most the store's attachment ceiling, past which an upload is
+//   the modelled `ServiceQuotaExceededException` (HTTP 402).
+
+/// The only value the modelled `ContentDisposition` enumeration declares
+/// (`smithy_query(query="shape",shape="ContentDisposition")`), written out here rather than
+/// imported from the implementation.
+const CONTENT_DISPOSITION: &str = "ATTACHMENT";
+
+/// The published bound of `AttachmentFileName`
+/// (`smithy_query(query="operation",operation="CreateMessageTemplateAttachment")`: `len
+/// 1..256`, pattern `^[\p{L}\p{M}\p{N}_\s&@()+,;=\-]+\.[A-Za-z0-9]+$`).
+const ATTACHMENT_NAME_MAX: usize = 256;
+
+/// The sentence an upload whose `body` is not base64 is refused with, and the one an upload
+/// past either attachment ceiling is refused with. Written out here rather than imported,
+/// so the assertions pin what a client reads.
+const MESSAGE_BODY_NOT_BASE64: &str = "The body must be encoded using base64 encoding.";
+const MESSAGE_ATTACHMENT_QUOTA: &str =
+    "This message template holds as many attachments as its store keeps. Delete an \
+     attachment before uploading another.";
+
+/// The sentence a label that carries a version qualifier is refused with, on an operation
+/// whose own documentation says it may not carry one.
+const MESSAGE_QUALIFIER_NOT_ACCEPTED: &str = "The messageTemplateId cannot contain a qualifier.";
+
+/// `bytes` as the base64 text the request's `body` carries, through the workspace's own
+/// codec rather than a hand-written one.
+fn base64_of(bytes: &[u8]) -> String {
+    ::aws_smithy_types::base64::encode(bytes)
+}
+
+/// One instant a response reports, in the epoch seconds this endpoint's JSON carries a
+/// modelled `Timestamp` as, or `None` when the member is absent.
+fn instant(reply: &Reply, pointer: &str) -> Option<f64> {
+    reply.field(pointer).and_then(Value::as_f64)
+}
+
+/// The attachment surface of the shared harness, and the fixtures these rows need.
+impl Emulator {
+    /// Upload one attachment to the template `message_template` names under
+    /// `knowledge_base`.
+    async fn create_attachment(
+        &self,
+        knowledge_base: &str,
+        message_template: &str,
+        body: Value,
+    ) -> Reply {
+        self.send(
+            "POST",
+            &format!(
+                "/knowledgeBases/{}/messageTemplates/{}/attachments",
+                label(knowledge_base),
+                label(message_template)
+            ),
+            Some(body),
+        )
+        .await
+    }
+
+    /// A message template of `knowledge_base` holding no attachment yet, answering with
+    /// its `messageTemplateId`.
+    async fn given_message_template(&self, knowledge_base: &str, name: &str) -> String {
+        let created = self
+            .create_message_template(
+                knowledge_base,
+                json!({
+                    "name": name,
+                    "channelSubtype": "EMAIL",
+                    "content": content_for("EMAIL"),
+                }),
+            )
+            .await;
+        assert_eq!(
+            created.status, 200,
+            "case {name:?}: the template these rows attach to must be created, got HTTP {} with \
+             body {}",
+            created.status, created.body
+        );
+        created.string("/messageTemplate/messageTemplateId")
+    }
+}
+
+/// One attachment an upload carries. The rows differ along what the rule generalises over:
+/// the file's bytes (text, binary, one byte, several kilobytes) and the form and length of
+/// the name the pattern admits.
+struct AttachmentCase {
+    case: &'static str,
+    name: String,
+    file: Vec<u8>,
+}
+
+fn attachment_cases() -> Vec<AttachmentCase> {
+    vec![
+        AttachmentCase {
+            case: "a text file",
+            name: "notes.txt".to_string(),
+            file: b"the attachment body, as a client uploaded it".to_vec(),
+        },
+        AttachmentCase {
+            case: "a binary file whose bytes are no text",
+            name: "logo.PNG".to_string(),
+            file: vec![0x89, 0x50, 0x4e, 0x47, 0x00, 0x01, 0xfa, 0xff],
+        },
+        AttachmentCase {
+            case: "a one-byte file, the shortest body the model admits",
+            name: "x.y".to_string(),
+            file: b"x".to_vec(),
+        },
+        AttachmentCase {
+            // Every class of character the `AttachmentFileName` pattern admits beside the
+            // letters: a mark, a number, `_`, whitespace and `&@()+,;=-`.
+            case: "a name of every character class the pattern admits",
+            name: "rapport final &@()+,;=-u\u{308}mlaut_2.pdf".to_string(),
+            file: b"%PDF-1.7 and the rest".to_vec(),
+        },
+        AttachmentCase {
+            case: "a name at the published maximum length",
+            name: format!("{}.txt", "n".repeat(ATTACHMENT_NAME_MAX - 4)),
+            file: b"at the name ceiling".to_vec(),
+        },
+        AttachmentCase {
+            case: "a file of several kilobytes",
+            name: "handbook.csv".to_string(),
+            file: (0..4096u32).map(|index| (index % 251) as u8).collect(),
+        },
+    ]
+}
+
+/// The rule: an upload persists the attachment on the template's working copy and answers
+/// out of the stored record, every later read reports it, and the `url` it reports can be
+/// followed to download the file the base64 body decoded to.
+#[tokio::test]
+async fn an_upload_persists_the_attachment_and_its_url_serves_the_file() {
+    let emulator = Emulator::new();
+    let knowledge_base_id = emulator.create_knowledge_base_named("attachments").await;
+
+    for case in attachment_cases() {
+        let AttachmentCase { case, name, file } = case;
+        let message_template_id = emulator
+            .given_message_template(&knowledge_base_id, case)
+            .await;
+        let before = emulator
+            .get_message_template(&knowledge_base_id, &message_template_id)
+            .await;
+        let checksum_before = before.string("/messageTemplate/messageTemplateContentSha256");
+        assert!(
+            before.field("/messageTemplate/attachments").is_none(),
+            "case {case:?}: a template holds no attachment until one is uploaded, got {:?}",
+            before.field("/messageTemplate/attachments")
+        );
+
+        let uploaded = emulator
+            .create_attachment(
+                &knowledge_base_id,
+                &message_template_id,
+                json!({
+                    "name": name,
+                    "contentDisposition": CONTENT_DISPOSITION,
+                    "body": base64_of(&file),
+                }),
+            )
+            .await;
+        assert_eq!(
+            uploaded.status, 200,
+            "case {case:?}: expected HTTP 200 from the upload, got HTTP {} with body {}",
+            uploaded.status, uploaded.body
+        );
+        let attachment_id = uploaded.string("/attachment/attachmentId");
+        assert!(
+            is_modelled_uuid(&attachment_id),
+            "case {case:?}: expected a modelled Uuid attachmentId, got {attachment_id:?}"
+        );
+        assert_eq!(
+            uploaded.string("/attachment/name"),
+            name,
+            "case {case:?}: the upload must report the name it carried, got {:?}",
+            uploaded.string("/attachment/name")
+        );
+        assert_eq!(
+            uploaded.string("/attachment/contentDisposition"),
+            CONTENT_DISPOSITION,
+            "case {case:?}: expected contentDisposition {CONTENT_DISPOSITION:?}, got {:?}",
+            uploaded.string("/attachment/contentDisposition")
+        );
+        let url = uploaded.string("/attachment/url");
+        assert_eq!(
+            url,
+            format!(
+                "https://wisdom.{REGION}.amazonaws.com/knowledgeBases/{knowledge_base_id}\
+                 /messageTemplates/{message_template_id}/attachments/{attachment_id}/file"
+            ),
+            "case {case:?}: the url must address this attachment at the endpoint the caller \
+             reached, got {url:?}"
+        );
+        // Both instants are derived from the one instant the upload happened at, so the
+        // url expires exactly the store's time to live after the file was uploaded.
+        // Nothing here reads the test host's clock.
+        let uploaded_time = instant(&uploaded, "/attachment/uploadedTime");
+        let url_expiry = instant(&uploaded, "/attachment/urlExpiry");
+        let (Some(uploaded_time), Some(url_expiry)) = (uploaded_time, url_expiry) else {
+            panic!(
+                "case {case:?}: the upload must report uploadedTime and urlExpiry, got {:?} and \
+                 {:?}",
+                uploaded.field("/attachment/uploadedTime"),
+                uploaded.field("/attachment/urlExpiry")
+            );
+        };
+        let time_to_live = (DEFAULT_PRESIGNED_URL_TIME_TO_LIVE_MINUTES * 60) as f64;
+        assert!(
+            (url_expiry - uploaded_time - time_to_live).abs() < 0.001,
+            "case {case:?}: the url must expire {time_to_live} seconds after the upload at \
+             {uploaded_time}, got {url_expiry}"
+        );
+
+        // Every read of the template reports exactly that attachment — by bare id, by ARN
+        // and under the `$LATEST` qualifier — and the checksum the model says is calculated
+        // over the attachments has moved.
+        let bare_arn = expected_message_template_arn(&knowledge_base_id, &message_template_id);
+        let readers = [
+            ("the bare id", message_template_id.clone()),
+            ("the ARN", bare_arn.clone()),
+            (
+                "the $LATEST qualifier",
+                format!("{message_template_id}:{QUALIFIER_LATEST}"),
+            ),
+        ];
+        for (reader, template_label) in readers {
+            let read = emulator
+                .get_message_template(&knowledge_base_id, &template_label)
+                .await;
+            assert_eq!(
+                read.status, 200,
+                "case {case:?} read by {reader}: expected HTTP 200, got HTTP {} with body {}",
+                read.status, read.body
+            );
+            assert_eq!(
+                read.field("/messageTemplate/attachments").cloned(),
+                uploaded
+                    .field("/attachment")
+                    .cloned()
+                    .map(|attachment| Value::Array(vec![attachment])),
+                "case {case:?} read by {reader}: the read must report the attachment the upload \
+                 persisted, got {:?}",
+                read.field("/messageTemplate/attachments")
+            );
+            let checksum_after = read.string("/messageTemplate/messageTemplateContentSha256");
+            assert!(
+                is_sha256_hex(&checksum_after),
+                "case {case:?} read by {reader}: expected a SHA-256 checksum, got \
+                 {checksum_after:?}"
+            );
+            assert_ne!(
+                checksum_after, checksum_before,
+                "case {case:?} read by {reader}: the checksum is calculated over the \
+                 attachments, so uploading one must change it away from {checksum_before:?}"
+            );
+        }
+
+        // The url is followable, unsigned, and answers the bytes the base64 body decoded
+        // to, presented as an attachment with the file's own name.
+        let followed = emulator.follow("GET", &url).await;
+        assert_eq!(
+            followed.status, 200,
+            "case {case:?}: the attachment url must be followable, got HTTP {} with {:?}",
+            followed.status,
+            String::from_utf8_lossy(&followed.bytes)
+        );
+        assert_eq!(
+            followed.bytes, file,
+            "case {case:?}: the url must serve the file the body decoded to, got {} bytes",
+            followed.bytes.len()
+        );
+        let disposition = followed
+            .headers
+            .get("content-disposition")
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            disposition.starts_with("attachment"),
+            "case {case:?}: the file must be presented as the contentDisposition asked for, got \
+             {disposition:?}"
+        );
+        if name.is_ascii() {
+            assert!(
+                disposition.contains(&format!("filename=\"{name}\"")),
+                "case {case:?}: the presentation must name the file, got {disposition:?}"
+            );
+        }
+        assert_eq!(
+            followed.headers.get("content-length").cloned(),
+            Some(file.len().to_string()),
+            "case {case:?}: expected a content-length of {} bytes, got {:?}",
+            file.len(),
+            followed.headers.get("content-length")
+        );
+
+        // The plane reads the file and nothing else: another method against the same url is
+        // refused, and the file is still there afterwards.
+        let written = emulator.follow("PUT", &url).await;
+        assert_eq!(
+            written.status, 405,
+            "case {case:?}: the attachment url is read by a GET alone, got HTTP {}",
+            written.status
+        );
+        let again = emulator.follow("GET", &url).await;
+        assert_eq!(
+            again.bytes, file,
+            "case {case:?}: the refused write must leave the file alone, got {} bytes",
+            again.bytes.len()
+        );
+    }
+}
+
+/// The rule the operation documents: an attachment `name` identifies one file on one
+/// working copy, so a second upload claiming it conflicts and leaves the first untouched,
+/// while another template may hold the same name — and a template holds the attachments it
+/// was given, in upload order.
+#[tokio::test]
+async fn an_attachment_name_identifies_one_file_on_the_working_copy() {
+    let emulator = Emulator::new();
+    let knowledge_base_id = emulator.create_knowledge_base_named("names").await;
+    let first_template = emulator
+        .given_message_template(&knowledge_base_id, "holder")
+        .await;
+    let other_template = emulator
+        .given_message_template(&knowledge_base_id, "other-holder")
+        .await;
+
+    // Several names, uploaded in this order to ONE working copy.
+    let names = ["first.txt", "second.csv", "third.pdf"];
+    let mut ids = Vec::new();
+    for name in names {
+        let uploaded = emulator
+            .create_attachment(
+                &knowledge_base_id,
+                &first_template,
+                json!({
+                    "name": name,
+                    "contentDisposition": CONTENT_DISPOSITION,
+                    "body": base64_of(format!("the file of {name}").as_bytes()),
+                }),
+            )
+            .await;
+        assert_eq!(
+            uploaded.status, 200,
+            "case {name:?}: expected HTTP 200, got HTTP {} with body {}",
+            uploaded.status, uploaded.body
+        );
+        ids.push(uploaded.string("/attachment/attachmentId"));
+    }
+
+    for name in names {
+        let again = emulator
+            .create_attachment(
+                &knowledge_base_id,
+                &first_template,
+                json!({
+                    "name": name,
+                    "contentDisposition": CONTENT_DISPOSITION,
+                    "body": base64_of(b"a second file under a name in use"),
+                }),
+            )
+            .await;
+        assert_eq!(
+            again.status, 409,
+            "case {name:?}: a name this working copy holds must conflict, got HTTP {} with body \
+             {}",
+            again.status, again.body
+        );
+        assert_eq!(
+            again.error_type, "ConflictException",
+            "case {name:?}: expected error type ConflictException, got {:?}",
+            again.error_type
+        );
+        assert_eq!(
+            again.string("/message"),
+            MESSAGE_NAME_IN_USE,
+            "case {name:?}: expected the message {MESSAGE_NAME_IN_USE:?}, got {:?}",
+            again.string("/message")
+        );
+
+        // Another template may hold the same name: the name identifies a file on ONE
+        // working copy.
+        let elsewhere = emulator
+            .create_attachment(
+                &knowledge_base_id,
+                &other_template,
+                json!({
+                    "name": name,
+                    "contentDisposition": CONTENT_DISPOSITION,
+                    "body": base64_of(b"the same name, another template"),
+                }),
+            )
+            .await;
+        assert_eq!(
+            elsewhere.status, 200,
+            "case {name:?}: another template may hold the same attachment name, got HTTP {} with \
+             body {}",
+            elsewhere.status, elsewhere.body
+        );
+    }
+
+    // The refused uploads left the working copy holding exactly the three files it was
+    // given, in the order they were uploaded.
+    let read = emulator
+        .get_message_template(&knowledge_base_id, &first_template)
+        .await;
+    let reported: Vec<String> = read
+        .field("/messageTemplate/attachments")
+        .and_then(Value::as_array)
+        .map(|attachments| {
+            attachments
+                .iter()
+                .map(|attachment| {
+                    attachment
+                        .pointer("/attachmentId")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        reported, ids,
+        "case \"three files in upload order\": expected the attachments {ids:?}, got {reported:?}"
+    );
+    let reported_names: Vec<String> = read
+        .field("/messageTemplate/attachments")
+        .and_then(Value::as_array)
+        .map(|attachments| {
+            attachments
+                .iter()
+                .map(|attachment| {
+                    attachment
+                        .pointer("/name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        reported_names,
+        names.map(str::to_string).to_vec(),
+        "case \"three files in upload order\": expected the names {names:?}, got \
+         {reported_names:?}"
+    );
+}
+
+/// The rule the member documents: the `body` is base64, so a body that is no base64
+/// encoding carries no file and is refused with the modelled `ValidationException`,
+/// persisting nothing.
+#[tokio::test]
+async fn a_body_that_is_not_base64_is_refused_and_persists_nothing() {
+    let emulator = Emulator::new();
+    let knowledge_base_id = emulator.create_knowledge_base_named("bodies").await;
+    let message_template_id = emulator
+        .given_message_template(&knowledge_base_id, "bodies")
+        .await;
+
+    // Rows: characters outside the base64 alphabet, in each position a caller puts them.
+    let bodies = [
+        ("plain text that is no encoding", "not base64 at all!"),
+        ("characters outside the alphabet", "%%%%"),
+        ("an alphabet character replaced", "YW*jZA=="),
+        ("padding in the middle", "YQ==YQ=="),
+    ];
+    for (case, body) in bodies {
+        let refused = emulator
+            .create_attachment(
+                &knowledge_base_id,
+                &message_template_id,
+                json!({
+                    "name": "refused.txt",
+                    "contentDisposition": CONTENT_DISPOSITION,
+                    "body": body,
+                }),
+            )
+            .await;
+        assert_eq!(
+            refused.status, 400,
+            "case {case:?}: expected HTTP 400, got HTTP {} with body {}",
+            refused.status, refused.body
+        );
+        assert_eq!(
+            refused.error_type, "ValidationException",
+            "case {case:?}: expected error type ValidationException, got {:?}",
+            refused.error_type
+        );
+        assert_eq!(
+            refused.string("/message"),
+            MESSAGE_BODY_NOT_BASE64,
+            "case {case:?}: expected the message {MESSAGE_BODY_NOT_BASE64:?}, got {:?}",
+            refused.string("/message")
+        );
+    }
+
+    let read = emulator
+        .get_message_template(&knowledge_base_id, &message_template_id)
+        .await;
+    assert!(
+        read.field("/messageTemplate/attachments").is_none(),
+        "case \"every refused body\": a refused upload must persist nothing, got {:?}",
+        read.field("/messageTemplate/attachments")
+    );
+}
+
+/// The rule: a replayed `clientToken` answers with the attachment that token already
+/// uploaded, while the same token carrying a different request is the modelled idempotency
+/// conflict.
+#[tokio::test]
+async fn a_replayed_client_token_answers_with_the_attachment_it_uploaded() {
+    let emulator = Emulator::new();
+    let knowledge_base_id = emulator.create_knowledge_base_named("tokens").await;
+    let message_template_id = emulator
+        .given_message_template(&knowledge_base_id, "tokens")
+        .await;
+    let other_template = emulator
+        .given_message_template(&knowledge_base_id, "tokens-elsewhere")
+        .await;
+
+    let token = "an-idempotency-token";
+    let body = json!({
+        "name": "receipt.pdf",
+        "contentDisposition": CONTENT_DISPOSITION,
+        "body": base64_of(b"the receipt"),
+        "clientToken": token,
+    });
+    let first = emulator
+        .create_attachment(&knowledge_base_id, &message_template_id, body.clone())
+        .await;
+    assert_eq!(
+        first.status, 200,
+        "case \"the first upload\": expected HTTP 200, got HTTP {} with body {}",
+        first.status, first.body
+    );
+
+    let replayed = emulator
+        .create_attachment(&knowledge_base_id, &message_template_id, body.clone())
+        .await;
+    assert_eq!(
+        replayed.field("/attachment").cloned(),
+        first.field("/attachment").cloned(),
+        "case \"the identical request again\": a replay must answer with the attachment the \
+         token uploaded, got {:?}",
+        replayed.field("/attachment")
+    );
+
+    // Rows: the same token carrying a different request, one differing member each.
+    let mut renamed = body.clone();
+    renamed["name"] = json!("another.pdf");
+    let mut refilled = body.clone();
+    refilled["body"] = json!(base64_of(b"another file"));
+    for (case, differing) in [("a different name", renamed), ("a different file", refilled)] {
+        let conflict = emulator
+            .create_attachment(&knowledge_base_id, &message_template_id, differing)
+            .await;
+        assert_eq!(
+            conflict.status, 409,
+            "case {case:?}: expected HTTP 409, got HTTP {} with body {}",
+            conflict.status, conflict.body
+        );
+        assert_eq!(
+            conflict.string("/message"),
+            MESSAGE_IDEMPOTENCY_CONFLICT,
+            "case {case:?}: expected the message {MESSAGE_IDEMPOTENCY_CONFLICT:?}, got {:?}",
+            conflict.string("/message")
+        );
+    }
+
+    // The token is scoped to its own parent: the same token on another template uploads
+    // its own attachment.
+    let elsewhere = emulator
+        .create_attachment(&knowledge_base_id, &other_template, body)
+        .await;
+    assert_eq!(
+        elsewhere.status, 200,
+        "case \"the same token on another template\": expected HTTP 200, got HTTP {} with body {}",
+        elsewhere.status, elsewhere.body
+    );
+    assert_ne!(
+        elsewhere.string("/attachment/attachmentId"),
+        first.string("/attachment/attachmentId"),
+        "case \"the same token on another template\": the two uploads must be two attachments"
+    );
+
+    // Exactly one attachment was stored on the first template, whatever the replays and
+    // the refusals asked for.
+    let read = emulator
+        .get_message_template(&knowledge_base_id, &message_template_id)
+        .await;
+    assert_eq!(
+        read.field("/messageTemplate/attachments")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(1),
+        "case \"after the replays\": expected one stored attachment, got {:?}",
+        read.field("/messageTemplate/attachments")
+    );
+}
+
+/// The rule: an upload is addressed to a template of this knowledge base through a label
+/// that carries no version qualifier — a label that names no such template is not found,
+/// and one that carries a qualifier is refused.
+#[tokio::test]
+async fn an_upload_resolves_its_template_through_an_unqualified_label() {
+    let emulator = Emulator::new();
+    let knowledge_base_id = emulator.create_knowledge_base_named("labels").await;
+    let other_base_id = emulator.create_knowledge_base_named("labels-elsewhere").await;
+    let message_template_id = emulator
+        .given_message_template(&knowledge_base_id, "labelled")
+        .await;
+    let elsewhere_id = emulator
+        .given_message_template(&other_base_id, "held-elsewhere")
+        .await;
+
+    let body = json!({
+        "name": "refused.txt",
+        "contentDisposition": CONTENT_DISPOSITION,
+        "body": base64_of(b"a file nobody stores"),
+    });
+
+    // Rows: every label form that names no template of THIS knowledge base.
+    let missing = [
+        ("an id no template holds", ABSENT_UUID.to_string()),
+        (
+            "an ARN of this account naming nothing",
+            wisdom_arn(
+                "aws",
+                REGION,
+                engine::EMULATOR_ACCOUNT_ID,
+                &format!("message-template/{knowledge_base_id}/{ABSENT_UUID}"),
+            ),
+        ),
+        (
+            "an ARN of another account",
+            wisdom_arn(
+                "aws",
+                REGION,
+                OTHER_ACCOUNT,
+                &format!("message-template/{knowledge_base_id}/{message_template_id}"),
+            ),
+        ),
+        (
+            "another knowledge base's template",
+            elsewhere_id.clone(),
+        ),
+    ];
+    for (case, template_label) in missing {
+        let refused = emulator
+            .create_attachment(&knowledge_base_id, &template_label, body.clone())
+            .await;
+        assert_eq!(
+            refused.status, 404,
+            "case {case:?}: expected HTTP 404, got HTTP {} with body {}",
+            refused.status, refused.body
+        );
+        assert_eq!(
+            refused.error_type, "ResourceNotFoundException",
+            "case {case:?}: expected error type ResourceNotFoundException, got {:?}",
+            refused.error_type
+        );
+        assert_eq!(
+            refused.string("/message"),
+            MESSAGE_MESSAGE_TEMPLATE_NOT_FOUND,
+            "case {case:?}: expected the message {MESSAGE_MESSAGE_TEMPLATE_NOT_FOUND:?}, got {:?}",
+            refused.string("/message")
+        );
+    }
+
+    // A knowledge base this account does not hold is reported as the missing resource.
+    let no_parent = emulator
+        .create_attachment(ABSENT_UUID, &message_template_id, body.clone())
+        .await;
+    assert_eq!(
+        no_parent.status, 404,
+        "case \"a knowledge base this account does not hold\": expected HTTP 404, got HTTP {} \
+         with body {}",
+        no_parent.status, no_parent.body
+    );
+    assert_eq!(
+        no_parent.string("/message"),
+        MESSAGE_KNOWLEDGE_BASE_NOT_FOUND,
+        "case \"a knowledge base this account does not hold\": expected the message \
+         {MESSAGE_KNOWLEDGE_BASE_NOT_FOUND:?}, got {:?}",
+        no_parent.string("/message")
+    );
+
+    // Rows: every qualifier form the label may carry, each refused rather than read as
+    // naming a version to upload to.
+    for qualifier in [QUALIFIER_LATEST, QUALIFIER_ACTIVE, "1"] {
+        let refused = emulator
+            .create_attachment(
+                &knowledge_base_id,
+                &format!("{message_template_id}:{qualifier}"),
+                body.clone(),
+            )
+            .await;
+        assert_eq!(
+            refused.status, 400,
+            "case {qualifier:?}: expected HTTP 400, got HTTP {} with body {}",
+            refused.status, refused.body
+        );
+        assert_eq!(
+            refused.error_type, "ValidationException",
+            "case {qualifier:?}: expected error type ValidationException, got {:?}",
+            refused.error_type
+        );
+        assert_eq!(
+            refused.string("/message"),
+            MESSAGE_QUALIFIER_NOT_ACCEPTED,
+            "case {qualifier:?}: expected the message {MESSAGE_QUALIFIER_NOT_ACCEPTED:?}, got \
+             {:?}",
+            refused.string("/message")
+        );
+    }
+
+    // None of the refusals stored anything.
+    let read = emulator
+        .get_message_template(&knowledge_base_id, &message_template_id)
+        .await;
+    assert!(
+        read.field("/messageTemplate/attachments").is_none(),
+        "case \"every refused label\": a refused upload must persist nothing, got {:?}",
+        read.field("/messageTemplate/attachments")
+    );
+}
+
+/// The rule: a file is stored up to the store's per-file ceiling, and a body past it is
+/// refused with the modelled `ValidationException` stating the limit — the bound is tested
+/// at the ceiling and one byte past it.
+#[tokio::test]
+async fn a_file_at_the_per_file_ceiling_is_stored_and_one_past_it_is_refused() {
+    let emulator = Emulator::new();
+    let knowledge_base_id = emulator.create_knowledge_base_named("file-ceiling").await;
+    let message_template_id = emulator
+        .given_message_template(&knowledge_base_id, "file-ceiling")
+        .await;
+
+    let at_ceiling: Vec<u8> = (0..MAX_MESSAGE_TEMPLATE_ATTACHMENT_BYTES)
+        .map(|index| (index % 256) as u8)
+        .collect();
+    let accepted = emulator
+        .create_attachment(
+            &knowledge_base_id,
+            &message_template_id,
+            json!({
+                "name": "at-the-ceiling.bin",
+                "contentDisposition": CONTENT_DISPOSITION,
+                "body": base64_of(&at_ceiling),
+            }),
+        )
+        .await;
+    assert_eq!(
+        accepted.status, 200,
+        "case \"a file at the ceiling\": expected HTTP 200, got HTTP {} with body {}",
+        accepted.status, accepted.body
+    );
+    let followed = emulator
+        .follow("GET", &accepted.string("/attachment/url"))
+        .await;
+    assert_eq!(
+        followed.bytes.len(),
+        at_ceiling.len(),
+        "case \"a file at the ceiling\": the whole file must be served, got {} bytes",
+        followed.bytes.len()
+    );
+
+    let past_ceiling: Vec<u8> = (0..=MAX_MESSAGE_TEMPLATE_ATTACHMENT_BYTES)
+        .map(|index| (index % 256) as u8)
+        .collect();
+    let refused = emulator
+        .create_attachment(
+            &knowledge_base_id,
+            &message_template_id,
+            json!({
+                "name": "one-byte-too-far.bin",
+                "contentDisposition": CONTENT_DISPOSITION,
+                "body": base64_of(&past_ceiling),
+            }),
+        )
+        .await;
+    assert_eq!(
+        refused.status, 400,
+        "case \"one byte past the ceiling\": expected HTTP 400, got HTTP {} with body {}",
+        refused.status, refused.body
+    );
+    assert_eq!(
+        refused.error_type, "ValidationException",
+        "case \"one byte past the ceiling\": expected error type ValidationException, got {:?}",
+        refused.error_type
+    );
+    assert!(
+        refused
+            .string("/message")
+            .contains(&MAX_MESSAGE_TEMPLATE_ATTACHMENT_BYTES.to_string()),
+        "case \"one byte past the ceiling\": the refusal must state the limit, got {:?}",
+        refused.string("/message")
+    );
+
+    // The refusal left the stored file alone.
+    let read = emulator
+        .get_message_template(&knowledge_base_id, &message_template_id)
+        .await;
+    assert_eq!(
+        read.field("/messageTemplate/attachments")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(1),
+        "case \"one byte past the ceiling\": expected the one stored attachment, got {:?}",
+        read.field("/messageTemplate/attachments")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+    );
+}
+
+/// The rule: one working copy holds at most the store's attachment ceiling, past which an
+/// upload is the modelled `ServiceQuotaExceededException` (HTTP 402) and nothing is stored.
+#[tokio::test]
+async fn an_upload_past_the_attachment_ceiling_is_refused() {
+    let emulator = Emulator::new();
+    let knowledge_base_id = emulator.create_knowledge_base_named("ceiling").await;
+    let message_template_id = emulator
+        .given_message_template(&knowledge_base_id, "ceiling")
+        .await;
+
+    for index in 0..MAX_ATTACHMENTS_PER_MESSAGE_TEMPLATE {
+        let uploaded = emulator
+            .create_attachment(
+                &knowledge_base_id,
+                &message_template_id,
+                json!({
+                    "name": format!("bulk-{index}.txt"),
+                    "contentDisposition": CONTENT_DISPOSITION,
+                    "body": base64_of(format!("the file of {index}").as_bytes()),
+                }),
+            )
+            .await;
+        assert_eq!(
+            uploaded.status, 200,
+            "case \"attachment {index}\": expected HTTP 200 up to the ceiling, got HTTP {} with \
+             body {}",
+            uploaded.status, uploaded.body
+        );
+    }
+
+    let over = emulator
+        .create_attachment(
+            &knowledge_base_id,
+            &message_template_id,
+            json!({
+                "name": "one-too-many.txt",
+                "contentDisposition": CONTENT_DISPOSITION,
+                "body": base64_of(b"one file too many"),
+            }),
+        )
+        .await;
+    assert_eq!(
+        over.status, 402,
+        "case \"one past the ceiling\": expected HTTP 402, got HTTP {} with body {}",
+        over.status, over.body
+    );
+    assert_eq!(
+        over.error_type, "ServiceQuotaExceededException",
+        "case \"one past the ceiling\": expected error type ServiceQuotaExceededException, got \
+         {:?}",
+        over.error_type
+    );
+    assert_eq!(
+        over.string("/message"),
+        MESSAGE_ATTACHMENT_QUOTA,
+        "case \"one past the ceiling\": expected the message {MESSAGE_ATTACHMENT_QUOTA:?}, got \
+         {:?}",
+        over.string("/message")
+    );
+
+    let read = emulator
+        .get_message_template(&knowledge_base_id, &message_template_id)
+        .await;
+    assert_eq!(
+        read.field("/messageTemplate/attachments")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(MAX_ATTACHMENTS_PER_MESSAGE_TEMPLATE),
+        "case \"one past the ceiling\": the working copy must hold exactly the ceiling, got {:?}",
+        read.field("/messageTemplate/attachments")
+            .and_then(Value::as_array)
+            .map(Vec::len)
     );
 }

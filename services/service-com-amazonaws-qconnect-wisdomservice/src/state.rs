@@ -29,6 +29,11 @@ pub use message_templates::*;
 mod message_template_versions;
 pub use message_template_versions::*;
 
+/// The attachment files of a message template: the record, its projection and the locator
+/// the download plane serves one under.
+mod message_template_attachments;
+pub use message_template_attachments::*;
+
 /// Rendering a message template: the variable placeholders its content names and the
 /// attribute values a render resolves them from.
 mod message_template_render;

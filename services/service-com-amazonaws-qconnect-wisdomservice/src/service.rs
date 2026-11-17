@@ -56,6 +56,15 @@
 //!   authentication precisely for requests that name no modelled operation, which is
 //!   what makes an unsigned `PUT` to a minted URL work.
 //!
+//! ## The message-template attachment plane
+//!
+//! `CreateMessageTemplateAttachment` answers with "a pre-signed Amazon S3 URL that can be
+//! used to download the attachment file", which is the same promise: the URL it mints
+//! (`crate::state::message_template_attachment_url`) addresses the endpoint the caller
+//! reached, one segment deeper than the modelled route for the attachment itself, and is
+//! claimed and served by the two seams below exactly as the content-asset URL is. A `GET`
+//! answers the file the upload carried and changes nothing.
+//!
 //! The plane writes ONLY the upload the URL names — the bytes, bounded both per body
 //! (`crate::state::MAX_CONTENT_UPLOAD_BYTES`) and across every written body this store
 //! holds (`crate::state::MAX_PENDING_UPLOAD_BYTES`) — and refuses a `PUT` that is late
@@ -347,6 +356,115 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         resp
     }
 
+    /// Whether this request FOLLOWS an attachment URL this service handed out: its path is
+    /// one the attachment plane publishes and it names an attachment THIS store holds.
+    ///
+    /// The same rule as [`Self::holds_content_upload`], and for the same reason: the
+    /// minted attachment id in the path is the receipt, so exactly the view that handed
+    /// the URL out claims a request following it.
+    fn holds_message_template_attachment(
+        &self,
+        target: &crate::state::MessageTemplateAttachmentTarget,
+    ) -> bool {
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return false;
+        };
+        let store = state.lock();
+        let knowledge_base_id = crate::state::resolve_id(&target.knowledge_base_label);
+        let message_template_id = crate::state::resolve_id(&target.message_template_label);
+        store
+            .message_template_attachment(
+                knowledge_base_id,
+                message_template_id,
+                &target.attachment_id,
+            )
+            .is_some()
+    }
+
+    /// Serve one request to a published attachment URL.
+    ///
+    /// A `GET` answers the file `CreateMessageTemplateAttachment` stored on the message
+    /// template the URL names — which is the only thing the plane can touch, and it
+    /// changes nothing — and is refused when the attachment's `urlExpiry` has passed. The
+    /// attachment, the template that holds it and the knowledge base that holds the
+    /// template must all agree: a path that crosses one template with another's attachment
+    /// names nothing.
+    fn serve_message_template_attachment(
+        &self,
+        req: &RtRequest,
+        target: &crate::state::MessageTemplateAttachmentTarget,
+    ) -> RtResponse {
+        if req.method() != "GET" {
+            return upload_error(
+                405,
+                "MethodNotAllowed",
+                "This attachment URL is read by a single GET",
+            );
+        }
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return upload_error(
+                500,
+                "InternalServerException",
+                "the message-template store is unavailable",
+            );
+        };
+        let now = ::std::time::SystemTime::now();
+        let store = state.lock();
+        let knowledge_base_id = crate::state::resolve_id(&target.knowledge_base_label);
+        let message_template_id = crate::state::resolve_id(&target.message_template_label);
+        let Some(attachment) = store.message_template_attachment(
+            knowledge_base_id,
+            message_template_id,
+            &target.attachment_id,
+        ) else {
+            return upload_error(404, "NoSuchKey", ATTACHMENT_NOT_FOUND_MESSAGE);
+        };
+        // The URL stops being usable at the `urlExpiry` every read of the template
+        // reports, so a late GET is refused rather than served: what the plane honours and
+        // what a read publishes are the one stored instant.
+        if attachment.has_expired_url(now) {
+            return upload_error(403, "AccessDenied", UPLOAD_EXPIRED_MESSAGE);
+        }
+        let mut resp = RtResponse::new(
+            StatusCode::try_from(200u16).expect("200 is a valid status"),
+            SdkBody::from(attachment.body.clone()),
+        );
+        // The model carries no media type for an attachment file, so the plane claims
+        // none: the bytes are served as the generic binary type, with the presentation the
+        // upload gave. The presentation and the file NAME are both stored values that came
+        // from a request, and a header's text is visible ASCII, so each is written only
+        // when it is text a header may carry: a name of other scripts is served under the
+        // presentation alone, and a presentation that is not header text under the fixed
+        // [`ATTACHMENT_DISPOSITION`] — never as raw bytes in a header, and never through a
+        // path that could unwind this request.
+        resp.headers_mut()
+            .insert("content-type", GENERIC_ASSET_CONTENT_TYPE);
+        let presentation = attachment.content_disposition.to_ascii_lowercase();
+        let presentation = if header_safe_text(&presentation) {
+            presentation
+        } else {
+            ATTACHMENT_DISPOSITION.to_string()
+        };
+        let disposition = if header_safe_text(&attachment.name) {
+            format!("{presentation}; filename=\"{}\"", attachment.name)
+        } else {
+            presentation
+        };
+        if resp
+            .headers_mut()
+            .try_insert("content-disposition", disposition)
+            .is_err()
+        {
+            // Unreachable: every part of the value above is header text. The module's own
+            // constant is served rather than unwinding this request.
+            resp.headers_mut()
+                .insert("content-disposition", ATTACHMENT_DISPOSITION);
+        }
+        resp.headers_mut()
+            .insert("content-length", attachment.body.len().to_string());
+        resp
+    }
+
     /// Whether this request FOLLOWS a content-asset URL this service handed out: its path
     /// is one the asset plane publishes and it names a content THIS store holds.
     ///
@@ -469,6 +587,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         if let Some(target) = crate::state::parse_content_asset_path(parts.uri.path()) {
             return self.holds_content(&target);
         }
+        // And so is one that follows a message-template attachment URL, by the store that
+        // minted the attachment id in its path. That path is one segment deeper than the
+        // modelled route for the attachment, so nothing modelled is diverted here.
+        if let Some(target) =
+            crate::state::parse_message_template_attachment_path(parts.uri.path())
+        {
+            return self.holds_message_template_attachment(&target);
+        }
         claims_endpoint_traffic(parts)
     }
 
@@ -562,8 +688,11 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         if let Some(target) = crate::state::parse_content_upload_path(path) {
             return Some(self.serve_content_upload(req, &target));
         }
-        let target = crate::state::parse_content_asset_path(path)?;
-        Some(self.serve_content_asset(req, &target))
+        if let Some(target) = crate::state::parse_content_asset_path(path) {
+            return Some(self.serve_content_asset(req, &target));
+        }
+        let target = crate::state::parse_message_template_attachment_path(path)?;
+        Some(self.serve_message_template_attachment(req, &target))
     }
 
     fn override_framework_error(
@@ -588,6 +717,26 @@ const UPLOAD_NOT_FOUND_MESSAGE: &str = "The requested upload does not exist";
 /// The body of an asset-plane refusal that found no content: the same rule as
 /// [`UPLOAD_NOT_FOUND_MESSAGE`].
 const ASSET_NOT_FOUND_MESSAGE: &str = "The requested content does not exist";
+
+/// The body of an attachment-plane refusal that found no attachment: the same rule as
+/// [`UPLOAD_NOT_FOUND_MESSAGE`].
+const ATTACHMENT_NOT_FOUND_MESSAGE: &str = "The requested attachment does not exist";
+
+/// The presentation the attachment plane serves a file under when the stored
+/// `contentDisposition` is not text a header may carry: the lowercase form of the one
+/// value the model's `ContentDisposition` declares. A constant of this module, so the
+/// fallback is STATICALLY a legal header value and cannot unwind this request, which
+/// arrives with no credential and is served before authentication.
+const ATTACHMENT_DISPOSITION: &str = "attachment";
+
+/// Whether a stored value can be written into a header: the visible-ASCII text a header
+/// value carries, and neither of the two characters that would end the quoted string a
+/// `filename` parameter is written in.
+fn header_safe_text(value: &str) -> bool {
+    value
+        .chars()
+        .all(|character| matches!(character, ' '..='~') && !matches!(character, '"' | '\\'))
+}
 
 /// The media type an asset is served as when the content's own stored media type is not
 /// a string a header may carry: the generic binary type, which says only "these are

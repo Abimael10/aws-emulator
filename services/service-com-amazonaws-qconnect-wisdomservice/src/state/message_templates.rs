@@ -16,9 +16,9 @@ use std::time::SystemTime;
 
 use super::*;
 use crate::ops::types::{
-    ExtendedMessageTemplateData, GroupingConfiguration, MessageTemplateAttachment,
-    MessageTemplateAttributes, MessageTemplateContentProvider, MessageTemplateData,
-    MessageTemplateSourceConfiguration, MessageTemplateSourceConfigurationSummary,
+    ExtendedMessageTemplateData, GroupingConfiguration, MessageTemplateAttributes,
+    MessageTemplateContentProvider, MessageTemplateData, MessageTemplateSourceConfiguration,
+    MessageTemplateSourceConfigurationSummary,
     WhatsAppMessageTemplateSourceConfigurationSummary,
 };
 
@@ -232,7 +232,11 @@ pub struct MessageTemplate {
     /// The attachments held on the working copy of this template, in the order they were
     /// uploaded. Empty until an attachment is uploaded to it, and part of the content
     /// checksum ([`Self::content_sha256`]) as the model says it is.
-    pub attachments: Vec<MessageTemplateAttachment>,
+    ///
+    /// Each one is the stored FILE and its metadata ([`MessageTemplateAttachmentFile`]),
+    /// projected onto the modelled shape by [`Self::attachments_out`], so the URL a read
+    /// reports addresses bytes this store actually holds.
+    pub attachments: Vec<MessageTemplateAttachmentFile>,
 }
 
 impl MessageTemplate {
@@ -405,7 +409,7 @@ impl MessageTemplate {
             grouping_configuration: self.grouping_configuration.clone(),
             default_attributes: self.default_attributes.clone(),
             attribute_types: self.attribute_types(),
-            attachments: (!self.attachments.is_empty()).then(|| self.attachments.clone()),
+            attachments: self.attachments_out(),
             is_active,
             version_number,
             message_template_content_sha256: self.content_sha256(),
