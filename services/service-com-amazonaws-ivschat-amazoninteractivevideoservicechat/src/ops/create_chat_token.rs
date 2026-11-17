@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateChatToken
-//! IMPLEMENTED: verifies the room exists in [`crate::state`], then mints an opaque token
-//! recorded there against (room, user, capabilities, attributes) with its expiry
-//! timestamps. Two calls never return the same token. An unknown room answers
+//! IMPLEMENTED: verifies the room exists in [`crate::state`], then issues an encrypted
+//! token for the session the request asked for — the session's own claims sealed under a
+//! key only this service holds ([`crate::state::chat_tokens`]) — and records that session
+//! against the token it returns, with its expiry timestamps. Two calls never return the
+//! same token. An unknown room answers
 //! `ResourceNotFoundException` (404); a capability the modelled enum does not carry, or a
 //! `sessionDurationInMinutes` outside the modelled range, answers `ValidationException`
 //! (400).
@@ -213,7 +215,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let session_minutes = input
             .session_duration_in_minutes
             .unwrap_or(crate::state::DEFAULT_SESSION_DURATION_IN_MINUTES);
-        let now = ::std::time::SystemTime::now();
+        // The instants are recorded at the millisecond resolution this service reports a
+        // `Time` member at, so the record, the claims sealed into the token and the response
+        // all carry the same instant.
+        let now = crate::state::at_reported_precision(::std::time::SystemTime::now());
         let token_expiration_time = now + crate::state::CHAT_TOKEN_LIFETIME;
         // The session runs for the minutes the request asked for, from the mint.
         let session_expiration_time = now
@@ -233,15 +238,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // already ended, and the oldest-expiring ones if the set is at its cap.
         store.prune_chat_tokens(now);
 
-        let token = store.mint_chat_token();
-        let record = crate::state::ChatToken {
-            token: token.clone(),
+        // The session this call issues a token for. The token itself is that session
+        // sealed: an opaque encrypted value, so what the response carries is read back out
+        // of the stored record rather than built here.
+        let session = crate::state::ChatSession {
             room_id,
             user_id: input.user_id,
             capabilities,
             attributes: input.attributes.unwrap_or_default().into_iter().collect(),
             token_expiration_time,
             session_expiration_time,
+        };
+        let Some(token) = store.mint_chat_token(&session) else {
+            // Unreachable: a mint fails only when every draw collides with a token the
+            // store already holds, which no sealed payload of this size does.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateChatToken",
+            ));
+        };
+        let record = crate::state::ChatToken {
+            token: token.clone(),
+            session,
         };
         // A plain insert, so the record this call persists is the one it describes.
         store.chat_tokens.insert(token.clone(), record);
@@ -254,9 +271,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(CreateChatTokenOutput {
             token: Some(stored.token.clone()),
-            token_expiration_time: Some(crate::state::as_date_time(stored.token_expiration_time)),
+            token_expiration_time: Some(crate::state::as_date_time(
+                stored.session.token_expiration_time,
+            )),
             session_expiration_time: Some(crate::state::as_date_time(
-                stored.session_expiration_time,
+                stored.session.session_expiration_time,
             )),
         })
     }

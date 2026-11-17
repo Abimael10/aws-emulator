@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_ivschat_amazoninteractivevideoservicechat::state::{
-    Room, ROOMS_PER_REGION,
+    chat_token_claims, Room, CHAT_TOKEN_MIN_LENGTH, ROOMS_PER_REGION,
 };
 use service_com_amazonaws_ivschat_amazoninteractivevideoservicechat::ComAmazonawsIvschatAmazoninteractivevideoservicechatState as ChatState;
 
@@ -1101,5 +1101,244 @@ async fn reading_a_room_does_not_change_what_a_later_caller_sees() {
             after, baseline,
             "case {case:?}: a read changed the stored room: expected {baseline}, got {after}"
         );
+    }
+}
+
+/// Whether `token` is rendered in the base64 alphabet — the standard alphabet and its
+/// padding character, which is what an encrypted blob travels in on a JSON wire.
+fn is_base64(token: &str) -> bool {
+    !token.is_empty()
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+}
+
+/// `time` as whole seconds since the Unix epoch, so a sealed instant can be compared with
+/// the ISO 8601 timestamp the response reported it as.
+fn epoch_secs(time: SystemTime) -> i64 {
+    i64::try_from(
+        time.duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_secs(),
+    )
+    .unwrap_or(i64::MAX)
+}
+
+/// The capability values a request asked for, in the order it listed them.
+fn requested_list(request: &Value, member: &str) -> Vec<String> {
+    request
+        .get(member)
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .map(|value| value.as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The attributes a request asked to encode into the token.
+fn requested_map(request: &Value, member: &str) -> BTreeMap<String, String> {
+    request
+        .get(member)
+        .and_then(Value::as_object)
+        .map(|members| {
+            members
+                .iter()
+                .map(|(key, value)| (key.clone(), value.as_str().unwrap_or_default().to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// THE RULE UNDER TEST: `CreateChatToken` "creates an encrypted token", answers it as "the
+/// issued client token, encrypted" and encodes the session's attributes into it, so the
+/// value is the session sealed under a key the service holds — opaque, high-entropy base64
+/// material whose size follows the claims it carries, never a fixed-width rendering of
+/// anything the store counted.
+#[tokio::test]
+async fn create_chat_token_issues_encrypted_material_carrying_the_session() {
+    let emulator = Emulator::new();
+    let room = emulator.create_room(&json!({ "name": "token-form" })).await;
+    let arn = str_field(&room, "arn");
+    let room_id = str_field(&room, "id");
+
+    // Rows differ in what the session carries — the user id's length, how many capabilities
+    // and the number and size of the attributes — which is what the value's size follows.
+    let cases: Vec<(&str, Value)> = vec![
+        (
+            "no capabilities and no attributes",
+            json!({ "userId": "alice" }),
+        ),
+        (
+            "one capability",
+            json!({ "userId": "bob", "capabilities": [CAPABILITIES[0]] }),
+        ),
+        (
+            "every modelled capability",
+            json!({ "userId": "carol", "capabilities": CAPABILITIES }),
+        ),
+        (
+            "several attributes",
+            json!({
+                "userId": "dave",
+                "attributes": {
+                    "displayName": "Dave",
+                    "icon": "https://example.test/avatar.png",
+                    "badge": "moderator"
+                }
+            }),
+        ),
+        (
+            "a long user id and a long attribute value",
+            json!({
+                "userId": "u".repeat(128),
+                "capabilities": [CAPABILITIES[CAPABILITIES.len() - 1]],
+                "attributes": { "bio": "x".repeat(600) }
+            }),
+        ),
+    ];
+
+    let mut widths = BTreeSet::new();
+    let mut issued = BTreeSet::new();
+    for (case, extra) in cases {
+        let mut request = extra.clone();
+        request["roomIdentifier"] = json!(arn);
+        let (status, body) = emulator.call("CreateChatToken", &request).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: CreateChatToken must answer 200, got {status} {body}"
+        );
+
+        let token = str_field(&body, "token");
+        assert!(
+            token.len() >= CHAT_TOKEN_MIN_LENGTH,
+            "case {case:?}: expected at least {CHAT_TOKEN_MIN_LENGTH} characters of encrypted \
+             material, got {} in {token}",
+            token.len()
+        );
+        assert!(
+            is_base64(&token),
+            "case {case:?}: expected a base64 rendering, got {token}"
+        );
+        let distinct: BTreeSet<char> = token.chars().collect();
+        assert!(
+            distinct.len() >= 24,
+            "case {case:?}: expected high-entropy material, got {} distinct characters in \
+             {token}",
+            distinct.len()
+        );
+        assert!(
+            issued.insert(token.clone()),
+            "case {case:?}: token {token} was issued twice"
+        );
+        widths.insert(token.len());
+
+        // The value IS the session: what the service sealed into it is exactly what the
+        // request asked for, which no digest and no counter rendering could carry.
+        let claims = chat_token_claims(&token).unwrap_or_else(|| {
+            panic!("case {case:?}: the issued token must decrypt to its session, got {token}")
+        });
+        assert_eq!(
+            claims.room_id, room_id,
+            "case {case:?}: expected the room {room_id} sealed in, got {:?}",
+            claims.room_id
+        );
+        let expected_user = str_field(&request, "userId");
+        assert_eq!(
+            claims.user_id, expected_user,
+            "case {case:?}: expected the user {expected_user} sealed in, got {:?}",
+            claims.user_id
+        );
+        let expected_capabilities = requested_list(&request, "capabilities");
+        assert_eq!(
+            claims.capabilities, expected_capabilities,
+            "case {case:?}: expected {expected_capabilities:?} sealed in, got {:?}",
+            claims.capabilities
+        );
+        let expected_attributes = requested_map(&request, "attributes");
+        assert_eq!(
+            claims.attributes, expected_attributes,
+            "case {case:?}: expected {expected_attributes:?} sealed in, got {:?}",
+            claims.attributes
+        );
+        let reported_token_expiry = seconds(&body, "tokenExpirationTime");
+        assert_eq!(
+            epoch_secs(claims.token_expiration_time),
+            reported_token_expiry,
+            "case {case:?}: the sealed token expiry must be the one reported"
+        );
+        let reported_session_expiry = seconds(&body, "sessionExpirationTime");
+        assert_eq!(
+            epoch_secs(claims.session_expiration_time),
+            reported_session_expiry,
+            "case {case:?}: the sealed session expiry must be the one reported"
+        );
+
+        // And the store holds the record under exactly the value the response carried.
+        {
+            let state = emulator.engine.state::<ChatState>();
+            let store = state.lock();
+            let stored = store
+                .chat_tokens
+                .get(&token)
+                .unwrap_or_else(|| panic!("case {case:?}: the store must hold token {token}"));
+            assert_eq!(
+                stored.session, claims,
+                "case {case:?}: the stored session must be the sealed one, got {:?}",
+                stored.session
+            );
+        }
+    }
+
+    assert!(
+        widths.len() > 1,
+        "case the table as a whole: a token's size must follow the claims it carries, got one \
+         width for every session: {widths:?}"
+    );
+}
+
+/// THE RULE UNDER TEST, second half: nothing about an issued token follows from the ones
+/// issued before it, so two tokens for one identical request differ from their very first
+/// characters — which a rendering of a monotonic counter cannot do.
+#[tokio::test]
+async fn consecutive_chat_tokens_are_unpredictable_from_one_another() {
+    let emulator = Emulator::new();
+    let room = emulator.create_room(&json!({ "name": "token-entropy" })).await;
+    let arn = str_field(&room, "arn");
+
+    // Rows: the SAME request repeated, which is the case a value derived from the request or
+    // from a mint counter could not tell apart.
+    let request = json!({ "roomIdentifier": arn, "userId": "alice" });
+    let mut previous: Option<String> = None;
+    for mint in 0..6 {
+        let (status, body) = emulator.call("CreateChatToken", &request).await;
+        assert_eq!(
+            status, 200,
+            "case mint {mint}: CreateChatToken must answer 200, got {status} {body}"
+        );
+        let token = str_field(&body, "token");
+        if let Some(earlier) = previous.replace(token.clone()) {
+            assert_ne!(
+                earlier, token,
+                "case mint {mint}: two identical calls must not answer the same token"
+            );
+            let shared = earlier
+                .chars()
+                .zip(token.chars())
+                .take_while(|(left, right)| left == right)
+                .count();
+            assert!(
+                shared < 8,
+                "case mint {mint}: expected tokens that differ from their first characters, \
+                 got {shared} shared leading characters between {earlier} and {token}"
+            );
+            assert_eq!(
+                earlier.len(),
+                token.len(),
+                "case mint {mint}: one session's claims must seal to one size"
+            );
+        }
     }
 }

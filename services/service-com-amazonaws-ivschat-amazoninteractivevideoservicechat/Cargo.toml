@@ -30,6 +30,14 @@ aws-sdk-cloudwatchlogs = { version = "1", default-features = false }
 aws-sdk-firehose = { version = "=1.126.0", default-features = false }
 # Hex codec for the opaque `nextToken` ListRooms issues.
 hex = { workspace = true }
+# The AEAD a chat token's claims are sealed with: `CreateChatToken` answers "an encrypted
+# token", so the value is the session encrypted under a key only this service holds
+# (`src/state/chat_tokens.rs`). No AES-NI feature detection beyond the `aes` backend, and no
+# OS random source of its own: the entropy comes from `rand` below.
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+# The operating-system-seeded generator the chat-token key, nonces and per-token identifiers
+# are drawn from, so an issued token is not predictable from another one.
+rand = "0.9"
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }

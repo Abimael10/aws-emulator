@@ -25,6 +25,10 @@ use crate::ops::types::{
     UPDATE_LOGGING_CONFIGURATION_STATE_VALUES,
 };
 
+/// What a chat token IS: the session it stands for, and the encrypted value a participant
+/// carries it in.
+pub mod chat_tokens;
+
 /// Resolving the destination a logging configuration logs to against the service that owns
 /// it, which is what a write that names one is gated on.
 pub mod log_destinations;
@@ -32,6 +36,10 @@ pub mod log_destinations;
 /// How this service words a request it refuses because one member's value is wrong, and the
 /// modelled `ValidationException` that wording travels in.
 pub mod refusals;
+
+pub use chat_tokens::{
+    at_reported_precision, chat_token_claims, ChatSession, ChatToken, CHAT_TOKEN_MIN_LENGTH,
+};
 
 pub use refusals::{
     check_range, field_validation_failed, member_path, missing_member_violation,
@@ -198,16 +206,14 @@ pub fn updated_logging_configuration_state() -> &'static str {
         .unwrap_or("ACTIVE")
 }
 
-/// The alphabet room ids and chat tokens are rendered in — exactly the character set
-/// `RoomID`'s `^[a-zA-Z0-9]+$` pattern admits.
+/// The alphabet room ids and logging-configuration ids are rendered in — exactly the
+/// character set `RoomID`'s `^[a-zA-Z0-9]+$` pattern admits.
 const BASE62: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
-/// Domain separators mixed into the mint counter, so a room id and a chat token minted at
-/// the same counter value are different strings.
+/// Domain separators mixed into the mint counter, so a room id and a logging-configuration
+/// id minted at the same counter value are different strings.
 const ROOM_ID_DOMAIN: u64 = 0x524f_4f4d_5f49_4400; // "ROOM_ID"
 const LOGGING_CONFIGURATION_ID_DOMAIN: u64 = 0x4c4f_4747_5f49_4400; // "LOG_ID"
-const CHAT_TOKEN_DOMAIN: u64 = 0x544f_4b45_4e5f_3031; // "TOKEN_01"
-const CHAT_TOKEN_DOMAIN_HI: u64 = 0x544f_4b45_4e5f_3032; // "TOKEN_02"
 
 /// SplitMix64's finalizer: a bijection on `u64`, so distinct mint counters always give
 /// distinct ids while the rendered id carries no readable sequence number.
@@ -268,18 +274,6 @@ pub struct LoggingConfiguration {
     pub tags: BTreeMap<String, String>,
 }
 
-/// A chat token minted by `CreateChatToken` against a room.
-#[derive(Debug, Clone)]
-pub struct ChatToken {
-    pub token: String,
-    pub room_id: String,
-    pub user_id: String,
-    pub capabilities: Vec<String>,
-    pub attributes: BTreeMap<String, String>,
-    pub token_expiration_time: SystemTime,
-    pub session_expiration_time: SystemTime,
-}
-
 /// Per-service state for com-amazonaws-ivschat-amazoninteractivevideoservicechat. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsIvschatAmazoninteractivevideoservicechatState {
@@ -302,16 +296,16 @@ impl ComAmazonawsIvschatAmazoninteractivevideoservicechatState {
         base62_fixed(mix64(self.minted ^ ROOM_ID_DOMAIN), ROOM_ID_LEN)
     }
 
-    /// Mint a fresh opaque chat token. Unique within this store: two calls never collide,
-    /// so no caller can treat the value as a constant.
-    pub fn mint_chat_token(&mut self) -> String {
-        self.minted = self.minted.wrapping_add(1);
-        let n = self.minted;
-        format!(
-            "{}{}",
-            base62_fixed(mix64(n ^ CHAT_TOKEN_DOMAIN), 24),
-            base62_fixed(mix64(n ^ CHAT_TOKEN_DOMAIN_HI), 24)
-        )
+    /// Mint a fresh chat token for `session`: the session's own claims sealed under this
+    /// process's key ([`chat_tokens::fresh_chat_token`]), unique among the tokens this
+    /// store holds. `None` only when no draw produced a value the store does not already
+    /// hold, which is not reachable in practice.
+    ///
+    /// Nothing about the value follows from how many tokens have been minted: the mint
+    /// counter below names ids the model constrains to a fixed width, and a chat token is
+    /// not one of those.
+    pub fn mint_chat_token(&self, session: &ChatSession) -> Option<String> {
+        chat_tokens::fresh_chat_token(session, &self.chat_tokens)
     }
 
     /// The `RoomID` a room identifier names: the part after `:room/` of a room ARN, or a
@@ -345,7 +339,7 @@ impl ComAmazonawsIvschatAmazoninteractivevideoservicechatState {
     pub fn remove_room(&mut self, identifier: &str) -> Option<Room> {
         let id = Self::room_id_of(identifier)?.to_string();
         let room = self.rooms.remove(&id)?;
-        self.chat_tokens.retain(|_, token| token.room_id != id);
+        self.chat_tokens.retain(|_, token| token.session.room_id != id);
         Some(room)
     }
 
@@ -444,7 +438,7 @@ impl ComAmazonawsIvschatAmazoninteractivevideoservicechatState {
     /// steady stream of mints cannot grow the store without limit.
     pub fn prune_chat_tokens(&mut self, now: SystemTime) {
         self.chat_tokens
-            .retain(|_, token| token.session_expiration_time > now);
+            .retain(|_, token| token.session.session_expiration_time > now);
         if self.chat_tokens.len() < MAX_RETAINED_CHAT_TOKENS {
             return;
         }
@@ -455,7 +449,7 @@ impl ComAmazonawsIvschatAmazoninteractivevideoservicechatState {
         let mut by_expiry: Vec<(SystemTime, String)> = self
             .chat_tokens
             .iter()
-            .map(|(token, record)| (record.session_expiration_time, token.clone()))
+            .map(|(token, record)| (record.session.session_expiration_time, token.clone()))
             .collect();
         by_expiry.sort();
         for (_, token) in by_expiry.into_iter().take(excess) {
@@ -698,13 +692,46 @@ mod tests {
         }
     }
 
+    /// A session for the store's own tests: the claims a mint seals, varied by the caller.
+    fn test_session(user: &str, expires: SystemTime) -> ChatSession {
+        ChatSession {
+            room_id: "abc123ABC456".to_string(),
+            user_id: user.to_string(),
+            capabilities: Vec::new(),
+            attributes: BTreeMap::new(),
+            token_expiration_time: expires,
+            session_expiration_time: expires,
+        }
+    }
+
     #[test]
     fn minted_chat_tokens_never_repeat() {
         let mut state = ComAmazonawsIvschatAmazoninteractivevideoservicechatState::default();
-        let first = state.mint_chat_token();
-        let second = state.mint_chat_token();
-        assert_ne!(first, second, "two mints must not return the same token");
-        assert!(!first.is_empty(), "a chat token must not be empty");
+        let session = test_session("alice", SystemTime::now() + Duration::from_secs(60));
+        let mut seen = std::collections::BTreeSet::new();
+        // Rows: the same session minted repeatedly, which is the case a value derived from
+        // the request could not tell apart.
+        for mint in 0..8 {
+            let token = state
+                .mint_chat_token(&session)
+                .unwrap_or_else(|| panic!("case mint {mint}: a mint must answer a token"));
+            assert!(
+                token.len() >= CHAT_TOKEN_MIN_LENGTH,
+                "case mint {mint}: expected at least {CHAT_TOKEN_MIN_LENGTH} characters, got {}",
+                token.len()
+            );
+            assert!(
+                seen.insert(token.clone()),
+                "case mint {mint}: token {token} was minted twice"
+            );
+            state.chat_tokens.insert(
+                token.clone(),
+                ChatToken {
+                    token,
+                    session: session.clone(),
+                },
+            );
+        }
     }
 
     #[test]
@@ -753,12 +780,7 @@ mod tests {
                 token.to_string(),
                 ChatToken {
                     token: token.to_string(),
-                    room_id: "abc123ABC456".to_string(),
-                    user_id: "alice".to_string(),
-                    capabilities: Vec::new(),
-                    attributes: BTreeMap::new(),
-                    token_expiration_time: expires,
-                    session_expiration_time: expires,
+                    session: test_session("alice", expires),
                 },
             );
         }
@@ -778,12 +800,7 @@ mod tests {
                 token.clone(),
                 ChatToken {
                     token,
-                    room_id: "abc123ABC456".to_string(),
-                    user_id: "alice".to_string(),
-                    capabilities: Vec::new(),
-                    attributes: BTreeMap::new(),
-                    token_expiration_time: expires,
-                    session_expiration_time: expires,
+                    session: test_session("alice", expires),
                 },
             );
         }

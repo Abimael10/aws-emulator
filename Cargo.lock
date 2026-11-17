@@ -15487,6 +15487,7 @@ dependencies = [
 name = "service-com-amazonaws-ivschat-amazoninteractivevideoservicechat"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "aws-emulator-build-support",
  "aws-emulator-emulator-telemetry",
  "aws-emulator-engine",
@@ -15503,6 +15504,7 @@ dependencies = [
  "bytes",
  "hex",
  "http",
+ "rand 0.9.5",
  "serde_json",
  "service-com-amazonaws-cloudwatchlogs-logs-20140328",
  "service-com-amazonaws-firehose-firehose-20150804",
