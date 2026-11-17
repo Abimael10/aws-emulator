@@ -350,6 +350,21 @@ fn as_path_segment(target: &str) -> String {
     target.replace('%', "%25").replace(':', "%3A").replace('/', "%2F")
 }
 
+/// The sentence a value of no supported target form is refused with.
+///
+/// The API names the ADDRESS it read when the value is an ARN — one it could read, just
+/// not one naming a resource a policy attaches to — and names nothing at all when the
+/// value is no address: nothing was read out of it. `names_the_target` is which of the
+/// two a row is. Shared with the principal-policy suite, which refuses a `principal`
+/// through the same resolver.
+pub(crate) fn invalid_target_message(target: &str, names_the_target: bool) -> String {
+    if names_the_target {
+        format!("Invalid Target: {target}")
+    } else {
+        "Invalid Target".to_string()
+    }
+}
+
 /// The ARN a policy created in this suite's region carries.
 fn policy_arn(policy_name: &str) -> String {
     format!("arn:aws:iot:{REGION}:{ACCOUNT_ID}:policy/{policy_name}")
@@ -916,7 +931,9 @@ async fn an_attachment_to_a_resource_that_does_not_exist_is_refused() {
             "an unknown policy name",
             "no-such-policy",
             certificate.clone(),
-            "Policy no-such-policy does not exist".to_string(),
+            // An attach states its miss as fixed text naming no value, which is why
+            // the name the request sent is nowhere in it.
+            "Policy not found".to_string(),
         ),
         (
             "an unknown certificate target",
@@ -957,32 +974,42 @@ async fn an_attachment_to_a_resource_that_does_not_exist_is_refused() {
     }
 
     // The INVALID rows: strings that name no policy target at all. Each is refused 400,
-    // the class the model has for a request that is not valid.
+    // the class the model has for a request that is not valid; the third field is
+    // whether the row is an ARN, which is what decides whether the sentence names it
+    // ([`invalid_target_message`]).
     let invalid = vec![
-        ("an empty target", String::new()),
-        ("a bare name", "plant-floor".to_string()),
-        ("a path with no ARN prefix", "cert/abc".to_string()),
+        ("an empty target", String::new(), false),
+        ("a bare name", "plant-floor".to_string(), false),
+        ("a path with no ARN prefix", "cert/abc".to_string(), false),
         (
             "an ARN of another service",
             format!("arn:aws:iam::{ACCOUNT_ID}:role/device"),
+            true,
         ),
         (
             "an IoT ARN of a resource no policy attaches to",
             format!("arn:aws:iot:{REGION}:{ACCOUNT_ID}:thing/sensor-1"),
+            true,
         ),
         (
             "a certificate ARN with no id",
             format!("arn:aws:iot:{REGION}:{ACCOUNT_ID}:cert/"),
+            true,
         ),
         (
             "an IoT ARN with no resource type",
             format!("arn:aws:iot:{REGION}:{ACCOUNT_ID}:cert"),
+            true,
         ),
-        ("a Cognito identity with no id", format!("{REGION}:")),
-        ("a Cognito identity with no region", ":abcdef".to_string()),
+        ("a Cognito identity with no id", format!("{REGION}:"), false),
+        (
+            "a Cognito identity with no region",
+            ":abcdef".to_string(),
+            false,
+        ),
     ];
 
-    for (label, target) in &invalid {
+    for (label, target, names_the_target) in &invalid {
         let refused = emulator.attach_policy("known-policy", target).await;
         assert_eq!(
             refused.status, 400,
@@ -995,9 +1022,10 @@ async fn an_attachment_to_a_resource_that_does_not_exist_is_refused() {
             "case {label}: expected InvalidRequestException, got {:?}",
             refused.error_code
         );
-        assert!(
-            refused.message().contains("policy target"),
-            "case {label}: the refusal must name what a policy target is, got {:?}",
+        assert_eq!(
+            refused.message(),
+            invalid_target_message(target, *names_the_target),
+            "case {label}: unexpected refusal message {:?}",
             refused.message()
         );
     }
@@ -1149,5 +1177,192 @@ async fn a_target_holds_at_most_the_ceiling_of_policies() {
         repeat.status, 200,
         "case the ceiling: a repeat of a recorded pair must answer 200, got {} {:?}",
         repeat.status, repeat.body
+    );
+}
+
+/// The two refusals of the policy-target plane state the sentences the API states, over
+/// the whole class each rule spans.
+///
+/// A value of no supported target form is refused `InvalidRequestException` (400): the
+/// message names the ADDRESS the service read when the value is an ARN (`Invalid Target:
+/// <target>`, the target exactly as the request sent it) and names nothing when the
+/// value is no address at all (`Invalid Target`) — by EVERY operation that reads a
+/// policy target, since one value is read by one resolver. An attach of a policy name
+/// the registry does not hold is refused `ResourceNotFoundException` (404) whose message
+/// is fixed text naming no value, while the operations addressing the policy RECORD keep
+/// the sentence that names the name they were given.
+#[tokio::test]
+async fn the_policy_target_plane_refusals_state_the_api_sentences() {
+    let emulator = Emulator::new();
+
+    let certificate = given_certificate(&emulator, true).await;
+    given_policy(&emulator, "known-policy").await;
+
+    // Values that are no policy target at all, each missing the forms
+    // `ListAttachedPolicies$target` documents ("Valid principals are CertificateArn
+    // (arn:aws:iot:region:accountId:cert/certificateId), thingGroupArn
+    // (arn:aws:iot:region:accountId:thinggroup/groupName) and CognitoId (region:id)") in
+    // a DIFFERENT way: ARNs of resource types no policy attaches to, an ARN of another
+    // service, an ARN whose resource carries no name or no type at all — every one of
+    // which the API names in its refusal — and then the values that are no address at
+    // all: a bare name, a resource path with no ARN around it, and a Cognito identity
+    // missing or malforming one half, which the API refuses naming nothing.
+    let unsupported: Vec<(&str, String, bool)> = vec![
+        (
+            "a thing ARN",
+            format!("arn:aws:iot:{REGION}:{ACCOUNT_ID}:thing/sensor-7"),
+            true,
+        ),
+        (
+            "a role alias ARN",
+            format!("arn:aws:iot:{REGION}:{ACCOUNT_ID}:rolealias/devices"),
+            true,
+        ),
+        (
+            "a policy ARN",
+            format!("arn:aws:iot:{REGION}:{ACCOUNT_ID}:policy/known-policy"),
+            true,
+        ),
+        (
+            "an ARN of another service",
+            format!("arn:aws:iam::{ACCOUNT_ID}:role/device"),
+            true,
+        ),
+        (
+            "a thing group ARN with no group name",
+            format!("arn:aws:iot:{REGION}:{ACCOUNT_ID}:thinggroup/"),
+            true,
+        ),
+        (
+            "an IoT ARN with no resource type",
+            format!("arn:aws:iot:{REGION}:{ACCOUNT_ID}:cert"),
+            true,
+        ),
+        ("a bare name", "plant-floor".to_string(), false),
+        (
+            "a resource path with no ARN prefix",
+            "cert/abc".to_string(),
+            false,
+        ),
+        ("a Cognito identity with no id", format!("{REGION}:"), false),
+        (
+            "a Cognito identity with no region",
+            ":abcdef".to_string(),
+            false,
+        ),
+        (
+            "a Cognito identity whose id is of another form",
+            format!("{REGION}:id_with_underscores"),
+            false,
+        ),
+    ];
+
+    // The three operations that read a `PolicyTarget`: the write that records a pair, the
+    // write that removes one, and the read of one target's policies.
+    const TARGET_READERS: [&str; 3] = ["AttachPolicy", "DetachPolicy", "ListAttachedPolicies"];
+
+    for (label, target, names_the_target) in &unsupported {
+        for operation in TARGET_READERS {
+            let refused = match operation {
+                "AttachPolicy" => emulator.attach_policy("known-policy", target).await,
+                "DetachPolicy" => emulator.detach_policy("known-policy", target).await,
+                _ => {
+                    emulator
+                        .list_attached_policies(target, false, None, None)
+                        .await
+                }
+            };
+            assert_eq!(
+                refused.status, 400,
+                "case {operation} with {label}: expected 400, got {} {:?}",
+                refused.status, refused.body
+            );
+            assert_eq!(
+                refused.error_code.as_deref(),
+                Some("InvalidRequestException"),
+                "case {operation} with {label}: expected InvalidRequestException, got {:?}",
+                refused.error_code
+            );
+            assert_eq!(
+                refused.message(),
+                invalid_target_message(target, *names_the_target),
+                "case {operation} with {label}: unexpected message {:?}",
+                refused.message()
+            );
+        }
+    }
+
+    // The ATTACH's miss is one sentence whichever name was asked for: policy names of
+    // several forms the modelled `PolicyName` admits (`len 1..128, pattern
+    // ^[\w+=,.@-]+$`) — one character, the longest the model takes, and one carrying
+    // every punctuation mark of the pattern — are all refused the same value-free
+    // sentence.
+    let longest_name = "p".repeat(128);
+    for policy_name in [
+        "no-such-policy",
+        "A",
+        longest_name.as_str(),
+        "app+policy=1.ok@x,y-z",
+    ] {
+        let refused = emulator.attach_policy(policy_name, &certificate).await;
+        assert_eq!(
+            refused.status, 404,
+            "case attaching {policy_name:?}: expected 404, got {} {:?}",
+            refused.status, refused.body
+        );
+        assert_eq!(
+            refused.error_code.as_deref(),
+            Some("ResourceNotFoundException"),
+            "case attaching {policy_name:?}: expected ResourceNotFoundException, got {:?}",
+            refused.error_code
+        );
+        assert_eq!(
+            refused.message(),
+            "Policy not found",
+            "case attaching {policy_name:?}: unexpected message {:?}",
+            refused.message()
+        );
+    }
+
+    // An operation addressing the policy RECORD still words its miss after the name it
+    // was given: the attach's fixed sentence belongs to the attach, not to every reader
+    // of a policy.
+    let record_miss = emulator
+        .list_targets_for_policy("no-such-policy", None, None)
+        .await;
+    assert_eq!(
+        record_miss.status, 404,
+        "case ListTargetsForPolicy on an unknown policy: expected 404, got {} {:?}",
+        record_miss.status, record_miss.body
+    );
+    assert_eq!(
+        record_miss.message(),
+        "Policy no-such-policy does not exist",
+        "case ListTargetsForPolicy on an unknown policy: unexpected message {:?}",
+        record_miss.message()
+    );
+
+    // Nothing was recorded by any refusal, and a SUPPORTED target still attaches: the
+    // wording changed, the resolver's verdict did not.
+    let attached = emulator.attach_policy("known-policy", &certificate).await;
+    assert_eq!(
+        attached.status, 200,
+        "case attaching a certificate ARN: expected 200, got {} {:?}",
+        attached.status, attached.body
+    );
+    let listed = emulator
+        .list_attached_policies(&certificate, false, None, None)
+        .await;
+    assert_eq!(
+        listed.policy_names(),
+        vec!["known-policy".to_string()],
+        "case after the refusals: only the accepted pair may be recorded, got {:?}",
+        listed.policy_names()
+    );
+    assert_eq!(
+        listed.policy_arns(),
+        vec![policy_arn("known-policy")],
+        "case after the refusals: the listing must report the policy's ARN, got {:?}",
+        listed.policy_arns()
     );
 }

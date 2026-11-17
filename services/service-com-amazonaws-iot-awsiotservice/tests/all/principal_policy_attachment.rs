@@ -518,7 +518,9 @@ async fn an_attachment_to_a_principal_that_does_not_exist_is_refused() {
             "an unknown policy name",
             "no-such-policy",
             certificate.clone(),
-            "Policy no-such-policy does not exist".to_string(),
+            // The same attach `AttachPolicy` performs, so the same fixed sentence,
+            // which names no value.
+            "Policy not found".to_string(),
         ),
         (
             "an unknown certificate principal",
@@ -555,31 +557,41 @@ async fn an_attachment_to_a_principal_that_does_not_exist_is_refused() {
         );
     }
 
-    // Strings that name no principal of this account's policies at all.
+    // Strings that name no principal of this account's policies at all. The third field
+    // is whether the value is an ARN, which is what decides whether the refusal names
+    // it: the API names the address it read, and names nothing when it read none.
     let invalid = vec![
-        ("a bare name", "plant-floor".to_string()),
-        ("a path with no ARN prefix", "cert/abc".to_string()),
+        ("a bare name", "plant-floor".to_string(), false),
+        ("a path with no ARN prefix", "cert/abc".to_string(), false),
         (
             "an ARN of another service",
             format!("arn:aws:iam::{ACCOUNT_ID}:role/device"),
+            true,
         ),
         (
             "an IoT ARN of a resource no policy attaches to",
             format!("arn:aws:iot:{REGION}:{ACCOUNT_ID}:thing/sensor-1"),
+            true,
         ),
         (
             "a certificate ARN with no id",
             format!("arn:aws:iot:{REGION}:{ACCOUNT_ID}:cert/"),
+            true,
         ),
         (
             "an IoT ARN with no resource type",
             format!("arn:aws:iot:{REGION}:{ACCOUNT_ID}:cert"),
+            true,
         ),
-        ("a Cognito identity with no id", format!("{REGION}:")),
-        ("a Cognito identity with no region", ":abcdef".to_string()),
+        ("a Cognito identity with no id", format!("{REGION}:"), false),
+        (
+            "a Cognito identity with no region",
+            ":abcdef".to_string(),
+            false,
+        ),
     ];
 
-    for (label, principal) in &invalid {
+    for (label, principal, names_the_principal) in &invalid {
         let refused = emulator
             .attach_principal_policy("known-policy", principal)
             .await;
@@ -594,9 +606,13 @@ async fn an_attachment_to_a_principal_that_does_not_exist_is_refused() {
             "case {label}: expected InvalidRequestException, got {:?}",
             refused.error_code
         );
-        assert!(
-            refused.message().contains("policy target"),
-            "case {label}: the refusal must name what a principal may be, got {:?}",
+        assert_eq!(
+            refused.message(),
+            // One wording rule, stated once: the principal-policy plane resolves its
+            // `principal` through the same resolver the target plane resolves `target`
+            // with.
+            crate::policy_attachments::invalid_target_message(principal, *names_the_principal),
+            "case {label}: unexpected refusal message {:?}",
             refused.message()
         );
     }

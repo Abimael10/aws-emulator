@@ -3133,7 +3133,8 @@ pub use certificates::{
 pub mod policy_attachments;
 pub use policy_attachments::{
     decode_page_marker, encode_page_marker, invalid_cognito_identity_pool_id_message,
-    missing_certificate_target_message, missing_policy_message, page_of, parse_policy_target,
+    missing_attached_policy_message, missing_certificate_target_message, missing_policy_message,
+    page_of, parse_policy_target,
     PolicyAttachmentLimit, PolicyAttachments, PolicyTarget, PolicyTargetRefusal,
     ResolvedPolicyTarget, MAX_ATTACHED_TARGETS, MAX_LIST_PAGE_SIZE, MAX_POLICIES_PER_TARGET,
 };

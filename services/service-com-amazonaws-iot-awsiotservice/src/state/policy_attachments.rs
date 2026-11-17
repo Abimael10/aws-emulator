@@ -115,6 +115,21 @@ pub fn missing_policy_message(policy_name: &str) -> String {
     format!("Policy {policy_name} does not exist")
 }
 
+/// The message an ATTACH of a policy to a target or principal refuses a `policyName`
+/// the account holds no policy under with.
+///
+/// AWS words this one after the policy it could not resolve rather than after the name
+/// it was given, so the sentence is entirely fixed text with NO variable part — the
+/// requested name is not echoed — unlike [`missing_policy_message`], which the
+/// operations addressing the policy RECORD state a miss with. Shared by
+/// `AttachPolicy` and its deprecated twin `AttachPrincipalPolicy`
+/// (`smithy_query(query="operation",operation="AttachPolicy,AttachPrincipalPolicy")`
+/// models `ResourceNotFoundException`, HTTP 404, on both), so the one write states one
+/// wording whichever name it is called by.
+pub fn missing_attached_policy_message() -> String {
+    "Policy not found".to_string()
+}
+
 /// The message a certificate target nothing in this account holds is refused with.
 ///
 /// AWS IoT words this one after the PRINCIPAL rather than after the ARN — the
@@ -158,7 +173,10 @@ pub struct ResolvedPolicyTarget {
 /// reason [`super::parse_job_target`] documents: a caller may name a resource by an ARN
 /// minted elsewhere, and these registries are keyed by id and by name.
 pub fn parse_policy_target(target: &str) -> Result<PolicyTarget, PolicyTargetRefusal> {
-    if let Some(resource) = iot_arn_resource(target) {
+    if let Some((service, resource)) = arn_service_and_resource(target) {
+        if service != "iot" {
+            return Err(unsupported_target(target));
+        }
         let Some((resource_type, name)) = resource.split_once('/') else {
             return Err(unsupported_target(target));
         };
@@ -175,18 +193,18 @@ pub fn parse_policy_target(target: &str) -> Result<PolicyTarget, PolicyTargetRef
     if is_cognito_identity(target) {
         return Ok(PolicyTarget::CognitoIdentity(target.to_string()));
     }
-    Err(unsupported_target(target))
+    Err(unreadable_target())
 }
 
-/// The resource field of `target` when it is an `iot` ARN at all, else `None`.
-fn iot_arn_resource(target: &str) -> Option<&str> {
+/// The service and resource fields of `target` when it is an ARN at all, else `None`.
+fn arn_service_and_resource(target: &str) -> Option<(&str, &str)> {
     // 6 fields: arn:<partition>:<service>:<region>:<account-id>:<resource>. The
     // resource keeps any colon of its own, so the split is bounded at 6.
     let fields: Vec<&str> = target.splitn(6, ':').collect();
-    let ["arn", _partition, "iot", _region, _account, resource] = fields.as_slice() else {
+    let ["arn", _partition, service, _region, _account, resource] = fields.as_slice() else {
         return None;
     };
-    Some(resource)
+    Some((service, resource))
 }
 
 /// Whether `target` is the `<region>:<id>` form a Cognito identity takes.
@@ -211,15 +229,25 @@ fn is_cognito_identity(target: &str) -> bool {
     region_shaped && identity_shaped
 }
 
-/// The refusal a target of no supported form is answered with. The message names the
-/// forms the modelled member documents, so a caller learns what a target may be.
+/// The refusal an ARN that is no supported policy target is answered with: an address
+/// the service READ, naming a resource no policy attaches to.
+///
+/// AWS states it as one sentence that names the address it read — the fixed text
+/// `Invalid Target: `, and the only variable part is the target exactly as the request
+/// sent it. Shared, so every operation reading a `PolicyTarget` — the attach, the
+/// detach and the listing of one target's policies — refuses an unsupported ARN in one
+/// wording with one status.
 fn unsupported_target(target: &str) -> PolicyTargetRefusal {
-    PolicyTargetRefusal::Invalid(format!(
-        "Invalid policy target: {target}. A policy target is a certificate ARN \
-         (arn:aws:iot:region:accountId:cert/certificateId), a thing group ARN \
-         (arn:aws:iot:region:accountId:thinggroup/groupName) or a Cognito identity \
-         (region:id)"
-    ))
+    PolicyTargetRefusal::Invalid(format!("Invalid Target: {target}"))
+}
+
+/// The refusal a value that is no ADDRESS at all is answered with: neither an ARN nor
+/// the `<region>:<id>` form a Cognito identity takes, so nothing was read out of it.
+///
+/// Nothing having been read, the sentence names nothing: AWS states this one as fixed
+/// text with no variable part, where [`unsupported_target`] names the ARN it read.
+fn unreadable_target() -> PolicyTargetRefusal {
+    PolicyTargetRefusal::Invalid("Invalid Target".to_string())
 }
 
 /// The relation between the account's policies and the targets they are attached to.

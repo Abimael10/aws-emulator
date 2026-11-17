@@ -754,11 +754,8 @@ async fn effective_policies_refuse_a_request_that_names_no_resolvable_device() {
             thing_name: None,
             status: 400,
             error_code: "InvalidRequestException",
-            message: "Invalid policy target: not-a-principal. A policy target is a \
-                      certificate ARN (arn:aws:iot:region:accountId:cert/certificateId), a \
-                      thing group ARN (arn:aws:iot:region:accountId:thinggroup/groupName) \
-                      or a Cognito identity (region:id)"
-                .to_string(),
+            // No address was read out of the value, so the refusal names nothing.
+            message: "Invalid Target".to_string(),
         },
         RefusalCase {
             label: "a principal naming an IoT resource of another type",
@@ -769,13 +766,7 @@ async fn effective_policies_refuse_a_request_that_names_no_resolvable_device() {
             thing_name: None,
             status: 400,
             error_code: "InvalidRequestException",
-            message: format!(
-                "Invalid policy target: arn:aws:iot:{REGION}:{ACCOUNT_ID}:thing/sensor-7. A \
-                 policy target is a certificate ARN \
-                 (arn:aws:iot:region:accountId:cert/certificateId), a thing group ARN \
-                 (arn:aws:iot:region:accountId:thinggroup/groupName) or a Cognito identity \
-                 (region:id)"
-            ),
+            message: format!("Invalid Target: arn:aws:iot:{REGION}:{ACCOUNT_ID}:thing/sensor-7"),
         },
         RefusalCase {
             label: "a cognitoIdentityPoolId of no supported form",

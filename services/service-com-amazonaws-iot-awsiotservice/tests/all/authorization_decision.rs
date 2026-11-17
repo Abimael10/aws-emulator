@@ -1275,7 +1275,7 @@ async fn an_identity_or_policy_the_account_does_not_hold_is_refused() {
             json!({ "principal": "not-a-principal", "authInfos": question }),
             400,
             "InvalidRequestException",
-            "Invalid policy target: not-a-principal.".to_string(),
+            "Invalid Target".to_string(),
         ),
         (
             "a thing group ARN naming no group",
@@ -1292,7 +1292,9 @@ async fn an_identity_or_policy_the_account_does_not_hold_is_refused() {
             json!({ "cognitoIdentityPoolId": "nope", "authInfos": question }),
             400,
             "InvalidRequestException",
-            "Invalid CognitoIdentityPoolId: nope.".to_string(),
+            "Invalid CognitoIdentityPoolId: nope. A Cognito identity pool id has the form \
+             region:id"
+                .to_string(),
         ),
         (
             "a policyNamesToAdd naming no policy",
@@ -1320,9 +1322,10 @@ async fn an_identity_or_policy_the_account_does_not_hold_is_refused() {
             "case {label}: expected error code {code}, got {:?}",
             answer.error_code
         );
-        assert!(
-            answer.message().contains(message),
-            "case {label}: expected a message carrying {message:?}, got {:?}",
+        assert_eq!(
+            &answer.message(),
+            message,
+            "case {label}: expected the message {message:?}, got {:?}",
             answer.message()
         );
     }
