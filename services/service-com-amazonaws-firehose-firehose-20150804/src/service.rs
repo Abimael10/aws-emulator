@@ -30,8 +30,8 @@
 //!   model's anchored string (see `constraint_clause` / `reported_pattern`), and a value
 //!   submitted as an element of a list of constrained strings is reported against the list
 //!   with that element's whole constraint set, and an enumerated type's value set is
-//!   listed in the order the table it is held in is walked
-//!   (`service_common::validation_message::in_hashed_enum_order`).
+//!   listed in the order the table it is held in is walked, over the order this service's
+//!   own set is built in (`enum_value_sets`).
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -54,7 +54,8 @@
 //! have used.
 //!
 //! WHICH of the shared stated value-set orders this service takes, and the evidence for
-//! it, is `enum_value_sets`.
+//! it, is `enum_value_sets` — which also publishes the order an enumerated type's own set
+//! is built in, for the one type this checkout's model declares in another order.
 
 mod enum_value_sets;
 
@@ -104,12 +105,12 @@ const INVALID_ROLE_ARN: &str = "Invalid role ARN.";
 /// class can be added upstream).
 fn constraint_clause(violation: &Violation) -> Option<String> {
     // An enumerated type's admissible values are stated in the order the table they are
-    // held in is walked rather than in the order the schema presented them, so the
-    // violation is re-ordered before its requirement is worded
-    // (`service_common::validation_message::in_hashed_enum_order`). Only the values move:
-    // the member path, the subject and the requirement's wording are built below either
-    // way, and every other violation class comes back untouched.
-    let violation = &::service_common::validation_message::in_hashed_enum_order(violation);
+    // held in is walked rather than in the order the schema presented them, over the order
+    // the service's own set is built in, so the violation is re-ordered before its
+    // requirement is worded (`enum_value_sets`). Only the values move: the member path, the
+    // subject and the requirement's wording are built below either way, and every other
+    // violation class comes back untouched.
+    let violation = &enum_value_sets::as_this_service_states(violation);
     let requirement = constraint_requirement(&violation.kind)?;
     // A value submitted as an ELEMENT of a list of constrained strings has no member name
     // of its own, so it is reported against the LIST it was submitted in, and with that

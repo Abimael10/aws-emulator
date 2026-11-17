@@ -11,12 +11,20 @@
 //! the hash table those values are held in is walked: each value's bucket ascending — the
 //! bucket being the 31-polynomial hash of the value's UTF-16 code units, taken modulo the
 //! table's width — and two values that share a bucket read from the head each was pushed
-//! onto, so the LATER-declared of the two is listed first.
+//! onto, so the one pushed LATER is listed first.
 //!
 //! The order is therefore a property of the enumerated TYPE: it is computed from the
 //! values themselves, so one type reads the same way under every member that carries it —
 //! any operation, any destination, any depth, any list index — and it is neither the order
-//! the model declares the values in nor a sort of them.
+//! the model declares the values in nor a sort of them. The order the values were PUSHED in
+//! is the service's own, which for all but one of this service's types is the order the
+//! model declares them in; `CompressionFormat`'s set is built in the order the service's API
+//! reference publishes that member's valid values instead, which the service publishes
+//! itself (`src/service/enum_value_sets.rs`).
+//!
+//! The `ProcessorType` and `CompressionFormat` listings are the ones this service's own
+//! refusals are recorded stating; every other row's listing is what the rule above derives
+//! for that type.
 //!
 //! The rows differ along what the rule generalises over: which enumerated type failed
 //! (seven of them), how many values it has (two to eleven), whether two of its values
@@ -27,14 +35,17 @@
 //! list element, a list element inside a list element) and which 1-based index of a list it
 //! sat at.
 //!
+//! The last three tests take ONE type further — `CompressionFormat`, whose set this service
+//! builds in an order this checkout's model does not carry — over every member that targets
+//! it and every shape of value outside it the rows draw, and pin that a create refused for
+//! one leaves no stream behind.
+//!
 //! Each row's declared values are the model's own
 //! (`smithy_query(query="shape", shape="ProcessorType,ProcessorParameterName,
 //! CompressionFormat,OrcCompression,ElasticsearchIndexRotationPeriod,HECEndpointType,
 //! ContentEncoding")`) and are checked against the generated value lists in `ops::types`,
 //! so neither the membership a row expects nor the listing it pins can drift from the type
-//! the model declares. The `ProcessorType` listing is the one this service's own refusal is
-//! recorded stating; every other row's listing is what the rule above derives for that
-//! type.
+//! the model declares.
 //!
 //! The sibling suite `enum_value_set_order` pins the clause's envelope, subject and member
 //! path, and that a structural refusal keeps its own error code and leaves no stream
@@ -80,9 +91,10 @@ struct Row {
     modelled: &'static [&'static str],
     /// The listing the refusal must state.
     listing: &'static str,
-    /// Two values of this type that share a bucket, as `(declared earlier, declared
-    /// later)`. The later one is stated first, so a row naming a pair pins the direction
-    /// a shared bucket is read in.
+    /// Two values of this type that share a bucket, as `(pushed earlier, pushed later)` —
+    /// the order being the one the service's own set is built in, which is the model's
+    /// declaration order for every type but `CompressionFormat`. The later one is stated
+    /// first, so a row naming a pair pins the direction a shared bucket is read in.
     collision: Option<(&'static str, &'static str)>,
 }
 
@@ -128,9 +140,12 @@ const PROCESSOR_PARAMETER_NAME_LISTING: &str = "DataMessageExtraction, NumberOfR
 const COMPRESSION_FORMAT_DECLARED: &[&str] =
     &["ZIP", "ZSTD", "HADOOP_SNAPPY", "Snappy", "GZIP", "UNCOMPRESSED"];
 
-/// `CompressionFormat`'s six values in the order the rule derives, `GZIP` and
-/// `UNCOMPRESSED` sharing one bucket.
-const COMPRESSION_FORMAT_LISTING: &str = "ZIP, ZSTD, HADOOP_SNAPPY, Snappy, UNCOMPRESSED, GZIP";
+/// `CompressionFormat`'s six values in the order the rule derives over the order this
+/// service's own set is built in (`UNCOMPRESSED`, `GZIP`, `ZIP`, `Snappy`, `HADOOP_SNAPPY`,
+/// `ZSTD`), `GZIP` and `UNCOMPRESSED` sharing one bucket and `GZIP` having been pushed
+/// later. The listing this service's refusal is recorded stating; here it coincides with
+/// the order this checkout's model happens to declare the six in.
+const COMPRESSION_FORMAT_LISTING: &str = "ZIP, ZSTD, HADOOP_SNAPPY, Snappy, GZIP, UNCOMPRESSED";
 
 /// `OrcCompression` as the model declares it.
 const ORC_COMPRESSION_DECLARED: &[&str] = &["NONE", "ZLIB", "SNAPPY"];
@@ -256,7 +271,7 @@ fn rows() -> Vec<Row> {
             declared: COMPRESSION_FORMAT_DECLARED,
             modelled: COMPRESSION_FORMAT_VALUES,
             listing: COMPRESSION_FORMAT_LISTING,
-            collision: Some(("GZIP", "UNCOMPRESSED")),
+            collision: Some(("UNCOMPRESSED", "GZIP")),
         },
         // … the SAME type under another destination, inside that destination's nested
         // Amazon S3 configuration rather than on the destination itself.
@@ -279,7 +294,7 @@ fn rows() -> Vec<Row> {
             declared: COMPRESSION_FORMAT_DECLARED,
             modelled: COMPRESSION_FORMAT_VALUES,
             listing: COMPRESSION_FORMAT_LISTING,
-            collision: Some(("GZIP", "UNCOMPRESSED")),
+            collision: Some(("UNCOMPRESSED", "GZIP")),
         },
         // … and on the other operation that writes a destination, whose member is an
         // update rather than a configuration.
@@ -297,7 +312,7 @@ fn rows() -> Vec<Row> {
             declared: COMPRESSION_FORMAT_DECLARED,
             modelled: COMPRESSION_FORMAT_VALUES,
             listing: COMPRESSION_FORMAT_LISTING,
-            collision: Some(("GZIP", "UNCOMPRESSED")),
+            collision: Some(("UNCOMPRESSED", "GZIP")),
         },
         // A fourth type, on the serializer five structures below the destination member.
         Row {
@@ -461,22 +476,22 @@ async fn every_enumerated_type_states_its_whole_set_in_the_order_its_table_is_wa
 async fn a_listing_is_neither_the_declaration_order_nor_a_sort_of_the_values() {
     let emulator = Emulator::new();
 
-    // Which types this service's refusals state in an order of their own, and so would be
-    // got wrong by a renderer that walked the schema or sorted the values. (The two
-    // two-value types above are stated in their declaration order, so they discriminate
-    // nothing and are not asked to.)
-    let stated_in_its_own_order = [
+    // Which types this service's refusals state in an order other than the model's
+    // declaration order, and so would be got wrong by a renderer that walked the schema.
+    // (The two two-value types above are stated in their declaration order, so they
+    // discriminate nothing and are not asked to; so is `CompressionFormat`, whose set the
+    // derivation reaches over the order the SERVICE built that set in — which, for these
+    // six values, lands on the order this checkout's model happens to declare them in. The
+    // sort assertion below still covers it, and the `CompressionFormat` tests at the end of
+    // this suite pin its listing member by member.)
+    let not_the_declaration_order = [
         "ProcessorType",
         "ProcessorParameterName",
-        "CompressionFormat",
         "OrcCompression",
         "ElasticsearchIndexRotationPeriod",
     ];
 
     for row in rows() {
-        if !stated_in_its_own_order.contains(&row.type_name) {
-            continue;
-        }
         let (_, refused) = emulator.call(row.operation, row.body.clone()).await;
         let message = error_message(&refused);
         let Some(stated) = stated_set(&message) else {
@@ -485,13 +500,18 @@ async fn a_listing_is_neither_the_declaration_order_nor_a_sort_of_the_values() {
                 row.case
             );
         };
-        assert_ne!(
-            stated,
-            row.declared.join(", "),
-            "case {:?}: {} must not be stated in the model's declaration order, got [{stated}]",
-            row.case,
-            row.type_name
-        );
+        if not_the_declaration_order.contains(&row.type_name) {
+            assert_ne!(
+                stated,
+                row.declared.join(", "),
+                "case {:?}: {} must not be stated in the model's declaration order, got \
+                 [{stated}]",
+                row.case,
+                row.type_name
+            );
+        }
+        // No type of this service is stated as a sort of its values, whichever order its
+        // own set was built in.
         assert_ne!(
             stated,
             membership(row.declared).join(", "),
@@ -503,7 +523,7 @@ async fn a_listing_is_neither_the_declaration_order_nor_a_sort_of_the_values() {
 }
 
 #[tokio::test]
-async fn two_values_sharing_a_bucket_are_stated_later_declared_first() {
+async fn two_values_sharing_a_bucket_are_stated_the_later_pushed_first() {
     let emulator = Emulator::new();
 
     for row in rows() {
@@ -529,7 +549,7 @@ async fn two_values_sharing_a_bucket_are_stated_later_declared_first() {
         };
         assert!(
             at(later) < at(earlier),
-            "case {:?}: {later} shares {earlier}'s bucket and is declared after it, so it \
+            "case {:?}: {later} shares {earlier}'s bucket and was pushed after it, so it \
              must be stated first, got [{stated}]",
             row.case
         );
@@ -573,5 +593,269 @@ async fn one_type_is_stated_alike_under_every_member_that_carries_it() {
         seen.len(),
         7,
         "expected all seven enumerated types to have been refused, got {seen:?}"
+    );
+}
+
+/// One position a `CompressionFormat` is submitted at: the request that carries it, the
+/// member path the clause must name, and the value submitted there.
+struct Position {
+    /// What this position varies, for the assertion messages.
+    case: &'static str,
+    /// The operation whose request carries the value.
+    operation: &'static str,
+    /// That request.
+    body: Value,
+    /// The member path the refused value sat at.
+    path: &'static str,
+}
+
+/// A Splunk destination's backing Amazon S3 configuration, carrying a compression format of
+/// `compression`.
+fn splunk_with_compression(compression: &str) -> Value {
+    splunk_destination(
+        "Raw",
+        json!({
+            "RoleARN": ROLE_ARN,
+            "BucketARN": BUCKET_ARN,
+            "CompressionFormat": compression,
+        }),
+    )
+}
+
+/// Every member that carries a `CompressionFormat`, each submitted a value outside the type.
+///
+/// The rows differ along what the rule generalises over: the operation
+/// (`CreateDeliveryStream`, `UpdateDestination`), the destination the member sits under
+/// (extended Amazon S3, the deprecated Amazon S3 destination, a backup configuration,
+/// Splunk, Elasticsearch), the depth it sits at (a destination member, a nested
+/// configuration's member) and the SHAPE of the value submitted (a format name the service
+/// does not take, the lower-cased spelling of a modelled one, a modelled one with a trailing
+/// space, a value of another enumerated type, and the empty string).
+fn compression_format_positions() -> Vec<Position> {
+    vec![
+        Position {
+            case: "a format name outside the type, on an extended Amazon S3 destination",
+            operation: "CreateDeliveryStream",
+            body: json!({
+                "DeliveryStreamName": "compression-outside-extended",
+                "ExtendedS3DestinationConfiguration": {
+                    "RoleARN": ROLE_ARN,
+                    "BucketARN": BUCKET_ARN,
+                    "CompressionFormat": "BOGUS_FORMAT",
+                },
+            }),
+            path: "extendedS3DestinationConfiguration.compressionFormat",
+        },
+        Position {
+            case: "the lower-cased spelling of a modelled value, on the deprecated \
+                   Amazon S3 destination",
+            operation: "CreateDeliveryStream",
+            body: json!({
+                "DeliveryStreamName": "compression-outside-legacy",
+                "S3DestinationConfiguration": {
+                    "RoleARN": ROLE_ARN,
+                    "BucketARN": BUCKET_ARN,
+                    "CompressionFormat": "gzip",
+                },
+            }),
+            path: "s3DestinationConfiguration.compressionFormat",
+        },
+        Position {
+            case: "the empty string, on a destination's backup configuration",
+            operation: "CreateDeliveryStream",
+            body: json!({
+                "DeliveryStreamName": "compression-outside-backup",
+                "ExtendedS3DestinationConfiguration": {
+                    "RoleARN": ROLE_ARN,
+                    "BucketARN": BUCKET_ARN,
+                    "S3BackupMode": "Enabled",
+                    "S3BackupConfiguration": {
+                        "RoleARN": ROLE_ARN,
+                        "BucketARN": BUCKET_ARN,
+                        "CompressionFormat": "",
+                    },
+                },
+            }),
+            path: "extendedS3DestinationConfiguration.s3BackupConfiguration.compressionFormat",
+        },
+        Position {
+            case: "a modelled value with a trailing space, nested in a Splunk destination's \
+                   Amazon S3 configuration",
+            operation: "CreateDeliveryStream",
+            body: json!({
+                "DeliveryStreamName": "compression-outside-splunk",
+                "SplunkDestinationConfiguration": splunk_with_compression("GZIP "),
+            }),
+            path: "splunkDestinationConfiguration.s3Configuration.compressionFormat",
+        },
+        Position {
+            case: "a value of another enumerated type, nested in an Elasticsearch \
+                   destination's Amazon S3 configuration",
+            operation: "CreateDeliveryStream",
+            body: json!({
+                "DeliveryStreamName": "compression-outside-elasticsearch",
+                "ElasticsearchDestinationConfiguration": {
+                    "RoleARN": ROLE_ARN,
+                    "IndexName": "events",
+                    "S3Configuration": {
+                        "RoleARN": ROLE_ARN,
+                        "BucketARN": BUCKET_ARN,
+                        "CompressionFormat": "ZLIB",
+                    },
+                },
+            }),
+            path: "elasticsearchDestinationConfiguration.s3Configuration.compressionFormat",
+        },
+        Position {
+            case: "a format name outside the type, on an extended Amazon S3 update",
+            operation: "UpdateDestination",
+            body: json!({
+                "DeliveryStreamName": "compression-outside-update",
+                "CurrentDeliveryStreamVersionId": "1",
+                "DestinationId": "destinationId-000000000001",
+                "ExtendedS3DestinationUpdate": { "CompressionFormat": "ZSTD-1" },
+            }),
+            path: "extendedS3DestinationUpdate.compressionFormat",
+        },
+        Position {
+            case: "the lower-cased spelling of a modelled value, on the deprecated \
+                   Amazon S3 update",
+            operation: "UpdateDestination",
+            body: json!({
+                "DeliveryStreamName": "compression-outside-legacy-update",
+                "CurrentDeliveryStreamVersionId": "1",
+                "DestinationId": "destinationId-000000000001",
+                "S3DestinationUpdate": { "CompressionFormat": "zstd" },
+            }),
+            path: "s3DestinationUpdate.compressionFormat",
+        },
+    ]
+}
+
+#[tokio::test]
+async fn a_compression_format_outside_the_type_is_refused_with_the_set_this_service_states() {
+    let emulator = Emulator::new();
+
+    // The one listing every position must state, so the set belongs to the TYPE and not to
+    // a member, an operation or a depth.
+    let mut stated_everywhere: Vec<(&str, String)> = Vec::new();
+
+    for position in compression_format_positions() {
+        let (status, refused) = emulator.call(position.operation, position.body).await;
+        assert_eq!(
+            status, 400,
+            "case {:?}: expected HTTP 400, got {status} with {refused:?}",
+            position.case
+        );
+        let code = error_code(&refused);
+        assert_eq!(
+            code, VALIDATION_EXCEPTION,
+            "case {:?}: expected {VALIDATION_EXCEPTION}, got {code:?} with {refused:?}",
+            position.case
+        );
+
+        let actual = error_message(&refused);
+        let expected = format!(
+            "1 validation error detected: Value at '{}' failed to satisfy constraint: \
+             Member must satisfy enum value set: [{COMPRESSION_FORMAT_LISTING}]",
+            position.path
+        );
+        assert_eq!(
+            actual, expected,
+            "case {:?}: expected {expected:?}, got {actual:?}",
+            position.case
+        );
+
+        let stated = stated_set(&actual)
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {:?}: the message states no enum value set, got {actual:?}",
+                    position.case
+                )
+            })
+            .to_string();
+        // The listing holds exactly the modelled membership, re-ordered — not a set of its
+        // own.
+        let listed: Vec<&str> = stated.split(", ").collect();
+        assert_eq!(
+            membership(&listed),
+            membership(COMPRESSION_FORMAT_VALUES),
+            "case {:?}: the listing [{stated}] is not CompressionFormat's membership {:?}",
+            position.case,
+            COMPRESSION_FORMAT_VALUES
+        );
+        if let Some((first_case, first)) = stated_everywhere.first() {
+            assert_eq!(
+                &stated, first,
+                "case {:?}: the type was stated as [{first}] by case {first_case:?}, got \
+                 [{stated}]",
+                position.case
+            );
+        }
+        stated_everywhere.push((position.case, stated));
+    }
+
+    assert_eq!(
+        stated_everywhere.len(),
+        7,
+        "expected every position to have been refused, got {stated_everywhere:?}"
+    );
+}
+
+/// RULE: a create refused for a value outside an enumerated type leaves no stream behind
+/// under the name it carried.
+///
+/// The positive control — that every value the type DOES declare is taken and reported back
+/// — is `destination_argument_rules`'s
+/// `every_value_the_compression_format_set_admits_can_be_configured_and_is_reported`, which
+/// reads each stored format back through `DescribeDeliveryStream`; this test does not repeat
+/// it.
+#[tokio::test]
+async fn a_create_refused_for_a_compression_format_outside_the_type_leaves_no_stream() {
+    let emulator = Emulator::new();
+
+    let name = "compression-refused-leaves-nothing";
+    let (status, refused) = emulator
+        .call(
+            "CreateDeliveryStream",
+            json!({
+                "DeliveryStreamName": name,
+                "ExtendedS3DestinationConfiguration": {
+                    "RoleARN": ROLE_ARN,
+                    "BucketARN": BUCKET_ARN,
+                    "CompressionFormat": "BOGUS_FORMAT",
+                },
+            }),
+        )
+        .await;
+    assert_eq!(
+        status, 400,
+        "case {name:?}: expected HTTP 400, got {status} with {refused:?}"
+    );
+    let actual = error_message(&refused);
+    let expected = format!(
+        "1 validation error detected: Value at \
+         'extendedS3DestinationConfiguration.compressionFormat' failed to satisfy constraint: \
+         Member must satisfy enum value set: [{COMPRESSION_FORMAT_LISTING}]"
+    );
+    assert_eq!(
+        actual, expected,
+        "case {name:?}: expected {expected:?}, got {actual:?}"
+    );
+
+    let (status, described) = emulator
+        .call(
+            "DescribeDeliveryStream",
+            json!({ "DeliveryStreamName": name }),
+        )
+        .await;
+    assert_eq!(
+        status, 400,
+        "case {name:?}: expected HTTP 400 for the refused name, got {status} with {described:?}"
+    );
+    let code = error_code(&described);
+    assert_eq!(
+        code, "ResourceNotFoundException",
+        "case {name:?}: expected \"ResourceNotFoundException\", got {code:?} with {described:?}"
     );
 }
