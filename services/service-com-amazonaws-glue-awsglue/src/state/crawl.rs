@@ -155,13 +155,6 @@ pub const PARTITION_KEY_TYPE: &str = "string";
 /// Glue names a partition key it cannot read a name off the path for.
 pub const UNNAMED_PARTITION_KEY_PREFIX: &str = "partition_";
 
-/// How many finished crawls one crawler keeps the duration of, for the median runtime a
-/// metrics read reports.
-///
-/// CHOSEN: the record is resident memory and a crawl is reachable by any caller, so the
-/// history one crawler holds is bounded here; the oldest duration is dropped first.
-pub const MAX_CRAWL_DURATIONS: usize = 20;
-
 /// `LastCrawlInfo$ErrorMessage` of a crawl of a crawler that names no target database.
 ///
 /// A crawl WRITES the tables it discovers into a database, so a crawler with no
@@ -422,6 +415,10 @@ impl DiscoveredTable {
 /// flight leaves the previous crawl's report in place.
 #[derive(Debug, Clone)]
 pub struct CrawlRecord {
+    /// "A UUID identifier for each crawl" (`CrawlerHistory$CrawlId`), minted when the crawl
+    /// is recorded ([`new_crawl_id`]) and never again, so every later read of this crawl —
+    /// and every page of the crawler's history — addresses it by the same id.
+    pub crawl_id: String,
     /// One of the modelled `LastCrawlStatus` values.
     pub status: String,
     /// Why the crawl failed, absent for one that did not.
@@ -437,12 +434,18 @@ pub struct CrawlRecord {
     pub tables_updated: i32,
     /// How many it deleted.
     pub tables_deleted: i32,
+    /// How many PARTITIONS of those tables it created: the other half of what a crawl's run
+    /// summary reports ([`CrawlRecord::to_crawler_history`]).
+    pub partitions_created: i32,
+    /// How many partitions it removed. See [`Self::partitions_created`].
+    pub partitions_deleted: i32,
 }
 
 impl CrawlRecord {
     /// A crawl that started at `started_at` and failed for `reason`, having written nothing.
     pub fn failed(started_at: SystemTime, reason: String) -> Self {
         Self {
+            crawl_id: new_crawl_id(),
             status: LAST_CRAWL_STATUS_FAILED.to_string(),
             error_message: Some(reason),
             started_at,
@@ -450,12 +453,15 @@ impl CrawlRecord {
             tables_created: 0,
             tables_updated: 0,
             tables_deleted: 0,
+            partitions_created: 0,
+            partitions_deleted: 0,
         }
     }
 
     /// A crawl that started at `started_at` and wrote `counts` into the catalog.
     pub fn succeeded(started_at: SystemTime, counts: CrawlCounts) -> Self {
         Self {
+            crawl_id: new_crawl_id(),
             status: LAST_CRAWL_STATUS_SUCCEEDED.to_string(),
             // A crawl that wrote what it found failed at nothing, so it carries no error
             // message at all.
@@ -465,6 +471,8 @@ impl CrawlRecord {
             tables_created: counts.created,
             tables_updated: counts.updated,
             tables_deleted: counts.deleted,
+            partitions_created: counts.partitions_created,
+            partitions_deleted: counts.partitions_deleted,
         }
     }
 
@@ -505,6 +513,15 @@ pub struct CrawlCounts {
     /// Tables the crawl removed because their data was gone and the delete behaviour in
     /// force removes them.
     pub deleted: i32,
+    /// Partitions of those tables the crawl wrote that the table did not hold.
+    pub partitions_created: i32,
+    /// Partitions the crawl removed because it no longer found that slice of the data and the
+    /// delete behaviour in force removes it.
+    ///
+    /// There is no count of partitions UPDATED beside these two: a partition the crawl found
+    /// again is addressed by the same value list and left exactly as it was
+    /// ([`write_partitions`]), so a crawl updates none.
+    pub partitions_deleted: i32,
 }
 
 impl ComAmazonawsGlueAwsglueState {
@@ -639,6 +656,7 @@ impl ComAmazonawsGlueAwsglueState {
                     now,
                     store_has_partition_room,
                     encryption.clone(),
+                    &mut counts,
                 );
             }
         }
@@ -715,6 +733,9 @@ fn written_by_crawler(table: &TableEntry, crawler: &str) -> bool {
 /// table's to hold: a value list that does not line up with the stored table's partition keys
 /// addresses no slice of it, which is what a crawl under [`UPDATE_BEHAVIOR_LOG`] finds when
 /// the stored schema it left alone is partitioned differently.
+///
+/// `counts` is the crawl's own tally, which the partitions written and removed here are added
+/// to: the figures a crawl's run summary reports are the ones its writes produced.
 fn write_partitions(
     table: &mut TableEntry,
     dataset: &DiscoveredTable,
@@ -722,6 +743,7 @@ fn write_partitions(
     now: SystemTime,
     store_has_room: bool,
     encryption: Option<ObjectEncryption>,
+    counts: &mut CrawlCounts,
 ) -> bool {
     let found: HashSet<Vec<String>> = dataset
         .partitions
@@ -736,7 +758,9 @@ fn write_partitions(
             .cloned()
             .collect();
         for values in gone {
-            table.partitions.remove(&values);
+            if table.partitions.remove(&values).is_some() {
+                counts.partitions_deleted = counts.partitions_deleted.saturating_add(1);
+            }
         }
     }
     let mut stored_every_one = true;
@@ -744,15 +768,15 @@ fn write_partitions(
         if table.partitions.contains_key(&partition.values) {
             continue;
         }
-        if let Err(refusal) = table.create_partition(
+        match table.create_partition(
             &dataset.to_partition_input(partition),
             now,
             store_has_room,
             encryption.clone(),
         ) {
-            if matches!(refusal, PartitionCreateRefusal::LimitExceeded { .. }) {
-                stored_every_one = false;
-            }
+            Ok(_) => counts.partitions_created = counts.partitions_created.saturating_add(1),
+            Err(PartitionCreateRefusal::LimitExceeded { .. }) => stored_every_one = false,
+            Err(_) => {}
         }
     }
     stored_every_one

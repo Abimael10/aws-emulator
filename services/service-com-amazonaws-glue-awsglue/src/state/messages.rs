@@ -1954,3 +1954,53 @@ pub fn segment_number_outside_total(segment_number: i32, total_segments: i32) ->
         total_segments.saturating_sub(1)
     )
 }
+
+/// A crawl listing (`ListCrawls`) whose `Filters` states a filter missing one of the three
+/// members a comparison is made of: `Filters` is "a list of fields, comparators and value
+/// that you can use to filter the crawler runs" (`CrawlsFilter`), so a filter without a
+/// field name, a comparator or a value compares nothing.
+///
+/// NOT recorded: what is pinned is the behaviour — 400 with the operation's modelled
+/// `InvalidInputException` — and the sentence states the rule the filter broke, naming the
+/// member it left out.
+pub fn crawls_filter_without_member(member: &str) -> String {
+    format!(
+        "Filters states a filter without {member}; a filter on a crawler's runs is a \
+             FieldName, a FilterOperator and a FieldValue to compare against"
+    )
+}
+
+/// A crawl listing whose `Filters` keys on a field that is no field of a crawl. NOT
+/// recorded: the behaviour is the operation's modelled `InvalidInputException`, and the
+/// sentence carries the field name as submitted beside the fields a crawl is filtered on
+/// ([`crate::ops::types::FIELD_NAME_VALUES`]).
+pub fn crawls_filter_field_unknown(field: &str) -> String {
+    format!(
+        "Filters states FieldName {field}, which is not a field of a crawl; the fields a \
+             crawler's runs are filtered on are {}",
+        crate::ops::types::FIELD_NAME_VALUES.join(", ")
+    )
+}
+
+/// A crawl listing whose `Filters` compares with a comparator the model does not declare.
+/// NOT recorded: the behaviour is the operation's modelled `InvalidInputException`, and the
+/// sentence carries the comparator as submitted beside the ones a filter compares with
+/// ([`crate::ops::types::FILTER_OPERATOR_VALUES`]).
+pub fn crawls_filter_operator_unknown(operator: &str) -> String {
+    format!(
+        "Filters states FilterOperator {operator}, which is not a comparator; a filter on \
+             a crawler's runs compares with {}",
+        crate::ops::types::FILTER_OPERATOR_VALUES.join(", ")
+    )
+}
+
+/// A crawl listing whose `Filters` compares a NUMERIC field of a crawl against a value that
+/// is no number — `START_TIME` and `END_TIME` are "the epoch timestamp in milliseconds" and
+/// `DPU_HOUR` "the number of data processing unit (DPU) hours used for the crawl"
+/// (`CrawlsFilter$FieldName`).
+///
+/// NOT recorded: the behaviour is the operation's modelled `InvalidInputException`, and the
+/// sentence carries the field and the value as submitted.
+pub fn crawls_filter_value_not_a_number(field: &str, value: &str) -> String {
+    format!("Filters compares {field} against {value}, which is not a number")
+}

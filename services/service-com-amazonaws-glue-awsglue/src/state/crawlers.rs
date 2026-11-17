@@ -83,12 +83,16 @@ pub struct CrawlerEntry {
     /// STARTED, so this is what it answered — which is why the status, the error message
     /// and the table counts a settled crawl reports are its own reading's.
     pub pending_crawl: Option<CrawlRecord>,
-    /// The most recent crawl that has FINISHED, which is what `LastCrawl` reports and
-    /// where a metrics read takes this crawler's table counts from. `None` until one has.
-    pub last_crawl: Option<CrawlRecord>,
-    /// How long each of the last [`MAX_CRAWL_DURATIONS`] finished crawls took, oldest
-    /// first: the durations `MedianRuntimeSeconds` is the median of.
-    pub crawl_durations: Vec<Duration>,
+    /// The crawls of this crawler that have FINISHED, newest first and bounded by
+    /// [`MAX_CRAWL_HISTORY`] (the oldest dropped first).
+    ///
+    /// ONE record per crawl, so everything read off this crawler's past agrees: the newest
+    /// entry is what `LastCrawl` reports and where a metrics read takes this crawler's table
+    /// counts from ([`Self::last_crawl`]), the durations of the entries are the ones
+    /// `MedianRuntimeSeconds` is the median of, and the whole list — behind the crawl in
+    /// flight, which is newer than any of them — is the history a crawl listing pages over
+    /// ([`Self::crawls`]).
+    pub crawl_history: VecDeque<CrawlRecord>,
 }
 
 impl CrawlerEntry {
@@ -128,8 +132,7 @@ impl CrawlerEntry {
             crawl_settles_at: None,
             crawl_region: None,
             pending_crawl: None,
-            last_crawl: None,
-            crawl_durations: Vec::new(),
+            crawl_history: VecDeque::new(),
         }
     }
 
@@ -308,16 +311,33 @@ impl CrawlerEntry {
         self.last_updated = due;
         let mut record = self.pending_crawl.take()?;
         record.finished_at = Some(due);
-        if let Some(duration) = record.duration() {
-            self.crawl_durations.push(duration);
-            if self.crawl_durations.len() > MAX_CRAWL_DURATIONS {
-                let overflow = self.crawl_durations.len() - MAX_CRAWL_DURATIONS;
-                self.crawl_durations.drain(..overflow);
-            }
-        }
         let change = self.crawl_state_change(&record, due);
-        self.last_crawl = Some(record);
+        // Newest first, bounded: the oldest crawl this crawler holds the record of is dropped
+        // to make room, the way every other bounded history in this store is kept.
+        self.crawl_history.push_front(record);
+        while self.crawl_history.len() > MAX_CRAWL_HISTORY {
+            self.crawl_history.pop_back();
+        }
         change
+    }
+
+    /// The most recent crawl of this crawler that has FINISHED, or `None` until one has:
+    /// the newest entry of [`Self::crawl_history`], which is what `LastCrawl` and a metrics
+    /// read report.
+    pub fn last_crawl(&self) -> Option<&CrawlRecord> {
+        self.crawl_history.front()
+    }
+
+    /// Every crawl of this crawler this store holds the record of, newest first: the crawl in
+    /// FLIGHT, which is newer than any that finished, then the finished ones in
+    /// [`Self::crawl_history`] order.
+    ///
+    /// The one order the crawls of a crawler are read in, so a listing of them cannot
+    /// disagree with what `LastCrawl` reports.
+    pub fn crawls(&self) -> impl Iterator<Item = &CrawlRecord> {
+        self.pending_crawl
+            .iter()
+            .chain(self.crawl_history.iter())
     }
 
     /// How long the crawl in flight has been running at `now`, in milliseconds: "if the
@@ -351,7 +371,7 @@ impl CrawlerEntry {
     ///   for a crawler that is not running.
     /// * `LastRuntimeSeconds` and `MedianRuntimeSeconds` are durations of this crawler's
     ///   runs, so they are read off the crawls that have FINISHED
-    ///   ([`Self::crawl_durations`]) — zero for a crawler none of whose crawls has
+    ///   ([`Self::crawl_history`]) — zero for a crawler none of whose crawls has
     ///   finished, because it has no run to have taken any time.
     /// * `TablesCreated`, `TablesUpdated` and `TablesDeleted` are the catalog tables this
     ///   crawler's crawls wrote, so they are the ones the LAST finished crawl wrote
@@ -359,7 +379,7 @@ impl CrawlerEntry {
     ///   `LastCrawl`, so a metrics read and a crawler read cannot disagree about which
     ///   crawl they describe.
     pub fn to_crawler_metrics(&self) -> CrawlerMetrics {
-        let finished = self.last_crawl.as_ref();
+        let finished = self.last_crawl();
         CrawlerMetrics {
             crawler_name: Some(self.name.clone()),
             time_left_seconds: 0.0,
@@ -367,7 +387,13 @@ impl CrawlerEntry {
             last_runtime_seconds: finished
                 .and_then(CrawlRecord::duration)
                 .map_or(0.0, |duration| duration.as_secs_f64()),
-            median_runtime_seconds: median_seconds(&self.crawl_durations),
+            median_runtime_seconds: median_seconds(
+                &self
+                    .crawl_history
+                    .iter()
+                    .filter_map(CrawlRecord::duration)
+                    .collect::<Vec<Duration>>(),
+            ),
             tables_created: finished.map_or(0, |crawl| crawl.tables_created),
             tables_updated: finished.map_or(0, |crawl| crawl.tables_updated),
             tables_deleted: finished.map_or(0, |crawl| crawl.tables_deleted),
@@ -405,7 +431,7 @@ impl CrawlerEntry {
             // "Status and error information about the most recent crawl": absent until
             // a crawl has FINISHED and produced one — a crawl in flight has produced no
             // status yet, so it leaves the previous crawl's report in place.
-            last_crawl: self.last_crawl.as_ref().map(CrawlRecord::to_last_crawl_info),
+            last_crawl: self.last_crawl().map(CrawlRecord::to_last_crawl_info),
             version: self.version,
             configuration: self.configuration.clone(),
             crawler_security_configuration: self.crawler_security_configuration.clone(),
@@ -420,7 +446,7 @@ impl CrawlerEntry {
 ///
 /// The median of an even number of durations is the mean of the two in the middle, which is
 /// what a median of a sample of runtimes is. The input is at most
-/// [`MAX_CRAWL_DURATIONS`] long, so the sort is a bounded cost.
+/// [`MAX_CRAWL_HISTORY`] long, so the sort is a bounded cost.
 fn median_seconds(durations: &[Duration]) -> f64 {
     if durations.is_empty() {
         return 0.0;

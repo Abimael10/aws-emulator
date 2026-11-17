@@ -267,6 +267,7 @@ mod column_statistics;
 mod column_statistics_source;
 mod column_statistics_values;
 mod crawl;
+mod crawl_history;
 mod crawl_source;
 mod crawler_events;
 mod crawler_roles_and_connections;
@@ -305,6 +306,7 @@ pub use column_statistics::*;
 pub use column_statistics_source::*;
 pub use column_statistics_values::*;
 pub use crawl::*;
+pub use crawl_history::*;
 pub use crawl_source::*;
 pub use crawler_events::*;
 pub use crawler_roles_and_connections::*;
@@ -355,7 +357,8 @@ use crate::ops::types::{
     ConfigurationObject,
     Condition,
     Connection, ConnectionInput,
-    ConnectionPasswordEncryption, ConnectionsList, Crawler, CrawlerMetrics, CrawlerTargets,
+    ConnectionPasswordEncryption, ConnectionsList, Crawler, CrawlerHistory, CrawlerMetrics,
+    CrawlerTargets, CrawlsFilter,
     CreateClassifierInput,
     CreateColumnStatisticsTaskSettingsInput, CreateCrawlerInput,
     CreateCustomEntityTypeInput, CreateDataQualityRulesetInput, CreateGlossaryInput,

@@ -28,6 +28,9 @@
 //!
 //! The due instant a crawl's finish falls at is moved THROUGH THE STORE rather than slept
 //! for ([`set_due_instant`]), so every transition here is deterministic.
+//!
+//! The records those crawls leave on the crawler are what `ListCrawls` reports, which the last
+//! section of this file is about; the rule for that listing is stated there.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -35,13 +38,15 @@ use std::time::{Duration, SystemTime};
 use serde_json::{json, Value};
 use service_com_amazonaws_glue_awsglue::state::{
     crawl_target_unreadable, fold_name, ComAmazonawsGlueAwsglueState, CLASSIFICATION_CSV,
-    CLASSIFICATION_JSON, CRAWLER_STATE_READY, CRAWLER_STATE_RUNNING,
+    CLASSIFICATION_JSON, CRAWLER_HISTORY_STATE_COMPLETED, CRAWLER_HISTORY_STATE_FAILED,
+    CRAWLER_HISTORY_STATE_RUNNING, CRAWLER_STATE_READY, CRAWLER_STATE_RUNNING,
     CRAWL_WITHOUT_TARGET_DATABASE, DEPRECATED_BY_CRAWLER_PARAMETER, LAST_CRAWL_STATUS_FAILED,
-    LAST_CRAWL_STATUS_SUCCEEDED, MAX_CRAWLED_EXCLUSIONS, UPDATED_BY_CRAWLER_PARAMETER,
+    LAST_CRAWL_STATUS_SUCCEEDED, MAX_CRAWLED_EXCLUSIONS, MAX_CRAWL_HISTORY,
+    UPDATED_BY_CRAWLER_PARAMETER,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::wire::{call, error_code, error_message, ok, ACCOUNT_ID};
+use crate::wire::{call, error_code, error_message, ok, ACCOUNT_ID, REGION};
 
 /// The role every crawler here is created with.
 pub(crate) const ROLE: &str =
@@ -1114,4 +1119,955 @@ async fn starting_a_crawler_that_does_not_exist_is_a_miss() {
             "case {case:?}: expected the miss to name the crawler, got {parsed}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The crawls a crawler has run, as `ListCrawls` reports them
+// ---------------------------------------------------------------------------
+//
+// RULE: `ListCrawls` "returns all the crawls of a specified crawler" — it answers 200 with one
+// `CrawlerHistory` per crawl the addressed crawler has run, the one in flight included, newest
+// first, each computed from that crawl's OWN record (the id minted for it, the state it stands
+// in, the instants it ran between, the summary of what it wrote into the catalog and the reason
+// it failed), narrowed to the crawls every `CrawlsFilter` criterion admits and served one page
+// of at most `MaxResults` at a time with a `NextToken` that resumes the walk. A name no crawler
+// in the account has is `EntityNotFoundException`, a `Filters` entry that is no comparison on a
+// field of a crawl is `InvalidInputException`, and the call changes nothing a later caller sees.
+
+/// The largest page `ListCrawls` serves, and the page it serves when the request names no
+/// `MaxResults`.
+///
+/// Source: `ListCrawlsRequest$MaxResults` itself — "the maximum number of results to return.
+/// The default is 20, and maximum is 100"
+/// (`smithy_query(query="operation",operation="ListCrawls")`).
+const MAX_CRAWLS_PAGE: usize = 100;
+/// See [`MAX_CRAWLS_PAGE`].
+const DEFAULT_CRAWLS_PAGE: usize = 20;
+
+/// The published upper bound of `MaxResults` as a MEMBER: it targets `PageSize`, range
+/// 1..1000, so a value between the documented maximum above and this one is accepted and
+/// served as pages of that maximum, and one past this is refused at the boundary.
+const MAX_PAGE_SIZE_MEMBER: i32 = 1_000;
+
+/// One `ListCrawls` request body: the crawler the row addresses, plus the filters, the page
+/// size and the cursor the row names.
+fn crawls_request(
+    crawler: &str,
+    filters: Value,
+    page_size: Option<i32>,
+    token: Option<&str>,
+) -> Value {
+    let mut body = json!({ "CrawlerName": crawler });
+    if !filters.is_null() {
+        body["Filters"] = filters;
+    }
+    if let Some(size) = page_size {
+        body["MaxResults"] = json!(size);
+    }
+    if let Some(cursor) = token {
+        body["NextToken"] = json!(cursor);
+    }
+    body
+}
+
+/// The `Crawls` of one answer, which must be present even when empty.
+fn crawls_of(body: &Value) -> Vec<Value> {
+    body.get("Crawls")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("ListCrawls must report a Crawls list, got {body}"))
+        .clone()
+}
+
+/// The `CrawlId` of every crawl reported, in the order the service served them.
+fn crawl_ids(body: &Value) -> Vec<String> {
+    crawls_of(body)
+        .iter()
+        .map(|crawl| {
+            crawl
+                .get("CrawlId")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("every crawl carries a CrawlId, got {crawl}"))
+                .to_string()
+        })
+        .collect()
+}
+
+/// One text member of a reported crawl, or `None` when it carries none.
+fn crawl_member(crawl: &Value, member: &str) -> Option<String> {
+    crawl.get(member).and_then(Value::as_str).map(str::to_string)
+}
+
+/// One instant member of a reported crawl, as the seconds since the epoch the protocol puts
+/// a timestamp on the wire as, or `None` when the crawl carries none.
+fn crawl_instant(crawl: &Value, member: &str) -> Option<f64> {
+    crawl.get(member).and_then(Value::as_f64)
+}
+
+/// The `Summary` of a reported crawl, read as the document it is: "a run summary for the
+/// specific crawl in JSON".
+fn crawl_summary(crawl: &Value) -> Value {
+    let text = crawl_member(crawl, "Summary")
+        .unwrap_or_else(|| panic!("a finished crawl reports a Summary, got {crawl}"));
+    serde_json::from_str(&text)
+        .unwrap_or_else(|error| panic!("a crawl's Summary is JSON, got {text:?} ({error})"))
+}
+
+/// One count of a crawl's run summary.
+fn summarised(summary: &Value, member: &str) -> i64 {
+    summary
+        .get(member)
+        .and_then(Value::as_i64)
+        .unwrap_or_else(|| panic!("a run summary states {member}, got {summary}"))
+}
+
+/// The crawls of `crawler`, unfiltered and in one page large enough for the whole history.
+async fn listed_crawls(router: &MultiServiceRouter, crawler: &str) -> Value {
+    ok(
+        router,
+        "ListCrawls",
+        &crawls_request(
+            crawler,
+            Value::Null,
+            Some(i32::try_from(MAX_CRAWLS_PAGE).unwrap_or(1)),
+            None,
+        ),
+    )
+    .await
+}
+
+/// Run one crawl of `name` to its end, with the finish the clock owes it falling due at an
+/// instant AFTER the crawl began — so the crawl reports the span it really ran over, and
+/// nothing is slept for.
+async fn crawl_to_the_end(
+    router: &MultiServiceRouter,
+    engine: &Arc<engine::InMemoryEngine>,
+    name: &str,
+) {
+    ok(router, "StartCrawler", &json!({ "Name": name })).await;
+    set_due_instant(engine, SystemTime::now());
+    // The owed finish is materialised by the next call, whoever makes it.
+    ok(router, "GetCrawler", &json!({ "Name": name })).await;
+}
+
+/// One `CrawlsFilter` of a request.
+fn filter(field: &str, operator: &str, value: &str) -> Value {
+    json!({ "FieldName": field, "FilterOperator": operator, "FieldValue": value })
+}
+
+/// Walk every page the listing hands out for one page size, following its own token, and
+/// answer the crawl ids in the order they were served.
+async fn walk_crawls(
+    router: &MultiServiceRouter,
+    case: &str,
+    crawler: &str,
+    page_size: Option<i32>,
+    ceiling: usize,
+) -> Vec<String> {
+    let mut served: Vec<String> = Vec::new();
+    let mut token: Option<String> = None;
+    loop {
+        let page = ok(
+            router,
+            "ListCrawls",
+            &crawls_request(crawler, Value::Null, page_size, token.as_deref()),
+        )
+        .await;
+        let ids = crawl_ids(&page);
+        let bound = page_size
+            .map(|size| usize::try_from(size).unwrap_or(MAX_CRAWLS_PAGE).min(MAX_CRAWLS_PAGE))
+            .unwrap_or(DEFAULT_CRAWLS_PAGE);
+        assert!(
+            ids.len() <= bound,
+            "case {case:?}: a page must not exceed {bound} crawls, got {} of them",
+            ids.len()
+        );
+        served.extend(ids);
+        token = page
+            .get("NextToken")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if token.is_none() {
+            break;
+        }
+        assert!(
+            served.len() <= ceiling,
+            "case {case:?}: the walk must terminate, got {served:?} for {ceiling} crawls"
+        );
+    }
+    served
+}
+
+/// Every crawl the crawler has run is reported, newest first, each from its own record — and
+/// a crawler nothing has crawled reports an empty history rather than an absent one.
+///
+/// The rows differ along how many crawls the crawler has run (none, which is the state a
+/// freshly created crawler is in, then one, two and three), and the assertions after the walk
+/// read the members each crawl produced: a run summary whose counts are the ones THAT crawl's
+/// writes made, which is why the first crawl of the data created a table and a partition and
+/// the later ones re-wrote the table and found no new partition.
+#[tokio::test]
+async fn the_crawls_a_crawler_ran_are_reported_newest_first() {
+    let (router, engine) = emulator_with_s3();
+    stage(
+        &router,
+        "crawl-history",
+        &[("data/year=2024/a.csv", "id\n1\n")],
+    )
+    .await;
+    given_database(&router, DATABASE).await;
+    given_crawler(
+        &router,
+        "historied",
+        json!({ "Path": "s3://crawl-history/data/" }),
+        json!({}),
+    )
+    .await;
+    given_crawler(
+        &router,
+        "idle",
+        json!({ "Path": "s3://crawl-history/data/" }),
+        json!({}),
+    )
+    .await;
+
+    let mut reported_before: Vec<String> = Vec::new();
+    for crawls in 0..=3usize {
+        if crawls > 0 {
+            crawl_to_the_end(&router, &engine, "historied").await;
+        }
+        let body = listed_crawls(&router, "historied").await;
+        let ids = crawl_ids(&body);
+        assert_eq!(
+            ids.len(),
+            crawls,
+            "case {crawls} crawl(s) run: expected that many crawls reported, got {body}"
+        );
+        assert!(
+            body.get("NextToken").is_none(),
+            "case {crawls} crawl(s) run: one page holds the whole history, so it carries no \
+             token, got {body}"
+        );
+        // Newest first: the crawl just run is served ahead of the ones already reported, and
+        // each of those keeps its place.
+        assert_eq!(
+            ids.iter().skip(1).cloned().collect::<Vec<String>>(),
+            reported_before,
+            "case {crawls} crawl(s) run: expected the crawls already reported behind the \
+             newest, got {ids:?}"
+        );
+        let starts: Vec<f64> = crawls_of(&body)
+            .iter()
+            .map(|crawl| {
+                crawl_instant(crawl, "StartTime")
+                    .unwrap_or_else(|| panic!("every crawl reports when it started, got {crawl}"))
+            })
+            .collect();
+        assert!(
+            starts.windows(2).all(|pair| pair[0] >= pair[1]),
+            "case {crawls} crawl(s) run: expected the start instants in descending order, got \
+             {starts:?}"
+        );
+        reported_before = ids;
+    }
+
+    let body = listed_crawls(&router, "historied").await;
+    let listed = crawls_of(&body);
+    let ids = crawl_ids(&body);
+    let distinct: std::collections::BTreeSet<&String> = ids.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        ids.len(),
+        "case \"three crawls\": every crawl carries an id of its own, got {ids:?}"
+    );
+    for crawl in &listed {
+        let case = crawl_member(crawl, "CrawlId").unwrap_or_default();
+        assert_eq!(
+            crawl_member(crawl, "State").as_deref(),
+            Some(CRAWLER_HISTORY_STATE_COMPLETED),
+            "case {case:?}: a crawl that ran to its end COMPLETED, got {crawl}"
+        );
+        let (start, end) = (
+            crawl_instant(crawl, "StartTime"),
+            crawl_instant(crawl, "EndTime"),
+        );
+        assert!(
+            matches!((start, end), (Some(start), Some(end)) if end >= start),
+            "case {case:?}: a finished crawl ran from its start to its end, got {crawl}"
+        );
+        assert_eq!(
+            crawl.get("DPUHour").and_then(Value::as_f64).unwrap_or(0.0),
+            0.0,
+            "case {case:?}: no data processing unit was provisioned for the crawl, got {crawl}"
+        );
+        assert!(
+            crawl.get("ErrorMessage").is_none(),
+            "case {case:?}: a crawl that failed at nothing carries no error message, got {crawl}"
+        );
+        // The CloudWatch Logs stream a crawl writes its log to: nothing here writes one, so
+        // naming one would name a record no log read can serve.
+        for absent in ["LogGroup", "LogStream", "MessagePrefix"] {
+            assert!(
+                crawl.get(absent).is_none(),
+                "case {case:?}: no log stream is written, so {absent} is absent, got {crawl}"
+            );
+        }
+    }
+
+    // The summary is what THAT crawl's writes did: the first crawl of the data created the
+    // table it found and the partition below it, and a later crawl of the same data re-wrote
+    // the table and found no new partition.
+    let oldest = crawl_summary(&listed[listed.len() - 1]);
+    assert_eq!(
+        (
+            summarised(&oldest, "TablesCreated"),
+            summarised(&oldest, "TablesUpdated"),
+            summarised(&oldest, "TablesDeleted"),
+            summarised(&oldest, "PartitionsCreated"),
+        ),
+        (1, 0, 0, 1),
+        "case \"the first crawl of the data\": expected the table and the partition it wrote, \
+         got {oldest}"
+    );
+    let newest = crawl_summary(&listed[0]);
+    assert_eq!(
+        (
+            summarised(&newest, "TablesCreated"),
+            summarised(&newest, "TablesUpdated"),
+            summarised(&newest, "TablesDeleted"),
+            summarised(&newest, "PartitionsCreated"),
+        ),
+        (0, 1, 0, 0),
+        "case \"a later crawl of the same data\": expected the table re-written and no new \
+         partition, got {newest}"
+    );
+
+    // The newest crawl of the listing is the crawl `GetCrawler` reports as the crawler's
+    // last: one record, read two ways.
+    let crawler = crawler_of(&router, "historied").await;
+    assert_eq!(
+        crawler
+            .pointer("/LastCrawl/StartTime")
+            .and_then(Value::as_f64),
+        crawl_instant(&listed[0], "StartTime"),
+        "case \"the newest crawl\": expected the crawl GetCrawler reports as the last one, got \
+         {crawler}"
+    );
+
+    // A read does not change what a later caller sees, and the listing is scoped to the
+    // crawler addressed: the sibling crawler has run nothing.
+    let again = listed_crawls(&router, "historied").await;
+    assert_eq!(
+        again, body,
+        "case \"read twice\": ListCrawls must be repeatable, got {again}"
+    );
+    let idle = listed_crawls(&router, "idle").await;
+    assert!(
+        crawls_of(&idle).is_empty(),
+        "case \"another crawler\": a crawler that has run nothing reports an empty history, got \
+         {idle}"
+    );
+}
+
+/// Each crawl is reported in the state it stands in: the one in flight is RUNNING and has
+/// neither ended nor summarised anything, the same record COMPLETED once the finish the clock
+/// owed it fell due — under the same id, because the record moves state rather than being
+/// replaced — and a crawl that could not be carried out is FAILED carrying its reason.
+///
+/// The rows are the states a crawl of this emulator reaches, of the modelled
+/// `CrawlerHistoryState` (`RUNNING | COMPLETED | FAILED | STOPPED`, from
+/// `smithy_query(query="shape",shape="CrawlerHistoryState")`); `STOPPED` is the state a crawl
+/// somebody stopped stands in, which the operation that stops one owns.
+#[tokio::test]
+async fn a_crawl_is_reported_in_the_state_it_stands_in() {
+    let (router, engine) = emulator_with_s3();
+    stage(&router, "crawl-states", &[("data/a.csv", "id\n1\n")]).await;
+    given_database(&router, DATABASE).await;
+    given_crawler(
+        &router,
+        "in-flight",
+        json!({ "Path": "s3://crawl-states/data/" }),
+        json!({}),
+    )
+    .await;
+    // A crawler that names no database has nowhere to write what it finds, so its crawl is
+    // carried out and fails.
+    ok(
+        &router,
+        "CreateCrawler",
+        &json!({
+            "Name": "failing",
+            "Role": ROLE,
+            "Targets": { "S3Targets": [{ "Path": "s3://crawl-states/data/" }] },
+        }),
+    )
+    .await;
+
+    ok(&router, "StartCrawler", &json!({ "Name": "in-flight" })).await;
+    // Held open, so the transient window is observable without sleeping for it.
+    set_due_instant(&engine, far_future());
+    let before = crawler_of(&router, "in-flight").await;
+
+    let running = crawls_of(&listed_crawls(&router, "in-flight").await);
+    assert_eq!(
+        running.len(),
+        1,
+        "case \"in flight\": the crawl that started is reported, got {running:?}"
+    );
+    assert_eq!(
+        crawl_member(&running[0], "State").as_deref(),
+        Some(CRAWLER_HISTORY_STATE_RUNNING),
+        "case \"in flight\": the crawl is still under way, got {}",
+        running[0]
+    );
+    assert!(
+        crawl_instant(&running[0], "StartTime").is_some(),
+        "case \"in flight\": a crawl under way reports when it started, got {}",
+        running[0]
+    );
+    assert!(
+        running[0].get("EndTime").is_none(),
+        "case \"in flight\": a crawl still running has not ended, got {}",
+        running[0]
+    );
+    assert!(
+        running[0].get("Summary").is_none(),
+        "case \"in flight\": a crawl still running has published no summary, got {}",
+        running[0]
+    );
+
+    // Listing the crawls of a crawl in flight does not advance it: its run state, the
+    // definition's `Version`, the instant of its last write and the previous crawl's report
+    // are all exactly what they were. (`CrawlElapsedTime` is measured from the instant the
+    // read is served, so it is the one member a second read may differ in.)
+    let after = crawler_of(&router, "in-flight").await;
+    for member in ["State", "Version", "LastUpdated", "LastCrawl"] {
+        assert_eq!(
+            after.get(member),
+            before.get(member),
+            "case \"in flight\": the read must leave {member} untouched, expected {before}, got \
+             {after}"
+        );
+    }
+
+    // The finish the clock owed is materialised by the next call: the SAME crawl, now
+    // completed.
+    set_due_instant(&engine, SystemTime::now());
+    let finished = crawls_of(&listed_crawls(&router, "in-flight").await);
+    assert_eq!(
+        crawl_member(&finished[0], "CrawlId"),
+        crawl_member(&running[0], "CrawlId"),
+        "case \"finished\": the crawl that finished is the one that was running, got {}",
+        finished[0]
+    );
+    assert_eq!(
+        crawl_member(&finished[0], "State").as_deref(),
+        Some(CRAWLER_HISTORY_STATE_COMPLETED),
+        "case \"finished\": the crawl ran to its end, got {}",
+        finished[0]
+    );
+    assert!(
+        crawl_instant(&finished[0], "EndTime").is_some(),
+        "case \"finished\": a crawl that finished reports when it ended, got {}",
+        finished[0]
+    );
+    assert_eq!(
+        summarised(&crawl_summary(&finished[0]), "TablesCreated"),
+        1,
+        "case \"finished\": the summary states the table the crawl wrote, got {}",
+        finished[0]
+    );
+
+    crawl_to_the_end(&router, &engine, "failing").await;
+    let failed = crawls_of(&listed_crawls(&router, "failing").await);
+    assert_eq!(
+        crawl_member(&failed[0], "State").as_deref(),
+        Some(CRAWLER_HISTORY_STATE_FAILED),
+        "case \"failed\": a crawl that could not be carried out FAILED, got {}",
+        failed[0]
+    );
+    assert_eq!(
+        crawl_member(&failed[0], "ErrorMessage").as_deref(),
+        Some(CRAWL_WITHOUT_TARGET_DATABASE),
+        "case \"failed\": the crawl reports why it failed, got {}",
+        failed[0]
+    );
+}
+
+/// Seed the crawls of `crawler` directly: one FINISHED record per `(start, end)` row, in the
+/// order given (newest first), plus a crawl IN FLIGHT when `in_flight` names the instant it
+/// started. Answers every crawl id in the order a listing serves them.
+///
+/// Seeded rather than crawled for the reason the metrics suite seeds its crawlers: what the
+/// rows below are about is which crawls a criterion admits and how a page is cut, not how a
+/// crawl produces a record — and a filter on an instant is read against milliseconds this
+/// test chose rather than ones a crawl happened to take.
+fn seed_crawls(
+    engine: &Arc<engine::InMemoryEngine>,
+    crawler: &str,
+    finished: &[(SystemTime, SystemTime)],
+    in_flight: Option<SystemTime>,
+) -> Vec<String> {
+    use service_com_amazonaws_glue_awsglue::state::{CrawlCounts, CrawlRecord};
+
+    let state = engine.state::<ComAmazonawsGlueAwsglueState>();
+    let mut store = state.lock();
+    let entry = store
+        .crawlers
+        .get_mut(crawler)
+        .unwrap_or_else(|| panic!("the suite created {crawler}"));
+    entry.crawl_history.clear();
+    let mut ids: Vec<String> = Vec::new();
+    for (start, end) in finished {
+        let mut record = CrawlRecord::succeeded(*start, CrawlCounts::default());
+        record.finished_at = Some(*end);
+        ids.push(record.crawl_id.clone());
+        entry.crawl_history.push_back(record);
+    }
+    if let Some(start) = in_flight {
+        let record = CrawlRecord::succeeded(start, CrawlCounts::default());
+        let id = record.crawl_id.clone();
+        entry.start_crawl(record, start, REGION);
+        // The crawl in flight is newer than every crawl that has finished, which is the order
+        // a listing serves them in.
+        ids.insert(0, id);
+    }
+    ids
+}
+
+/// The epoch millisecond the seeded crawls below are stamped from, how far apart they are and
+/// how long each ran: values this test chose, so a criterion on an instant is read against
+/// known milliseconds.
+const SEEDED_START_MS: u64 = 1_760_000_000_000;
+/// See [`SEEDED_START_MS`].
+const SEEDED_STEP_MS: u64 = 60_000;
+/// See [`SEEDED_START_MS`].
+const SEEDED_RAN_MS: u64 = 5_000;
+
+/// `Filters` narrows the crawls to the ones every criterion admits: the crawls reported are
+/// those the whole list of criteria selects, and an empty list narrows nothing.
+///
+/// The rows differ along what the rule generalises over: the field keyed on (every value of
+/// the modelled `FieldName` — `CRAWL_ID`, `STATE`, `START_TIME`, `END_TIME`, `DPU_HOUR`, from
+/// `smithy_query(query="shape",shape="FieldName")`), the comparator (every value of
+/// `FilterOperator` — `EQ`, `NE`, `GT`, `GE`, `LT`, `LE`), the kind the field is compared as
+/// (text or number), how many criteria are stated at once, and whether the crawl carries a
+/// value for the field at all.
+#[tokio::test]
+async fn filters_narrow_the_crawls_to_what_every_criterion_admits() {
+    let (router, engine) = emulator_with_s3();
+    stage(&router, "crawl-filters", &[("data/a.csv", "id\n1\n")]).await;
+    given_database(&router, DATABASE).await;
+    given_crawler(
+        &router,
+        "filtered",
+        json!({ "Path": "s3://crawl-filters/data/" }),
+        json!({}),
+    )
+    .await;
+
+    // Three finished crawls a minute apart, newest first, and one still in flight.
+    let finished: Vec<(SystemTime, SystemTime)> = (0..3)
+        .map(|index| {
+            let start = SystemTime::UNIX_EPOCH
+                + Duration::from_millis(SEEDED_START_MS - index * SEEDED_STEP_MS);
+            (start, start + Duration::from_millis(SEEDED_RAN_MS))
+        })
+        .collect();
+    let ids = seed_crawls(&engine, "filtered", &finished, Some(SystemTime::now()));
+    let (running, newest, middle, oldest) = (
+        ids[0].clone(),
+        ids[1].clone(),
+        ids[2].clone(),
+        ids[3].clone(),
+    );
+    // The crawl in flight is held in its transient window, so the rows read a store that
+    // holds one crawl of every state.
+    set_due_instant(&engine, far_future());
+
+    let middle_start = (SEEDED_START_MS - SEEDED_STEP_MS).to_string();
+    let newest_end = (SEEDED_START_MS + SEEDED_RAN_MS).to_string();
+    let everything = vec![
+        running.clone(),
+        newest.clone(),
+        middle.clone(),
+        oldest.clone(),
+    ];
+
+    // (case, the Filters sent, the crawl ids that must be reported, in order)
+    let rows: Vec<(&str, Value, Vec<String>)> = vec![
+        ("no Filters member", Value::Null, everything.clone()),
+        ("an empty filter list", json!([]), everything.clone()),
+        (
+            "one crawl by its id",
+            json!([filter("CRAWL_ID", "EQ", &middle)]),
+            vec![middle.clone()],
+        ),
+        (
+            "every crawl but one id",
+            json!([filter("CRAWL_ID", "NE", &middle)]),
+            vec![running.clone(), newest.clone(), oldest.clone()],
+        ),
+        (
+            "an id no crawl carries",
+            json!([filter("CRAWL_ID", "EQ", "not-a-crawl-of-this-crawler")]),
+            vec![],
+        ),
+        (
+            "the crawls that completed",
+            json!([filter("STATE", "EQ", CRAWLER_HISTORY_STATE_COMPLETED)]),
+            vec![newest.clone(), middle.clone(), oldest.clone()],
+        ),
+        (
+            "the crawl still running",
+            json!([filter("STATE", "EQ", CRAWLER_HISTORY_STATE_RUNNING)]),
+            vec![running.clone()],
+        ),
+        (
+            "the crawls that are not running",
+            json!([filter("STATE", "NE", CRAWLER_HISTORY_STATE_RUNNING)]),
+            vec![newest.clone(), middle.clone(), oldest.clone()],
+        ),
+        (
+            "a state no crawl of this crawler stands in",
+            json!([filter("STATE", "EQ", "STOPPED")]),
+            vec![],
+        ),
+        (
+            "every crawl started after the epoch",
+            json!([filter("START_TIME", "GT", "0")]),
+            everything.clone(),
+        ),
+        (
+            // Compared as a NUMBER and not as text: these instants are 13 digits, so a text
+            // comparison would order them below this 12-digit value.
+            "a start compared against fewer digits",
+            json!([filter("START_TIME", "GT", "999999999999")]),
+            everything.clone(),
+        ),
+        (
+            "the crawls started at or after the middle one",
+            json!([filter("START_TIME", "GE", &middle_start)]),
+            vec![running.clone(), newest.clone(), middle.clone()],
+        ),
+        (
+            "the crawls started before the middle one",
+            json!([filter("START_TIME", "LT", &middle_start)]),
+            vec![oldest.clone()],
+        ),
+        (
+            // A crawl in flight has not ended, so it carries no value of this field to
+            // compare.
+            "the crawls that have ended",
+            json!([filter("END_TIME", "GT", "0")]),
+            vec![newest.clone(), middle.clone(), oldest.clone()],
+        ),
+        (
+            "the crawls that ended at or before the newest one",
+            json!([filter("END_TIME", "LE", &newest_end)]),
+            vec![newest.clone(), middle.clone(), oldest.clone()],
+        ),
+        (
+            "the crawls that ended after the newest one",
+            json!([filter("END_TIME", "GT", &newest_end)]),
+            vec![],
+        ),
+        (
+            "no data processing unit hour was used",
+            json!([filter("DPU_HOUR", "EQ", "0")]),
+            everything.clone(),
+        ),
+        (
+            "a fractional DPU hour nothing reached",
+            json!([filter("DPU_HOUR", "GT", "0.5")]),
+            vec![],
+        ),
+        (
+            "a fractional DPU hour every crawl is below",
+            json!([filter("DPU_HOUR", "LE", "0.5")]),
+            everything.clone(),
+        ),
+        (
+            "two criteria, both of which must hold",
+            json!([
+                filter("STATE", "EQ", CRAWLER_HISTORY_STATE_COMPLETED),
+                filter("CRAWL_ID", "NE", &newest),
+            ]),
+            vec![middle.clone(), oldest.clone()],
+        ),
+        (
+            "two criteria no crawl satisfies at once",
+            json!([
+                filter("STATE", "EQ", CRAWLER_HISTORY_STATE_RUNNING),
+                filter("END_TIME", "GT", "0"),
+            ]),
+            vec![],
+        ),
+    ];
+
+    for (case, filters, expected) in rows {
+        let body = ok(
+            &router,
+            "ListCrawls",
+            &crawls_request(
+                "filtered",
+                filters,
+                Some(i32::try_from(MAX_CRAWLS_PAGE).unwrap_or(1)),
+                None,
+            ),
+        )
+        .await;
+        let served = crawl_ids(&body);
+        assert_eq!(
+            served, expected,
+            "case {case:?}: expected the crawls {expected:?}, got {served:?} in {body}"
+        );
+    }
+}
+
+/// The crawls of one crawler are served one bounded page at a time, in the listing's own
+/// order, with no crawl served twice and none left out — and the store keeps the records of
+/// the last [`MAX_CRAWL_HISTORY`] crawls, dropping the oldest first.
+///
+/// The rows differ along the page size asked for: absent (the documented default), each
+/// published bound of the documented range and sizes between them, and one above that range
+/// which is served as pages of the documented maximum rather than refused.
+#[tokio::test]
+async fn the_crawl_history_is_walked_one_bounded_page_at_a_time() {
+    let (router, engine) = emulator_with_s3();
+    stage(&router, "crawl-pages", &[("data/a.csv", "id\n1\n")]).await;
+    given_database(&router, DATABASE).await;
+    given_crawler(
+        &router,
+        "paged",
+        json!({ "Path": "s3://crawl-pages/data/" }),
+        json!({}),
+    )
+    .await;
+
+    // Two crawls past the bound, so the bound is read on the path a crawl really takes and
+    // the walk below covers a full history.
+    let mut minted: Vec<String> = Vec::new();
+    for _ in 0..MAX_CRAWL_HISTORY + 2 {
+        crawl_to_the_end(&router, &engine, "paged").await;
+        let newest = crawl_ids(&listed_crawls(&router, "paged").await);
+        minted.push(
+            newest
+                .first()
+                .cloned()
+                .unwrap_or_else(|| panic!("the crawl that just ran is reported")),
+        );
+    }
+
+    let whole = crawl_ids(&listed_crawls(&router, "paged").await);
+    let kept: Vec<String> = minted
+        .iter()
+        .rev()
+        .take(MAX_CRAWL_HISTORY)
+        .cloned()
+        .collect();
+    assert_eq!(
+        whole, kept,
+        "case \"past the bound\": expected the newest {MAX_CRAWL_HISTORY} crawls, newest first, \
+         got {whole:?}"
+    );
+    for dropped in minted.iter().take(minted.len() - MAX_CRAWL_HISTORY) {
+        assert!(
+            !whole.contains(dropped),
+            "case \"past the bound\": the oldest crawl {dropped:?} is dropped first, got {whole:?}"
+        );
+    }
+
+    // (case, the page size asked for)
+    let rows: &[(&str, Option<i32>)] = &[
+        ("no page size at all", None),
+        ("the smallest page the documented range allows", Some(1)),
+        ("a page smaller than the history", Some(3)),
+        ("a page one short of the history", Some(19)),
+        ("a page the size of the history", Some(20)),
+        (
+            "the largest page the documentation allows",
+            Some(i32::try_from(MAX_CRAWLS_PAGE).unwrap_or(1)),
+        ),
+        (
+            "a page size above the documented maximum",
+            Some(MAX_PAGE_SIZE_MEMBER),
+        ),
+    ];
+    for (case, page_size) in rows {
+        let served = walk_crawls(&router, case, "paged", *page_size, MAX_CRAWL_HISTORY).await;
+        assert_eq!(
+            served, whole,
+            "case {case:?}: expected the whole history in one order, got {served:?}"
+        );
+    }
+
+    // A cursor past the end of the listing is not an error: the walk resumes past every crawl,
+    // so the page is empty and final. A cursor before all of them resumes at the first.
+    for (case, token, expected) in [
+        ("a cursor past every crawl", "0", Vec::new()),
+        ("a cursor before every crawl", "99999999999999999999:", whole.clone()),
+    ] {
+        let page = ok(
+            &router,
+            "ListCrawls",
+            &crawls_request(
+                "paged",
+                Value::Null,
+                Some(i32::try_from(MAX_CRAWLS_PAGE).unwrap_or(1)),
+                Some(token),
+            ),
+        )
+        .await;
+        assert_eq!(
+            crawl_ids(&page),
+            expected,
+            "case {case:?}: expected {expected:?}, got {page}"
+        );
+    }
+}
+
+/// A crawl listing the service cannot serve is refused and changes nothing: a name no crawler
+/// in the account has is the operation's own miss, a `Filters` entry that is no comparison on
+/// a field of a crawl is its own input refusal, and a `MaxResults` outside the member's
+/// modelled range is refused at the request boundary.
+#[tokio::test]
+async fn a_crawl_listing_the_service_cannot_serve_is_refused() {
+    let (router, engine) = emulator_with_s3();
+    stage(&router, "crawl-refusals", &[("data/a.csv", "id\n1\n")]).await;
+    given_database(&router, DATABASE).await;
+    given_crawler(
+        &router,
+        "listed",
+        json!({ "Path": "s3://crawl-refusals/data/" }),
+        json!({}),
+    )
+    .await;
+    crawl_to_the_end(&router, &engine, "listed").await;
+    let before = listed_crawls(&router, "listed").await;
+
+    // The rows differ along the spelling of the absent name: one nothing created, and the
+    // stored crawler's name in another casing — a crawler is addressed by name exactly as it
+    // was created.
+    for (case, name) in [
+        ("a name nothing created", "absent"),
+        ("the stored name in another casing", "LISTED"),
+    ] {
+        let (status, parsed) = call(
+            &router,
+            "ListCrawls",
+            &crawls_request(name, Value::Null, None, None),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected 400, got {status} with {parsed}"
+        );
+        assert!(
+            error_code(&parsed).ends_with("EntityNotFoundException"),
+            "case {case:?}: expected EntityNotFoundException, got {parsed}"
+        );
+        assert_eq!(
+            error_message(&parsed),
+            format!("Crawler entry with name {name} does not exist"),
+            "case {case:?}: expected the miss to name the crawler, got {parsed}"
+        );
+    }
+
+    // (case, the Filters sent) — each states no comparison on a field of a crawl.
+    let rows: Vec<(&str, Value)> = vec![
+        (
+            "a filter stating no field",
+            json!([{ "FilterOperator": "EQ", "FieldValue": "COMPLETED" }]),
+        ),
+        (
+            "a filter stating no comparator",
+            json!([{ "FieldName": "STATE", "FieldValue": "COMPLETED" }]),
+        ),
+        (
+            "a filter stating no value",
+            json!([{ "FieldName": "STATE", "FilterOperator": "EQ" }]),
+        ),
+        (
+            "a start instant that is no number",
+            json!([filter("START_TIME", "GT", "yesterday")]),
+        ),
+        (
+            "a DPU hour that is no number",
+            json!([filter("DPU_HOUR", "GE", "a few")]),
+        ),
+        (
+            "one criterion the listing can serve beside one it cannot",
+            json!([
+                filter("STATE", "EQ", CRAWLER_HISTORY_STATE_COMPLETED),
+                filter("END_TIME", "LT", "the day before"),
+            ]),
+        ),
+    ];
+    for (case, filters) in rows {
+        let (status, parsed) = call(
+            &router,
+            "ListCrawls",
+            &crawls_request("listed", filters, None, None),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected 400, got {status} with {parsed}"
+        );
+        assert!(
+            error_code(&parsed).ends_with("InvalidInputException"),
+            "case {case:?}: expected InvalidInputException, got {parsed}"
+        );
+    }
+
+    // A field name or a comparator the model does not declare, and a page size outside the
+    // member's modelled range, break a modelled constraint: each is refused at the request
+    // boundary, before the listing is reached.
+    let rows: Vec<(&str, Value)> = vec![
+        (
+            "a field no crawl has",
+            crawls_request(
+                "listed",
+                json!([filter("CRAWLER_NAME", "EQ", "listed")]),
+                None,
+                None,
+            ),
+        ),
+        (
+            "a comparator the model does not declare",
+            crawls_request(
+                "listed",
+                json!([filter("STATE", "LIKE", CRAWLER_HISTORY_STATE_COMPLETED)]),
+                None,
+                None,
+            ),
+        ),
+        (
+            "a page size below the minimum",
+            crawls_request("listed", Value::Null, Some(0), None),
+        ),
+        (
+            "a page size above the maximum",
+            crawls_request("listed", Value::Null, Some(MAX_PAGE_SIZE_MEMBER + 1), None),
+        ),
+    ];
+    for (case, body) in rows {
+        let (status, parsed) = call(&router, "ListCrawls", &body).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected 400, got {status} with {parsed}"
+        );
+        assert!(
+            !error_code(&parsed).is_empty(),
+            "case {case:?}: the refusal must name an error, got {parsed}"
+        );
+    }
+
+    // The refusals changed nothing: the crawl the crawler ran is still reported, exactly as
+    // it was.
+    let after = listed_crawls(&router, "listed").await;
+    assert_eq!(
+        after, before,
+        "case \"after the refusals\": expected the listing to be untouched, got {after}"
+    );
 }
