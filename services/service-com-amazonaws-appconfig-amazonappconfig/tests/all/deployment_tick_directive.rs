@@ -24,6 +24,18 @@
 //! also binds a SECOND extension whose tick action targets an Amazon SQS queue — the
 //! target kind that cannot answer — because that is where the event handed to the action
 //! point is observable as a client sees it.
+//!
+//! The second suite reads the same rule where a running APPLICATION reads it: an in-flight
+//! rollout that is directed to roll back converges on the terminal `ROLLED_BACK` state
+//! available to no target, and from the instant that rollback starts the configuration
+//! AppConfig serves is the version that was in force before it — for every consumer of the
+//! environment, whatever share of the targets the rollout had reached — read through the
+//! data plane an application polls (AppConfigData's `StartConfigurationSession` and
+//! `GetLatestConfiguration`) rather than through the control plane's own read. Its rows
+//! differ along how the rollout is paced (its `GrowthType`, its `GrowthFactor`, its rollout
+//! window and its final bake time) and along whether the tick's answer aborts it at all,
+//! because the version in force afterwards follows from the rollback and not from the
+//! pacing.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -37,8 +49,8 @@ use crate::appconfig_workflow::{
 };
 use crate::configuration_profile_validators::{activate_functions, lambda};
 use crate::extension_action_points::{
-    associate, create_version, drain, get_deployment, given_growing_strategy, given_queue,
-    given_strategy, start_deployment,
+    associate, create_version, drain, get_deployment, given_growing_strategy,
+    given_growing_strategy_of_type, given_queue, given_strategy, start_deployment,
 };
 use crate::extensions::create_extension;
 use crate::resource_tags::arn;
@@ -652,5 +664,442 @@ async fn an_at_deployment_tick_directive_steers_the_deployment_it_is_invoked_for
             message, expected,
             "case {case:?}: expected the refusal {expected:?}, got {message:?}"
         );
+    }
+}
+
+/// The `DeploymentState` values of a deployment whose rollback has begun: the one the
+/// service is still working the rollback through and the terminal one it ends in. From the
+/// first of them on, the version under rollout is available to no target
+/// (`smithy_query(query="shape",shape="Deployment")` for `PercentageComplete`: "the
+/// percentage of targets for which the deployment is available"), so nothing is served it.
+const WITHDRAWN_STATES: &[&str] = &["ROLLING_BACK", "ROLLED_BACK"];
+
+/// How many independently opened configuration sessions the sample taken after the rollout
+/// settled holds.
+///
+/// Each session's position in a rollout is minted by the service and carried by every poll
+/// of it, so a sample of several spans the positions a fleet holds rather than one of them.
+const SESSION_SAMPLE: usize = 8;
+
+/// The `FinalBakeTimeInMinutes` an aborted row's strategy declares
+/// (`MinutesBetween0And24Hours`, range 0..1440).
+///
+/// A window for the DIRECTIVE to arrive in, not a limit any row tests: AppConfig monitors a
+/// deployment over its final bake time, so a row declaring one keeps its deployment in
+/// flight — and therefore ticking — for that long. Generous, because a row whose directive
+/// arrived after its deployment had already finished would be reporting on how fast the
+/// host runs rather than on the rule. No row ever waits it out: each is aborted at its first
+/// tick, which the interval the ticks are paced by makes due at once.
+const ABORT_WINDOW_IN_MINUTES: i32 = 5;
+
+/// How long a row of this suite waits for its deployment to reach a terminal state.
+///
+/// A ceiling on the WAIT, not a statement about how long a rollback takes: the rollback a
+/// directive asks for is owed within one tick interval plus the span the service works it
+/// through, so a row that spends this long is one whose directive never arrived — the defect
+/// this suite pins — and nothing here is decided by the clock short of it.
+const REVERTED_BY: Duration = Duration::from_secs(180);
+
+/// AppConfig, Lambda and the AppConfigData data plane on ONE engine: the steering target of
+/// the tick lives in Lambda, and what the rollback leaves in service is what an application
+/// polling its own configuration is served.
+fn emulator_with_data_plane() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut router = MultiServiceRouter::new();
+    router.set_request_authentication(false);
+    router.register_service(
+        service_com_amazonaws_appconfig_amazonappconfig::EmulatedService::new(Arc::clone(&engine)),
+    );
+    router.register_service(
+        service_com_amazonaws_lambda_awsgirapiservice::EmulatedService::new(Arc::clone(&engine)),
+    );
+    router.register_service(
+        service_com_amazonaws_appconfigdata_appconfigdata::EmulatedService::new(Arc::clone(&engine)),
+    );
+    (router, engine)
+}
+
+/// A deployment strategy of this account's own, paced exactly as a row asks.
+///
+/// The create itself is the sibling helper every suite of this target shares; this one only
+/// orders a row's own members into it. Answers the strategy's minted id.
+async fn given_paced_strategy(router: &MultiServiceRouter, name: &str, row: &ServedRow) -> String {
+    given_growing_strategy_of_type(
+        router,
+        name,
+        row.growth_type,
+        row.duration_in_minutes,
+        row.bake_in_minutes,
+        row.growth_factor,
+    )
+    .await
+}
+
+/// Open ONE fresh configuration session over the triple through the AppConfigData data
+/// plane, poll it once, and assert the exact bytes it was served.
+///
+/// A fresh session each time because a poll serves the configuration only "when it differs
+/// from the version the session was last served": a client that has just started is the one
+/// whose poll always carries the content in force.
+async fn assert_served_to_a_session(
+    router: &MultiServiceRouter,
+    case: &str,
+    when: &str,
+    triple: (&str, &str, &str),
+    expected: &[u8],
+) {
+    let (application, environment, profile) = triple;
+    let started = json_call(
+        router,
+        "POST",
+        "/configurationsessions",
+        &json!({
+            "ApplicationIdentifier": application,
+            "EnvironmentIdentifier": environment,
+            "ConfigurationProfileIdentifier": profile,
+        }),
+    )
+    .await;
+    assert_eq!(
+        started.status,
+        201,
+        "case {case:?}: {when}: StartConfigurationSession answered {} / {}",
+        started.status,
+        String::from_utf8_lossy(&started.body)
+    );
+    let token = started.string("InitialConfigurationToken").unwrap_or_else(|| {
+        panic!("case {case:?}: {when}: StartConfigurationSession answered no token")
+    });
+    let polled = send(
+        router,
+        "GET",
+        &format!("/configuration?configuration_token={token}"),
+        "application/json",
+        Vec::new(),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        polled.status,
+        200,
+        "case {case:?}: {when}: GetLatestConfiguration answered {} / {}",
+        polled.status,
+        String::from_utf8_lossy(&polled.body)
+    );
+    assert_eq!(
+        polled.body.as_ref(),
+        expected,
+        "case {case:?}: {when}: expected the bytes of {:?} in service, got {:?}",
+        String::from_utf8_lossy(expected),
+        String::from_utf8_lossy(&polled.body)
+    );
+}
+
+/// One row of the data-plane suite: how the rollout under tick is paced, what its tick
+/// target answers, and what the environment serves once the deployment is terminal.
+struct ServedRow {
+    /// The row's name, which every assertion of it reports.
+    case: &'static str,
+    /// A `GrowthType` the model declares
+    /// (`smithy_query(query="shape",shape="GrowthType")`: `EXPONENTIAL | LINEAR`).
+    growth_type: &'static str,
+    /// `CreateDeploymentStrategy$GrowthFactor` (`Percentage`, range 1..100).
+    growth_factor: f64,
+    /// `CreateDeploymentStrategy$DeploymentDurationInMinutes`
+    /// (`MinutesBetween0And24Hours`, range 0..1440).
+    duration_in_minutes: i32,
+    /// `CreateDeploymentStrategy$FinalBakeTimeInMinutes`, the same range.
+    bake_in_minutes: i32,
+    /// The JSON document the row's tick target answers, verbatim.
+    answer: &'static str,
+    /// The terminal `DeploymentState` the rollout ends in.
+    expected_state: &'static str,
+}
+
+/// The rows: an aborted rollout paced four different ways, and one nothing aborted. The
+/// growth factor spans the model's own range — the smallest share a rollout can grow by,
+/// shares that take several intervals, and the one that reaches every target in a single
+/// interval — because the version left in service follows from the rollback rather than
+/// from how far the rollout had got.
+///
+/// Every aborted row is paced so that the deployment stays in flight for far longer than
+/// the directive needs to arrive — a rollout window of many growth steps, or a final bake
+/// window to be monitored over — so no row's outcome depends on how fast the host gets to
+/// its first read: a tight window is not what any of them is about.
+const SERVED_ROWS: &[ServedRow] = &[
+    ServedRow {
+        case: "a linear rollout aborted at a tick",
+        growth_type: "LINEAR",
+        growth_factor: 25.0,
+        duration_in_minutes: 1,
+        bake_in_minutes: ABORT_WINDOW_IN_MINUTES,
+        answer: r#"{"Directive": "ROLL_BACK", "Description": "the canary is failing"}"#,
+        expected_state: "ROLLED_BACK",
+    },
+    ServedRow {
+        case: "an exponential rollout aborted at a tick",
+        growth_type: "EXPONENTIAL",
+        growth_factor: 5.0,
+        duration_in_minutes: 2,
+        bake_in_minutes: ABORT_WINDOW_IN_MINUTES,
+        answer: r#"{"Directive": "ROLL_BACK"}"#,
+        expected_state: "ROLLED_BACK",
+    },
+    ServedRow {
+        case: "a rollout with no bake window, growing by the smallest share the model \
+               admits, aborted at a tick",
+        growth_type: "LINEAR",
+        growth_factor: 1.0,
+        duration_in_minutes: 1,
+        bake_in_minutes: 0,
+        answer: r#"{"Directive": "ROLL_BACK", "Description": "aborted one percent in"}"#,
+        expected_state: "ROLLED_BACK",
+    },
+    ServedRow {
+        case: "a rollout reaching every target in one interval, aborted at a tick",
+        growth_type: "LINEAR",
+        growth_factor: 100.0,
+        duration_in_minutes: 1,
+        bake_in_minutes: ABORT_WINDOW_IN_MINUTES,
+        answer: r#"{"Directive": "ROLL_BACK"}"#,
+        expected_state: "ROLLED_BACK",
+    },
+    ServedRow {
+        case: "a rollout no directive aborted",
+        growth_type: "LINEAR",
+        growth_factor: 50.0,
+        duration_in_minutes: 1,
+        bake_in_minutes: 0,
+        answer: r#"{"Directive": "CONTINUE", "Description": "the canary is healthy"}"#,
+        expected_state: "COMPLETE",
+    },
+];
+
+/// RULE: a rollout directed to roll back converges on the terminal `ROLLED_BACK` state
+/// available to no target, and from the instant the rollback starts every session of the
+/// environment is served the exact bytes of the version that was in force before it; a
+/// rollout nothing aborted completes and its own version is what is served.
+#[tokio::test]
+async fn an_aborted_rollout_serves_the_previous_version_to_every_session() {
+    let (router, engine) = emulator_with_data_plane();
+    // An instant strategy to put the PREVIOUS version in service: a strategy that paces no
+    // stage leaves nothing in flight, so that deployment is complete when it answers.
+    let instant = given_strategy(&router, "revert-instant", 0, 0).await;
+
+    for (index, row) in SERVED_ROWS.iter().enumerate() {
+        let case = row.case;
+        let suffix = index + 1;
+        let application = create_application(&router, &format!("revert-app-{suffix}")).await;
+        let environment =
+            create_environment(&router, &application, &format!("revert-env-{suffix}")).await;
+        let profile =
+            create_profile(&router, &application, &format!("revert-profile-{suffix}")).await;
+        let previous = format!(r#"{{"release":"previous","row":{suffix}}}"#);
+        let next = format!(r#"{{"release":"next","row":{suffix}}}"#);
+        for content in [&previous, &next] {
+            let written = create_version(
+                &router,
+                &application,
+                &profile,
+                "application/json",
+                content.as_bytes(),
+            )
+            .await;
+            assert_eq!(
+                written.status,
+                201,
+                "case {case:?}: CreateHostedConfigurationVersion answered {} / {}",
+                written.status,
+                String::from_utf8_lossy(&written.body)
+            );
+        }
+        let triple = (application.as_str(), environment.as_str(), profile.as_str());
+
+        // Version 1 in force, with no extension associated yet: it is the configuration a
+        // rolled-back deployment of version 2 has to leave behind.
+        let seeding = start_deployment(
+            &router,
+            &application,
+            &environment,
+            &json!({
+                "DeploymentStrategyId": instant,
+                "ConfigurationProfileId": profile,
+                "ConfigurationVersion": "1",
+            }),
+        )
+        .await;
+        assert_eq!(
+            seeding.json()["State"],
+            json!("COMPLETE"),
+            "case {case:?}: the instant deployment of version 1 must be complete, got {}",
+            seeding.json()
+        );
+        assert_served_to_a_session(
+            &router,
+            case,
+            "before the rollout",
+            triple,
+            previous.as_bytes(),
+        )
+        .await;
+
+        // The steering extension, bound to the environment under rollout.
+        let function = given_function(
+            &router,
+            &engine,
+            case,
+            &format!("revert-steer-{suffix}"),
+            &steering_source(row.answer),
+        )
+        .await;
+        let extension = given_tick_extension(
+            &router,
+            case,
+            &format!("revert-steer-ext-{suffix}"),
+            &function,
+        )
+        .await;
+        let environment_arn = arn(&format!("application/{application}/environment/{environment}"));
+        associate(&router, case, &extension, &environment_arn, &Value::Null).await;
+
+        let strategy = given_paced_strategy(&router, &format!("revert-paced-{suffix}"), row).await;
+        let started = start_deployment(
+            &router,
+            &application,
+            &environment,
+            &json!({
+                "DeploymentStrategyId": strategy,
+                "ConfigurationProfileId": profile,
+                "ConfigurationVersion": "2",
+            }),
+        )
+        .await;
+        assert_eq!(
+            started.status,
+            201,
+            "case {case:?}: StartDeployment answered {} / {}",
+            started.status,
+            String::from_utf8_lossy(&started.body)
+        );
+        assert_eq!(
+            started.json()["State"],
+            json!("DEPLOYING"),
+            "case {case:?}: a paced deployment is still rolling out when StartDeployment \
+             answers, got {}",
+            started.json()
+        );
+
+        // Read the deployment until it reaches a state it can no longer leave. The wait is
+        // on the CONDITION, with a deadline generous enough that nothing here depends on
+        // how fast the host runs; reading the deployment is also what runs the ticks the
+        // clock has made due, the way a client watching its own rollout does.
+        let deadline = Instant::now() + REVERTED_BY;
+        let document = loop {
+            let read = get_deployment(&router, &application, &environment, 2).await;
+            assert_eq!(
+                read.status,
+                200,
+                "case {case:?}: GetDeployment answered {} / {}",
+                read.status,
+                String::from_utf8_lossy(&read.body)
+            );
+            let body = read.json();
+            let state = body["State"].as_str().unwrap_or_default().to_string();
+            // The withdrawal reaches the data plane from the instant the rollback STARTS,
+            // not only once it has finished: a deployment being rolled back is returning to
+            // the configuration that preceded it, so no session is served the version under
+            // rollout while it is in either of those states.
+            if WITHDRAWN_STATES.contains(&state.as_str()) {
+                assert_served_to_a_session(
+                    &router,
+                    case,
+                    &format!("a session opened while the deployment reported {state:?}"),
+                    triple,
+                    previous.as_bytes(),
+                )
+                .await;
+            }
+            if TERMINAL_STATES.contains(&state.as_str()) {
+                break body;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "case {case:?}: the deployment never reached a terminal state, it is still \
+                 {state:?}"
+            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+        };
+
+        let state = document["State"].as_str().unwrap_or_default().to_string();
+        assert_eq!(
+            state, row.expected_state,
+            "case {case:?}: expected the rollout to end {}, got {state:?} with event log {:?}",
+            row.expected_state,
+            event_types(&document)
+        );
+
+        let types = event_types(&document);
+        let in_service: &str = if row.expected_state == "ROLLED_BACK" {
+            // An aborted rollout is available to NO target, its rollback is on its event
+            // log at both ends, and it never completed.
+            let percentage = document["PercentageComplete"].as_f64();
+            assert_eq!(
+                percentage,
+                Some(0.0),
+                "case {case:?}: an aborted rollout is available to no target, got \
+                 {percentage:?}"
+            );
+            for owed in ["ROLLBACK_STARTED", "ROLLBACK_COMPLETED"] {
+                assert!(
+                    types.iter().any(|event| event == owed),
+                    "case {case:?}: an aborted rollout logs {owed}, got {types:?}"
+                );
+            }
+            assert!(
+                !types.iter().any(|event| event == "DEPLOYMENT_COMPLETED"),
+                "case {case:?}: an aborted rollout never completed, got {types:?}"
+            );
+            &previous
+        } else {
+            assert!(
+                types.iter().any(|event| event == "DEPLOYMENT_COMPLETED"),
+                "case {case:?}: a rollout nothing aborted completes, got {types:?}"
+            );
+            assert!(
+                !types.iter().any(|event| event == "ROLLBACK_STARTED"),
+                "case {case:?}: only a ROLL_BACK directive aborts a rollout, got {types:?}"
+            );
+            &next
+        };
+
+        // Nothing is left for a reader to finish: a second read of a settled deployment
+        // reports the same state and the same share of targets, so the rollout it had
+        // reached is not advancing any more.
+        let again = get_deployment(&router, &application, &environment, 2).await.json();
+        assert_eq!(
+            (
+                again["State"].as_str().unwrap_or_default(),
+                again["PercentageComplete"].as_f64()
+            ),
+            (
+                state.as_str(),
+                document["PercentageComplete"].as_f64()
+            ),
+            "case {case:?}: a settled deployment keeps the state and the share it settled \
+             at, got {again}"
+        );
+
+        // And the data plane follows it, for every session of the environment rather than
+        // for the one position a single session happens to hold.
+        for sample in 0..SESSION_SAMPLE {
+            assert_served_to_a_session(
+                &router,
+                case,
+                &format!("session {sample} of the settled environment"),
+                triple,
+                in_service.as_bytes(),
+            )
+            .await;
+        }
     }
 }

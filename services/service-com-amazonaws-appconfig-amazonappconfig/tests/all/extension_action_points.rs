@@ -278,12 +278,16 @@ async fn stored_bytes(
 /// A deployment strategy of this account's own, so a suite can pick the pacing it needs
 /// rather than the bake time a predefined strategy carries. Answers its id.
 ///
-/// [`given_strategy`] is the shorthand for one that reaches every target in a single
-/// growth step; a suite that needs a rollout to pass THROUGH shares names its growth
-/// factor here.
-pub(crate) async fn given_growing_strategy(
+/// The ONE place a suite of this target creates a strategy, so the three shorthands below
+/// differ only in which of the pacing members they fix: [`given_strategy`] reaches every
+/// target in a single growth step, [`given_growing_strategy`] passes THROUGH shares of the
+/// targets by growing LINEARLY, and a suite whose rows differ in the SHAPE of the growth
+/// names the `GrowthType` here (`smithy_query(query="shape",shape="GrowthType")`:
+/// `EXPONENTIAL | LINEAR`).
+pub(crate) async fn given_growing_strategy_of_type(
     router: &MultiServiceRouter,
     name: &str,
+    growth_type: &str,
     duration_in_minutes: i32,
     final_bake_time_in_minutes: i32,
     growth_factor: f64,
@@ -297,7 +301,7 @@ pub(crate) async fn given_growing_strategy(
             "DeploymentDurationInMinutes": duration_in_minutes,
             "FinalBakeTimeInMinutes": final_bake_time_in_minutes,
             "GrowthFactor": growth_factor,
-            "GrowthType": "LINEAR",
+            "GrowthType": growth_type,
             "ReplicateTo": "NONE",
         }),
     )
@@ -312,6 +316,26 @@ pub(crate) async fn given_growing_strategy(
     created
         .string("Id")
         .unwrap_or_else(|| panic!("case {name:?}: the strategy answered no Id"))
+}
+
+/// The same, growing LINEARLY — the shape a suite that only needs a rollout to pass
+/// through shares of its targets asks for.
+pub(crate) async fn given_growing_strategy(
+    router: &MultiServiceRouter,
+    name: &str,
+    duration_in_minutes: i32,
+    final_bake_time_in_minutes: i32,
+    growth_factor: f64,
+) -> String {
+    given_growing_strategy_of_type(
+        router,
+        name,
+        "LINEAR",
+        duration_in_minutes,
+        final_bake_time_in_minutes,
+        growth_factor,
+    )
+    .await
 }
 
 /// The same, reaching every target in one growth step — the pacing most suites need.

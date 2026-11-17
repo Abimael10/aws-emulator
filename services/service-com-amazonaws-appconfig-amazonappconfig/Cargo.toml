@@ -79,6 +79,10 @@ percent-encoding = "2.3"
 # function it names.
 service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
+# AppConfig's own DATA plane: what a rollback leaves in service is read where a running
+# application reads it, through a configuration session rather than through this service's
+# deprecated `GetConfiguration` (`tests/all/deployment_tick_directive.rs`).
+service-com-amazonaws-appconfigdata-appconfigdata = { workspace = true }
 # The deployment package the tick suite uploads for its steering function is a .zip
 # archive it writes in memory, the way a caller uploads one.
 zip = { version = "9", default-features = false, features = ["deflate"] }
