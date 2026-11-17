@@ -12,20 +12,28 @@
 //! is a `BadRequestException` and the cluster is not created.
 //!
 //! `BrokerNodeGroupInfo$ClientSubnets` names the subnets the brokers' elastic
-//! network interfaces are created in. Those subnets are EC2's, not this service's,
-//! so they are resolved against the account's EC2 inventory
-//! ([`crate::state::network::placement_subnet_refusal`]) before any ARN is minted:
+//! network interfaces are created in — ONE subnet per Availability Zone, so a
+//! repeated id names no second zone and is refused as a duplicate list
+//! ([`crate::state::duplicate_placement_violation`]). Those subnets are EC2's, not
+//! this service's, so they are resolved against the account's EC2 inventory
+//! ([`crate::state::network::resolve_placement_subnets`]) before any ARN is minted:
 //! a subnet the account does not have is a `BadRequestException` and no cluster
-//! record is written. That resolution is this handler's LAST refusal, though: every
-//! decision this service takes from the request and from its own registry — the
-//! name conflict included — is taken first, so a create MSK refuses on its own
-//! terms is never answered out of what another service reports.
+//! record is written. That same answer says which Availability Zones the placement
+//! spans, and MSK gives each of them the same number of brokers, so a
+//! `NumberOfBrokerNodes` that is not a multiple of that count describes a layout the
+//! service could not build ([`crate::state::broker_count_zone_violation`]). That
+//! resolution is this handler's LAST refusal, though: every decision this service
+//! takes from the request and from its own registry — the name conflict included —
+//! is taken first, so a create MSK refuses on its own terms is never answered out of
+//! what another service reports.
 //!
 //! `KafkaVersion` names the broker software the cluster runs, which is one of the
 //! versions this service's own catalog publishes
 //! ([`crate::state::create_kafka_version_violation`]), so a value that catalog
-//! does not name is a `BadRequestException` too — answered from the request alone,
-//! before the network it asks for is resolved.
+//! does not name is a `BadRequestException` too — as is a
+//! `BrokerNodeGroupInfo$InstanceType` outside the broker types the service offers
+//! ([`crate::state::create_instance_type_violation`]); both are answered from the
+//! request alone, before the network it asks for is resolved.
 //!
 //! Authentication and authorization are NOT this handler's business: the emulator
 //! verifies every request signature centrally (see `AGENTS.md`), so the modelled
@@ -238,6 +246,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(bad_request(crate::state::KAFKA_VERSION_MEMBER, reason));
         }
 
+        // The brokers run on hardware the service offers, so an instance type
+        // outside its catalogue names no broker this cluster could be built from.
+        // Answered from the request alone, like the version above.
+        if let Some(reason) =
+            crate::state::create_instance_type_violation(&input.broker_node_group_info.instance_type)
+        {
+            return Err(bad_request(crate::state::INSTANCE_TYPE_MEMBER, reason));
+        }
+
+        // The client subnets place one broker interface per Availability Zone, so
+        // the same subnet twice names no second zone: the list is refused as a
+        // duplicate list, from the request alone, before it is resolved against
+        // EC2's inventory.
+        if let Some(reason) = crate::state::duplicate_placement_violation(
+            &input.broker_node_group_info.client_subnets,
+        ) {
+            return Err(bad_request("brokerNodeGroupInfo", reason));
+        }
+
         // The tag rules apply wherever a caller supplies tags, so the set a
         // create carries goes through the same admission check `TagResource`
         // uses — against an empty stored set, because the cluster this request
@@ -276,14 +303,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is minted and no cluster is enumerable. The member MSK blames is the
         // one the request carries the placement in — the broker node group — not
         // the list inside it.
-        if let Some(reason) = crate::state::network::placement_subnet_refusal(
+        match crate::state::network::resolve_placement_subnets(
             ctx,
             &region,
             &input.broker_node_group_info.client_subnets,
         )
         .await
         {
-            return Err(bad_request("brokerNodeGroupInfo", reason));
+            crate::state::network::PlacementSubnets::Refused(reason) => {
+                return Err(bad_request("brokerNodeGroupInfo", reason))
+            }
+            // The same answer says which Availability Zones the placement spans,
+            // and MSK spreads a cluster's brokers evenly over them, so a count
+            // that does not divide by that many zones describes no layout. Taken
+            // only from the zones EC2 really reported: a placement whose zones
+            // nothing resolved grounds no refusal.
+            crate::state::network::PlacementSubnets::Resolved(Some(zones)) => {
+                if let Some(reason) = crate::state::broker_count_zone_violation(
+                    input.number_of_broker_nodes,
+                    zones.len(),
+                ) {
+                    return Err(bad_request("numberOfBrokerNodes", reason));
+                }
+            }
+            crate::state::network::PlacementSubnets::Resolved(None)
+            | crate::state::network::PlacementSubnets::Unknown => {}
         }
 
         let mut state = state.lock();

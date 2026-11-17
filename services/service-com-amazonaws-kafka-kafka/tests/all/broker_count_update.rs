@@ -20,8 +20,10 @@
 //!    cluster ends holding the broker nodes of the last target it accepted.
 //!
 //! The rows differ along what each rule generalises over: the broker count the
-//! cluster starts at, the DIRECTION and size of the change (up, down, to the
-//! published bounds and to the count the cluster already has), how many client
+//! cluster starts at, the size of the change (up by one, up by four, up to the
+//! published bounds and to the count the cluster already has — a count only ever
+//! goes up, and `tests/all/broker_capacity_admission.rs` is the suite for the
+//! refusal of a decrease), how many client
 //! subnets the nodes are placed across, the kind of ARN, the kind of stale version
 //! and the state the cluster is in.
 
@@ -193,9 +195,10 @@ fn update_info_ids(value: &Value, case: &str, member: &str) -> Vec<i64> {
 #[tokio::test]
 async fn an_accepted_update_lands_the_broker_nodes_once_the_clock_owes_it() {
     // The rows differ along what the rule generalises over: the count the cluster
-    // starts at, the DIRECTION and size of the change (up by one, up to the
-    // published maximum, down, down to the published minimum, and to the count the
-    // cluster already has), and how many client subnets the nodes are spread over.
+    // starts at, the size of the change (up by one, up by four, up to the
+    // published maximum, up from the published minimum, and to the count the
+    // cluster already has — a broker count only ever goes up), and how many client
+    // subnets the nodes are spread over.
     let rows: &[(&str, i64, i64, Vec<&'static str>)] = &[
         ("up-by-one", 3, 4, vec!["subnet-a", "subnet-b", "subnet-c"]),
         (
@@ -204,8 +207,8 @@ async fn an_accepted_update_lands_the_broker_nodes_once_the_clock_owes_it() {
             i64::from(MAX_BROKER_NODES_PER_CLUSTER),
             vec!["subnet-a", "subnet-b"],
         ),
-        ("down", 6, 2, vec!["subnet-a", "subnet-b", "subnet-c"]),
-        ("down-to-the-minimum", 4, 1, vec!["subnet-a"]),
+        ("up-by-four", 2, 6, vec!["subnet-a", "subnet-b", "subnet-c"]),
+        ("up-from-the-minimum", 1, 4, vec!["subnet-a"]),
         ("same-count", 3, 3, vec!["subnet-a", "subnet-b", "subnet-c"]),
         ("up-from-one", 1, 2, vec!["subnet-a", "subnet-b"]),
     ];
@@ -443,7 +446,10 @@ async fn a_target_outside_the_modelled_range_is_refused() {
     // The bounds come from the `range` on
     // `UpdateBrokerCountRequest$TargetNumberOfBrokerNodes` (`__integerMin1Max15`,
     // 1..15), which the service crate exports as MAX_BROKER_NODES_PER_CLUSTER:
-    // each published bound is accepted and each value one past it refused.
+    // each published bound is accepted and each value one past it refused. The
+    // cluster starts AT the published minimum, because a broker count may only go
+    // up, so asking for the minimum is a target the cluster already holds rather
+    // than a decrease.
     let maximum = i64::from(MAX_BROKER_NODES_PER_CLUSTER);
     let rows: &[(i64, bool)] = &[
         (1, true),
@@ -460,8 +466,8 @@ async fn a_target_outside_the_modelled_range_is_refused() {
         let (arn, version) = active_cluster(
             &emulator,
             &format!("range-row-{index}"),
-            3,
-            vec!["subnet-a", "subnet-b", "subnet-c"],
+            1,
+            vec!["subnet-a"],
         )
         .await;
 
@@ -514,7 +520,7 @@ async fn a_target_outside_the_modelled_range_is_refused() {
         );
         assert_eq!(
             after.at("/clusterInfo/numberOfBrokerNodes").as_i64(),
-            Some(3),
+            Some(1),
             "case {case}: a refused update must not change the broker count, got {}",
             after.at("/clusterInfo/numberOfBrokerNodes")
         );
@@ -846,13 +852,13 @@ async fn an_update_is_refused_unless_the_cluster_is_active() {
 
 /// RULE: every accepted update is its own operation — a new operation ARN and a
 /// new cluster version each time — and the cluster ends holding exactly the broker
-/// nodes of the last target it accepted, whichever direction each step moved in.
+/// nodes of the last target it accepted, however large each step was.
 #[tokio::test]
 async fn consecutive_updates_each_mint_their_own_operation() {
     // A chain rather than a single call: the rule is about successive updates, so
-    // the row count and the direction of each step are what it generalises over —
-    // up, down, and back up past the count a step removed.
-    let targets = [5, 2, 6];
+    // the row count and the size of each step are what it generalises over — up by
+    // two, up by one, and up to the count a wider step would have reached.
+    let targets = [5, 6, 9];
 
     let emulator = Emulator::new();
     let (arn, mut version) = active_cluster(

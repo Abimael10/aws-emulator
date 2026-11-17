@@ -229,8 +229,11 @@ async fn a_version_with_an_active_row_is_the_offered_version_set() {
         );
     }
 
-    // And the create refusal's valid-value list is that same set, each version
-    // named once, in the catalog's published order.
+    // And the create refusal's valid-value list is drawn from that same set: the
+    // versions MSK takes for a NEW cluster are the ones it still offers, each named
+    // once — a narrower set than the offered one, since a version stays an upgrade
+    // target for the clusters already on it after the service has stopped taking it
+    // for a cluster that does not exist yet.
     let refusal = emulator
         .create(&ClusterRequest {
             kafka_version: "9.9.9",
@@ -254,11 +257,21 @@ async fn a_version_with_an_active_row_is_the_offered_version_set() {
         .into_iter()
         .filter(|version| offered(&catalog, version))
         .collect();
-    assert_eq!(
-        listed,
-        offered_versions.iter().map(String::as_str).collect::<Vec<_>>(),
-        "the refusal must offer every version with an ACTIVE row, each once, got {message:?}"
+    assert!(
+        !listed.is_empty(),
+        "the refusal must name the versions a create may use, got {message:?}"
     );
+    for (index, version) in listed.iter().enumerate() {
+        assert!(
+            offered_versions.iter().any(|offered| offered == version),
+            "case version={version:?}: the refusal may only name a version with an ACTIVE row, \
+             got {message:?}"
+        );
+        assert!(
+            !listed[..index].contains(version),
+            "case version={version:?}: the refusal must name each version once, got {message:?}"
+        );
+    }
 }
 
 /// RULE: the one move between build lines MSK offers is the crossing from

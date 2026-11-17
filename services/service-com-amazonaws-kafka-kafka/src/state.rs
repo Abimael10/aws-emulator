@@ -190,6 +190,14 @@ pub mod state_gate;
 /// keep, which is what `GetBootstrapBrokers` announces an address for.
 pub mod broker_plane;
 
+/// What the service admits as a provisioned cluster's CAPACITY: the broker types
+/// it offers, how a broker count relates to the Availability Zones the client
+/// subnets span, and which direction that count may move in. Each is a function of
+/// a request and of the cluster's own count rather than of anything this module
+/// holds, so it sits beside this one.
+mod broker_capacity;
+pub use broker_capacity::*;
+
 /// The registry's own operations — every lookup, insertion and removal over the
 /// maps the state struct below holds. Its own file so this module keeps to the
 /// RECORDS and the service's fixed values.

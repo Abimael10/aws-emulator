@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/bootstrap_broker_entitlement.rs"]
 mod bootstrap_broker_entitlement;
+#[path = "all/broker_capacity_admission.rs"]
+mod broker_capacity_admission;
 #[path = "all/broker_count_update.rs"]
 mod broker_count_update;
 #[path = "all/broker_data_plane.rs"]

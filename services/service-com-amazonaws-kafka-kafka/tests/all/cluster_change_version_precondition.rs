@@ -301,17 +301,21 @@ async fn a_change_quoting_a_version_an_accepted_change_spent_is_refused_on_the_v
 ///
 /// The rows differ along the pair of targets the two callers ask for, across the
 /// published range of `UpdateBrokerCount`'s `TargetNumberOfBrokerNodes`
-/// (`__integerMin1Max15`): either side of the cluster's own count, both above it,
-/// and the two published bounds.
+/// (`__integerMin1Max15`): both above the cluster's own count, the count itself
+/// against one above it, and the published maximum.
 #[tokio::test]
 async fn two_concurrent_changes_from_one_version_admit_exactly_one() {
     let emulator = Emulator::new();
     // `(case, the two targets)`. The cluster each row races against starts with
-    // three brokers, so the pairs span targets below, above and at both bounds.
+    // three brokers, and a broker count only ever goes UP — a target below it is
+    // refused on its own terms, whatever version it quotes
+    // (`tests/all/broker_capacity_admission.rs`) — so each pair races two targets
+    // the cluster would accept, at and above its own count and up to the published
+    // maximum.
     let rows: Vec<(&str, [i64; 2])> = vec![
-        ("either side of the cluster's own count", [1, 6]),
-        ("both above it", [4, 6]),
-        ("the published bounds", [15, 1]),
+        ("both above the cluster's own count", [4, 6]),
+        ("the cluster's own count against one above it", [3, 6]),
+        ("the published maximum against one above the count", [15, 4]),
     ];
 
     for (case, targets) in rows {

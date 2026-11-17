@@ -12,8 +12,9 @@
 //!    category the request asked for and the versions MSK offers for a new
 //!    cluster.
 //! 2. `CreateClusterV2` names exactly one cluster type, and the two ways to get
-//!    that wrong are two DIFFERENT refusals: naming neither is a refusal of the
-//!    `clusterType` parameter, naming both is MSK's body-level rejection.
+//!    that wrong are two DIFFERENT refusals: naming neither is answered with the
+//!    sentence that says a cluster type is required, naming both with the one that
+//!    says only one may be given — both about the `clusterType` parameter.
 //! 3. `UpdateReplicationInfo` admits the REQUEST before it resolves the replicator
 //!    its path names: a request that leaves an end of its replication unnamed, or
 //!    quotes a `CurrentVersion` that is not a version token at all, is answered
@@ -56,9 +57,11 @@ const GHOST_ID: &str = "11111111-2222-4333-8444-555555555555-1";
 const NO_CLUSTER_TYPE_MESSAGE: &str =
     "You must specify a cluster type, either provisioned or serverless.";
 
-/// What MSK answers a create that names BOTH: its body-level rejection, which says
-/// nothing about which member to drop.
-const BOTH_CLUSTER_TYPES_MESSAGE: &str = "Invalid request body";
+/// What MSK answers a create that names BOTH cluster types: its own sentence for a
+/// body that asks for two at once, which says only one may be named and points at
+/// neither member.
+const BOTH_CLUSTER_TYPES_MESSAGE: &str =
+    "You can specify only one cluster type, either provisioned or serverless.";
 
 /// What MSK answers a request whose `CurrentVersion` is not a version token at all.
 const INVALID_CURRENT_VERSION_MESSAGE: &str = "Invalid parameter currentVersion.";
@@ -73,13 +76,31 @@ const VALUE_NOT_VALID_MESSAGE: &str = "The provided value is not valid.";
 const NOT_RUNNING_MESSAGE: &str = "Invalid parameter replicatorArn: This operation is only valid \
      for resources that are in one of the following states: [RUNNING]";
 
-/// The versions MSK offers for a NEW cluster: the versions the catalog documented
-/// in `src/state.rs` (the Amazon MSK Developer Guide's "Supported Apache Kafka
-/// versions") publishes an `ACTIVE` row for, each named ONCE at its first published
-/// row — which is the order the refusal renders them in. Read off the catalog's own
-/// ROWS rather than through the service's offered-set helper, so this suite can
-/// still disagree with that helper, and never written out, so it cannot drift from
-/// the versions the service publishes.
+/// The versions MSK takes for a NEW cluster, in the order it names them in when it
+/// refuses one it does not take: written out here rather than read from the
+/// service's own constant, so the list is pinned by this suite instead of by the
+/// code under test.
+///
+/// Source: the valid-value list the service itself renders in that refusal. It is
+/// NARROWER than the versions the catalog publishes an `ACTIVE` row for — a version
+/// stays an upgrade target for the clusters already on it after the service stops
+/// taking it for a cluster that does not exist yet — and [`offered_versions`] is
+/// what this suite checks that narrowing against.
+const NEW_CLUSTER_VERSIONS: &[&str] = &[
+    "3.8.x",
+    "3.8.x.kraft",
+    "3.9.x",
+    "3.9.x.kraft",
+    "4.0.x.kraft",
+    "4.1.x.kraft",
+];
+
+/// The versions MSK OFFERS: the versions the catalog documented in `src/state.rs`
+/// (the Amazon MSK Developer Guide's "Supported Apache Kafka versions") publishes
+/// an `ACTIVE` row for, each named ONCE at its first published row. Read off the
+/// catalog's own ROWS rather than through the service's offered-set helper, so this
+/// suite can still disagree with that helper, and never written out, so it cannot
+/// drift from the versions the service publishes.
 fn offered_versions() -> Vec<&'static str> {
     let mut offered: Vec<&'static str> = Vec::new();
     for entry in KAFKA_VERSION_CATALOG {
@@ -94,12 +115,12 @@ fn offered_versions() -> Vec<&'static str> {
 }
 
 /// The sentence MSK refuses `version` for brokers of `category` with: its fixed
-/// text, the version the request named, and the offered list.
+/// text, the version the request named, and the versions a create may name.
 fn unsupported_version_message(category: &str, version: &str) -> String {
     format!(
         "{category} instance types are not supported for Kafka version {version}. \
          Valid values: [{}]",
-        offered_versions().join(", ")
+        NEW_CLUSTER_VERSIONS.join(", ")
     )
 }
 
@@ -154,6 +175,18 @@ async fn listed_names(emulator: &Emulator) -> Vec<String> {
 #[tokio::test]
 async fn a_provisioned_create_refuses_a_version_the_catalog_does_not_publish() {
     let emulator = Emulator::new();
+
+    // Every version the refusal recommends is one the catalog really publishes as
+    // offered, so the list can never name a version a later create would be
+    // refused for.
+    let offered = offered_versions();
+    for version in NEW_CLUSTER_VERSIONS {
+        assert!(
+            offered.contains(version),
+            "case version={version:?}: a version a create may name must be published as \
+             offered, got the offered set {offered:?}"
+        );
+    }
 
     // The rows differ along the FORM of the rejected value — a release newer than
     // every catalogued one, an older-looking one, a two-component version, a
@@ -233,10 +266,11 @@ async fn a_provisioned_create_refuses_a_version_the_catalog_does_not_publish() {
 }
 
 /// RULE: `CreateClusterV2` names exactly ONE cluster type, and the two ways of
-/// getting that wrong are two DIFFERENT refusals — a missing cluster type names the
-/// `clusterType` parameter, while naming both kinds is a rejection of the body as a
-/// whole — so a client can tell the two input errors apart. Neither registers
-/// anything.
+/// getting that wrong are two DIFFERENT refusals — a missing cluster type is
+/// answered with the sentence that says one is required, while naming both kinds is
+/// answered with the one that says only one may be given, and both blame the
+/// `clusterType` parameter rather than either alternative member — so a client can
+/// tell the two input errors apart. Neither registers anything.
 #[tokio::test]
 async fn the_two_cluster_type_refusals_are_distinct() {
     let emulator = Emulator::new();
@@ -267,7 +301,7 @@ async fn the_two_cluster_type_refusals_are_distinct() {
 
     // Rows naming BOTH kinds differ in what each body says — the broker count of
     // the provisioned one, how many VPC configurations the serverless one names —
-    // because MSK rejects the body whatever is in the two blocks.
+    // because MSK refuses the choice whatever is in the two blocks.
     for (index, (case, brokers, configurations)) in [
         ("one broker, one VPC configuration", 1, 1),
         ("three brokers, two VPC configurations", 3, 2),
@@ -280,13 +314,7 @@ async fn the_two_cluster_type_refusals_are_distinct() {
         body["provisioned"]["numberOfBrokerNodes"] = json!(brokers);
         body["serverless"] = v2_serverless_body(&name, *configurations)["serverless"].clone();
         let reply = emulator.create_cluster_v2(body).await;
-        assert_eq!(
-            (reply.status, reply.error_code(), reply.error_message()),
-            (400, "BadRequestException", BOTH_CLUSTER_TYPES_MESSAGE),
-            "case {case}: expected the body-level refusal, got {} {}",
-            reply.status,
-            reply.body
-        );
+        assert_refusal(&reply, case, "clusterType", BOTH_CLUSTER_TYPES_MESSAGE);
     }
 
     let listed = listed_names(&emulator).await;

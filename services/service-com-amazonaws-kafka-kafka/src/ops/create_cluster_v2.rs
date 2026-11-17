@@ -18,7 +18,9 @@
 //!
 //! A provisioned body also names the broker software its cluster would run, so
 //! its `KafkaVersion` is admitted against the catalog this service publishes
-//! ([`crate::state::create_kafka_version_violation`]) before anything is minted.
+//! ([`crate::state::create_kafka_version_violation`]) and its
+//! `BrokerNodeGroupInfo$InstanceType` against the broker types the service offers
+//! ([`crate::state::create_instance_type_violation`]) before anything is minted.
 //!
 //! A cluster name is unique within an account and region, so a second create under
 //! a name already taken — by a cluster of either kind — is a `ConflictException`,
@@ -27,11 +29,15 @@
 //!
 //! Both kinds are PLACED in the subnets the body names — the provisioned body's
 //! `BrokerNodeGroupInfo$ClientSubnets`, the serverless body's `VpcConfig$SubnetIds`
-//! — and those subnets are EC2's, not this service's, so each list is resolved
-//! against the account's EC2 inventory
-//! ([`crate::state::network::placement_subnet_refusal`]) before any ARN is minted:
-//! a subnet the account does not have is a `BadRequestException` and no cluster
-//! record is written. That resolution is this handler's LAST refusal, though: every
+//! — one subnet per Availability Zone, so a repeated id is refused as a duplicate
+//! list ([`crate::state::duplicate_placement_violation`]), and those subnets are
+//! EC2's, not this service's, so each list is resolved against the account's EC2
+//! inventory ([`crate::state::network::resolve_placement_subnets`]) before any ARN
+//! is minted: a subnet the account does not have is a `BadRequestException` and no
+//! cluster record is written. That same answer says which Availability Zones a
+//! placement spans, which is what a provisioned body's `NumberOfBrokerNodes` has to
+//! divide by ([`crate::state::broker_count_zone_violation`]). That resolution is
+//! this handler's LAST refusal, though: every
 //! decision this service takes from the request and from its own registry — the
 //! name conflict included — is taken first, so a create MSK refuses on its own
 //! terms is never answered out of what another service reports.
@@ -126,12 +132,13 @@ const CLUSTER_TYPE_MEMBER: &str = "clusterType";
 const NO_CLUSTER_TYPE_MESSAGE: &str =
     "You must specify a cluster type, either provisioned or serverless.";
 
-/// What MSK answers a create that names BOTH: its body-level rejection, which
-/// says that the body as a whole describes no cluster rather than pointing at one
-/// member of it to drop. A different refusal class from
-/// [`NO_CLUSTER_TYPE_MESSAGE`], so the two stay distinct and a client can tell
-/// the two input errors apart.
-const BOTH_CLUSTER_TYPES_MESSAGE: &str = "Invalid request body";
+/// What MSK answers a create that names BOTH: its one fixed sentence for a body
+/// that asks for two cluster types at once, which says that only one of them may
+/// be named rather than pointing at either member to drop. A different refusal
+/// from [`NO_CLUSTER_TYPE_MESSAGE`], so the two stay distinct and a client can
+/// tell the two input errors apart.
+const BOTH_CLUSTER_TYPES_MESSAGE: &str =
+    "You can specify only one cluster type, either provisioned or serverless.";
 
 /// The member a serverless body carries its VPC configurations — and so the
 /// subnets each one is reached through — in, as the wire spells it.
@@ -237,12 +244,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let body = match (provisioned, serverless) {
             (Some(request), None) => ClusterBody::Provisioned(Box::new(request)),
             (None, Some(request)) => ClusterBody::Serverless(request),
-            // A body naming BOTH kinds is rejected as a body rather than as a
-            // parameter: MSK answers its one body-level sentence and says nothing
-            // about which of the two members to drop, which is what tells this
-            // refusal apart from the one below.
+            // A body naming BOTH kinds asks for two clusters at once: MSK answers
+            // its own sentence for that, which says only one cluster type may be
+            // named and so blames the CHOICE rather than either of the two
+            // alternatives — the parameter the refusal below names too.
             (Some(_), Some(_)) => {
-                return Err(bad_request("Serverless", BOTH_CLUSTER_TYPES_MESSAGE.to_string()))
+                return Err(bad_request(
+                    CLUSTER_TYPE_MEMBER,
+                    BOTH_CLUSTER_TYPES_MESSAGE.to_string(),
+                ))
             }
             // A body naming NEITHER kind names no cluster type at all, and either
             // member would have named one, so the refusal blames the abstract
@@ -292,11 +302,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // lock is taken, because the calls are made over the in-process callback
         // and no mutex is held across them; a refused create registers nothing, so
         // no ARN is minted and no cluster is enumerable.
-        for (subnet_parameter, subnet_ids) in body.placement_subnets() {
-            if let Some(reason) =
-                crate::state::network::placement_subnet_refusal(ctx, &region, &subnet_ids).await
+        for placement in body.placement_subnets() {
+            match crate::state::network::resolve_placement_subnets(
+                ctx,
+                &region,
+                &placement.subnet_ids,
+            )
+            .await
             {
-                return Err(bad_request(subnet_parameter, reason));
+                crate::state::network::PlacementSubnets::Refused(reason) => {
+                    return Err(bad_request(placement.parameter, reason))
+                }
+                // The same answer says which Availability Zones the placement
+                // spans, and MSK spreads a provisioned cluster's brokers evenly
+                // over them, so a count that does not divide by that many zones
+                // describes no layout. A serverless body asks for no brokers of
+                // its own, so it carries no count to divide. Taken only from the
+                // zones EC2 really reported: a placement whose zones nothing
+                // resolved grounds no refusal.
+                crate::state::network::PlacementSubnets::Resolved(Some(zones)) => {
+                    if let Some((parameter, reason)) = placement
+                        .broker_count
+                        .and_then(|count| {
+                            crate::state::broker_count_zone_violation(count, zones.len())
+                        })
+                        .map(|reason| ("numberOfBrokerNodes", reason))
+                    {
+                        return Err(bad_request(parameter, reason));
+                    }
+                }
+                crate::state::network::PlacementSubnets::Resolved(None)
+                | crate::state::network::PlacementSubnets::Unknown => {}
             }
         }
 
@@ -424,6 +460,21 @@ impl ClusterBody {
                 ) {
                     return Some((crate::state::KAFKA_VERSION_MEMBER, reason));
                 }
+                // The brokers run on hardware the service offers, so an instance
+                // type outside its catalogue names no broker the cluster could be
+                // built from.
+                if let Some(reason) = crate::state::create_instance_type_violation(
+                    &request.broker_node_group_info.instance_type,
+                ) {
+                    return Some((crate::state::INSTANCE_TYPE_MEMBER, reason));
+                }
+                // The client subnets place one broker interface per Availability
+                // Zone, so the same subnet twice names no second zone.
+                if let Some(reason) = crate::state::duplicate_placement_violation(
+                    &request.broker_node_group_info.client_subnets,
+                ) {
+                    return Some(("brokerNodeGroupInfo", reason));
+                }
                 // The model's own 1..15 range refuses an out-of-range value at the
                 // boundary; it is checked again here because it is a request value
                 // that sizes the broker list.
@@ -471,6 +522,13 @@ impl ClusterBody {
                             format!("A VPC configuration must name at most {entries} subnets."),
                         ));
                     }
+                    // One subnet per Availability Zone here too, so a
+                    // configuration naming one twice names no second zone.
+                    if let Some(reason) =
+                        crate::state::duplicate_placement_violation(&config.subnet_ids)
+                    {
+                        return Some(("subnetIds", reason));
+                    }
                     if config
                         .security_group_ids
                         .as_ref()
@@ -496,19 +554,37 @@ impl ClusterBody {
     /// configuration, which is the granularity [`Self::violation`] bounds them at.
     /// One reading for both kinds, so neither can be minted on a subnet the account
     /// does not have.
-    fn placement_subnets(&self) -> Vec<(&'static str, Vec<String>)> {
+    fn placement_subnets(&self) -> Vec<Placement> {
         match self {
-            Self::Provisioned(request) => vec![(
-                "brokerNodeGroupInfo",
-                request.broker_node_group_info.client_subnets.clone(),
-            )],
+            Self::Provisioned(request) => vec![Placement {
+                parameter: "brokerNodeGroupInfo",
+                subnet_ids: request.broker_node_group_info.client_subnets.clone(),
+                // The brokers this placement has to hold, which is what the
+                // Availability Zones it spans have to divide.
+                broker_count: Some(request.number_of_broker_nodes),
+            }],
             Self::Serverless(request) => request
                 .vpc_configs
                 .iter()
-                .map(|config| (SERVERLESS_VPC_CONFIGS_MEMBER, config.subnet_ids.clone()))
+                .map(|config| Placement {
+                    parameter: SERVERLESS_VPC_CONFIGS_MEMBER,
+                    subnet_ids: config.subnet_ids.clone(),
+                    // MSK Serverless provisions the brokers itself, so a
+                    // serverless body asks for no count of its own.
+                    broker_count: None,
+                })
                 .collect(),
         }
     }
+}
+
+/// One placement a create asks for: the subnets it names, the member it names them
+/// in — which a refusal of that list reports — and how many brokers the placement
+/// has to hold, where the body says so.
+struct Placement {
+    parameter: &'static str,
+    subnet_ids: Vec<String>,
+    broker_count: Option<i32>,
 }
 
 /// The refusal a create under a cluster name this region already holds earns: the

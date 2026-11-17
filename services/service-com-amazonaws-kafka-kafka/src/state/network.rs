@@ -86,6 +86,38 @@ pub const CLIENT_SUBNETS_ABSENT_MESSAGE: &str =
 /// includes the case where this emulator has no EC2 to ask, because a refusal has to be
 /// grounded in what EC2 answered rather than assumed from silence.
 ///
+/// The REFUSING half of [`resolve_placement_subnets`], for every caller that places a
+/// resource in the subnets a request names without caring which Availability Zones they
+/// span.
+pub async fn placement_subnet_refusal(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    subnet_ids: &[String],
+) -> Option<String> {
+    match resolve_placement_subnets(ctx, region, subnet_ids).await {
+        PlacementSubnets::Refused(reason) => Some(reason),
+        PlacementSubnets::Resolved(_) | PlacementSubnets::Unknown => None,
+    }
+}
+
+/// What EC2 answered about the subnets a request named as a placement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlacementSubnets {
+    /// EC2 reported a subnet for every id the request named. The payload is the
+    /// Availability Zones those subnets span — each zone once — when EC2 reported a zone
+    /// for every one of them, and `None` when it did not: which zones a placement spans
+    /// is then simply not known, and nothing can be refused on it.
+    Resolved(Option<std::collections::BTreeSet<String>>),
+    /// Amazon MSK refuses this placement, in its own sentence.
+    Refused(String),
+    /// EC2 could not be asked at all, so nothing about the placement is known — the same
+    /// standing as a fact nobody answered, which grounds no refusal.
+    Unknown,
+}
+
+/// Resolve the subnets `subnet_ids` names against the account's EC2 inventory, and report
+/// both whether they can be placed in and which Availability Zones they span.
+///
 /// Two questions, in this order: whether the list is within [`MAX_PLACEMENT_SUBNETS`],
 /// which is answered from the request alone and so bounds everything below it, and then
 /// whether EC2 resolves every id it carries.
@@ -97,27 +129,34 @@ pub const CLIENT_SUBNETS_ABSENT_MESSAGE: &str =
 /// carries, and an id it reports no subnet for says the same thing. Either way the caller
 /// is answered MSK's own [`CLIENT_SUBNETS_ABSENT_MESSAGE`] — EC2's answer decides WHETHER
 /// the create is refused, not what the refusal says.
-pub async fn placement_subnet_refusal(
+///
+/// The Availability Zone of a subnet is EC2's fact too, which is why it is read off the
+/// SAME answer rather than guessed from the list: a cluster's brokers are spread over the
+/// zones its client subnets are in, so an admission rule about those zones is grounded in
+/// what EC2 reported or is not applied at all.
+pub async fn resolve_placement_subnets(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     subnet_ids: &[String],
-) -> Option<String> {
+) -> PlacementSubnets {
     use ::aws_smithy_types::error::metadata::ProvideErrorMetadata;
 
     if subnet_ids.is_empty() {
-        return None;
+        return PlacementSubnets::Resolved(Some(std::collections::BTreeSet::new()));
     }
     // The caller-sized list is clamped here, before it is cloned into the call below or
     // walked against what EC2 answered, so neither is sized by the request.
     if subnet_ids.len() > MAX_PLACEMENT_SUBNETS {
-        return Some(format!(
+        return PlacementSubnets::Refused(format!(
             "A create may name at most {MAX_PLACEMENT_SUBNETS} subnets, not {}.",
             subnet_ids.len()
         ));
     }
     // No Region label, so no endpoint to ask EC2 at: the same answer an unreachable EC2
     // gets, which grounds no refusal.
-    let endpoint = peer_endpoint("ec2", region)?;
+    let Some(endpoint) = peer_endpoint("ec2", region) else {
+        return PlacementSubnets::Unknown;
+    };
     let answer = callback_client!(aws_sdk_ec2, ctx, endpoint, region)
         .describe_subnets()
         .set_subnet_ids(Some(subnet_ids.to_vec()))
@@ -127,15 +166,26 @@ pub async fn placement_subnet_refusal(
         Ok(output) => {
             // EC2 reports one subnet per id it resolved, so an id it reported nothing for
             // names no subnet of the account — the same thing the refusal below says.
-            let reported: Vec<&str> = output
-                .subnets()
-                .iter()
-                .filter_map(::aws_sdk_ec2::types::Subnet::subnet_id)
-                .collect();
-            if !subnet_ids.iter().all(|id| reported.contains(&id.as_str())) {
-                return Some(CLIENT_SUBNETS_ABSENT_MESSAGE.to_string());
+            let mut zones = Some(std::collections::BTreeSet::new());
+            for id in subnet_ids {
+                let Some(subnet) = output
+                    .subnets()
+                    .iter()
+                    .find(|subnet| subnet.subnet_id() == Some(id.as_str()))
+                else {
+                    return PlacementSubnets::Refused(CLIENT_SUBNETS_ABSENT_MESSAGE.to_string());
+                };
+                // A subnet EC2 reports no zone for leaves the SPAN of the placement
+                // unknown; the placement itself still resolved.
+                match (subnet.availability_zone(), zones.as_mut()) {
+                    (Some(zone), Some(spanned)) => {
+                        spanned.insert(zone.to_string());
+                    }
+                    (None, _) => zones = None,
+                    (Some(_), None) => {}
+                }
             }
-            return None;
+            return PlacementSubnets::Resolved(zones);
         }
         Err(error) => error,
     };
@@ -152,9 +202,9 @@ pub async fn placement_subnet_refusal(
             error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
             "the subnets a request named could not be resolved against EC2"
         );
-        return None;
+        return PlacementSubnets::Unknown;
     }
-    Some(CLIENT_SUBNETS_ABSENT_MESSAGE.to_string())
+    PlacementSubnets::Refused(CLIENT_SUBNETS_ABSENT_MESSAGE.to_string())
 }
 
 /// The endpoint the in-process callback reaches `service` in `region` at, or `None` when

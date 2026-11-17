@@ -82,9 +82,10 @@ fn folded_status(folded: &[(String, String)], version: &str) -> Option<String> {
         .map(|(_, status)| status.clone())
 }
 
-/// The versions the SERVICE reports as the ones it offers: the valid-value list its
-/// refusal of a version it does not publish carries, in the order that message names
-/// them.
+/// The versions the SERVICE names as the ones a CREATE may use: the valid-value list
+/// its refusal of a version it does not publish carries, in the order that message
+/// names them. A narrower set than the versions it still offers — see the fold rule
+/// below.
 async fn offered_versions(emulator: &Emulator) -> Vec<String> {
     let refusal = create_provisioned(emulator, "catalog-fold-refusal", UNCATALOGUED).await;
     assert_eq!(
@@ -199,28 +200,33 @@ async fn the_status_a_client_folds_out_of_the_catalog_is_the_status_the_service_
         "a version published on two rows means more rows than folded versions, got {rows:?}"
     );
 
-    // The service's own report of which versions it offers is exactly the versions
-    // the fold reads as ACTIVE, each once, in published order.
+    // The versions the service names as the ones a CREATE may use are drawn from
+    // the versions the fold reads as ACTIVE, each named once and in published
+    // order. It is a NARROWER set: a version stays offered — and stays an upgrade
+    // target for the clusters already on it — after the service has stopped taking
+    // it for a cluster that does not exist yet.
     let offered = offered_versions(&emulator).await;
     let active: Vec<String> = folded
         .iter()
         .filter(|(_, status)| status == ACTIVE)
         .map(|(version, _)| version.clone())
         .collect();
-    assert_eq!(
-        offered, active,
-        "the versions the service reports as offered must be the ones the fold reads as \
-         {ACTIVE:?}, in published order"
+    assert!(
+        !offered.is_empty(),
+        "the refusal must name the versions a create may use, got {offered:?}"
     );
-    for (version, status) in &folded {
-        let named = offered.iter().any(|offered| offered == version);
-        assert_eq!(
-            named,
-            status == ACTIVE,
-            "case version={version:?}: folded {status:?}, so expected named among the offered \
-             versions = {}, got {named} (offered {offered:?})",
-            status == ACTIVE
-        );
+    let mut published_at = 0_usize;
+    for version in &offered {
+        let step = active[published_at..]
+            .iter()
+            .position(|active| active == version)
+            .unwrap_or_else(|| {
+                panic!(
+                    "case version={version:?}: expected a version the fold reads as {ACTIVE:?}, \
+                     named once and in published order, got {offered:?} against {active:?}"
+                )
+            });
+        published_at += step + 1;
     }
 
     // Every upgrade target the matrix offers folds to ACTIVE: a client is never

@@ -315,13 +315,16 @@ async fn the_catalog_carries_the_variant_lines_and_both_statuses() {
 
 /// RULE: the LAST row the catalog publishes for a version carries the status the
 /// service OFFERS that version under, so the catalog's final word about a version
-/// agrees with the gate that accepts it — a client reducing the published rows to
-/// one status per version (a version has one lifecycle status) reads the version
-/// the way a create naming it is answered.
+/// agrees with the answers a client gets about it — a client reducing the published
+/// rows to one status per version (a version has one lifecycle status) never reads
+/// a version as deprecated while the service recommends it for a new cluster.
 ///
-/// Checked EXHAUSTIVELY over every version the catalog publishes, against the
-/// offered set read from the WIRE: the valid-value list a create refusal carries,
-/// which is the versions the service offers for a new cluster.
+/// Checked over the set read from the WIRE: the valid-value list a create refusal
+/// carries, which is the versions the service takes for a NEW cluster. That set is
+/// narrower than the offered one — a version stays an upgrade target for the
+/// clusters already on it after the service stops taking it for a cluster that does
+/// not exist yet — so what the catalog's final word must agree with is that every
+/// version in it is published as offered.
 #[tokio::test]
 async fn the_last_published_row_is_the_status_the_service_offers() {
     let emulator = Emulator::new();
@@ -342,8 +345,9 @@ async fn the_last_published_row_is_the_status_the_service_offers() {
         listed.body
     );
 
-    // The offered set, as the service itself renders it: a create naming a version
-    // the catalog does not publish is refused with the versions it DOES offer.
+    // The new-cluster set, as the service itself renders it: a create naming a
+    // version the catalog does not publish is refused with the versions it DOES
+    // take for a new cluster.
     let refusal = emulator
         .create(&ClusterRequest {
             kafka_version: "9.9.9",
@@ -364,13 +368,17 @@ async fn the_last_published_row_is_the_status_the_service_offers() {
         .unwrap_or_else(|| panic!("the refusal must carry a valid-value list, got {message:?}"))
         .split(", ")
         .collect();
+    assert!(
+        !offered.is_empty(),
+        "the refusal must name the versions a create may use, got {message:?}"
+    );
 
-    for (version, status) in &last_row {
+    for version in &offered {
         assert_eq!(
-            status == ACTIVE,
-            offered.contains(version.as_str()),
-            "case version={version:?}: the last published row says {status:?}, while the \
-             offered set is {offered:?}"
+            last_row.get(*version).map(String::as_str),
+            Some(ACTIVE),
+            "case version={version:?}: a version the service takes for a new cluster must be \
+             published with {ACTIVE} as its last row, got {last_row:?}"
         );
     }
     // Not vacuous: the catalog publishes both statuses as some version's last row.

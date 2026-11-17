@@ -207,8 +207,9 @@ async fn a_second_row_changes_no_answer_about_the_version() {
         );
     }
 
-    // The valid-value list a refusal carries is that same de-duplicated set,
-    // filtered to the versions the service offers, each named once.
+    // The valid-value list a refusal carries is drawn from that same de-duplicated
+    // set, filtered to the versions the service offers, each named once — a second
+    // row for a version never puts it in the list twice.
     let refusal = emulator
         .create(&ClusterRequest {
             kafka_version: "9.9.9",
@@ -232,11 +233,23 @@ async fn a_second_row_changes_no_answer_about_the_version() {
         .iter()
         .filter(|version| published_statuses(&catalog, version).iter().any(|s| s == ACTIVE))
         .collect();
-    assert_eq!(
-        listed,
-        offered.iter().map(|version| version.as_str()).collect::<Vec<_>>(),
-        "the refusal must name each offered version once, in published order, got {message:?}"
+    // Without this, a refusal that named no version at all would satisfy the loop below by
+    // holding nothing to break it.
+    assert!(
+        !listed.is_empty(),
+        "expected the refusal to name the versions a create may use, got {message:?}"
     );
+    for (index, version) in listed.iter().enumerate() {
+        assert!(
+            offered.iter().any(|offered| offered.as_str() == *version),
+            "case version={version:?}: the refusal may only name a version the catalog \
+             publishes an {ACTIVE} row for, got {message:?}"
+        );
+        assert!(
+            !listed[..index].contains(version),
+            "case version={version:?}: the refusal must name each version once, got {message:?}"
+        );
+    }
 
     // And a create naming a version the catalog publishes on two rows, one of them
     // `ACTIVE`, is accepted: the gate reads the version, not the last row.

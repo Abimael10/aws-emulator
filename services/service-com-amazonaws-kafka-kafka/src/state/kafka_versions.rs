@@ -474,6 +474,46 @@ fn broker_instance_category(instance_type: &str) -> &'static str {
     }
 }
 
+/// The versions Amazon MSK offers for a NEW cluster, in the order it names them
+/// in when it refuses a version a create may not name
+/// ([`create_kafka_version_violation`]).
+///
+/// This is NARROWER than the versions the catalog publishes, and narrower than
+/// the ones it publishes an `ACTIVE` row for: a version stays in the published
+/// catalog — and stays an upgrade target for the clusters already on it — after
+/// the service has stopped taking it for a cluster that does not exist yet. So
+/// this is a THIRD fact about a version, beside its membership of the catalog and
+/// the lifecycle status the catalog publishes it under, and it is recorded
+/// separately rather than derived from either.
+///
+/// Source: the valid-value list the service itself renders in that refusal.
+///
+/// Only versions the catalog publishes are named ([`new_cluster_kafka_versions`]),
+/// so this list can never offer a version no reader of this service knows.
+const KAFKA_VERSIONS_FOR_A_NEW_CLUSTER: &[&str] = &[
+    "3.8.x",
+    "3.8.x.kraft",
+    "3.9.x",
+    "3.9.x.kraft",
+    "4.0.x.kraft",
+    "4.1.x.kraft",
+];
+
+/// The versions a create may name, as the refusal below lists them: the recorded
+/// sequence above, narrowed to the versions the catalog really publishes.
+///
+/// Derived once, like [`catalogued_kafka_versions`]: both factors are constants.
+pub fn new_cluster_kafka_versions() -> &'static [&'static str] {
+    static OFFERED: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock::new(|| {
+        KAFKA_VERSIONS_FOR_A_NEW_CLUSTER
+            .iter()
+            .filter(|version| kafka_version_index(version).is_some())
+            .copied()
+            .collect()
+    });
+    &OFFERED
+}
+
 /// Why a provisioned create naming Apache Kafka version `kafka_version` for
 /// brokers of `instance_type` describes no cluster the service could run, or
 /// `None` when the service knows that version.
@@ -486,29 +526,24 @@ fn broker_instance_category(instance_type: &str) -> &'static str {
 ///
 /// The sentence is the service's: the broker category the request asked for
 /// ([`broker_instance_category`]), the version it named, and the versions MSK
-/// OFFERS for a new cluster ([`is_offered_kafka_version`]) in catalog order —
-/// the actionable half of the refusal, so it is derived from the catalog rather
-/// than written out beside it.
+/// takes for a NEW cluster ([`new_cluster_kafka_versions`]) — the actionable half
+/// of the refusal, which is why it names that set rather than every version the
+/// catalog publishes.
 ///
-/// A version the catalog publishes but no longer offers is ADMITTED here: a
-/// cluster running one is exactly what the version-update surface moves a
-/// cluster away from ([`compatible_target_versions`]), and this emulator has no
-/// other way to hold such a cluster, so the catalog's membership is the gate and
-/// the offered set is what the refusal recommends.
+/// A version the catalog publishes but does not take for a new cluster is
+/// ADMITTED here: a cluster running one is exactly what the version-update surface
+/// moves a cluster away from ([`compatible_target_versions`]), and this emulator
+/// has no other way to hold such a cluster, so the catalog's membership is the
+/// gate and the new-cluster set is what the refusal recommends.
 pub fn create_kafka_version_violation(kafka_version: &str, instance_type: &str) -> Option<String> {
     if kafka_version_index(kafka_version).is_some() {
         return None;
     }
-    let offered: Vec<&str> = catalogued_kafka_versions()
-        .iter()
-        .filter(|version| is_offered_kafka_version(version))
-        .copied()
-        .collect();
     Some(format!(
         "{} instance types are not supported for Kafka version {kafka_version}. \
          Valid values: [{}]",
         broker_instance_category(instance_type),
-        offered.join(", ")
+        new_cluster_kafka_versions().join(", ")
     ))
 }
 

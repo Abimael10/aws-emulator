@@ -21,9 +21,9 @@
 //! of the operation under test rather than of whichever reader happened to settle
 //! the record for it first.
 //!
-//! The rows differ along what the rule generalises over: the direction and size of
-//! the change (up by one, up to the published maximum, down to the published
-//! minimum, down by four), how many client subnets the broker nodes are placed
+//! The rows differ along what the rule generalises over: the size of
+//! the change (up by one, up to the published maximum, up from the published
+//! minimum, up by four), how many client subnets the broker nodes are placed
 //! across, how far along the version ladder the move goes, and which operation
 //! reaches the cluster first.
 
@@ -226,7 +226,7 @@ struct CountRow {
 impl CountRow {
     /// The replication factor the `CreateTopic` probe asks for: the LARGER of the
     /// two counts, so one factor is placeable under exactly one of them and the row
-    /// observes the change whichever direction it goes in.
+    /// observes the change whichever count it is asked under.
     fn probe_factor(&self) -> i64 {
         self.before.max(self.after)
     }
@@ -241,8 +241,9 @@ impl CountRow {
 
 /// The broker-count table. The bounds are the service's published ones:
 /// `TargetNumberOfBrokerNodes` is modelled `__integerMin1Max15`, which
-/// [`MAX_BROKER_NODES_PER_CLUSTER`] names, so the rows move up to that maximum and
-/// down to the minimum of one as well as by one and by four.
+/// [`MAX_BROKER_NODES_PER_CLUSTER`] names, so the rows move up to that maximum as
+/// well as by one and by four — a broker count only ever goes up, so every row is
+/// an increase.
 fn count_rows() -> Vec<CountRow> {
     vec![
         CountRow {
@@ -258,15 +259,15 @@ fn count_rows() -> Vec<CountRow> {
             subnets: vec!["subnet-a", "subnet-b", "subnet-c"],
         },
         CountRow {
-            case: "down-to-the-published-minimum",
-            before: 4,
-            after: 1,
+            case: "up-from-the-published-minimum",
+            before: 1,
+            after: 4,
             subnets: vec!["subnet-a"],
         },
         CountRow {
-            case: "down-by-four",
-            before: 6,
-            after: 2,
+            case: "up-by-four",
+            before: 2,
+            after: 6,
             subnets: vec!["subnet-a", "subnet-b"],
         },
     ]

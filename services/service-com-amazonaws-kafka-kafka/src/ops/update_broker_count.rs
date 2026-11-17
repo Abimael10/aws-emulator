@@ -3,6 +3,11 @@
 //! @op UpdateBrokerCount
 //!
 //! `UpdateBrokerCount` changes how many broker nodes a provisioned cluster holds.
+//! The count may only go UP ([`crate::state::broker_count_decrease_violation`]) and
+//! has to divide by the number of Availability Zones the cluster's client subnets
+//! span ([`crate::state::broker_count_zone_violation`]), which is the same pair of
+//! rules a create's own `NumberOfBrokerNodes` is admitted under.
+//!
 //! It is ASYNCHRONOUS: the call records a cluster operation, leaves the cluster
 //! `UPDATING` with that operation as its `ActiveOperationArn`, and the broker nodes
 //! the target asks for are created or deleted once the clock owes that operation its
@@ -195,23 +200,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = std::time::SystemTime::now();
-        let mut state = state.lock();
-        // Resolved through the settling lookup every other operation uses, so the
-        // transitions the clock already owed this cluster — its own provisioning,
-        // and an earlier update of its own whose completion has come due — are
-        // materialised before this call judges its state and version.
-        let Some(cluster) = state.settled_cluster_in(&region, &input.cluster_arn, now) else {
-            return Err(
-                UpdateBrokerCountErrorModeled::NotFoundException(NotFoundException {
-                    invalid_parameter: Some("ClusterArn".to_string()),
-                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
-                })
-                .into(),
-            );
+        // The registry lock is held for this read alone and released with the block
+        // it is taken in: the resolution further down is made over the in-process
+        // callback, and no mutex may be held across it.
+        let (change_refusal, is_serverless, current_broker_count, client_subnets) = {
+            let mut registry = state.lock();
+            // Resolved through the settling lookup every other operation uses, so
+            // the transitions the clock already owed this cluster — its own
+            // provisioning, and an earlier update of its own whose completion has
+            // come due — are materialised before this call judges its state and
+            // version.
+            let Some(cluster) = registry.settled_cluster_in(&region, &input.cluster_arn, now)
+            else {
+                return Err(cluster_not_found());
+            };
+            // Copied out of the record: the checks below are followed by a write,
+            // so the borrow of the registry has to end here — the shared
+            // version-and-state precondition included, which is decided here and
+            // answered at the point below where this operation applies it.
+            (
+                crate::state::state_gate::cluster_change_refusal(&input.current_version, cluster),
+                cluster.is_serverless(),
+                cluster.number_of_broker_nodes,
+                cluster.broker_node_group_info.client_subnets.clone(),
+            )
         };
-        // Copied out of the record: the write below ends the borrow of the registry,
-        // so the values the checks in between need are taken here.
-        let is_serverless = cluster.is_serverless();
 
         // Only now is the count the request asks for judged: the target becomes
         // the cluster's own broker count, so the range the model puts on it
@@ -261,10 +274,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a stale version — which is what the loser of two calls racing from one
         // version is told — and only a call quoting the version the cluster will
         // accept its next change from is answered on the state it is in. Both
-        // through the one precondition every update of this service shares.
-        if let Some(refusal) =
-            crate::state::state_gate::cluster_change_refusal(&input.current_version, cluster)
+        // through the one precondition every update of this service shares,
+        // decided on the record read above.
+        if let Some(refusal) = change_refusal {
+            return Err(UpdateBrokerCountErrorModeled::BadRequestException(refusal).into());
+        }
+
+        // Amazon MSK scales a broker count UP only: the brokers hold the
+        // partition replicas, so taking one out would have to move the data on it.
+        // A target BELOW the count the cluster holds is therefore refused, and the
+        // cluster keeps its brokers, its state and its version.
+        if let Some(reason) = crate::state::broker_count_decrease_violation(
+            current_broker_count,
+            input.target_number_of_broker_nodes,
+        ) {
+            return Err(bad_request(TARGET_NUMBER_OF_BROKER_NODES_MEMBER, reason));
+        }
+
+        // The brokers are spread evenly over the Availability Zones the cluster's
+        // client subnets span, so the target has to divide by how many zones those
+        // are — the same rule a create's own count is admitted under. The zones are
+        // EC2's fact about subnets the create already resolved, so they are read by
+        // asking EC2 about the cluster's stored placement, with no lock held; this
+        // call places nothing new, so an answer that resolves none of them says
+        // only that the span is unknown, which grounds no refusal.
+        if let crate::state::network::PlacementSubnets::Resolved(Some(zones)) =
+            crate::state::network::resolve_placement_subnets(ctx, &region, &client_subnets).await
         {
+            if let Some(reason) = crate::state::broker_count_zone_violation(
+                input.target_number_of_broker_nodes,
+                zones.len(),
+            ) {
+                return Err(bad_request(TARGET_NUMBER_OF_BROKER_NODES_MEMBER, reason));
+            }
+        }
+
+        // Read again at the instant the operation is FILED: the zones above were
+        // resolved over the in-process callback with no lock held, so the clock has
+        // moved on and the cluster may have too. The precondition is applied once
+        // more under the lock the operation is started with, so the version this
+        // update is accepted from is the version the cluster is at then.
+        let now = std::time::SystemTime::now();
+        let mut registry = state.lock();
+        let Some(cluster) = registry.settled_cluster_in(&region, &input.cluster_arn, now) else {
+            return Err(cluster_not_found());
+        };
+        let settled_refusal =
+            crate::state::state_gate::cluster_change_refusal(&input.current_version, cluster);
+        if let Some(refusal) = settled_refusal {
             return Err(UpdateBrokerCountErrorModeled::BadRequestException(refusal).into());
         }
 
@@ -273,7 +330,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // instant the change comes due — the same path the sibling update
         // operations start their own through, so one cluster holds one in-flight
         // update whatever began it.
-        let Some(operation_arn) = state.start_broker_count_update(
+        let Some(operation_arn) = registry.start_broker_count_update(
             &region,
             &input.cluster_arn,
             now,
@@ -302,6 +359,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// wire (`TargetNumberOfBrokerNodes`'s `jsonName`) — the spelling every refusal
 /// of this service reports in `BadRequestException$InvalidParameter`.
 const TARGET_NUMBER_OF_BROKER_NODES_MEMBER: &str = "targetNumberOfBrokerNodes";
+
+/// The refusal a call naming an ARN no live cluster of this region holds earns: the
+/// service's modelled `NotFoundException` (HTTP 404) in its one sentence for a
+/// resource it cannot resolve. Built in one place because the cluster is resolved
+/// twice — once for the decisions below, and again under the lock the operation is
+/// filed with.
+fn cluster_not_found() -> UpdateBrokerCountError {
+    UpdateBrokerCountErrorModeled::NotFoundException(NotFoundException {
+        invalid_parameter: Some("ClusterArn".to_string()),
+        message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+    })
+    .into()
+}
 
 /// Refuse the request with the modeled `BadRequestException`, naming the member at
 /// fault and what was wrong with it — the caller has to fix the request from this
