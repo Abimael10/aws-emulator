@@ -897,3 +897,207 @@ async fn the_default_mappings_are_state_the_mapping_writes_compose_on_top_of() {
         );
     }
 }
+
+/// One write a sequence applies to a stored profile.
+#[derive(Debug, Clone)]
+enum ProfileWrite {
+    /// `UpdateProfile` carrying these members.
+    Update(Value),
+    /// `DisableProfile`.
+    Disable,
+    /// `EnableProfile`.
+    Enable,
+}
+
+/// The members an echo reports beyond what [`assert_detail_follows_the_create`] covers: the
+/// identifier the request addressed, and the two members a create and an update both write.
+fn assert_identity_members(case: &str, expected: &Value, detail: &Value, id: &str) {
+    assert_eq!(
+        detail.get("profileId").and_then(Value::as_str),
+        Some(id),
+        "case {case:?}: the echo must report the addressed profile, got {detail:?}"
+    );
+    assert_eq!(
+        detail.get("name"),
+        expected.get("name"),
+        "case {case:?}: expected the name the last write left, got {detail:?}"
+    );
+    assert_eq!(
+        detail.get("roleArns"),
+        expected.get("roleArns"),
+        "case {case:?}: expected the roleArns the last write left, got {detail:?}"
+    );
+}
+
+/// A session policy document a row's update submits: `sessionPolicy` is `@length(1, 100000)`
+/// (`smithy_query(query="operation", operation="UpdateProfile")`), so any document in that
+/// range is a legal value to store and report back.
+fn session_policy(effect: &str) -> String {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [{"Effect": effect, "Action": "*", "Resource": "*"}],
+    })
+    .to_string()
+}
+
+/// Every write-path `ProfileDetail` echo answers the profile's whole state as that write
+/// left it — the same body the read path answers immediately afterwards, service defaults,
+/// principal-ARN `createdBy` and omitted unset members included — and the deletion receipt
+/// reports the state the delete found, whatever sequence of writes came before it.
+///
+/// The rows span the ORDER of the writes, how many there are, whether one is repeated, which
+/// members an update carries (both published `durationSeconds` bounds among them), and the
+/// shape of the profile the sequence runs against, since each row takes a different create
+/// body from [`create_rows`].
+#[tokio::test]
+async fn every_profile_write_echo_reports_the_state_the_write_left() {
+    let bodies = create_rows();
+    let sequences: Vec<(&str, Vec<ProfileWrite>)> = vec![
+        (
+            "update-then-disable",
+            vec![
+                ProfileWrite::Update(json!({
+                    "durationSeconds": 7200,
+                    "sessionPolicy": session_policy("Allow"),
+                })),
+                ProfileWrite::Disable,
+            ],
+        ),
+        (
+            "disable-then-update-then-enable",
+            vec![
+                ProfileWrite::Disable,
+                ProfileWrite::Update(json!({
+                    "managedPolicyArns": ["arn:aws:iam::aws:policy/ReadOnlyAccess"],
+                })),
+                ProfileWrite::Enable,
+            ],
+        ),
+        (
+            "enable-disable-enable",
+            vec![
+                ProfileWrite::Enable,
+                ProfileWrite::Disable,
+                ProfileWrite::Enable,
+            ],
+        ),
+        (
+            "disable-repeated-then-update",
+            vec![
+                ProfileWrite::Disable,
+                ProfileWrite::Disable,
+                ProfileWrite::Update(json!({
+                    "name": "renamed by the update",
+                    "acceptRoleSessionName": true,
+                })),
+            ],
+        ),
+        (
+            "update-at-each-duration-bound-then-toggle",
+            vec![
+                ProfileWrite::Update(json!({"durationSeconds": 900})),
+                ProfileWrite::Update(json!({"durationSeconds": 43200})),
+                ProfileWrite::Disable,
+                ProfileWrite::Enable,
+            ],
+        ),
+        (
+            "enable-then-update-every-writable-member",
+            vec![
+                ProfileWrite::Enable,
+                ProfileWrite::Update(json!({
+                    "name": "fully updated",
+                    "roleArns": [role_arn("Updated"), role_arn("team/AlsoUpdated")],
+                    "managedPolicyArns": [],
+                    "sessionPolicy": session_policy("Deny"),
+                    "durationSeconds": 1800,
+                    "acceptRoleSessionName": false,
+                })),
+                ProfileWrite::Disable,
+                ProfileWrite::Enable,
+            ],
+        ),
+        (
+            "one-update-and-nothing-else",
+            vec![ProfileWrite::Update(json!({
+                "sessionPolicy": session_policy("Allow"),
+            }))],
+        ),
+    ];
+
+    for (index, (case, writes)) in sequences.into_iter().enumerate() {
+        let (shape, body) = &bodies[index % bodies.len()];
+        let labelled_case = format!("{case}/over-{shape}");
+        let client = Client::new();
+        let created = client.create_profile(body.clone()).await;
+        ok(&labelled_case, 201, &created);
+        let id = minted_id(&labelled_case, &created.profile(&labelled_case));
+
+        // What the profile holds, as the requests sent so far left it: the create body with
+        // every later write folded in. Every expectation below is read off this, so the
+        // table states the rule rather than one recorded body.
+        let mut expected = body.clone();
+        let mut last_state = created.profile(&labelled_case);
+
+        for (step, write) in writes.iter().enumerate() {
+            let labelled = format!("{labelled_case}/step-{step}");
+            let answer = match write {
+                ProfileWrite::Update(members) => {
+                    for (member, value) in members
+                        .as_object()
+                        .expect("an update body is a JSON object")
+                    {
+                        expected[member.clone()] = value.clone();
+                    }
+                    client.update_profile(&id, members.clone()).await
+                }
+                ProfileWrite::Disable => {
+                    expected["enabled"] = Value::Bool(false);
+                    client.disable_profile(&id).await
+                }
+                ProfileWrite::Enable => {
+                    expected["enabled"] = Value::Bool(true);
+                    client.enable_profile(&id).await
+                }
+            };
+            ok(&labelled, 200, &answer);
+            let echo = answer.profile(&labelled);
+            assert_detail_follows_the_create(&labelled, &expected, &echo);
+            assert_identity_members(&labelled, &expected, &echo, &id);
+
+            // The echo IS the stored record, so the read path answers the same body — a
+            // client that takes the echo as the profile's current state reads what a
+            // re-read would have told it.
+            let read = client.get_profile(&id).await;
+            ok(&labelled, 200, &read);
+            assert_eq!(
+                read.profile(&labelled),
+                echo,
+                "case {labelled:?}: GetProfile must report what the write echoed, got {read:?}"
+            );
+            assert_eq!(
+                client.listed(&labelled, &id).await,
+                echo,
+                "case {labelled:?}: the ListProfiles projection must report the same record"
+            );
+            last_state = echo;
+        }
+
+        // The deletion receipt reports the profile as the delete found it — the state the
+        // last write left, flag included — and the profile is then gone.
+        let removed = client.delete_profile(&id).await;
+        let delete_case = format!("{labelled_case}/delete");
+        ok(&delete_case, 200, &removed);
+        assert_eq!(
+            removed.profile(&delete_case),
+            last_state,
+            "case {delete_case:?}: the receipt must report the state the delete found, got \
+             {removed:?}"
+        );
+        let gone = client.get_profile(&id).await;
+        assert_eq!(
+            gone.status, 404,
+            "case {delete_case:?}: the deleted profile must resolve to nothing, got {gone:?}"
+        );
+    }
+}
