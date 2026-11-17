@@ -32,9 +32,9 @@
 //!
 //! It reads one file; it starts no router and reaches no network.
 
-// The declaration root this rule is about, the header boundary it is read against, and which
-// lines of that header say something, all taken from the siblings that own them rather than
-// opened, decided or read a second time.
+// The header boundary it is read against, and which lines of that header say something, both
+// taken from the siblings that own them rather than decided or read a second time, and the
+// root it is read for.
 use crate::all_rs_carries_one_header_block::{header_of, prose_of};
 use crate::all_rs_declares_each_suite_once::all_rs;
 

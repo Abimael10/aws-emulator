@@ -241,6 +241,13 @@ pub(crate) fn workspace_root() -> PathBuf {
 /// A root is listed only where it is a file: a crate whose target declares its suites
 /// with `automod` keeps no hand-maintained root, and a rule about a root's contents has
 /// nothing to read there.
+///
+/// The rule read against these roots belongs to the single-target layout rather than to
+/// one crate, and the crate that breaks it cannot pin it itself: a repeated `mod` makes
+/// that crate's own `all` target fail to compile, so no suite inside it is ever run to
+/// report the repetition. This target is the one that links every service crate, so it is
+/// where the rule can be checked for all of them. A sibling suite checking another rule of
+/// the same layout reads the same roots, so this enumerator is shared rather than copied.
 pub(crate) fn declaration_roots() -> Vec<PathBuf> {
     let services = workspace_root().join("services");
     let entries = fs::read_dir(&services)

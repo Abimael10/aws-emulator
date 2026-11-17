@@ -55,9 +55,8 @@ const UNKNOWN_SUBNET: &str = "subnet-0000000000bad0bad";
 struct Emulator {
     router: MultiServiceRouter,
     /// The engine both services were built from, so a case can assert on the store itself —
-    /// what a refused create must NOT have written. `GetVpcLinks` is still a scaffold stub
-    /// (its own open issue owns it), so the account's links are counted here rather than
-    /// read over the wire.
+    /// what a refused create must NOT have written, read from the record rather than over the
+    /// wire.
     engine: Arc<engine::InMemoryEngine>,
     ec2: ::aws_sdk_ec2::Client,
 }

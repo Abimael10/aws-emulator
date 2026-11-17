@@ -325,6 +325,8 @@ mod vpc_link_deletion;
 mod vpc_link_lifecycle;
 #[path = "all/vpc_link_listing.rs"]
 mod vpc_link_listing;
+#[path = "all/vpc_link_name_refusal_text.rs"]
+mod vpc_link_name_refusal_text;
 #[path = "all/vpc_link_name_refusal_wording.rs"]
 mod vpc_link_name_refusal_wording;
 #[path = "all/vpc_link_status_messages.rs"]

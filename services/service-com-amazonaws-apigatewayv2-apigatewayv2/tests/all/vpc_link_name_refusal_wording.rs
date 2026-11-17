@@ -49,7 +49,10 @@ const APIS: &str = "/v2/apis";
 /// This service's sentence for a member whose value falls outside the length window the
 /// shape it targets documents: it names the member, the window and the length the request
 /// carried.
-fn length_window_message(member: &str, got: usize) -> String {
+///
+/// `pub(crate)` so the sibling suite that reads what that window COUNTS states the sentence
+/// through this one rather than writing the template a second time.
+pub(crate) fn length_window_message(member: &str, got: usize) -> String {
     let (min, max) = API_NAME_LEN;
     format!("Invalid value for {member}: must have length between {min} and {max}, got {got}.")
 }
@@ -112,7 +115,10 @@ fn named(create: &Value, name: &str) -> Value {
 }
 
 /// Assert one answer is the modelled `BadRequestException` carrying exactly `expected`.
-fn assert_bad_request(case: &str, status: u16, body: &Value, expected: &str) {
+///
+/// `pub(crate)` for the same reason as [`length_window_message`]: the sibling suite asserts
+/// the same three facts about a refusal, through this reader rather than a copy of it.
+pub(crate) fn assert_bad_request(case: &str, status: u16, body: &Value, expected: &str) {
     assert_eq!(
         status, 400,
         "case {case:?}: expected 400, got {status} {body}"

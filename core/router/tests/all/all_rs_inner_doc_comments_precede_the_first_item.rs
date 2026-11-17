@@ -21,11 +21,11 @@
 use std::fs;
 
 // The roots this rule holds for are the ones the sibling layout suite already enumerates —
-// this crate's `tests/all.rs` plus every service crate's — so that enumerator is shared
-// rather than copied. The rule belongs to the single-target layout rather than to any one
-// crate, and the crate that breaks it cannot pin it itself: a misplaced inner doc comment
-// makes that crate's own `all` target fail to compile, so no suite inside it ever runs to
-// report the break. This target is the one that links every service crate.
+// every crate's `tests/all.rs` that there is — so that enumerator is shared rather than
+// copied. The rule belongs to the single-target layout rather than to any one crate, and the
+// crate that breaks it cannot pin it itself: a misplaced inner doc comment makes that crate's
+// own `all` target fail to compile, so no suite inside it ever runs to report the break. This
+// target is the one that links every service crate.
 use crate::all_rs_declares_each_suite_once::{
     automod_suite_files, declaration_roots, declared_suite_files, workspace_root,
 };
