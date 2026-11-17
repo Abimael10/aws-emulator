@@ -37,7 +37,10 @@
 //! ([`crate::state::pass_role_refusal`], 403 `AccessDeniedException`), and the subnets it
 //! names must exist in EC2 ([`crate::state::resolve_subnets`], 400
 //! `InvalidParameterException`) — a cluster is never minted against a role the caller
-//! cannot pass or a subnet nothing holds.
+//! cannot pass or a subnet nothing holds. The security groups it names must belong to the
+//! VPC those subnets sit in ([`crate::state::security_group_vpc_refusal`], 400
+//! `InvalidParameterException`): a group of another VPC governs no interface of this
+//! cluster's network.
 //!
 //! Nor until the request's own parameters pass the rules Amazon EKS states for them
 //! (`crate::state::cluster_parameters`, the sentence each refusal carries): `name` is
@@ -557,6 +560,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         if let Some(why) = resolved_subnets.refusal {
             return Err(invalid_parameter(&input.name, why));
+        }
+
+        // The security groups the request names are applied to those same interfaces —
+        // "Specify one or more security groups for the cross-account elastic network
+        // interfaces that Amazon EKS creates" (`VpcConfigRequest$securityGroupIds`) — and
+        // a security group belongs to exactly one VPC, governing only interfaces of that
+        // VPC. So a group of another VPC than the one the subnets resolved to could never
+        // apply to this cluster's network, and the create is refused before anything is
+        // written. The groups are EC2's resources, so the comparison is grounded in what
+        // EC2 reports ([`state::security_group_vpc_refusal`]), which is why it runs here,
+        // once the subnets have named the network and with no lock held.
+        if let (Some(group_ids), Some(vpc_id)) = (
+            input.resources_vpc_config.security_group_ids.as_deref(),
+            resolved_subnets.vpc_id.as_deref(),
+        ) {
+            if let Some(why) =
+                state::security_group_vpc_refusal(ctx, &region, group_ids, vpc_id).await
+            {
+                return Err(invalid_parameter(&input.name, why));
+            }
         }
 
         // The last of the service CIDR's rules, the one that needs the NETWORK the

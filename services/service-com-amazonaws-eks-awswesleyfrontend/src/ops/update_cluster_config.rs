@@ -25,6 +25,12 @@
 //! of more than one category reports the generic `ConfigUpdate`. Every member the
 //! request carried is reported as an `UpdateParam`, keyed by its `UpdateParamType`.
 //!
+//! Nothing is written until the network the request names RESOLVES: the subnets must
+//! exist in EC2 ([`crate::state::resolve_subnets`]) and the security groups must belong
+//! to the VPC the cluster's cross-account network interfaces sit in
+//! ([`crate::state::security_group_vpc_refusal`]) — "you can't change which VPC the
+//! subnets are from" — each refused 400 `InvalidParameterException`.
+//!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
 //! ---
@@ -272,15 +278,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // This is the ONE part of the request judged before the cluster is resolved,
         // because it is a call out to another service and so must run with no lock held;
         // every other judgment of the body happens against the resolved cluster, in
-        // [`requested_change`] below.
-        if let Some(subnet_ids) = input
+        // [`requested_change`] below. The same answer carries the VPC those subnets sit
+        // in, which the security groups below are compared against.
+        let resolved_subnets = match input
             .resources_vpc_config
             .as_ref()
             .and_then(|vpc| vpc.subnet_ids.as_deref())
         {
-            if let Some(why) = state::unresolved_subnet_refusal(ctx, &region, subnet_ids).await {
-                return Err(invalid_parameter(&cluster_name, why));
-            }
+            Some(subnet_ids) => state::resolve_subnets(ctx, &region, subnet_ids).await,
+            None => state::ResolvedSubnets::default(),
+        };
+        if let Some(why) = resolved_subnets.refusal {
+            return Err(invalid_parameter(&cluster_name, why));
         }
 
         let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
@@ -297,6 +306,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A cluster name identifies a cluster only within one region, so the record this
         // updates is the one in the region the request is signed for.
         let key = (region.clone(), cluster_name.clone());
+
+        // The security groups a request names are applied to those same interfaces —
+        // "Specify one or more security groups for the cross-account elastic network
+        // interfaces that Amazon EKS creates" (`VpcConfigRequest$securityGroupIds`) — and
+        // a security group belongs to exactly one VPC, governing only interfaces of that
+        // VPC. So one of another VPC than the cluster's network could never apply to it,
+        // and the update is refused before anything is written. That network is the VPC
+        // the subnets this request names resolved to, or — when it names none — the VPC
+        // the cluster already reports; the comparison is grounded in what EC2 reports
+        // about the groups ([`state::security_group_vpc_refusal`]), so it runs here, with
+        // no lock held. A cluster this region does not hold names no network, which leaves
+        // the 404 below as the answer.
+        let network_vpc_id = match resolved_subnets.vpc_id.clone() {
+            Some(vpc_id) => Some(vpc_id),
+            None => store.lock().clusters.get(&key).and_then(|record| {
+                record
+                    .resources_vpc_config
+                    .as_ref()
+                    .and_then(|vpc| vpc.vpc_id.clone())
+            }),
+        };
+        if let (Some(group_ids), Some(vpc_id)) = (
+            input
+                .resources_vpc_config
+                .as_ref()
+                .and_then(|vpc| vpc.security_group_ids.as_deref()),
+            network_vpc_id.as_deref(),
+        ) {
+            if let Some(why) =
+                state::security_group_vpc_refusal(ctx, &region, group_ids, vpc_id).await
+            {
+                return Err(invalid_parameter(&cluster_name, why));
+            }
+        }
+
         // Every refusal this operation reads off the store, and the write that starts the
         // update, under ONE lock — which is given up before the control plane logs are
         // exported, because that is a call out to another service.

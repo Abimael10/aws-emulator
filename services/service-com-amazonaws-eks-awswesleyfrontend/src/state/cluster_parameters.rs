@@ -156,6 +156,22 @@ pub fn invalid_security_group_message(group_id: &str) -> String {
     format!("The request contains an invalid security group Id: {group_id}")
 }
 
+/// The sentence a `securityGroupIds` naming groups that belong to another VPC than the
+/// one the request's subnets sit in is refused with.
+///
+/// The variable parts are the offending security group ids, as the request named them —
+/// rendered as the list they are, comma-separated inside the brackets the sentence puts
+/// them in — and the VPC the resource's cross-account network interfaces are created in,
+/// as EC2 resolved it from those subnets ([`super::resolve_subnets`]) or as the cluster
+/// already reports it; the rest of the sentence is fixed text.
+pub fn security_groups_not_in_vpc_message(group_ids: &[&str], vpc_id: &str) -> String {
+    format!(
+        "Security group(s) [{}] are not (in/associated to) the same VPC as the subnets. \
+         Please specify a security group that is associated with the VPC: {vpc_id}",
+        group_ids.join(", ")
+    )
+}
+
 /// Whether `candidate` is an Amazon EC2 resource id of the kind `prefix` names.
 ///
 /// EC2 identifies a resource as its kind's prefix followed by the resource's

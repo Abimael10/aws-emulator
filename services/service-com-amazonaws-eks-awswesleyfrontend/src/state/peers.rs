@@ -713,6 +713,116 @@ pub async fn resolve_vpc_cidr_blocks(
     blocks
 }
 
+// ---------------------------------------------------------------------------
+// The security groups a REQUEST names.
+//
+// `resourcesVpcConfig.securityGroupIds` names the groups Amazon EKS applies to "the
+// cross-account elastic network interfaces that Amazon EKS creates" in the request's
+// subnets (`VpcConfigRequest$securityGroupIds`). A security group belongs to exactly
+// one VPC (`SecurityGroup$VpcId`) and only ever governs interfaces of that VPC, so a
+// group of another VPC than the one those subnets sit in could never be applied to
+// them. The groups are EC2's resources, so EC2 is what the comparison is grounded in
+// — over the same in-process callback every other cross-service reading here goes
+// through.
+// ---------------------------------------------------------------------------
+
+/// The `DescribeSecurityGroups` filter that selects groups BY ID (`group-id`, one of the
+/// names that operation's own `Filters` documentation lists).
+///
+/// A filter is what asks the question rather than `GroupIds`: an id the account holds no
+/// group for is then an absent row instead of a failure of the whole read, so the groups
+/// EC2 does hold are still reported for every other id the request named.
+pub(super) const EC2_GROUP_ID_FILTER: &str = "group-id";
+
+/// How many of a request's security group ids are resolved against EC2 in ONE read.
+///
+/// Amazon VPC publishes 60 inbound (or outbound) rules per security group ("Amazon VPC
+/// quotas", *Inbound or outbound rules per security group*), and authorizing traffic
+/// against one group costs one rule, so a list naming more distinct groups than this
+/// names more groups than one network interface's rules could reach. The read therefore
+/// does bounded work whatever length of list a request carries, and a list past the cap
+/// is compared on the ids that fit it.
+pub const MAX_SECURITY_GROUPS_RESOLVED: usize = 60;
+
+/// The refusal a list of security group ids earns when EC2 reports one of them in a VPC
+/// other than `vpc_id`, or `None` when every group EC2 answered for belongs to it.
+///
+/// WHICH ids a refusal names: every one of them EC2 placed in another VPC, in the order
+/// the request listed them, deduplicated — a repeated id is the same question.
+///
+/// Grounded in what EC2 REPORTED and nothing else: a group it answered for, carrying a
+/// VPC that is not the one the resource's network interfaces are created in. An id EC2
+/// reported no group for says nothing about which VPC it is in, and an EC2 this emulator
+/// cannot ask says nothing at all — the same silence [`resolve_subnets`] refuses nothing
+/// on.
+pub async fn security_group_vpc_refusal(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    security_group_ids: &[String],
+    vpc_id: &str,
+) -> Option<String> {
+    if vpc_id.is_empty() {
+        return None;
+    }
+    // The distinct ids of the request that could name a security group at all, in the
+    // order it listed them, capped where the work grows
+    // ([`MAX_SECURITY_GROUPS_RESOLVED`]): the length of the list a caller sends is never
+    // what decides how much is asked of EC2, and a value outside the form EC2 identifies
+    // a security group by ([`is_security_group_id`]) names no group of any VPC, so there
+    // is nothing to ask about it — the operations that take the member refuse it for its
+    // form instead.
+    let mut asked: Vec<&str> = Vec::new();
+    let mut seen: ::std::collections::BTreeSet<&str> = ::std::collections::BTreeSet::new();
+    for group_id in security_group_ids
+        .iter()
+        .filter(|group_id| is_security_group_id(group_id))
+    {
+        if seen.insert(group_id.as_str()) {
+            asked.push(group_id.as_str());
+            if asked.len() == MAX_SECURITY_GROUPS_RESOLVED {
+                break;
+            }
+        }
+    }
+    if asked.is_empty() {
+        return None;
+    }
+    // No Region label, so no endpoint to ask EC2 at: the same answer an unreachable EC2
+    // gets, which grounds no refusal.
+    let endpoint = peer_endpoint("ec2", region)?;
+    let filter = ::aws_sdk_ec2::types::Filter::builder()
+        .name(EC2_GROUP_ID_FILTER)
+        .set_values(Some(asked.iter().map(|id| (*id).to_string()).collect()))
+        .build();
+    let described = callback_client!(aws_sdk_ec2, ctx, endpoint, region)
+        .describe_security_groups()
+        .filters(filter)
+        .send()
+        .await;
+    let output = match described {
+        Ok(output) => output,
+        Err(error) => {
+            ::tracing::warn!(
+                %vpc_id,
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "the security groups the request named could not be resolved against EC2"
+            );
+            return None;
+        }
+    };
+    let elsewhere: ::std::collections::BTreeSet<&str> = output
+        .security_groups()
+        .iter()
+        .filter(|group| group.vpc_id().is_some_and(|reported| reported != vpc_id))
+        .filter_map(::aws_sdk_ec2::types::SecurityGroup::group_id)
+        .collect();
+    let offending: Vec<&str> = asked
+        .into_iter()
+        .filter(|id| elsewhere.contains(id))
+        .collect();
+    (!offending.is_empty()).then(|| security_groups_not_in_vpc_message(&offending, vpc_id))
+}
+
 /// Release the security group a deleted cluster owned.
 ///
 /// A group this emulator cannot delete is reported rather than refused: the
