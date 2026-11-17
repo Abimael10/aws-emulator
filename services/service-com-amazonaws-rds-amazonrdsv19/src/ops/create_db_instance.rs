@@ -402,6 +402,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map_err(CreateDBInstanceError::invalid_parameter_value)?;
         }
 
+        // `EnableCloudwatchLogsExports` is STORED on the instance and is what the log-export
+        // groups are provisioned from, so the list's length and each entry are bounded where
+        // they enter the handler, exactly as `CreateDBCluster` bounds the same member.
+        if let Some(values) = &input.enable_cloudwatch_logs_exports {
+            crate::state::check_request_list_len(
+                "EnableCloudwatchLogsExports",
+                values.len(),
+                crate::state::MAX_CLUSTER_LIST_ENTRIES,
+            )
+            .map_err(CreateDBInstanceError::invalid_parameter_value)?;
+            for value in values {
+                crate::state::check_free_form("EnableCloudwatchLogsExports", value)
+                    .map_err(CreateDBInstanceError::invalid_parameter_value)?;
+            }
+        }
+
         // A value this service can resolve for itself is resolved BEFORE anything is
         // stored, and before the duplicate-identifier check below: a request that is
         // wrong in its parameters is refused for the parameter, not for a conflict the
@@ -920,6 +936,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The instance's log starts empty; the line below is its first entry, and the
             // transitions the clock then makes due add the rest (`DbInstanceRecord`).
             engine_log: crate::state::InstanceLog::default(),
+            // `EnableCloudwatchLogsExports`: "the list of log types that need to be enabled
+            // for exporting to CloudWatch Logs", which is what the instance exports from the
+            // moment it is created, and nothing for a request that named none.
+            enabled_cloudwatch_logs_exports: input
+                .enable_cloudwatch_logs_exports
+                .unwrap_or_default(),
+            // No statement has been logged yet, so the instance has no general query log
+            // file at all ([`crate::state::engine_log`]).
+            general_query_log: crate::state::InstanceLog::default(),
+            // And its continuous backup holds no recovery point yet: the instance's data is
+            // what it came up with until a session commits a change to it.
+            recovery_points: Vec::new(),
         };
         record.engine_log.record(format!(
             "DB instance {} created with engine {}; status {}",
@@ -1056,6 +1084,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if record.served_endpoint.is_none() {
             record.served_endpoint = crate::state::api_plane_endpoint(&record.engine, ctx);
         }
+        // The instance's CONTINUOUS BACKUP starts from the data it comes up with, so an
+        // instant before its first commit has the state it started from to be restored to
+        // rather than a later commit's
+        // ([`crate::state::data_plane::continuous_backup::record_initial_state`]).
+        crate::state::data_plane::continuous_backup::record_initial_state(
+            &mut record,
+            endpoint.as_ref(),
+        )
+        .await;
 
         // Another request may have created this identifier while this one was binding, so
         // the conflict is answered again here rather than overwriting a stored instance —
@@ -1098,6 +1135,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .lock()
                     .record_default_subnet_group_network(&region, network);
             }
+        }
+        // The CloudWatch Logs group each log type this instance exports to is a group RDS
+        // publishes under its own name, so it exists from the moment the create that turns
+        // the export on is accepted rather than from the first line written into it: a client
+        // reads the group to confirm the export is on, and attaches a retention policy or a
+        // subscription filter to it, before the engine has logged anything. The lines
+        // themselves go into that same group
+        // ([`crate::state::data_plane::log_export`]). Best effort, and awaited here with NO
+        // store guard held, as every in-process hop of this handler is.
+        for log_type in &record.enabled_cloudwatch_logs_exports {
+            ::service_common::cloudwatch_logs::provisioned(
+                ctx,
+                &region,
+                &crate::state::data_plane::log_export::instance_log_group(
+                    &identifier,
+                    log_type,
+                ),
+            )
+            .await;
         }
         let mut store = state.lock();
 

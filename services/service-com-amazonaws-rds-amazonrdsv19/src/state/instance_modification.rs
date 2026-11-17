@@ -47,17 +47,49 @@ pub struct DeferredModification {
     /// `@sensitive` and is never stored or reported
     /// ([`MASKED_PENDING_MASTER_USER_PASSWORD`] is what the member carries).
     pub master_user_password: Option<data_plane::wire_session::MasterPasswordHash>,
+    /// `PendingCloudwatchLogsExports`: the log types a staged modification turns ON and OFF
+    /// for export to CloudWatch Logs ([`PendingLogExports`]). `None` for a modification that
+    /// named no `CloudwatchLogsExportConfiguration`.
+    pub cloudwatch_logs_exports: Option<PendingLogExports>,
+    /// The instant this service OWES these settings, for a modification the caller asked to
+    /// apply as soon as possible: `ApplyImmediately` "specifies whether the modifications in
+    /// this request and any pending modifications are asynchronously applied as soon as
+    /// possible, regardless of the PreferredMaintenanceWindow setting" — asynchronously, so
+    /// the instance keeps the settings it is running under until that instant, reports them
+    /// as pending until then, and reports itself `modifying` for exactly as long.
+    ///
+    /// `None` for a modification that waits for the maintenance window, which is what
+    /// `ApplyImmediately` disabled asks for.
+    pub apply_at: Option<Instant>,
+}
+
+/// The log types a staged modification turns on and off for export to CloudWatch Logs:
+/// `CloudwatchLogsExportConfiguration`'s `EnableLogTypes` and `DisableLogTypes`, which is
+/// what `PendingCloudwatchLogsExports` reports while the change is pending.
+#[derive(Debug, Clone, Default)]
+pub struct PendingLogExports {
+    /// `LogTypesToEnable`: "the log types that are being enabled".
+    pub enable: Vec<String>,
+    /// `LogTypesToDisable`: "the log types that are being disabled".
+    pub disable: Vec<String>,
 }
 
 impl DeferredModification {
-    /// Whether `window` has come round, so these settings are owed NOW: "changes to the DB
-    /// instance are applied during the next maintenance window", and the window is open
+    /// Whether `window` has come round, or the instant an immediate modification was owed
+    /// has passed, so these settings are owed NOW.
+    ///
+    /// Two things make a staged modification due. `ApplyImmediately` asks for it "as soon as
+    /// possible", which is the instant [`Self::apply_at`] records; otherwise "changes to the
+    /// DB instance are applied during the next maintenance window", and the window is open
     /// ([`maintenance_window::window_is_open`]).
     ///
-    /// `false` for a resource whose window cannot be read as a schedule, which leaves the
-    /// settings pending until a request applies them rather than applying them at a time no
-    /// window names.
-    pub fn is_due_in(&self, window: Option<&str>) -> bool {
+    /// `false` for a resource whose window cannot be read as a schedule and that owes no
+    /// instant, which leaves the settings pending until a request applies them rather than
+    /// applying them at a time no window names.
+    pub fn is_due(&self, window: Option<&str>, now: Instant) -> bool {
+        if self.apply_at.is_some_and(|due_at| now >= due_at) {
+            return true;
+        }
         window.is_some_and(|window| {
             maintenance_window::window_is_open(window, SystemTime::now())
         })
@@ -84,6 +116,7 @@ impl DeferredModification {
             && self.iam_database_authentication_enabled.is_none()
             && self.dedicated_log_volume.is_none()
             && self.master_user_password.is_none()
+            && self.cloudwatch_logs_exports.is_none()
     }
 
     /// Take `staged` into this record, each setting the newer request named replacing what
@@ -109,6 +142,8 @@ impl DeferredModification {
             iam_database_authentication_enabled,
             dedicated_log_volume,
             master_user_password,
+            cloudwatch_logs_exports,
+            apply_at,
         } = staged;
         replace(&mut self.identifier, identifier);
         replace(&mut self.db_instance_class, db_instance_class);
@@ -136,6 +171,36 @@ impl DeferredModification {
         );
         replace(&mut self.dedicated_log_volume, dedicated_log_volume);
         replace(&mut self.master_user_password, master_user_password);
+        // The log types the newer request names are MERGED into what an earlier one staged:
+        // each type the later request enables is one it enables, whichever list an earlier
+        // request put it in.
+        if let Some(staged) = cloudwatch_logs_exports {
+            let held = self
+                .cloudwatch_logs_exports
+                .get_or_insert_with(PendingLogExports::default);
+            held.enable.retain(|held| !staged.disable.contains(held));
+            held.disable.retain(|held| !staged.enable.contains(held));
+            for log_type in staged.enable {
+                if !held.enable.contains(&log_type) {
+                    held.enable.push(log_type);
+                }
+            }
+            for log_type in staged.disable {
+                if !held.disable.contains(&log_type) {
+                    held.disable.push(log_type);
+                }
+            }
+            // What one request may name is bounded where it enters the handler; what
+            // SUCCESSIVE requests accumulate here is bounded by the same ceiling, so a
+            // modification that stays pending cannot grow the staged record past the number
+            // of log types the instance can carry applied.
+            held.enable.truncate(MAX_CLUSTER_LIST_ENTRIES);
+            held.disable.truncate(MAX_CLUSTER_LIST_ENTRIES);
+        }
+        // The instant the settings are owed is the one the LATER request asked for: a
+        // modification that asks for them as soon as possible carries what an earlier one
+        // staged with it, which is what `ApplyImmediately` states.
+        replace(&mut self.apply_at, apply_at);
     }
 
     /// Write every staged setting onto `record`, which is what applying the modification
@@ -199,6 +264,24 @@ impl DeferredModification {
         if let Some(value) = self.master_user_password {
             record.master_user_password = Some(value);
         }
+        // "The log types that are being enabled" and "being disabled": the enabled set the
+        // instance reports is the stored one plus what the modification enables, less what it
+        // disables.
+        if let Some(exports) = self.cloudwatch_logs_exports {
+            for log_type in exports.enable {
+                if !record.enabled_cloudwatch_logs_exports.contains(&log_type) {
+                    record.enabled_cloudwatch_logs_exports.push(log_type);
+                }
+            }
+            for log_type in exports.disable {
+                record
+                    .enabled_cloudwatch_logs_exports
+                    .retain(|enabled| *enabled != log_type);
+            }
+            record
+                .enabled_cloudwatch_logs_exports
+                .truncate(MAX_CLUSTER_LIST_ENTRIES);
+        }
     }
 
     /// Project the staged settings onto the modelled `PendingModifiedValues`.
@@ -228,6 +311,15 @@ impl DeferredModification {
                 .master_user_password
                 .as_ref()
                 .map(|_| MASKED_PENDING_MASTER_USER_PASSWORD.to_string()),
+            // `PendingCloudwatchLogsExports`: "the log types that are being enabled" and
+            // "being disabled", reported while the change is pending and not at all for an
+            // instance with no log-export change staged.
+            pending_cloudwatch_logs_exports: self.cloudwatch_logs_exports.as_ref().map(
+                |exports| PendingCloudwatchLogsExports {
+                    log_types_to_enable: Some(exports.enable.clone()),
+                    log_types_to_disable: Some(exports.disable.clone()),
+                },
+            ),
             ..PendingModifiedValues::default()
         }
     }

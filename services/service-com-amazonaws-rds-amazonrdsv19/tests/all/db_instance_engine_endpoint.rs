@@ -74,22 +74,30 @@ pub(crate) async fn available_instance(
     request.extend(extra.iter().cloned());
     let created = expect_ok(identifier, call(router, "CreateDBInstance", &request).await);
     let endpoint = endpoint_of(&created);
-    wait_for_settle();
-    let described = expect_ok(
-        identifier,
-        call(
-            router,
-            "DescribeDBInstances",
-            &params!["DBInstanceIdentifier" => identifier],
-        )
-        .await,
-    );
-    assert_eq!(
-        text(&described, "DBInstanceStatus"),
-        "available",
-        "case {identifier:?}: the instance must settle to available before a client \
-         connects, got {described}"
-    );
+    // The instance comes up on its own, so what this waits for is the CONDITION — the
+    // status a client has to see before it connects — read again until it holds or a
+    // deadline far longer than the span this service owes that transition in has passed.
+    let deadline = std::time::SystemTime::now() + std::time::Duration::from_secs(120);
+    let described = loop {
+        let described = expect_ok(
+            identifier,
+            call(
+                router,
+                "DescribeDBInstances",
+                &params!["DBInstanceIdentifier" => identifier],
+            )
+            .await,
+        );
+        if text(&described, "DBInstanceStatus") == "available" {
+            break described;
+        }
+        assert!(
+            std::time::SystemTime::now() < deadline,
+            "case {identifier:?}: the instance must settle to available before a client \
+             connects, last read {described}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
     assert_eq!(
         endpoint_of(&described),
         endpoint,

@@ -605,6 +605,12 @@ async fn serve_query(
     if !answer.log_lines.is_empty() {
         super::log_export::export(context, facts, &answer.log_lines).await;
     }
+    // The statement itself goes to the GENERAL QUERY LOG, the file of its own this engine
+    // keeps the statements it ran in, while `general_log` is on
+    // ([`super::statement_log`]).
+    if let Some(line) = super::statement_log::general_log_line(facts, &statement) {
+        super::statement_log::record_general_log(context, line);
+    }
     if let Some((name, value)) = answer.setting_changed.clone() {
         facts.settings.insert(name, value);
     }
@@ -617,12 +623,20 @@ async fn serve_query(
     }
     // What the source has COMMITTED is what its read replicas hold: carried over once the
     // statement is through and the session has no transaction still open, so a write still
-    // inside a transaction reaches no replica until that transaction commits.
+    // inside a transaction reaches no replica until that transaction commits. The same
+    // committed state is what the instance's CONTINUOUS BACKUP records a recovery point of
+    // ([`super::continuous_backup`]).
     if super::replication::publishes_changes(&answer.verb)
         && !database.in_transaction(facts.connection_id)
     {
         super::replication::apply_to_read_replicas(&context.state, &context.target, database)
             .await;
+        super::continuous_backup::record_committed_state(
+            &context.state,
+            &context.target,
+            database,
+        )
+        .await;
     }
     if answer.result.columns.is_empty() {
         return write_ok(

@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RestoreDBInstanceToPointInTime
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RestoreDBInstanceToPointInTime`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation creates a new DB instance holding the data the source DB
+//! instance's continuous backup recorded for the requested instant. This is the ONLY file to
+//! touch for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RestoreDBInstanceToPointInTime::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The recovery points it reads are the DB instance's own
+//! ([`crate::state::data_plane::continuous_backup`]), and the restored instance's record and
+//! its projection onto the modelled wire shapes live in [`crate::state`], shared with the
+//! other implemented DB-instance operations.
 //!
 //! ## Shape of an operation
 //!
@@ -365,18 +364,792 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RestoreDBInstanceToPointInTime` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RestoreDBInstanceToPointInTimeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let region = crate::state::request_region(ctx)
+            .map_err(RestoreDBInstanceToPointInTimeError::validation)?;
+
+        // "The name of the new DB instance to create. Constraints: Must contain from 1 to 63
+        // letters, numbers, or hyphens" — checked against the value the REQUEST carried, so
+        // the refusal quotes what the caller sent, and stored folded exactly as
+        // `CreateDBInstance` stores an identifier.
+        crate::state::check_identifier(
+            "TargetDBInstanceIdentifier",
+            &input.target_db_instance_identifier,
+            63,
+        )
+        .map_err(RestoreDBInstanceToPointInTimeError::invalid_parameter_value)?;
+        let identifier = input.target_db_instance_identifier.to_ascii_lowercase();
+
+        // WHICH instant the restore reads, as the two members that name one state it:
+        // `RestoreTime` "can't be specified if the UseLatestRestorableTime parameter is
+        // enabled", and one of them has to name an instant for there to be anything to
+        // restore. Neither combination has a modelled error, so both are refused with the
+        // Query API code for parameters that cannot hold together, naming the members.
+        let use_latest = input.use_latest_restorable_time == Some(true);
+        let requested_instant = match (input.restore_time, use_latest) {
+            (Some(_), true) => {
+                return Err(
+                    RestoreDBInstanceToPointInTimeError::invalid_parameter_combination(
+                        crate::state::RESTORE_TIME_CONFLICT_MESSAGE,
+                    ),
+                )
+            }
+            (None, false) => {
+                return Err(
+                    RestoreDBInstanceToPointInTimeError::invalid_parameter_combination(
+                        crate::state::RESTORE_TIME_REQUIRED_MESSAGE,
+                    ),
+                )
+            }
+            (Some(instant), false) => Some(instant),
+            (None, true) => None,
+        };
+        // And WHICH instance it reads it from: the source is named by its identifier or by
+        // its resource id, and an instance's own continuous backup is what this restore
+        // reads — the REPLICATED automated backups
+        // `SourceDBInstanceAutomatedBackupsArn` names are a resource of their own, which
+        // this service holds none of, so naming one is that resource's modelled 404.
+        if let Some(named) = &input.source_db_instance_automated_backups_arn {
+            return Err(
+                RestoreDBInstanceToPointInTimeErrorModeled::DBInstanceAutomatedBackupNotFoundFault(
+                    DBInstanceAutomatedBackupNotFoundFault {
+                        message: Some(format!("DBInstanceAutomatedBackup not found: {named}")),
+                    },
+                )
+                .into(),
+            );
+        }
+        let named_source = match (
+            &input.source_db_instance_identifier,
+            &input.source_dbi_resource_id,
+        ) {
+            (Some(_), Some(_)) => {
+                return Err(
+                    RestoreDBInstanceToPointInTimeError::invalid_parameter_combination(
+                        "SourceDBInstanceIdentifier can't be specified when \
+                         SourceDbiResourceId is specified",
+                    ),
+                )
+            }
+            (None, None) => {
+                return Err(
+                    RestoreDBInstanceToPointInTimeError::invalid_parameter_combination(
+                        "SourceDBInstanceIdentifier must be specified when \
+                         SourceDbiResourceId isn't specified",
+                    ),
+                )
+            }
+            (Some(named), None) => NamedSource::Identifier(named.to_ascii_lowercase()),
+            (None, Some(named)) => NamedSource::ResourceId(named.clone()),
+        };
+
+        // Documented constraints this operation models no error for: refused as a 400 naming
+        // the member and its bound, never a 501 — the same guards, in the same words, as the
+        // create these settings would otherwise have gone to.
+        if input.multi_az == Some(true) && input.availability_zone.is_some() {
+            return Err(RestoreDBInstanceToPointInTimeError::validation(
+                "AvailabilityZone can't be specified when MultiAZ is enabled",
+            ));
+        }
+        if let Some(port) = input.port {
+            if !crate::state::PORT_RANGE.contains(&port) {
+                return Err(
+                    RestoreDBInstanceToPointInTimeError::invalid_parameter_value(format!(
+                        "invalid value {port} for Port: must be a value from {} to {}",
+                        crate::state::PORT_RANGE.start(),
+                        crate::state::PORT_RANGE.end()
+                    )),
+                );
+            }
+        }
+        if let Some(period) = input.backup_retention_period {
+            crate::state::check_backup_retention_period(
+                period,
+                &crate::state::BACKUP_RETENTION_RANGE,
+            )
+            .map_err(RestoreDBInstanceToPointInTimeError::invalid_parameter_value)?;
+        }
+        if let Some(engine) = &input.engine {
+            crate::state::check_engine(engine)
+                .map_err(RestoreDBInstanceToPointInTimeError::invalid_parameter_value)?;
+        }
+        if let Some(class) = &input.db_instance_class {
+            crate::state::check_db_instance_class(class)
+                .map_err(RestoreDBInstanceToPointInTimeError::invalid_parameter_value)?;
+        }
+        // `MasterUserSecretKmsKeyId` "is valid only if the master user password is managed by
+        // RDS in Amazon Web Services Secrets Manager for the DB instance": naming a key for a
+        // secret this restore creates none of names nothing.
+        if input.manage_master_user_password != Some(true)
+            && input.master_user_secret_kms_key_id.is_some()
+        {
+            return Err(
+                RestoreDBInstanceToPointInTimeError::invalid_parameter_combination(
+                    crate::state::master_user_secret_kms_key_without_management_message(
+                        "ManageMasterUserPassword",
+                    ),
+                ),
+            );
+        }
+
+        // `EnableCloudwatchLogsExports` is STORED on the restored instance, so the list's
+        // length and each entry are bounded where they enter the handler, exactly as the
+        // create of an instance bounds the same member.
+        if let Some(values) = &input.enable_cloudwatch_logs_exports {
+            crate::state::check_request_list_len(
+                "EnableCloudwatchLogsExports",
+                values.len(),
+                crate::state::MAX_CLUSTER_LIST_ENTRIES,
+            )
+            .map_err(RestoreDBInstanceToPointInTimeError::invalid_parameter_value)?;
+            for value in values {
+                crate::state::check_free_form("EnableCloudwatchLogsExports", value)
+                    .map_err(RestoreDBInstanceToPointInTimeError::invalid_parameter_value)?;
+            }
+        }
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated instance.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        // The key the restored instance is stored under, in both the record map and the
+        // engine endpoint map, so the two always name the same instance.
+        let key = (region.clone(), identifier.clone());
+
+        // Everything this restore decides from the STORE is decided here, under the state
+        // lock, and the lock is released at the end of this block: the engine endpoint below
+        // is opened asynchronously, and a state guard cannot be held across an await. The
+        // recovery point the restore reads leaves the block as a handle, so the data loaded
+        // below is the data the source held at the restored instant.
+        let (mut record, restored_from) = {
+            let mut store = state.lock();
+            store.settle_due_transitions(&region);
+
+            // The source is resolved FIRST: a restore of an instance that does not exist is
+            // the modelled 404, not a conflict or a quota refusal the caller cannot act on.
+            let source = match &named_source {
+                NamedSource::Identifier(named) => store
+                    .db_instances
+                    .get(&(region.clone(), named.clone()))
+                    .filter(|record| !record.is_deleting()),
+                NamedSource::ResourceId(named) => store
+                    .instance_by_resource_id(&region, named)
+                    .filter(|record| !record.is_deleting()),
+            };
+            let Some(source) = source else {
+                return Err(
+                    RestoreDBInstanceToPointInTimeErrorModeled::DBInstanceNotFoundFault(
+                        DBInstanceNotFoundFault {
+                            message: Some(format!(
+                                "DBInstance not found: {}",
+                                named_source.describe()
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            };
+
+            // "You can restore to any point in time before the time identified by the
+            // LatestRestorableTime property. You can restore to a point up to the number of
+            // days specified by the BackupRetentionPeriod property" — and an instance with
+            // automated backups off has no such window at all, which is exactly what the
+            // modelled `PointInTimeRestoreNotEnabledFault` reports
+            // (`SourceDBInstanceIdentifier` "refers to a DB instance with
+            // BackupRetentionPeriod equal to 0").
+            let Some((earliest, latest)) = source.restorable_window() else {
+                return Err(
+                    RestoreDBInstanceToPointInTimeErrorModeled::PointInTimeRestoreNotEnabledFault(
+                        PointInTimeRestoreNotEnabledFault {
+                            message: Some(format!(
+                                "Automated backups are not enabled for the DB instance {}",
+                                source.identifier
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            // The instant the restore reads: the one the request named, which has to lie in
+            // that window, or the latest the instance can be restored to where
+            // `UseLatestRestorableTime` asked for it ("specifies whether the DB instance is
+            // restored from the latest backup time").
+            let restore_time = match requested_instant {
+                Some(instant) => {
+                    if !crate::state::data_plane::continuous_backup::is_at_or_before(
+                        earliest, instant,
+                    ) {
+                        return Err(
+                            RestoreDBInstanceToPointInTimeError::invalid_parameter_value(
+                                crate::state::restore_time_before_the_window_message(
+                                    earliest,
+                                    source.backup_retention_period,
+                                ),
+                            ),
+                        );
+                    }
+                    if !crate::state::data_plane::continuous_backup::is_at_or_before(
+                        instant, latest,
+                    ) {
+                        return Err(
+                            RestoreDBInstanceToPointInTimeError::invalid_parameter_value(
+                                crate::state::restore_time_after_the_window_message(latest),
+                            ),
+                        );
+                    }
+                    instant
+                }
+                None => latest,
+            };
+            // The DATA the restore loads: the recovery point the source's continuous backup
+            // holds for that instant ([`crate::state::data_plane::continuous_backup`]). An
+            // instance that has recorded none has not been written to since it came up, so
+            // the data it holds NOW is the data it held at every instant of its lifetime, and
+            // the live storage is what the restore copies.
+            let restored_from = match source.recovery_point_at(restore_time) {
+                Some(point) => Some(::std::sync::Arc::clone(&point.storage)),
+                None => match source.earliest_recovery_point() {
+                    // Every point this instance holds is NEWER than the instant named: its
+                    // continuous backup does not cover that instant, so the restore is
+                    // refused with the instant the backup covers from rather than served the
+                    // data of a later commit.
+                    Some(covered_from) => {
+                        return Err(
+                            RestoreDBInstanceToPointInTimeError::invalid_parameter_value(
+                                crate::state::restore_time_before_the_window_message(
+                                    covered_from,
+                                    source.backup_retention_period,
+                                ),
+                            ),
+                        )
+                    }
+                    None => store
+                        .engine_endpoint(&(source.region.clone(), source.identifier.clone()))
+                        .map(crate::state::DbEngineEndpoint::database),
+                },
+            };
+            let source = source.clone();
+
+            // "RDS doesn't allow two DB instances with the same name": an identifier the
+            // region already holds is the modelled conflict.
+            if store.db_instances.contains_key(&key) {
+                return Err(
+                    RestoreDBInstanceToPointInTimeErrorModeled::DBInstanceAlreadyExistsFault(
+                        DBInstanceAlreadyExistsFault {
+                            message: Some(
+                                crate::state::DB_INSTANCE_ALREADY_EXISTS_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            // The region's DB instance quota, and the number of regions this store keeps
+            // records for at all: a restore adds a DB instance, so it is bounded exactly as a
+            // create is, and the modelled fault says so.
+            if store.instances_in(&region).len() >= crate::state::DB_INSTANCE_QUOTA_PER_REGION
+                || !store.has_room_for_region(&region)
+            {
+                return Err(
+                    RestoreDBInstanceToPointInTimeErrorModeled::InstanceQuotaExceededFault(
+                        InstanceQuotaExceededFault {
+                            message: Some(format!(
+                                "the request would exceed the allowed number of DB instances \
+                                 ({} per region, in at most {} regions)",
+                                crate::state::DB_INSTANCE_QUOTA_PER_REGION,
+                                crate::state::MAX_REGIONS
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+
+            // "The database engine to use for the new instance. Default: The same as source."
+            // The version is the source's while the engine is unchanged; a request that names
+            // a DIFFERENT engine gets that engine's own default available version, because a
+            // version string of the source's engine names no version of another one.
+            let engine = input.engine.clone().unwrap_or_else(|| source.engine.clone());
+            let version_hint = if engine.eq_ignore_ascii_case(&source.engine) {
+                source.engine_version.clone()
+            } else {
+                None
+            };
+            let resolved_version = crate::ops::describe_db_engine_versions::resolve_version(
+                &engine,
+                version_hint.as_deref(),
+            )
+            .map_err(RestoreDBInstanceToPointInTimeError::invalid_parameter_combination)?;
+            let engine_version = match resolved_version {
+                Some(entry) => Some(entry.engine_version.to_string()),
+                None => version_hint,
+            };
+
+            // Every resource this request REFERENCES by name is resolved before the instance
+            // is inserted, and a name that resolves to nothing is that resource type's
+            // modelled not-found fault — the same resolution `CreateDBInstance` does, because
+            // the restored instance is a DB instance. `DBSubnetGroupName` "is stored as a
+            // lowercase string"; a request that names none leaves the restored instance in
+            // the group the SOURCE is in.
+            let db_subnet_group_name = input
+                .db_subnet_group_name
+                .as_ref()
+                .map(|name| name.to_ascii_lowercase());
+            if let Some(name) = &db_subnet_group_name {
+                if store.resolve_db_subnet_group(&region, name).is_none() {
+                    return Err(
+                        RestoreDBInstanceToPointInTimeErrorModeled::DBSubnetGroupNotFoundFault(
+                            DBSubnetGroupNotFoundFault {
+                                message: Some(
+                                    crate::state::db_subnet_group_not_found_for_db_instance_message(
+                                        name,
+                                    ),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            }
+            let db_subnet_group_name =
+                db_subnet_group_name.or_else(|| source.db_subnet_group_name.clone());
+            // `DBParameterGroupName`: "If supplied, must match the name of an existing DB
+            // parameter group." The groups RDS provides itself are there without any request
+            // having created them, so a name of that form resolves even though this store
+            // holds no record of it.
+            if let Some(named) = &input.db_parameter_group_name {
+                if !store.db_parameter_group_exists(&region, named) {
+                    return Err(
+                        RestoreDBInstanceToPointInTimeErrorModeled::DBParameterGroupNotFoundFault(
+                            DBParameterGroupNotFoundFault {
+                                message: Some(
+                                    crate::state::db_parameter_group_not_found_message(named),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            }
+
+            let mint = store.next_mint();
+            // "Default: The same DB instance class as the original DB instance", and the same
+            // for the port, the storage and the license model the restore does not name.
+            let db_instance_class = input
+                .db_instance_class
+                .clone()
+                .unwrap_or_else(|| source.db_instance_class.clone());
+            let endpoint_port = input.port.unwrap_or(source.endpoint_port);
+            let storage_type = input
+                .storage_type
+                .clone()
+                .unwrap_or_else(|| source.storage_type.clone());
+            let db_parameter_group_name = input
+                .db_parameter_group_name
+                .clone()
+                .or_else(|| source.db_parameter_group_name.clone());
+            let option_group_name = input
+                .option_group_name
+                .clone()
+                .or_else(|| source.option_group_name.clone());
+            // "RDS checks whether you specify new tags. If yes, the new tags are added to the
+            // restored DB instance. If there are no new tags, RDS looks for the tags from the
+            // source DB instance" — the same rule the snapshot restore carries.
+            let tags = match input.tags.clone() {
+                Some(tags) if !tags.is_empty() => tags,
+                _ => source.tags.clone(),
+            };
+
+            let mut record = crate::state::DbInstanceRecord {
+                identifier: identifier.clone(),
+                region: region.clone(),
+                // A restored instance replicates nothing: it is a new instance of the
+                // source's data at an instant, not a replica of the source.
+                read_replica_source_db_instance_identifier: None,
+                read_replica_source_db_cluster_identifier: None,
+                read_replica_db_instance_identifiers: Vec::new(),
+                // The restored instance is a NEW resource: it gets its own resource id and
+                // its own endpoint host, never the source's.
+                dbi_resource_id: crate::state::mint_dbi_resource_id(mint),
+                endpoint_host: crate::state::mint_endpoint_host(mint),
+                db_instance_class,
+                engine: engine.clone(),
+                engine_version,
+                // A restored DB instance is not usable the instant the call returns: RDS
+                // answers `creating` and the instance reaches `available` on its own.
+                status: crate::state::DB_INSTANCE_STATUS_CREATING.to_string(),
+                pending_status: Some(crate::state::PendingStatus::in_a_moment(
+                    crate::state::DB_INSTANCE_STATUS_AVAILABLE,
+                )),
+                // `DBName` "doesn't apply to ... RDS for Db2, RDS for MariaDB, RDS for
+                // MySQL", whose restored instance carries the databases the source's data
+                // holds.
+                db_name: if engine_takes_restored_db_name(&engine) {
+                    input.db_name.clone().or_else(|| source.db_name.clone())
+                } else {
+                    source.db_name.clone()
+                },
+                // "Be sure to allocate enough storage for your new DB instance so that the
+                // restore operation can succeed": the request may enlarge the source's
+                // storage, and names none to keep it.
+                allocated_storage: input.allocated_storage.or(source.allocated_storage),
+                max_allocated_storage: input.max_allocated_storage,
+                // The restored instance keeps the SOURCE's master credential — the digests a
+                // login on its engine endpoint is verified against, never a password —
+                // because the restore mints no new one.
+                master_user_password: source.master_user_password.clone(),
+                master_username: source.master_username.clone(),
+                // The secret RDS manages for the master user password is minted once this
+                // scope has released the store's guard (`ManageMasterUserPassword` below), so
+                // a record built here carries none yet — and the SOURCE's secret is never
+                // carried over, since it belongs to the instance it was minted for.
+                master_user_secret: None,
+                endpoint_port,
+                // Filled in below, once the core has assigned the engine listener its port.
+                served_endpoint: None,
+                // "By default, the new DB instance is created as a single-AZ deployment."
+                multi_az: input.multi_az.unwrap_or(false),
+                // The standby of a Multi-AZ deployment, placed below from the zone the
+                // restored instance's primary is in; a restore owes no failover.
+                secondary_availability_zone: None,
+                pending_failover: false,
+                storage_throughput: input
+                    .storage_throughput
+                    .unwrap_or(source.storage_throughput),
+                storage_type,
+                // This operation has no `StorageEncrypted` or `KmsKeyId` member, so the
+                // restored instance's storage is encrypted exactly as the source's is, under
+                // the same key.
+                storage_encrypted: source.storage_encrypted,
+                kms_key_id: source.kms_key_id.clone(),
+                iops: input.iops.or(source.iops),
+                license_model: input
+                    .license_model
+                    .clone()
+                    .or_else(|| source.license_model.clone()),
+                // "Default: A random, system-chosen Availability Zone"; this emulator picks
+                // the region's first zone, stores it, and reports it from the store.
+                availability_zone: input
+                    .availability_zone
+                    .clone()
+                    .unwrap_or_else(|| format!("{region}a")),
+                // `BackupRetentionPeriod` and `PreferredBackupWindow`: "Default: Uses
+                // existing setting" — the source's.
+                backup_retention_period: input
+                    .backup_retention_period
+                    .unwrap_or(source.backup_retention_period),
+                preferred_backup_window: input
+                    .preferred_backup_window
+                    .clone()
+                    .or_else(|| source.preferred_backup_window.clone()),
+                // `PreferredMaintenanceWindow` is not a member of this operation, so the
+                // restored instance gets the window a new instance gets.
+                preferred_maintenance_window: Some(
+                    crate::state::DEFAULT_PREFERRED_MAINTENANCE_WINDOW.to_string(),
+                ),
+                publicly_accessible: input
+                    .publicly_accessible
+                    .unwrap_or(source.publicly_accessible),
+                auto_minor_version_upgrade: input
+                    .auto_minor_version_upgrade
+                    .unwrap_or(source.auto_minor_version_upgrade),
+                // `CopyTagsToSnapshot`: "By default, tags are not copied."
+                copy_tags_to_snapshot: input.copy_tags_to_snapshot.unwrap_or(false),
+                // `DeletionProtection`: "By default, deletion protection isn't enabled."
+                deletion_protection: input.deletion_protection.unwrap_or(false),
+                db_subnet_group_name,
+                db_parameter_group_name,
+                option_group_name,
+                vpc_security_group_ids: input
+                    .vpc_security_group_ids
+                    .clone()
+                    .unwrap_or_else(|| source.vpc_security_group_ids.clone()),
+                // This operation has no `DBSecurityGroups` member — the legacy EC2-Classic
+                // platform is not one a restore reaches — so the restored instance is in
+                // none.
+                db_security_group_names: Vec::new(),
+                // A restored DB instance is a standalone instance: it joins no DB cluster,
+                // which this operation has no member to name either.
+                db_cluster_identifier: None,
+                domain: input.domain.clone().or_else(|| source.domain.clone()),
+                ca_certificate_identifier: input
+                    .ca_certificate_identifier
+                    .clone()
+                    .unwrap_or_else(|| store.default_ca_certificate(&region).to_string()),
+                // `MonitoringInterval` and the Performance Insights members are not members
+                // of this operation, so Enhanced Monitoring is off and the insights mode is
+                // the one a new instance gets.
+                monitoring_interval: crate::state::DEFAULT_MONITORING_INTERVAL,
+                performance_insights_enabled: false,
+                performance_insights_kms_key_id: None,
+                performance_insights_retention_period: None,
+                iam_database_authentication_enabled: input
+                    .enable_iam_database_authentication
+                    .unwrap_or(false),
+                database_insights_mode: crate::state::DEFAULT_DATABASE_INSIGHTS_MODE.to_string(),
+                dedicated_log_volume: input.dedicated_log_volume.unwrap_or(false),
+                customer_owned_ip_enabled: input.enable_customer_owned_ip.unwrap_or(false),
+                network_type: input
+                    .network_type
+                    .clone()
+                    .unwrap_or_else(|| source.network_type.clone()),
+                // `BackupTarget`: "The default is region."
+                backup_target: input
+                    .backup_target
+                    .clone()
+                    .unwrap_or_else(|| crate::state::DEFAULT_BACKUP_TARGET.to_string()),
+                engine_lifecycle_support: input
+                    .engine_lifecycle_support
+                    .clone()
+                    .unwrap_or_else(|| source.engine_lifecycle_support.clone()),
+                // The restored instance was created NOW; the source keeps its own creation
+                // time.
+                instance_create_time: crate::state::now_as_wire_timestamp(),
+                engine_started_at: crate::state::now_as_wire_timestamp(),
+                tags,
+                // A restore publishes no `AssociatedRoles` member, so the restored instance
+                // starts with none of the source's associations: each one is made against the
+                // instance that carries it.
+                associated_roles: Vec::new(),
+                // A restored instance has nothing staged for its maintenance window: a
+                // deferred modification belongs to the instance it was staged on.
+                deferred_modification: None,
+                engine_log: crate::state::InstanceLog::default(),
+                // `EnableCloudwatchLogsExports`: "the list of logs that the restored DB
+                // instance is to export to CloudWatch Logs" — the restored instance's own
+                // configuration, and nothing for a request that named none.
+                enabled_cloudwatch_logs_exports: input
+                    .enable_cloudwatch_logs_exports
+                    .clone()
+                    .unwrap_or_default(),
+                general_query_log: crate::state::InstanceLog::default(),
+                // The restored instance's continuous backup is its OWN: it starts from the
+                // data this restore loads, and records a point of its own at each commit.
+                recovery_points: Vec::new(),
+            };
+            record.engine_log.record(format!(
+                "DB instance {} restored from {} at {}; status {}",
+                record.identifier,
+                named_source.describe(),
+                instant_as_text(restore_time),
+                record.status
+            ));
+            // `MultiAZ`: an instance restored as a Multi-AZ deployment has a STANDBY in
+            // another Availability Zone of its Region, which is what
+            // `SecondaryAvailabilityZone` names; a Single-AZ one has none.
+            record.place_multi_az_standby();
+            (record, restored_from)
+        };
+
+        // The restored instance's own ENGINE ENDPOINT, opened with the state lock released,
+        // exactly as a create opens one: binding is asynchronous and the core owns the
+        // socket, the bind interface and the port. It is opened AFTER every refusal above has
+        // been answered, and before the record is admitted to the store.
+        let endpoint = match crate::state::engine_wire(&record.engine) {
+            Some(wire) => Some(
+                crate::state::open_engine_endpoint(
+                    &*self.engine,
+                    &state,
+                    crate::state::EngineEndpointPlan {
+                        target: crate::state::SessionTarget::DbInstance {
+                            region: region.clone(),
+                            resource_id: record.dbi_resource_id.clone(),
+                        },
+                        wire,
+                        role: crate::state::EndpointRole::Writer,
+                        // A DB instance publishes ONE address, its own `Endpoint`: no
+                        // read-only endpoint is opened for it.
+                        reader: false,
+                        storage: None,
+                        callback: ctx.callback().clone(),
+                    },
+                )
+                .await
+                .map_err(RestoreDBInstanceToPointInTimeError::internal_failure)?,
+            ),
+            // An engine whose native wire this emulator does not speak: no listener is opened
+            // and the instance keeps the DNS-form endpoint this service has always reported
+            // for it, rather than publishing a port that would answer nothing.
+            None => None,
+        };
+        record.served_endpoint = endpoint
+            .as_ref()
+            .map(|endpoint| endpoint.endpoint.clone());
+        // `ManageMasterUserPassword` has RDS "generate and manage the master user password
+        // with Amazon Web Services Secrets Manager" for the instance this call creates, and
+        // report the secret it created as `MasterUserSecret` — a NEW secret of the restored
+        // instance's own, which is why the restored record then carries the generated
+        // credential rather than the source's.
+        if input.manage_master_user_password == Some(true) {
+            let minted = crate::state::mint_master_user_secret(
+                &*self.engine,
+                ctx,
+                &region,
+                &crate::state::MasterSecretRequest {
+                    name: &crate::state::instance_master_user_secret_name(
+                        &record.dbi_resource_id,
+                    ),
+                    username: record.master_username.as_deref(),
+                    engine: &record.engine,
+                    owner: crate::state::ManagedSecretOwner::db_instance(
+                        &crate::state::db_instance_arn(&region, &record.identifier),
+                    ),
+                    kms_key_id: input.master_user_secret_kms_key_id.as_deref(),
+                },
+            )
+            .await
+            .map_err(RestoreDBInstanceToPointInTimeError::internal_failure)?;
+            record.master_user_password = record.master_username.as_deref().map(|username| {
+                crate::state::data_plane::wire_session::MasterPasswordHash::new(
+                    username,
+                    &minted.password,
+                )
+            });
+            record.master_user_secret = Some(minted.secret);
+        }
+        // THE RESTORE ITSELF: the data the source held at the restored instant is loaded into
+        // the new instance's own storage, by the engine, before the endpoint is published —
+        // so the first session a client opens on it finds the rows the source had committed by
+        // then and none it committed afterwards. A source with no storage at all (an engine
+        // this emulator serves no data plane for) leaves the new storage empty, which is all
+        // there is to restore.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RestoreDBInstanceToPointInTime"))
+        // On a blocking task and with no state lock held: the copy is engine work, bounded by
+        // the engine's own copy deadline, exactly as the capture that recorded the point was.
+        if let (Some(endpoint), Some(storage)) = (endpoint.as_ref(), restored_from) {
+            let destination = endpoint.database();
+            ::tokio::task::spawn_blocking(move || destination.load_from(&storage))
+                .await
+                .map_err(|error| {
+                    RestoreDBInstanceToPointInTimeError::internal_failure(format!(
+                        "the DB instance's data could not be restored: {error}"
+                    ))
+                })?
+                .map_err(|error| {
+                    RestoreDBInstanceToPointInTimeError::internal_failure(format!(
+                        "the DB instance's data could not be restored: {}",
+                        error.message
+                    ))
+                })?;
+        }
+        // The restored instance's CONTINUOUS BACKUP starts from the data this restore loaded,
+        // so an instant before its own first commit has that state to be restored to rather
+        // than a later commit's.
+        crate::state::data_plane::continuous_backup::record_initial_state(
+            &mut record,
+            endpoint.as_ref(),
+        )
+        .await;
+
+        // Another request may have created this identifier while this one was binding, so the
+        // conflict is answered again here rather than overwriting a stored instance — and a
+        // secret minted for this instance is deleted rather than left behind, since the
+        // instance that would have reported it is not created.
+        let taken = {
+            let store = state.lock();
+            store.db_instances.contains_key(&key)
+        };
+        if taken {
+            if let Some(secret) = &record.master_user_secret {
+                crate::state::release_orphaned_master_user_secret(
+                    &*self.engine,
+                    ctx,
+                    &region,
+                    &crate::state::db_instance_arn(&region, &record.identifier),
+                    &secret.secret_arn,
+                )
+                .await;
+            }
+            return Err(
+                RestoreDBInstanceToPointInTimeErrorModeled::DBInstanceAlreadyExistsFault(
+                    DBInstanceAlreadyExistsFault {
+                        message: Some(
+                            crate::state::DB_INSTANCE_ALREADY_EXISTS_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+        let mut store = state.lock();
+
+        let db_instance = store.instance_to_wire(&record);
+        let dbi_resource_id = record.dbi_resource_id.clone();
+        let instance_arn = record.arn();
+        let engine = record.engine.clone();
+        let monitoring = ::service_common::db_data_sources::MonitoringConfiguration {
+            performance_insights_enabled: record.performance_insights_enabled,
+            database_insights_mode: Some(record.database_insights_mode.clone()),
+        };
+        store.db_instances.insert(key.clone(), record);
+        // The listener is the instance's: the store holds it, so it stays open for as long as
+        // the instance does and closes with it.
+        if let Some(endpoint) = endpoint {
+            store.db_engine_endpoints.insert(key, endpoint);
+        }
+        // A DB instance was created, so the region's event log records it: the restore is how
+        // this one came to exist, and `DescribeEvents` reports that entry for it from now on.
+        store.record_event(
+            &region,
+            crate::state::events::DB_INSTANCE_CREATED,
+            &identifier,
+            instance_arn,
+        );
+        // The id just minted is recorded in the SHARED data-source directory, exactly as
+        // `CreateDBInstance` records one, so a service that monitors this instance can tell
+        // that THIS service owns the id. The RDS store is already locked here and the
+        // directory is taken second, the order its doc fixes.
+        if let Some(directory) = crate::state::data_source_directory(&*self.engine) {
+            let mut directory = directory.lock();
+            directory.register(
+                &dbi_resource_id,
+                ::service_common::db_data_sources::SERVICE_TYPE_RDS,
+                &engine,
+            );
+            directory.record_monitoring(&dbi_resource_id, monitoring);
+        }
+
+        Ok(RestoreDBInstanceToPointInTimeOutput {
+            db_instance: Some(db_instance),
+        })
     }
+}
+
+/// How a request named the source instance to restore: by its identifier
+/// (`SourceDBInstanceIdentifier`) or by its resource id (`SourceDbiResourceId`). Exactly one
+/// of the two names one.
+enum NamedSource {
+    Identifier(String),
+    ResourceId(String),
+}
+
+impl NamedSource {
+    /// The source as the refusal and the restored instance's own log name it.
+    fn describe(&self) -> String {
+        match self {
+            Self::Identifier(named) | Self::ResourceId(named) => named.clone(),
+        }
+    }
+}
+
+/// An instant as this service writes one into a refusal and a log line: the UTC date and time
+/// `RestoreTime` itself is given in ("Must be a time in Universal Coordinated Time (UTC)
+/// format. Example: 2009-09-07T23:45:00Z").
+fn instant_as_text(at: ::aws_smithy_types::DateTime) -> String {
+    at.fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_else(|_| at.as_secs_f64().to_string())
+}
+
+/// Whether `engine` is one of the engines whose restored DB instance takes its database name
+/// from this request.
+///
+/// `DBName` on this operation "doesn't apply to the following DB instances: RDS Custom, RDS
+/// for Db2, RDS for MariaDB, RDS for MySQL" — those restore the databases the source's data
+/// holds. The engines are matched by the prefix their published `Engine` values share.
+fn engine_takes_restored_db_name(engine: &str) -> bool {
+    let engine = engine.to_ascii_lowercase();
+    !["db2", "mariadb", "mysql", "custom-"]
+        .iter()
+        .any(|family| engine.starts_with(family))
 }

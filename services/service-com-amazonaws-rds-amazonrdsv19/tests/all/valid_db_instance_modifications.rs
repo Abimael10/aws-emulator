@@ -1189,8 +1189,9 @@ async fn the_reported_bounds_are_the_ones_modify_enforces() {
         match row.outcome {
             Ok(allocated) => {
                 expect_ok(case, response);
-                // Read the instance back: what a modification the bounds admit stores is
-                // what a later caller sees.
+                // Read the instance back once the modification has been applied: what a
+                // modification the bounds admit stores is what a later caller sees.
+                wait_for_settle();
                 let body = expect_ok(
                     case,
                     call(

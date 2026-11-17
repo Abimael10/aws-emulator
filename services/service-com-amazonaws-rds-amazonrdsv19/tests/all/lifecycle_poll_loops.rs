@@ -1253,7 +1253,10 @@ async fn modifying_multi_az_places_and_removes_the_standby() {
          {standby:?}"
     );
 
-    // Turning Multi-AZ on gives the instance a standby, in another zone of its Region.
+    // Turning Multi-AZ on gives the instance a standby, in another zone of its Region. The
+    // modification is applied when the instance finishes modifying, so the ANSWER reports the
+    // deployment the instance is still running in and the requested one as pending, and the
+    // SETTLED read reports the deployment it ended up in.
     let modified = expect_ok(
         case,
         call(
@@ -1267,25 +1270,39 @@ async fn modifying_multi_az_places_and_removes_the_standby() {
         )
         .await,
     );
+    let answered = the_instance(case, &modified);
+    assert_eq!(
+        deployment(&answered),
+        ("false".to_string(), primary.clone(), None),
+        "case {case:?}: the answer must report the deployment the instance is still running \
+         in, got {answered}"
+    );
+    let staged = subtrees(&answered, "PendingModifiedValues")
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("case {case:?}: the change must be pending: {answered}"));
+    assert_eq!(
+        text(&staged, "MultiAZ"),
+        "true",
+        "case {case:?}: the requested deployment must be reported as pending, got {staged}"
+    );
     let turned_on = poll_available_in(&router, REGION, case, identifier).await;
-    for (what, instance) in [("the answer", &modified), ("the settled read", &turned_on)] {
-        let instance = the_instance(case, instance);
-        let (multi_az, now_primary, now_standby) = deployment(&instance);
-        assert_eq!(
-            (multi_az.as_str(), now_primary.as_str()),
-            ("true", primary.as_str()),
-            "case {case:?}: {what} must report the Multi-AZ deployment on the zone the \
-             instance already ran in, got {instance}"
-        );
-        let placed = now_standby.unwrap_or_else(|| {
-            panic!("case {case:?}: {what} must report a secondary zone: {instance}")
-        });
-        assert!(
-            placed != primary && zones.contains(&placed),
-            "case {case:?}: {what} must place the standby in another zone of {REGION}, got \
-             {placed:?}"
-        );
-    }
+    let settled = the_instance(case, &turned_on);
+    let (multi_az, now_primary, now_standby) = deployment(&settled);
+    assert_eq!(
+        (multi_az.as_str(), now_primary.as_str()),
+        ("true", primary.as_str()),
+        "case {case:?}: the settled read must report the Multi-AZ deployment on the zone the \
+         instance already ran in, got {settled}"
+    );
+    let placed = now_standby.unwrap_or_else(|| {
+        panic!("case {case:?}: the settled read must report a secondary zone: {settled}")
+    });
+    assert!(
+        placed != primary && zones.contains(&placed),
+        "case {case:?}: the settled read must place the standby in another zone of {REGION}, \
+         got {placed:?}"
+    );
 
     // And a failover is now something the instance can be rebooted through.
     reboot(&router, REGION, case, identifier, Some(true)).await;
@@ -1302,7 +1319,8 @@ async fn modifying_multi_az_places_and_removes_the_standby() {
         "case {case:?}: the forced failover must promote the standby, got {failed_over}"
     );
 
-    // Turning Multi-AZ off takes the standby away: there is no second zone to report.
+    // Turning Multi-AZ off takes the standby away: there is no second zone to report once
+    // the modification has been applied, and the answer reports the removal as pending.
     let turned_off = expect_ok(
         case,
         call(
@@ -1316,11 +1334,16 @@ async fn modifying_multi_az_places_and_removes_the_standby() {
         )
         .await,
     );
+    let answered = the_instance(case, &turned_off);
+    let staged = subtrees(&answered, "PendingModifiedValues")
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("case {case:?}: the change must be pending: {answered}"));
     assert_eq!(
-        deployment(&the_instance(case, &turned_off)),
-        ("false".to_string(), promoted_primary.clone(), None),
-        "case {case:?}: turning Multi-AZ off must leave the instance with no standby, got \
-         {turned_off}"
+        text(&staged, "MultiAZ"),
+        "false",
+        "case {case:?}: the requested Single-AZ deployment must be reported as pending, got \
+         {staged}"
     );
     let single_again = poll_available_in(&router, REGION, case, identifier).await;
     assert_eq!(

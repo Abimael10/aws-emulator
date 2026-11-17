@@ -391,6 +391,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::check_performance_insights_retention_period(period)
                 .map_err(ModifyDBInstanceError::invalid_parameter_value)?;
         }
+        // The log types `CloudwatchLogsExportConfiguration` names are STORED on the instance
+        // and are what the groups below are provisioned from, so each list's length and each
+        // entry are bounded where they enter the handler, exactly as `ModifyDBCluster` bounds
+        // the same member: a request that names more than this service stores is refused
+        // rather than fixing a list of the caller's choosing on the record.
+        if let Some(exports) = &input.cloudwatch_logs_export_configuration {
+            for (member, values) in [
+                ("EnableLogTypes", exports.enable_log_types.as_ref()),
+                ("DisableLogTypes", exports.disable_log_types.as_ref()),
+            ] {
+                if let Some(values) = values {
+                    crate::state::check_request_list_len(
+                        member,
+                        values.len(),
+                        crate::state::MAX_CLUSTER_LIST_ENTRIES,
+                    )
+                    .map_err(ModifyDBInstanceError::invalid_parameter_value)?;
+                    for value in values {
+                        crate::state::check_free_form(member, value)
+                            .map_err(ModifyDBInstanceError::invalid_parameter_value)?;
+                    }
+                }
+            }
+        }
 
         // No store means this service was mounted on an engine it has no state in,
         // so it cannot serve the operation at all. Unreachable with the engine the
@@ -782,6 +806,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // The CloudWatch Logs group a log type this modification turns ON is exported to is a
+        // group RDS publishes under its own name, so it exists from the moment the
+        // configuration that turns that log on is accepted rather than from the first line
+        // written into it: a client reads the group to confirm the export is on, and attaches
+        // a retention policy or a subscription filter to it, before the engine has logged
+        // anything. The lines themselves go into that same group
+        // ([`crate::state::data_plane::log_export`]). Best effort, and awaited here with NO
+        // store guard held — the modification has been accepted by this point, and the group
+        // is named after the identifier the instance carries once it has been applied.
+        let exported_identifier = match (input.apply_immediately == Some(true), &renamed_to) {
+            (true, Some(renamed)) => renamed.clone(),
+            _ => identifier.clone(),
+        };
+        for log_type in input
+            .cloudwatch_logs_export_configuration
+            .as_ref()
+            .and_then(|configuration| configuration.enable_log_types.as_ref())
+            .into_iter()
+            .flatten()
+        {
+            ::service_common::cloudwatch_logs::provisioned(
+                ctx,
+                &region,
+                &crate::state::data_plane::log_export::instance_log_group(
+                    &exported_identifier,
+                    log_type,
+                ),
+            )
+            .await;
+        }
         let mut store = state.lock();
         let resolved_engine_version = accepted.resolved_engine_version;
         let moved_to_subnet_group = accepted.moved_to_subnet_group;
@@ -856,25 +910,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                 })
             }),
+            // "The configuration setting for the log types to be enabled for export to
+            // CloudWatch Logs": a `PendingCloudwatchLogsExports` member of its own, so the
+            // change is staged and reported as pending exactly as the settings above are,
+            // and the instance's `EnabledCloudwatchLogsExports` lists the types it is
+            // exporting NOW until the change is applied.
+            cloudwatch_logs_exports: input.cloudwatch_logs_export_configuration.map(
+                |exports| crate::state::PendingLogExports {
+                    enable: exports.enable_log_types.unwrap_or_default(),
+                    disable: exports.disable_log_types.unwrap_or_default(),
+                },
+            ),
+            // Filled in below for a modification the caller asked to apply as soon as
+            // possible; a deferred one waits for the maintenance window.
+            apply_at: None,
         };
-        let mut changed = !staged.is_empty();
+        let mut changed = false;
+        let mut staged = staged;
         if retention_applies_at_once {
             if let Some(value) = input.backup_retention_period {
                 changed = true;
                 record.backup_retention_period = value;
             }
         }
+        // `NewDBInstanceIdentifier` is the one staged setting the control plane applies AT
+        // ONCE where the caller asked for it: "when you change the DB instance identifier, an
+        // instance reboot occurs immediately if you enable ApplyImmediately, or will occur
+        // during the next maintenance window if you disable ApplyImmediately" — the rename
+        // itself is what the reboot follows, so the instance is renamed here and is reported
+        // under its new identifier from this answer on.
         if apply_immediately {
-            // "the modifications in this request and any pending modifications are
-            // asynchronously applied as soon as possible": what an earlier call staged is
-            // applied first, so a setting THIS request also names still wins.
-            changed |= record.apply_deferred_modification();
-            staged.apply(&mut record);
-        } else if !staged.is_empty() {
-            record
+            if let Some(renamed) = staged.identifier.take() {
+                changed = true;
+                record.identifier = renamed;
+            }
+        }
+        // WHEN the staged settings land: `ApplyImmediately` "specifies whether the
+        // modifications in this request and any pending modifications are ASYNCHRONOUSLY
+        // applied as soon as possible", so an immediate modification is owed at an instant of
+        // its own rather than applied inside this call — the instance keeps the settings it is
+        // running under, reports the requested ones as pending and reports itself `modifying`
+        // until that instant, which is the same span every transition this service owes
+        // takes. The two are owed from the SAME instant, so a caller never reads an instance
+        // that is `available` with the change still pending or one that has applied it while
+        // still `modifying`.
+        let accepted_at = ::std::time::Instant::now();
+        if !staged.is_empty() || apply_immediately {
+            let pending = record
                 .deferred_modification
-                .get_or_insert_with(crate::state::DeferredModification::default)
-                .stage(staged);
+                .get_or_insert_with(crate::state::DeferredModification::default);
+            pending.stage(staged);
+            if apply_immediately {
+                pending.apply_at = Some(accepted_at + crate::state::STATUS_TRANSITION_DELAY);
+            }
+            // A request that asked for an immediate application while nothing at all is
+            // staged has nothing to apply: the instance keeps no empty pending record, which
+            // `PendingModifiedValues` is "returned only when there are pending changes" for.
+            if pending.is_empty() {
+                record.deferred_modification = None;
+            } else {
+                changed = true;
+            }
         }
         if let Some(value) = input.max_allocated_storage {
             changed = true;
@@ -1010,9 +1106,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         if changed {
             // RDS answers a modification with the instance in `modifying`; it settles
-            // back to `available` on its own.
+            // back to `available` on its own, at the instant the settings it staged are
+            // applied (`accepted_at` above).
             record.status = "modifying".to_string();
-            record.pending_status = Some(crate::state::PendingStatus::in_a_moment("available"));
+            record.pending_status = Some(crate::state::PendingStatus::in_a_moment_after(
+                accepted_at,
+                "available",
+            ));
         }
 
         let db_instance = store.instance_to_wire(&record);

@@ -565,3 +565,135 @@ async fn an_aurora_mysql_cluster_group_publishes_the_engines_first_cluster_param
         );
     }
 }
+
+/// One row of the membership table: a parameter of the instance's own group, the value and
+/// apply method a request sets it with, and the `ParameterApplyStatus` the instance's
+/// membership in that group then reports.
+///
+/// `ModifyDBParameterGroup` is the rule: "changes to dynamic parameters are applied
+/// immediately" while "changes to static parameters require a reboot ... before the change
+/// can take effect". The parameters and their apply types come from this service's own
+/// published catalog for the family (`crate::state::published_db_parameters`), so a row
+/// cannot drift from the catalog the status is decided against.
+const MEMBERSHIP_ROWS: &[(&str, &str, &str, &str, &str)] = &[
+    (
+        "a dynamic parameter applied immediately",
+        "log_statement",
+        "all",
+        "immediate",
+        "in-sync",
+    ),
+    (
+        "a dynamic parameter the caller defers to a reboot",
+        "log_statement",
+        "all",
+        "pending-reboot",
+        "pending-reboot",
+    ),
+    (
+        "a static parameter, which can only be applied by a reboot",
+        "shared_buffers",
+        "16384",
+        "pending-reboot",
+        "pending-reboot",
+    ),
+];
+
+#[tokio::test]
+async fn the_membership_reports_whether_the_group_is_waiting_on_a_reboot() {
+    for (row, (case, parameter, value, apply_method, expected)) in
+        MEMBERSHIP_ROWS.iter().enumerate()
+    {
+        let router = emulator();
+        let group = format!("emu-apply-status-{row}");
+        let identifier = format!("emu-apply-status-{row}");
+        create_db_group(&router, case, &group, "postgres18").await;
+        expect_ok(
+            case,
+            call(
+                &router,
+                "CreateDBInstance",
+                &[
+                    ("DBInstanceIdentifier", identifier.clone()),
+                    ("Engine", "postgres".to_string()),
+                    ("DBInstanceClass", "db.t3.micro".to_string()),
+                    ("AllocatedStorage", "20".to_string()),
+                    ("MasterUsername", "pgadmin".to_string()),
+                    ("MasterUserPassword", "a-strong-password-1".to_string()),
+                    ("DBParameterGroupName", group.clone()),
+                ],
+            )
+            .await,
+        );
+        crate::db_instances::wait_for_settle();
+        // A group nobody has modified is in sync: there is no change for a reboot to apply.
+        assert_eq!(
+            membership_status(&router, case, &identifier).await,
+            "in-sync",
+            "case {case:?}: a group with no change of its own is in sync"
+        );
+
+        expect_ok(
+            case,
+            call(
+                &router,
+                "ModifyDBParameterGroup",
+                &[
+                    ("DBParameterGroupName", group.clone()),
+                    ("Parameters.Parameter.1.ParameterName", (*parameter).to_string()),
+                    ("Parameters.Parameter.1.ParameterValue", (*value).to_string()),
+                    ("Parameters.Parameter.1.ApplyMethod", (*apply_method).to_string()),
+                ],
+            )
+            .await,
+        );
+        let status = membership_status(&router, case, &identifier).await;
+        assert_eq!(
+            status, *expected,
+            "case {case:?}: expected the membership to report {expected:?}, got {status:?}"
+        );
+
+        // And the reboot is what clears it: "changes to static parameters require a reboot",
+        // so an instance whose engine has come up again since the change is in sync.
+        if *expected != "in-sync" {
+            expect_ok(
+                case,
+                call(
+                    &router,
+                    "RebootDBInstance",
+                    &[("DBInstanceIdentifier", identifier.clone())],
+                )
+                .await,
+            );
+            crate::db_instances::wait_for_settle();
+            let status = membership_status(&router, case, &identifier).await;
+            assert_eq!(
+                status, "in-sync",
+                "case {case:?}: the reboot applies the change, so the membership is in sync \
+                 again, got {status:?}"
+            );
+        }
+    }
+}
+
+/// The `ParameterApplyStatus` of the DB parameter group `identifier` is a member of.
+async fn membership_status(
+    router: &MultiServiceRouter,
+    case: &str,
+    identifier: &str,
+) -> String {
+    let body = expect_ok(
+        case,
+        call(
+            router,
+            "DescribeDBInstances",
+            &[("DBInstanceIdentifier", identifier)],
+        )
+        .await,
+    );
+    let membership = crate::db_instances::subtrees(&body, "DBParameterGroup")
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("case {case:?}: expected a parameter-group membership: {body}"));
+    text(&membership, "ParameterApplyStatus")
+}

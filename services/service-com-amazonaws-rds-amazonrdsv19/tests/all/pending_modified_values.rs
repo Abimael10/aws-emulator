@@ -30,7 +30,8 @@ use service_com_amazonaws_rds_amazonrdsv19::state::STATUS_TRANSITION_DELAY;
 use std::time::{Duration, SystemTime};
 
 use crate::db_instances::{
-    call, emulator, expect_error, expect_ok, optional_text, subtrees, text, wait_for_settle,
+    call, emulator, expect_error, expect_ok, optional_text, subtrees, text, texts,
+    wait_for_settle,
 };
 
 /// `[(name, value.to_string()), ..]` — the query parameters of one call.
@@ -331,6 +332,248 @@ async fn apply_immediately_enabled_applies_the_request_and_what_was_pending() {
         "an instance with everything applied reports no PendingModifiedValues, got \
          {read_back}"
     );
+}
+
+/// The log types the export-configuration cases turn on and off, in the order the member
+/// takes them. The types come from `EnableCloudwatchLogsExports`' own publication for the
+/// PostgreSQL engines — `postgresql` and `upgrade` — so the table spans more than the one
+/// type a single case would.
+const EXPORTED_LOG_TYPES: &[&str] = &["postgresql", "upgrade"];
+
+#[tokio::test]
+async fn a_modification_asked_for_at_once_is_pending_until_the_instance_is_available() {
+    let router = emulator();
+    // The rule is about WHEN a staged setting lands, so the table is the same set of
+    // deferrable settings the window case is driven over: each one asked for AS SOON AS
+    // POSSIBLE this time.
+    for case in DEFERRED {
+        let identifier = format!("{}-now", case.identifier);
+        an_instance(&router, &identifier, &[]).await;
+        let modified = expect_ok(
+            case.case,
+            call(
+                &router,
+                "ModifyDBInstance",
+                &params![
+                    "DBInstanceIdentifier" => &identifier,
+                    "ApplyImmediately" => true,
+                    case.member => case.value,
+                ],
+            )
+            .await,
+        );
+        let answered = subtrees(&modified, "DBInstance")
+            .into_iter()
+            .next()
+            .expect("the modification answers with the instance");
+        // A rename is the one change the control plane applies at once: "an instance reboot
+        // occurs immediately if you enable ApplyImmediately", and the rename is what that
+        // reboot follows. Every other setting is applied when the instance finishes
+        // modifying, so until then the instance reports what it is RUNNING and the requested
+        // value is reported as pending.
+        let renaming = case.member == "NewDBInstanceIdentifier";
+        let live = optional_text(&answered, case.reported_as);
+        let expected_live = if renaming { case.value } else { case.was };
+        assert_eq!(
+            live.as_deref(),
+            Some(expected_live),
+            "case {:?}: expected the live {} to read {expected_live:?} while the change is \
+             applied, got {live:?}",
+            case.case,
+            case.reported_as
+        );
+        if !renaming {
+            let staged = pending(&answered).unwrap_or_else(|| {
+                panic!(
+                    "case {:?}: a modification being applied must report \
+                     PendingModifiedValues, got {answered}",
+                    case.case
+                )
+            });
+            let reported = optional_text(&staged, case.pending_as);
+            assert_eq!(
+                reported.as_deref(),
+                Some(case.value),
+                "case {:?}: expected {} reported as pending, got {reported:?}",
+                case.case,
+                case.pending_as
+            );
+            let status = optional_text(&answered, "DBInstanceStatus");
+            assert_eq!(
+                status.as_deref(),
+                Some("modifying"),
+                "case {:?}: an instance with a change still being applied reports modifying, \
+                 got {status:?}",
+                case.case
+            );
+        }
+        // The change CLEARS as it is applied, and the instance is available again at the
+        // same moment: a client that waits for the pending value to go finds the instance
+        // available, never one that is still modifying. Read until it holds rather than
+        // waited on for a fixed time. A rename has nothing pending — it was applied in the
+        // call — so what is waited for there is the instance coming back from the reboot the
+        // rename causes.
+        let settled_identifier = if renaming { case.value } else { &identifier };
+        let deadline = SystemTime::now() + POLL_DEADLINE;
+        loop {
+            let read_back = describe(&router, case.case, settled_identifier).await;
+            let status = optional_text(&read_back, "DBInstanceStatus");
+            let settled = if renaming {
+                status.as_deref() == Some("available")
+            } else {
+                pending(&read_back).is_none()
+            };
+            if settled {
+                assert_eq!(
+                    status.as_deref(),
+                    Some("available"),
+                    "case {:?}: the instance must be available once nothing is pending, got \
+                     {read_back}",
+                    case.case
+                );
+                let live = optional_text(&read_back, case.reported_as);
+                // `DbInstancePort` reports the port of a CLUSTER MEMBER and zero for an
+                // instance that belongs to no DB cluster, which every instance here is, so
+                // the applied value is not observable on that member — what this row asserts
+                // is that the staged port stops being pending.
+                if case.reported_as != "DbInstancePort" {
+                    assert_eq!(
+                        live.as_deref(),
+                        Some(case.value),
+                        "case {:?}: expected {} applied to {:?}, got {live:?}",
+                        case.case,
+                        case.reported_as,
+                        case.value
+                    );
+                }
+                break;
+            }
+            assert!(
+                SystemTime::now() < deadline,
+                "case {:?}: the change asked for at once must be applied, last read \
+                 {read_back}",
+                case.case
+            );
+            std::thread::sleep(POLL_INTERVAL);
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_log_export_configuration_is_pending_and_then_lists_the_types_it_enabled() {
+    let router = emulator();
+    an_instance(&router, "emu-log-exports", &[]).await;
+    let created = describe(&router, "the created instance", "emu-log-exports").await;
+    assert_eq!(
+        subtrees(&created, "EnabledCloudwatchLogsExports").len(),
+        1,
+        "an instance created with no export reports an empty list, got {created}"
+    );
+    assert_eq!(
+        texts_in(&created, "EnabledCloudwatchLogsExports"),
+        Vec::<String>::new(),
+        "an instance created with no export exports nothing, got {created}"
+    );
+
+    // Each type is enabled, read back, and disabled again: "the enabled types appear in
+    // PendingModifiedValues.PendingCloudwatchLogsExports while pending and in
+    // DBInstance.EnabledCloudwatchLogsExports once applied, and are removed again when
+    // disabled."
+    for log_type in EXPORTED_LOG_TYPES {
+        let modified = expect_ok(
+            log_type,
+            call(
+                &router,
+                "ModifyDBInstance",
+                &params![
+                    "DBInstanceIdentifier" => "emu-log-exports",
+                    "ApplyImmediately" => true,
+                    "CloudwatchLogsExportConfiguration.EnableLogTypes.member.1" => log_type,
+                ],
+            )
+            .await,
+        );
+        let answered = subtrees(&modified, "DBInstance")
+            .into_iter()
+            .next()
+            .expect("the modification answers with the instance");
+        let staged = pending(&answered).unwrap_or_else(|| {
+            panic!("case {log_type:?}: the change must be reported as pending, got {answered}")
+        });
+        let pending_exports = subtrees(&staged, "PendingCloudwatchLogsExports")
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| {
+                panic!("case {log_type:?}: expected PendingCloudwatchLogsExports, got {staged}")
+            });
+        let enabling = texts_in(&pending_exports, "LogTypesToEnable");
+        assert_eq!(
+            enabling,
+            vec![(*log_type).to_string()],
+            "case {log_type:?}: expected the type reported as being enabled, got {enabling:?}"
+        );
+        let listed = poll_until_exports(&router, log_type, |exports| {
+            exports.contains(&(*log_type).to_string())
+        })
+        .await;
+        assert!(
+            listed.contains(&(*log_type).to_string()),
+            "case {log_type:?}: expected the applied export to be listed, got {listed:?}"
+        );
+
+        // And disabling it takes it off the list again.
+        expect_ok(
+            log_type,
+            call(
+                &router,
+                "ModifyDBInstance",
+                &params![
+                    "DBInstanceIdentifier" => "emu-log-exports",
+                    "ApplyImmediately" => true,
+                    "CloudwatchLogsExportConfiguration.DisableLogTypes.member.1" => log_type,
+                ],
+            )
+            .await,
+        );
+        let listed = poll_until_exports(&router, log_type, |exports| {
+            !exports.contains(&(*log_type).to_string())
+        })
+        .await;
+        assert!(
+            !listed.contains(&(*log_type).to_string()),
+            "case {log_type:?}: expected the disabled export to be gone, got {listed:?}"
+        );
+    }
+}
+
+/// The values of every `<member>` of the list element `named` of `xml`, in order.
+fn texts_in(xml: &str, named: &str) -> Vec<String> {
+    subtrees(xml, named)
+        .into_iter()
+        .flat_map(|list| texts(&list, "member"))
+        .collect()
+}
+
+/// Read `emu-log-exports` until its `EnabledCloudwatchLogsExports` satisfies `holds`, and
+/// answer the list it reported then.
+async fn poll_until_exports(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    case: &str,
+    holds: impl Fn(&[String]) -> bool,
+) -> Vec<String> {
+    let deadline = SystemTime::now() + POLL_DEADLINE;
+    loop {
+        let read_back = describe(router, case, "emu-log-exports").await;
+        let exports = texts_in(&read_back, "EnabledCloudwatchLogsExports");
+        if holds(&exports) {
+            return exports;
+        }
+        assert!(
+            SystemTime::now() < deadline,
+            "case {case:?}: the export configuration must be applied, last read {read_back}"
+        );
+        std::thread::sleep(POLL_INTERVAL);
+    }
 }
 
 #[tokio::test]

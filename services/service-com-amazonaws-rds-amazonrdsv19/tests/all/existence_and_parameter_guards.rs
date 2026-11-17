@@ -299,7 +299,7 @@ async fn modify_resolves_the_db_subnet_group_it_moves_the_instance_to() {
         ("the stored group", "emu-move-subnets"),
         ("the account's default group", DEFAULT_DB_SUBNET_GROUP),
     ] {
-        let body = expect_ok(
+        expect_ok(
             case,
             call(
                 &router,
@@ -309,10 +309,21 @@ async fn modify_resolves_the_db_subnet_group_it_moves_the_instance_to() {
                     // Moving the instance to another DB subnet group "causes an outage
                     // during the change. The change is applied during the next maintenance
                     // window, unless you enable ApplyImmediately" — and what this case is
-                    // about is the group the instance ends up in.
+                    // about is the group the instance ends up in, which is the group it
+                    // reports once the modification has been applied.
                     "ApplyImmediately" => true,
                     "DBSubnetGroupName" => group,
                 ],
+            )
+            .await,
+        );
+        wait_for_settle();
+        let body = expect_ok(
+            case,
+            call(
+                &router,
+                "DescribeDBInstances",
+                &params!["DBInstanceIdentifier" => "emu-move-me"],
             )
             .await,
         );
@@ -321,7 +332,6 @@ async fn modify_resolves_the_db_subnet_group_it_moves_the_instance_to() {
             reported, group,
             "case {case:?}: expected the stored DB subnet group {group}, got {reported:?}"
         );
-        wait_for_settle();
     }
 }
 
@@ -469,7 +479,7 @@ async fn create_and_modify_resolve_the_engine_version_against_the_report() {
         400,
         "InvalidParameterCombination",
     );
-    let body = expect_ok(
+    expect_ok(
         "a version postgres does have",
         call(
             &router,
@@ -478,10 +488,21 @@ async fn create_and_modify_resolve_the_engine_version_against_the_report() {
                 "DBInstanceIdentifier" => "emu-modver",
                 // An engine-version change is "applied during the next maintenance window
                 // unless the ApplyImmediately parameter is enabled for this request", and
-                // what this case is about is the version the instance ends up running.
+                // what this case is about is the version the instance ends up running — the
+                // one it reports once the modification has been applied.
                 "ApplyImmediately" => true,
                 "EngineVersion" => &versions[0],
             ],
+        )
+        .await,
+    );
+    wait_for_settle();
+    let body = expect_ok(
+        "the version the instance ends up running",
+        call(
+            &router,
+            "DescribeDBInstances",
+            &params!["DBInstanceIdentifier" => "emu-modver"],
         )
         .await,
     );

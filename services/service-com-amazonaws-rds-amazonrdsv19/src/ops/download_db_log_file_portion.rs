@@ -218,9 +218,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             }
         };
-        // The instance writes the one log file its engine names, so any other name names
-        // no log file of this instance.
-        if input.log_file_name != instance.log_file_name() {
+        // The instance has the log files it has written ([`crate::state::DbInstanceRecord::
+        // log_files`]), so any other name names no log file of this instance.
+        let Some(log) = instance.log_file(&input.log_file_name) else {
             return Err(
                 DownloadDBLogFilePortionErrorModeled::DBLogFileNotFoundFault(
                     DBLogFileNotFoundFault {
@@ -232,9 +232,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into(),
             );
-        }
+        };
 
-        let lines = instance.engine_log.lines();
+        let lines = log.lines();
         // `Marker`: "the pagination token provided in the previous request or '0'". The
         // token this operation hands out is the index of the line the next portion starts
         // at, so a token it never issued — one that is not an index of this file — is

@@ -188,11 +188,27 @@ pub struct DbInstanceRecord {
     /// what `PendingModifiedValues` reports ([`DeferredModification`]). `None` for an
     /// instance with nothing staged.
     pub deferred_modification: Option<DeferredModification>,
-    /// The instance's log: the lifecycle lines THIS SERVICE has recorded for it, which is
-    /// what `DescribeDBLogFiles` lists and `DownloadDBLogFilePortion` serves. See
-    /// [`engine_log`] for why those lines are the only honest content for it, and for the
-    /// bounds on the log.
+    /// `EnabledCloudwatchLogsExports`: "a list of log types that this DB instance is
+    /// configured to export to CloudWatch Logs" — the types the instance was created with
+    /// (`EnableCloudwatchLogsExports`) plus every type a modification enabled and minus every
+    /// type one disabled (`CloudwatchLogsExportConfiguration`), in the order they were
+    /// enabled. EMPTY for an instance exporting none, which exports nothing at all
+    /// ([`data_plane::log_export`]).
+    pub enabled_cloudwatch_logs_exports: Vec<String>,
+    /// The instance's SERVER log: the lifecycle lines this service has recorded for it and
+    /// the lines its engine wrote while serving sessions, which is what `DescribeDBLogFiles`
+    /// lists and `DownloadDBLogFilePortion` serves. See [`engine_log`] for the bounds on it.
     pub engine_log: InstanceLog,
+    /// The MySQL family's GENERAL QUERY LOG, a log file of its own: the statements the engine
+    /// ran while `general_log` was on ([`data_plane::statement_log`]). EMPTY for an instance
+    /// whose engine has written none, which has no such file at all.
+    pub general_query_log: InstanceLog,
+    /// The recovery points this instance's CONTINUOUS BACKUP holds, oldest first: the data it
+    /// held at each instant a session committed a change, which is what
+    /// `RestoreDBInstanceToPointInTime` restores an instant's data from
+    /// ([`data_plane::continuous_backup`]). EMPTY for an instance with automated backups off,
+    /// which keeps none, and for one nothing has written to yet.
+    pub recovery_points: Vec<data_plane::continuous_backup::RecoveryPoint>,
 }
 
 impl DbInstanceRecord {
@@ -232,26 +248,25 @@ impl DbInstanceRecord {
         false
     }
 
-    /// Apply a staged modification whose maintenance window has arrived: "changes to the
-    /// DB instance are applied during the next maintenance window", so once the clock
-    /// reaches that window the instance runs under the staged settings and has nothing
-    /// pending.
+    /// Apply a staged modification the clock has made due: the instant `ApplyImmediately`
+    /// asked for it "as soon as possible", or the maintenance window a deferred one waits
+    /// for — "changes to the DB instance are applied during the next maintenance window" —
+    /// after which the instance runs under the staged settings and has nothing pending.
     ///
-    /// Nothing is applied before the window: a modification staged for a window that has
-    /// not come round stays pending however often the instance is read.
+    /// Nothing is applied before then: a modification staged for a window that has not come
+    /// round stays pending however often the instance is read.
     fn settle_deferred_modification(&mut self) {
         let due = self
             .deferred_modification
             .as_ref()
             .is_some_and(|staged| {
-                staged.is_due_in(self.preferred_maintenance_window.as_deref())
+                staged.is_due(self.preferred_maintenance_window.as_deref(), Instant::now())
             });
         if !due {
             return;
         }
         if let Some(staged) = self.deferred_modification.take() {
-            self.engine_log
-                .record("applying pending modified values in the maintenance window");
+            self.engine_log.record("applying pending modified values");
             staged.apply(self);
         }
     }
@@ -379,10 +394,66 @@ impl DbInstanceRecord {
             || self.read_replica_source_db_cluster_identifier.is_some()
     }
 
-    /// The name of the log file this instance writes, which follows from its engine; see
-    /// [`engine_log::log_file_name`].
+    /// The name of the log file a DB instance running `engine` writes, which follows from its
+    /// engine; see [`engine_log::log_file_name`].
     pub fn log_file_name(&self) -> &'static str {
         engine_log::log_file_name(&self.engine)
+    }
+
+    /// The log FILES this instance has: its engine's server log, which every instance has,
+    /// and the MySQL general query log where that engine has written one.
+    ///
+    /// A file the engine has written nothing to is not a file the instance has, which is why
+    /// the general query log appears only once a statement has been logged to it
+    /// ([`data_plane::statement_log`]): `DescribeDBLogFiles` lists "the DB log files for the
+    /// DB instance", and `DownloadDBLogFilePortion` serves exactly those.
+    pub fn log_files(&self) -> Vec<(&'static str, &InstanceLog)> {
+        let mut files: Vec<(&'static str, &InstanceLog)> =
+            vec![(self.log_file_name(), &self.engine_log)];
+        if !self.general_query_log.entries.is_empty() {
+            files.push((engine_log::MYSQL_GENERAL_LOG_FILE, &self.general_query_log));
+        }
+        files
+    }
+
+    /// `DBParameterGroupStatus$ParameterApplyStatus` for the group this instance names:
+    /// whether the values that group holds are the ones its engine is RUNNING.
+    ///
+    /// `ModifyDBParameterGroup` documents the rule: "changes to dynamic parameters are
+    /// applied immediately" while "changes to static parameters require a reboot ... before
+    /// the change can take effect". So a group holding a change this instance's engine has
+    /// not come up again since — one whose apply method or published apply type makes it
+    /// pending ([`change_is_pending_for`]), set after the engine last started — leaves the
+    /// membership `pending-reboot`, which is what tells a caller that a reboot is what applies
+    /// it; every other membership is `in-sync`. Decided by the SAME comparison the engine data
+    /// plane makes when it picks the value it is running
+    /// ([`data_plane::pg_server::running_parameters`]), so the status a caller reads and the
+    /// value a session reads cannot disagree.
+    pub fn parameter_apply_status(
+        &self,
+        db_parameter_group: Option<&DbParameterGroupRecord>,
+    ) -> &'static str {
+        let pending = db_parameter_group.is_some_and(|group| {
+            group.parameters.iter().any(|(name, setting)| {
+                let spec = published_db_parameter(&group.family, name)
+                    .map(|spec| published_spec_for_family(&group.family, spec));
+                change_is_pending_for(spec.as_ref(), &setting.apply_method)
+                    && setting.set_at.as_secs_f64() > self.engine_started_at.as_secs_f64()
+            })
+        });
+        if pending {
+            PARAMETER_APPLY_STATUS_PENDING_REBOOT
+        } else {
+            MEMBERSHIP_IN_SYNC
+        }
+    }
+
+    /// The log file `named`, or `None` when this instance has no such file.
+    pub fn log_file(&self, named: &str) -> Option<&InstanceLog> {
+        self.log_files()
+            .into_iter()
+            .find(|(name, _)| *name == named)
+            .map(|(_, log)| log)
     }
 
     /// `arn:aws:rds:<region>:<account>:db:<identifier>`, from the stored region and
@@ -529,35 +600,50 @@ impl DbInstanceRecord {
     /// still being created, which has taken no backup yet — in both cases there is no
     /// instant the instance can be restored to, which is what reporting no member says.
     ///
-    /// The value ADVANCES with the clock, trailing it by [`LATEST_RESTORABLE_LAG`], and
-    /// never predates the instance: a point before it existed is not a point it can be
-    /// restored to. Computed from the clock and the stored retention period rather than
-    /// stored, so it cannot go stale between two describes.
+    /// The value ADVANCES with the clock and never predates the instance, in the STEPS the
+    /// published point advances in ([`RECOVERY_POINT_INTERVAL`]): a client reads this instant,
+    /// works out the window it may restore in from it and then calls the restore, so the two
+    /// calls have to read the same value. This emulator's continuous backup records a recovery
+    /// point at every commit ([`data_plane::continuous_backup`]) and nothing changes the
+    /// instance's data between two commits, so the data of every instant the published point
+    /// covers is held. Computed from the clock rather than stored, so it cannot go stale
+    /// between two describes.
     pub fn latest_restorable_time(&self) -> Option<::aws_smithy_types::DateTime> {
-        if self.backup_retention_period < 1 || self.status == DB_INSTANCE_STATUS_CREATING {
+        if !self.keeps_continuous_backups() || self.status == DB_INSTANCE_STATUS_CREATING {
             return None;
         }
-        let trailing = now_as_wire_timestamp().as_secs_f64() - LATEST_RESTORABLE_LAG.as_secs_f64();
-        Some(::aws_smithy_types::DateTime::from_secs_f64(
-            trailing.max(self.instance_create_time.as_secs_f64()),
+        let step = RECOVERY_POINT_INTERVAL.as_secs().max(1) as i64;
+        let now = now_as_wire_timestamp().secs();
+        let published = now - now.rem_euclid(step);
+        Some(::aws_smithy_types::DateTime::from_secs(
+            published.max(self.instance_create_time.secs()),
         ))
     }
 
-    /// The window a point-in-time restore of this instance may target: "any point in time
-    /// during your backup retention period", up to [`Self::latest_restorable_time`].
+    /// The window a point-in-time restore of this instance may target: "you can restore to
+    /// any point in time before the time identified by the `LatestRestorableTime` property.
+    /// You can restore to a point up to the number of days specified by the
+    /// `BackupRetentionPeriod` property."
+    ///
+    /// The lower bound is the retention period measured back from the published recovery point
+    /// ([`Self::latest_restorable_time`]) — the span the automated backups cover, which is
+    /// what the refusal of an earlier instant attributes the bound to
+    /// ([`restore_time_before_the_window_message`]). The upper bound is that published point
+    /// itself: "you can restore to any point in time BEFORE the time identified by the
+    /// LatestRestorableTime property", so an instant the point has not reached yet is outside
+    /// the window however recent the data this service holds is
+    /// ([`restore_time_after_the_window_message`]).
     ///
     /// `None` for an instance that keeps no continuous backup, which is the case
     /// `RestoreDBInstanceToPointInTime` answers `PointInTimeRestoreNotEnabled` for.
     pub fn restorable_window(
         &self,
     ) -> Option<(::aws_smithy_types::DateTime, ::aws_smithy_types::DateTime)> {
-        let latest = self.latest_restorable_time()?;
+        let published = self.latest_restorable_time()?;
         let retention = f64::from(self.backup_retention_period) * 24.0 * 60.0 * 60.0;
-        let earliest =
-            (latest.as_secs_f64() - retention).max(self.instance_create_time.as_secs_f64());
         Some((
-            ::aws_smithy_types::DateTime::from_secs_f64(earliest),
-            latest,
+            ::aws_smithy_types::DateTime::from_secs_f64(published.as_secs_f64() - retention),
+            published,
         ))
     }
 
@@ -578,7 +664,17 @@ impl DbInstanceRecord {
     /// the group an instance reports and the one `DescribeDBSubnetGroups` reports are one
     /// answer. `None` where the instance names a group this store no longer resolves, which
     /// reports no group at all rather than a name with nothing behind it.
-    pub fn to_wire(&self, db_subnet_group: Option<&DbSubnetGroupRecord>) -> DBInstance {
+    /// `db_parameter_group` is the DB PARAMETER GROUP record the instance's own
+    /// `DBParameterGroupName` resolves to, read by the store for this projection
+    /// ([`ComAmazonawsRdsAmazonrdsv19State::db_parameter_group_of`]): whether the values that
+    /// group holds are the ones the engine is RUNNING is what the membership's
+    /// `ParameterApplyStatus` reports ([`Self::parameter_apply_status`]), and that is a fact
+    /// about the group and this instance's engine run together.
+    pub fn to_wire(
+        &self,
+        db_subnet_group: Option<&DbSubnetGroupRecord>,
+        db_parameter_group: Option<&DbParameterGroupRecord>,
+    ) -> DBInstance {
         DBInstance {
             db_instance_identifier: Some(self.identifier.clone()),
             db_instance_class: Some(self.db_instance_class.clone()),
@@ -627,7 +723,9 @@ impl DbInstanceRecord {
                     .iter()
                     .map(|name| DBParameterGroupStatus {
                         db_parameter_group_name: Some(name.clone()),
-                        parameter_apply_status: Some(MEMBERSHIP_IN_SYNC.to_string()),
+                        parameter_apply_status: Some(
+                            self.parameter_apply_status(db_parameter_group).to_string(),
+                        ),
                     })
                     .collect(),
             ),
@@ -726,6 +824,11 @@ impl DbInstanceRecord {
             // the order they were made, and EMPTY for an instance that carries none.
             associated_roles: Some(self.associated_roles.clone()),
             max_allocated_storage: self.max_allocated_storage,
+            // `EnabledCloudwatchLogsExports`: "a list of log types that this DB instance is
+            // configured to export to CloudWatch Logs" — the types the instance exports NOW,
+            // and an EMPTY list for one that exports none, which is what RDS reports for an
+            // instance with no export configured.
+            enabled_cloudwatch_logs_exports: Some(self.enabled_cloudwatch_logs_exports.clone()),
             tag_list: Some(self.tags.clone()),
             customer_owned_ip_enabled: Some(self.customer_owned_ip_enabled),
             network_type: Some(self.network_type.clone()),

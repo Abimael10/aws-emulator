@@ -209,34 +209,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // The instance has the one log file its engine writes, whose size and last-written
-        // time are those of the lines this service has recorded in it.
-        let log_file_name = instance.log_file_name().to_string();
-        let details = DescribeDBLogFilesDetails {
-            log_file_name: Some(log_file_name.clone()),
-            last_written: instance.engine_log.last_written(),
-            size: Some(instance.engine_log.size()),
-        };
-        // The three narrowing members each drop the file when it does not match:
+        // The instance has the log files it has WRITTEN: its engine's server log, and the
+        // general query log where the engine has logged a statement to one
+        // ([`crate::state::DbInstanceRecord::log_files`]). Each file's size and
+        // last-written time are those of the lines it holds.
+        //
+        // The three narrowing members each drop a file when it does not match:
         // `FilenameContains` is "filters the available log files for log file names that
         // contain the specified string", `FileLastWritten` "filters the available log
         // files for files written since the specified date" and `FileSize` "filters the
         // available log files for files larger than the specified size".
-        let matches = input
-            .filename_contains
-            .as_ref()
-            .is_none_or(|wanted| log_file_name.contains(wanted.as_str()))
-        && input.file_last_written.is_none_or(|since| {
-            details.last_written.is_some_and(|written| written >= since)
-        })
-        && input
-            .file_size
-            .is_none_or(|larger_than| details.size.is_some_and(|size| size > larger_than));
-        let files: Vec<(String, DescribeDBLogFilesDetails)> = if matches {
-            vec![(log_file_name, details)]
-        } else {
-            Vec::new()
-        };
+        let files: Vec<(String, DescribeDBLogFilesDetails)> = instance
+            .log_files()
+            .into_iter()
+            .map(|(name, log)| {
+                (
+                    name.to_string(),
+                    DescribeDBLogFilesDetails {
+                        log_file_name: Some(name.to_string()),
+                        last_written: log.last_written(),
+                        size: Some(log.size()),
+                    },
+                )
+            })
+            .filter(|(name, details)| {
+                input
+                    .filename_contains
+                    .as_ref()
+                    .is_none_or(|wanted| name.contains(wanted.as_str()))
+                    && input.file_last_written.is_none_or(|since| {
+                        details.last_written.is_some_and(|written| written >= since)
+                    })
+                    && input.file_size.is_none_or(|larger_than| {
+                        details.size.is_some_and(|size| size > larger_than)
+                    })
+            })
+            .collect();
 
         // A `Marker` is placed in the report's own order and the page resumes BEYOND it; a
         // token this codec could not have produced is refused: see `crate::state::paginate`.

@@ -48,6 +48,62 @@ impl ClusterKind {
     }
 }
 
+/// What a point-in-time restore refuses a request that names NO instant to restore to with:
+/// `RestoreTime` "can't be specified if the UseLatestRestorableTime parameter is enabled",
+/// and one of the two has to name an instant for there to be anything to restore — so the
+/// sentence states which of the two the request is missing. (Amazon RDS words the member in
+/// this sentence as `UseLatestRestoreTime`.)
+pub const RESTORE_TIME_REQUIRED_MESSAGE: &str =
+    "If UseLatestRestoreTime is not true, the RestoreTime parameter must be specified.";
+
+/// What it refuses a request that names BOTH with: the other half of the same rule, so the
+/// two combinations are distinguishable by their sentence.
+pub const RESTORE_TIME_CONFLICT_MESSAGE: &str =
+    "If UseLatestRestoreTime is true, the RestoreTime parameter must be omitted.";
+
+/// What a point-in-time restore refuses a `RestoreTime` EARLIER than the window the source
+/// instance's automated backups cover with.
+///
+/// Amazon RDS words this one as a statement about the instance and the retention period that
+/// decides the bound: `RestoreTime` "must be before the latest restorable time for the DB
+/// instance" and a restore reaches "a point up to the number of days specified by the
+/// BackupRetentionPeriod property", so a request for an earlier instant is refused with the
+/// bound itself and the setting it follows from. The instant is written to the second, in the
+/// UTC form the member itself is given in ("Must be a time in Universal Coordinated Time
+/// (UTC) format. Example: `2009-09-07T23:45:00Z`").
+pub fn restore_time_before_the_window_message(
+    earliest: ::aws_smithy_types::DateTime,
+    backup_retention_period: i32,
+) -> String {
+    format!(
+        "The specified instance cannot be restored to a time earlier than {} because its \
+         backup retention period is set to {backup_retention_period} days.",
+        restore_time_text(earliest)
+    )
+}
+
+/// What a point-in-time restore refuses a `RestoreTime` LATER than the instance's published
+/// recovery point with: the sibling of the sentence above at the other end of the window,
+/// where the bound is `LatestRestorableTime` itself — "you can restore to any point in time
+/// before the time identified by the LatestRestorableTime property", and the instant that
+/// member reports is the whole of what the sentence has to state.
+pub fn restore_time_after_the_window_message(latest: ::aws_smithy_types::DateTime) -> String {
+    format!(
+        "The specified instance cannot be restored to a time later than {}.",
+        restore_time_text(latest)
+    )
+}
+
+/// An instant as a restore-window refusal writes one: the UTC date and time to the SECOND,
+/// the form `RestoreTime` itself is given in — a recovery point's sub-second part is not part
+/// of the bound the sentence states.
+fn restore_time_text(at: ::aws_smithy_types::DateTime) -> String {
+    let to_the_second = ::aws_smithy_types::DateTime::from_secs(at.secs());
+    to_the_second
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_else(|_| at.secs().to_string())
+}
+
 /// What an operation that serves ONE kind of DB cluster refuses a `DBClusterIdentifier`
 /// naming a cluster of the other kind with.
 ///

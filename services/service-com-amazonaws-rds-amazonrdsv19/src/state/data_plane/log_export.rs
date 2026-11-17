@@ -80,12 +80,10 @@ pub fn cluster_log_group(cluster_identifier: &str, log_type: &str) -> String {
 /// The CloudWatch Logs group a DB INSTANCE's `log_type` is exported to:
 /// `/aws/rds/instance/<DBInstanceIdentifier>/<log type>`, the sibling name for an instance.
 ///
-/// The name of the group, for the resource kind this service does not yet hold an export
-/// configuration for: `DbInstanceRecord` carries no `EnabledCloudwatchLogsExports`, so
-/// [`destination`] resolves no instance group and nothing is delivered to one — a MEMBER
-/// instance of a DB cluster exports to its CLUSTER's group, which is where Amazon RDS puts
-/// an Aurora member's engine log. The name lives here, beside its sibling, so the per-instance
-/// member has one reading to be wired to rather than a second one written then.
+/// Which group a session's lines go to is [`destination`]: a standalone DB instance exports
+/// its engine log to this group under its own `EnabledCloudwatchLogsExports`, while a MEMBER
+/// instance of a DB cluster exports to its CLUSTER's group ([`cluster_log_group`]), which is
+/// where Amazon RDS puts an Aurora member's engine log.
 #[must_use]
 pub fn instance_log_group(instance_identifier: &str, log_type: &str) -> String {
     format!("/aws/rds/instance/{instance_identifier}/{log_type}")
@@ -289,8 +287,9 @@ fn postgres_instant(at: SystemTime) -> String {
 }
 
 /// The instant as the MySQL error log prints it: the ISO 8601 UTC form its
-/// `log_timestamps=UTC` default writes.
-fn mysql_instant(at: SystemTime) -> String {
+/// `log_timestamps=UTC` default writes — the same instant form its general query log writes
+/// ([`super::statement_log`]).
+pub(super) fn mysql_instant(at: SystemTime) -> String {
     let instant = ::aws_smithy_types::DateTime::from_secs_f64(epoch_seconds(at));
     instant
         .fmt(::aws_smithy_types::date_time::Format::DateTime)
@@ -330,10 +329,9 @@ pub struct ExportDestination {
 /// `None` when nothing is exported.
 ///
 /// `None` covers every case in which there is no export: a resource this store no longer
-/// holds, one whose `EnabledCloudwatchLogsExports` does not carry this engine's log type,
-/// and a DB instance that is not a member of a DB cluster — the export configuration this
-/// service holds is the DB CLUSTER's, and an Aurora member instance's engine log belongs to
-/// its cluster's group, which is where Amazon RDS puts it.
+/// holds, and one whose `EnabledCloudwatchLogsExports` does not carry this engine's log type
+/// — the DB CLUSTER's configuration for a member instance of a cluster, whose engine log
+/// belongs to its cluster's group, and the DB INSTANCE's own for a standalone instance.
 ///
 /// Read under the store's guard by the caller, so the delivery itself runs with none held.
 #[must_use]
@@ -362,14 +360,32 @@ pub fn destination(
             resource_id,
         } => {
             let instance = store.instance_by_resource_id(region, resource_id)?;
-            let named = instance.db_cluster_identifier.as_deref()?;
-            let cluster = store.resolve_db_cluster(&instance.region, named)?;
-            exported(cluster, log_type)?;
-            Some(ExportDestination {
-                region: cluster.region.clone(),
-                log_group: cluster_log_group(&cluster.identifier, log_type),
-                log_stream: instance.identifier.clone(),
-            })
+            // A MEMBER instance of a DB cluster exports to its CLUSTER's group, which is
+            // where Amazon RDS puts an Aurora member's engine log, under the configuration
+            // the CLUSTER carries; its stream is the member that wrote the line.
+            if let Some(cluster) = instance
+                .db_cluster_identifier
+                .as_deref()
+                .and_then(|named| store.resolve_db_cluster(&instance.region, named))
+            {
+                exported(cluster, log_type)?;
+                return Some(ExportDestination {
+                    region: cluster.region.clone(),
+                    log_group: cluster_log_group(&cluster.identifier, log_type),
+                    log_stream: instance.identifier.clone(),
+                });
+            }
+            // A standalone DB instance exports its own engine log to its own group, under
+            // its own `EnabledCloudwatchLogsExports`.
+            instance
+                .enabled_cloudwatch_logs_exports
+                .iter()
+                .any(|enabled| enabled.eq_ignore_ascii_case(log_type))
+                .then(|| ExportDestination {
+                    region: instance.region.clone(),
+                    log_group: instance_log_group(&instance.identifier, log_type),
+                    log_stream: instance.identifier.clone(),
+                })
         }
     }
 }
@@ -413,12 +429,16 @@ fn stream_of(
     )
 }
 
-/// Deliver what the engine wrote about one statement to the resource's log export.
+/// WRITE what the engine wrote about one statement to the resource's own log, and deliver it
+/// to the log export where one is configured.
 ///
-/// The lines a severity keeps out of the log are left out here, so what reaches CloudWatch
-/// Logs is exactly what the engine's log holds. Nothing is delivered for a resource with no
-/// export configured, and nothing about the outcome changes the answer the client has
-/// already been given.
+/// The lines a severity keeps out of the log are left out here, so what the engine's log
+/// FILE holds and what reaches CloudWatch Logs are the same lines: the file is the one
+/// `DescribeDBLogFiles` lists and `DownloadDBLogFilePortion` serves
+/// ([`crate::state::InstanceLog`]), and the delivery is what a resource with
+/// `EnableCloudwatchLogsExports` streams. Nothing is delivered for a resource with no export
+/// configured, the file is still written either way, and nothing about the outcome changes
+/// the answer the client has already been given.
 ///
 /// Call it with NO store guard held — it awaits.
 pub async fn export(context: &SessionContext, facts: &SessionFacts, lines: &[LogLine]) {
@@ -430,19 +450,32 @@ pub async fn export(context: &SessionContext, facts: &SessionFacts, lines: &[Log
     if written.is_empty() {
         return;
     }
-    // The guard is BOUND to this block, so it is released before the delivery is awaited.
-    let exported_to = {
-        let store = context.state.lock();
-        destination(&store, &context.target, &context.role, facts.wire)
-    };
-    let Some(destination) = exported_to else {
-        return;
-    };
     let at = SystemTime::now();
     let records: Vec<String> = written
         .into_iter()
         .map(|line| rendered(facts, at, line))
         .collect();
+    // The guard is BOUND to this block, so it is released before the delivery is awaited.
+    // The engine WROTE these lines, so the instance's own log file carries them whether or
+    // not anything exports it.
+    let exported_to = {
+        let mut store = context.state.lock();
+        if let SessionTarget::DbInstance {
+            region,
+            resource_id,
+        } = &context.target
+        {
+            if let Some(record) = store.instance_by_resource_id_mut(region, resource_id) {
+                for line in &records {
+                    record.engine_log.record_engine_line(line.clone());
+                }
+            }
+        }
+        destination(&store, &context.target, &context.role, facts.wire)
+    };
+    let Some(destination) = exported_to else {
+        return;
+    };
     if !::service_common::cloudwatch_logs::delivered_over(
         &context.callback,
         &destination.region,

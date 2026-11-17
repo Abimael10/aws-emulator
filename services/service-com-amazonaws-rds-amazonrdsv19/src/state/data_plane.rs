@@ -74,6 +74,9 @@ use super::snapshot_data_bytes;
 
 pub mod cluster_endpoint;
 pub mod constraint_names;
+// The CONTINUOUS BACKUP of a DB instance: the recovery points `RestoreDBInstanceToPointInTime`
+// serves an instant's data from, and the engine work that records one.
+pub mod continuous_backup;
 pub mod dialect;
 pub mod engine_s3_role;
 pub mod engine_time;
@@ -103,6 +106,8 @@ pub mod row_locks;
 pub mod server_statements;
 pub mod session_transactions;
 pub mod sql_engine;
+// The statement line an engine writes to its own log when its statement logging is on.
+pub mod statement_log;
 pub mod tls_probe;
 pub mod wire_session;
 
@@ -389,6 +394,22 @@ impl ComAmazonawsRdsAmazonrdsv19State {
     ) -> Option<&DbInstanceRecord> {
         self.db_instances
             .range((region.to_string(), String::new())..)
+            .take_while(|((stored, _), _)| stored == region)
+            .map(|(_, record)| record)
+            .find(|record| record.dbi_resource_id == resource_id)
+    }
+
+    /// The same instance, held MUTABLY: what a session writes through when the engine
+    /// behind the endpoint records something on the instance it belongs to — a line of its
+    /// log ([`statement_log`]), a recovery point of its continuous backup
+    /// ([`continuous_backup`]).
+    pub fn instance_by_resource_id_mut(
+        &mut self,
+        region: &str,
+        resource_id: &str,
+    ) -> Option<&mut DbInstanceRecord> {
+        self.db_instances
+            .range_mut((region.to_string(), String::new())..)
             .take_while(|((stored, _), _)| stored == region)
             .map(|(_, record)| record)
             .find(|record| record.dbi_resource_id == resource_id)

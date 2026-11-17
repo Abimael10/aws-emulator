@@ -892,7 +892,14 @@ async fn modifying_an_instance_resolves_the_new_engine_version_too() {
             .await,
         );
         let modified = the_instance(row_case, &modified);
-        assert_member(row_case, "modify", &modified, "EngineVersion", expected);
+        // The version the modification resolved is what it reports as PENDING: a
+        // modification is applied when the instance finishes modifying, so until then the
+        // instance reports the version it is RUNNING (see `pending_modified_values`).
+        let staged = subtrees(&modified, "PendingModifiedValues")
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("case {row_case:?}: expected a pending element, got {modified}"));
+        assert_member(row_case, "modify", &staged, "EngineVersion", expected);
         wait_for_settle();
         let described = describe_instance(&router, row_case, identifier).await;
         assert_member(row_case, "describe", &described, "EngineVersion", expected);

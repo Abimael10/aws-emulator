@@ -159,6 +159,9 @@ mod tests {
             associated_roles: Vec::new(),
             deferred_modification: None,
             engine_log: InstanceLog::default(),
+            enabled_cloudwatch_logs_exports: Vec::new(),
+            general_query_log: InstanceLog::default(),
+            recovery_points: Vec::new(),
         }
     }
 }

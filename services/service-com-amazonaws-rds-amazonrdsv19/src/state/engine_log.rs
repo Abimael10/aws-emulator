@@ -1,17 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The DB instance log `DescribeDBLogFiles` lists and `DownloadDBLogFilePortion`
+//! The DB instance log files `DescribeDBLogFiles` lists and `DownloadDBLogFilePortion`
 //! serves.
 //!
-//! No database engine runs behind this emulator, so there is no engine log to copy. What
-//! this module holds instead is the log THIS SERVICE keeps for a DB instance: one line per
-//! lifecycle event it actually performed on that instance (the create it accepted, each
-//! status the clock then made due), timestamped when it happened. That is real, stored
-//! state — a line appears only because the service did the thing it records — and it is
-//! what the two log operations report: the file's size is the size of those lines, and its
-//! last-written time is the instant of the last one.
+//! What a file holds is what was written to it: the lifecycle lines THIS SERVICE keeps for a
+//! DB instance — one per event it actually performed on that instance (the create it
+//! accepted, each status the clock then made due) — and the lines the instance's own ENGINE
+//! wrote while serving sessions on its endpoint, each rendered the way that engine writes one
+//! ([`super::data_plane::log_export`]). That is real, stored state — a line appears only
+//! because the service or the engine did the thing it records — and it is what the two log
+//! operations report: the file's size is the size of those lines, and its last-written time is
+//! the instant of the last one.
 //!
-//! The log lives ON the DB instance record, so it is removed with the instance and is
+//! An instance has the server log its engine writes ([`log_file_name`]), and the MySQL family
+//! also has the GENERAL QUERY LOG, a file of its own that carries the statements the server
+//! ran while `general_log` was on ([`MYSQL_GENERAL_LOG_FILE`]); a file nothing has written to
+//! is not one the instance has.
+//!
+//! Each log lives ON the DB instance record, so it is removed with the instance and is
 //! bounded by [`MAX_LOG_ENTRIES`] lines of at most [`MAX_LOG_LINE_LEN`] characters each.
 
 /// How many lines one instance's log keeps. A DB instance's lifecycle produces a line per
@@ -23,16 +29,26 @@ pub const MAX_LOG_ENTRIES: usize = 64;
 /// identifier this service already bounds, so this is a backstop rather than a filter.
 pub const MAX_LOG_LINE_LEN: usize = 256;
 
-/// One line of a DB instance's log: when this service recorded it, and what it recorded.
+/// The file the MySQL family's GENERAL QUERY LOG is written to, as Amazon RDS names it in
+/// `DescribeDBLogFiles`.
+///
+/// Source: the per-engine log files Amazon RDS publishes in "Monitoring Amazon RDS log
+/// files" — the MySQL general query log is `general/mysql-general.log`, beside the
+/// `error/mysql-error.log` of the same engine ([`log_file_name`]). A separate file because
+/// that is what it is on the server: the statements the engine ran are not entries of its
+/// error log.
+pub const MYSQL_GENERAL_LOG_FILE: &str = "general/mysql-general.log";
+
+/// One line of a DB instance's log: when this service recorded it, and the line itself.
 #[derive(Debug, Clone)]
 pub struct LogEntry {
     /// When the event this line records happened.
     pub at: ::aws_smithy_types::DateTime,
-    /// What happened, as the line reads after the timestamp.
-    pub text: String,
+    /// The line as a client downloading the file reads it.
+    pub line: String,
 }
 
-/// A DB instance's log: the lifecycle lines this service has recorded for it, oldest
+/// A DB instance's log: the lines this service and its engine have recorded for it, oldest
 /// first.
 #[derive(Debug, Clone, Default)]
 pub struct InstanceLog {
@@ -41,35 +57,44 @@ pub struct InstanceLog {
 }
 
 impl InstanceLog {
-    /// Record one line, timestamped now, dropping the oldest line when the log is full.
+    /// Record one line of this SERVICE's own: the instant it happened, then what happened,
+    /// which is how a line of a lifecycle event reads.
     pub fn record(&mut self, text: impl Into<String>) {
-        let mut text: String = text.into();
-        text.truncate(
-            text.char_indices()
+        let at = super::now_as_wire_timestamp();
+        let instant = at
+            .fmt(::aws_smithy_types::date_time::Format::DateTime)
+            .unwrap_or_else(|_| at.as_secs_f64().to_string());
+        let text: String = text.into();
+        self.push(at, format!("{instant} {text}"));
+    }
+
+    /// Record one line the ENGINE wrote, which already carries the prefix that engine writes
+    /// in front of a line (its instant, the session it was written for, the severity) — so
+    /// the file holds the line as the engine wrote it rather than one this service re-stamped
+    /// ([`super::data_plane::log_export::rendered`]).
+    pub fn record_engine_line(&mut self, line: impl Into<String>) {
+        self.push(super::now_as_wire_timestamp(), line.into());
+    }
+
+    /// Append one line, dropping the oldest when the log is full.
+    fn push(&mut self, at: ::aws_smithy_types::DateTime, line: String) {
+        let mut line = line;
+        line.truncate(
+            line.char_indices()
                 .nth(MAX_LOG_LINE_LEN)
-                .map_or(text.len(), |(offset, _)| offset),
+                .map_or(line.len(), |(offset, _)| offset),
         );
-        self.entries.push(LogEntry {
-            at: super::now_as_wire_timestamp(),
-            text,
-        });
+        self.entries.push(LogEntry { at, line });
         if self.entries.len() > MAX_LOG_ENTRIES {
             self.entries.remove(0);
         }
     }
 
-    /// The file's lines as a client downloading it reads them: the timestamp of each
-    /// event, then what was recorded.
+    /// The file's lines as a client downloading it reads them.
     pub fn lines(&self) -> Vec<String> {
         self.entries
             .iter()
-            .map(|entry| {
-                let at = entry
-                    .at
-                    .fmt(::aws_smithy_types::date_time::Format::DateTime)
-                    .unwrap_or_else(|_| entry.at.as_secs_f64().to_string());
-                format!("{at} {}", entry.text)
-            })
+            .map(|entry| entry.line.clone())
             .collect()
     }
 

@@ -1022,9 +1022,13 @@ async fn run_statement(
             return Err(refusal);
         }
     };
-    // And so is every message the statement itself produced, at the levels the engine logs.
-    if !answer.log_lines.is_empty() {
-        super::log_export::export(context, facts, &answer.log_lines).await;
+    // And so is every message the statement itself produced, at the levels the engine logs
+    // — plus the statement itself, where this engine's statement logging logs it
+    // ([`super::statement_log`]).
+    let mut logged = answer.log_lines.clone();
+    logged.extend(super::statement_log::server_log_line(facts, &answer.verb, &sql));
+    if !logged.is_empty() {
+        super::log_export::export(context, facts, &logged).await;
     }
     if let Some((name, value)) = answer.setting_changed.clone() {
         facts.settings.insert(name, value);
@@ -1038,12 +1042,21 @@ async fn run_statement(
     }
     // What the source has COMMITTED is what its read replicas hold: carried over once the
     // statement is through and the session has no transaction still open, so a write still
-    // inside a transaction reaches no replica until that transaction commits.
+    // inside a transaction reaches no replica until that transaction commits. The same
+    // committed state is what the instance's CONTINUOUS BACKUP records a recovery point of,
+    // so a point-in-time restore can serve the data as of this instant
+    // ([`super::continuous_backup`]).
     if super::replication::publishes_changes(&answer.verb)
         && !database.in_transaction(facts.connection_id)
     {
         super::replication::apply_to_read_replicas(&context.state, &context.target, database)
             .await;
+        super::continuous_backup::record_committed_state(
+            &context.state,
+            &context.target,
+            database,
+        )
+        .await;
     }
     Ok(answer)
 }

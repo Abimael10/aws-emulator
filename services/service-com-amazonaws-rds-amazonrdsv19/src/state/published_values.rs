@@ -42,19 +42,22 @@ pub const DB_INSTANCE_STATUS_AVAILABLE: &str = "available";
 /// [`STATUS_TRANSITION_DELAY`] later.
 pub const DB_INSTANCE_STATUS_CREATING: &str = "creating";
 
-/// How far behind the clock a DB instance's `LatestRestorableTime` trails.
-///
-/// Amazon RDS documents the continuous-backup recovery point as being within five minutes
-/// of the current time ("you can restore to any point in time during your backup retention
-/// period … typically up to the last five minutes"), so the latest instant an instance can
-/// be restored to is five minutes behind now rather than now itself. See
-/// [`DbInstanceRecord::latest_restorable_time`].
-pub const LATEST_RESTORABLE_LAG: Duration = Duration::from_secs(5 * 60);
-
 /// The status an accepted `StopDBInstance` reports while the database engine shuts down.
 /// Transient: the clock owes [`DB_INSTANCE_STATUS_STOPPED`] [`STATUS_TRANSITION_DELAY`]
 /// later.
 pub const DB_INSTANCE_STATUS_STOPPING: &str = "stopping";
+
+/// How often the recovery point a DB instance PUBLISHES advances.
+///
+/// Amazon RDS advances `LatestRestorableTime` as the instance's transaction logs are
+/// archived rather than with every tick of the clock, which is why it reads as an instant
+/// within the last few minutes: a client reads that instant, works out the window it may
+/// restore in from it ("you can restore to a point up to the number of days specified by the
+/// BackupRetentionPeriod property") and then calls the restore, so the value has to be the
+/// same for both calls. RDS takes minutes; a generated emulator picks its own span, and this
+/// one is short enough that a caller that records an instant sees the published point reach
+/// it inside a poll. See [`DbInstanceRecord::latest_restorable_time`].
+pub const RECOVERY_POINT_INTERVAL: Duration = Duration::from_secs(5);
 
 /// The status of a DB instance whose stop has run its course, and the one status a
 /// `StartDBInstance` is accepted from.

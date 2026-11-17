@@ -453,6 +453,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // `EnableCloudwatchLogsExports` is STORED on the replica, so the list's length and
+        // each entry are bounded where they enter the handler, exactly as the create of an
+        // instance bounds the same member.
+        if let Some(values) = &input.enable_cloudwatch_logs_exports {
+            crate::state::check_request_list_len(
+                "EnableCloudwatchLogsExports",
+                values.len(),
+                crate::state::MAX_CLUSTER_LIST_ENTRIES,
+            )
+            .map_err(CreateDBInstanceReadReplicaError::invalid_parameter_value)?;
+            for value in values {
+                crate::state::check_free_form("EnableCloudwatchLogsExports", value)
+                    .map_err(CreateDBInstanceReadReplicaError::invalid_parameter_value)?;
+            }
+        }
+
         // No store means this service was mounted on an engine it has no state in, so it
         // cannot serve the operation at all. Unreachable with the engine the router builds;
         // 501 is the honest answer, never a fabricated replica.
@@ -755,6 +771,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // under, so it has nothing of its own staged.
                 deferred_modification: None,
                 engine_log: crate::state::InstanceLog::default(),
+                // `EnableCloudwatchLogsExports`: "the list of logs that the new DB instance is
+                // to export to CloudWatch Logs" — the replica's own configuration, not the
+                // source's, and nothing for a request that named none.
+                enabled_cloudwatch_logs_exports: input
+                    .enable_cloudwatch_logs_exports
+                    .clone()
+                    .unwrap_or_default(),
+                // The replica has logged no statement of its own, and keeps no recovery point
+                // of the source's continuous backup: the points a point-in-time restore reads
+                // are the ones recorded against the instance that holds them.
+                general_query_log: crate::state::InstanceLog::default(),
+                recovery_points: Vec::new(),
                 // A read replica manages NO Secrets Manager secret of its own: this
                 // operation has no `ManageMasterUserPassword` member, so nothing creates a
                 // secret for the replica, and the source's secret belongs to the source —
@@ -854,6 +882,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ))
                 })?;
         }
+        // The replica's CONTINUOUS BACKUP starts from the data it comes up with, so an
+        // instant before its first commit has that state to be restored to rather than a
+        // later commit's.
+        crate::state::data_plane::continuous_backup::record_initial_state(
+            &mut record,
+            endpoint.as_ref(),
+        )
+        .await;
 
         let mut store = state.lock();
         // Another request may have created this identifier, or deleted the source, while
@@ -1390,6 +1426,11 @@ fn resolve_source_cluster(
         associated_roles: Vec::new(),
         deferred_modification: None,
         engine_log: crate::state::InstanceLog::default(),
+        // The cluster's `EnabledCloudwatchLogsExports` is the CLUSTER's configuration; the
+        // replica exports what this request names, which the caller's own members set.
+        enabled_cloudwatch_logs_exports: Vec::new(),
+        general_query_log: crate::state::InstanceLog::default(),
+        recovery_points: Vec::new(),
     };
     let resolved = ResolvedSource::Cluster(cluster.identifier.clone());
     Ok((settings, resolved))

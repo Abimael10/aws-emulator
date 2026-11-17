@@ -85,7 +85,8 @@ use crate::ops::types::{
     DomainMembership, EC2SecurityGroup, Endpoint, EventCategoriesMap, EventSubscription,
     GlobalCluster, GlobalClusterMember, IPRange, MasterUserSecret, Option2, OptionGroup,
     OptionGroupMembership,
-    OptionSetting, Outpost, Parameter, PendingModifiedValues, RestoreWindow,
+    OptionSetting, Outpost, Parameter,
+    PendingCloudwatchLogsExports, PendingModifiedValues, RestoreWindow,
     ScalingConfigurationInfo,
     ServerlessV2ScalingConfigurationInfo, SourceNotFoundFault, Subnet, Tag,
     VpcSecurityGroupMembership,
@@ -1187,7 +1188,27 @@ impl ComAmazonawsRdsAmazonrdsv19State {
     /// the same group for it, and a group `ModifyDBSubnetGroup` changes is reported as it
     /// is now rather than as it was when the instance was created.
     pub fn instance_to_wire(&self, record: &DbInstanceRecord) -> DBInstance {
-        record.to_wire(self.db_subnet_group_of(record).as_ref())
+        record.to_wire(
+            self.db_subnet_group_of(record).as_ref(),
+            self.db_parameter_group_of(record).as_ref(),
+        )
+    }
+
+    /// The DB parameter group `record` names, as this store holds it, or `None` for an
+    /// instance that names none and for one of the DEFAULT groups AWS provides, which no
+    /// request creates and this store therefore has no record of (such a group sets no
+    /// parameter of its own, so a membership in it is always in sync).
+    ///
+    /// Taken by VALUE for the reason [`Self::db_subnet_group_of`] is: a handler that holds the
+    /// instance record mutably still has to report the membership it projects.
+    pub fn db_parameter_group_of(
+        &self,
+        record: &DbInstanceRecord,
+    ) -> Option<DbParameterGroupRecord> {
+        let name = record.db_parameter_group_name.as_ref()?;
+        self.db_parameter_groups
+            .get(&(record.region.clone(), name.to_ascii_lowercase()))
+            .cloned()
     }
 
     /// The DB subnet group `record` was created in, as this store holds it, or `None` for an
@@ -3746,6 +3767,15 @@ pub const DEFAULT_UPGRADE_ROLLOUT_ORDER: &str = "second";
 /// `ParameterApplyStatus` of an applied DB parameter group and the `Status` of an
 /// applied option group.
 const MEMBERSHIP_IN_SYNC: &str = "in-sync";
+
+/// The `DBParameterGroupStatus$ParameterApplyStatus` of a DB parameter group whose change
+/// this instance's engine has not come up again since.
+///
+/// `ModifyDBParameterGroup`: "changes to static parameters require a reboot ... before the
+/// change can take effect" — and the status says which reboot a caller still owes, so a
+/// client can tell a change that is in force from one that is waiting
+/// ([`ComAmazonawsRdsAmazonrdsv19State::parameter_apply_status`]).
+const PARAMETER_APPLY_STATUS_PENDING_REBOOT: &str = "pending-reboot";
 
 /// The status RDS reports for a security-group membership that is in effect.
 const MEMBERSHIP_ACTIVE: &str = "active";

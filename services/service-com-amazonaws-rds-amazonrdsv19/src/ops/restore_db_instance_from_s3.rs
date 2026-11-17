@@ -536,6 +536,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // `EnableCloudwatchLogsExports` is STORED on the restored instance, so the list's
+        // length and each entry are bounded where they enter the handler, exactly as the
+        // create of an instance bounds the same member.
+        if let Some(values) = &input.enable_cloudwatch_logs_exports {
+            crate::state::check_request_list_len(
+                "EnableCloudwatchLogsExports",
+                values.len(),
+                crate::state::MAX_CLUSTER_LIST_ENTRIES,
+            )
+            .map_err(RestoreDBInstanceFromS3Error::invalid_parameter_value)?;
+            for value in values {
+                crate::state::check_free_form("EnableCloudwatchLogsExports", value)
+                    .map_err(RestoreDBInstanceFromS3Error::invalid_parameter_value)?;
+            }
+        }
+
         // No store means this service was mounted on an engine it has no state in, so it
         // cannot serve the operation at all. Unreachable with the engine the router builds;
         // 501 is the honest answer, never a fabricated instance.
@@ -833,6 +849,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // deferred modification belongs to the instance it was staged on.
                 deferred_modification: None,
                 engine_log: crate::state::InstanceLog::default(),
+                // `EnableCloudwatchLogsExports`: the log types the restored instance exports,
+                // and nothing for a request that named none.
+                enabled_cloudwatch_logs_exports: input
+                    .enable_cloudwatch_logs_exports
+                    .clone()
+                    .unwrap_or_default(),
+                // No statement has been logged to a general query log yet, and the continuous
+                // backup starts from the data the migration loaded.
+                general_query_log: crate::state::InstanceLog::default(),
+                recovery_points: Vec::new(),
             };
             record.engine_log.record(format!(
                 "DB instance {} restored from the Amazon S3 bucket {}; status {}",
@@ -953,6 +979,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
             record.master_user_secret = Some(minted.secret);
         }
+        // The restored instance's CONTINUOUS BACKUP starts from the data it comes up with, so
+        // an instant before its first commit has that state to be restored to rather than a
+        // later commit's.
+        crate::state::data_plane::continuous_backup::record_initial_state(
+            &mut record,
+            endpoint.as_ref(),
+        )
+        .await;
 
         // Another request may have created this identifier while this one was binding, so the
         // conflict is answered again here rather than overwriting a stored instance. Deciding
