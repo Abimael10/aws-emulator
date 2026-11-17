@@ -169,6 +169,29 @@ impl Harness {
     }
 }
 
+/// The AWS account the address list's OWN `AddressListArn` is scoped to: the account field
+/// of that ARN, read back through `GetAddressList` rather than written as a literal.
+async fn owner_account(harness: &Harness, address_list_id: &str) -> String {
+    let (status, out) = harness
+        .call(
+            "GetAddressList",
+            json!({ "AddressListId": address_list_id }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {address_list_id:?}: expected GetAddressList to answer 200, got {status} {out:?}"
+    );
+    let arn = out["AddressListArn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {address_list_id:?}: no AddressListArn in {out:?}"))
+        .to_string();
+    arn.split(':')
+        .nth(4)
+        .unwrap_or_else(|| panic!("case {address_list_id:?}: no account field in {arn:?}"))
+        .to_string()
+}
+
 /// The wire error code of a failure body: the `__type` member, without its namespace.
 fn error_code(body: &Value) -> String {
     body.get("__type")
@@ -1428,4 +1451,80 @@ async fn a_member_an_existing_address_list_does_not_hold_is_refused_as_a_request
         format!("Could not find AddressList with id {unknown}"),
         "case an-unknown-list: a list that does not resolve keeps its own wording, got {out:?}"
     );
+}
+
+/// RULE: the account clause of a member miss is the account the address list IS SCOPED TO, so
+/// the id it carries is the one that list's own `AddressListArn` carries — it is read off the
+/// resource the request named, not written as a literal.
+///
+/// The test derives the expected account independently, out of the `AddressListArn` the list
+/// reports through `GetAddressList`, so the assertion cannot be satisfied by a message that
+/// restates a constant the handler itself carries. Rows span the miss class (an address
+/// nothing registered, a bare domain, an address a deregister removed, and a case variant of a
+/// registered local part), each probed against TWO separately created lists.
+#[tokio::test]
+async fn a_member_miss_names_the_account_its_address_list_arn_carries() {
+    let harness = Harness::new();
+
+    // (case, the address to register first (if any), whether that register is then undone,
+    // the address to look up)
+    let rows: [(&str, Option<&str>, bool, &str); 4] = [
+        (
+            "an email address nothing registered",
+            None,
+            false,
+            "nobody@example.com",
+        ),
+        (
+            "a bare domain nothing registered",
+            None,
+            false,
+            "Unknown.Example.NET",
+        ),
+        (
+            "an address a deregister removed",
+            Some("removed@example.com"),
+            true,
+            "removed@example.com",
+        ),
+        (
+            "the all-upper-case variant of a registered local part",
+            Some("CaseProbe@Example.COM"),
+            false,
+            "CASEPROBE@EXAMPLE.COM",
+        ),
+    ];
+
+    for list_case in ["arn-account-first", "arn-account-second"] {
+        let list = harness.create_list(list_case).await;
+        let account = owner_account(&harness, &list).await;
+
+        for (row, registered, remove_it, lookup) in rows {
+            let case = format!("{row} / {list_case}");
+            if let Some(registered) = registered {
+                harness.register(&list, registered).await;
+                if remove_it {
+                    harness.deregister(&list, registered).await;
+                }
+            }
+
+            let (status, out) = harness
+                .call(
+                    "GetMemberOfAddressList",
+                    json!({ "AddressListId": list, "Address": lookup }),
+                )
+                .await;
+            assert_eq!(
+                error_code(&out),
+                "ResourceNotFoundException",
+                "case {case:?}: unexpected error code at {status}, got {out:?}"
+            );
+            assert_eq!(
+                error_message(&out),
+                format!("Could not find Address in AddressList {list} of AWS account {account}"),
+                "case {case:?}: the refusal must name the account this list's ARN carries \
+                 ({account}), got {out:?}"
+            );
+        }
+    }
 }
