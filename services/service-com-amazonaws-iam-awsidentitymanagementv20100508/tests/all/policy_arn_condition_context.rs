@@ -57,21 +57,24 @@ fn policy_arn((name, path): (&str, &str)) -> String {
 /// One kind of identity a managed policy attaches to: the three the attachment
 /// operations address, with the calls that attach to it, detach from it, report its
 /// attachments and create it.
+///
+/// `pub(crate)` because `tests/all.rs` is ONE crate root: a sibling suite driving the same
+/// six attachment operations borrows this table rather than writing a second one.
 #[derive(Debug, Clone, Copy)]
-struct Identity {
+pub(crate) struct Identity {
     /// The entity type, which is both the ARN's resource type and the word a refusal
     /// names the entity by.
-    kind: &'static str,
+    pub(crate) kind: &'static str,
     /// The awsQuery parameter the request addresses the identity by.
-    parameter: &'static str,
+    pub(crate) parameter: &'static str,
     /// The awsQuery action that creates one, and whether that create requires a trust
     /// policy.
-    create: &'static str,
-    trusted: bool,
+    pub(crate) create: &'static str,
+    pub(crate) trusted: bool,
     /// The two attachment calls and the reader of their result.
-    attach: &'static str,
-    detach: &'static str,
-    list: &'static str,
+    pub(crate) attach: &'static str,
+    pub(crate) detach: &'static str,
+    pub(crate) list: &'static str,
 }
 
 impl Identity {
@@ -88,7 +91,7 @@ impl Identity {
 }
 
 /// The three kinds, so every one of the six attachment operations is driven.
-const IDENTITIES: &[Identity] = &[
+pub(crate) const IDENTITIES: &[Identity] = &[
     Identity {
         kind: "user",
         parameter: "UserName",
@@ -152,7 +155,7 @@ async fn fixture_policies(router: &MultiServiceRouter) {
 }
 
 /// Create the identity `name` of kind `identity`, which the rows' calls address.
-async fn create_identity(
+pub(crate) async fn create_identity(
     router: &MultiServiceRouter,
     case: &str,
     identity: Identity,
@@ -172,7 +175,7 @@ async fn create_identity(
 
 /// The managed policies `name` carries, ascending by ARN, read back through the reader of
 /// that identity's attachments — the round trip every write below is checked by.
-async fn attached(
+pub(crate) async fn attached(
     router: &MultiServiceRouter,
     case: &str,
     identity: Identity,

@@ -47,6 +47,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_iam_awsidentitymanagementv20100508::state;
 
+use crate::policy_arn_condition_context::{attached, create_identity, Identity, IDENTITIES};
 use crate::policy_simulation::{reported, simulate};
 use crate::user_lifecycle::{account_id, call, element, elements, error_code, router};
 
@@ -965,4 +966,202 @@ async fn a_service_namespace_no_service_is_published_under_is_refused() {
         vec!["reads".to_string()],
         "the inline policy granting s3 must still be reported, got {body}"
     );
+}
+
+/// One attach or detach of `policy_arn` on the identity `name`, through the action the
+/// identity kind spells it with.
+///
+/// The identity kinds themselves, the creates and the reader of an identity's attachments
+/// are the table `tests/all/policy_arn_condition_context.rs` owns
+/// ([`IDENTITIES`], [`create_identity`], [`attached`]): `tests/all.rs` is one crate root,
+/// so the six attachment operations are enumerated once for the whole target.
+async fn change_attachment(
+    router: &MultiServiceRouter,
+    identity: Identity,
+    action: &str,
+    name: &str,
+    policy_arn: &str,
+) -> (u16, String) {
+    let params = vec![
+        param(identity.parameter, name),
+        param("PolicyArn", policy_arn),
+    ];
+    call(router, action, &borrowed(&params)).await
+}
+
+/// RULE 3, across the two sides of one attachment: a value that is no ARN at all is refused
+/// 400 `ValidationError` by both halves of the attachment family, and WHICH sentence it
+/// carries goes by what the operation has to decide about the ARN — the attach of each
+/// identity kind decides attachability and names the value, while the detach of that same
+/// identity kind states IAM's generic parse failure, whose empty reading sits between the
+/// template's two spaces and quotes nothing of the value. Neither call records anything.
+#[tokio::test]
+async fn the_attach_and_detach_of_an_identity_word_an_unparseable_policy_arn_their_own_way() {
+    let router = router();
+
+    // Rows: the identity kind the attachment is made on (all three), crossed with the ways
+    // a value misses the `arn:` frame ([`NOT_AN_ARN`]) — so neither the sentence nor the
+    // side of the family it belongs to is pinned to one operation or one value.
+    for identity in IDENTITIES {
+        let name = format!("ArnForm-{}", identity.kind);
+        create_identity(&router, identity.kind, *identity, &name).await;
+
+        for (how, value) in NOT_AN_ARN {
+            let case = format!("{} with {how} ({value:?})", identity.attach);
+            let (status, body) =
+                change_attachment(&router, *identity, identity.attach, &name, value).await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected HTTP 400, got {status}: {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "ValidationError",
+                "case {case:?}: expected ValidationError, got {:?}: {body}",
+                error_code(&body)
+            );
+            let message = element(&body, "Message");
+            assert_eq!(
+                message,
+                arn_not_valid(value),
+                "case {case:?}: the attach side names the value, got {message:?}"
+            );
+
+            let case = format!("{} with {how} ({value:?})", identity.detach);
+            let (status, body) =
+                change_attachment(&router, *identity, identity.detach, &name, value).await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected HTTP 400, got {status}: {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "ValidationError",
+                "case {case:?}: expected ValidationError, got {:?}: {body}",
+                error_code(&body)
+            );
+            let message = element(&body, "Message");
+            assert_eq!(
+                message, UNPARSEABLE_ARN,
+                "case {case:?}: expected {UNPARSEABLE_ARN:?}, got {message:?}"
+            );
+            assert!(
+                !message.contains(value.trim()),
+                "case {case:?}: the parse failure quotes nothing of the value, got {message:?}"
+            );
+            assert!(
+                message.contains("  "),
+                "case {case:?}: the empty reading is rendered between the template's two \
+                 spaces, got {message:?}"
+            );
+
+            let carried = attached(&router, &case, *identity, &name).await;
+            assert!(
+                carried.is_empty(),
+                "case {case:?}: a refused pair must leave the identity carrying nothing, got \
+                 {carried:?}"
+            );
+        }
+    }
+}
+
+/// RULE 3, bounded on the other side: the refusal above is about the value's FORM, so a
+/// well-formed managed-policy ARN is SERVED by the same two operations on every identity
+/// kind — attached, reported by the identity's own listing, detached, and gone from that
+/// listing afterwards — and a well-formed ARN the identity does not carry is the policy
+/// family's own absence (404 `NoSuchEntity` naming the ARN) rather than this
+/// `ValidationError`.
+#[tokio::test]
+async fn a_well_formed_policy_arn_attaches_and_detaches_on_every_identity_kind() {
+    let router = router();
+    let customer = create_policy(&router, "ArnFormRoundTrip").await;
+
+    // Rows: the namespaces and paths a managed policy's ARN is written in — an AWS-managed
+    // policy at the catalog's root, one under the path AWS files service-role policies at
+    // (both SOURCE: this crate's published catalog, `state::AWS_MANAGED_POLICIES`), and a
+    // customer-managed policy of this account under its own path.
+    let published: [(&str, &str); 2] = [
+        ("/", "ReadOnlyAccess"),
+        ("/service-role/", "AWSLambdaBasicExecutionRole"),
+    ];
+    let aws_managed: Vec<(String, String)> = published
+        .iter()
+        .map(|(path, name)| {
+            let arn = format!("arn:aws:iam::aws:policy{path}{name}");
+            assert!(
+                state::aws_managed_policy(&arn).is_some(),
+                "case {arn:?}: the row must name a policy the published catalog carries"
+            );
+            (format!("an AWS-managed policy at {path}"), arn)
+        })
+        .collect();
+    let mut policies = aws_managed;
+    policies.push((
+        "a customer-managed policy of this account".to_string(),
+        customer,
+    ));
+
+    for identity in IDENTITIES {
+        for (row, (case, policy_arn)) in policies.iter().enumerate() {
+            let name = format!("RoundTrip-{}-{row}", identity.kind);
+            create_identity(&router, case, *identity, &name).await;
+
+            let (status, body) =
+                change_attachment(&router, *identity, identity.attach, &name, policy_arn).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?} through {}: expected HTTP 200, got {status}: {body}",
+                identity.attach
+            );
+            let carried = attached(&router, case, *identity, &name).await;
+            assert_eq!(
+                carried,
+                vec![policy_arn.clone()],
+                "case {case:?} through {}: the identity must report the policy it was given, \
+                 got {carried:?}",
+                identity.attach
+            );
+
+            let (status, body) =
+                change_attachment(&router, *identity, identity.detach, &name, policy_arn).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?} through {}: expected HTTP 200, got {status}: {body}",
+                identity.detach
+            );
+            let carried = attached(&router, case, *identity, &name).await;
+            assert!(
+                carried.is_empty(),
+                "case {case:?} through {}: the detached policy must be gone from the listing, \
+                 got {carried:?}",
+                identity.detach
+            );
+
+            // The same call again addresses a policy the identity does not carry, which is
+            // the policy family's own absence — so the ValidationError above stays specific
+            // to a value nothing can be read as an ARN from.
+            let (status, body) =
+                change_attachment(&router, *identity, identity.detach, &name, policy_arn).await;
+            assert_eq!(
+                status, 404,
+                "case {case:?} through {}: expected HTTP 404 for an attachment the identity \
+                 no longer carries, got {status}: {body}",
+                identity.detach
+            );
+            assert_eq!(
+                error_code(&body),
+                "NoSuchEntity",
+                "case {case:?} through {}: expected NoSuchEntity, got {:?}: {body}",
+                identity.detach,
+                error_code(&body)
+            );
+            let message = element(&body, "Message");
+            let expected = format!("Policy {policy_arn} was not found.");
+            assert_eq!(
+                message, expected,
+                "case {case:?} through {}: expected {expected:?}, got {message:?}",
+                identity.detach
+            );
+        }
+    }
 }
