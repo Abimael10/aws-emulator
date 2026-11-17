@@ -41,6 +41,11 @@ pub use endpoint_plane::{open_endpoint_plane, EndpointPlane};
 mod endpoints;
 pub use endpoints::*;
 
+/// The grammar a resource-based policy document has to follow before the put
+/// will attach it.
+mod policy_document;
+pub use policy_document::*;
+
 /// The resource-policy slice: the resource-based policy a web function carries,
 /// the document rule the put holds it to and the revision rule both mutating
 /// operations apply.

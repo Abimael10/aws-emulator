@@ -212,8 +212,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 GetWebFunctionEndpointErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         message: crate::state::function_not_found_message(&input.function_name),
-                        resource_id: Some(input.function_name.clone()),
-                        resource_type: Some("WebFunction".to_string()),
+                        resource_id: None,
+                        resource_type: None,
                     },
                 )
                 .into(),
@@ -229,8 +229,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             "The endpoint {} doesn't exist on web function {}.",
                             input.endpoint_name, function.function_name
                         ),
-                        resource_id: Some(input.endpoint_name.clone()),
-                        resource_type: Some("Endpoint".to_string()),
+                        resource_id: None,
+                        resource_type: None,
                     },
                 )
                 .into(),

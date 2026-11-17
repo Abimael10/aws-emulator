@@ -14,7 +14,7 @@
 //! has been through, how a document fails to be JSON, which operation carries the
 //! stale revision id), and the single-statement document is only one row.
 
-use serde_json::{json, Value};
+use serde_json::json;
 
 use super::web_function_lifecycle::{build_config, percent_encoded, role_arn, Emulator, Reply};
 
@@ -26,13 +26,26 @@ const REGION: &str = "us-east-1";
 /// (source: `smithy_query(query="shape", shape="ResourcePolicy")`).
 const POLICY_MAX_CHARS: usize = 20480;
 
-/// The sentence both mutating resource-policy operations refuse a stale
-/// `revisionId` with: ONE fixed sentence pair for ONE conflict class, carrying no
-/// revision id, ARN or function name — the id the request sent is the caller's own
-/// and the current one is what `GetResourcePolicy` reports.
-const STALE_REVISION_MESSAGE: &str =
+/// The sentence `PutResourcePolicy` refuses a stale `revisionId` with: fixed
+/// text, carrying no revision id, ARN or function name — the id the request sent
+/// is the caller's own and the current one is what `GetResourcePolicy` reports.
+const PUT_STALE_REVISION_MESSAGE: &str =
     "The policy was updated or deleted by another request. Try again with the latest policy \
      revisionId.";
+
+/// The sentence `DeleteResourcePolicy` refuses a stale `revisionId` with: the
+/// same conflict class as the put's, worded for the removal, so the two refusals
+/// stay distinguishable by text.
+const DELETE_STALE_REVISION_MESSAGE: &str = "The policy was updated by another request. Try again.";
+
+/// The sentence every stale-revision refusal of `operation` reports.
+fn stale_revision_message(operation: &str) -> &'static str {
+    match operation {
+        "PutResourcePolicy" => PUT_STALE_REVISION_MESSAGE,
+        "DeleteResourcePolicy" => DELETE_STALE_REVISION_MESSAGE,
+        other => panic!("no stale-revision sentence is stated for {other}"),
+    }
+}
 
 /// The sentence the readers report for a function that carries no policy.
 const POLICY_NOT_FOUND_MESSAGE: &str = "The function does not have a policy.";
@@ -55,6 +68,22 @@ fn is_modelled_revision_id(value: &str) -> bool {
         && value
             .chars()
             .all(|c| matches!(c, '0'..='9' | 'a'..='f' | '-'))
+}
+
+/// A resource-based policy document the policy language accepts, for a row whose
+/// axis is NOT the document: the put judges the document before it resolves the
+/// function or checks the revision, so every other rule has to be driven with a
+/// document the grammar admits.
+fn well_formed_policy() -> String {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": { "AWS": "111122223333" },
+            "Action": "lambda:InvokeFunction",
+        }],
+    })
+    .to_string()
 }
 
 /// A resource-based policy document of exactly `length` characters: a statement
@@ -224,8 +253,16 @@ fn accepted_documents(resource_arn: &str) -> Vec<DocumentCase> {
             .to_string(),
         },
         DocumentCase {
-            case: "a JSON object carrying no elements",
-            document: "{}".to_string(),
+            case: "a Deny stated with NotPrincipal and NotAction, and no Version",
+            document: json!({
+                "Statement": {
+                    "Sid": "everyoneElse",
+                    "Effect": "Deny",
+                    "NotPrincipal": { "AWS": ["111122223333", "444455556666"] },
+                    "NotAction": ["lambda:InvokeFunction"],
+                },
+            })
+            .to_string(),
         },
         DocumentCase {
             case: "a document of exactly the longest length the model allows",
@@ -369,7 +406,7 @@ async fn a_stale_revision_id_is_a_conflict_that_changes_nothing() {
             for (operation, refused) in [
                 (
                     "PutResourcePolicy",
-                    put_policy(&emulator, &arn, "{}", Some(id)).await,
+                    put_policy(&emulator, &arn, &well_formed_policy(), Some(id)).await,
                 ),
                 (
                     "DeleteResourcePolicy",
@@ -391,7 +428,7 @@ async fn a_stale_revision_id_is_a_conflict_that_changes_nothing() {
                 );
                 assert_eq!(
                     refused.string("message").as_deref(),
-                    Some(STALE_REVISION_MESSAGE),
+                    Some(stale_revision_message(operation)),
                     "case generation {generation} ({operation} with the stale id {id:?}): \
                      expected the stale-revision sentence, got {:?}",
                     refused.body
@@ -412,10 +449,10 @@ async fn a_stale_revision_id_is_a_conflict_that_changes_nothing() {
 }
 
 #[tokio::test]
-async fn every_stale_revision_conflict_reports_the_same_fixed_sentence() {
+async fn every_stale_revision_conflict_reports_its_operations_fixed_sentence() {
     // RULE: the refusal of a `revisionId` that is not the stored policy's current
-    // generation is ONE conflict class, so both mutating resource-policy operations
-    // report the same fixed sentence for it, however the id came to be stale and
+    // generation is ONE conflict class, and each mutating resource-policy operation
+    // states it in its own fixed sentence, however the id came to be stale and
     // whatever the request carries — the sentence templates nothing, so neither the
     // supplied id, nor the current one, nor the ARN or function name appears in it.
     // The rows span how stale the id is: one generation back, two, three, an id this
@@ -462,7 +499,7 @@ async fn every_stale_revision_conflict_reports_the_same_fixed_sentence() {
         for (operation, refused) in [
             (
                 "PutResourcePolicy",
-                put_policy(&emulator, &arn, "{}", Some(id)).await,
+                put_policy(&emulator, &arn, &well_formed_policy(), Some(id)).await,
             ),
             (
                 "DeleteResourcePolicy",
@@ -485,7 +522,7 @@ async fn every_stale_revision_conflict_reports_the_same_fixed_sentence() {
         ("the id of a policy that was deleted", &current),
         ("an id this service never minted", &never_minted),
     ] {
-        let refused = put_policy(&emulator, &arn, "{}", Some(id)).await;
+        let refused = put_policy(&emulator, &arn, &well_formed_policy(), Some(id)).await;
         assert_conflict(case, "PutResourcePolicy", &refused, &[id, &arn, name]);
     }
 }
@@ -507,7 +544,8 @@ fn assert_conflict(case: &str, operation: &str, refused: &Reply, values: &[&str]
     );
     let message = refused.string("message").unwrap_or_default();
     assert_eq!(
-        message, STALE_REVISION_MESSAGE,
+        message,
+        stale_revision_message(operation),
         "case {case:?} ({operation}): expected the stale-revision sentence, got {message:?}"
     );
     for value in values {
@@ -745,7 +783,7 @@ async fn a_resource_arn_that_names_no_stored_function_is_not_found() {
         for (operation, reply) in [
             (
                 "PutResourcePolicy",
-                put_policy(&emulator, arn, "{}", None).await,
+                put_policy(&emulator, arn, &well_formed_policy(), None).await,
             ),
             ("GetResourcePolicy", get_policy(&emulator, arn).await),
             (
@@ -766,13 +804,17 @@ async fn a_resource_arn_that_names_no_stored_function_is_not_found() {
                 reply.body
             );
             assert_eq!(
-                reply
-                    .field("resourceType")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default(),
-                "WebFunction",
-                "case {case:?} ({operation} on {arn}): the refusal names the resource that is \
-                 missing, got {:?}",
+                reply.field("resourceId"),
+                None,
+                "case {case:?} ({operation} on {arn}): the refusal carries message only, \
+                 got {:?}",
+                reply.body
+            );
+            assert_eq!(
+                reply.field("resourceType"),
+                None,
+                "case {case:?} ({operation} on {arn}): the refusal carries message only, \
+                 got {:?}",
                 reply.body
             );
         }
@@ -787,12 +829,330 @@ async fn a_resource_arn_that_names_no_stored_function_is_not_found() {
         no_policy.status, no_policy.body
     );
     assert_eq!(
-        no_policy
-            .field("resourceType")
-            .and_then(Value::as_str)
-            .unwrap_or_default(),
-        "ResourcePolicy",
-        "a function with no policy attached: the refusal names the policy, got {:?}",
+        no_policy.string("message").as_deref(),
+        Some(POLICY_NOT_FOUND_MESSAGE),
+        "a function with no policy attached: the refusal names the missing policy, got {:?}",
         no_policy.body
     );
+}
+
+/// The documents the policy language cannot read, each a JSON object: every row
+/// fails the IAM JSON policy language's resource-policy grammar in a different
+/// way — no statement element the language can read, a `Version` it does not
+/// define, or a statement that does not state an `Effect` of `Allow` or `Deny`
+/// over at least one action (`Action`/`NotAction`) for at least one principal
+/// (`Principal`/`NotPrincipal`). The clauses and the two published policy
+/// language versions are the language's, read for the whole tree by
+/// `service_common::iam_policy::resource_policy_defect`, not this suite's.
+fn documents_that_are_not_policies() -> Vec<DocumentCase> {
+    let statement = json!({
+        "Effect": "Allow",
+        "Principal": "*",
+        "Action": "lambda:InvokeFunction",
+    });
+    vec![
+        DocumentCase {
+            case: "a JSON object carrying no elements",
+            document: "{}".to_string(),
+        },
+        DocumentCase {
+            case: "no statement element at all",
+            document: json!({ "Version": "2012-10-17" }).to_string(),
+        },
+        DocumentCase {
+            case: "a statement list with no statements in it",
+            document: json!({ "Version": "2012-10-17", "Statement": [] }).to_string(),
+        },
+        DocumentCase {
+            case: "a statement element that is a string",
+            document: json!({ "Statement": "lambda:InvokeFunction" }).to_string(),
+        },
+        DocumentCase {
+            case: "the statements under a top-level name the language does not define",
+            document: json!({ "Statements": [statement.clone()] }).to_string(),
+        },
+        DocumentCase {
+            case: "a policy language version that is not published",
+            document: json!({ "Version": "2019-01-01", "Statement": [statement.clone()] })
+                .to_string(),
+        },
+        DocumentCase {
+            case: "a statement that states no Effect",
+            document: json!({
+                "Statement": [{ "Principal": "*", "Action": "lambda:InvokeFunction" }],
+            })
+            .to_string(),
+        },
+        DocumentCase {
+            case: "an Effect the policy language does not define",
+            document: json!({
+                "Statement": [{
+                    "Effect": "Permit",
+                    "Principal": "*",
+                    "Action": "lambda:InvokeFunction",
+                }],
+            })
+            .to_string(),
+        },
+        DocumentCase {
+            case: "a statement that names no action",
+            document: json!({ "Statement": [{ "Effect": "Allow", "Principal": "*" }] }).to_string(),
+        },
+        DocumentCase {
+            case: "a statement that is not a JSON object",
+            document: json!({ "Statement": [17] }).to_string(),
+        },
+        DocumentCase {
+            case: "an action list with no actions in it",
+            document: json!({
+                "Statement": [{ "Effect": "Allow", "Principal": "*", "Action": [] }],
+            })
+            .to_string(),
+        },
+        DocumentCase {
+            case: "a statement that names no principal",
+            document: json!({
+                "Statement": [{ "Effect": "Allow", "Action": "lambda:InvokeFunction" }],
+            })
+            .to_string(),
+        },
+        DocumentCase {
+            case: "an action element that is a number",
+            document: json!({
+                "Statement": [{ "Effect": "Allow", "Principal": "*", "Action": 17 }],
+            })
+            .to_string(),
+        },
+        DocumentCase {
+            case: "a principal element that names nothing",
+            document: json!({
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": {},
+                    "Action": "lambda:InvokeFunction",
+                }],
+            })
+            .to_string(),
+        },
+        DocumentCase {
+            case: "a complement that names nothing",
+            document: json!({
+                "Statement": [{
+                    "Effect": "Deny",
+                    "NotPrincipal": "",
+                    "NotAction": "lambda:InvokeFunction",
+                }],
+            })
+            .to_string(),
+        },
+        DocumentCase {
+            case: "one well-formed statement beside one the language cannot read",
+            document: json!({
+                "Version": "2012-10-17",
+                "Statement": [statement, json!({ "Effect": "Allow" })],
+            })
+            .to_string(),
+        },
+    ]
+}
+
+/// Assert `refused` is this service's policy-document refusal: HTTP 400,
+/// `ValidationException`, exactly the fixed sentence, and `message` alone.
+fn assert_policy_syntax_refusal(case: &str, refused: &Reply) {
+    assert_eq!(
+        refused.status, 400,
+        "case {case:?}: expected HTTP 400, got {} with {:?}",
+        refused.status, refused.body
+    );
+    assert_eq!(
+        refused.error(),
+        "ValidationException",
+        "case {case:?}: expected ValidationException, got {:?}",
+        refused.body
+    );
+    assert_eq!(
+        refused.string("message").as_deref(),
+        Some(POLICY_SYNTAX_MESSAGE),
+        "case {case:?}: expected the policy-syntax sentence, got {:?}",
+        refused.body
+    );
+}
+
+#[tokio::test]
+async fn a_json_object_that_is_not_a_policy_is_refused_and_changes_nothing() {
+    // RULE: `policy` is a JSON-formatted resource-based POLICY, so a document is
+    // held to the policy language's grammar and not merely to "is a JSON object":
+    // one that the language cannot read is refused whole with the service's
+    // policy-syntax ValidationException and nothing is attached. The rows span the
+    // ways a JSON object fails that grammar.
+    let emulator = Emulator::new();
+    let arn = create_function(&emulator, "policy-not-a-policy").await;
+
+    // A policy is attached first, so every row also shows the refusal is total:
+    // the generation held before it survives it.
+    let held = well_formed_policy();
+    let attached = put_policy(&emulator, &arn, &held, None).await;
+    let (_, held_revision_id) = reported("the held policy", &attached);
+
+    for DocumentCase { case, document } in documents_that_are_not_policies() {
+        let refused = put_policy(&emulator, &arn, &document, None).await;
+        assert_policy_syntax_refusal(case, &refused);
+        assert_eq!(
+            refused.field("resourceId"),
+            None,
+            "case {case:?}: the refusal carries message only, got {:?}",
+            refused.body
+        );
+
+        let got = get_policy(&emulator, &arn).await;
+        assert_eq!(
+            reported(case, &got),
+            (held.clone(), held_revision_id.clone()),
+            "case {case:?}: a refused put leaves the attached policy as it was, got {:?}",
+            got.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_document_the_language_cannot_read_is_refused_before_the_request_is_resolved() {
+    // RULE: the REQUEST is judged before the resource it addresses and before the
+    // generation it names, so a put whose document the policy language cannot read
+    // reports the policy-syntax ValidationException whether or not the ARN names a
+    // stored function and whatever `revisionId` it carries. The rows span the ways
+    // a document fails the grammar crossed with the ways the rest of the request
+    // would itself have been refused.
+    let emulator = Emulator::new();
+    let held = create_function(&emulator, "policy-validation-order").await;
+    let absent = held.replace("policy-validation-order", "never-created");
+
+    let attached = put_policy(&emulator, &held, &well_formed_policy(), None).await;
+    let (_, current) = reported("the held policy", &attached);
+    // 36 characters of the modelled alphabet, so the boundary validator passes it
+    // and the handler is what would refuse it.
+    let stale = "ffffffff-ffff-ffff-ffff-ffffffffffff";
+
+    for DocumentCase { case, document } in documents_that_are_not_policies() {
+        for (addressed, arn, revision_id) in [
+            ("a function that was never created", &absent, None),
+            (
+                "a function that was never created, with a revision id",
+                &absent,
+                Some(stale),
+            ),
+            ("a stored function, with a stale revision id", &held, Some(stale)),
+        ] {
+            let refused = put_policy(&emulator, arn, &document, revision_id).await;
+            assert_policy_syntax_refusal(&format!("{case} against {addressed}"), &refused);
+        }
+    }
+
+    // ... and a document the language CAN read is what lets the absent function be
+    // reported, which is how the two refusals stay distinguishable.
+    let not_found = put_policy(&emulator, &absent, &well_formed_policy(), None).await;
+    assert_eq!(
+        not_found.status, 404,
+        "case a well-formed document against an absent function: expected HTTP 404, got {} \
+         with {:?}",
+        not_found.status, not_found.body
+    );
+    assert_eq!(
+        not_found.string("message").as_deref(),
+        Some(format!("The function {absent} does not exist.").as_str()),
+        "case a well-formed document against an absent function: expected the absent-function \
+         sentence, got {:?}",
+        not_found.body
+    );
+
+    // The stored policy survived every refusal above.
+    let got = get_policy(&emulator, &held).await;
+    assert_eq!(
+        reported("after every refusal", &got).1,
+        current,
+        "case after every refusal: the stored generation is untouched, got {:?}",
+        got.body
+    );
+}
+
+#[tokio::test]
+async fn every_resource_policy_refusal_carries_only_a_message() {
+    // RULE: `ResourceNotFoundException`, `ConflictException` and
+    // `ValidationException` declare `message` as their only required member, and
+    // this service's refusals report that member alone — the optional `resourceId`
+    // and `resourceType` are left unset, so the serializer omits them. The rows
+    // span every refusal the resource-policy operations can answer: the function is
+    // absent (404), the policy is absent (404), the revision id is stale (409) and
+    // the document is not a policy (400).
+    let emulator = Emulator::new();
+    let arn = create_function(&emulator, "policy-refusal-shape").await;
+    let absent = arn.replace("policy-refusal-shape", "never-created");
+    let document = well_formed_policy();
+
+    let mut refusals: Vec<(String, Reply)> = vec![
+        (
+            "PutResourcePolicy: the function is absent".to_string(),
+            put_policy(&emulator, &absent, &document, None).await,
+        ),
+        (
+            "GetResourcePolicy: the function is absent".to_string(),
+            get_policy(&emulator, &absent).await,
+        ),
+        (
+            "DeleteResourcePolicy: the function is absent".to_string(),
+            delete_policy(&emulator, &absent, None).await,
+        ),
+        (
+            "GetResourcePolicy: the function carries no policy".to_string(),
+            get_policy(&emulator, &arn).await,
+        ),
+        (
+            "DeleteResourcePolicy: the function carries no policy".to_string(),
+            delete_policy(&emulator, &arn, None).await,
+        ),
+        (
+            "PutResourcePolicy: the document is not a policy".to_string(),
+            put_policy(&emulator, &arn, "{}", None).await,
+        ),
+    ];
+
+    // Two generations, so the first one's id is stale and both mutating operations
+    // can be refused with it.
+    let first = put_policy(&emulator, &arn, &document, None).await;
+    let (_, stale) = reported("the superseded generation", &first);
+    let second = put_policy(&emulator, &arn, &padded_policy(512), Some(&stale)).await;
+    assert_eq!(
+        second.status, 200,
+        "case the current generation: PutResourcePolicy expected 200, got {} with {:?}",
+        second.status, second.body
+    );
+    refusals.push((
+        "PutResourcePolicy: the revision id is stale".to_string(),
+        put_policy(&emulator, &arn, &document, Some(&stale)).await,
+    ));
+    refusals.push((
+        "DeleteResourcePolicy: the revision id is stale".to_string(),
+        delete_policy(&emulator, &arn, Some(&stale)).await,
+    ));
+
+    for (case, refused) in &refusals {
+        assert!(
+            (400..500).contains(&refused.status),
+            "case {case:?}: expected a client refusal, got {} with {:?}",
+            refused.status,
+            refused.body
+        );
+        assert!(
+            refused.string("message").is_some_and(|m| !m.is_empty()),
+            "case {case:?}: a refusal states its message, got {:?}",
+            refused.body
+        );
+        for member in ["resourceId", "resourceType"] {
+            assert_eq!(
+                refused.field(member),
+                None,
+                "case {case:?}: expected no {member} member, got {:?}",
+                refused.body
+            );
+        }
+    }
 }

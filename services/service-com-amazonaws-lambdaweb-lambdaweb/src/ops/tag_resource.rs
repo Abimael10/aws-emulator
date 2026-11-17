@@ -215,8 +215,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(TagResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: crate::state::function_not_found_message(&input.resource),
-                    resource_id: Some(input.resource.clone()),
-                    resource_type: Some("WebFunction".to_string()),
+                    resource_id: None,
+                    resource_type: None,
                 },
             )
             .into());
@@ -228,8 +228,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         "The request would exceed the maximum number of tags ({}) for this web function",
                         crate::state::MAX_TAGS_PER_FUNCTION
                     ),
-                    resource_id: Some(input.resource.clone()),
-                    resource_type: Some("WebFunction".to_string()),
+                    resource_id: None,
+                    resource_type: None,
                     service_code: Some(crate::state::ARN_NAMESPACE.to_string()),
                     quota_code: None,
                 },

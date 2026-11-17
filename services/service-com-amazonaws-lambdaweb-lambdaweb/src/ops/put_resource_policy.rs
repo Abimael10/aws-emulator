@@ -5,9 +5,11 @@
 //! stored with the `revisionId` of the generation it wrote — this is the ONLY file to
 //! touch for this operation.
 //!
-//! The document is held to the `policy` member's own rule (JSON-formatted, see
-//! [`crate::state::is_policy_document`]) and the revision check is applied BEFORE
-//! anything is written, so a refused put leaves the stored policy exactly as it was. The
+//! The document is held to the policy language's grammar (see
+//! [`crate::state::is_policy_document`]) BEFORE the function the ARN names is
+//! resolved, so a request that never passed validation reports its validation
+//! refusal rather than a not-found; the revision check is applied before anything
+//! is written, so a refused put leaves the stored policy exactly as it was. The
 //! stored policy lives in the function's own record
 //! (`crate::state::WebFunction::resource_policy`), so `GetResourcePolicy`,
 //! `DeleteResourcePolicy` and the function's own delete all see ONE copy of it.
@@ -184,23 +186,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         state.materialise_due_transitions(now);
 
-        // The `resourceArn` names the web function the policy hangs off; the store
-        // keys that function by name, exactly as every other reader resolves it.
-        let name = crate::state::resolve_function_name(&input.resource_arn).to_string();
-        let Some(function) = state.functions.get(&name) else {
-            return Err(PutResourcePolicyErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: crate::state::function_not_found_message(&input.resource_arn),
-                    resource_id: Some(input.resource_arn.clone()),
-                    resource_type: Some("WebFunction".to_string()),
-                },
-            )
-            .into());
-        };
-        let current = function.resource_policy.clone();
-
-        // Both checks run BEFORE the write, so a put this service refuses leaves
-        // the stored policy and its revision id exactly as they were.
+        // The REQUEST is judged before the resource it addresses is resolved: a
+        // document that is not a policy is refused whatever function the ARN
+        // names, so a request that never passed validation reports no not-found.
         if !crate::state::is_policy_document(&input.policy) {
             return Err(
                 PutResourcePolicyErrorModeled::ValidationException(ValidationException {
@@ -209,6 +197,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
+
+        // The `resourceArn` names the web function the policy hangs off; the store
+        // keys that function by name, exactly as every other reader resolves it.
+        let name = crate::state::resolve_function_name(&input.resource_arn).to_string();
+        let Some(function) = state.functions.get(&name) else {
+            return Err(PutResourcePolicyErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::function_not_found_message(&input.resource_arn),
+                    resource_id: None,
+                    resource_type: None,
+                },
+            )
+            .into());
+        };
+        let current = function.resource_policy.clone();
+
+        // The revision check runs BEFORE the write, so a put this service refuses
+        // leaves the stored policy and its revision id exactly as they were.
         if let Some(supplied) = input.revision_id.as_deref() {
             // A request that names a revision id may write over the generation
             // that id identifies and no other — and over no generation at all
@@ -219,11 +225,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !accepted {
                 return Err(PutResourcePolicyErrorModeled::ConflictException(
                     ConflictException {
-                        message: crate::state::STALE_POLICY_REVISION_MESSAGE.to_string(),
-                        resource_id: Some(input.resource_arn.clone()),
-                        resource_type: Some(
-                            crate::state::RESOURCE_POLICY_RESOURCE_TYPE.to_string(),
-                        ),
+                        message: crate::state::STALE_POLICY_REVISION_PUT_MESSAGE.to_string(),
+                        resource_id: None,
+                        resource_type: None,
                     },
                 )
                 .into());

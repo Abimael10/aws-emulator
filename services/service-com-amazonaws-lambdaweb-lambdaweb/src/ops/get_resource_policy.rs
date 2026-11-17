@@ -170,8 +170,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(GetResourcePolicyErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: crate::state::function_not_found_message(&input.resource_arn),
-                    resource_id: Some(input.resource_arn.clone()),
-                    resource_type: Some("WebFunction".to_string()),
+                    resource_id: None,
+                    resource_type: None,
                 },
             )
             .into());
@@ -181,8 +181,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(GetResourcePolicyErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: crate::state::POLICY_NOT_FOUND_MESSAGE.to_string(),
-                    resource_id: Some(input.resource_arn.clone()),
-                    resource_type: Some(crate::state::RESOURCE_POLICY_RESOURCE_TYPE.to_string()),
+                    resource_id: None,
+                    resource_type: None,
                 },
             )
             .into());

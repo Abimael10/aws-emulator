@@ -520,16 +520,15 @@ async fn a_resource_that_names_no_stored_function_is_not_found_on_every_tag_path
                  got {:?}",
                 reply.body
             );
-            assert_eq!(
-                reply
-                    .field("resourceType")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default(),
-                "WebFunction",
-                "case {case:?} ({operation} on {arn}): the refusal names the resource that is \
-                 missing, got {:?}",
-                reply.body
-            );
+            for member in ["resourceId", "resourceType"] {
+                assert_eq!(
+                    reply.field(member),
+                    None,
+                    "case {case:?} ({operation} on {arn}): the refusal carries message only, \
+                     got {:?}",
+                    reply.body
+                );
+            }
         }
     }
 

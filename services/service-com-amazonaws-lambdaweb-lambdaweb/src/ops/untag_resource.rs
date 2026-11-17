@@ -206,8 +206,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(UntagResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: crate::state::function_not_found_message(&input.resource),
-                    resource_id: Some(input.resource.clone()),
-                    resource_type: Some("WebFunction".to_string()),
+                    resource_id: None,
+                    resource_type: None,
                 },
             )
             .into());

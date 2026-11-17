@@ -166,8 +166,8 @@ fn refuse_if_taken(
                 "A web function named {} already exists.",
                 existing.function_name
             ),
-            resource_id: Some(existing.function_arn.clone()),
-            resource_type: Some("WebFunction".to_string()),
+            resource_id: None,
+            resource_type: None,
         })
         .into(),
     )
@@ -189,7 +189,7 @@ fn refuse_if_at_the_quota(
                     crate::state::MAX_WEB_FUNCTIONS
                 ),
                 resource_id: None,
-                resource_type: Some("WebFunction".to_string()),
+                resource_type: None,
                 service_code: Some(crate::state::ARN_NAMESPACE.to_string()),
                 quota_code: None,
             },
