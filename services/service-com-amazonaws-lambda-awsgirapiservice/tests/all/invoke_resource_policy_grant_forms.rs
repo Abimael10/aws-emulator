@@ -26,8 +26,10 @@
 //! Web Services account, IAM user, or IAM role that invokes the function" — plus the wildcard
 //! the policy language adds), WHO invokes (an IAM user, an assumed-role session), the ACTION the
 //! grant names (this action, both wildcards its `@pattern` admits, another action of this
-//! service, the deprecated asynchronous one) and the QUALIFIER the grant is attached to against
-//! the one the invocation addresses.
+//! service, the deprecated asynchronous one), the QUALIFIER the grant is attached to against the
+//! one the invocation addresses, and WHICH FUNCTION of the account holds the statement against
+//! the one the invocation addresses — a statement is a grant for the resource it is attached to
+//! alone, so a sibling function of the same account inherits nothing from it.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -824,4 +826,279 @@ async fn a_grant_authorizes_the_qualifier_it_is_attached_to() {
     emulator
         .remove_permission(case, function, "alias-level", Some(ALIAS))
         .await;
+}
+
+/// Which resource one row of the resource-scope table attaches its grant to, and which one its
+/// invocation addresses. The two functions are siblings of the same account, so the only thing
+/// telling their invocations apart is which of them the statement was written on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resource {
+    /// The first function, unqualified.
+    OneFunction,
+    /// The alias [`ALIAS`] of the first function.
+    OneAlias,
+    /// The sibling function, unqualified.
+    TwoFunction,
+    /// The alias [`ALIAS`] of the sibling function.
+    TwoAlias,
+}
+
+/// The first of the two sibling functions the resource-scope table chooses between.
+const SCOPED_ONE: &str = "scoped-one";
+
+/// The second of them: the one that must inherit nothing from the other's policy.
+const SCOPED_TWO: &str = "scoped-two";
+
+impl Resource {
+    /// The function whose policy a grant on this resource is written to, which is also the
+    /// function `AddPermission` and `Invoke` name in the path.
+    fn function(self) -> &'static str {
+        match self {
+            Self::OneFunction | Self::OneAlias => SCOPED_ONE,
+            Self::TwoFunction | Self::TwoAlias => SCOPED_TWO,
+        }
+    }
+
+    /// The qualifier this resource is, if it is one.
+    fn qualifier(self) -> Option<&'static str> {
+        match self {
+            Self::OneFunction | Self::TwoFunction => None,
+            Self::OneAlias | Self::TwoAlias => Some(ALIAS),
+        }
+    }
+
+    /// How a request names this resource in the `FunctionName` path label.
+    fn reference(self) -> String {
+        match self.qualifier() {
+            None => self.function().to_string(),
+            Some(qualifier) => format!("{}:{qualifier}", self.function()),
+        }
+    }
+
+    /// The ARN the decision about an invocation of this resource is taken on.
+    fn arn(self) -> String {
+        let arn = function_arn(self.function());
+        match self.qualifier() {
+            None => arn,
+            Some(qualifier) => format!("{arn}:{qualifier}"),
+        }
+    }
+}
+
+/// One row of the resource-scope table.
+#[derive(Debug)]
+struct ResourceRow {
+    case: &'static str,
+    who: Who,
+    /// The resource this row's statement is attached to.
+    granted: Resource,
+    /// The resource this row's invocation addresses.
+    addressed: Resource,
+    /// Whether that statement authorizes that invocation.
+    allowed: bool,
+}
+
+/// RULE: a statement is a grant for the FUNCTION it was written on, at the qualifier it was
+/// attached to, and for nothing else — so a caller holding no identity-based policy is served
+/// where it addresses that resource and falls to IAM's default deny on every other function and
+/// qualifier of the same account, a sibling function holding the very same statement included.
+#[tokio::test]
+async fn a_grant_authorizes_invocations_of_the_function_it_was_written_on() {
+    let _stream = one_invocation_stream_at_a_time().await;
+    let emulator = Emulator::new();
+    emulator.function(SCOPED_ONE).await;
+    emulator.function(SCOPED_TWO).await;
+
+    let user = emulator.user("scope-probe").await;
+    let role_arn = emulator.role("scope-probe-role").await;
+    let session = emulator.session(&role_arn).await;
+
+    let rows: &[ResourceRow] = &[
+        ResourceRow {
+            case: "a grant on the function the invocation addresses",
+            who: Who::User,
+            granted: Resource::OneFunction,
+            addressed: Resource::OneFunction,
+            allowed: true,
+        },
+        ResourceRow {
+            case: "a grant on a sibling function of the same account",
+            who: Who::User,
+            granted: Resource::TwoFunction,
+            addressed: Resource::OneFunction,
+            allowed: false,
+        },
+        ResourceRow {
+            case: "a grant on this function, the sibling addressed",
+            who: Who::User,
+            granted: Resource::OneFunction,
+            addressed: Resource::TwoFunction,
+            allowed: false,
+        },
+        ResourceRow {
+            case: "a grant on the alias of a sibling function",
+            who: Who::User,
+            granted: Resource::TwoAlias,
+            addressed: Resource::OneAlias,
+            allowed: false,
+        },
+        ResourceRow {
+            case: "a grant on the alias the invocation addresses",
+            who: Who::User,
+            granted: Resource::OneAlias,
+            addressed: Resource::OneAlias,
+            allowed: true,
+        },
+        ResourceRow {
+            case: "a grant on this alias, the sibling function addressed",
+            who: Who::User,
+            granted: Resource::OneAlias,
+            addressed: Resource::TwoFunction,
+            allowed: false,
+        },
+        ResourceRow {
+            case: "a session under a grant on the function it addresses",
+            who: Who::Session,
+            granted: Resource::TwoFunction,
+            addressed: Resource::TwoFunction,
+            allowed: true,
+        },
+        ResourceRow {
+            case: "a session under a grant on a sibling function",
+            who: Who::Session,
+            granted: Resource::OneFunction,
+            addressed: Resource::TwoFunction,
+            allowed: false,
+        },
+    ];
+
+    for (index, row) in rows.iter().enumerate() {
+        let caller = match row.who {
+            Who::User => &user,
+            Who::Session => &session,
+        };
+        let statement_id = format!("resource-scope-{index}");
+        let marker = format!("resource-scope-{index}");
+        let refusal = || {
+            not_authorized(
+                &caller.arn,
+                INVOKE_FUNCTION,
+                &row.addressed.arn(),
+                &no_allow(INVOKE_FUNCTION),
+            )
+        };
+
+        emulator
+            .add_permission(
+                row.case,
+                row.granted.function(),
+                &statement_id,
+                &caller.arn,
+                INVOKE_FUNCTION,
+                row.granted.qualifier(),
+            )
+            .await;
+
+        let answer = emulator
+            .invoke(
+                &caller.access_key_id,
+                &row.addressed.reference(),
+                &payload(&marker),
+            )
+            .await;
+        if row.allowed {
+            assert_invoked(row.case, &answer, &marker);
+        } else {
+            assert_denied(row.case, &answer, &refusal());
+        }
+
+        // The statement goes back out, so the next row is decided on its own grant alone — and
+        // the caller this row admitted is refused again straight after.
+        emulator
+            .remove_permission(
+                row.case,
+                row.granted.function(),
+                &statement_id,
+                row.granted.qualifier(),
+            )
+            .await;
+        if row.allowed {
+            let withdrawn = emulator
+                .invoke(
+                    &caller.access_key_id,
+                    &row.addressed.reference(),
+                    &payload(&marker),
+                )
+                .await;
+            assert_denied(row.case, &withdrawn, &refusal());
+        }
+    }
+}
+
+/// RULE: the grant stands on its own and from the next call on, so the IDENTICAL invocation by a
+/// caller holding no identity-based policy at all is refused before the statement is written,
+/// served once it is and refused again once it is taken back out — while a sibling function,
+/// whose own policy never named that caller, refuses it throughout.
+#[tokio::test]
+async fn a_grant_alone_flips_the_identical_invocation_and_leaves_the_sibling_refused() {
+    let _stream = one_invocation_stream_at_a_time().await;
+    let emulator = Emulator::new();
+    emulator.function(SCOPED_ONE).await;
+    emulator.function(SCOPED_TWO).await;
+
+    let caller = emulator.user("grant-alone").await;
+    let addressed = function_arn(SCOPED_ONE);
+    let sibling = function_arn(SCOPED_TWO);
+    let refusal = |resource: &str| {
+        not_authorized(
+            &caller.arn,
+            INVOKE_FUNCTION,
+            resource,
+            &no_allow(INVOKE_FUNCTION),
+        )
+    };
+
+    let before = emulator
+        .invoke(&caller.access_key_id, SCOPED_ONE, &payload("before"))
+        .await;
+    assert_denied(
+        "before the function's policy names the caller",
+        &before,
+        &refusal(&addressed),
+    );
+
+    emulator
+        .add_permission(
+            "the grant alone",
+            SCOPED_ONE,
+            "grant-alone",
+            &caller.arn,
+            INVOKE_FUNCTION,
+            None,
+        )
+        .await;
+
+    let served = emulator
+        .invoke(&caller.access_key_id, SCOPED_ONE, &payload("granted"))
+        .await;
+    assert_invoked("the grant alone", &served, "granted");
+
+    // Nothing about that grant reaches the sibling function: its own policy names nobody.
+    let elsewhere = emulator
+        .invoke(&caller.access_key_id, SCOPED_TWO, &payload("granted"))
+        .await;
+    assert_denied(
+        "the sibling function under the same grant",
+        &elsewhere,
+        &refusal(&sibling),
+    );
+
+    emulator
+        .remove_permission("the grant withdrawn", SCOPED_ONE, "grant-alone", None)
+        .await;
+
+    let after = emulator
+        .invoke(&caller.access_key_id, SCOPED_ONE, &payload("after"))
+        .await;
+    assert_denied("the grant withdrawn", &after, &refusal(&addressed));
 }
