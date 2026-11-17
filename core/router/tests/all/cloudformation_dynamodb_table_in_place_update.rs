@@ -111,7 +111,15 @@ pub(crate) async fn described_table(router: &MultiServiceRouter, name: &str) -> 
 }
 
 /// The physical id the stack publishes for its table — the name a client calls DynamoDB with.
-async fn published_table_name(router: &MultiServiceRouter, case: &str, stack: &str) -> String {
+///
+/// `pub(crate)` for the reason [`dynamodb`] is: a sibling suite that deploys a table through
+/// CloudFormation and then reads it needs exactly this, and a second copy of the awsQuery
+/// read drifts from this one.
+pub(crate) async fn published_table_name(
+    router: &MultiServiceRouter,
+    case: &str,
+    stack: &str,
+) -> String {
     let (status, resources) =
         cloudformation(router, "DescribeStackResources", &[("StackName", stack)]).await;
     assert_eq!(

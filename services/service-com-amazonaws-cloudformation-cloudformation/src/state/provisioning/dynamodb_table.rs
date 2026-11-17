@@ -139,13 +139,13 @@ const RESERVED_TAG_PREFIX: &str = "aws:";
 /// properties `AWS::DynamoDB::Table` publishes.
 const CREATE_MEMBERS: &[&str] = &[
     "AttributeDefinitions",
-    "BillingMode",
+    BILLING_MODE_PROPERTY,
     "DeletionProtectionEnabled",
     "GlobalSecondaryIndexes",
     "KeySchema",
     "LocalSecondaryIndexes",
-    "OnDemandThroughput",
-    "ProvisionedThroughput",
+    ON_DEMAND_THROUGHPUT_PROPERTY,
+    PROVISIONED_THROUGHPUT_PROPERTY,
     "TableClass",
     "WarmThroughput",
 ];
@@ -177,13 +177,35 @@ const STREAM_SPECIFICATION_MEMBERS: &[&str] = &[STREAM_ENABLED_MEMBER, STREAM_VI
 /// at all — so a deployment that changes one is reported as not applied rather than as a
 /// success that dropped the caller's change ([`update`]).
 const UPDATE_MEMBERS: &[&str] = &[
-    "BillingMode",
+    BILLING_MODE_PROPERTY,
     "DeletionProtectionEnabled",
-    "OnDemandThroughput",
-    "ProvisionedThroughput",
+    ON_DEMAND_THROUGHPUT_PROPERTY,
+    PROVISIONED_THROUGHPUT_PROPERTY,
     "TableClass",
     "WarmThroughput",
 ];
+
+/// The property stating the table's read/write capacity mode, and the two modes it names.
+///
+/// A declaration that states NO mode leaves the table in the provisioned one — "if you set
+/// BillingMode as `PROVISIONED`, you must specify this property. If you set BillingMode as
+/// `PAY_PER_REQUEST`, you cannot specify this property"
+/// (`smithy_query(query="doc",shape="CreateTableInput",member="ProvisionedThroughput")`),
+/// which is the mode the owning service reads a declaration carrying a provisioned capacity
+/// and no mode in — so that is the mode a declaration RESOLVES to when it states none
+/// ([`capacity_mode`]).
+const BILLING_MODE_PROPERTY: &str = "BillingMode";
+const PROVISIONED_CAPACITY_MODE: &str = "PROVISIONED";
+const ON_DEMAND_CAPACITY_MODE: &str = "PAY_PER_REQUEST";
+
+/// The two properties stating a capacity figure, each belonging to ONE capacity mode: the
+/// provisioned pair a `PROVISIONED` table is charged for, and the ceiling an on-demand table
+/// has ("sets the maximum number of read and write units for the specified on-demand table"
+/// — `smithy_query(query="doc",shape="OnDemandThroughput")`).
+///
+/// Which mode each belongs to is what [`applies_in_capacity_mode`] answers.
+const PROVISIONED_THROUGHPUT_PROPERTY: &str = "ProvisionedThroughput";
+const ON_DEMAND_THROUGHPUT_PROPERTY: &str = "OnDemandThroughput";
 
 /// The member `CreateTable` and `UpdateTable` answer the table's description under.
 const TABLE_DESCRIPTION_MEMBER: &str = "TableDescription";
@@ -352,8 +374,9 @@ async fn creation_window(
 /// the change left the table with.
 ///
 /// `Ok(None)` where the change is to a property `UpdateTable` does not take
-/// ([`UPDATE_MEMBERS`]): the table keeps the configuration in force and the deployment
-/// reports the change as not applied, rather than as a success that dropped it.
+/// ([`UPDATE_MEMBERS`]), or to one it takes and the declaration DROPPED with no value for the
+/// call to state ([`update_request`]): the table keeps the configuration in force and the
+/// deployment reports the change as not applied, rather than as a success that dropped it.
 ///
 /// The table's NAME is its identity, and a declaration that changes it is a different
 /// resource: [`super::super::template`] computes a new physical id for it, so the deployment
@@ -375,20 +398,11 @@ pub(super) async fn update(
     // What takes the table's STREAM from the specification in force to the declared one,
     // which travels as its own call rather than as a member of the request below.
     let streams = stream_steps(&resource.properties, declared);
-    let mut request = Map::new();
-    for member in UPDATE_MEMBERS {
-        let asked = declared_in(declared, member);
-        if asked == declared_in(&resource.properties, member) {
-            continue;
-        }
-        let Some(value) = asked else {
-            // A member the declaration DROPPED is not a member `UpdateTable` can take back
-            // to its default: there is no "unset" on that call, so the change has no
-            // in-place path.
-            return Ok(None);
-        };
-        request.insert((*member).to_string(), value.clone());
-    }
+    // The members of `UpdateTable` this declaration moves, or `None` where one of those
+    // changes has no in-place path.
+    let Some(request) = update_request(&resource.properties, declared) else {
+        return Ok(None);
+    };
     if changed_outside_update_members(&resource.properties, declared) {
         return Ok(None);
     }
@@ -420,6 +434,85 @@ pub(super) async fn update(
     Ok(Some(Created::attributes(published_attributes(
         answered.get(TABLE_DESCRIPTION_MEMBER),
     ))))
+}
+
+/// The `UpdateTable` body that takes the table from the configuration `in_force` to the one
+/// `declared` asks for, beside the member that addresses the call — or `None` where one of
+/// those changes has no in-place path, which the deployment reports as not applied.
+///
+/// Only the members that really CHANGED are carried: `UpdateTable` refuses a request that
+/// re-states a value the table already has, so re-stating an unchanged member would turn a
+/// change to one property into a refusal of the whole deployment.
+///
+/// A member the declaration DROPPED is not a member `UpdateTable` can take back to its
+/// default — there is no "unset" on that call — so such a change has no in-place path, with
+/// ONE exception: a member the capacity mode the declaration asks for does not take at all
+/// ([`applies_in_capacity_mode`]) is retired BY that mode change, so there is nothing left
+/// for the call to state and the drop is part of the change rather than a change with no
+/// path. A declaration that drops the capacity figure of the mode it LEAVES — the
+/// provisioned pair as the table goes on-demand, the on-demand ceiling as it goes
+/// provisioned — is therefore applied in place.
+///
+/// The capacity mode itself travels as the mode the declaration RESOLVES to
+/// ([`capacity_mode`]) rather than as the member as written, so a declaration that drops
+/// `BillingMode` asks for the mode a table carrying none is in instead of leaving the change
+/// unexpressed.
+fn update_request(in_force: &Value, declared: &Value) -> Option<Map<String, Value>> {
+    let mode = capacity_mode(declared);
+    let mut request = Map::new();
+    for member in UPDATE_MEMBERS {
+        if *member == BILLING_MODE_PROPERTY {
+            // Carried below as the mode the declaration resolves to, which a declaration
+            // that states no mode states as well.
+            continue;
+        }
+        let asked = declared_in(declared, member);
+        if asked == declared_in(in_force, member) {
+            continue;
+        }
+        let Some(value) = asked else {
+            if !applies_in_capacity_mode(member, mode) {
+                continue;
+            }
+            return None;
+        };
+        request.insert((*member).to_string(), value.clone());
+    }
+    if mode != capacity_mode(in_force) {
+        request.insert(
+            BILLING_MODE_PROPERTY.to_string(),
+            Value::String(mode.to_string()),
+        );
+    }
+    Some(request)
+}
+
+/// The read/write capacity mode a declaration puts the table in: the mode it states, or the
+/// provisioned one for a declaration that states none ([`BILLING_MODE_PROPERTY`]).
+fn capacity_mode(properties: &Value) -> &str {
+    declared_in(properties, BILLING_MODE_PROPERTY)
+        .and_then(Value::as_str)
+        .unwrap_or(PROVISIONED_CAPACITY_MODE)
+}
+
+/// Whether the property `member` is one the capacity mode `mode` takes at all.
+///
+/// The two capacity figures each belong to one mode: the provisioned pair is the capacity a
+/// `PROVISIONED` table is charged for and "you cannot specify this property" for a
+/// `PAY_PER_REQUEST` one, while the on-demand ceiling is "the maximum number of read and
+/// write units for the specified on-demand table" ([`PROVISIONED_THROUGHPUT_PROPERTY`],
+/// [`ON_DEMAND_THROUGHPUT_PROPERTY`]). Every other member of the call is about the table
+/// whatever its mode.
+///
+/// A declaration that STATES a figure the mode it asks for does not take is a contradiction
+/// of the owning service's own rule, not a drop: it travels into the call and that service
+/// refuses it, which fails the resource rather than being dropped from a success.
+fn applies_in_capacity_mode(member: &str, mode: &str) -> bool {
+    match member {
+        PROVISIONED_THROUGHPUT_PROPERTY => mode == PROVISIONED_CAPACITY_MODE,
+        ON_DEMAND_THROUGHPUT_PROPERTY => mode == ON_DEMAND_CAPACITY_MODE,
+        _ => true,
+    }
 }
 
 /// One `UpdateTable` on the table `physical_resource_id`, carrying `request` beside the member
@@ -1375,6 +1468,93 @@ mod tests {
                 outside, *expected,
                 "case {case:?}: expected a change outside UpdateTable's members to be \
                  {expected:?}, got {outside:?}"
+            );
+        }
+    }
+
+    /// The pair of read/write capacity figures a provisioned declaration carries.
+    fn capacity(read: u64, write: u64) -> Value {
+        serde_json::json!({ "ReadCapacityUnits": read, "WriteCapacityUnits": write })
+    }
+
+    /// The `UpdateTable` body a changed declaration asks for: the capacity mode it RESOLVES
+    /// to, the figures the new mode takes, and nothing for a figure that mode does not take
+    /// at all — which is what makes a capacity-mode move an in-place change rather than one
+    /// with no path.
+    #[test]
+    fn a_capacity_mode_move_is_one_in_place_update() {
+        let provisioned = serde_json::json!({ "BillingMode": "PROVISIONED",
+                                              "ProvisionedThroughput": capacity(5, 5) });
+        let on_demand = serde_json::json!({ "BillingMode": "PAY_PER_REQUEST" });
+        let cases: &[(&str, Value, Value, Option<Value>)] = &[
+            (
+                "provisioned to on-demand: the pair the new mode does not take is dropped",
+                provisioned.clone(),
+                on_demand.clone(),
+                Some(serde_json::json!({ "BillingMode": "PAY_PER_REQUEST" })),
+            ),
+            (
+                "the same move stated without a mode in force: PROVISIONED is the default",
+                serde_json::json!({ "ProvisionedThroughput": capacity(1, 1) }),
+                on_demand.clone(),
+                Some(serde_json::json!({ "BillingMode": "PAY_PER_REQUEST" })),
+            ),
+            (
+                "on-demand to provisioned: the new mode's own figures travel with it",
+                on_demand.clone(),
+                provisioned.clone(),
+                Some(serde_json::json!({ "BillingMode": "PROVISIONED",
+                                         "ProvisionedThroughput": capacity(5, 5) })),
+            ),
+            (
+                "the mode member dropped: the declaration resolves to the provisioned mode",
+                on_demand.clone(),
+                serde_json::json!({ "ProvisionedThroughput": capacity(2, 3) }),
+                Some(serde_json::json!({ "BillingMode": "PROVISIONED",
+                                         "ProvisionedThroughput": capacity(2, 3) })),
+            ),
+            (
+                "the on-demand ceiling dropped with the mode that has one",
+                serde_json::json!({ "BillingMode": "PAY_PER_REQUEST",
+                                    "OnDemandThroughput": { "MaxReadRequestUnits": 10 } }),
+                provisioned.clone(),
+                Some(serde_json::json!({ "BillingMode": "PROVISIONED",
+                                         "ProvisionedThroughput": capacity(5, 5) })),
+            ),
+            (
+                "a ceiling added as the table goes on-demand",
+                provisioned.clone(),
+                serde_json::json!({ "BillingMode": "PAY_PER_REQUEST",
+                                    "OnDemandThroughput": { "MaxWriteRequestUnits": 20 } }),
+                Some(serde_json::json!({ "BillingMode": "PAY_PER_REQUEST",
+                                         "OnDemandThroughput": {
+                                             "MaxWriteRequestUnits": 20 } })),
+            ),
+            (
+                "the mode member dropped for the mode already in force: nothing to call",
+                provisioned.clone(),
+                serde_json::json!({ "ProvisionedThroughput": capacity(5, 5) }),
+                Some(serde_json::json!({})),
+            ),
+            (
+                "a figure the mode in force takes, dropped with the mode kept: no path",
+                provisioned.clone(),
+                serde_json::json!({ "BillingMode": "PROVISIONED" }),
+                None,
+            ),
+            (
+                "a flag dropped, which no mode retires: no path",
+                serde_json::json!({ "DeletionProtectionEnabled": true }),
+                serde_json::json!({}),
+                None,
+            ),
+        ];
+        for (case, in_force, declared_now, expected) in cases {
+            let request = update_request(in_force, declared_now).map(Value::Object);
+            assert_eq!(
+                request.as_ref(),
+                expected.as_ref(),
+                "case {case:?}: expected the UpdateTable body {expected:?}, got {request:?}"
             );
         }
     }
