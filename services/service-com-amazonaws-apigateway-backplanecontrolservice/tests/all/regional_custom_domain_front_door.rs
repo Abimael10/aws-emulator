@@ -241,7 +241,11 @@ fn is_reachable_authority(published: &str) -> bool {
 /// The core binds its listeners on loopback (`EMULATOR_BIND_ADDRESS`, `127.0.0.1` by
 /// default), so the dial below is to this machine — and only the PORT is taken from the
 /// published authority, which is what pins it there.
-async fn dial(case: &str, published: &str) -> tokio::net::TcpStream {
+///
+/// `pub(crate)` so a sibling suite dials a published address through this one spelling
+/// rather than keeping a second copy of it (the `domain_name_certificate_completeness`
+/// suite does, to show that the address every reader of a record reports is answered on).
+pub(crate) async fn dial(case: &str, published: &str) -> tokio::net::TcpStream {
     let port = published
         .parse::<std::net::SocketAddr>()
         .unwrap_or_else(|error| {
