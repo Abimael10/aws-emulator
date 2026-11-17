@@ -156,6 +156,21 @@ pub const NO_SUCH_POLICY_STATEMENT: &str = "Statement with the provided id does 
 /// travels on the same modelled error.
 pub const QUOTA_EXCEEDED: &str = "The requested resource exceeds the maximum number allowed.";
 
+/// What EventBridge reports for a write that would leave a resource carrying more
+/// TAGS than the per-resource ceiling admits.
+///
+/// A tag ceiling bounds the tags ON a resource rather than how many resources an
+/// account holds, and EventBridge words it as its own refusal class: a sentence
+/// about the number of TAGS allowed per resource, distinct from the count-quota
+/// sentence above ([`QUOTA_EXCEEDED`]) that a request for one resource too many
+/// answers with. Like that one it is entirely FIXED text — it names neither the
+/// resource that was tagged, nor how many tags the request carried, nor the
+/// ceiling itself — so a consumer branching on it reads the same sentence
+/// whichever resource of this service a tag write was refused on, and can still
+/// tell "too many tags on this resource" from "too many of this resource".
+pub const TAG_QUOTA_EXCEEDED: &str =
+    "The request exceeds the maximum number of tags allowed per resource.";
+
 /// Largest page a list operation returns, and the page size it uses when the
 /// request names no `Limit`.
 ///
@@ -3726,21 +3741,24 @@ pub fn bound_tag_count(count: usize) -> Result<(), String> {
 
 /// What a refusal states for a tag write past [`MAX_TAGS_PER_RESOURCE`].
 ///
-/// A per-resource tag ceiling is a COUNT quota of this service like the targets
-/// a rule holds or the rules a bus holds, so the refusal carries the one
-/// sentence this service states for a count quota ([`QUOTA_EXCEEDED`]) rather
-/// than prose of this emulator's own: it names neither the resource the request
-/// was about nor the number that bounds it, so it reads the same whichever
-/// resource was tagged and whichever write crossed the quota. What differs from
-/// the other quotas is only the channel it travels on, because the tag writes
-/// model no quota error and refuse on the bad-request channel instead.
+/// A per-resource tag ceiling is a refusal class of its own: it bounds the tags
+/// one resource carries rather than how many resources the account holds, and
+/// EventBridge words it with the tag sentence ([`TAG_QUOTA_EXCEEDED`]) instead of
+/// the one it states for a count quota ([`QUOTA_EXCEEDED`]) — so a consumer can
+/// tell a tag write refused on this quota from a create refused on a
+/// resource-count quota. The sentence is fixed: it names neither the resource the
+/// request was about nor the number that bounds it, so it reads the same
+/// whichever resource was tagged and whichever write crossed the quota. Stated
+/// once, so every tag write of this service (`TagResource`, and the `Tags` a
+/// `CreateEventBus` or `PutRule` request carries) refuses in the same words —
+/// on the bad-request channel, because the tag writes model no quota error.
 ///
 /// The quota is charged on the set a write would LEAVE — "You can use the
 /// TagResource action with a resource that already has tags ... the new tag
 /// value that you specify replaces the previous value for that tag"
 /// (`TagResource`), so re-setting a stored key leaves the set the size it was.
 fn too_many_tags() -> String {
-    QUOTA_EXCEEDED.to_string()
+    TAG_QUOTA_EXCEEDED.to_string()
 }
 
 /// Remove from `stored` every tag whose key `keys` names, leaving the order of
