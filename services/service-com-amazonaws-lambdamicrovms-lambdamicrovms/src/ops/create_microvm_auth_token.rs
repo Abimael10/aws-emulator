@@ -179,6 +179,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // `expirationInMinutes` is modelled with no maximum, so the service's own
+        // ceiling is what refuses an over-long lifetime — AFTER the lookup above, because
+        // whether the MicroVM exists at all is decided before anything about the token
+        // it was asked for. A client that asked for more than the service mints has to
+        // re-ask within the cap, which is what the refusal tells it; clamping the
+        // lifetime silently would answer it a token whose real expiry is not the one it
+        // was told.
+        if input.expiration_in_minutes > crate::state::MAX_AUTH_TOKEN_EXPIRATION_MINUTES {
+            return Err(CreateMicrovmAuthTokenErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::auth_token_expiration_exceeded_message(
+                        input.expiration_in_minutes,
+                    )),
+                },
+            )
+            .into());
+        }
+
         // "an authentication token for accessing a running MicroVM": a MicroVM on its
         // way out, or already gone, accepts no further connection, so there is nothing
         // for a token to grant access to — the modelled conflict with the resource's

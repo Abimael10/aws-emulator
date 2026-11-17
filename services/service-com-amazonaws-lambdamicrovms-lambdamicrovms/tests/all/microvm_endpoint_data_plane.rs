@@ -19,30 +19,30 @@ use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::microvm_endpoint
     auth_token_digest, serve_request, AUTH_TOKEN_HEADER, NO_GUEST_RESPONSE_STATUS,
 };
 use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::microvm_network::connector_state;
-use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::ComAmazonawsLambdamicrovmsLambdamicrovmsState as MicrovmState;
+use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::{
+    auth_token_expiration_exceeded_message, microvm_not_found_message,
+    ComAmazonawsLambdamicrovmsLambdamicrovmsState as MicrovmState,
+    MAX_AUTH_TOKEN_EXPIRATION_MINUTES,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::microvm_lifecycle::{
     built_image, call, emulator_with_engine, image_body, run_microvm,
 };
+use crate::microvm_suspend_resume::{deadline_left, set_deadline, Deadline};
 
-/// One row of the status table: the case, the address a client sends to, the guest
-/// path it appends to that address, the method, the token it presents (where it
-/// presents one) and the status the endpoint must answer with.
+/// One row of the status table: the case, the MicroVM whose endpoint the client sends
+/// to, the guest path it addresses, the method, the token it presents (where it presents
+/// one) and the status the endpoint must answer with.
 type EndpointCase<'a> = (&'a str, &'a str, &'a str, &'a str, Option<&'a str>, u16);
 
-/// One request a client sends through a MicroVM's published endpoint: the endpoint,
-/// the guest's own path appended to it (`<endpoint><path>`, as AWS documents), and the
-/// `X-aws-proxy-auth` token where the client presents one.
-fn guest_request(
-    method: &str,
-    endpoint: &str,
-    path: &str,
-    token: Option<&str>,
-) -> http::Request<Vec<u8>> {
-    let mut builder = http::Request::builder()
-        .method(method)
-        .uri(format!("{endpoint}{path}"));
+/// One request a client sends through a MicroVM's published endpoint: the guest's own
+/// path, which is the whole path of a request to that address (`<scheme>://<endpoint>` +
+/// the guest path, as AWS documents), and the `X-aws-proxy-auth` token where the client
+/// presents one.
+fn guest_request(method: &str, path: &str, token: Option<&str>) -> http::Request<Vec<u8>> {
+    let path = if path.is_empty() { "/" } else { path };
+    let mut builder = http::Request::builder().method(method).uri(path);
     if let Some(token) = token {
         builder = builder.header(AUTH_TOKEN_HEADER, token);
     }
@@ -51,19 +51,22 @@ fn guest_request(
         .expect("a well-formed request to a MicroVM endpoint")
 }
 
-/// Send `request` to the endpoint this emulator serves, and report the status, the
-/// content type and the body as text.
+/// Send `request` to the endpoint of `microvm_id` — the address that MicroVM alone is
+/// published on — and report the status, the content type and the body as text.
 fn through_endpoint(
     router: &MultiServiceRouter,
     engine: &Arc<engine::InMemoryEngine>,
+    microvm_id: &str,
     request: &http::Request<Vec<u8>>,
 ) -> impl std::future::Future<Output = (u16, String, String)> {
     let state = engine.state::<MicrovmState>();
     let connectors = connector_state(&**engine);
     let callback = smithy_server_runtime::EmbeddedEmulator::from_router(router.clone());
     let request = request.clone();
+    let microvm_id = microvm_id.to_string();
     async move {
-        let response = serve_request(&state, connectors.as_ref(), &callback, &request).await;
+        let response =
+            serve_request(&state, connectors.as_ref(), &callback, &microvm_id, &request).await;
         let status = response.status().as_u16();
         let content_type = response
             .headers()
@@ -169,31 +172,27 @@ async fn auth_token(
         .to_string()
 }
 
-/// The `host:port` an endpoint URL addresses, as a socket address — so a test can
-/// prove the published address is one a client on this machine can open.
+/// The `host:port` a published endpoint is, as a socket address — so a test can prove
+/// the published value is an AUTHORITY a client on this machine can open, carrying no
+/// scheme and no path.
 fn endpoint_socket_addr(endpoint: &str) -> std::net::SocketAddr {
-    let authority = endpoint
-        .strip_prefix("https://")
-        .unwrap_or_default()
-        .split('/')
-        .next()
-        .unwrap_or_default();
-    authority
+    endpoint
         .parse()
         .unwrap_or_else(|error| panic!("endpoint {endpoint:?} has no socket address: {error}"))
 }
 
-/// RULE: a published `endpoint` is an ADDRESS THE EMULATOR ANSWERS ON — its own
-/// loopback HTTPS listener, with the MicroVM named in the path — so a client can open
-/// it, every MicroVM of one emulator is published on that one address, and the reader
+/// RULE: a published `endpoint` is the AUTHORITY of an address THE EMULATOR ANSWERS ON —
+/// a host, optionally `host:port`, with no scheme and no path, because a client composes
+/// its request URL by prefixing the scheme and appending the guest's own path. Each
+/// MicroVM is published on an address of its own, a client can open it, and the reader
 /// (`GetMicrovm`) reports the same endpoint the launch did.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_published_microvm_endpoint_is_an_address_a_client_can_open() {
     let (router, _engine) = emulator_with_engine();
     built_image(&router, "endpoint-bearing").await;
 
-    // Rows differ in what the launch asks for, because none of it changes WHERE the
-    // MicroVM is published: the request members, the hook port its image declares, and
+    // Rows differ in what the launch asks for, because none of it changes the FORM of
+    // the published address: the request members, the hook port its image declares, and
     // how many MicroVMs the store already holds.
     let rows: Vec<(&str, Value)> = vec![
         ("required members only", json!({"imageIdentifier": "endpoint-bearing"})),
@@ -207,8 +206,8 @@ async fn a_published_microvm_endpoint_is_an_address_a_client_can_open() {
                 "imageIdentifier": "endpoint-bearing",
                 "maximumDurationInSeconds": 900,
                 "idlePolicy": {
-                    "maxIdleDurationSeconds": 60,
-                    "suspendedDurationSeconds": 0,
+                    "maxIdleDurationSeconds": 600,
+                    "suspendedDurationSeconds": 300,
                     "autoResumeEnabled": true,
                 },
             }),
@@ -230,13 +229,22 @@ async fn a_published_microvm_endpoint_is_an_address_a_client_can_open() {
         let microvm_id = run["microvmId"].as_str().unwrap_or_default().to_string();
         let endpoint = run["endpoint"].as_str().unwrap_or_default().to_string();
 
+        // The published value is an authority and nothing else: the shape a client
+        // prefixes a scheme onto and appends the guest's path to.
         assert!(
-            endpoint.starts_with("https://"),
-            "case {case:?}: expected an HTTPS endpoint, got {endpoint:?}"
+            endpoint
+                .chars()
+                .all(|byte| byte.is_ascii_alphanumeric() || ".-:".contains(byte)),
+            "case {case:?}: expected a bare host, optionally with a port, got {endpoint:?}"
         );
         assert!(
-            endpoint.ends_with(&format!("/microvms/{microvm_id}")),
-            "case {case:?}: expected the endpoint to name the MicroVM, got {endpoint:?}"
+            !endpoint.contains("://") && !endpoint.contains('/'),
+            "case {case:?}: expected no scheme and no path, got {endpoint:?}"
+        );
+        assert!(
+            !endpoint.contains(&microvm_id),
+            "case {case:?}: the MicroVM's id belongs in the address, not in the \
+             published value, got {endpoint:?}"
         );
 
         // The address is this emulator's own: a loopback host and a port a client on
@@ -278,27 +286,19 @@ async fn a_published_microvm_endpoint_is_an_address_a_client_can_open() {
         published.push((microvm_id, endpoint));
     }
 
-    // Every MicroVM of one emulator is published on the one address the store opened,
-    // and each is addressed by its own path.
-    let authorities: Vec<std::net::SocketAddr> = published
-        .iter()
-        .map(|(_, endpoint)| endpoint_socket_addr(endpoint))
-        .collect();
-    assert!(
-        authorities.windows(2).all(|pair| pair[0] == pair[1]),
-        "expected one address for every MicroVM of the store, got {authorities:?}"
-    );
-    let mut paths: Vec<&str> = published
+    // Each MicroVM is published on an address of its OWN, which is what carries the
+    // discriminator the published value no longer does.
+    let mut addresses: Vec<&str> = published
         .iter()
         .map(|(_, endpoint)| endpoint.as_str())
         .collect();
-    paths.sort_unstable();
-    let count = paths.len();
-    paths.dedup();
+    addresses.sort_unstable();
+    let count = addresses.len();
+    addresses.dedup();
     assert_eq!(
-        paths.len(),
+        addresses.len(),
         count,
-        "expected a distinct endpoint per MicroVM, got {paths:?}"
+        "expected a distinct endpoint per MicroVM, got {addresses:?}"
     );
 }
 
@@ -334,8 +334,8 @@ async fn a_published_endpoint_answers_an_http_status_for_every_request_class() {
     settled_image(&router, "ported").await;
     settled_image(&router, "portless").await;
 
-    let (ported_id, ported) = running_microvm(&router, "ported").await;
-    let (_, portless) = running_microvm(&router, "portless").await;
+    let (ported_id, _ported) = running_microvm(&router, "ported").await;
+    let (portless_id, _portless) = running_microvm(&router, "portless").await;
     let (other_id, _other) = running_microvm(&router, "ported").await;
 
     let every_port = auth_token(&router, &ported_id, 15, json!([{"allPorts": {}}])).await;
@@ -355,27 +355,20 @@ async fn a_published_endpoint_answers_an_http_status_for_every_request_class() {
         json!([{"range": {"startPort": 9000, "endPort": 9100}}]),
     )
     .await;
-    let portless_id = portless
-        .rsplit('/')
-        .next()
-        .expect("the endpoint names the MicroVM")
-        .to_string();
     let portless_every_port = auth_token(&router, &portless_id, 1, json!([{"allPorts": {}}])).await;
     let portless_one_port = auth_token(&router, &portless_id, 1, json!([{"port": 443}])).await;
     let other_microvm_token = auth_token(&router, &other_id, 15, json!([{"allPorts": {}}])).await;
 
-    // The base of the published address, which names no MicroVM by itself.
-    let base = ported
-        .strip_suffix(&format!("/microvms/{ported_id}"))
-        .expect("the endpoint is the store's address plus the MicroVM")
-        .to_string();
+    // An id no MicroVM of this store carries: an address that publishes nothing.
+    let absent_id = "mvm-ffffffffffffffff";
 
-    // (case, the address, the guest path appended to it, the method, the token, status)
+    // (case, the MicroVM published at the address, the guest path, the method, the
+    // token, status)
     let rows: Vec<EndpointCase> = vec![
-        ("no token at all", &ported, "/health", "GET", None, 403),
+        ("no token at all", &ported_id, "/health", "GET", None, 403),
         (
             "a token value nothing minted",
-            &ported,
+            &ported_id,
             "/health",
             "GET",
             Some("not-a-token-this-emulator-minted"),
@@ -383,7 +376,7 @@ async fn a_published_endpoint_answers_an_http_status_for_every_request_class() {
         ),
         (
             "a live token minted for another MicroVM",
-            &ported,
+            &ported_id,
             "/health",
             "GET",
             Some(&other_microvm_token),
@@ -391,7 +384,7 @@ async fn a_published_endpoint_answers_an_http_status_for_every_request_class() {
         ),
         (
             "a token whose allowedPorts name another port",
-            &ported,
+            &ported_id,
             "/health",
             "GET",
             Some(&other_port),
@@ -399,7 +392,7 @@ async fn a_published_endpoint_answers_an_http_status_for_every_request_class() {
         ),
         (
             "a token whose range excludes the addressed port",
-            &ported,
+            &ported_id,
             "/health",
             "GET",
             Some(&other_range),
@@ -407,7 +400,7 @@ async fn a_published_endpoint_answers_an_http_status_for_every_request_class() {
         ),
         (
             "a token for every port",
-            &ported,
+            &ported_id,
             "/health",
             "GET",
             Some(&every_port),
@@ -415,7 +408,7 @@ async fn a_published_endpoint_answers_an_http_status_for_every_request_class() {
         ),
         (
             "a token naming the addressed port exactly",
-            &ported,
+            &ported_id,
             "/health",
             "GET",
             Some(&exact_port),
@@ -423,7 +416,7 @@ async fn a_published_endpoint_answers_an_http_status_for_every_request_class() {
         ),
         (
             "a token whose range covers the addressed port",
-            &ported,
+            &ported_id,
             "/health",
             "GET",
             Some(&covering_range),
@@ -431,7 +424,7 @@ async fn a_published_endpoint_answers_an_http_status_for_every_request_class() {
         ),
         (
             "a MicroVM whose image publishes no port, with a token for every port",
-            &portless,
+            &portless_id,
             "/health",
             "GET",
             Some(&portless_every_port),
@@ -440,7 +433,7 @@ async fn a_published_endpoint_answers_an_http_status_for_every_request_class() {
         (
             "a MicroVM whose image publishes no port, with a token scoped to a port the \
              request does not address",
-            &portless,
+            &portless_id,
             "/health",
             "GET",
             Some(&portless_one_port),
@@ -448,7 +441,7 @@ async fn a_published_endpoint_answers_an_http_status_for_every_request_class() {
         ),
         (
             "a guest path carrying a query",
-            &ported,
+            &ported_id,
             "/connect?host=10.90.1.17&port=443",
             "GET",
             Some(&every_port),
@@ -456,7 +449,7 @@ async fn a_published_endpoint_answers_an_http_status_for_every_request_class() {
         ),
         (
             "the guest's root path",
-            &ported,
+            &ported_id,
             "/",
             "GET",
             Some(&every_port),
@@ -464,15 +457,23 @@ async fn a_published_endpoint_answers_an_http_status_for_every_request_class() {
         ),
         (
             "no path past the endpoint at all",
-            &ported,
+            &ported_id,
             "",
             "GET",
             Some(&every_port),
             NO_GUEST_RESPONSE_STATUS,
         ),
         (
+            "a deep guest path",
+            &ported_id,
+            "/microvms/mvm-0000000000000000/health",
+            "GET",
+            Some(&every_port),
+            NO_GUEST_RESPONSE_STATUS,
+        ),
+        (
             "a POST to the guest",
-            &ported,
+            &ported_id,
             "/health",
             "POST",
             Some(&every_port),
@@ -480,49 +481,34 @@ async fn a_published_endpoint_answers_an_http_status_for_every_request_class() {
         ),
         (
             "a HEAD of the guest",
-            &ported,
+            &ported_id,
             "/health",
             "HEAD",
             Some(&every_port),
             NO_GUEST_RESPONSE_STATUS,
         ),
         (
-            "an address naming a MicroVM this store never minted",
-            &base,
-            "/microvms/mvm-ffffffffffffffff/health",
-            "GET",
-            Some(&every_port),
-            404,
-        ),
-        (
-            "an address under no MicroVM path",
-            &base,
+            "an address publishing a MicroVM this store never minted",
+            absent_id,
             "/health",
             "GET",
             Some(&every_port),
             404,
         ),
         (
-            "the listener's own root",
-            &base,
+            "that same address with no token at all",
+            absent_id,
             "/",
             "GET",
-            Some(&every_port),
-            404,
-        ),
-        (
-            "a MicroVM path with no identifier",
-            &base,
-            "/microvms/",
-            "GET",
-            Some(&every_port),
+            None,
             404,
         ),
     ];
 
-    for (case, endpoint, path, method, token, expected) in rows {
-        let request = guest_request(method, endpoint, path, token);
-        let (status, content_type, body) = through_endpoint(&router, &engine, &request).await;
+    for (case, microvm_id, path, method, token, expected) in rows {
+        let request = guest_request(method, path, token);
+        let (status, content_type, body) =
+            through_endpoint(&router, &engine, microvm_id, &request).await;
         assert_eq!(
             status, expected,
             "case {case:?}: expected {expected}, got {status} {body:?}"
@@ -543,6 +529,17 @@ async fn a_published_endpoint_answers_an_http_status_for_every_request_class() {
             );
         }
     }
+
+    // A request carrying NO authentication is refused for THAT, which is the one thing
+    // the proxy's answer names.
+    let unauthenticated = guest_request("GET", "/health", None);
+    let (status, _, body) =
+        through_endpoint(&router, &engine, &ported_id, &unauthenticated).await;
+    assert_eq!(status, 403, "an unauthenticated request is refused, got {status}");
+    assert!(
+        body.contains("missing authentication"),
+        "expected the refusal to name the missing authentication, got {body:?}"
+    );
 }
 
 /// RULE: a token is accepted only while it is LIVE — the clock's own expiry, and the
@@ -553,19 +550,19 @@ async fn a_published_endpoint_answers_an_http_status_for_every_request_class() {
 async fn a_token_stops_being_accepted_once_the_clock_or_the_microvm_has_ended_it() {
     let (router, engine) = emulator_with_engine();
     built_image(&router, "expiring").await;
-    let (microvm_id, endpoint) = running_microvm(&router, "expiring").await;
-    let (doomed_id, doomed) = running_microvm(&router, "expiring").await;
+    let (microvm_id, _endpoint) = running_microvm(&router, "expiring").await;
+    let (doomed_id, _doomed) = running_microvm(&router, "expiring").await;
 
     let token = auth_token(&router, &microvm_id, 15, json!([{"allPorts": {}}])).await;
     let doomed_token = auth_token(&router, &doomed_id, 15, json!([{"allPorts": {}}])).await;
 
     // The control: both tokens are live, so both endpoints answer past the token check.
-    for (case, endpoint, token) in [
-        ("the MicroVM whose token is about to expire", &endpoint, &token),
-        ("the MicroVM about to be terminated", &doomed, &doomed_token),
+    for (case, microvm_id, token) in [
+        ("the MicroVM whose token is about to expire", &microvm_id, &token),
+        ("the MicroVM about to be terminated", &doomed_id, &doomed_token),
     ] {
-        let request = guest_request("GET", endpoint, "/health", Some(token));
-        let (status, _, body) = through_endpoint(&router, &engine, &request).await;
+        let request = guest_request("GET", "/health", Some(token));
+        let (status, _, body) = through_endpoint(&router, &engine, microvm_id, &request).await;
         assert_eq!(
             status,
             NO_GUEST_RESPONSE_STATUS,
@@ -588,8 +585,8 @@ async fn a_token_stops_being_accepted_once_the_clock_or_the_microvm_has_ended_it
             .checked_sub(Duration::from_secs(1))
             .unwrap_or_else(Instant::now);
     }
-    let request = guest_request("GET", &endpoint, "/health", Some(&token));
-    let (status, _, body) = through_endpoint(&router, &engine, &request).await;
+    let request = guest_request("GET", "/health", Some(&token));
+    let (status, _, body) = through_endpoint(&router, &engine, &microvm_id, &request).await;
     assert_eq!(
         status, 403,
         "an expired token must be refused, got {status} {body:?}"
@@ -612,8 +609,8 @@ async fn a_token_stops_being_accepted_once_the_clock_or_the_microvm_has_ended_it
         ("with the token minted for it", Some(doomed_token.as_str())),
         ("with no token at all", None),
     ] {
-        let request = guest_request("GET", &doomed, "/health", token);
-        let (status, _, body) = through_endpoint(&router, &engine, &request).await;
+        let request = guest_request("GET", "/health", token);
+        let (status, _, body) = through_endpoint(&router, &engine, &doomed_id, &request).await;
         assert_eq!(
             status, 404,
             "case {case:?}: a MicroVM on its way out is published nowhere, got {status} {body:?}"
@@ -622,10 +619,216 @@ async fn a_token_stops_being_accepted_once_the_clock_or_the_microvm_has_ended_it
     // The termination is clock-owed, so this waits for the MicroVM to REACH its terminal
     // state rather than for a fixed time.
     microvm_in_state(&router, &doomed_id, "TERMINATED").await;
-    let request = guest_request("GET", &doomed, "/health", Some(&doomed_token));
-    let (status, _, body) = through_endpoint(&router, &engine, &request).await;
+    let request = guest_request("GET", "/health", Some(&doomed_token));
+    let (status, _, body) = through_endpoint(&router, &engine, &doomed_id, &request).await;
     assert_eq!(
         status, 404,
         "a terminated MicroVM is published nowhere, got {status} {body:?}"
     );
+}
+
+/// RULE: inbound traffic through a MicroVM's endpoint is what its `idlePolicy` measures —
+/// "idle time is measured by inbound traffic through the MicroVM proxy endpoint" — so a
+/// request a token GRANTED puts the automatic suspend a whole `maxIdleDurationSeconds`
+/// away again, a request the endpoint REFUSED reached the MicroVM with nothing and moves
+/// nothing, and a request that arrives while the MicroVM rests brings it back exactly
+/// where `autoResumeEnabled` says so.
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_traffic_through_the_endpoint_is_what_an_idle_policy_measures() {
+    let (router, engine) = emulator_with_engine();
+    built_image(&router, "idle-policy").await;
+
+    // The idle duration every row carries, well above the figure a refreshed deadline is
+    // asserted against, so the assertions are about WHICH deadline is owed rather than
+    // about how fast the host runs.
+    let max_idle = Duration::from_secs(600);
+
+    // The rows differ along `autoResumeEnabled`, the one member that decides what a
+    // request to a resting MicroVM does.
+    for (case, auto_resume, after_traffic) in [
+        ("a policy that auto-resumes", true, "RUNNING"),
+        ("a policy that does not", false, "SUSPENDED"),
+    ] {
+        let (status, run) = run_microvm(
+            &router,
+            json!({
+                "imageIdentifier": "idle-policy",
+                "idlePolicy": {
+                    "maxIdleDurationSeconds": max_idle.as_secs(),
+                    "suspendedDurationSeconds": 300,
+                    "autoResumeEnabled": auto_resume,
+                },
+            }),
+        )
+        .await;
+        assert_eq!(status, 200, "case {case:?}: run got {status} {run}");
+        let microvm_id = run["microvmId"].as_str().unwrap_or_default().to_string();
+        microvm_in_state(&router, &microvm_id, "RUNNING").await;
+        let token = auth_token(&router, &microvm_id, 15, json!([{"allPorts": {}}])).await;
+
+        // A deadline a few seconds away, so what the request does to it is unmistakable.
+        let nearly_due = Duration::from_secs(5);
+        set_deadline(&engine, &microvm_id, Deadline::Idle, Some(nearly_due));
+        let granted = guest_request("GET", "/health", Some(&token));
+        let (status, _, body) = through_endpoint(&router, &engine, &microvm_id, &granted).await;
+        assert_eq!(
+            status,
+            NO_GUEST_RESPONSE_STATUS,
+            "case {case:?}: the token must grant the request, got {status} {body:?}"
+        );
+        let left = deadline_left(&engine, &microvm_id, Deadline::Idle)
+            .unwrap_or_else(|| panic!("case {case:?}: a MicroVM with a policy owes a suspend"));
+        assert!(
+            left > nearly_due && left <= max_idle,
+            "case {case:?}: traffic must put the suspend a whole idle duration away, got \
+             {left:?}"
+        );
+
+        // A refused request is no traffic at all: it leaves the deadline where it was.
+        set_deadline(&engine, &microvm_id, Deadline::Idle, Some(nearly_due));
+        let refused = guest_request("GET", "/health", Some("not-a-token-this-emulator-minted"));
+        let (status, _, body) = through_endpoint(&router, &engine, &microvm_id, &refused).await;
+        assert_eq!(
+            status, 403,
+            "case {case:?}: the request must be refused, got {status} {body:?}"
+        );
+        let left = deadline_left(&engine, &microvm_id, Deadline::Idle)
+            .unwrap_or_else(|| panic!("case {case:?}: the suspend is still owed"));
+        assert!(
+            left <= nearly_due,
+            "case {case:?}: a refused request moves no deadline, got {left:?}"
+        );
+
+        // The platform suspends it once the idle duration has passed with no traffic, and
+        // the next request then decides what the policy says it decides.
+        set_deadline(&engine, &microvm_id, Deadline::Idle, None);
+        microvm_in_state(&router, &microvm_id, "SUSPENDED").await;
+        let granted = guest_request("GET", "/health", Some(&token));
+        let (status, _, body) = through_endpoint(&router, &engine, &microvm_id, &granted).await;
+        assert_eq!(
+            status,
+            NO_GUEST_RESPONSE_STATUS,
+            "case {case:?}: the address still answers a granted request, got {status} {body:?}"
+        );
+        let (status, read) = call(
+            &router,
+            "GET",
+            &format!("/2025-09-09/microvms/{microvm_id}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, 200, "case {case:?}: read got {status} {read}");
+        assert_eq!(
+            read["state"].as_str(),
+            Some(after_traffic),
+            "case {case:?}: expected {after_traffic} after a request reached the resting \
+             MicroVM, got {read}"
+        );
+    }
+}
+
+/// RULE: `expirationInMinutes` is modelled with no maximum, so the service's own ceiling
+/// decides: a request for a token longer-lived than the maximum is refused with the
+/// modelled 400 `ValidationException` naming the value it asked for and the limit, the
+/// boundary value itself is minted, and the refusal is taken AFTER the MicroVM lookup, so
+/// an identifier naming no MicroVM is still answered with the 404.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_token_is_minted_only_within_the_services_expiration_maximum() {
+    let (router, _engine) = emulator_with_engine();
+    built_image(&router, "token-bearing").await;
+    // The shell connector as well as the HTTP one, so the same table drives BOTH mints of
+    // this API: `CreateMicrovmShellAuthToken` is served only for a MicroVM run with
+    // `SHELL_INGRESS` attached.
+    let (status, run) = run_microvm(
+        &router,
+        json!({
+            "imageIdentifier": "token-bearing",
+            "ingressNetworkConnectors": ["HTTP_INGRESS", "SHELL_INGRESS"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "run a MicroVM: got {status} {run}");
+    let microvm_id = run["microvmId"].as_str().unwrap_or_default().to_string();
+    microvm_in_state(&router, &microvm_id, "RUNNING").await;
+
+    let cap = MAX_AUTH_TOKEN_EXPIRATION_MINUTES;
+    // Rows span the member's own range around the service maximum: its smallest value,
+    // one inside the cap, the boundary itself, one past it, and values far past it.
+    let rows: Vec<(&str, i32, bool)> = vec![
+        ("the smallest lifetime the member admits", 1, true),
+        ("a lifetime inside the maximum", cap - 1, true),
+        ("the maximum itself", cap, true),
+        ("one minute past the maximum", cap + 1, false),
+        ("a whole day", 24 * 60, false),
+        ("the largest value the member admits", i32::MAX, false),
+    ];
+
+    for (case, expiration_in_minutes, minted) in rows {
+        for mint in ["auth-token", "shell-auth-token"] {
+            let (status, response) = call(
+                &router,
+                "POST",
+                &format!("/2025-09-09/microvms/{microvm_id}/{mint}"),
+                Some(json!({
+                    "expirationInMinutes": expiration_in_minutes,
+                    "allowedPorts": [{"allPorts": {}}],
+                })),
+            )
+            .await;
+            if minted {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?} on {mint}: expected a minted token, got {status} {response}"
+                );
+                assert!(
+                    response["authToken"][AUTH_TOKEN_HEADER].is_string(),
+                    "case {case:?} on {mint}: expected a token, got {response}"
+                );
+            } else {
+                assert_eq!(
+                    status, 400,
+                    "case {case:?} on {mint}: expected the service maximum to refuse it, \
+                     got {status} {response}"
+                );
+                assert_eq!(
+                    response["__type"].as_str(),
+                    Some("ValidationException"),
+                    "case {case:?} on {mint}: expected ValidationException, got {response}"
+                );
+                assert_eq!(
+                    response["message"].as_str(),
+                    Some(
+                        auth_token_expiration_exceeded_message(expiration_in_minutes).as_str()
+                    ),
+                    "case {case:?} on {mint}: expected the value asked for and the limit, \
+                     got {response}"
+                );
+            }
+        }
+    }
+
+    // The lookup comes first: an identifier naming no MicroVM is the 404 even when the
+    // lifetime asked for is one the maximum refuses.
+    let absent = "microvm-00000000-0000-0000-0000-000000000000";
+    for mint in ["auth-token", "shell-auth-token"] {
+        let (status, response) = call(
+            &router,
+            "POST",
+            &format!("/2025-09-09/microvms/{absent}/{mint}"),
+            Some(json!({
+                "expirationInMinutes": cap + 1,
+                "allowedPorts": [{"allPorts": {}}],
+            })),
+        )
+        .await;
+        assert_eq!(
+            status, 404,
+            "on {mint}: the MicroVM lookup is decided first, got {status} {response}"
+        );
+        assert_eq!(
+            response["message"].as_str(),
+            Some(microvm_not_found_message(absent).as_str()),
+            "on {mint}: expected the not-found built from the identifier, got {response}"
+        );
+    }
 }

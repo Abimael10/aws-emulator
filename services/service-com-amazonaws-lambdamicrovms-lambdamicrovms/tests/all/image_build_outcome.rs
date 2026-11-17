@@ -22,12 +22,14 @@
 //! `microvm_lifecycle` owns; the router here is its own, because this suite needs the
 //! owner of objects on the same engine.
 
+use std::io::Write;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::code_artifact::{
     BUCKET_ABSENT_REASON, OBJECT_ABSENT_REASON,
 };
+use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::image_build::step_failure_reason;
 use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::{
     no_active_version_message, state_time_bucket, BUILD_STATE_FAILED,
     BUILD_STATE_SUCCESSFUL, FIRST_IMAGE_VERSION, IMAGE_STATE_CREATED, IMAGE_STATE_CREATE_FAILED,
@@ -36,7 +38,10 @@ use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::microvm_lifecycle::{as_uri_value, call, image_body, PAST_THE_SPAN, REGION};
+use crate::microvm_guest_data_plane::stage_artifact;
+use crate::microvm_lifecycle::{
+    as_uri_value, call, image_body, poll_until, PAST_THE_SPAN, REGION,
+};
 
 /// A router carrying this service and the one its builds resolve their code artifact
 /// against — Amazon S3 — over ONE shared engine.
@@ -205,6 +210,35 @@ async fn listed_image(router: &MultiServiceRouter, name: &str) -> Value {
 /// A member's text, or the empty string when the member is absent.
 fn text(value: &Value, member: &str) -> String {
     value[member].as_str().unwrap_or_default().to_string()
+}
+
+/// Look at one version until its build has SETTLED — both of the states a build settles
+/// in are terminal — and answer the settled version, so a case waits for the CONDITION
+/// rather than for a fixed time.
+async fn settled_version(
+    router: &MultiServiceRouter,
+    case: &str,
+    identifier: &str,
+    image_version: &str,
+) -> Value {
+    poll_until(
+        case,
+        &format!("the build of {identifier} version {image_version} has settled"),
+        || async {
+            let (status, read) = get_version(router, identifier, image_version).await;
+            status == 200
+                && read["state"].as_str().is_some_and(|state| {
+                    state == VERSION_STATE_SUCCESSFUL || state == VERSION_STATE_FAILED
+                })
+        },
+    )
+    .await;
+    let (status, version) = get_version(router, identifier, image_version).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: read the settled version: got {status} {version}"
+    );
+    version
 }
 
 /// Assert that a settled version's `versionStateTimeBucket` is the state the version
@@ -574,6 +608,167 @@ async fn an_update_whose_artifact_is_not_served_fails_its_own_version_only() {
             "case {case:?}: expected stateReason {expected_reason:?}, got {actual_reason:?}"
         );
         assert_state_time_bucket(&version, case);
+    }
+}
+
+/// The .zip a client uploads as a code artifact, with `dockerfile` as the container
+/// specification that declares the build's own steps and a guest module beside it.
+fn artifact_with(dockerfile: &str) -> Vec<u8> {
+    let mut buffer = std::io::Cursor::new(Vec::new());
+    {
+        let mut writer = zip::ZipWriter::new(&mut buffer);
+        let options: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default();
+        for (name, source) in [
+            ("Dockerfile", dockerfile),
+            ("server.js", "// the guest this image would run\n"),
+        ] {
+            writer.start_file(name, options).expect("the entry starts");
+            writer
+                .write_all(source.as_bytes())
+                .expect("the entry's bytes");
+        }
+        writer.finish().expect("a finished archive");
+    }
+    buffer.into_inner()
+}
+
+/// RULE: a build that FETCHED its code artifact settles on the SUCCESS branch only when
+/// the artifact can be built: a step of the context's own build instructions that RAN and
+/// reported a failure settles the version `FAILED` with that step as the reason, while a
+/// context whose steps succeed — and one whose steps this emulator holds no program for,
+/// which establishes nothing — settles `SUCCESSFUL`. The version's STATUS is independent
+/// of that outcome, so activating a `FAILED` version is accepted and leaves its state
+/// exactly as the build settled it.
+#[tokio::test]
+async fn an_artifact_whose_build_steps_fail_settles_the_version_failed() {
+    let router = emulator();
+
+    // The rows differ in what the context's build steps DO: a step that ends itself on a
+    // failure, one that reports failure, a failure after a step that succeeded, steps
+    // that all succeed, a step this emulator has no program for, and no step at all.
+    let rows: Vec<(&str, &str, &str, Option<String>)> = vec![
+        (
+            "a step that cannot succeed",
+            "broken-step",
+            "FROM node:24-alpine\nCOPY . /app\nRUN exit 1\nCMD [\"node\", \"server.js\"]\n",
+            Some(step_failure_reason("exit 1", 1)),
+        ),
+        (
+            "a step that reports failure",
+            "reporting-step",
+            "FROM node:24-alpine\nRUN false\nCMD [\"node\", \"server.js\"]\n",
+            Some(step_failure_reason("false", 1)),
+        ),
+        (
+            "a failure after a step that succeeded",
+            "late-failure",
+            "FROM node:24-alpine\nRUN echo building > /log.txt\nRUN exit 3\n",
+            Some(step_failure_reason("exit 3", 3)),
+        ),
+        (
+            "steps that all succeed",
+            "succeeding-steps",
+            "FROM node:24-alpine\nRUN echo building > /log.txt\nRUN test -f /log.txt\n",
+            None,
+        ),
+        (
+            "a step this emulator holds no program for",
+            "unknown-step",
+            "FROM node:24-alpine\nRUN npm ci --omit=dev\nCMD [\"node\", \"server.js\"]\n",
+            None,
+        ),
+        (
+            "no build step at all",
+            "stepless",
+            "FROM node:24-alpine\nCMD [\"node\", \"server.js\"]\n",
+            None,
+        ),
+    ];
+
+    for (case, name, dockerfile, reason) in rows {
+        let bucket = format!("mvm-{name}-artifacts");
+        stage_artifact(&router, &bucket, "code.zip", artifact_with(dockerfile)).await;
+        let image_arn = create_image(&router, name, &format!("s3://{bucket}/code.zip")).await;
+        // The build is clock-owed, so this waits for it to SETTLE rather than for a time.
+        let version = settled_version(&router, case, &image_arn, FIRST_IMAGE_VERSION).await;
+
+        let expected_state = match reason {
+            None => VERSION_STATE_SUCCESSFUL,
+            Some(_) => VERSION_STATE_FAILED,
+        };
+        let actual_state = text(&version, "state");
+        assert_eq!(
+            actual_state, expected_state,
+            "case {case:?}: expected the build to settle {expected_state}, got {actual_state:?} \
+             {version}"
+        );
+        let actual_reason = version["stateReason"].as_str().map(str::to_string);
+        assert_eq!(
+            actual_reason, reason,
+            "case {case:?}: expected stateReason {reason:?}, got {actual_reason:?}"
+        );
+
+        // The image's own lifecycle settled on the matching branch.
+        let (status, image) = get_image(&router, &image_arn).await;
+        assert_eq!(status, 200, "case {case:?}: read the image: got {status} {image}");
+        let expected_image_state = match reason {
+            None => IMAGE_STATE_CREATED,
+            Some(_) => IMAGE_STATE_CREATE_FAILED,
+        };
+        let actual_image_state = text(&image, "state");
+        assert_eq!(
+            actual_image_state, expected_image_state,
+            "case {case:?}: expected the image {expected_image_state}, got \
+             {actual_image_state:?}"
+        );
+
+        if reason.is_none() {
+            continue;
+        }
+
+        // The STATUS is independent of the build outcome: activating a failed version is
+        // accepted, reports ACTIVE, and rewrites no part of what the build settled.
+        let (status, activated) = call(
+            &router,
+            "PATCH",
+            &format!(
+                "/2025-09-09/microvm-images/{}/versions/{FIRST_IMAGE_VERSION}",
+                as_uri_value(&image_arn)
+            ),
+            Some(json!({"status": VERSION_STATUS_ACTIVE})),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: activating a failed version is accepted, got {status} {activated}"
+        );
+        assert_eq!(
+            text(&activated, "status"),
+            VERSION_STATUS_ACTIVE,
+            "case {case:?}: the activation reports the status it set, got {activated}"
+        );
+        assert_eq!(
+            text(&activated, "state"),
+            VERSION_STATE_FAILED,
+            "case {case:?}: the activation must not rewrite the build outcome, got {activated}"
+        );
+
+        // An independent read agrees: the response was the stored record.
+        let (status, read) = get_version(&router, &image_arn, FIRST_IMAGE_VERSION).await;
+        assert_eq!(status, 200, "case {case:?}: read back: got {status} {read}");
+        assert_eq!(
+            (text(&read, "state"), text(&read, "status")),
+            (
+                VERSION_STATE_FAILED.to_string(),
+                VERSION_STATUS_ACTIVE.to_string()
+            ),
+            "case {case:?}: expected the failed-and-active pair, got {read}"
+        );
+        assert_eq!(
+            read["stateReason"].as_str().map(str::to_string),
+            reason,
+            "case {case:?}: the activation leaves the build's reason as it is, got {read}"
+        );
     }
 }
 

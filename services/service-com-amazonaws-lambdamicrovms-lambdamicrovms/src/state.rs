@@ -16,6 +16,10 @@
 //!   store ([`code_artifact`]);
 //! * `RunMicrovm` — "The MicroVM starts in PENDING state and transitions to
 //!   RUNNING once provisioning completes."; and
+//! * `RunMicrovm`'s `idlePolicy` — "idle time is measured by inbound traffic through the
+//!   MicroVM proxy endpoint — if no requests arrive within the configured duration, the
+//!   MicroVM is suspended", and a MicroVM that then rests longer than
+//!   `suspendedDurationSeconds` is terminated by the platform; and
 //! * `DeleteMicrovmImage` — the image is reported `DELETING` and the removal that
 //!   makes every later read miss is owed by the clock; and
 //! * `CreateMicrovmAuthToken` — "the duration in minutes before the authentication
@@ -45,6 +49,10 @@ pub mod microvm_endpoint;
 /// holds at the address the request named, which is what says whether its build can
 /// produce an image at all.
 pub mod code_artifact;
+
+/// What the BUILD then makes of that artifact: the build steps its own container
+/// specification declares, performed, and the verdict that gives the version.
+pub mod image_build;
 
 /// The region a record belongs to: every resource of this service is regional, so the
 /// store is partitioned by region and every lookup is scoped to the region the request
@@ -94,6 +102,15 @@ pub const MICROVM_TERMINATE_SPAN: Duration = Duration::from_millis(500);
 /// MicroVM as transitioning "through SUSPENDING to SUSPENDED" but publishes no
 /// duration for it.
 pub const MICROVM_SUSPEND_SPAN: Duration = Duration::from_millis(500);
+
+/// The `stateReason` a MicroVM carries when the platform terminated it for resting
+/// suspended longer than its `idlePolicy$suspendedDurationSeconds` allows — "the maximum
+/// time in seconds that a MicroVM can remain suspended before it is automatically
+/// terminated".
+///
+/// `stateReason` is `NonBlankString @pattern("^[^\\s]+$")`, so a reason carries no
+/// whitespace: it is a dotted platform code, like [`EXPIRY_REASON`].
+pub const SUSPENDED_EXPIRY_REASON: &str = "Platform.MaximumSuspendedDurationExceeded";
 
 /// How long after `DeleteMicrovmImage` the image's removal becomes due.
 ///
@@ -1057,6 +1074,28 @@ pub fn is_connectable_microvm_state(state: &str) -> bool {
     state != MICROVM_STATE_TERMINATING && state != MICROVM_STATE_TERMINATED
 }
 
+/// The longest lifetime this service mints an authentication token for, in minutes.
+///
+/// `CreateMicrovmAuthToken$expirationInMinutes` and
+/// `CreateMicrovmShellAuthToken$expirationInMinutes` are both modelled
+/// `PositiveInteger @range(min: 1)` with NO maximum, so the ceiling is the service's own:
+/// a request for a longer-lived token is refused rather than served a token whose real
+/// lifetime is not the one it asked for ([`auth_token_expiration_exceeded_message`]).
+pub const MAX_AUTH_TOKEN_EXPIRATION_MINUTES: i32 = 60;
+
+/// The refusal a request for a token longer-lived than
+/// [`MAX_AUTH_TOKEN_EXPIRATION_MINUTES`] carries: the value the request asked for and the
+/// limit it passed.
+pub fn auth_token_expiration_exceeded_message(requested: i32) -> String {
+    format!("ExpirationMinutes {requested} exceeded max allowed of {MAX_AUTH_TOKEN_EXPIRATION_MINUTES}.")
+}
+
+/// The refusal a `DeleteMicrovmImage` of an image a MicroVM still runs from carries.
+///
+/// Entirely fixed text: it names neither the image nor the MicroVMs holding it, so a
+/// caller reads WHY the delete was refused and nothing of the account's other resources.
+pub const IMAGE_IN_USE_REFUSAL: &str = "Cannot delete microvm image with running microvms.";
+
 /// The AWS-managed network connector that carries a MicroVM's interactive SHELL.
 ///
 /// `CreateMicrovmShellAuthToken` documents "The MicroVM must have been run with the
@@ -1323,6 +1362,10 @@ pub fn microvm_transition_verdict(
 /// resume "restor[es] it to RUNNING state with all state intact", so a resume is
 /// complete when it answers and it drops the suspend the clock still owed.
 ///
+/// Either direction re-arms the deadlines the MicroVM's own `idlePolicy` owes
+/// ([`Microvm::arm_idle_deadlines`]): a MicroVM that is not running is not idling, and one
+/// that runs again starts a fresh idle span.
+///
 /// Neither direction touches [`Microvm::expiry_due_at`]: `maximumDurationInSeconds` is
 /// "the maximum duration in seconds that the MicroVM can EXIST before being terminated by
 /// the platform", and a suspended MicroVM still exists, so that clock runs through a
@@ -1338,6 +1381,7 @@ pub fn start_microvm_transition(vm: &mut Microvm, transition: MicrovmTransition,
             vm.suspend_due_at = None;
         }
     }
+    vm.arm_idle_deadlines(now);
 }
 
 /// One build of one MicroVM image version: the target it was built for and the state
@@ -1777,6 +1821,17 @@ pub struct Microvm {
     /// When `SUSPENDING` -> `SUSPENDED` becomes due; `None` once it has, and once a
     /// resume or a termination has overtaken the suspend.
     pub suspend_due_at: Option<Instant>,
+    /// When this MicroVM's `idlePolicy` makes the platform's own suspend due — one
+    /// `maxIdleDurationSeconds` after the last request its endpoint carried, because
+    /// "idle time is measured by inbound traffic through the MicroVM proxy endpoint".
+    /// `None` for a MicroVM carrying no `idlePolicy`, and while it is in no state an
+    /// auto-suspend starts from.
+    pub idle_due_at: Option<Instant>,
+    /// When `idlePolicy$suspendedDurationSeconds` — "the maximum time in seconds that a
+    /// MicroVM can remain suspended before it is automatically terminated" — runs out on
+    /// the rest this MicroVM is taking; `None` while it is not suspended, and for a
+    /// MicroVM carrying no `idlePolicy`.
+    pub suspended_expiry_due_at: Option<Instant>,
     /// When `TERMINATING` -> `TERMINATED` becomes due; `None` once it has.
     pub terminate_due_at: Option<Instant>,
     /// When `maximumDurationInSeconds` runs out and the platform terminates this
@@ -1793,6 +1848,53 @@ pub struct Microvm {
     /// guest wrote and what it reports of itself outlive every request; `None` before a
     /// MicroVM has started its guest and once it has terminated.
     pub guest_machine: Option<::std::sync::Arc<guest_machine::GuestMachine>>,
+}
+
+impl Microvm {
+    /// Re-arm the deadlines this MicroVM's own `idlePolicy` owes, from the state it is in
+    /// at `now`.
+    ///
+    /// `IdlePolicy` is "configuration that controls MicroVM auto-suspend and auto-resume
+    /// behavior", and each of its two durations is owed in exactly one state: a RUNNING
+    /// MicroVM is the one that can be IDLE, so its automatic suspend is due one
+    /// `maxIdleDurationSeconds` from here, and a SUSPENDED one is the one that can be
+    /// RESTING, so its automatic termination is due one `suspendedDurationSeconds` from
+    /// here. In every other state neither is owed, and a MicroVM carrying no policy owes
+    /// neither in any state.
+    ///
+    /// Both durations are the CALLER's own, so each keeps the value the request gave it.
+    pub fn arm_idle_deadlines(&mut self, now: Instant) {
+        let (idle, resting) = match (self.idle_policy.as_ref(), self.state.as_str()) {
+            (Some(policy), MICROVM_STATE_RUNNING) => (
+                now.checked_add(idle_policy_duration(policy.max_idle_duration_seconds)),
+                None,
+            ),
+            (Some(policy), MICROVM_STATE_SUSPENDED) => (
+                None,
+                now.checked_add(idle_policy_duration(policy.suspended_duration_seconds)),
+            ),
+            _ => (None, None),
+        };
+        self.idle_due_at = idle;
+        self.suspended_expiry_due_at = resting;
+    }
+
+    /// Whether this MicroVM's `idlePolicy` says it comes back on the next request:
+    /// `autoResumeEnabled` is "indicates whether the MicroVM automatically resumes when
+    /// it receives a request while suspended".
+    pub fn auto_resumes(&self) -> bool {
+        self.idle_policy
+            .as_ref()
+            .is_some_and(|policy| policy.auto_resume_enabled)
+    }
+}
+
+/// One `IdlePolicy` duration as a span. Both members are modelled `Integer` in SECONDS
+/// (`maxIdleDurationSeconds` `@range(min: 60)`, `suspendedDurationSeconds`
+/// `@range(min: 0)`), and the boundary validator refuses anything below those bounds
+/// before a handler runs.
+fn idle_policy_duration(seconds: i32) -> Duration {
+    Duration::from_secs(u64::try_from(seconds).unwrap_or_default())
 }
 
 /// What an `@idempotencyToken` replay must return instead of minting a second
@@ -1839,9 +1941,14 @@ pub struct ComAmazonawsLambdamicrovmsLambdamicrovmsState {
     /// the secret. Bounded by [`microvm_endpoint::MAX_LIVE_AUTH_TOKENS`] and by the
     /// expiry the clock applies.
     pub auth_tokens: BTreeMap<String, microvm_endpoint::MicrovmAuthToken>,
-    /// The one address every MicroVM of this store is published on, opened on first
-    /// use. `None` until a `RunMicrovm` needs an endpoint.
-    pub microvm_proxy: Option<microvm_endpoint::MicrovmProxy>,
+    /// The ADDRESS each MicroVM of this store is published on, keyed by its
+    /// `microvmId` and opened when that MicroVM is run
+    /// ([`microvm_endpoint::ensure_endpoint`]). AWS publishes a host per MicroVM, so each
+    /// holds a listener of its own; the entry is dropped — which closes the port — once
+    /// nothing can connect to that MicroVM any more, and the map is capped at
+    /// [`microvm_endpoint::MAX_PUBLISHED_ENDPOINTS`], so the sockets this process holds
+    /// are bounded however many regions a caller launches in.
+    pub microvm_proxies: BTreeMap<String, microvm_endpoint::MicrovmProxy>,
     /// The sequence the next minted `microvmId` is formatted from.
     pub next_microvm_seq: u64,
     /// The sequence the next minted `buildId` is formatted from.
@@ -1949,6 +2056,51 @@ impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
         self.regions.retain(|_, regional| !regional.is_empty());
         self.expire_auth_tokens(now);
         self.reap_guest_processes();
+        self.reap_microvm_endpoints();
+    }
+
+    /// Close the published endpoint of every MicroVM nothing can connect to any more —
+    /// owed at this instant whether or not anybody called. Dropping the entry closes its
+    /// port, so the address a terminated MicroVM was published on stops answering.
+    ///
+    /// An id this store holds NO record for keeps its listener: that is a MicroVM whose
+    /// launch has opened its address and not stored its record yet
+    /// ([`microvm_endpoint::ensure_endpoint`]), and closing it would publish an address
+    /// nothing serves. A record that has reached its terminal state loses the listener
+    /// here, before it is ever reclaimed, so nothing is left behind.
+    fn reap_microvm_endpoints(&mut self) {
+        let ended: ::std::collections::BTreeSet<String> = self
+            .regions
+            .values()
+            .flat_map(|regional| regional.microvms.values())
+            .filter(|vm| !is_connectable_microvm_state(&vm.state))
+            .map(|vm| vm.microvm_id.clone())
+            .collect();
+        self.microvm_proxies
+            .retain(|microvm_id, _| !ended.contains(microvm_id));
+    }
+
+    /// Record that the MicroVM `microvm_id` of `region` just carried a request through
+    /// its published endpoint.
+    ///
+    /// `IdlePolicy` measures idle time "by inbound traffic through the MicroVM proxy
+    /// endpoint", so a request that reached the MicroVM is what makes it NOT idle: the
+    /// automatic suspend is due a fresh `maxIdleDurationSeconds` from here. A request that
+    /// arrives while the MicroVM rests brings it back where its policy says so
+    /// (`autoResumeEnabled`), which is the other half of the same configuration; where it
+    /// does not, the rest is left exactly as it is — traffic nothing answered neither
+    /// extends nor shortens it.
+    pub fn record_endpoint_traffic(&mut self, region: &str, microvm_id: &str, now: Instant) {
+        let Some(vm) = self.microvm_mut(region, microvm_id) else {
+            return;
+        };
+        match vm.state.as_str() {
+            MICROVM_STATE_RUNNING => vm.arm_idle_deadlines(now),
+            MICROVM_STATE_SUSPENDING | MICROVM_STATE_SUSPENDED if vm.auto_resumes() => {
+                start_microvm_transition(vm, MicrovmTransition::Resume, now);
+            }
+            _ => {}
+        }
     }
 
     /// Let go of the guest process of every MicroVM nothing can connect to any more, and
@@ -2139,6 +2291,19 @@ impl regions::RegionalStore {
                             now,
                         ),
                     ));
+                    // A MicroVM that has started RUNNING is one that can now go idle, so
+                    // the deadline its own `idlePolicy` owes starts here.
+                    vm.arm_idle_deadlines(now);
+                }
+            }
+            // "Idle time is measured by inbound traffic through the MicroVM proxy
+            // endpoint — if no requests arrive within the configured duration, the
+            // MicroVM is suspended": the PLATFORM's own suspend, owed with no
+            // `SuspendMicrovm` call, and it comes to rest exactly as a requested one does.
+            if vm.idle_due_at.is_some_and(|at| at <= now) {
+                vm.idle_due_at = None;
+                if vm.state == MICROVM_STATE_RUNNING {
+                    start_microvm_transition(vm, MicrovmTransition::Suspend, now);
                 }
             }
             // "The MicroVM transitions through SUSPENDING to SUSPENDED."
@@ -2146,6 +2311,27 @@ impl regions::RegionalStore {
                 vm.suspend_due_at = None;
                 if vm.state == MICROVM_STATE_SUSPENDING {
                     vm.state = MICROVM_STATE_SUSPENDED.to_string();
+                    // A MicroVM that has come to rest is one its policy's
+                    // `suspendedDurationSeconds` now runs on.
+                    vm.arm_idle_deadlines(now);
+                }
+            }
+            // `suspendedDurationSeconds` is "the maximum time in seconds that a MicroVM
+            // can remain suspended before it is automatically terminated", so the rest
+            // itself is bounded: the platform ends the MicroVM where it outlasts it.
+            if let Some(due) = vm.suspended_expiry_due_at.filter(|at| *at <= now) {
+                vm.suspended_expiry_due_at = None;
+                if vm.state == MICROVM_STATE_SUSPENDED {
+                    vm.state = MICROVM_STATE_TERMINATED.to_string();
+                    vm.provision_due_at = None;
+                    vm.suspend_due_at = None;
+                    vm.idle_due_at = None;
+                    vm.expiry_due_at = None;
+                    vm.terminated_at = Some(now_datetime());
+                    vm.state_reason = Some(SUSPENDED_EXPIRY_REASON.to_string());
+                    vm.reclaim_due_at = Some(due + TERMINATED_MICROVM_RETENTION);
+                    // The memory and the disk the suspend was preserving go with it.
+                    vm.guest_machine = None;
                 }
             }
             if let Some(due) = vm.terminate_due_at.filter(|at| *at <= now) {
@@ -2159,6 +2345,9 @@ impl regions::RegionalStore {
                     // The retention runs from the TERMINATION instant, not from the
                     // request that happened to observe it.
                     vm.reclaim_due_at = Some(due + TERMINATED_MICROVM_RETENTION);
+                    // A terminated MicroVM is neither idling nor resting.
+                    vm.idle_due_at = None;
+                    vm.suspended_expiry_due_at = None;
                     // A terminated MicroVM holds no machine: its memory and its disk
                     // are gone with it, which is what makes a terminate different from
                     // a suspend.
@@ -2173,6 +2362,8 @@ impl regions::RegionalStore {
                     vm.state = MICROVM_STATE_TERMINATED.to_string();
                     vm.provision_due_at = None;
                     vm.suspend_due_at = None;
+                    vm.idle_due_at = None;
+                    vm.suspended_expiry_due_at = None;
                     vm.terminated_at = Some(now_datetime());
                     vm.state_reason = Some(EXPIRY_REASON.to_string());
                     vm.reclaim_due_at = Some(due + TERMINATED_MICROVM_RETENTION);

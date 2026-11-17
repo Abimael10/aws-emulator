@@ -316,6 +316,19 @@ impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
             .count()
     }
 
+    /// Whether `region` still holds a MicroVM RUNNING FROM the image `image_arn`: one
+    /// whose `imageArn` is this image and whose lifecycle has not ended, so the image is
+    /// still the thing that MicroVM executes.
+    ///
+    /// Every MicroVM runs an image of the region it was launched in, so this is scoped to
+    /// that region exactly as every other lookup is. A MicroVM that has reached
+    /// `TERMINATED` runs nothing any more and holds the image no longer; one still
+    /// terminating does.
+    pub fn runs_microvm_from_image(&self, region: &str, image_arn: &str) -> bool {
+        self.microvms_in(region)
+            .any(|vm| vm.image_arn == image_arn && vm.state != MICROVM_STATE_TERMINATED)
+    }
+
     /// What `client_token` already minted on `operation` in `region`, if anything.
     pub fn minted_by(
         &self,

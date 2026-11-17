@@ -253,6 +253,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let CodeArtifact::Uri(code_artifact_uri) = &input.code_artifact;
         let code_artifact_uri = code_artifact_uri.clone();
         let artifact = crate::state::code_artifact::resolve(ctx, &code_artifact_uri).await;
+        // What that artifact's own build then settles with, taken BEFORE the store is
+        // locked as well: reading the archive and performing the build steps its context
+        // declares is the caller's own bounded work, so it runs off the async worker and
+        // holds no lock (`crate::state::code_artifact::settle`).
+        let settled =
+            crate::state::code_artifact::settle(artifact, code_artifact_uri.clone()).await;
 
         let mut store = state.lock();
         store.materialize_due(now);
@@ -424,12 +430,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             build_due_at: Some(now + crate::state::IMAGE_BUILD_SPAN),
             // Nothing has asked for this version to go, so no removal of it is owed.
             delete_due_at: None,
-            // "or CREATE_FAILED on failure": the branch that move takes is the verdict
-            // the object store gave for this version's code artifact.
-            build_failure_reason: artifact.failure_reason(),
+            // "or CREATE_FAILED on failure": the branch that move takes is what this
+            // version's build establishes — whether the object store served the code
+            // artifact, and whether the build steps the served artifact declares
+            // complete.
+            build_failure_reason: settled.failure_reason.clone(),
             // The GUEST the served artifact holds, which a MicroVM run from this version
             // executes behind its published endpoint.
-            guest: artifact.guest(&code_artifact_uri),
+            guest: settled.guest.clone(),
             // The build has not settled yet, so the version's state has no settlement
             // instant to report.
             state_settled_at: None,

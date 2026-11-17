@@ -583,7 +583,9 @@ async fn an_auth_token_is_minted_for_every_form_of_allowed_ports() {
             "several specifications at once, addressed by ARN",
             microvm_arn.as_str(),
             json!({
-                "expirationInMinutes": 1_440,
+                // The service's own maximum lifetime, which the mint accepts at the
+                // boundary (`microvm_endpoint_data_plane` owns that rule).
+                "expirationInMinutes": 60,
                 "allowedPorts": [
                     {"port": 80},
                     {"range": {"startPort": 3000, "endPort": 3010}},

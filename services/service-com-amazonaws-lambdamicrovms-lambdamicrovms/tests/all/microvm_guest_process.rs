@@ -218,17 +218,20 @@ async fn auth_token(
 
 /// One request through a MicroVM's published endpoint: the status and the body it
 /// answered, with `port` named in `X-aws-proxy-port` where the client names one.
+///
+/// `microvm_id` is the MicroVM whose own address the request is sent to — the published
+/// endpoint is that address's authority, so the request's whole path is the guest's.
 async fn through_endpoint(
     router: &MultiServiceRouter,
     engine: &Arc<engine::InMemoryEngine>,
-    endpoint: &str,
+    microvm_id: &str,
     path: &str,
     token: &str,
     port: Option<&str>,
 ) -> (u16, Value) {
     let mut builder = http::Request::builder()
         .method("GET")
-        .uri(format!("{endpoint}{path}"))
+        .uri(path)
         .header(AUTH_TOKEN_HEADER, token);
     if let Some(port) = port {
         builder = builder.header(PROXY_PORT_HEADER, port);
@@ -239,7 +242,8 @@ async fn through_endpoint(
     let state = engine.state::<MicrovmState>();
     let connectors = connector_state(&**engine);
     let callback = smithy_server_runtime::EmbeddedEmulator::from_router(router.clone());
-    let response = serve_request(&state, connectors.as_ref(), &callback, &request).await;
+    let response =
+        serve_request(&state, connectors.as_ref(), &callback, microvm_id, &request).await;
     let status = response.status().as_u16();
     let body = serde_json::from_slice(response.body()).unwrap_or(Value::Null);
     (status, body)
@@ -249,14 +253,15 @@ async fn through_endpoint(
 async fn guest_answer(
     router: &MultiServiceRouter,
     engine: &Arc<engine::InMemoryEngine>,
-    endpoint: &str,
+    microvm_id: &str,
     path: &str,
     token: &str,
 ) -> Value {
-    let (status, body) = through_endpoint(router, engine, endpoint, path, token, None).await;
+    let (status, body) = through_endpoint(router, engine, microvm_id, path, token, None).await;
     assert_eq!(
         status, 200,
-        "GET {path} on {endpoint}: expected the guest's own answer, got {status} {body}"
+        "GET {path} on the endpoint of {microvm_id}: expected the guest's own answer, \
+         got {status} {body}"
     );
     body
 }
@@ -292,15 +297,15 @@ async fn standing() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>, String)
 #[tokio::test(flavor = "multi_thread")]
 async fn a_microvms_guest_is_one_process_with_its_own_memory_disk_and_identity() {
     let (router, engine, image) = standing().await;
-    let (first_id, first) = running_microvm(&router, &image).await;
-    let (second_id, second) = running_microvm(&router, &image).await;
+    let (first_id, _first_endpoint) = running_microvm(&router, &image).await;
+    let (second_id, _second_endpoint) = running_microvm(&router, &image).await;
     let token = auth_token(&router, &first_id, json!([{"allPorts": {}}])).await;
     let other_token = auth_token(&router, &second_id, json!([{"allPorts": {}}])).await;
 
     // The identity the MicroVM published to its guest, read twice: a process answers the
     // same identity however often it is asked.
-    let identity = guest_answer(&router, &engine, &first, "/id", &token).await;
-    let again = guest_answer(&router, &engine, &first, "/id", &token).await;
+    let identity = guest_answer(&router, &engine, &first_id, "/id", &token).await;
+    let again = guest_answer(&router, &engine, &first_id, "/id", &token).await;
     assert_eq!(
         identity, again,
         "two reads of one running MicroVM must report one identity, got {identity} then {again}"
@@ -332,7 +337,7 @@ async fn a_microvms_guest_is_one_process_with_its_own_memory_disk_and_identity()
     // The memory and the disk of that one process: each request reaches what the request
     // before it left behind.
     for expected in 1..=3 {
-        let counted = guest_answer(&router, &engine, &first, "/count", &token).await;
+        let counted = guest_answer(&router, &engine, &first_id, "/count", &token).await;
         assert_eq!(
             counted["count"].as_i64(),
             Some(expected),
@@ -354,7 +359,7 @@ async fn a_microvms_guest_is_one_process_with_its_own_memory_disk_and_identity()
         let stored = guest_answer(
             &router,
             &engine,
-            &first,
+            &first_id,
             &format!("/set?key={key}&value={value}"),
             &token,
         )
@@ -368,7 +373,7 @@ async fn a_microvms_guest_is_one_process_with_its_own_memory_disk_and_identity()
     // What the guest holds for each key now: the last value written for it.
     let held: Vec<(&str, &str)> = vec![("alpha", "replaced"), ("beta", "second value")];
     for (key, expected) in &held {
-        let read = guest_answer(&router, &engine, &first, &format!("/get?key={key}"), &token).await;
+        let read = guest_answer(&router, &engine, &first_id, &format!("/get?key={key}"), &token).await;
         assert_eq!(
             read["memory"].as_str(),
             Some(*expected),
@@ -393,7 +398,7 @@ async fn a_microvms_guest_is_one_process_with_its_own_memory_disk_and_identity()
     assert_eq!(status, 200, "suspend the MicroVM: got {status} {suspended}");
     microvm_in_state(&router, &first_id, "SUSPENDED").await;
     for path in ["/id", "/count", "/get?key=alpha"] {
-        let (status, body) = through_endpoint(&router, &engine, &first, path, &token, None).await;
+        let (status, body) = through_endpoint(&router, &engine, &first_id, path, &token, None).await;
         assert_eq!(
             status, NO_GUEST_RESPONSE_STATUS,
             "GET {path} on a SUSPENDED MicroVM must not be answered by its guest, got \
@@ -412,20 +417,20 @@ async fn a_microvms_guest_is_one_process_with_its_own_memory_disk_and_identity()
     .await;
     assert_eq!(status, 200, "resume the MicroVM: got {status} {resumed}");
     microvm_in_state(&router, &first_id, "RUNNING").await;
-    let after = guest_answer(&router, &engine, &first, "/id", &token).await;
+    let after = guest_answer(&router, &engine, &first_id, "/id", &token).await;
     assert_eq!(
         after, identity,
         "a resumed MicroVM runs the process it suspended, so its identity is unchanged: \
          expected {identity}, got {after}"
     );
-    let counted = guest_answer(&router, &engine, &first, "/count", &token).await;
+    let counted = guest_answer(&router, &engine, &first_id, "/count", &token).await;
     assert_eq!(
         counted["count"].as_i64(),
         Some(4),
         "the counter the process held through the suspend must carry on, got {counted}"
     );
     for (key, expected) in &held {
-        let read = guest_answer(&router, &engine, &first, &format!("/get?key={key}"), &token).await;
+        let read = guest_answer(&router, &engine, &first_id, &format!("/get?key={key}"), &token).await;
         assert_eq!(
             (read["memory"].as_str(), read["disk"].as_str()),
             (Some(*expected), Some(*expected)),
@@ -434,7 +439,7 @@ async fn a_microvms_guest_is_one_process_with_its_own_memory_disk_and_identity()
     }
 
     // The other MicroVM of the same image is another machine running another process.
-    let other = guest_answer(&router, &engine, &second, "/id", &other_token).await;
+    let other = guest_answer(&router, &engine, &second_id, "/id", &other_token).await;
     assert_eq!(
         other["hostname"].as_str(),
         Some(second_id.as_str()),
@@ -449,13 +454,13 @@ async fn a_microvms_guest_is_one_process_with_its_own_memory_disk_and_identity()
         "two MicroVMs run two processes, so the id each minted differs: got {other} and \
          {identity}"
     );
-    let counted = guest_answer(&router, &engine, &second, "/count", &other_token).await;
+    let counted = guest_answer(&router, &engine, &second_id, "/count", &other_token).await;
     assert_eq!(
         counted["count"].as_i64(),
         Some(1),
         "the second MicroVM's process holds none of the first's memory, got {counted}"
     );
-    let read = guest_answer(&router, &engine, &second, "/get?key=alpha", &other_token).await;
+    let read = guest_answer(&router, &engine, &second_id, "/get?key=alpha", &other_token).await;
     assert_eq!(
         (read["memory"].as_str(), read["disk"].as_str()),
         (None, None),
@@ -478,7 +483,7 @@ type PortScopeRow<'a> = (&'a str, Value, Option<&'a str>, u16);
 #[tokio::test(flavor = "multi_thread")]
 async fn a_token_grants_the_port_the_request_addresses() {
     let (router, engine, image) = standing().await;
-    let (microvm_id, endpoint) = running_microvm(&router, &image).await;
+    let (microvm_id, _endpoint) = running_microvm(&router, &image).await;
 
     // The port this suite's guest bound its server on, which is therefore the port its
     // endpoint fronts, and one it bound nothing on.
@@ -582,7 +587,7 @@ async fn a_token_grants_the_port_the_request_addresses() {
     for (case, allowed_ports, named, expected) in rows {
         let token = auth_token(&router, &microvm_id, allowed_ports.clone()).await;
         let (status, body) =
-            through_endpoint(&router, &engine, &endpoint, "/id", &token, named).await;
+            through_endpoint(&router, &engine, &microvm_id, "/id", &token, named).await;
         assert_eq!(
             status, expected,
             "case {case:?}: a token for {allowed_ports} addressing {named:?} must be \

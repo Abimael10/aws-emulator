@@ -503,23 +503,27 @@ async fn auth_token(router: &MultiServiceRouter, microvm_id: &str) -> String {
 
 /// One authenticated request to a MicroVM's published endpoint: the status and the body
 /// the GUEST answered.
+///
+/// `microvm_id` is the MicroVM the address belongs to: its published endpoint is that
+/// address's authority, so `path` is the guest's own path in full.
 async fn through_endpoint(
     router: &MultiServiceRouter,
     engine: &Arc<engine::InMemoryEngine>,
-    endpoint: &str,
+    microvm_id: &str,
     path: &str,
     token: &str,
 ) -> (u16, Value) {
     let request = http::Request::builder()
         .method("GET")
-        .uri(format!("{endpoint}{path}"))
+        .uri(path)
         .header(AUTH_TOKEN_HEADER, token)
         .body(Vec::new())
         .expect("a well-formed request to a MicroVM endpoint");
     let state = engine.state::<MicrovmState>();
     let connectors = connector_state(&**engine);
     let response =
-        serve_request(&state, connectors.as_ref(), &callback(router), &request).await;
+        serve_request(&state, connectors.as_ref(), &callback(router), microvm_id, &request)
+            .await;
     let status = response.status().as_u16();
     let body = serde_json::from_slice(response.body()).unwrap_or(Value::Null);
     (status, body)
@@ -578,7 +582,7 @@ async fn guest_connect(
     let (status, body) = through_endpoint(
         &standing.router,
         &standing.engine,
-        &microvm.1,
+        &microvm.0,
         &format!("/connect?host={address}&port={port}"),
         &token,
     )
@@ -642,7 +646,7 @@ async fn a_published_endpoint_answers_with_the_guests_own_response() {
         let (actual_status, actual) = through_endpoint(
             &standing.router,
             &standing.engine,
-            &microvm.1,
+            &microvm.0,
             path,
             &token,
         )

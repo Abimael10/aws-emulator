@@ -16,13 +16,14 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::{
-    delete_image_not_found_message, invalid_arn_format_message,
+    delete_image_not_found_message, invalid_arn_format_message, IMAGE_IN_USE_REFUSAL,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::microvm_image_and_instance_paths::{delete_image, get_image};
 use crate::microvm_lifecycle::{
-    call, emulator, expected_image_arn, image_body, ACCOUNT, PAST_THE_SPAN, REGION,
+    built_image, call, emulator, expected_image_arn, image_body, poll_until_microvm_state,
+    run_microvm, ACCOUNT, PAST_THE_SPAN, REGION,
 };
 
 /// `POST /2025-09-09/microvm-images`.
@@ -119,6 +120,134 @@ async fn a_delete_of_a_record_that_is_gone_is_refused() {
             status, 404,
             "case {case:?}: the read misses on the same identifier, got {status} {read}"
         );
+    }
+}
+
+/// RULE: a delete of a resource another resource still RUNS FROM is refused with the
+/// modelled 400 `ValidationException` and has no effect at all, and the refusal stops
+/// being given the moment the last dependent has reached its terminal state — so the
+/// refusal is a client's signal that the image is still in use rather than a permanent
+/// verdict.
+#[tokio::test]
+async fn an_image_a_microvm_still_runs_from_cannot_be_deleted() {
+    let router = emulator();
+    let image = built_image(&router, "in-use").await;
+
+    // Rows differ in the STATE the dependent MicroVM is in when the delete is tried,
+    // because what decides the refusal is only whether a MicroVM still runs from the
+    // image: one still provisioning, one running, one resting under a suspend and one on
+    // its way out all hold it, and one that has terminated holds it no longer.
+    let rows: Vec<(&str, &str, Option<&str>, bool)> = vec![
+        ("the MicroVM is still provisioning", "PENDING", None, true),
+        ("the MicroVM is running", "RUNNING", None, true),
+        (
+            "the MicroVM rests under a suspend",
+            "SUSPENDED",
+            Some("suspend"),
+            true,
+        ),
+        (
+            "the MicroVM is on its way out",
+            "TERMINATED",
+            Some("terminate"),
+            false,
+        ),
+    ];
+
+    for (case, state, action, refused) in rows {
+        let (status, run) = run_microvm(
+            &router,
+            json!({"imageIdentifier": image, "maximumDurationInSeconds": 600}),
+        )
+        .await;
+        assert_eq!(status, 200, "case {case:?}: run got {status} {run}");
+        let microvm_id = run["microvmId"].as_str().unwrap_or_default().to_string();
+        if let Some(action) = action {
+            // The MicroVM has to be RUNNING before it can be suspended or terminated,
+            // which is a condition the test polls for rather than a wait it times.
+            poll_until_microvm_state(&router, case, &microvm_id, "RUNNING").await;
+            let (status, moved) = if action == "terminate" {
+                // `TerminateMicrovm` is `DELETE /2025-09-09/microvms/{microvmIdentifier}`
+                // (`smithy_query(query="digest")`); the suspend is a POST of its own name.
+                call(
+                    &router,
+                    "DELETE",
+                    &format!("/2025-09-09/microvms/{microvm_id}"),
+                    None,
+                )
+                .await
+            } else {
+                call(
+                    &router,
+                    "POST",
+                    &format!("/2025-09-09/microvms/{microvm_id}/{action}"),
+                    None,
+                )
+                .await
+            };
+            assert_eq!(status, 200, "case {case:?}: {action} got {status} {moved}");
+        }
+        if state != "PENDING" {
+            poll_until_microvm_state(&router, case, &microvm_id, state).await;
+        }
+
+        let (status, body) = delete_image(&router, &image).await;
+        if refused {
+            assert_eq!(
+                status, 400,
+                "case {case:?}: a MicroVM in {state} still runs from the image, so the \
+                 delete must be refused, got {status} {body}"
+            );
+            assert_eq!(
+                body["__type"].as_str(),
+                Some("ValidationException"),
+                "case {case:?}: expected ValidationException, got {body}"
+            );
+            assert_eq!(
+                body["message"].as_str(),
+                Some(IMAGE_IN_USE_REFUSAL),
+                "case {case:?}: expected the refusal's own sentence, got {:?}",
+                body["message"]
+            );
+
+            // The refusal has NO effect: the image is untouched, with its version still
+            // the active one a launch resolves.
+            let (status, read) = get_image(&router, &image).await;
+            assert_eq!(status, 200, "case {case:?}: read got {status} {read}");
+            assert_eq!(
+                read["state"].as_str(),
+                Some("CREATED"),
+                "case {case:?}: the refused delete left the image as it was, got {:?}",
+                read["state"]
+            );
+            assert!(
+                read["latestActiveImageVersion"].is_string(),
+                "case {case:?}: the image keeps its active version, got {read}"
+            );
+            // Terminating the dependent is what lifts the refusal, so the next row's
+            // dependent is this row's cleanup.
+            let (status, ended) = call(
+                &router,
+                "DELETE",
+                &format!("/2025-09-09/microvms/{microvm_id}"),
+                None,
+            )
+            .await;
+            assert_eq!(status, 200, "case {case:?}: terminate got {status} {ended}");
+            poll_until_microvm_state(&router, case, &microvm_id, "TERMINATED").await;
+        } else {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: a terminated MicroVM runs from nothing, so the identical \
+                 delete is accepted, got {status} {body}"
+            );
+            assert_eq!(
+                body["state"].as_str(),
+                Some("DELETING"),
+                "case {case:?}: the accepted delete is in flight, got {:?}",
+                body["state"]
+            );
+        }
     }
 }
 

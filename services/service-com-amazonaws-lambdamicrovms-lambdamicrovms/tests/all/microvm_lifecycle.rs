@@ -612,13 +612,18 @@ async fn running_a_microvm_persists_it_and_get_returns_the_stored_record() {
             run["state"]
         );
         let endpoint = run["endpoint"].as_str().unwrap_or_default();
-        // The endpoint is the address this emulator publishes the MicroVM on: its own
-        // HTTPS listener, with the MicroVM named in the path. What that address answers
-        // is pinned in `microvm_endpoint_data_plane`.
+        // The endpoint is the AUTHORITY of the address this emulator publishes the
+        // MicroVM on — a host, optionally `host:port`, with no scheme and no path, which
+        // is what a client prefixes a scheme onto. What that address answers, and that
+        // each MicroVM gets one of its own, is pinned in `microvm_endpoint_data_plane`.
         assert!(
-            endpoint.starts_with("https://")
-                && endpoint.ends_with(&format!("/microvms/{microvm_id}")),
-            "case {case:?}: expected an HTTPS endpoint naming this MicroVM, got {:?}",
+            !endpoint.is_empty()
+                && !endpoint.contains("://")
+                && !endpoint.contains('/')
+                && endpoint
+                    .chars()
+                    .all(|byte| byte.is_ascii_alphanumeric() || ".-:".contains(byte)),
+            "case {case:?}: expected a bare host, optionally with a port, got {:?}",
             run["endpoint"]
         );
         assert_eq!(

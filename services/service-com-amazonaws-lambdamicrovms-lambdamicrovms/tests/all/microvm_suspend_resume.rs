@@ -9,12 +9,18 @@
 //! examples, not the specification. The harness (`emulator`, `call`, `built_image`,
 //! `run_microvm`, …) is the one the lifecycle suite beside this file already defines.
 
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
 use serde_json::{json, Value};
+use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::{
+    ComAmazonawsLambdamicrovmsLambdamicrovmsState as MicrovmStore, SUSPENDED_EXPIRY_REASON,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::microvm_lifecycle::{
-    as_uri_value, built_image, call, emulator, expected_microvm_arn, run_microvm, PAST_THE_SPAN,
-    REGION,
+    as_uri_value, built_image, call, emulator, emulator_with_engine, expected_microvm_arn,
+    poll_until_microvm_state, run_microvm, PAST_THE_SPAN, REGION,
 };
 
 /// The run states a MicroVM of this store can be observed in. Source:
@@ -329,6 +335,177 @@ async fn a_transition_no_run_state_leads_out_of_is_refused() {
             "case {case:?}: a refused transition must change nothing, got {after}"
         );
     }
+}
+
+/// How long is left of a deadline the store holds for the MicroVM `microvm_id`, read
+/// through the shared engine — `None` where the record owes no such deadline.
+///
+/// `which` picks the deadline: the automatic suspend an `idlePolicy` owes a RUNNING
+/// MicroVM, or the automatic termination it owes a resting one.
+pub(crate) fn deadline_left(
+    engine: &Arc<engine::InMemoryEngine>,
+    microvm_id: &str,
+    which: Deadline,
+) -> Option<Duration> {
+    let state = engine.state::<MicrovmStore>();
+    let store = state.lock();
+    let vm = store.microvm(REGION, microvm_id)?;
+    let due = match which {
+        Deadline::Idle => vm.idle_due_at,
+        Deadline::Rest => vm.suspended_expiry_due_at,
+    }?;
+    Some(due.saturating_duration_since(Instant::now()))
+}
+
+/// Move one of those deadlines to `left` from now, and into the PAST where the caller
+/// names no time left — which is the same thing as waiting it out: the store holds the
+/// INSTANT each clock-owed move becomes due, so a test drives THAT clock rather than the
+/// wall clock. The durations an `idlePolicy` carries are the caller's own and keep their
+/// value, which is why no test waits them out.
+pub(crate) fn set_deadline(
+    engine: &Arc<engine::InMemoryEngine>,
+    microvm_id: &str,
+    which: Deadline,
+    left: Option<Duration>,
+) {
+    let state = engine.state::<MicrovmStore>();
+    let mut store = state.lock();
+    let vm = store
+        .microvm_mut(REGION, microvm_id)
+        .unwrap_or_else(|| panic!("the MicroVM {microvm_id} is in the store"));
+    let now = Instant::now();
+    let due = match left {
+        Some(left) => now.checked_add(left).unwrap_or(now),
+        None => now
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(Instant::now),
+    };
+    match which {
+        Deadline::Idle => vm.idle_due_at = Some(due),
+        Deadline::Rest => vm.suspended_expiry_due_at = Some(due),
+    }
+}
+
+/// Which clock-owed deadline of an `idlePolicy` a test is driving.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Deadline {
+    /// `maxIdleDurationSeconds`: the automatic suspend.
+    Idle,
+    /// `suspendedDurationSeconds`: the automatic termination of a resting MicroVM.
+    Rest,
+}
+
+/// RULE: an `idlePolicy` is enforced by the PLATFORM's own clock, with no call from the
+/// client: a MicroVM that carries one is suspended once `maxIdleDurationSeconds` has
+/// passed with no inbound traffic through its endpoint, a MicroVM that then rests longer
+/// than `suspendedDurationSeconds` is terminated, each deadline keeps the duration the
+/// request gave it, and a MicroVM carrying no policy owes neither move.
+///
+/// Source for the members and their bounds:
+/// `smithy_query(query="shape",shape="IdlePolicy")` — `maxIdleDurationSeconds`
+/// `@range(min: 60)`, `suspendedDurationSeconds` `@range(min: 0)`, both required.
+#[tokio::test]
+async fn an_idle_policy_suspends_and_then_terminates_a_microvm_on_the_platforms_own_clock() {
+    let (router, engine) = emulator_with_engine();
+    built_image(&router, "idling").await;
+
+    // Rows differ along the durations the policy carries — the smallest idle duration the
+    // member admits, a longer one, and the smallest rest the member admits (0, which
+    // leaves a MicroVM no time to rest at all) — because the rule is the same mechanism
+    // whatever the figures are.
+    let rows: Vec<(&str, u64, u64, bool)> = vec![
+        ("the smallest idle duration the member admits", 60, 300, true),
+        ("ten minutes idle and five of rest", 600, 300, true),
+        ("an hour idle and an hour of rest", 3_600, 3_600, true),
+        ("no time to rest at all", 60, 0, false),
+    ];
+
+    for (case, max_idle, rest_for, rests) in rows {
+        let (status, run) = run_microvm(
+            &router,
+            json!({
+                "imageIdentifier": "idling",
+                "idlePolicy": {
+                    "maxIdleDurationSeconds": max_idle,
+                    "suspendedDurationSeconds": rest_for,
+                    "autoResumeEnabled": true,
+                },
+            }),
+        )
+        .await;
+        assert_eq!(status, 200, "case {case:?}: run got {status} {run}");
+        let id = run["microvmId"].as_str().unwrap_or_default().to_string();
+        poll_until_microvm_state(&router, case, &id, RUNNING).await;
+
+        // The deadline a RUNNING MicroVM owes is one `maxIdleDurationSeconds` away: the
+        // caller's own duration, not a span of this emulator's choosing.
+        let left = deadline_left(&engine, &id, Deadline::Idle)
+            .unwrap_or_else(|| panic!("case {case:?}: a MicroVM with a policy owes a suspend"));
+        assert!(
+            left <= Duration::from_secs(max_idle)
+                && left + Duration::from_secs(30) > Duration::from_secs(max_idle),
+            "case {case:?}: expected about {max_idle}s of idle time left, got {left:?}"
+        );
+
+        // Waiting the idle duration out: the suspend is the platform's, so no
+        // SuspendMicrovm is called here at all.
+        set_deadline(&engine, &id, Deadline::Idle, None);
+        if rests {
+            poll_until_microvm_state(&router, case, &id, SUSPENDED).await;
+
+            // A resting MicroVM owes the other deadline, one `suspendedDurationSeconds`
+            // away.
+            let left = deadline_left(&engine, &id, Deadline::Rest).unwrap_or_else(|| {
+                panic!("case {case:?}: a resting MicroVM with a policy owes a termination")
+            });
+            assert!(
+                left <= Duration::from_secs(rest_for)
+                    && left + Duration::from_secs(30) > Duration::from_secs(rest_for),
+                "case {case:?}: expected about {rest_for}s of rest left, got {left:?}"
+            );
+            set_deadline(&engine, &id, Deadline::Rest, None);
+        }
+
+        // "The maximum time in seconds that a MicroVM can remain suspended before it is
+        // automatically terminated."
+        poll_until_microvm_state(&router, case, &id, TERMINATED).await;
+        let (status, ended) = get_microvm(&router, &id).await;
+        assert_eq!(status, 200, "case {case:?}: read got {status} {ended}");
+        assert_eq!(
+            ended["stateReason"].as_str(),
+            Some(SUSPENDED_EXPIRY_REASON),
+            "case {case:?}: the platform's own termination names its reason, got {ended}"
+        );
+        assert!(
+            ended["terminatedAt"].as_f64().is_some(),
+            "case {case:?}: a terminated MicroVM carries the instant it ended, got {ended}"
+        );
+    }
+
+    // The control: a MicroVM carrying NO policy owes neither move, so nothing the
+    // platform's clock materialises can take it out of RUNNING — there is no deadline to
+    // bring forward, which is the whole of the claim.
+    let (status, run) = run_microvm(&router, json!({"imageIdentifier": "idling"})).await;
+    assert_eq!(status, 200, "run without a policy: got {status} {run}");
+    let id = run["microvmId"].as_str().unwrap_or_default().to_string();
+    poll_until_microvm_state(&router, "no policy at all", &id, RUNNING).await;
+    assert!(
+        deadline_left(&engine, &id, Deadline::Idle).is_none(),
+        "a MicroVM with no idlePolicy owes no automatic suspend"
+    );
+    assert!(
+        deadline_left(&engine, &id, Deadline::Rest).is_none(),
+        "a MicroVM with no idlePolicy owes no automatic termination either"
+    );
+    // Every read materialises the moves the clock has made due, so a read that still
+    // reports RUNNING is one that found none owed.
+    let (_, got) = get_microvm(&router, &id).await;
+    assert_eq!(
+        got["state"].as_str(),
+        Some(RUNNING),
+        "a MicroVM with no idlePolicy is never auto-suspended, got {:?}",
+        got["state"]
+    );
 }
 
 /// RULE: a transition addressed at an identifier naming no stored MicroVM answers 404

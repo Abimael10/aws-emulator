@@ -110,14 +110,17 @@ fn minted_token(case: &str, response: &Value) -> String {
 /// Send one shell request to the MicroVM's published endpoint: `program` as the body, the
 /// token in `X-aws-proxy-auth`. Answers `(status, shell status, body)`, where the shell
 /// status is `None` for an answer that carries none.
+///
+/// `microvm_id` is the MicroVM whose own address the request is sent to: the published
+/// endpoint is that address's authority, so the request carries the channel's own path.
 async fn through_shell(
     router: &MultiServiceRouter,
     engine: &Arc<engine::InMemoryEngine>,
-    endpoint: &str,
+    microvm_id: &str,
     token: Option<&str>,
     program: &str,
 ) -> (u16, Option<i32>, String) {
-    let mut builder = http::Request::builder().method("POST").uri(endpoint);
+    let mut builder = http::Request::builder().method("POST").uri("/");
     if let Some(token) = token {
         builder = builder.header(AUTH_TOKEN_HEADER, token);
     }
@@ -127,7 +130,8 @@ async fn through_shell(
     let state = engine.state::<MicrovmState>();
     let connectors = connector_state(&**engine);
     let callback = smithy_server_runtime::EmbeddedEmulator::from_router(router.clone());
-    let response = serve_request(&state, connectors.as_ref(), &callback, &request).await;
+    let response =
+        serve_request(&state, connectors.as_ref(), &callback, microvm_id, &request).await;
     let status = response.status().as_u16();
     let shell_status = response
         .headers()
@@ -334,14 +338,14 @@ async fn a_shell_token_grants_the_microvms_own_shell() {
     )
     .await;
 
-    let (microvm_id, endpoint) = running_microvm(
+    let (microvm_id, _endpoint) = running_microvm(
         &router,
         "the MicroVM whose shell is reached",
         "shell-running",
         Some(json!([SHELL_INGRESS_NETWORK_CONNECTOR])),
     )
     .await;
-    let (_, other_endpoint) = running_microvm(
+    let (other_id, _other_endpoint) = running_microvm(
         &router,
         "another MicroVM of the same image",
         "shell-running",
@@ -403,7 +407,7 @@ async fn a_shell_token_grants_the_microvms_own_shell() {
     ];
     for (case, program, expected_status, expected_lines) in rows {
         let (status, shell_status, body) =
-            through_shell(&router, &engine, &endpoint, Some(&token), program).await;
+            through_shell(&router, &engine, &microvm_id, Some(&token), program).await;
         assert_eq!(
             status, 200,
             "case {case:?}: the shell was reached, so the channel answers, got {status} {body:?}"
@@ -426,13 +430,13 @@ async fn a_shell_token_grants_the_microvms_own_shell() {
     for (case, address, presented) in [
         (
             "the token at another MicroVM's address",
-            &other_endpoint,
+            &other_id,
             Some(token.as_str()),
         ),
-        ("no token at all", &endpoint, None),
+        ("no token at all", &microvm_id, None),
         (
             "a token value nothing minted",
-            &endpoint,
+            &microvm_id,
             Some("not-a-token-this-emulator-minted"),
         ),
     ] {
@@ -462,7 +466,7 @@ async fn a_shell_token_grants_the_microvms_own_shell() {
     assert_eq!(status, 200, "mint a port token: got {status} {ports}");
     let port_token = minted_token("a token scoped to the endpoint's ports", &ports);
     let (status, shell_status, body) =
-        through_shell(&router, &engine, &endpoint, Some(&port_token), "echo one").await;
+        through_shell(&router, &engine, &microvm_id, Some(&port_token), "echo one").await;
     assert_eq!(
         status, NO_GUEST_RESPONSE_STATUS,
         "a port token reaches the guest rather than the shell, got {status} {body:?}"
@@ -478,7 +482,7 @@ async fn a_shell_token_grants_the_microvms_own_shell() {
     assert_eq!(status, 200, "mint a second shell token: got {status} {response}");
     let next = minted_token("a token minted after the writes", &response);
     let (status, shell_status, body) =
-        through_shell(&router, &engine, &endpoint, Some(&next), "cat /data/note.txt").await;
+        through_shell(&router, &engine, &microvm_id, Some(&next), "cat /data/note.txt").await;
     assert_eq!(status, 200, "the shell answers the second token, got {status} {body:?}");
     assert_eq!(
         shell_status,

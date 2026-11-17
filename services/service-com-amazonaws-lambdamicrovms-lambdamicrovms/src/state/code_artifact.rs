@@ -24,9 +24,12 @@
 //!   FAILURE branch with the reason for that answer
 //!   ([`CodeArtifactVerdict::Unfetchable`]);
 //! * nothing answered the read at all — this emulator was assembled with no object store
-//!   to ask — so NOTHING about the artifact is established
+//!   to ask — so NOTHING is established about the artifact
 //!   ([`CodeArtifactVerdict::Unestablished`]), and a failure that was never established
 //!   is not reported as one.
+//!
+//! An artifact the store DID serve is then built, which is the other half of the verdict:
+//! what performing the context's own build steps establishes ([`super::image_build`]).
 //!
 //! The answer is taken when the build is SCHEDULED and settled on the record when the
 //! clock makes the build due
@@ -69,6 +72,41 @@ pub enum CodeArtifactVerdict {
     Unestablished,
 }
 
+/// What the build of one version's code artifact SETTLES with: the reason it failed, and
+/// the guest program the artifact holds.
+///
+/// Both are read out of the artifact's own bytes, which is work proportional to what the
+/// caller staged, so they are taken together off the async worker
+/// ([`settle`]) rather than one at a time on the request's own thread.
+#[derive(Debug, Default, Clone)]
+pub struct BuildSettlement {
+    /// The `stateReason` the version and its builds settle with, and `None` for a build
+    /// that settles successfully.
+    pub failure_reason: Option<String>,
+    /// The GUEST a MicroVM run from this version executes, and `None` where the artifact
+    /// holds none this emulator's engine can run.
+    pub guest: Option<::std::sync::Arc<super::guest_program::GuestProgram>>,
+}
+
+/// What the build of the artifact `verdict` resolved settles with, computed on a BLOCKING
+/// worker.
+///
+/// Reading an archive and PERFORMING the build steps its context declares
+/// ([`super::image_build`]) are bounded but synchronous, and both are work the CALLER's
+/// own artifact sizes, so neither happens on the async worker serving the request and
+/// neither happens under the store's lock. A worker that ended without answering settles
+/// nothing, which is the same claim an unanswered artifact read makes.
+///
+/// `uri` is the `codeArtifact$uri` the artifact was fetched from.
+pub async fn settle(verdict: CodeArtifactVerdict, uri: String) -> BuildSettlement {
+    ::tokio::task::spawn_blocking(move || BuildSettlement {
+        failure_reason: verdict.build_failure_reason(&uri),
+        guest: verdict.guest(&uri),
+    })
+    .await
+    .unwrap_or_default()
+}
+
 impl CodeArtifactVerdict {
     /// The `stateReason` the build this verdict was taken for settles with, and `None`
     /// for a build that settles successfully.
@@ -80,6 +118,31 @@ impl CodeArtifactVerdict {
         match self {
             Self::Unfetchable(reason) => Some((*reason).to_string()),
             Self::Fetched(_) | Self::Unestablished => None,
+        }
+    }
+
+    /// The `stateReason` the WHOLE build settles with: the store's refusal to serve the
+    /// artifact ([`Self::failure_reason`]) and, for an artifact it did serve, what
+    /// PERFORMING that artifact's own build steps established
+    /// ([`super::image_build::refuted`]).
+    ///
+    /// The two are the two ways a build produces no image — there was nothing to build,
+    /// or building it did not complete — and they are asked in that order, because a
+    /// build that never fetched its code ran no step of it.
+    ///
+    /// `uri` is the `codeArtifact$uri` the artifact was fetched from: its OBJECT KEY names
+    /// the single entry of an artifact that is not an archive, so that is what the read is
+    /// given.
+    pub fn build_failure_reason(&self, uri: &str) -> Option<String> {
+        if let Some(reason) = self.failure_reason() {
+            return Some(reason);
+        }
+        match self {
+            Self::Fetched(bytes) => {
+                let key = super::s3_object_uri(uri).map_or(uri, |(_, key)| key);
+                super::image_build::refuted(bytes, key)
+            }
+            Self::Unfetchable(_) | Self::Unestablished => None,
         }
     }
 

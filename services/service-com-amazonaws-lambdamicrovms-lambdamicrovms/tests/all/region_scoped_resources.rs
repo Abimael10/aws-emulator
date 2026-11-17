@@ -396,7 +396,6 @@ async fn an_authentication_token_grants_access_only_in_the_region_that_minted_it
     .await;
     assert_eq!(status, 200, "run in {REGION}: got {status} {run}");
     let microvm_id = run["microvmId"].as_str().unwrap_or_default().to_string();
-    let endpoint = run["endpoint"].as_str().unwrap_or_default().to_string();
 
     // A second region holding a MicroVM under the SAME id. The ids this service mints are
     // unique across the store, so the collision is written into the store directly — the
@@ -418,7 +417,7 @@ async fn an_authentication_token_grants_access_only_in_the_region_that_minted_it
     // The token minted at the MINTING region's endpoint grants nothing in the partition
     // the address resolves in.
     let home_token = mint_auth_token(&router, REGION, &microvm_id).await;
-    let (status, _, body) = through_endpoint(&router, &engine, &endpoint, Some(&home_token)).await;
+    let (status, _, body) = through_endpoint(&router, &engine, &microvm_id, Some(&home_token)).await;
     assert_eq!(
         status, 403,
         "case a token minted in {REGION} presented for the {other_region} partition: expected \
@@ -431,7 +430,7 @@ async fn an_authentication_token_grants_access_only_in_the_region_that_minted_it
     // answers for a MicroVM it reached nothing inside of — see `microvm_endpoint`.)
     let foreign_token = mint_auth_token(&router, other_region, &microvm_id).await;
     let (status, _, body) =
-        through_endpoint(&router, &engine, &endpoint, Some(&foreign_token)).await;
+        through_endpoint(&router, &engine, &microvm_id, Some(&foreign_token)).await;
     assert_eq!(
         status,
         NO_GUEST_RESPONSE_STATUS,
@@ -463,13 +462,16 @@ async fn mint_auth_token(router: &MultiServiceRouter, region: &str, microvm_id: 
 
 /// One request to the address a MicroVM is published on, answered by the one decision the
 /// core's listener hands every request there (`state::microvm_endpoint::serve_request`).
+///
+/// `microvm_id` is the MicroVM the address belongs to: its published endpoint is that
+/// address's authority, so the request carries the guest's own path.
 async fn through_endpoint(
     router: &MultiServiceRouter,
     engine: &Arc<engine::InMemoryEngine>,
-    endpoint: &str,
+    microvm_id: &str,
     token: Option<&str>,
 ) -> (u16, String, String) {
-    let mut builder = http::Request::builder().method("GET").uri(endpoint);
+    let mut builder = http::Request::builder().method("GET").uri("/");
     if let Some(token) = token {
         builder = builder.header(AUTH_TOKEN_HEADER, token);
     }
@@ -479,7 +481,8 @@ async fn through_endpoint(
     let state = engine.state::<MicrovmState>();
     let connectors = connector_state(&**engine);
     let callback = smithy_server_runtime::EmbeddedEmulator::from_router(router.clone());
-    let response = serve_request(&state, connectors.as_ref(), &callback, &request).await;
+    let response =
+        serve_request(&state, connectors.as_ref(), &callback, microvm_id, &request).await;
     let status = response.status().as_u16();
     let content_type = response
         .headers()

@@ -6,20 +6,24 @@
 //! `RunMicrovmResponse$endpoint` and `GetMicrovmResponse$endpoint` are documented as
 //! "The HTTPS endpoint URL for communicating with the MicroVM. Include a valid
 //! authentication token in the X-aws-proxy-auth header when sending requests." A
-//! published endpoint is therefore an ADDRESS A CLIENT USES, so this emulator
-//! publishes one it answers on itself — the core's own loopback HTTPS listener
+//! published endpoint is therefore an ADDRESS A CLIENT USES, and the recorded value is
+//! the AUTHORITY of that address — a host, optionally `host:port`, with no scheme and no
+//! path — because a client composes its request URL by prefixing the scheme and
+//! appending the guest's own path to it. So this emulator publishes an authority it
+//! answers on itself: the core's own loopback HTTPS listener
 //! (`engine.listeners().http(..)`, which owns the socket, the bind interface and the
-//! TLS) with the MicroVM named in the path — rather than a hostname that resolves off
-//! this machine. The address is opened once per store and reported by the control
-//! plane, so every MicroVM of one emulator shares the listener and differs in its path.
+//! TLS), opened PER MICROVM, rather than a hostname that resolves off this machine.
+//! AWS gives each MicroVM an address of its own, so each gets its own listener here and
+//! the published value carries nothing but that listener's authority: the whole path of
+//! a request is the GUEST's, exactly as it is against AWS.
 //!
 //! What the address answers:
 //!
-//! * a path that names no MicroVM this store holds, or one that can no longer be
-//!   connected to ([`super::is_connectable_microvm_state`]) — nothing is published
+//! * an address whose MicroVM this store no longer holds, or holds in a state nothing
+//!   can connect to ([`super::is_connectable_microvm_state`]) — nothing is published
 //!   there, so `404`;
 //! * no `X-aws-proxy-auth` token, or one this store does not hold live for the MicroVM
-//!   the path names (another MicroVM's, one the clock has expired, or one whose
+//!   the address names (another MicroVM's, one the clock has expired, or one whose
 //!   `allowedPorts` do not cover the port THE REQUEST ADDRESSES) — `403`, the answer
 //!   `CreateMicrovmAuthToken`'s token is what avoids;
 //! * a request a token of `CreateMicrovmAuthToken` granted — the GUEST's own HTTP response
@@ -74,10 +78,6 @@ use crate::ops::types::PortSpecification;
 /// \"X-aws-proxy-auth\" as the header value when connecting to the MicroVM endpoint."
 pub const AUTH_TOKEN_HEADER: &str = "X-aws-proxy-auth";
 
-/// The first path segment of a published endpoint, ahead of the `microvmId` — so one
-/// listener addresses every MicroVM of the store and a guest path appends to the
-/// endpoint exactly as it does against AWS (`<endpoint><path>`).
-pub const MICROVM_PATH_SEGMENT: &str = "microvms";
 
 /// The header a client names the port it addresses on the MicroVM endpoint in, which is
 /// the port a presented token's `allowedPorts` is judged against.
@@ -103,13 +103,29 @@ const PORT_RANGE: ::std::ops::RangeInclusive<i32> = 1..=65535;
 /// ([`ServiceState::record_minted`]).
 pub const MAX_LIVE_AUTH_TOKENS: usize = 1_000;
 
+/// How many MicroVM endpoints one store keeps OPEN at a time.
+///
+/// Each published endpoint is a socket this process holds, and a launch is what opens one,
+/// so the ceiling on them is the ceiling on the records they belong to
+/// ([`super::MAX_ACTIVE_MICROVMS`]) rather than the number of regions a caller can reach
+/// multiplied by it: a launch that would open one past this answers its modelled refusal
+/// instead, and an endpoint is closed again as soon as nothing can connect to its MicroVM
+/// ([`ServiceState::reap_microvm_endpoints`]).
+pub const MAX_PUBLISHED_ENDPOINTS: usize = super::MAX_ACTIVE_MICROVMS;
+
 /// What a published endpoint answers for a path that names no MicroVM of this store.
 /// One sentence carrying nothing from the request, so a caller cannot probe with it.
 const NO_MICROVM_AT_THIS_ADDRESS: &str = "No MicroVM is published at this address.\n";
 
-/// What it answers a request that presents no live authentication token for the
-/// MicroVM the address names. One sentence for every way the token fails, so the
-/// answer does not say which.
+/// What it answers a request that carries NO authentication at all: the proxy's own
+/// sentence naming what the request is missing, which is what AWS answers such a request
+/// with.
+const MISSING_AUTHENTICATION: &str = "Request missing authentication";
+
+/// What it answers a request that PRESENTED a token this store does not hold live for the
+/// MicroVM the address names, or whose scope does not cover the port the request
+/// addresses. One sentence for every way a presented token fails, so the answer does not
+/// say which.
 const AUTH_TOKEN_REQUIRED: &str = "Present a valid authentication token for this \
                                    MicroVM in the X-aws-proxy-auth header. Create one \
                                    with CreateMicrovmAuthToken.\n";
@@ -165,22 +181,22 @@ pub fn auth_token_digest(token: &str) -> String {
     ::hex::encode(Sha256::digest(token.as_bytes()))
 }
 
-/// This store's MicroVM endpoint listener: the one address every MicroVM of the store
-/// is published on.
+/// ONE MicroVM's endpoint listener: the address that MicroVM alone is published on.
 ///
-/// The state OWNS the listener: dropping it closes the port, so it must outlive every
-/// endpoint handed out, which is the whole life of the state.
+/// The state OWNS the listener: dropping it closes the port, so it is held for as long as
+/// the MicroVM is one anything can connect to ([`ServiceState::reap_microvm_endpoints`]).
 pub struct MicrovmProxy {
-    /// `https://<loopback host>:<port>`, the base of every published endpoint.
-    base_url: String,
+    /// `<loopback host>:<port>` — the authority the control plane publishes, with no
+    /// scheme and no path.
+    endpoint: String,
     /// Held only to keep the port open; the core owns the socket and its TLS.
     _listener: ::emulator_server::ResourceListener,
 }
 
 impl MicrovmProxy {
-    /// The base every endpoint of this store is built on.
-    pub fn base_url(&self) -> &str {
-        &self.base_url
+    /// The authority this MicroVM is published on.
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
     }
 }
 
@@ -190,34 +206,44 @@ impl MicrovmProxy {
 impl std::fmt::Debug for MicrovmProxy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MicrovmProxy")
-            .field("base_url", &self.base_url)
+            .field("endpoint", &self.endpoint)
             .finish()
     }
 }
 
-/// The base URL of this store's MicroVM endpoint listener, opening it on first use.
+/// The authority the MicroVM `microvm_id` is published on, opening its listener on first
+/// use.
 ///
-/// Opening it changes no MicroVM and is idempotent: the first listener is kept, so a
-/// MicroVM's published endpoint is the same address for the life of the store.
-/// `None` when the listener could not be opened at all, which leaves the caller to
-/// answer with a modelled server error rather than to publish an address nothing
-/// serves.
-pub async fn ensure_base_url<Eng: Send + Sync + 'static>(
+/// Opening it changes no MicroVM and is idempotent: the listener a MicroVM already holds
+/// is kept, so its published endpoint is the same address for as long as it can be
+/// connected to. `None` when the listener could not be opened at all, which leaves the
+/// caller to answer with a modelled server error rather than to publish an address
+/// nothing serves.
+pub async fn ensure_endpoint<Eng: Send + Sync + 'static>(
     engine: &Eng,
     state: &::engine::ServiceState<ServiceState>,
     callback: ::smithy_server_runtime::EmbeddedEmulator,
+    microvm_id: &str,
 ) -> Option<String> {
     // The guard is taken and dropped before the await below: a lock held across an
     // await would make this future non-`Send`.
     let existing = {
         let store = state.lock();
+        if store.microvm_proxies.len() >= MAX_PUBLISHED_ENDPOINTS
+            && !store.microvm_proxies.contains_key(microvm_id)
+        {
+            // The sockets this store holds are capped, so nothing is bound past the
+            // ceiling: the caller answers its modelled refusal rather than publishing an
+            // address this process could not open.
+            return None;
+        }
         store
-            .microvm_proxy
-            .as_ref()
-            .map(|proxy| proxy.base_url.clone())
+            .microvm_proxies
+            .get(microvm_id)
+            .map(|proxy| proxy.endpoint.clone())
     };
-    if let Some(base_url) = existing {
-        return Some(base_url);
+    if let Some(endpoint) = existing {
+        return Some(endpoint);
     }
 
     let listener = super::shared_engine(engine)?
@@ -230,31 +256,34 @@ pub async fn ensure_base_url<Eng: Send + Sync + 'static>(
                 // not a second emulator, it is a second ADDRESS of this one.
                 connectors: super::microvm_network::connector_state(engine),
                 callback,
+                microvm_id: microvm_id.to_string(),
             },
             ::emulator_server::HttpPolicy::default(),
         )
         .await
         .ok()?;
-    let base_url = format!("https://{}", authority(&listener));
+    let endpoint = authority(&listener);
 
     let mut store = state.lock();
-    // Another request may have opened one while this one was binding; keep the first,
-    // so a published endpoint never changes under a client. Dropping the loser closes
-    // its port.
-    if let Some(proxy) = &store.microvm_proxy {
-        return Some(proxy.base_url.clone());
+    // Another request may have opened one for this MicroVM while this one was binding;
+    // keep the first, so a published endpoint never changes under a client. Dropping the
+    // loser closes its port.
+    if let Some(proxy) = store.microvm_proxies.get(microvm_id) {
+        return Some(proxy.endpoint.clone());
     }
-    store.microvm_proxy = Some(MicrovmProxy {
-        base_url: base_url.clone(),
-        _listener: listener,
-    });
-    Some(base_url)
-}
-
-/// The endpoint the MicroVM `microvm_id` is published on, on the base
-/// [`ensure_base_url`] returned.
-pub fn endpoint_url(base_url: &str, microvm_id: &str) -> String {
-    format!("{base_url}/{MICROVM_PATH_SEGMENT}/{microvm_id}")
+    // The cap is checked again on this side of the bind, because other launches ran while
+    // this one was binding: dropping the listener closes the port it took.
+    if store.microvm_proxies.len() >= MAX_PUBLISHED_ENDPOINTS {
+        return None;
+    }
+    store.microvm_proxies.insert(
+        microvm_id.to_string(),
+        MicrovmProxy {
+            endpoint: endpoint.clone(),
+            _listener: listener,
+        },
+    );
+    Some(endpoint)
 }
 
 /// The `host:port` an endpoint addresses the listener by, with an IPv6 host bracketed
@@ -270,8 +299,8 @@ fn authority(listener: &::emulator_server::ResourceListener) -> String {
     }
 }
 
-/// Serves every MicroVM endpoint of one store on the core's listener. The core runs
-/// the browser checks and owns CORS; this answers the address the path names.
+/// Serves ONE MicroVM's endpoint on the core's listener. The core runs the browser
+/// checks and owns CORS; this answers for the MicroVM the address belongs to.
 struct MicrovmEndpointServer {
     state: ::engine::ServiceState<ServiceState>,
     /// The lambda-core store a MicroVM's `egressNetworkConnectors` are read from, and
@@ -279,6 +308,9 @@ struct MicrovmEndpointServer {
     connectors: Option<::engine::ServiceState<super::microvm_network::ConnectorState>>,
     /// The in-process handle the emulated network is asked over.
     callback: ::smithy_server_runtime::EmbeddedEmulator,
+    /// The `microvmId` this address is the endpoint OF — the discriminator AWS puts in
+    /// the host, which is why the published member carries none.
+    microvm_id: String,
 }
 
 impl ::emulator_server::HttpHandler for MicrovmEndpointServer {
@@ -289,21 +321,29 @@ impl ::emulator_server::HttpHandler for MicrovmEndpointServer {
         let state = self.state.clone();
         let connectors = self.connectors.clone();
         let callback = self.callback.clone();
-        Box::pin(async move { serve_request(&state, connectors.as_ref(), &callback, &req).await })
+        let microvm_id = self.microvm_id.clone();
+        Box::pin(async move {
+            serve_request(&state, connectors.as_ref(), &callback, &microvm_id, &req).await
+        })
     }
 }
 
 /// One request to a published MicroVM endpoint, answered from this store — the
 /// decision the listener's handler serves, and the one this service's tests drive.
 ///
-/// The MicroVM is resolved FIRST and the token second, which is the order the real
-/// address works in: only an address that names a MicroVM answers at all, and then the
-/// token decides. An authenticated request is then handed to the MicroVM's GUEST and
-/// answered with what the guest's own program produced.
+/// `microvm_id` is the MicroVM the ADDRESS belongs to: AWS publishes a host per MicroVM,
+/// so the listener the request arrived on is what names it and the whole request path is
+/// the guest's own. The MicroVM is resolved FIRST and the token second, which is the
+/// order the real address works in: only an address that still publishes a MicroVM
+/// answers at all, and then the token decides. An authenticated request is then handed to
+/// the MicroVM's GUEST and answered with what the guest's own program produced.
 ///
 /// The writes are the clock's own ([`ServiceState::materialize_due`], and the same on the
 /// connector store a guest's connection is decided against), owed at this instant whether
-/// or not anybody connected, so reaching an endpoint changes nothing a later caller sees.
+/// or not anybody connected — plus the one write INBOUND TRAFFIC itself owes, which is
+/// what an `idlePolicy` measures ([`ServiceState::record_endpoint_traffic`]): a request a
+/// token granted reached the MicroVM, so the MicroVM is not idle and auto-resumes where
+/// its policy says so.
 ///
 /// `connectors` is the lambda-core store the MicroVM's `egressNetworkConnectors` are read
 /// from and `callback` the in-process handle the emulated network is asked over; a
@@ -313,6 +353,7 @@ pub async fn serve_request(
     state: &::engine::ServiceState<ServiceState>,
     connectors: Option<&::engine::ServiceState<super::microvm_network::ConnectorState>>,
     callback: &::smithy_server_runtime::EmbeddedEmulator,
+    microvm_id: &str,
     req: &::http::Request<Vec<u8>>,
 ) -> ::http::Response<Vec<u8>> {
     let head = req.method() == ::http::Method::HEAD;
@@ -321,10 +362,9 @@ pub async fn serve_request(
         .get(AUTH_TOKEN_HEADER)
         .and_then(|value| value.to_str().ok())
         .map(auth_token_digest);
-
-    let Some(addressed) = addressed_microvm(req.uri().path()) else {
-        return endpoint_response(head, 404, NO_MICROVM_AT_THIS_ADDRESS);
-    };
+    // A request carrying no authentication at all is refused for that, which is the one
+    // thing the proxy's answer does name.
+    let carried_authentication = presented.is_some();
 
     // Everything the request is answered from is copied out under the lock, which is
     // dropped before the guest runs: no store lock is held across an await.
@@ -333,11 +373,11 @@ pub async fn serve_request(
         let mut store = state.lock();
         store.materialize_due(now);
 
-        // The address carries the MicroVM's own id rather than a region, so the record is
+        // The address names the MicroVM's own id rather than a region, so the record is
         // resolved wherever this store holds it (see `super::regions`) — and the region
         // that holds it is half the identity a presented token has to match.
         let Some((region, microvm_id)) = store
-            .microvm_anywhere(&addressed)
+            .microvm_anywhere(microvm_id)
             .filter(|(_, vm)| is_connectable_microvm_state(&vm.state))
             .map(|(region, vm)| (region.to_string(), vm.microvm_id.clone()))
         else {
@@ -358,6 +398,13 @@ pub async fn serve_request(
                     && token.expires_at > now
             })
             .map(|token| token.grant.clone());
+        // INBOUND TRAFFIC the token let through: "idle time is measured by inbound
+        // traffic through the MicroVM proxy endpoint", so this is what resets the idle
+        // clock and what auto-resumes a MicroVM resting on it. A refused request reached
+        // the MicroVM with nothing, so it counts as no traffic.
+        if granted.is_some() {
+            store.record_endpoint_traffic(&region, &microvm_id, now);
+        }
         let vm = store.microvm(&region, &microvm_id);
         // The run state the MicroVM is in AT THIS INSTANT, after the clock's own moves
         // have been materialised: whether a guest is executing inside it at all.
@@ -404,7 +451,12 @@ pub async fn serve_request(
             "MicroVM endpoint request without a live authentication token for the port it \
              addressed"
         );
-        endpoint_response(head, 403, AUTH_TOKEN_REQUIRED)
+        let message = if carried_authentication {
+            AUTH_TOKEN_REQUIRED
+        } else {
+            MISSING_AUTHENTICATION
+        };
+        endpoint_response(head, 403, message)
     };
 
     let Some(granted) = granted else {
@@ -610,10 +662,9 @@ async fn run_guest(
 ///
 /// `port` is the port of the MicroVM the request addressed, so the guest's server bound to
 /// THAT port is the one that answers it. `req.url` is the path the client appended to the
-/// published endpoint — the guest's own path, with the segments addressing the MicroVM
-/// taken off, exactly as the request would arrive at a server inside the MicroVM — and the
-/// headers are lowercased, as a Node server reports them. The body is read as the TEXT a
-/// guest reads.
+/// published endpoint — which is the GUEST's own path in full, because the published
+/// endpoint is an authority and carries none of it — and the headers are lowercased, as a
+/// Node server reports them. The body is read as the TEXT a guest reads.
 fn guest_request(
     req: &::http::Request<Vec<u8>>,
     port: i32,
@@ -623,10 +674,12 @@ fn guest_request(
         .query()
         .map(|query| format!("?{query}"))
         .unwrap_or_default();
+    let path = req.uri().path();
+    let path = if path.is_empty() { "/" } else { path };
     super::guest_runtime::GuestRequest {
         port,
         method: req.method().as_str().to_string(),
-        url: format!("{}{query}", guest_path(req.uri().path())),
+        url: format!("{path}{query}"),
         headers: req
             .headers()
             .iter()
@@ -668,35 +721,6 @@ fn guest_response(head: bool, answer: &super::guest_runtime::GuestAnswer) -> ::h
         .unwrap_or_else(|_| {
             endpoint_response(head, NO_GUEST_RESPONSE_STATUS, NO_GUEST_RESPONSE)
         })
-}
-
-/// The GUEST's own path in a request to a published endpoint: whatever follows the
-/// segments that address the MicroVM, and `/` where nothing does.
-fn guest_path(path: &str) -> String {
-    let rest = path
-        .strip_prefix('/')
-        .and_then(|rest| rest.strip_prefix(MICROVM_PATH_SEGMENT))
-        .and_then(|rest| rest.strip_prefix('/'))
-        .map(|rest| match rest.split_once('/') {
-            Some((_identifier, guest)) => format!("/{guest}"),
-            None => "/".to_string(),
-        });
-    rest.unwrap_or_else(|| "/".to_string())
-}
-
-/// The `microvmIdentifier` a request path addresses, or `None` when the path names no
-/// MicroVM at all. The segments after it are the guest's own path, which only the
-/// guest could answer.
-fn addressed_microvm(path: &str) -> Option<String> {
-    let rest = path
-        .strip_prefix('/')?
-        .strip_prefix(MICROVM_PATH_SEGMENT)?
-        .strip_prefix('/')?;
-    let identifier = match rest.split_once('/') {
-        Some((identifier, _guest_path)) => identifier,
-        None => rest,
-    };
-    (!identifier.is_empty()).then(|| identifier.to_string())
 }
 
 /// The port a request ADDRESSES on the MicroVM endpoint: the one it names in

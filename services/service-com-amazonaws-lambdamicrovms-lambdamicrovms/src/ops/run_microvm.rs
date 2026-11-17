@@ -212,162 +212,190 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::Instant::now();
         let started_at = crate::state::now_datetime();
 
-        // `endpoint` is "the HTTPS endpoint URL for communicating with the MicroVM", so
-        // it is published on the address this emulator ANSWERS on — its own MicroVM
-        // endpoint listener, opened on first use and shared by every MicroVM of the
-        // store (`crate::state::microvm_endpoint`). Opened before the store is locked,
-        // because opening it is asynchronous.
-        let Some(endpoint_base) =
-            crate::state::microvm_endpoint::ensure_base_url(
-                &*self.engine,
-                &state,
-                ctx.callback().clone(),
+        // Everything this launch decides from the store is decided under ONE guard,
+        // which is released before the MicroVM's address is opened below: a lock is
+        // never held across an await.
+        let prepared = {
+            let mut store = state.lock();
+            store.materialize_due(now);
+
+            // `clientToken` replay returns the MicroVM that token already minted.
+            if let Some(vm) = replayed(&store, &region, input.client_token.as_deref()) {
+                return Ok(output_of(vm));
+            }
+
+            // The AUTHORIZATION verdict on the image the request names, decided BEFORE
+            // its version is resolved: an identifier in the AWS-OWNED namespace names a
+            // resource of AWS's own catalogue — something to BUILD on through
+            // `CreateMicrovmImage$baseImageArn`, not something this account may run — so
+            // it is DENIED rather than reported as an image with no active version.
+            if crate::state::is_managed_microvm_image_arn(&input.image_identifier) {
+                return Err(RunMicrovmErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
+                        message: Some(crate::state::image_access_denied_message(
+                            Self::NAME,
+                            &input.image_identifier,
+                        )),
+                    },
+                )
+                .into());
+            }
+
+            // A MicroVM runs a BUILT image version. With no `imageVersion` named, the
+            // precondition is the resolution of the image's ACTIVE version — and that
+            // resolution fails identically whether the account holds no such image or the
+            // image holds no active version yet, so both answer the one 404 that names
+            // the active-version miss ("image absent" and "no active version" are
+            // reported as the same failed resolution, which is what the client must act
+            // on: publish or wait for a version).
+            let (image_arn, image_version) = match input.image_version.as_deref() {
+                None => {
+                    let resolved =
+                        store.image(&region, &input.image_identifier).and_then(|image| {
+                            let arn = image.image_arn.clone();
+                            image
+                                .latest_active_image_version
+                                .clone()
+                                .map(|version| (arn, version))
+                        });
+                    match resolved {
+                        Some(resolved) => resolved,
+                        None => {
+                            // The image by its stored ARN when this account holds it,
+                            // otherwise by the identifier the request carried — there is
+                            // no ARN to name for an image that does not exist.
+                            let named = store
+                                .image(&region, &input.image_identifier)
+                                .map(|image| image.image_arn.clone())
+                                .unwrap_or_else(|| input.image_identifier.clone());
+                            return Err(no_active_version(&named));
+                        }
+                    }
+                }
+                Some(requested) => {
+                    let Some(image) = store.image(&region, &input.image_identifier) else {
+                        return Err(version_not_found(&input.image_identifier, requested));
+                    };
+                    let image_arn = image.image_arn.clone();
+                    match image.versions.get(requested) {
+                        Some(version)
+                            if version.status == crate::state::VERSION_STATUS_ACTIVE =>
+                        {
+                            (image_arn, requested.to_string())
+                        }
+                        Some(version) => {
+                            let message = format!(
+                                "version {requested} of MicroVM image {} is not active \
+                                 (build state {})",
+                                image.name, version.state
+                            );
+                            return Err(conflict(message, &image_arn));
+                        }
+                        None => {
+                            return Err(version_not_found(&image_arn, requested));
+                        }
+                    }
+                }
+            };
+
+            // A MicroVM is launched from what a build PRODUCED, so the version the
+            // resolution settled on must hold a build that produced an image. A version
+            // can be published ACTIVE whatever state its build settled in
+            // (`UpdateMicrovmImageVersion` sets the status, not the state), so a version
+            // whose builds all failed resolves here and is refused as the missing build
+            // it is rather than launching a MicroVM from nothing.
+            let built = store
+                .image(&region, &image_arn)
+                .and_then(|image| image.versions.get(&image_version))
+                .is_some_and(|version| {
+                    version
+                        .builds
+                        .values()
+                        .any(|build| build.state == crate::state::BUILD_STATE_SUCCESSFUL)
+                });
+            if !built {
+                return Err(no_image_build(&image_arn, &image_version));
+            }
+
+            // The account's concurrent-MicroVM quota in this region: the modelled 402
+            // rather than an unbounded store.
+            if store.active_microvm_count(&region) >= crate::state::MAX_ACTIVE_MICROVMS {
+                return Err(RunMicrovmErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "this account already runs its limit of {} concurrent MicroVMs",
+                            crate::state::MAX_ACTIVE_MICROVMS
+                        )),
+                        resource_id: Some(input.image_identifier.clone()),
+                        resource_type: Some("Microvm".to_string()),
+                        service_code: Some("lambda".to_string()),
+                        quota_code: None,
+                    },
+                )
+                .into());
+            }
+
+            // `maximumDurationInSeconds` is modelled `@range(min: 1, max: 28800)`: the
+            // boundary validator refuses anything outside it before this handler runs,
+            // and this refuses it again, so an out-of-range value can never become a
+            // lifetime.
+            let maximum_duration_in_seconds = input
+                .maximum_duration_in_seconds
+                .unwrap_or(crate::state::DEFAULT_MAXIMUM_DURATION_IN_SECONDS);
+            // The refusal and the conversion share one check, so no value that failed it
+            // can reach the stored lifetime.
+            let maximum_duration = match u64::try_from(maximum_duration_in_seconds) {
+                Ok(seconds)
+                    if (crate::state::MIN_MAXIMUM_DURATION_IN_SECONDS
+                        ..=crate::state::MAX_MAXIMUM_DURATION_IN_SECONDS)
+                        .contains(&maximum_duration_in_seconds) =>
+                {
+                    seconds
+                }
+                _ => return Err(duration_out_of_range(maximum_duration_in_seconds)),
+            };
+
+            // The MicroVM's own interface address, assigned from the same sequence its id
+            // is minted from, so it is read before the id advances that sequence.
+            let link_local_address = store.next_link_local_address();
+            let microvm_id = store.next_microvm_id();
+            (
+                image_arn,
+                image_version,
+                maximum_duration_in_seconds,
+                maximum_duration,
+                link_local_address,
+                microvm_id,
             )
-            .await
+        };
+        let (
+            image_arn,
+            image_version,
+            maximum_duration_in_seconds,
+            maximum_duration,
+            link_local_address,
+            microvm_id,
+        ) = prepared;
+        let microvm_arn = crate::state::microvm_arn(&region, &microvm_id);
+        // `endpoint` is "the HTTPS endpoint URL for communicating with the MicroVM", and
+        // the published value is the ADDRESS's authority: AWS gives each MicroVM a host of
+        // its own, so this emulator opens an address of its own for this MicroVM — its
+        // core's loopback HTTPS listener (`crate::state::microvm_endpoint`) — and
+        // publishes that authority, with no scheme and no path, so a client composes its
+        // request URL exactly as it does against AWS. The id is already minted, so
+        // nothing else can take it while the address is being opened.
+        let Some(endpoint) = crate::state::microvm_endpoint::ensure_endpoint(
+            &*self.engine,
+            &state,
+            ctx.callback().clone(),
+            &microvm_id,
+        )
+        .await
         else {
             return Err(endpoint_unavailable());
         };
 
         let mut store = state.lock();
-        store.materialize_due(now);
-
-        // `clientToken` replay returns the MicroVM that token already minted.
-        if let Some(vm) = replayed(&store, &region, input.client_token.as_deref()) {
-            return Ok(output_of(vm));
-        }
-
-        // The AUTHORIZATION verdict on the image the request names, decided BEFORE its
-        // version is resolved: an identifier in the AWS-OWNED namespace names a
-        // resource of AWS's own catalogue — something to BUILD on through
-        // `CreateMicrovmImage$baseImageArn`, not something this account may run — so it
-        // is DENIED rather than reported as an image with no active version.
-        if crate::state::is_managed_microvm_image_arn(&input.image_identifier) {
-            return Err(RunMicrovmErrorModeled::AccessDeniedException(
-                AccessDeniedException {
-                    message: Some(crate::state::image_access_denied_message(
-                        Self::NAME,
-                        &input.image_identifier,
-                    )),
-                },
-            )
-            .into());
-        }
-
-        // A MicroVM runs a BUILT image version. With no `imageVersion` named, the
-        // precondition is the resolution of the image's ACTIVE version — and that
-        // resolution fails identically whether the account holds no such image or the
-        // image holds no active version yet, so both answer the one 404 that names the
-        // active-version miss ("image absent" and "no active version" are reported as
-        // the same failed resolution, which is what the client must act on: publish or
-        // wait for a version).
-        let (image_arn, image_version) = match input.image_version.as_deref() {
-            None => {
-                let resolved = store.image(&region, &input.image_identifier).and_then(|image| {
-                    let arn = image.image_arn.clone();
-                    image
-                        .latest_active_image_version
-                        .clone()
-                        .map(|version| (arn, version))
-                });
-                match resolved {
-                    Some(resolved) => resolved,
-                    None => {
-                        // The image by its stored ARN when this account holds it,
-                        // otherwise by the identifier the request carried — there is
-                        // no ARN to name for an image that does not exist.
-                        let named = store
-                            .image(&region, &input.image_identifier)
-                            .map(|image| image.image_arn.clone())
-                            .unwrap_or_else(|| input.image_identifier.clone());
-                        return Err(no_active_version(&named));
-                    }
-                }
-            }
-            Some(requested) => {
-                let Some(image) = store.image(&region, &input.image_identifier) else {
-                    return Err(version_not_found(&input.image_identifier, requested));
-                };
-                let image_arn = image.image_arn.clone();
-                match image.versions.get(requested) {
-                    Some(version) if version.status == crate::state::VERSION_STATUS_ACTIVE => {
-                        (image_arn, requested.to_string())
-                    }
-                    Some(version) => {
-                        let message = format!(
-                            "version {requested} of MicroVM image {} is not active (build state {})",
-                            image.name, version.state
-                        );
-                        return Err(conflict(message, &image_arn));
-                    }
-                    None => {
-                        return Err(version_not_found(&image_arn, requested));
-                    }
-                }
-            }
-        };
-
-        // A MicroVM is launched from what a build PRODUCED, so the version the
-        // resolution settled on must hold a build that produced an image. A version can
-        // be published ACTIVE whatever state its build settled in
-        // (`UpdateMicrovmImageVersion` sets the status, not the state), so a version
-        // whose builds all failed resolves here and is refused as the missing build it
-        // is rather than launching a MicroVM from nothing.
-        let built = store
-            .image(&region, &image_arn)
-            .and_then(|image| image.versions.get(&image_version))
-            .is_some_and(|version| {
-                version
-                    .builds
-                    .values()
-                    .any(|build| build.state == crate::state::BUILD_STATE_SUCCESSFUL)
-            });
-        if !built {
-            return Err(no_image_build(&image_arn, &image_version));
-        }
-
-        // The account's concurrent-MicroVM quota in this region: the modelled 402
-        // rather than an unbounded store.
-        if store.active_microvm_count(&region) >= crate::state::MAX_ACTIVE_MICROVMS {
-            return Err(RunMicrovmErrorModeled::ServiceQuotaExceededException(
-                ServiceQuotaExceededException {
-                    message: Some(format!(
-                        "this account already runs its limit of {} concurrent MicroVMs",
-                        crate::state::MAX_ACTIVE_MICROVMS
-                    )),
-                    resource_id: Some(input.image_identifier.clone()),
-                    resource_type: Some("Microvm".to_string()),
-                    service_code: Some("lambda".to_string()),
-                    quota_code: None,
-                },
-            )
-            .into());
-        }
-
-        // `maximumDurationInSeconds` is modelled `@range(min: 1, max: 28800)`: the
-        // boundary validator refuses anything outside it before this handler runs, and
-        // this refuses it again, so an out-of-range value can never become a lifetime.
-        let maximum_duration_in_seconds = input
-            .maximum_duration_in_seconds
-            .unwrap_or(crate::state::DEFAULT_MAXIMUM_DURATION_IN_SECONDS);
-        // The refusal and the conversion share one check, so no value that failed it
-        // can reach the stored lifetime.
-        let maximum_duration = match u64::try_from(maximum_duration_in_seconds) {
-            Ok(seconds)
-                if (crate::state::MIN_MAXIMUM_DURATION_IN_SECONDS
-                    ..=crate::state::MAX_MAXIMUM_DURATION_IN_SECONDS)
-                    .contains(&maximum_duration_in_seconds) =>
-            {
-                seconds
-            }
-            _ => return Err(duration_out_of_range(maximum_duration_in_seconds)),
-        };
-
-        // The MicroVM's own interface address, assigned from the same sequence its id is
-        // minted from, so it is read before the id advances that sequence.
-        let link_local_address = store.next_link_local_address();
-        let microvm_id = store.next_microvm_id();
-        let microvm_arn = crate::state::microvm_arn(&region, &microvm_id);
-        let endpoint = crate::state::microvm_endpoint::endpoint_url(&endpoint_base, &microvm_id);
         store
             .insert_microvm(
                 &region,
@@ -404,6 +432,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // once provisioning completes."
                     provision_due_at: Some(now + crate::state::MICROVM_PROVISION_SPAN),
                     suspend_due_at: None,
+                    // Neither of the `idlePolicy` deadlines is owed yet: a MicroVM that
+                    // has not started RUNNING is not idling, and the deadlines are armed
+                    // from the state it is in (`crate::state::Microvm::arm_idle_deadlines`).
+                    idle_due_at: None,
+                    suspended_expiry_due_at: None,
                     terminate_due_at: None,
                     expiry_due_at: Some(now + ::std::time::Duration::from_secs(maximum_duration)),
                     reclaim_due_at: None,
@@ -443,7 +476,9 @@ fn unavailable() -> RunMicrovmError {
 
 /// The modelled server error for a MicroVM endpoint this emulator could not open: a
 /// MicroVM whose `endpoint` nothing answers on is not a MicroVM a client can use, so
-/// the launch is refused rather than reported with an address that serves nothing.
+/// the launch is refused rather than reported with an address that serves nothing. The
+/// same answer covers a store already holding its cap of open endpoints
+/// (`crate::state::microvm_endpoint::MAX_PUBLISHED_ENDPOINTS`).
 fn endpoint_unavailable() -> RunMicrovmError {
     RunMicrovmErrorModeled::InternalServerException(InternalServerException {
         message: Some("the MicroVM endpoint could not be opened".to_string()),

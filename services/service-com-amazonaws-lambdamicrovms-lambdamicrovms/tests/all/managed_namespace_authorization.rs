@@ -21,7 +21,8 @@ use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::{
 };
 
 use crate::microvm_lifecycle::{
-    as_uri_value, call, emulator, expected_image_arn, image_body, PAST_THE_SPAN, REGION,
+    as_uri_value, call, emulator, expected_image_arn, image_body, poll_until,
+    poll_until_microvm_state, REGION,
 };
 
 /// Every customer-facing operation this suite probes with one `imageIdentifier`, as
@@ -123,13 +124,53 @@ async fn a_customer_call_on_an_aws_owned_image_arn_is_denied() {
     // The positive control: this account's own image is served through every one of the
     // same paths, so the rows above are denied by the verdict and not by a dead path.
     let held_arn = expected_image_arn(held);
-    tokio::time::sleep(PAST_THE_SPAN).await;
+    // The image's build is clock-owed, and the control's `RunMicrovm` row launches from
+    // its ACTIVE version: wait for THAT condition rather than for a fixed time.
+    poll_until(
+        "the positive control",
+        &format!("the image {held} has settled with an active version"),
+        || async {
+            let (status, read) = call(
+                &router,
+                "GET",
+                &format!("/2025-09-09/microvm-images/{}", as_uri_value(&held_arn)),
+                None,
+            )
+            .await;
+            status == 200 && read["latestActiveImageVersion"].is_string()
+        },
+    )
+    .await;
+    let mut launched: Option<String> = None;
     for (operation, method, uri, body) in customer_calls(&held_arn) {
+        // The delete of an image a MicroVM still RUNS FROM is refused for that dependency
+        // (the rule `gone_image_delete_refusal` owns), so the MicroVM this control's own
+        // `RunMicrovm` row launched is ended first — what this row proves is that the
+        // delete reaches the account's own image at all.
+        if operation == "DeleteMicrovmImage" {
+            if let Some(microvm_id) = launched.take() {
+                let (status, ended) = call(
+                    &router,
+                    "DELETE",
+                    &format!("/2025-09-09/microvms/{microvm_id}"),
+                    None,
+                )
+                .await;
+                assert_eq!(
+                    status, 200,
+                    "terminate the control's own MicroVM: got {status} {ended}"
+                );
+                poll_until_microvm_state(&router, operation, &microvm_id, "TERMINATED").await;
+            }
+        }
         let (status, response) = call(&router, method, &uri, body).await;
         assert_eq!(
             status, 200,
             "case {operation}: this account's own image is served, got {status} {response}"
         );
+        if operation == "RunMicrovm" {
+            launched = response["microvmId"].as_str().map(str::to_string);
+        }
     }
 }
 

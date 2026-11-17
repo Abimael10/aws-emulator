@@ -104,16 +104,31 @@ pub struct GuestProgram {
 /// of an artifact that is not an archive.
 #[must_use]
 pub fn read(bytes: &[u8], key: &str) -> Option<GuestProgram> {
-    let entries = match archive_entries(bytes) {
+    program(artifact_entries(bytes, key))
+}
+
+/// Every entry of the artifact `bytes`, whether or not this engine can load it: the
+/// archive's own entries, or the single entry a non-archive object is.
+///
+/// `key` is the object key the artifact was fetched from, which names that single entry.
+/// The build reads the entries this way too — its own instructions live in one of the
+/// entries no engine loads ([`super::image_build`]) — so what a build is performed over
+/// and what a guest runs come out of ONE read of the artifact.
+#[must_use]
+pub fn artifact_entries(bytes: &[u8], key: &str) -> Vec<GuestModule> {
+    match archive_entries(bytes) {
         Some(entries) => entries,
         // Not an archive this emulator reads: the object is the guest's own single
         // module, under the name it was stored as.
-        None => vec![GuestModule {
-            path: module_path(key),
-            source: String::from_utf8(bytes.to_vec()).ok()?,
-        }],
-    };
-    program(entries)
+        None => String::from_utf8(bytes.to_vec())
+            .map(|source| {
+                vec![GuestModule {
+                    path: module_path(key),
+                    source,
+                }]
+            })
+            .unwrap_or_default(),
+    }
 }
 
 /// The program `entries` make up: the modules the engine can load, and the entry the

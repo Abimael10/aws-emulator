@@ -4,7 +4,8 @@
 //!
 //! Deletes the [`crate::state::MicrovmImage`] the `imageIdentifier` names: the call
 //! records it `DELETING` and the removal the clock then owes takes the record and
-//! every version it holds, so a later read misses. Idempotent while the record still
+//! every version it holds, so a later read misses. Refused while a MicroVM is still
+//! running from the image. Idempotent while the record still
 //! exists with a deletion in flight; once the record is gone the identifier resolves to
 //! nothing and the delete is refused with the modelled 404.
 //!
@@ -199,6 +200,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .resolve_image_reference(&region, &input.image_identifier)
         {
             crate::state::ImageReference::Resolved(name) => {
+                let Some(image) = store.image_named(&region, &name) else {
+                    return Err(not_found(&input.image_identifier));
+                };
+                // An image a MicroVM is still RUNNING FROM is not deletable: the record
+                // and its versions are what that MicroVM executes, so taking them would
+                // leave a live workload addressing nothing. The dependency is refused
+                // before anything is scheduled, so the refusal leaves the image exactly
+                // as it was — it is the signal a client detects "this image is still in
+                // use" with, and it stops being given the moment the last MicroVM of the
+                // image has terminated.
+                let image_arn = image.image_arn.clone();
+                if store.runs_microvm_from_image(&region, &image_arn) {
+                    return Err(DeleteMicrovmImageErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(crate::state::IMAGE_IN_USE_REFUSAL.to_string()),
+                        },
+                    )
+                    .into());
+                }
                 let Some(image) = store.image_named_mut(&region, &name) else {
                     return Err(not_found(&input.image_identifier));
                 };
