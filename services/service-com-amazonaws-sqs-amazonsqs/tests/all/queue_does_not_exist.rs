@@ -3,12 +3,10 @@
 //! End-to-end tests for the ONE refusal every operation of this service shares.
 //!
 //! The rule under test: **a request naming a queue this account does not have is refused
-//! as `QueueDoesNotExist` carrying Amazon SQS's own fixed message for the FORM the request
-//! addressed that queue in — "The specified queue does not exist for this wsdl version."
-//! for a `QueueUrl`, whose closing clause names the API version the url was addressed
-//! through, and "The specified queue does not exist." for the `QueueName` the one
-//! name-addressed operation resolves — whatever the request named and whichever operation
-//! it called.** Each message is a constant — the error CODE
+//! as `QueueDoesNotExist` carrying Amazon SQS's own fixed message for that absence — "The
+//! specified queue does not exist." — whatever the request named, whichever operation it
+//! called, and whether it addressed the queue by its `QueueUrl` or by the `QueueName` the
+//! one name-addressed operation resolves.** The message is a constant — the error CODE
 //! (`AWS.SimpleQueueService.NonExistentQueue` / `QueueDoesNotExist`, from the model's
 //! `awsQueryError`) is what identifies the condition — so a client matching on AWS's
 //! documented text recognises the absence, and the queue the caller probed for is never
@@ -17,14 +15,12 @@
 //! The table spans what the rule generalises over: the OPERATION (every one that resolves
 //! a queue, addressed by url and by name), and the FORM of the absence (a name never
 //! created, a url of another account, an owner id that is not this emulator's, a value
-//! that is not a url at all, and a queue that was deleted). The expected messages are the
-//! constants exported by [`service_com_amazonaws_sqs_amazonsqs::state`], never strings
+//! that is not a url at all, and a queue that was deleted). The expected message is the
+//! constant exported by [`service_com_amazonaws_sqs_amazonsqs::state`], never a string
 //! copied out of an answer.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_sqs_amazonsqs::state::{
-    QUEUE_DOES_NOT_EXIST_MESSAGE, QUEUE_NAME_DOES_NOT_EXIST_MESSAGE,
-};
+use service_com_amazonaws_sqs_amazonsqs::state::QUEUE_DOES_NOT_EXIST_MESSAGE;
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::support::{account, call, create_ok, emulator, error_code, HOST, OTHER_ACCOUNT};
@@ -183,7 +179,7 @@ async fn get_queue_url_refuses_an_absent_name_with_the_fixed_message() {
             "GetQueueUrl",
             request,
             probed,
-            QUEUE_NAME_DOES_NOT_EXIST_MESSAGE,
+            QUEUE_DOES_NOT_EXIST_MESSAGE,
         )
         .await;
     }
@@ -228,7 +224,7 @@ async fn a_deleted_queue_is_refused_exactly_as_one_that_never_existed() {
         "GetQueueUrl",
         &json!({"QueueName": "transient"}),
         "transient",
-        QUEUE_NAME_DOES_NOT_EXIST_MESSAGE,
+        QUEUE_DOES_NOT_EXIST_MESSAGE,
     )
     .await;
 }

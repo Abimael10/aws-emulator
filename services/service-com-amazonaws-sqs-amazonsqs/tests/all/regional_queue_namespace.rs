@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use service_com_amazonaws_sqs_amazonsqs::state::{
     invalid_parameter_message, DEAD_LETTER_TARGET_OWNER_REASON, DEAD_LETTER_TARGET_REGION_REASON,
-    QUEUE_DOES_NOT_EXIST_MESSAGE, QUEUE_NAME_DOES_NOT_EXIST_MESSAGE, REDRIVE_POLICY,
+    QUEUE_DOES_NOT_EXIST_MESSAGE, REDRIVE_POLICY,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -266,17 +266,11 @@ async fn a_queue_of_another_region_is_not_served() {
                 "case {operation} from {region}: a queue of {home} must not be served there, \
                  got {status} with {parsed}"
             );
-            // The refusal carries Amazon SQS's fixed message for the FORM the request
-            // addressed the queue in: the url-addressed one for every operation that takes
-            // a `QueueUrl`, and the name-addressed one for the lookup that takes a name.
-            let expected = if *operation == "GetQueueUrl" {
-                QUEUE_NAME_DOES_NOT_EXIST_MESSAGE
-            } else {
-                QUEUE_DOES_NOT_EXIST_MESSAGE
-            };
+            // The refusal carries Amazon SQS's one fixed message for a queue that is not
+            // there, whether the request addressed it by url or by name.
             assert_eq!(
                 message_of(&parsed),
-                expected,
+                QUEUE_DOES_NOT_EXIST_MESSAGE,
                 "case {operation} from {region}: expected Amazon SQS's fixed message"
             );
         }

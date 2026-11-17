@@ -9,9 +9,9 @@
 //! A pure read: it resolves the stored [`crate::state::Queue`] and writes nothing.
 //!
 //! A name this account has no queue for — and a request naming any other owner — is
-//! refused as `QueueDoesNotExist` carrying the fixed message Amazon SQS answers a NAME
-//! with ([`crate::state::QUEUE_NAME_DOES_NOT_EXIST_MESSAGE`]), which names no queue: the
-//! probed name is never reported back to the caller.
+//! refused as `QueueDoesNotExist` carrying the one fixed message Amazon SQS answers for a
+//! queue that is not there ([`crate::state::QUEUE_DOES_NOT_EXIST_MESSAGE`]), which names no
+//! queue: the probed name is never reported back to the caller.
 //!
 //! ## Shape of an operation
 //!
@@ -179,7 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .is_some_and(|owner| owner != ::engine::emulator_account_id())
         {
             return Err(GetQueueUrlErrorModeled::QueueDoesNotExist(
-                state::queue_name_does_not_exist(),
+                state::queue_does_not_exist(),
             )
             .into());
         }
@@ -189,7 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // another region is another queue and is not reported here.
         let region = state::request_region(ctx.parts());
         let queue = store.queue(&region, &input.queue_name).ok_or_else(|| {
-            GetQueueUrlErrorModeled::QueueDoesNotExist(state::queue_name_does_not_exist())
+            GetQueueUrlErrorModeled::QueueDoesNotExist(state::queue_does_not_exist())
         })?;
 
         // Whether this caller may resolve this queue's url is decided against the queue's

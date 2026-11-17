@@ -276,7 +276,7 @@ impl Owner {
                 ),
             ],
             Self::Sqs => {
-                let sentence = "The specified queue does not exist for this wsdl version.";
+                let sentence = "The specified queue does not exist.";
                 vec![
                     (
                         "GetQueueAttributes",

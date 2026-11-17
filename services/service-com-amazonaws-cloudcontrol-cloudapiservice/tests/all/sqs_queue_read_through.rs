@@ -604,8 +604,8 @@ async fn a_queue_cloud_control_deletes_is_gone_from_the_owning_service() {
 
         // The queue is gone from the service that OWNS it, which answers for it in its own
         // terms: `GetQueueUrl` resolves no queue of that name, and an attribute write on
-        // the url is refused the same way — each with Amazon SQS's own sentence for the form
-        // the request addressed the queue in.
+        // the url is refused the same way — each with Amazon SQS's one sentence for a queue
+        // that is not there.
         for (operation, request, sentence) in [
             (
                 "GetQueueUrl",
@@ -615,7 +615,7 @@ async fn a_queue_cloud_control_deletes_is_gone_from_the_owning_service() {
             (
                 "SetQueueAttributes",
                 json!({ "QueueUrl": url, "Attributes": { "VisibilityTimeout": "30" } }),
-                "The specified queue does not exist for this wsdl version.",
+                "The specified queue does not exist.",
             ),
         ] {
             let (status, body) = emulator.sqs(operation, request).await;

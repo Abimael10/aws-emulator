@@ -160,9 +160,8 @@ async fn pairs(emulator: &Emulator) -> Vec<Pair> {
             optimized_service: "SQS",
             sdk_service: "Sqs",
             exception: "QueueDoesNotExistException",
-            // The sentence Amazon SQS answers a `QueueUrl` no queue answers to with, whose
-            // closing clause names the API version the url was addressed through.
-            carries: "The specified queue does not exist for this wsdl version.".to_string(),
+            // The one sentence Amazon SQS answers for a queue that is not there.
+            carries: "The specified queue does not exist.".to_string(),
         },
         Pair {
             // "If you do not provide a MessageGroupId when sending a message to a FIFO

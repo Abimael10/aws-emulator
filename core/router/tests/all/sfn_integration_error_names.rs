@@ -109,8 +109,8 @@ async fn a_refused_integration_call_is_named_after_the_services_own_exception() 
             parameters: json!({ "QueueUrl": absent_url.clone(), "MessageBody": "nowhere" }),
             error: "SQS.QueueDoesNotExistException",
             carries: vec![
-                // The sentence Amazon SQS answers a `QueueUrl` no queue answers to with.
-                "The specified queue does not exist for this wsdl version.".to_string(),
+                // The sentence Amazon SQS answers a queue that is not there with.
+                "The specified queue does not exist.".to_string(),
                 "(Service: AmazonSQS; Status Code: 400; Error Code: \
                  AWS.SimpleQueueService.NonExistentQueue;"
                     .to_string(),
@@ -141,7 +141,7 @@ async fn a_refused_integration_call_is_named_after_the_services_own_exception() 
             resource: "arn:aws:states:::aws-sdk:sqs:sendMessage",
             parameters: json!({ "QueueUrl": absent_url.clone(), "MessageBody": "nowhere" }),
             error: "Sqs.QueueDoesNotExistException",
-            carries: vec!["The specified queue does not exist for this wsdl version.".to_string()],
+            carries: vec!["The specified queue does not exist.".to_string()],
         },
         Row {
             // A second service, and the arm of the rule where the shape's own name

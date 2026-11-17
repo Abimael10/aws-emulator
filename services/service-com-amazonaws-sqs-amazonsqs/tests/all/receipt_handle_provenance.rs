@@ -44,9 +44,9 @@ use super::support::{
 /// expected that is not a receipt handle at all: fixed text, naming no value.
 const NOT_A_RECEIPT_HANDLE: &str = "The input receipt handle is invalid.";
 
-/// The sentence a refusal of a queue that does not exist carries where the request
-/// addressed the queue by its URL, which is how every row here addresses one.
-const NO_SUCH_QUEUE: &str = "The specified queue does not exist for this wsdl version.";
+/// The sentence a refusal of a queue that does not exist carries: one fixed text for that
+/// absence, whatever addressed the queue.
+const NO_SUCH_QUEUE: &str = "The specified queue does not exist.";
 
 /// The visibility timeout a row receives under, so the message it holds stays in flight
 /// for the whole test. Inside the documented range of
