@@ -325,14 +325,26 @@ fn secrets_manager_client(
     ::aws_sdk_secretsmanager::Client::from_conf(config)
 }
 
-/// The Region the secret `secret_arn` names lives in: the Region segment of the ARN
-/// itself, which the modelled `SecretArn` pattern allows to be empty — and then the
-/// Region the request was signed for, the only other place the secret could be.
+/// Secrets Manager's ARN namespace, which the modelled `SecretArn` fixes as the vendor
+/// field of the value a registration names
+/// (`^arn:[a-z0-9-\.]{1,63}:secretsmanager:…`).
+const SECRETS_MANAGER_ARN_VENDOR: &str = "secretsmanager";
+
+/// The Region the secret `secret_arn` names lives in: the Region LABEL its own ARN names,
+/// and otherwise the Region the request was signed for — the only other place the secret
+/// could be.
+///
+/// Read through [`::service_common::arn::region_of`], this tree's one reader of a
+/// caller-supplied ARN's Region for a value that ends up in an endpoint URL's AUTHORITY
+/// (which is what [`secrets_manager_client`] does with it), so the Region grammar the
+/// models state is applied here rather than restated. That reader answers `None` for every
+/// value naming no Region of Secrets Manager: the empty field of the partition-global form
+/// the modelled `SecretArn` pattern admits, and a field outside the grammar — the pattern
+/// bounds the field at `[a-z0-9-\.]{0,63}`, so it admits dots and lengths no AWS Region
+/// label has. Each of those is the Region the request was signed for, like a secret whose
+/// ARN names no Region of its own.
 fn secret_region(secret_arn: &str, request_region: &str) -> String {
-    secret_arn
-        .split(':')
-        .nth(3)
-        .filter(|segment| !segment.is_empty())
+    ::service_common::arn::region_of(secret_arn, SECRETS_MANAGER_ARN_VENDOR)
         .unwrap_or(request_region)
         .to_string()
 }
