@@ -9,23 +9,34 @@
 //! `functionCount` that is not computed from persisted state cannot pass.
 //!
 //! The rule under test is that `accountUsage.functionCount` is the number of web
-//! functions stored for the account, in every state, and that
-//! `accountQuotas.maxRevisionsPerFunction` is the bound the revision create path
-//! refuses at. The tests are tables: the rows differ along the axes the rule
+//! functions stored for the account, in every state — so it is exactly the size
+//! of the unfiltered listing, and only an operation that adds or removes a stored
+//! web function moves it — while `accountQuotas` reports the fixed allowances this
+//! emulator applies, `maxRevisionsPerFunction` being the bound the revision create
+//! path refuses at. The tests are tables: the rows differ along the axes the rule
 //! generalises over (how many functions are stored, the form of their names,
 //! whether they carry a revision, which ones are deleted, how long after the
-//! create the settings are read).
+//! create the settings are read, which other operation ran just before the read,
+//! and which Region's credential scope signed it).
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use service_com_amazonaws_lambdaweb_lambdaweb::state::PROVISIONING_DELAY;
+use super::web_function_lifecycle::{
+    build_config, expected_arn, percent_encoded, role_arn, Emulator, Reply,
+};
 
-use super::web_function_lifecycle::{build_config, role_arn, Emulator, Reply};
-
-/// The region every test signs with.
+/// The region every test signs with unless it is exercising the region rule itself.
 const REGION: &str = "us-east-1";
+
+/// How long a poll waits for a clock-owed state transition before giving up.
+/// Deliberately generous: the deadline is only there so a transition that never
+/// comes fails the test instead of hanging it, never to time the emulator.
+const SETTLE_DEADLINE: Duration = Duration::from_secs(180);
+
+/// How long a poll sleeps between looks.
+const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// The largest per-endpoint request rate the model documents as supported:
 /// "The value must be one of the following supported values: 0, 100, ... or
@@ -104,6 +115,26 @@ async fn delete_function(emulator: &Emulator, name: &str) {
         "case {name}: DeleteWebFunction expected 204, got {} with {:?}",
         reply.status, reply.body
     );
+}
+
+/// Look at `GetWebFunction` until the function reports `Active` — the transition
+/// the clock owes it after the create — or the generous deadline passes.
+async fn await_active(emulator: &Emulator, name: &str) {
+    let deadline = Instant::now() + SETTLE_DEADLINE;
+    loop {
+        let read = emulator
+            .send("GET", &format!("/web-functions/{name}"), REGION, None)
+            .await;
+        if read.string("state").as_deref() == Some("Active") {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {name}: the function never reached Active, last read {:?}",
+            read.body
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }
 
 /// How many functions `ListWebFunctions` reports with no filter, walking pages.
@@ -210,18 +241,9 @@ async fn function_count_counts_functions_in_every_state() {
         pending.body
     );
 
-    tokio::time::sleep(PROVISIONING_DELAY + Duration::from_millis(250)).await;
-    // The clock has made the Pending -> Active transition due by now, which
-    // `GetWebFunction` reports...
-    let read = emulator
-        .send("GET", "/web-functions/still-pending", REGION, None)
-        .await;
-    assert_eq!(
-        read.string("state").as_deref(),
-        Some("Active"),
-        "case an Active function: the function must have reached Active, got {:?}",
-        read.body
-    );
+    // The clock owes the function its `Pending -> Active` transition, which
+    // `GetWebFunction` reports once it is due...
+    await_active(&emulator, "still-pending").await;
     // ...and the count is unmoved by it.
     let active = settings(&emulator, "an Active function").await;
     assert_eq!(
@@ -240,6 +262,218 @@ async fn function_count_counts_functions_in_every_state() {
          ListWebFunctions reports, got {:?}",
         active.body
     );
+}
+
+/// The usage a settings read reports is the `stored` functions the caller created
+/// and not yet deleted, and it is also exactly the size of the unfiltered listing
+/// — one stored set, counted three ways, so a defect shared by both readers still
+/// fails against the size the test itself knows.
+async fn usage_is(emulator: &Emulator, case: &str, stored: usize) {
+    let expected = i64::try_from(stored).expect("the store's size fits an i64");
+    let report = settings(emulator, case).await;
+    assert_eq!(
+        function_count(&report, case),
+        expected,
+        "case {case}: expected functionCount {expected}, got {:?}",
+        report.body
+    );
+    let listed = listed_functions(emulator, case).await;
+    let listed = i64::try_from(listed).expect("the listing size fits an i64");
+    assert_eq!(
+        function_count(&report, case),
+        listed,
+        "case {case}: functionCount must equal the {listed} function(s) ListWebFunctions \
+         reports, got {:?}",
+        report.body
+    );
+}
+
+/// What a row's request is expected to answer: the success status it serves, or
+/// the error shape it is refused with. Either way it leaves the set of stored web
+/// functions — and so the reported usage — alone.
+#[derive(Debug)]
+enum Expected {
+    Status(u16),
+    Error(&'static str),
+}
+
+#[tokio::test]
+async fn only_a_function_create_or_delete_moves_the_reported_usage() {
+    let emulator = Emulator::new();
+    for name in ["usage-a", "usage-b"] {
+        create_function(&emulator, name, true).await;
+    }
+    let resource = percent_encoded(&expected_arn(REGION, "usage-a"));
+    let policy = concat!(
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","#,
+        r#""Principal":{"AWS":"111122223333"},"Action":"lambda:InvokeFunction","#,
+        r#""Sid":"usage"}]}"#
+    );
+
+    // The rows are the other operations this service serves on a web function —
+    // writes to what hangs off one, reads of one, and two refusals. None of them
+    // adds or removes a stored web function, so none of them may move the usage.
+    let rows: Vec<(&str, &str, String, Option<Value>, Expected)> = vec![
+        (
+            "a revision create",
+            "POST",
+            "/web-functions/usage-a/revisions".to_string(),
+            Some(json!({
+                "buildConfig": build_config("nodejs24.x", "demo-bucket", "app.zip", None),
+                "serviceConfig": { "executionRoleArn": role_arn("usage-a") },
+            })),
+            Expected::Status(202),
+        ),
+        (
+            "a tag",
+            "POST",
+            format!("/tags/{resource}"),
+            Some(json!({ "Tags": { "team": "web" } })),
+            Expected::Status(204),
+        ),
+        (
+            "an untag",
+            "DELETE",
+            format!("/tags/{resource}?tagKeys=team"),
+            None,
+            Expected::Status(204),
+        ),
+        (
+            "a resource-policy put",
+            "PUT",
+            format!("/resource-policy/{resource}"),
+            Some(json!({ "Policy": policy })),
+            Expected::Status(200),
+        ),
+        (
+            "a resource-policy delete",
+            "DELETE",
+            format!("/resource-policy/{resource}"),
+            None,
+            Expected::Status(204),
+        ),
+        (
+            "a read of a stored function",
+            "GET",
+            "/web-functions/usage-a".to_string(),
+            None,
+            Expected::Status(200),
+        ),
+        (
+            "a create refused as a duplicate",
+            "PUT",
+            "/web-functions".to_string(),
+            Some(json!({ "functionName": "usage-a" })),
+            Expected::Error("ConflictException"),
+        ),
+        (
+            "a read of an absent function",
+            "GET",
+            "/web-functions/absent-fn".to_string(),
+            None,
+            Expected::Error("ResourceNotFoundException"),
+        ),
+    ];
+
+    for (case, method, path, body, expected) in rows {
+        let reply = emulator.send(method, &path, REGION, body).await;
+        match expected {
+            Expected::Status(status) => assert_eq!(
+                reply.status, status,
+                "case {case}: expected HTTP {status}, got {} with {:?}",
+                reply.status, reply.body
+            ),
+            Expected::Error(error) => assert_eq!(
+                reply.error(),
+                error,
+                "case {case}: expected {error}, got {} with {:?}",
+                reply.status,
+                reply.body
+            ),
+        }
+
+        // The two functions the test created are still the whole usage.
+        usage_is(&emulator, case, 2).await;
+    }
+
+    // A delete of a function is exactly what does move it.
+    delete_function(&emulator, "usage-a").await;
+    let after = settings(&emulator, "after deleting usage-a").await;
+    assert_eq!(
+        function_count(&after, "after deleting usage-a"),
+        1,
+        "case after deleting usage-a: expected functionCount 1, got {:?}",
+        after.body
+    );
+}
+
+#[tokio::test]
+async fn the_reported_usage_is_the_size_of_the_listing_at_every_store_size() {
+    let emulator = Emulator::new();
+
+    // The rows differ along the store's size alone: empty, grown one function at
+    // a time, then shrunk back to empty. The usage follows the store at every
+    // size, with no counter of its own to drift.
+    usage_is(&emulator, "an empty store", 0).await;
+
+    let names = ["size-1", "size-2", "size-3", "size-4"];
+    let mut stored: Vec<&str> = Vec::new();
+    for name in names {
+        create_function(&emulator, name, false).await;
+        stored.push(name);
+        let case = format!("{} function(s) stored", stored.len());
+        usage_is(&emulator, &case, stored.len()).await;
+    }
+    while let Some(name) = stored.pop() {
+        delete_function(&emulator, name).await;
+        let case = format!("{} function(s) left", stored.len());
+        usage_is(&emulator, &case, stored.len()).await;
+    }
+}
+
+#[tokio::test]
+async fn the_quotas_do_not_depend_on_which_region_signed_the_request() {
+    let emulator = Emulator::new();
+    create_function(&emulator, "region-probe", false).await;
+
+    // The quotas are the allowances this emulator applies to the account, read
+    // from its own constants rather than from anything the request carries, so
+    // every row — one per credential-scope Region — reports the same four.
+    let mut first: Option<Value> = None;
+    for region in ["us-east-1", "us-west-2", "eu-central-1", "ap-southeast-2"] {
+        let reply = emulator
+            .send("GET", "/web-account-settings", region, None)
+            .await;
+        assert_eq!(
+            reply.status, 200,
+            "case {region}: GetWebAccountSettings expected 200, got {} with {:?}",
+            reply.status, reply.body
+        );
+        for member in [
+            "maxTotalArmVCpus",
+            "maxTotalRateLimit",
+            "maxRevisionsPerFunction",
+            "maxEndpointsPerFunction",
+        ] {
+            let value = quota(&reply, member, region);
+            assert!(
+                value > 0,
+                "case {region}: accountQuotas.{member} must be positive, got {value}"
+            );
+        }
+        let quotas = reply
+            .field("accountQuotas")
+            .cloned()
+            .unwrap_or_else(|| panic!("case {region}: accountQuotas is required: {:?}", reply.body));
+        match &first {
+            None => first = Some(quotas),
+            Some(baseline) => assert_eq!(
+                baseline, &quotas,
+                "case {region}: expected the same quotas as the first Region reported, \
+                 got {quotas:?} after {baseline:?}"
+            ),
+        }
+    }
 }
 
 #[tokio::test]
