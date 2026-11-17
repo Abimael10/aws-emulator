@@ -5,10 +5,15 @@
 //! environment, configuration profile) triple, read out of the deployments the control
 //! plane holds for that environment.
 //!
-//! This deprecated retrieval path refuses every triple it has nothing to serve for with
-//! ONE modelled `BadRequestException` ([`nothing_to_serve`]) rather than reporting which
-//! level of the triple it could not reach, which is why the `ResourceNotFoundException`
-//! its model also declares is never the answer here.
+//! This deprecated retrieval path refuses with the modelled `BadRequestException` — never
+//! the `ResourceNotFoundException` its model also declares — and WHICH of its two refusals
+//! it states follows what it was asked for: the (application, configuration profile) PAIR
+//! is the only thing it reports as a configuration profile it could not find
+//! ([`configuration_profile_not_found`]), and once that pair resolves the environment is a
+//! deployment-lookup key only, so every triple for which no version is in force — an
+//! environment label nothing resolves, a resolvable triple nothing was deployed into, and a
+//! deployed version AppConfig's hosted store does not hold — is the deployment-level refusal
+//! ([`no_deployed_version`]).
 //!
 //! ## Shape of an operation
 //!
@@ -131,18 +136,15 @@ impl From<GetConfigurationErrorModeled> for GetConfigurationError {
     }
 }
 
-/// The `BadRequestException` (HTTP 400) this operation answers a triple it has nothing to
-/// serve for.
+/// The `BadRequestException` (HTTP 400) this operation answers when the (Application,
+/// Configuration) PAIR it was addressed by resolves no configuration profile.
 ///
-/// ONE refusal for every such condition — an application, an environment or a
-/// configuration profile no identifier resolves, a triple nothing was ever deployed into,
-/// and a deployed version AppConfig's hosted store does not hold — stating the
-/// configuration profile it could not serve under the application and the account the
-/// lookup was scoped to. The deprecated retrieval path resolves the (Application,
-/// Configuration) pair and the deployment that serves it, and reports whichever of them it
-/// could not reach as that profile not being there: a caller learns that nothing is
-/// deployed for the profile it addressed, and not which level of the triple failed, so an
-/// unknown environment and a real environment with nothing deployed are the same answer.
+/// This is the refusal of the LOOKUP this path makes first: the configuration profile is
+/// what it reads a configuration out of, so a profile that cannot be reached under the
+/// application the request named — because the application resolves to nothing, or because
+/// it holds no such profile — is reported as that profile not being there. Nothing below the
+/// profile is consulted for it, and nothing below it can produce it: a level that resolves
+/// is never reported this way ([`no_deployed_version`]).
 ///
 /// Each of the two levels is named AS THIS CALL RESOLVED IT, which is what the identifiers
 /// a lookup was made with are: a level the request addressed by name or by id and that
@@ -154,11 +156,42 @@ impl From<GetConfigurationErrorModeled> for GetConfigurationError {
 /// (`crate::state::configuration_profile_not_found`), called rather than restated so the
 /// two cannot drift; what is this operation's own is the CLASS, which its model lists
 /// beside `ResourceNotFoundException` and which AppConfig answers here.
-fn nothing_to_serve(application: &str, configuration: &str) -> GetConfigurationError {
+fn configuration_profile_not_found(application: &str, configuration: &str) -> GetConfigurationError {
     GetConfigurationErrorModeled::BadRequestException(BadRequestException {
         message: Some(crate::state::configuration_profile_not_found(
             application,
             configuration,
+        )),
+        reason: None,
+        details: None,
+    })
+    .into()
+}
+
+/// The `BadRequestException` (HTTP 400) this operation answers once the (Application,
+/// Configuration) pair has resolved and no deployed version is in force for the triple.
+///
+/// The `Environment` label is this path's DEPLOYMENT-lookup key and nothing else — the
+/// configuration is read out of the version a deployment into that environment put in
+/// service — so a label no environment resolves is not a missing profile and not a missing
+/// resource: it is a deployment the service does not hold, exactly like a real environment
+/// nothing has been deployed into yet, and both get this one refusal. A client reads it as
+/// the ordinary pre-first-deployment state rather than going off to re-create a
+/// configuration profile that is there.
+///
+/// The three variable parts are the triple AS THE REQUEST SPELLED IT: this refusal reports
+/// no resolution (no account id, no trailing stop), so each level is echoed as written
+/// whether the caller addressed it by name or by id, and the environment — which may resolve
+/// to nothing at all — is reported the same way as the other two.
+fn no_deployed_version(
+    application: &str,
+    environment: &str,
+    configuration: &str,
+) -> GetConfigurationError {
+    GetConfigurationErrorModeled::BadRequestException(BadRequestException {
+        message: Some(format!(
+            "No deployed version for configuration profile {configuration} in environment \
+             {environment} and app {application}"
         )),
         reason: None,
         details: None,
@@ -238,11 +271,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Each of the three path members is documented as "the <level> name or the
         // <level> ID", so each resolves either way, and the (Application, Configuration)
-        // pair is resolved FIRST — before the environment — because that pair is what this
-        // deprecated path reports on when it has nothing to serve ([`nothing_to_serve`]),
-        // naming each level by the id it resolved to from there on.
+        // pair is resolved FIRST — before the environment — because that pair is the
+        // configuration profile this path reads a configuration out of, and the only
+        // thing it reports as a profile it could not find
+        // ([`configuration_profile_not_found`]), naming each level by the id it resolved
+        // to from there on.
         let Some(application_id) = store.resolve_application_id(&input.application) else {
-            return Err(nothing_to_serve(&input.application, &input.configuration));
+            return Err(configuration_profile_not_found(
+                &input.application,
+                &input.configuration,
+            ));
         };
         let Some(application) = store.application_mut(&application_id) else {
             return Err(internal(
@@ -253,13 +291,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .resolve_profile(&input.configuration)
             .map(|profile| profile.id.clone())
         else {
-            return Err(nothing_to_serve(&application_id, &input.configuration));
+            return Err(configuration_profile_not_found(
+                &application_id,
+                &input.configuration,
+            ));
         };
+        // From here the profile is there, so nothing below it can be reported as that
+        // profile missing: the environment is the key the DEPLOYMENT that serves this
+        // profile is looked up by, and a label no environment resolves holds no
+        // deployment, which is the same condition as a resolvable environment nothing was
+        // deployed into ([`no_deployed_version`]).
         let Some(environment_id) = application
             .resolve_environment(&input.environment)
             .map(|environment| environment.id.clone())
         else {
-            return Err(nothing_to_serve(&application_id, &profile_id));
+            return Err(no_deployed_version(
+                &input.application,
+                &input.environment,
+                &input.configuration,
+            ));
         };
 
         // The environment is brought up to the state the CLOCK already owes it before
@@ -278,7 +328,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .in_force_deployment(&profile_id, target)
             .map(|deployment| deployment.configuration_version.clone());
         let Some(deployed_version) = in_force else {
-            return Err(nothing_to_serve(&application_id, &profile_id));
+            return Err(no_deployed_version(
+                &input.application,
+                &input.environment,
+                &input.configuration,
+            ));
         };
 
         let Some(profile) = application.profiles.get(&profile_id) else {
@@ -290,8 +344,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The deployment records the version it deployed as the caller spelled it — a
         // hosted version number or that version's label — so it is resolved through the
         // profile's own lookup, the one every reader of a deployed configuration uses.
+        // A deployment of bytes AppConfig's hosted store does not hold — a profile whose
+        // `LocationUri` points outside it — serves no version here either, so it is the
+        // same deployment-level refusal rather than a claim about the profile, which
+        // resolved.
         let Some(version) = profile.resolve_hosted_version(&deployed_version) else {
-            return Err(nothing_to_serve(&application_id, &profile_id));
+            return Err(no_deployed_version(
+                &input.application,
+                &input.environment,
+                &input.configuration,
+            ));
         };
         // `ConfigurationVersion` identifies the version this answer carries, and
         // `ClientConfigurationVersion` is "the configuration version returned in the most

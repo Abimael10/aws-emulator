@@ -23,6 +23,12 @@
 //! ClientConfigurationVersion matches the version of the current configuration … the
 //! Content value will be empty").
 //!
+//! WHICH `BadRequestException` a triple it cannot serve gets is
+//! `deprecated_get_configuration_refusals`: the (Application, Configuration) pair resolving
+//! to no configuration profile is the profile refusal, and everything below that pair — an
+//! environment label nothing holds, a triple with no deployment, a deployed version the
+//! hosted store does not hold — is the deployment-level `No deployed version …`.
+//!
 //! Every case drives real HTTP requests through the router the emulator's front door
 //! uses, so what is asserted is what an AppConfig client sees on the wire: the payload
 //! bytes and the bound `Configuration-Version` / `Content-Type` headers.
@@ -361,11 +367,9 @@ fn assert_served(
     );
 }
 
-/// One modelled refusal: the status and error code on the wire where an SDK classifies
-/// it from, and the ONE message this deprecated read states for every triple it has nothing
-/// to serve for — built from the application and configuration the REQUEST named, and the
-/// account the lookup was scoped to.
-fn assert_nothing_to_serve(case: &str, answer: &Answer, application: &str, configuration: &str) {
+/// The status and error code every refusal of this read carries on the wire, which is where
+/// an SDK classifies it from.
+fn assert_bad_request(case: &str, answer: &Answer) {
     assert_eq!(
         answer.status,
         400,
@@ -378,10 +382,40 @@ fn assert_nothing_to_serve(case: &str, answer: &Answer, application: &str, confi
         "case {case:?}: expected BadRequestException, got {:?}",
         answer.error_code()
     );
+}
+
+/// The refusal of the lookup this read makes FIRST: the (Application, Configuration) pair
+/// resolved no configuration profile, reported under the application the request named and
+/// the account the lookup was scoped to.
+fn assert_profile_not_found(case: &str, answer: &Answer, application: &str, configuration: &str) {
+    assert_bad_request(case, answer);
     let expected = format!(
         "Configuration Profile with Application Id {application} and Configuration Profile Id \
          {configuration} could not be found for account {}.",
         account()
+    );
+    assert_eq!(
+        answer.string("Message").unwrap_or_default(),
+        expected,
+        "case {case:?}: expected the refusal {expected:?}, got {:?}",
+        answer.string("Message")
+    );
+}
+
+/// The refusal of the DEPLOYMENT lookup: the pair resolved and no deployed version is in
+/// force for the triple, reported from the three labels the request spelled. Which triples
+/// get this refusal rather than the one above is `deprecated_get_configuration_refusals`.
+fn assert_no_deployed_version(
+    case: &str,
+    answer: &Answer,
+    application: &str,
+    environment: &str,
+    configuration: &str,
+) {
+    assert_bad_request(case, answer);
+    let expected = format!(
+        "No deployed version for configuration profile {configuration} in environment \
+         {environment} and app {application}"
     );
     assert_eq!(
         answer.string("Message").unwrap_or_default(),
@@ -620,10 +654,11 @@ async fn the_newest_deployment_still_in_force_decides_what_is_served() {
     .await;
 
     // Nothing deployed yet: the triple resolves and no configuration is in force.
-    assert_nothing_to_serve(
+    assert_no_deployed_version(
         "nothing deployed",
         &get_configuration(&router, &application, &environment, &profile, None).await,
         &application,
+        &environment,
         &profile,
     );
 
@@ -758,11 +793,13 @@ async fn client_configuration_version_decides_whether_the_content_is_sent() {
     }
 }
 
-/// RULE: every triple this deprecated read has nothing to serve for — an unresolvable
-/// level, a triple with no configuration in force, and a deployed version AppConfig's
-/// hosted store does not hold — is ONE refusal: the modelled `BadRequestException`
-/// (HTTP 400) naming the configuration profile it could not serve under the application, as
-/// the request spelled the two of them, and the account the lookup was scoped to.
+/// RULE: every triple this deprecated read has nothing to serve for is the modelled
+/// `BadRequestException` (HTTP 400), and WHICH of its two messages depends on the lookup
+/// that failed: the (Application, Configuration) pair resolving no configuration profile is
+/// reported as that profile not being found under the application, while everything below
+/// that pair — an environment label nothing holds, a triple with no configuration in force,
+/// a deployed version AppConfig's hosted store does not hold — is reported as no deployed
+/// version for the triple the request spelled.
 #[tokio::test]
 async fn every_unservable_triple_is_the_one_modelled_bad_request() {
     let router = router();
@@ -790,21 +827,15 @@ async fn every_unservable_triple_is_the_one_modelled_bad_request() {
     )
     .await;
 
-    // Each level of the triple, addressed as something the store does not hold: whichever
-    // level failed, the refusal reports the configuration profile it could not serve under
-    // the application, so a caller cannot tell from it which level was the unresolvable
-    // one.
+    // The (Application, Configuration) pair addressed as something the store does not
+    // hold: whichever of the two failed, the refusal reports the configuration profile it
+    // could not reach under the application, so a caller cannot tell from it which of the
+    // pair was the unresolvable one.
     for (case, named_application, named_environment, named_configuration) in [
         (
             "an application the account does not hold",
             "nosuchapp",
             environment.as_str(),
-            profile.as_str(),
-        ),
-        (
-            "an environment the application does not hold",
-            application.as_str(),
-            "nosuchenv",
             profile.as_str(),
         ),
         (
@@ -828,19 +859,28 @@ async fn every_unservable_triple_is_the_one_modelled_bad_request() {
             None,
         )
         .await;
-        assert_nothing_to_serve(case, &answer, named_application, named_configuration);
+        assert_profile_not_found(case, &answer, named_application, named_configuration);
     }
 
-    // A profile that resolves under an environment nothing was deployed into: the same
-    // refusal, so an unknown environment and a real one with nothing deployed are one
-    // answer.
+    // The environment, which this path uses only to look a DEPLOYMENT up: a label nothing
+    // holds and a real environment with nothing deployed into it are one answer, and it is
+    // not a claim about the configuration profile.
     let other_environment = create_environment(&router, &application, "staging").await;
-    assert_nothing_to_serve(
-        "an environment with nothing deployed into it",
-        &get_configuration(&router, &application, &other_environment, &profile, None).await,
-        &application,
-        &profile,
-    );
+    for (case, named_environment) in [
+        ("an environment the application does not hold", "nosuchenv"),
+        (
+            "an environment with nothing deployed into it",
+            other_environment.as_str(),
+        ),
+    ] {
+        assert_no_deployed_version(
+            case,
+            &get_configuration(&router, &application, named_environment, &profile, None).await,
+            &application,
+            named_environment,
+            &profile,
+        );
+    }
 
     // A profile stored outside AppConfig's hosted configuration store: the control plane
     // holds the deployment, and the bytes it deployed are not AppConfig's to serve.
@@ -867,10 +907,11 @@ async fn every_unservable_triple_is_the_one_modelled_bad_request() {
         "a configuration stored outside the hosted store",
     )
     .await;
-    assert_nothing_to_serve(
+    assert_no_deployed_version(
         "a configuration stored outside the hosted store",
         &get_configuration(&router, &application, &other_environment, &elsewhere, None).await,
         &application,
+        &other_environment,
         &elsewhere,
     );
 }
@@ -929,10 +970,11 @@ async fn a_rolling_out_configuration_is_in_force_and_a_stop_withdraws_it() {
     .await;
     // The rollout has reached nobody yet, and nothing preceded it here, so there is no
     // configuration in force for this caller.
-    assert_nothing_to_serve(
+    assert_no_deployed_version(
         "a rollout that has reached nobody",
         &get_configuration(&router, &application, &environment, &profile, None).await,
         &application,
+        &environment,
         &profile,
     );
 
@@ -975,10 +1017,11 @@ async fn a_rolling_out_configuration_is_in_force_and_a_stop_withdraws_it() {
         "a stopped rollout",
     )
     .await;
-    assert_nothing_to_serve(
+    assert_no_deployed_version(
         "a stopped rollout",
         &get_configuration(&router, &application, &environment, &profile, None).await,
         &application,
+        &environment,
         &profile,
     );
 }
