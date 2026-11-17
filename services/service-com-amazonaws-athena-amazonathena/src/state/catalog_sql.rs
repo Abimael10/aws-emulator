@@ -131,6 +131,26 @@ const ICEBERG_WITHOUT_METADATA_LOCATION: &str = "GENERIC_USER_ERROR: Detected Ic
 /// is resolved, and a chain longer than this is reported rather than followed.
 const MAX_VIEW_DEPTH: usize = 4;
 
+/// Whether `database` — folded the way the Data Catalog folds a name — is a database the
+/// catalog SERVES whether or not it holds a record of it.
+///
+/// Athena's own `default` database is one: it is the database an unqualified name resolves
+/// against when a submission names none of its own
+/// ([`crate::state::DEFAULT_QUERY_DATABASE`]), and every account's Data Catalog carries it,
+/// so a statement addressing a relation in it addresses a database that IS there and holds
+/// exactly the relations the catalog records in it — none at all, where the catalog holds no
+/// record of the database. A statement naming a relation there that the catalog does not
+/// hold is therefore the not-found refusal for the RELATION, never one for the database: a
+/// database the catalog serves does not fail to resolve.
+///
+/// Only the resolution of a RELATION's database is decided here. A statement that acts on
+/// the database RECORD itself — the entries `CREATE DATABASE`, `DROP DATABASE` and
+/// `SHOW DATABASES` write and read, which are the same records the catalog's own API writes
+/// and reads — acts on what the catalog HOLDS, and this says nothing about those.
+pub fn served_without_record(database: &str) -> bool {
+    database == glue_state::fold_name(crate::state::DEFAULT_QUERY_DATABASE)
+}
+
 /// Why one statement did not run: the message Athena reports as the execution's
 /// `AthenaError$ErrorMessage`, the `StateChangeReason` it reports beside it where the two
 /// differ, and the classification that failure belongs to.
@@ -1064,6 +1084,10 @@ fn resolve<Eng: Send + Sync + 'static>(
                 Held::ReportingTable(reporting_table(&store, &catalog_id, relation, budget)?)
             } else {
                 match store.database(&catalog_id, &relation.database) {
+                    // A database the catalog serves without holding a record of it holds no
+                    // relation at all, so what the statement named is the relation that is
+                    // not there ([`served_without_record`]).
+                    None if served_without_record(&relation.database) => Held::NoTable,
                     None => Held::NoDatabase,
                     Some(database) => match database.tables.get(&relation.table) {
                         None => Held::NoTable,

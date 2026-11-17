@@ -313,6 +313,46 @@ pub fn show_databases(
     Ok(single_column_result(DATABASE_NAME_COLUMN, names))
 }
 
+/// The stored database a statement REGISTERS a relation in, or `None` when the catalog
+/// neither holds nor serves one of that name.
+///
+/// A database the catalog SERVES without holding a record of it
+/// ([`super::served_without_record`]) is there for a statement that defines a table or a
+/// view in it, and what such a statement registers has to be held where every reader of the
+/// catalog finds it — the catalog entry Glue's own reads report — so the record is written
+/// here before the object goes into it. Nothing is materialised for a database the catalog
+/// does not serve, nor for one whose record it already holds, and nothing is written past
+/// the bounds the catalog holds its own writes to.
+fn registered_in<'s>(
+    store: &'s mut glue_state::ComAmazonawsGlueAwsglueState,
+    catalog_id: &str,
+    database: &str,
+    now: SystemTime,
+) -> Option<&'s mut glue_state::DatabaseEntry> {
+    if store.database(catalog_id, database).is_none() {
+        if !super::served_without_record(database) {
+            return None;
+        }
+        let catalog_can_hold_another = store
+            .catalogs
+            .get(catalog_id)
+            .is_none_or(glue_state::Catalog::can_store_database);
+        if !store.can_store_database() || !catalog_can_hold_another {
+            return None;
+        }
+        let input = DatabaseInput {
+            name: database.to_string(),
+            ..DatabaseInput::default()
+        };
+        let entry = glue_state::DatabaseEntry::from_input(&input, catalog_id, None, now);
+        store
+            .catalog_mut_for_create(catalog_id)?
+            .databases
+            .insert(glue_state::fold_name(database), entry);
+    }
+    store.database_mut(catalog_id, database)
+}
+
 /// Register the table a `CREATE EXTERNAL TABLE` defines in the Data Catalog.
 ///
 /// The entry is the one the catalog holds for a DDL-authored table: its type is
@@ -339,7 +379,7 @@ pub fn create_external_table(
     now: SystemTime,
 ) -> Result<StoredResultSet, Failure> {
     let store_can_hold_another = store.can_store_table();
-    let Some(database) = store.database_mut(catalog_id, &table.target.database) else {
+    let Some(database) = registered_in(store, catalog_id, &table.target.database, now) else {
         // The statement is one the Hive DDL engine performs, so a database it cannot
         // resolve is that engine's own semantic error.
         return Err(Failure::hive_database_not_found(&table.target.database));
@@ -566,7 +606,7 @@ pub fn create_view(
 ) -> Result<StoredResultSet, Failure> {
     let columns = view_columns(store, catalog_id, view)?;
     let store_can_hold_another = store.can_store_table();
-    let Some(database) = store.database_mut(catalog_id, &view.target.database) else {
+    let Some(database) = registered_in(store, catalog_id, &view.target.database, now) else {
         return Err(Failure::schema_not_found(&view.target));
     };
     match database.tables.get(&view.target.table) {
@@ -615,6 +655,11 @@ fn view_columns(
     let mut source_columns: Vec<DeclaredColumn> = Vec::new();
     for source in &view.sources {
         let Some(database) = store.database(catalog_id, &source.database) else {
+            // A database the catalog serves without holding a record of it holds no
+            // relation, so the source is the relation that is not there.
+            if super::served_without_record(&source.database) {
+                return Err(Failure::table_not_found(source));
+            }
             return Err(Failure::schema_not_found(source));
         };
         let Some(table) = database.tables.get(&source.table) else {
@@ -764,6 +809,11 @@ pub fn drop_view(
         if if_exists {
             return Ok(StoredResultSet::default());
         }
+        // A database the catalog serves without holding a record of it holds no view,
+        // which is the engine's own view-does-not-exist refusal.
+        if super::served_without_record(&target.database) {
+            return Err(Failure::view_not_found(target));
+        }
         return Err(Failure::schema_not_found(target));
     };
     match database.tables.get(&target.table) {
@@ -787,6 +837,11 @@ pub fn show_create_view(
     target: &Relation,
 ) -> Result<StoredResultSet, Failure> {
     let Some(database) = store.database(catalog_id, &target.database) else {
+        // As in [`drop_view`]: a database the catalog serves without holding a record of it
+        // holds no view for this statement to report.
+        if super::served_without_record(&target.database) {
+            return Err(Failure::view_not_found(target));
+        }
         return Err(Failure::schema_not_found(target));
     };
     let entry = database.tables.get(&target.table);
@@ -881,6 +936,11 @@ pub fn show_relations(
         Some(filter) => Some(name_matcher(filter)?),
     };
     let Some(database) = store.database(catalog_id, &schema.database) else {
+        // A database the catalog serves without holding a record of it holds no relation,
+        // so the listing is empty rather than refused.
+        if super::served_without_record(&schema.database) {
+            return Ok(single_column_result(RELATION_NAME_COLUMN, Vec::new()));
+        }
         return Err(Failure::schema_not_found_at(schema.at, &schema.database));
     };
     let names = database

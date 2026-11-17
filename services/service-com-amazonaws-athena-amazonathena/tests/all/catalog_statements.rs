@@ -26,7 +26,14 @@
 //! * a statement that READS a relation resolves it through the catalog and computes its
 //!   answer from the objects at that relation's location, decoded by the SerDe the catalog
 //!   recorded — so a table with no objects under it answers no rows, and a relation the
-//!   catalog does not hold is Athena's own not-found refusal.
+//!   catalog does not hold is Athena's own not-found refusal;
+//! * Athena's own `default` database — the one an unqualified name resolves against when a
+//!   submission names no database of its own — is a database the catalog SERVES whether or
+//!   not it holds a record of it, so a statement that addresses a relation in it addresses a
+//!   database that IS there: a relation in it the catalog does not hold is the not-found
+//!   refusal for the RELATION, a listing of its relations is empty rather than refused, and
+//!   a table a statement defines in it is registered where the catalog's own reads report
+//!   it.
 //!
 //! Each suite is a TABLE whose rows differ along what the rule generalises over: how a
 //! name is qualified and quoted, which grammar the statement is written in, what the
@@ -51,7 +58,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_athena_amazonathena::state::catalog_sql::ddl;
+use service_com_amazonaws_athena_amazonathena::state::catalog_sql::{
+    ddl, ERROR_CATEGORY_SYSTEM, ERROR_CATEGORY_USER, ERROR_TYPE_ENTITY_NOT_FOUND, ERROR_TYPE_VIEW,
+};
 use service_com_amazonaws_athena_amazonathena::state::{
     query_engine, QUERY_EXECUTION_COMPLETION, QUERY_STATE_FAILED, QUERY_STATE_SUCCEEDED,
 };
@@ -2148,5 +2157,392 @@ async fn a_relation_the_catalog_does_not_hold_is_refused_as_not_found() {
         "case {:?}: a registered table with no objects under it answers no rows, got \
          {counted:?}",
         "the control read"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The database the catalog SERVES: Athena's own `default`
+// ---------------------------------------------------------------------------
+
+/// Athena's own `default` database: the database an unqualified name resolves against when
+/// a submission names none of its own, which every account's Data Catalog carries.
+const SERVED_DATABASE: &str = "default";
+
+/// The error code that opens Athena's message for a RELATION it could not resolve.
+const TABLE_NOT_FOUND: &str = "TABLE_NOT_FOUND";
+
+/// The error code that opens its message for a DATABASE it could not resolve.
+const SCHEMA_NOT_FOUND: &str = "SCHEMA_NOT_FOUND";
+
+/// Start one statement with NO `QueryExecutionContext` at all — the way a client submits a
+/// query it has named no database for — and return the `QueryExecutionId` it minted.
+async fn start_without_context(
+    router: &MultiServiceRouter,
+    case: &str,
+    sql: &str,
+) -> String {
+    let (status, answer) = athena(
+        router,
+        "StartQueryExecution",
+        &json!({
+            "QueryString": sql,
+            "ResultConfiguration": { "OutputLocation": OUTPUT_LOCATION },
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: StartQueryExecution({sql}) must be accepted, got {status} with \
+         {answer:?}"
+    );
+    answer["QueryExecutionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: expected an id, got {answer:?}"))
+        .to_string()
+}
+
+/// Which NAME of a statement could not be resolved, and so which of Athena's two
+/// not-found refusals the row expects.
+enum Unresolvable {
+    /// The RELATION: the message names it fully qualified, as the catalog, the database
+    /// and the table.
+    Relation(&'static str),
+    /// The DATABASE: a name the catalog neither holds a record of nor serves.
+    Database(&'static str),
+}
+
+/// One row of the unresolvable-name table.
+struct NameCase {
+    /// What this row is about.
+    case: &'static str,
+    /// The database its `QueryExecutionContext` names, or `None` for a submission that
+    /// carries no context at all.
+    context: Option<&'static str>,
+    /// The statement submitted.
+    sql: &'static str,
+    /// The one name in it the catalog cannot resolve.
+    unresolvable: Unresolvable,
+    /// The line the statement wrote that name on, 1-based.
+    line: u64,
+    /// The column that name starts at, 1-based.
+    column: u64,
+}
+
+impl NameCase {
+    /// The message Athena words for this row's failure class: the error code, the position
+    /// the statement wrote the name at, and the name itself.
+    fn expected_message(&self) -> String {
+        let (line, column) = (self.line, self.column);
+        match self.unresolvable {
+            Unresolvable::Relation(qualified) => format!(
+                "{TABLE_NOT_FOUND}: line {line}:{column}: Table '{qualified}' does not exist"
+            ),
+            Unresolvable::Database(database) => format!(
+                "{SCHEMA_NOT_FOUND}: line {line}:{column}: Schema '{database}' does not exist"
+            ),
+        }
+    }
+}
+
+/// A read whose relation the catalog cannot resolve reports the RELATION as the name that
+/// is not there whenever the database qualifying it is one the catalog serves — Athena's
+/// own `default` database included, which it serves whether or not it holds a record of it
+/// — and reports the DATABASE only for a name it neither holds nor serves.
+///
+/// The rows differ along how the relation is qualified and quoted, where in the statement
+/// it is written, which database qualifies it — the served default one, by the context, by
+/// the statement or by neither; one the catalog holds a record of; one it neither holds nor
+/// serves — and the shape of the statement that reads it.
+#[tokio::test]
+async fn a_read_in_a_served_database_reports_the_relation_as_the_name_that_is_absent() {
+    let router = emulator();
+    create_bucket(&router).await;
+    // One database the catalog holds a RECORD of, so the rule is read over both kinds of
+    // database the catalog resolves a relation in.
+    create_database(&router, "shop").await;
+
+    let cases: Vec<NameCase> = vec![
+        NameCase {
+            case: "no context at all, an unqualified name",
+            context: None,
+            sql: "SELECT * FROM absent_one",
+            unresolvable: Unresolvable::Relation("awsdatacatalog.default.absent_one"),
+            line: 1,
+            column: 15,
+        },
+        NameCase {
+            case: "the served database named by the context",
+            context: Some(SERVED_DATABASE),
+            sql: "SELECT * FROM absent_two",
+            unresolvable: Unresolvable::Relation("awsdatacatalog.default.absent_two"),
+            line: 1,
+            column: 15,
+        },
+        NameCase {
+            case: "the served database written in the statement",
+            context: None,
+            sql: "SELECT * FROM default.absent_three",
+            unresolvable: Unresolvable::Relation("awsdatacatalog.default.absent_three"),
+            line: 1,
+            column: 15,
+        },
+        NameCase {
+            case: "the catalog, the served database and the table all written",
+            context: None,
+            sql: "SELECT * FROM awsdatacatalog.default.absent_four",
+            unresolvable: Unresolvable::Relation("awsdatacatalog.default.absent_four"),
+            line: 1,
+            column: 15,
+        },
+        NameCase {
+            case: "the served database and the table written in mixed case",
+            context: None,
+            sql: "SELECT * FROM DeFaUlT.Absent_Five",
+            unresolvable: Unresolvable::Relation("awsdatacatalog.default.absent_five"),
+            line: 1,
+            column: 15,
+        },
+        NameCase {
+            case: "a quoted unqualified name",
+            context: None,
+            sql: "SELECT * FROM \"absent_six\"",
+            unresolvable: Unresolvable::Relation("awsdatacatalog.default.absent_six"),
+            line: 1,
+            column: 15,
+        },
+        NameCase {
+            case: "the name written on a later line",
+            context: None,
+            sql: "SELECT item_id, price\n  FROM absent_seven\n WHERE price > 1",
+            unresolvable: Unresolvable::Relation("awsdatacatalog.default.absent_seven"),
+            line: 2,
+            column: 8,
+        },
+        NameCase {
+            case: "the name written inside a subquery",
+            context: None,
+            sql: "SELECT count(*) AS n FROM (SELECT * FROM absent_eight) sub",
+            unresolvable: Unresolvable::Relation("awsdatacatalog.default.absent_eight"),
+            line: 1,
+            column: 42,
+        },
+        NameCase {
+            case: "a database the catalog holds a record of, with no such table",
+            context: Some("shop"),
+            sql: "SELECT * FROM absent_nine",
+            unresolvable: Unresolvable::Relation("awsdatacatalog.shop.absent_nine"),
+            line: 1,
+            column: 15,
+        },
+        NameCase {
+            case: "a database the catalog neither holds nor serves, written in the \
+                   statement",
+            context: None,
+            sql: "SELECT * FROM nowhere.absent_ten",
+            unresolvable: Unresolvable::Database("nowhere"),
+            line: 1,
+            column: 15,
+        },
+        NameCase {
+            case: "a database the catalog neither holds nor serves, named by the context",
+            context: Some("nowhere"),
+            sql: "SELECT * FROM absent_eleven",
+            unresolvable: Unresolvable::Database("nowhere"),
+            line: 1,
+            column: 15,
+        },
+    ];
+
+    let mut started: Vec<(&NameCase, String)> = Vec::new();
+    for case in &cases {
+        let id = match case.context {
+            Some(database) => start(&router, case.case, database, case.sql).await,
+            None => start_without_context(&router, case.case, case.sql).await,
+        };
+        started.push((case, id));
+    }
+
+    for (case, id) in &started {
+        crate::harness::settled(&router, id).await;
+        let message = failed(
+            &router,
+            case.case,
+            id,
+            i64::from(ERROR_CATEGORY_USER),
+            Some(i64::from(ERROR_TYPE_ENTITY_NOT_FOUND)),
+        )
+        .await;
+        assert_eq!(
+            message,
+            case.expected_message(),
+            "case {:?}: expected Athena's own message for the name it could not resolve, \
+             got {message:?}",
+            case.case
+        );
+    }
+}
+
+/// A database the catalog serves without holding a record of it is there for every
+/// statement that addresses a relation in it: a listing of its relations is empty rather
+/// than refused, a view it does not hold is reported as the VIEW that is not there, and a
+/// table a statement defines in it is registered where the catalog's own reads report it
+/// and where a later read of that table finds its rows.
+#[tokio::test]
+async fn the_served_database_holds_what_a_statement_registers_in_it() {
+    let router = emulator();
+    create_bucket(&router).await;
+    put_object(
+        &router,
+        "setup",
+        "served_items/rows.csv",
+        "1,desk,20\n2,lamp,9\n",
+    )
+    .await;
+
+    // Nothing has been registered yet, so the catalog holds no record of the served
+    // database at all.
+    let listed = start_without_context(&router, "the relations of the served database", "SHOW TABLES")
+        .await;
+    let dropped = start_without_context(
+        &router,
+        "a view the served database does not hold",
+        "DROP VIEW absent_view",
+    )
+    .await;
+    let shown = start_without_context(
+        &router,
+        "the definition of a view it does not hold",
+        "SHOW CREATE VIEW absent_view",
+    )
+    .await;
+    for id in [&listed, &dropped, &shown] {
+        crate::harness::settled(&router, id).await;
+    }
+
+    succeeded(&router, "the relations of the served database", &listed).await;
+    let names = rows_of(&router, "the relations of the served database", &listed).await;
+    assert!(
+        names.is_empty(),
+        "case {:?}: a served database the catalog holds no record of holds no relation, \
+         got {names:?}",
+        "the relations of the served database"
+    );
+
+    // (case, the id, the message the view class words for it — the position is where each
+    // statement wrote the name)
+    let view_cases: Vec<(&str, &String, String)> = vec![
+        (
+            "a view the served database does not hold",
+            &dropped,
+            "line 1:11: View 'default.absent_view' does not exist".to_string(),
+        ),
+        (
+            "the definition of a view it does not hold",
+            &shown,
+            "line 1:18: View 'default.absent_view' does not exist".to_string(),
+        ),
+    ];
+    for (case, id, expected) in &view_cases {
+        let message = failed(
+            &router,
+            case,
+            id,
+            i64::from(ERROR_CATEGORY_SYSTEM),
+            Some(i64::from(ERROR_TYPE_VIEW)),
+        )
+        .await;
+        assert_eq!(
+            &message, expected,
+            "case {case:?}: the statement addresses a view in a database that IS there, so \
+             the view is the name that is not there, got {message:?}"
+        );
+    }
+
+    // A table DEFINED in the served database is registered in it.
+    let registered = start_without_context(
+        &router,
+        "a table defined in the served database",
+        &format!(
+            "CREATE EXTERNAL TABLE items (item_id int, name string, price int) ROW FORMAT \
+             DELIMITED FIELDS TERMINATED BY ',' LOCATION 's3://{BUCKET}/served_items/'"
+        ),
+    )
+    .await;
+    crate::harness::settled(&router, &registered).await;
+    succeeded(&router, "a table defined in the served database", &registered).await;
+
+    let held = glue_ok(
+        &router,
+        "a table defined in the served database",
+        "GetDatabase",
+        &json!({ "Name": SERVED_DATABASE }),
+    )
+    .await;
+    assert_eq!(
+        held["Database"]["Name"].as_str(),
+        Some(SERVED_DATABASE),
+        "case {:?}: the catalog must hold the database the registration wrote into, got \
+         {held:?}",
+        "a table defined in the served database"
+    );
+    let table = glue_table(&router, SERVED_DATABASE, "items")
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "case {:?}: the catalog must hold the registered table",
+                "a table defined in the served database"
+            )
+        });
+    assert_eq!(
+        table["TableType"].as_str(),
+        Some(ddl::TABLE_TYPE_EXTERNAL),
+        "case {:?}: the statement registers an external table, got {table:?}",
+        "a table defined in the served database"
+    );
+
+    // And a read of it, submitted with no context either, answers the rows the objects
+    // under its location hold.
+    let read = start_without_context(
+        &router,
+        "a read of the registered table",
+        "SELECT * FROM items",
+    )
+    .await;
+    let relisted = start_without_context(
+        &router,
+        "the relations after the registration",
+        "SHOW TABLES",
+    )
+    .await;
+    for id in [&read, &relisted] {
+        crate::harness::settled(&router, id).await;
+    }
+    succeeded(&router, "a read of the registered table", &read).await;
+    let rows = rows_of(&router, "a read of the registered table", &read).await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Some("1".to_string()),
+                Some("desk".to_string()),
+                Some("20".to_string())
+            ],
+            vec![
+                Some("2".to_string()),
+                Some("lamp".to_string()),
+                Some("9".to_string())
+            ],
+        ],
+        "case {:?}: the read answers the rows the objects under the table's location hold, \
+         got {rows:?}",
+        "a read of the registered table"
+    );
+    succeeded(&router, "the relations after the registration", &relisted).await;
+    let relations = rows_of(&router, "the relations after the registration", &relisted).await;
+    assert_eq!(
+        relations,
+        vec![vec![Some("items".to_string())]],
+        "case {:?}: the served database now holds the registered table, got {relations:?}",
+        "the relations after the registration"
     );
 }
