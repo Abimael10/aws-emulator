@@ -49,3 +49,30 @@ Actual (emulator): buildStatus 'FAULT' with phases [SUBMITTED/SUCCEEDED, QUEUED/
    -> AWS: buildStatus 'SUCCEEDED', every phase 'SUCCEEDED'.
    -> Emulator: buildStatus 'FAULT' with phase PROVISIONING='FAULT' and the reason 'this emulator does not run CodeBuild build containers, ...'.
 6. (Unreachable on the emulator) DescribeImages for the pushed tag, register a task definition pinning repoUri@digest, create a Fargate service behind the ALB target group, and assert the ALB serves the baked body; then deploy a second build by digest and assert rolloutState COMPLETED, and a health-check-failing revision reaches rolloutState FAILED and rolls back while the ALB keeps serving the previous bytes.
+
+## Resolution
+
+The PROVISIONING `FAULT` this report was filed for is no longer produced: the build-execution
+path behind `StartBuild`/`BatchGetBuilds` creates the build environment in process and RUNS the
+buildspec, so a build of a project whose environment can be provisioned walks the phases
+`BuildPhaseType` names — `SUBMITTED`, `QUEUED`, `PROVISIONING`, `DOWNLOAD_SOURCE`, `INSTALL`,
+`PRE_BUILD`, `BUILD`, `POST_BUILD`, `UPLOAD_ARTIFACTS`, `FINALIZING`, `COMPLETED` — with every
+`phaseStatus` `SUCCEEDED`, and settles `buildStatus` `SUCCEEDED` when every command exited zero.
+The reason sentence this report quotes is in no file of the tree.
+
+What the chain now serves, end to end: `StartBuild` → every phase `SUCCEEDED` and `buildStatus`
+`SUCCEEDED`, the build's own log in the CloudWatch Logs group its project configured, the pushed
+image addressable in Amazon ECR by a `sha256:` digest of non-zero size at the address
+`Repository$repositoryUri` publishes, and an Amazon ECS task definition pinning
+`<repositoryUri>@<digest>` placing a task that pulls that image and starts. It is pinned by
+`core/router/tests/all/codebuild_pushed_image_runs_on_ecs.rs`, which drives all five services of
+this grouping over one engine with the chain's own buildspec shape.
+
+What is NOT served, and remains open as its own work: the last leg of both checks — an HTTP `GET`
+through the ALB answering with the bytes the built image serves, and the body-tracking and
+circuit-breaker rollback assertions that follow it. That needs a capability this emulator does not
+have: a container that RUNS its image's HTTP server in process, and an Elastic Load Balancing v2
+`forward` to an `ip` target group that reaches it. It is recorded by
+`20261116T122519Z-codebuild-ecr-ecs-elbv2-logs-both-container-ci.md` and
+`20261105T082918Z-codebuild-ecr-ecs-elbv2-logs-the-circuit-breaker.md`, and nothing of it is faked
+here.
