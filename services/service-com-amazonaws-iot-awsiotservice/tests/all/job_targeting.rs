@@ -34,6 +34,11 @@ const ACCOUNT_ID: &str = "000000000000";
 /// The region the harness signs for unless a case names another.
 const REGION: &str = "us-east-1";
 
+/// `InvalidRequestException` as this service NAMES it in `x-amzn-errortype`: the shape
+/// name, a `:`, and the service's API doc namespace.
+const QUALIFIED_INVALID_REQUEST: &str =
+    "InvalidRequestException:http://iot.amazonaws.com/doc/2015-10-02/";
+
 /// A SigV4 `Authorization` header whose credential scope names the `iot` signing name
 /// and `region`: the scope is how the router picks the claiming service, and how the
 /// service picks the region its ARNs are scoped to.
@@ -408,7 +413,7 @@ async fn a_refused_create_job_writes_neither_the_job_nor_an_execution() {
             targets: vec![format!("arn:aws:iot:{REGION}:{ACCOUNT_ID}:job/other-job")],
             document: Some(document.clone()),
             status: 400,
-            code: "InvalidRequestException",
+            code: QUALIFIED_INVALID_REQUEST,
             // The message names the resource type it rejected, which is built from
             // the ARN the request supplied.
             message_carries: "job",
@@ -418,16 +423,18 @@ async fn a_refused_create_job_writes_neither_the_job_nor_an_execution() {
             targets: vec![format!("arn:aws:s3:{REGION}:{ACCOUNT_ID}:thing/laser-known")],
             document: Some(document.clone()),
             status: 400,
-            code: "InvalidRequestException",
-            message_carries: "not an IoT thing or thing group ARN",
+            code: QUALIFIED_INVALID_REQUEST,
+            // A value that is no IoT resource ARN at all is refused on the ARN's SYNTAX,
+            // in AWS's fixed sentence for it: nothing of the request is echoed.
+            message_carries: "Target ARN not in proper syntax.",
         },
         RefusalCase {
             case: "a target that is not an ARN at all",
             targets: vec!["laser-known".to_string()],
             document: Some(document.clone()),
             status: 400,
-            code: "InvalidRequestException",
-            message_carries: "not an IoT thing or thing group ARN",
+            code: QUALIFIED_INVALID_REQUEST,
+            message_carries: "Target ARN not in proper syntax.",
         },
         RefusalCase {
             case: "a resolvable target beside an unresolvable one",
@@ -445,7 +452,7 @@ async fn a_refused_create_job_writes_neither_the_job_nor_an_execution() {
             targets: vec![thing_arn("laser-known")],
             document: None,
             status: 400,
-            code: "InvalidRequestException",
+            code: QUALIFIED_INVALID_REQUEST,
             message_carries: "document",
         },
         RefusalCase {
@@ -453,7 +460,7 @@ async fn a_refused_create_job_writes_neither_the_job_nor_an_execution() {
             targets: vec![thing_arn("laser/known")],
             document: Some(document.clone()),
             status: 400,
-            code: "InvalidRequestException",
+            code: QUALIFIED_INVALID_REQUEST,
             // The refusal names the unaddressable NAME and its constraint, not the
             // ARN format: the ARN itself is a thing ARN.
             message_carries: "is not a thing name a job may target",
@@ -463,7 +470,7 @@ async fn a_refused_create_job_writes_neither_the_job_nor_an_execution() {
             targets: vec![thing_arn(&"n".repeat(MAX_THING_NAME_LEN + 1))],
             document: Some(document.clone()),
             status: 400,
-            code: "InvalidRequestException",
+            code: QUALIFIED_INVALID_REQUEST,
             message_carries: "is not a thing name a job may target",
         },
         RefusalCase {
@@ -814,7 +821,7 @@ async fn the_per_job_fan_out_is_bounded_and_an_unschedulable_job_is_refused() {
         );
         assert_eq!(
             reply.error_code.as_deref(),
-            Some("InvalidRequestException"),
+            Some(QUALIFIED_INVALID_REQUEST),
             "case {case:?}: expected InvalidRequestException, got {:?}",
             reply.body
         );

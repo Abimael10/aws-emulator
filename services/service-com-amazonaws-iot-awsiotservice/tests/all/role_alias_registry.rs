@@ -553,7 +553,7 @@ async fn a_credential_duration_outside_the_modelled_range_is_refused() {
         );
         assert_eq!(
             refused.error_code.as_deref(),
-            Some("InvalidRequestException"),
+            Some("InvalidRequestException:http://iot.amazonaws.com/doc/2015-10-02/"),
             "case {duration}: expected this service's own validation-refusal class, got \
              {refused:?}"
         );

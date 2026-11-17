@@ -18,17 +18,34 @@
 //!   with none at all — `Value at '<member path>' failed to satisfy constraint: Member must
 //!   not be null` — where the framework writes the `null` it read;
 //! * a member outside its `@pattern` is stated with no value either: what the clause names
-//!   is the expression the value had to match, and the value itself is not echoed back into
-//!   the response;
+//!   is the expression the value had to match, quoted without the whole-value anchors the
+//!   model wraps it in, and the value itself is not echoed back into the response. That is
+//!   what this service's recorded refusals of a URI-LABEL member show; whether a `@pattern`
+//!   on a BODY member is stated the same way is a question about this rendering that a
+//!   report of its own carries, and the rendering lives in `service_common` either way;
 //! * every other class keeps the value the request submitted — a value outside an
 //!   enumerated set is quoted beside the set it had to be in — which is what the framework
 //!   already states.
 //!
+//! The last thing chosen here is the ORDER an enumerated type's value set is listed in: the
+//! front door in front of this service holds a type's admissible values in a HASH TABLE
+//! keyed on each value's own text and enumerates that table, so the set is stated in
+//! ascending bucket order rather than in the order the model declares the type
+//! ([`::service_common::validation_message::in_hashed_enum_order`], whose own docs carry the
+//! derivation). It is computed from the declared values themselves, so it belongs to the
+//! enumerated TYPE: every enum of this model is listed that way and a type the model gains
+//! needs nothing here.
+//!
 //! Nothing here is keyed to an operation, to a member path or to a submitted value, so one
-//! rule covers every `@required` member and every `@pattern` of every operation alike. How
-//! that shape name is NAMED on the wire — qualified with the service's API doc namespace —
-//! is `ValidationRefusalErrorType`'s, beside the operations it is known to be qualified
-//! for.
+//! rule covers every `@required` member, every `@pattern` and every enum of every operation
+//! alike.
+//!
+//! The error-shape NAME this chooses is the bare one, because naming it on the wire is not
+//! this seam's: the shape name a chosen refusal carries is reduced by the framework to the
+//! characters a shape id holds, so the namespace AWS IoT qualifies it with cannot travel
+//! through here. `ShapeNamespacedErrorType`, in front of every operation, is what writes
+//! that name — for this shape wherever it comes from, so a refusal worded here and one a
+//! handler answers name it identically.
 
 use ::smithy_server_runtime::{Refusal, Refused, Violation, ViolationKind};
 
@@ -39,13 +56,27 @@ use ::smithy_server_runtime::{Refusal, Refused, Violation, ViolationKind};
 /// a refusal with nothing to state.
 pub(crate) fn refused(refusal: &Refusal) -> Option<Refused> {
     ::service_common::validation_message::aws_validation_refusal_withholding_violations(
-        refusal,
+        &in_stated_value_set_order(refusal),
         states_no_value,
     )
     .map(|stated| Refused {
         code: super::INVALID_REQUEST_EXCEPTION.to_owned(),
         message: stated.message,
     })
+}
+
+/// `refusal` with every enumerated type's value set in the order this service's front door
+/// states it, and every other violation untouched.
+fn in_stated_value_set_order(refusal: &Refusal) -> Refusal {
+    match refusal {
+        Refusal::Invalid(violations) => Refusal::Invalid(
+            violations
+                .iter()
+                .map(::service_common::validation_message::in_hashed_enum_order)
+                .collect(),
+        ),
+        other => other.clone(),
+    }
 }
 
 /// Whether the clause for `violation` states no value: the member was ABSENT, so there is
@@ -113,6 +144,30 @@ mod tests {
                 ),
                 "1 validation error detected: Value 'MAYBE' at 'status' failed to satisfy \
                  constraint: Member must satisfy enum value set: [ACTIVE]",
+            ),
+            (
+                // `LogTargetType`, declared DEFAULT, THING_GROUP, CLIENT_ID, SOURCE_IP,
+                // PRINCIPAL_ID, DEVICE_DEFENDER
+                // (`smithy_query(query="shape",shape="LogTargetType")`), is stated in its
+                // hash table's bucket order — 1, 11, 12, 12, 14, 15 — which is neither the
+                // declaration order nor the alphabetical one, and where two values share a
+                // bucket the later-declared one is stated first.
+                "a member outside a value set of several members",
+                violation(
+                    "targetType",
+                    ViolationKind::EnumValue(vec![
+                        "DEFAULT".to_owned(),
+                        "THING_GROUP".to_owned(),
+                        "CLIENT_ID".to_owned(),
+                        "SOURCE_IP".to_owned(),
+                        "PRINCIPAL_ID".to_owned(),
+                        "DEVICE_DEFENDER".to_owned(),
+                    ]),
+                    Some("NOT_A_REAL_TYPE"),
+                ),
+                "1 validation error detected: Value 'NOT_A_REAL_TYPE' at 'targetType' failed \
+                 to satisfy constraint: Member must satisfy enum value set: [DEFAULT, \
+                 SOURCE_IP, DEVICE_DEFENDER, PRINCIPAL_ID, THING_GROUP, CLIENT_ID]",
             ),
         ];
 

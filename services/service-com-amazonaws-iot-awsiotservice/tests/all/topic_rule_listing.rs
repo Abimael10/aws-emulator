@@ -906,7 +906,7 @@ async fn a_next_token_of_another_listing_or_of_nothing_is_refused() {
         );
         assert_eq!(
             refused.error_code.as_deref(),
-            Some("InvalidRequestException"),
+            Some("InvalidRequestException:http://iot.amazonaws.com/doc/2015-10-02/"),
             "case {label:?}: expected InvalidRequestException, got {refused:?}"
         );
     }

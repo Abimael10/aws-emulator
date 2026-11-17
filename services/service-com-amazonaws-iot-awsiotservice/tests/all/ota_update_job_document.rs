@@ -783,7 +783,7 @@ async fn a_generated_document_past_what_a_job_document_may_hold_is_refused() {
     );
     assert_eq!(
         refused.error_code.as_deref(),
-        Some("InvalidRequestException"),
+        Some("InvalidRequestException:http://iot.amazonaws.com/doc/2015-10-02/"),
         "case \"a document past the bound\": expected InvalidRequestException, got {:?}",
         refused.error_code
     );

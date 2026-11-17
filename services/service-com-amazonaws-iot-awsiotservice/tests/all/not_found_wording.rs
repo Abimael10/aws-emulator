@@ -31,6 +31,30 @@
 //! sentence, so the table below spans what the rule generalises over — the family, the
 //! operation (a read, a delete and an update of the same family), the method, and the
 //! form and length of the identifier — rather than one recorded request.
+//!
+//! The second rule this suite pins is the OTHER refusal every operation of this service
+//! shares, the one its validation layer answers before any handler runs: a request that
+//! breaks a constraint the model declares is refused 400, named `InvalidRequestException`
+//! qualified with the service's API doc namespace in `x-amzn-errortype` — the name belongs
+//! to the SHAPE, so it is the same for every operation — and worded in AWS's constraint
+//! envelope, one clause per broken constraint, where
+//!
+//! * a member the request did not carry has no value to quote, and the clause states none;
+//! * a URI-LABEL member outside its `@pattern` is stated with no value either, and the
+//!   expression is quoted without the whole-value anchors the model wraps it in;
+//! * a value outside an enumerated set is quoted beside that set, whose members are listed
+//!   in the order of the hash table the front door holds them in rather than in the model's
+//!   declaration order.
+//!
+//! What a clause states for a `@pattern` on a BODY member is not pinned here: the shared
+//! clause builder renders it like a label's, and whether that is AWS's wording for such a
+//! member is a divergence of its own that another report owns. The error SHAPE, which is
+//! what this suite's second table asserts, is the same for all of them.
+//!
+//! Its tables span what the rule generalises over: five operations, four constraint classes
+//! (an absent `@required` member, a `@pattern` on a URI label on two operations, a
+//! `@pattern` on a body member and an enumerated set), members bound to the URI, to the
+//! query string and to the body, and several rejected values per row.
 
 use std::sync::Arc;
 
@@ -52,8 +76,9 @@ const REGION: &str = "eu-west-3";
 /// The wire error shape of a resource this service does not hold.
 const NOT_FOUND: &str = "ResourceNotFoundException";
 
-/// `InvalidRequestException` as AWS IoT's fleet-indexing validation layer names it in
-/// `x-amzn-errortype`: the shape name, a `:`, and the service's API doc namespace.
+/// `InvalidRequestException` as AWS IoT names it in `x-amzn-errortype`: the shape name, a
+/// `:`, and the service's API doc namespace. The name belongs to the SHAPE, so a refusal
+/// its validation layer words and one a handler answers both carry it.
 const QUALIFIED_INVALID_REQUEST: &str =
     "InvalidRequestException:http://iot.amazonaws.com/doc/2015-10-02/";
 
@@ -509,6 +534,320 @@ async fn a_recognised_index_is_served_once_it_is_enabled() {
             reply.body.get("indexName").and_then(Value::as_str),
             Some(index_name),
             "case {index_name:?}: the description must name the index, got {:?}",
+            reply.body
+        );
+    }
+}
+
+/// The `LogTargetType` members as a refusal LISTS them: the order of the hash table the
+/// front door holds an enumerated type's admissible values in, which for this type's six
+/// declared members (`smithy_query(query="shape",shape="LogTargetType")`: DEFAULT,
+/// THING_GROUP, CLIENT_ID, SOURCE_IP, PRINCIPAL_ID, DEVICE_DEFENDER) is neither their
+/// declaration order nor the alphabetical one. Written out here so the order is pinned by
+/// this suite rather than by the code under test.
+const LOG_TARGET_TYPES: &str =
+    "DEFAULT, SOURCE_IP, DEVICE_DEFENDER, PRINCIPAL_ID, THING_GROUP, CLIENT_ID";
+
+/// One request this service's validation layer will not accept, and the clause the
+/// refusal must state for it.
+#[derive(Debug)]
+struct RefusedRequest {
+    /// What this row is, for the assertion messages.
+    case: String,
+    method: &'static str,
+    path: String,
+    /// A body for the methods that carry one; `None` for a read or a delete.
+    body: Option<Value>,
+    /// What AWS states after the envelope's `1 validation error detected: `.
+    clause: String,
+    /// What the request sent for the member the clause is about.
+    rejected: String,
+    /// Whether this constraint class quotes the submitted value: an absent member and a
+    /// `@pattern` are stated with none, an enumerated set with the value it rejected.
+    quotes_the_value: bool,
+}
+
+/// A `CreateScheduledAudit` body carrying the two members the model requires of one —
+/// `frequency` and `targetCheckNames` — plus the `dayOfMonth` under test, so the refusal
+/// is about that member alone.
+fn scheduled_audit_body(day_of_month: &str) -> Value {
+    json!({
+        "frequency": "MONTHLY",
+        "targetCheckNames": ["LOGGING_DISABLED_CHECK"],
+        "dayOfMonth": day_of_month,
+    })
+}
+
+/// Every row of the validation table: each operation, each constraint class, and several
+/// rejected values per row.
+fn refused_requests() -> Vec<RefusedRequest> {
+    let mut rows = Vec::new();
+
+    // A value outside an enumerated set, bound to the QUERY string: the clause quotes the
+    // value and the set, and the set is listed in the order the front door's own hash table
+    // is walked ([`LOG_TARGET_TYPES`]).
+    for value in ["NOT_A_REAL_TYPE", "default", "THING-GROUP"] {
+        rows.push(RefusedRequest {
+            case: format!("DeleteV2LoggingLevel with the targetType {value:?}"),
+            method: "DELETE",
+            path: format!("/v2LoggingLevel?targetType={value}&targetName=probe"),
+            body: None,
+            clause: format!(
+                "Value '{value}' at 'targetType' failed to satisfy constraint: Member must \
+                 satisfy enum value set: [{LOG_TARGET_TYPES}]"
+            ),
+            rejected: value.to_string(),
+            quotes_the_value: true,
+        });
+    }
+
+    // A URI LABEL outside its `@pattern` (`DomainConfigurationName`: `^[\w.-]+$`): the
+    // clause names the expression without the model's anchors and states no value.
+    for value in ["IoT:reserved", "edge+1", "config!"] {
+        rows.push(RefusedRequest {
+            case: format!("CreateDomainConfiguration named {value:?}"),
+            method: "POST",
+            path: format!("/domainConfigurations/{value}"),
+            body: Some(json!({})),
+            clause: format!(
+                "Value at 'domainConfigurationName' failed to satisfy constraint: Member must \
+                 satisfy regular expression pattern: {}",
+                r"[\w.-]+"
+            ),
+            rejected: value.to_string(),
+            quotes_the_value: false,
+        });
+    }
+
+    // A second URI label under the same class, on another operation and another
+    // expression (`PolicyVersionId`: `^[0-9]+$`).
+    for value in ["v2", "1.0", "latest"] {
+        rows.push(RefusedRequest {
+            case: format!("SetDefaultPolicyVersion on the version {value:?}"),
+            method: "PATCH",
+            path: format!("/policies/probe-policy/version/{value}"),
+            body: None,
+            clause: "Value at 'policyVersionId' failed to satisfy constraint: Member must \
+                     satisfy regular expression pattern: [0-9]+"
+                .to_string(),
+            rejected: value.to_string(),
+            quotes_the_value: false,
+        });
+    }
+
+    // A `@required` member the request did not carry at all: no value is rendered between
+    // `Value` and `at`, however the rest of the body is shaped.
+    for (label, body) in [
+        ("an empty body", json!({})),
+        ("a body carrying only tags", json!({ "tags": [] })),
+    ] {
+        rows.push(RefusedRequest {
+            case: format!("CreatePolicy with {label}"),
+            method: "POST",
+            path: "/policies/probe-policy".to_string(),
+            body: Some(body),
+            clause: "Value at 'policyDocument' failed to satisfy constraint: Member must not \
+                     be null"
+                .to_string(),
+            rejected: "null".to_string(),
+            quotes_the_value: false,
+        });
+    }
+
+    rows
+}
+
+/// Every row of the validation table: the status, the error shape as this service NAMES
+/// it, and the one clause AWS states for the constraint the request broke.
+#[tokio::test]
+async fn a_request_the_validation_layer_will_not_accept_is_one_refusal_everywhere() {
+    for case in refused_requests() {
+        // A fresh emulator per row: a validation refusal is decided by the REQUEST, so it
+        // must not depend on what another row left behind.
+        let emulator = Emulator::new();
+        let reply = emulator
+            .call(case.method, &case.path, case.body.as_ref())
+            .await;
+        assert_eq!(
+            reply.status, 400,
+            "case {:?}: expected status 400, got {} {:?}",
+            case.case, reply.status, reply.body
+        );
+        assert_eq!(
+            reply.error_type.as_deref(),
+            Some(QUALIFIED_INVALID_REQUEST),
+            "case {:?}: expected x-amzn-errortype {QUALIFIED_INVALID_REQUEST:?}, got {:?}",
+            case.case,
+            reply.error_type
+        );
+        let expected = format!("1 validation error detected: {}", case.clause);
+        assert_eq!(
+            reply.message(),
+            expected,
+            "case {:?}: expected message {expected:?}, got {:?}",
+            case.case,
+            reply.message()
+        );
+        let quoted = format!("Value '{}'", case.rejected);
+        assert_eq!(
+            reply.message().contains(&quoted),
+            case.quotes_the_value,
+            "case {:?}: expected the clause to quote the submitted value: \
+             {}, got {:?}",
+            case.case,
+            case.quotes_the_value,
+            reply.message()
+        );
+    }
+}
+
+/// RULE: the error SHAPE a request-validation refusal names is this service's, qualified
+/// with its API doc namespace, for EVERY operation — the name belongs to the shape, so no
+/// operation has to be known for it to be named that way.
+///
+/// The CLAUSE is not asserted here: it is the table above's for the rows it covers, and for
+/// `CreateScheduledAudit`'s `dayOfMonth` the recorded wording (the value quoted, the
+/// `@pattern` verbatim) is a divergence of the shared clause builder that this suite does
+/// not pin either way.
+#[tokio::test]
+async fn every_operations_validation_refusal_names_this_services_shape() {
+    // (case, method, path, body) — one broken constraint per operation, over the three
+    // places a member is bound: the URI path, the query string and the body.
+    let rows: Vec<(&str, &str, String, Option<Value>)> = vec![
+        (
+            "DeleteV2LoggingLevel on a targetType outside the value set",
+            "DELETE",
+            "/v2LoggingLevel?targetType=NOT_A_REAL_TYPE&targetName=probe".to_string(),
+            None,
+        ),
+        (
+            "CreateDomainConfiguration on a name outside its pattern",
+            "POST",
+            "/domainConfigurations/IoT:reserved".to_string(),
+            Some(json!({})),
+        ),
+        (
+            "SetDefaultPolicyVersion on a version id outside its pattern",
+            "PATCH",
+            "/policies/probe-policy/version/v2".to_string(),
+            None,
+        ),
+        (
+            "CreatePolicy with the required document absent",
+            "POST",
+            "/policies/probe-policy".to_string(),
+            Some(json!({})),
+        ),
+        (
+            "CreateScheduledAudit on a day of month outside its pattern",
+            "POST",
+            "/audit/scheduledaudits/probe_audit".to_string(),
+            Some(scheduled_audit_body("99")),
+        ),
+        (
+            "CreateScheduledAudit with a frequency outside the value set",
+            "POST",
+            "/audit/scheduledaudits/probe_audit".to_string(),
+            Some(json!({
+                "frequency": "HOURLY",
+                "targetCheckNames": ["LOGGING_DISABLED_CHECK"],
+            })),
+        ),
+    ];
+
+    for (case, method, path, body) in rows {
+        let emulator = Emulator::new();
+        let reply = emulator.call(method, &path, body.as_ref()).await;
+        assert_eq!(
+            reply.status, 400,
+            "case {case:?}: expected status 400, got {} {:?}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            reply.error_type.as_deref(),
+            Some(QUALIFIED_INVALID_REQUEST),
+            "case {case:?}: expected x-amzn-errortype {QUALIFIED_INVALID_REQUEST:?}, got {:?}",
+            reply.error_type
+        );
+        assert!(
+            reply.message().starts_with("1 validation error detected: "),
+            "case {case:?}: expected AWS's constraint envelope, got {:?}",
+            reply.message()
+        );
+    }
+}
+
+/// The other side of the same decision: a request that satisfies the constraint is NOT
+/// answered in that envelope, so the refusals above are about the value the request sent
+/// and not about the operation.
+#[tokio::test]
+async fn a_request_that_satisfies_the_constraint_is_not_refused_that_way() {
+    let document = json!({
+        "Version": "2012-10-17",
+        "Statement": [{ "Effect": "Allow", "Action": "iot:Connect", "Resource": "*" }],
+    })
+    .to_string();
+
+    // (case, method, path, body, whether the request must be SERVED)
+    let rows: Vec<(&str, &str, String, Option<Value>, bool)> = vec![
+        (
+            "CreatePolicy carrying the required document",
+            "POST",
+            "/policies/probe-policy".to_string(),
+            Some(json!({ "policyDocument": document })),
+            true,
+        ),
+        (
+            "CreateDomainConfiguration named within its pattern",
+            "POST",
+            "/domainConfigurations/probe.config-1".to_string(),
+            Some(json!({})),
+            true,
+        ),
+        (
+            // The audit create is still scaffolded, so what it answers past the
+            // validation layer is not asserted here; what matters is that a day of month
+            // within the pattern draws no constraint clause.
+            "CreateScheduledAudit on a day of month within its pattern",
+            "POST",
+            "/audit/scheduledaudits/probe_audit".to_string(),
+            Some(scheduled_audit_body("28")),
+            false,
+        ),
+        (
+            // A member inside the model's value set: whatever this operation answers, it
+            // is not the validation layer's envelope.
+            "DeleteV2LoggingLevel with a targetType the model declares",
+            "DELETE",
+            "/v2LoggingLevel?targetType=CLIENT_ID&targetName=probe".to_string(),
+            None,
+            false,
+        ),
+        (
+            // A version id inside the model's pattern: the refusal that follows is the
+            // operation's own, not a constraint clause.
+            "SetDefaultPolicyVersion on a numeric version id",
+            "PATCH",
+            "/policies/probe-policy/version/2".to_string(),
+            None,
+            false,
+        ),
+    ];
+
+    for (case, method, path, body, served) in rows {
+        let emulator = Emulator::new();
+        let reply = emulator.call(method, &path, body.as_ref()).await;
+        if served {
+            assert_eq!(
+                reply.status, 200,
+                "case {case:?}: expected the request to be served, got {} {:?}",
+                reply.status, reply.body
+            );
+        }
+        assert!(
+            !reply.message().starts_with("1 validation error detected"),
+            "case {case:?}: expected no constraint clause, got {} {:?}",
+            reply.status,
             reply.body
         );
     }

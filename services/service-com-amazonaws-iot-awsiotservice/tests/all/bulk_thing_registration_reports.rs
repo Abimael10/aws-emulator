@@ -45,8 +45,9 @@ const REGION: &str = "us-east-1";
 /// The bucket every input file below is staged in.
 const BUCKET: &str = "iot-bulk-registration-reports";
 
-/// The modelled error a refused listing carries (`@httpError 400`).
-const INVALID_REQUEST: &str = "InvalidRequestException";
+/// The modelled error a refused listing carries (`@httpError 400`), as this service NAMES
+/// it in `x-amzn-errortype`: the shape name, a `:`, and the service's API doc namespace.
+const INVALID_REQUEST: &str = "InvalidRequestException:http://iot.amazonaws.com/doc/2015-10-02/";
 
 /// The two values of the modelled `ReportType` enum
 /// (`smithy_query(query="shape",shape="ReportType")`).

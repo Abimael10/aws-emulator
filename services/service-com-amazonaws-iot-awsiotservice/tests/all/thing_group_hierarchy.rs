@@ -812,7 +812,7 @@ async fn a_parent_group_that_does_not_exist_is_refused() {
         );
         assert_eq!(
             created.error_code.as_deref(),
-            Some("InvalidRequestException"),
+            Some("InvalidRequestException:http://iot.amazonaws.com/doc/2015-10-02/"),
             "case {label:?}: expected InvalidRequestException, got {created:?}"
         );
 

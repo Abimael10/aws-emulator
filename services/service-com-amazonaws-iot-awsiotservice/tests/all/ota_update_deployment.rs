@@ -48,6 +48,11 @@ use smithy_server_runtime::MultiServiceRouter;
 const ACCOUNT_ID: &str = "000000000000";
 /// The region the harness signs for unless a case names another.
 const REGION: &str = "us-east-1";
+
+/// `InvalidRequestException` as this service NAMES it in `x-amzn-errortype`: the shape
+/// name, a `:`, and the service's API doc namespace.
+const QUALIFIED_INVALID_REQUEST: &str =
+    "InvalidRequestException:http://iot.amazonaws.com/doc/2015-10-02/";
 /// An IAM role ARN of the shape `CreateOTAUpdate$roleArn` is modelled with (len
 /// 20..2048); the operation neither assumes nor resolves it.
 const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/ota-update-role";
@@ -711,7 +716,7 @@ async fn a_refused_create_records_no_update_and_no_execution() {
             )]),
             files: one_file.clone(),
             status: 400,
-            code: "InvalidRequestException",
+            code: QUALIFIED_INVALID_REQUEST,
             message_carries: "billinggroup".to_string(),
         },
         RefusalCase {
@@ -720,8 +725,8 @@ async fn a_refused_create_records_no_update_and_no_execution() {
             targets: json!(["sensor-a"]),
             files: one_file.clone(),
             status: 400,
-            code: "InvalidRequestException",
-            message_carries: "is not an IoT thing or thing group ARN".to_string(),
+            code: QUALIFIED_INVALID_REQUEST,
+            message_carries: "Target ARN not in proper syntax.".to_string(),
         },
         RefusalCase {
             case: "a thing target whose name no request could address",
@@ -729,7 +734,7 @@ async fn a_refused_create_records_no_update_and_no_execution() {
             targets: json!([thing_arn(&too_long_name)]),
             files: one_file.clone(),
             status: 400,
-            code: "InvalidRequestException",
+            code: QUALIFIED_INVALID_REQUEST,
             message_carries: format!("1..{MAX_THING_NAME_LEN}"),
         },
         RefusalCase {
@@ -747,7 +752,7 @@ async fn a_refused_create_records_no_update_and_no_execution() {
             targets: json!([thing_arn("sensor-a")]),
             files: json!([{"fileName": "firmware.bin"}]),
             status: 400,
-            code: "InvalidRequestException",
+            code: QUALIFIED_INVALID_REQUEST,
             message_carries: "files[0].fileLocation".to_string(),
         },
         RefusalCase {
@@ -756,7 +761,7 @@ async fn a_refused_create_records_no_update_and_no_execution() {
             targets: json!([thing_arn("sensor-a")]),
             files: json!([s3_file("firmware.bin", "1.0.0"), {"fileLocation": {}}]),
             status: 400,
-            code: "InvalidRequestException",
+            code: QUALIFIED_INVALID_REQUEST,
             message_carries: "files[1].fileLocation".to_string(),
         },
         RefusalCase {
@@ -783,7 +788,7 @@ async fn a_refused_create_records_no_update_and_no_execution() {
             targets: json!([thing_arn("sensor-a")]),
             files: one_file.clone(),
             status: 400,
-            code: "InvalidRequestException",
+            code: QUALIFIED_INVALID_REQUEST,
             message_carries: format!("at most {MAX_OTA_UPDATE_ID_LEN} characters"),
         },
     ];
@@ -1025,7 +1030,7 @@ async fn deleting_an_ota_update_removes_the_job_it_deployed_and_its_executions()
             force_delete_aws_job: None,
             delete_stream: None,
             status: 400,
-            code: Some("InvalidRequestException"),
+            code: Some(QUALIFIED_INVALID_REQUEST),
         },
         DeletionCase {
             case: "a device still has the job queued, and the delete forces it",

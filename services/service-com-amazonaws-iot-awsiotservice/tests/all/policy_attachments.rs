@@ -35,6 +35,11 @@ use smithy_server_runtime::MultiServiceRouter;
 const ACCOUNT_ID: &str = "000000000000";
 /// The region the harness signs for.
 const REGION: &str = "us-east-1";
+
+/// `InvalidRequestException` as this service NAMES it in `x-amzn-errortype`: the shape
+/// name, a `:`, and the service's API doc namespace.
+const QUALIFIED_INVALID_REQUEST: &str =
+    "InvalidRequestException:http://iot.amazonaws.com/doc/2015-10-02/";
 /// An IoT policy document every policy in this suite is created with: the document is
 /// not what this suite is about, so one valid document serves every case.
 const POLICY_DOCUMENT: &str =
@@ -763,7 +768,7 @@ async fn a_recursive_listing_adds_the_policies_of_the_groups_above() {
     );
     assert_eq!(
         crossed.error_code.as_deref(),
-        Some("InvalidRequestException"),
+        Some(QUALIFIED_INVALID_REQUEST),
         "case the marker scope: expected InvalidRequestException, got {:?}",
         crossed.error_code
     );
@@ -888,7 +893,7 @@ async fn every_page_size_pages_the_same_set() {
         );
         assert_eq!(
             attached_page.error_code.as_deref(),
-            Some("InvalidRequestException"),
+            Some(QUALIFIED_INVALID_REQUEST),
             "case marker={marker:?}: expected InvalidRequestException, got {:?}",
             attached_page.error_code
         );
@@ -902,7 +907,7 @@ async fn every_page_size_pages_the_same_set() {
         );
         assert_eq!(
             targets_page.error_code.as_deref(),
-            Some("InvalidRequestException"),
+            Some(QUALIFIED_INVALID_REQUEST),
             "case marker={marker:?}: expected InvalidRequestException, got {:?}",
             targets_page.error_code
         );
@@ -1018,7 +1023,7 @@ async fn an_attachment_to_a_resource_that_does_not_exist_is_refused() {
         );
         assert_eq!(
             refused.error_code.as_deref(),
-            Some("InvalidRequestException"),
+            Some(QUALIFIED_INVALID_REQUEST),
             "case {label}: expected InvalidRequestException, got {:?}",
             refused.error_code
         );
@@ -1279,7 +1284,7 @@ async fn the_policy_target_plane_refusals_state_the_api_sentences() {
             );
             assert_eq!(
                 refused.error_code.as_deref(),
-                Some("InvalidRequestException"),
+                Some(QUALIFIED_INVALID_REQUEST),
                 "case {operation} with {label}: expected InvalidRequestException, got {:?}",
                 refused.error_code
             );

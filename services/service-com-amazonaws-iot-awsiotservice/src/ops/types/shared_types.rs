@@ -1659,7 +1659,7 @@ pub const LOG_LEVEL_VALUES: &[&str] = &["DEBUG", "DISABLED", "ERROR", "INFO", "W
 
 
 /// The values `LogTargetType` accepts on the wire.
-pub const LOG_TARGET_TYPE_VALUES: &[&str] = &["CLIENT_ID", "DEFAULT", "PRINCIPAL_ID", "SOURCE_IP", "THING_GROUP"];
+pub const LOG_TARGET_TYPE_VALUES: &[&str] = &["CLIENT_ID", "DEFAULT", "DEVICE_DEFENDER", "PRINCIPAL_ID", "SOURCE_IP", "THING_GROUP"];
 
 
 /// The values `MessageFormat` accepts on the wire.

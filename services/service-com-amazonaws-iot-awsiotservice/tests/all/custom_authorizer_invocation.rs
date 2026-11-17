@@ -146,7 +146,11 @@ struct Reply {
 }
 
 impl Reply {
-    /// The wire error code, with the namespace a `__type` member carries stripped.
+    /// The wire error SHAPE, with either namespace the wire carries stripped: the `#`
+    /// prefix of a `__type` member, and the `:`-separated API doc namespace this service
+    /// qualifies a shape name with in `x-amzn-errortype`. The rows below are about WHICH
+    /// shape a refusal names; how this service spells that name on the wire is pinned by
+    /// the suites that assert the header verbatim.
     fn code(&self) -> String {
         self.error_code
             .clone()
@@ -158,6 +162,9 @@ impl Reply {
             })
             .unwrap_or_default()
             .rsplit('#')
+            .next()
+            .unwrap_or_default()
+            .split(':')
             .next()
             .unwrap_or_default()
             .to_string()

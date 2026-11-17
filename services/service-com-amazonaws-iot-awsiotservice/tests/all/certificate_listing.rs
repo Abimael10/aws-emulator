@@ -584,7 +584,7 @@ async fn a_marker_this_listing_did_not_issue_is_refused() {
         );
         assert_eq!(
             refused.error_code.as_deref(),
-            Some("InvalidRequestException"),
+            Some("InvalidRequestException:http://iot.amazonaws.com/doc/2015-10-02/"),
             "case {label:?}: expected InvalidRequestException, got {refused:?}"
         );
         assert!(

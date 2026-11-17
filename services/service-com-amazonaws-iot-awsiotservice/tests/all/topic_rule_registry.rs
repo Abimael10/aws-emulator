@@ -609,7 +609,7 @@ async fn the_rules_store_is_bounded() {
         );
         assert_eq!(
             refused.error_code.as_deref(),
-            Some("InvalidRequestException"),
+            Some("InvalidRequestException:http://iot.amazonaws.com/doc/2015-10-02/"),
             "case {name:?}: expected InvalidRequestException, got {refused:?}"
         );
         // The refused create recorded nothing under that name.

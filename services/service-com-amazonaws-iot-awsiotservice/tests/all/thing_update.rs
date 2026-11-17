@@ -515,7 +515,7 @@ async fn a_thing_type_an_update_names_is_resolved_as_a_create_resolves_it() {
     );
     assert_eq!(
         refused.error_code.as_deref(),
-        Some("InvalidRequestException"),
+        Some("InvalidRequestException:http://iot.amazonaws.com/doc/2015-10-02/"),
         "expected InvalidRequestException, got {refused:?}"
     );
 
@@ -533,7 +533,7 @@ async fn a_thing_type_an_update_names_is_resolved_as_a_create_resolves_it() {
     );
     assert_eq!(
         contradictory.error_code.as_deref(),
-        Some("InvalidRequestException"),
+        Some("InvalidRequestException:http://iot.amazonaws.com/doc/2015-10-02/"),
         "expected InvalidRequestException, got {contradictory:?}"
     );
 

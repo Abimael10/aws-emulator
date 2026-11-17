@@ -40,9 +40,17 @@ pub fn policy_versions_limit_message(policy_name: &str) -> String {
     )
 }
 
-/// How a reader of ONE version refuses a `policyVersionId` the policy does not hold.
+/// How an operation that addresses ONE version of a policy refuses a `policyVersionId`
+/// the policy does not hold.
+///
+/// The POLICY VERSION family states that miss in the parenthesised form this crate's other
+/// refusal about one version already uses
+/// ([`default_policy_version_deletion_message`]): fixed text, then the policy and the
+/// version the request named as `name=` and `versionId=`. One sentence covers a read of a
+/// version, a delete of one and a re-pointing at one, so the three cannot word one miss
+/// three ways.
 pub fn missing_policy_version_message(policy_name: &str, policy_version_id: &str) -> String {
-    format!("Version {policy_version_id} of policy {policy_name} does not exist")
+    format!("Policy version does not exist (name={policy_name}, versionId={policy_version_id})")
 }
 
 /// How a reader of the policy's DEFAULT version refuses a name the registry does not

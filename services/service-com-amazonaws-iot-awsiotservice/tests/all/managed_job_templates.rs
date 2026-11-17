@@ -45,6 +45,11 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The region used wherever a case is not varying the region.
 const REGION: &str = "eu-west-2";
 
+/// `InvalidRequestException` as this service NAMES it in `x-amzn-errortype`: the shape
+/// name, a `:`, and the service's API doc namespace.
+const QUALIFIED_INVALID_REQUEST: &str =
+    "InvalidRequestException:http://iot.amazonaws.com/doc/2015-10-02/";
+
 /// The parameters EVERY managed template declares, because they are about running the
 /// device client's handler rather than about the action: where the handlers live and
 /// which user to run one as. Both are optional.
@@ -394,7 +399,7 @@ async fn a_filter_naming_no_published_template_is_refused() {
         );
         assert_eq!(
             reply.error_code.as_deref(),
-            Some("InvalidRequestException"),
+            Some(QUALIFIED_INVALID_REQUEST),
             "case {name:?}: expected InvalidRequestException, got {reply:?}"
         );
         assert_eq!(
@@ -470,7 +475,7 @@ async fn a_token_of_another_listing_or_of_no_listing_is_refused() {
     );
     assert_eq!(
         filtered.error_code.as_deref(),
-        Some("InvalidRequestException"),
+        Some(QUALIFIED_INVALID_REQUEST),
         "case token of another listing: expected InvalidRequestException, got {filtered:?}"
     );
 
@@ -493,7 +498,7 @@ async fn a_token_of_another_listing_or_of_no_listing_is_refused() {
         );
         assert_eq!(
             reply.error_code.as_deref(),
-            Some("InvalidRequestException"),
+            Some(QUALIFIED_INVALID_REQUEST),
             "case {case:?}: expected InvalidRequestException, got {reply:?}"
         );
     }
@@ -671,7 +676,7 @@ async fn describe_selects_the_version_and_defaults_to_the_published_one() {
                     );
                     assert_eq!(
                         reply.error_code.as_deref(),
-                        Some("InvalidRequestException"),
+                        Some(QUALIFIED_INVALID_REQUEST),
                         "case {name:?}/{case}: expected InvalidRequestException, got {reply:?}"
                     );
                     assert_eq!(
@@ -700,7 +705,7 @@ async fn describing_a_template_the_catalog_does_not_publish_is_refused() {
         );
         assert_eq!(
             reply.error_code.as_deref(),
-            Some("InvalidRequestException"),
+            Some(QUALIFIED_INVALID_REQUEST),
             "case {name:?}: expected InvalidRequestException, got {reply:?}"
         );
         assert_eq!(

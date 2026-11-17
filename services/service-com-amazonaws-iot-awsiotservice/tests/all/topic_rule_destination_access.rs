@@ -240,7 +240,10 @@ async fn a_value_that_is_not_an_arn_is_refused_as_a_malformed_arn() {
             let refused = addressed.call(&emulator, value).await;
             assert_eq!(
                 (refused.status, refused.error_code.as_deref()),
-                (400, Some("InvalidRequestException")),
+                (
+                    400,
+                    Some("InvalidRequestException:http://iot.amazonaws.com/doc/2015-10-02/"),
+                ),
                 "case {case:?} on {addressed:?}: expected a malformed ARN to be refused \
                  400 InvalidRequestException, got {} {:?}",
                 refused.status,
@@ -296,7 +299,10 @@ async fn an_arn_of_another_account_is_refused() {
             let refused = addressed.call(&emulator, &arn).await;
             assert_eq!(
                 (refused.status, refused.error_code.as_deref()),
-                (400, Some("InvalidRequestException")),
+                (
+                    400,
+                    Some("InvalidRequestException:http://iot.amazonaws.com/doc/2015-10-02/"),
+                ),
                 "case {case:?} on {addressed:?}: expected an ARN of another account to be \
                  refused 400 InvalidRequestException, got {} {:?}",
                 refused.status,
@@ -561,7 +567,10 @@ async fn a_confirmation_url_that_is_no_https_url_is_refused() {
         let refused = emulator.create_http_destination(url).await;
         assert_eq!(
             (refused.status, refused.error_code.as_deref()),
-            (400, Some("InvalidRequestException")),
+            (
+                400,
+                Some("InvalidRequestException:http://iot.amazonaws.com/doc/2015-10-02/"),
+            ),
             "case {case:?}: expected the create to be refused 400 InvalidRequestException, \
              got {} {:?}",
             refused.status,

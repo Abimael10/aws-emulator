@@ -461,7 +461,7 @@ async fn a_document_that_cannot_be_resolved_is_refused_before_the_job_exists() {
     );
     assert_eq!(
         oversized_reply.error_code.as_deref(),
-        Some("InvalidRequestException"),
+        Some("InvalidRequestException:http://iot.amazonaws.com/doc/2015-10-02/"),
         "case \"a resolved document past the maximum\": expected InvalidRequestException, got {:?}",
         oversized_reply.error_code
     );

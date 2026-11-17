@@ -565,7 +565,7 @@ async fn an_attribute_value_without_an_attribute_name_is_refused() {
         );
         assert_eq!(
             listed.error_code.as_deref(),
-            Some("InvalidRequestException"),
+            Some("InvalidRequestException:http://iot.amazonaws.com/doc/2015-10-02/"),
             "case {label:?}: must be refused InvalidRequestException, got {listed:?}"
         );
     }
@@ -714,7 +714,7 @@ async fn a_next_token_this_listing_did_not_issue_is_refused() {
         );
         assert_eq!(
             refused.error_code.as_deref(),
-            Some("InvalidRequestException"),
+            Some("InvalidRequestException:http://iot.amazonaws.com/doc/2015-10-02/"),
             "case {label:?}: must be refused InvalidRequestException, got {refused:?}"
         );
     }

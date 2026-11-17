@@ -643,7 +643,10 @@ async fn a_job_in_a_terminal_status_cannot_be_canceled() {
                 .await;
             assert_eq!(
                 (refused.status, refused.error_code.as_deref()),
-                (400, Some("InvalidRequestException")),
+                (
+                    400,
+                    Some("InvalidRequestException:http://iot.amazonaws.com/doc/2015-10-02/"),
+                ),
                 "case {case:?} (force={force}): expected a 400 InvalidRequestException, \
                  got {} {:?}",
                 refused.status,

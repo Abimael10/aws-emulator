@@ -602,7 +602,7 @@ async fn an_attachment_to_a_principal_that_does_not_exist_is_refused() {
         );
         assert_eq!(
             refused.error_code.as_deref(),
-            Some("InvalidRequestException"),
+            Some("InvalidRequestException:http://iot.amazonaws.com/doc/2015-10-02/"),
             "case {label}: expected InvalidRequestException, got {:?}",
             refused.error_code
         );

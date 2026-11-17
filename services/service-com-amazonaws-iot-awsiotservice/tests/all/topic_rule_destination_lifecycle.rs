@@ -75,6 +75,11 @@ const REGION: &str = "us-east-1";
 /// The account id every emulated ARN carries (`emulator_server::EMULATOR_ACCOUNT_ID`).
 const ACCOUNT_ID: &str = "000000000000";
 
+/// `InvalidRequestException` as this service NAMES it in `x-amzn-errortype`: the shape
+/// name, a `:`, and the service's API doc namespace.
+const QUALIFIED_INVALID_REQUEST: &str =
+    "InvalidRequestException:http://iot.amazonaws.com/doc/2015-10-02/";
+
 /// How long a challenge or a delivery is waited for before a case fails: far longer than
 /// anything this emulator takes, so a slow machine does not fail a case.
 const ARRIVAL_DEADLINE: Duration = Duration::from_secs(10);
@@ -991,7 +996,7 @@ async fn a_requested_challenge_supersedes_the_token_the_last_one_carried() {
     let stale = emulator.confirm_destination(&first).await;
     assert_eq!(
         (stale.status, stale.error_code.as_deref()),
-        (400, Some("InvalidRequestException")),
+        (400, Some(QUALIFIED_INVALID_REQUEST)),
         "case {case:?}: expected the superseded token to confirm nothing, got {} {:?}",
         stale.status,
         stale.body
@@ -1255,7 +1260,7 @@ async fn a_request_no_destination_can_serve_is_refused_with_a_modelled_error() {
         ),
         (
             400,
-            Some("InvalidRequestException"),
+            Some(QUALIFIED_INVALID_REQUEST),
             "Invalid confirmation token.".to_string()
         ),
         "an unknown token must be refused, got {} {:?}",
@@ -1275,7 +1280,7 @@ async fn a_request_no_destination_can_serve_is_refused_with_a_modelled_error() {
         let refused = emulator.update_destination(&arn, status).await;
         assert_eq!(
             (refused.status, refused.error_code.as_deref()),
-            (400, Some("InvalidRequestException")),
+            (400, Some(QUALIFIED_INVALID_REQUEST)),
             "case {case:?}: expected {status} to be refused, got {} {:?}",
             refused.status,
             refused.body
@@ -1346,7 +1351,7 @@ async fn a_request_no_destination_can_serve_is_refused_with_a_modelled_error() {
         let refused = emulator.create_destination(&configuration).await;
         assert_eq!(
             (refused.status, refused.error_code.as_deref()),
-            (400, Some("InvalidRequestException")),
+            (400, Some(QUALIFIED_INVALID_REQUEST)),
             "case {case:?}: expected the create to be refused, got {} {:?}",
             refused.status,
             refused.body

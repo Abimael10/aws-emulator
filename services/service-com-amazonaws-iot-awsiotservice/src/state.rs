@@ -1496,6 +1496,15 @@ pub fn parse_job_target(target_arn: &str) -> Result<JobTarget, JobTargetRejectio
 /// answers the modelled `LimitExceededException`.
 pub const MAX_JOB_TARGETS: usize = 100;
 
+/// How this service refuses a `targets` entry that is no IoT resource ARN at all.
+///
+/// FIXED text about the ARN's SYNTAX, interpolating nothing: the entry is not an
+/// `arn:<partition>:iot:<region>:<account>:<type>/<name>`, which is a statement about
+/// the FORM a target takes and not about the value one request happened to send, so the
+/// value is not echoed back. Every operation that resolves `targets` states it
+/// ([`resolve_job_targets`]).
+pub const TARGET_ARN_SYNTAX_MESSAGE: &str = "Target ARN not in proper syntax.";
+
 /// Why a request's `targets` cannot be turned into job executions.
 ///
 /// Each variant carries the message the refusal states and names the modelled error
@@ -1570,9 +1579,9 @@ pub fn resolve_job_targets(targets: &[String]) -> Result<JobTargetFanout, JobTar
                 )));
             }
             Err(JobTargetRejection::NotAnIotResourceArn) => {
-                return Err(JobTargetsRefusal::Invalid(format!(
-                    "{target_arn} is not an IoT thing or thing group ARN"
-                )));
+                return Err(JobTargetsRefusal::Invalid(
+                    TARGET_ARN_SYNTAX_MESSAGE.to_string(),
+                ));
             }
         }
     }
@@ -3707,9 +3716,19 @@ pub fn to_job_execution_summary_for_thing(
 /// of the constant the documentation does not fix.
 pub const COMMAND_EXECUTION_RETENTION_SECONDS: i64 = 6 * 30 * 24 * 60 * 60;
 
-/// The DEVICE a command-execution request names, or the reason the supplied value
-/// names none — the message the caller reports with its modelled
-/// `ValidationException`.
+/// How this service refuses a command-execution `targetArn` that names no DEVICE.
+///
+/// FIXED text naming the MEMBER that was not accepted, interpolating nothing. The sentence
+/// is about the member rather than about how the service read the value, so it is the same
+/// answer for every way a value fails to name a device — a thing GROUP, another IoT
+/// resource type, a value that is no IoT resource ARN at all, and a `thing/` ARN whose name
+/// no request could address are each "this `targetArn` is not a device". Keeping a per-branch
+/// reading in it would put a part of the request back into the response, which is what the
+/// member-naming form exists to avoid, and would make one member's refusal four sentences.
+pub const INVALID_COMMAND_EXECUTION_TARGET_MESSAGE: &str = "Invalid targetArn";
+
+/// The DEVICE a command-execution request names, or the message the caller reports with
+/// its modelled `ValidationException` when the supplied value names none.
 ///
 /// `GetCommandExecution$targetArn` and `DeleteCommandExecution$targetArn` are "the
 /// ARN of the device on which the command execution is being performed" / "of the
@@ -3717,22 +3736,18 @@ pub const COMMAND_EXECUTION_RETENTION_SECONDS: i64 = 6 * 30 * 24 * 60 * 60;
 /// thing GROUP, any other IoT resource type, and a value that is no IoT resource ARN
 /// at all name no device, so the request is refused rather than answered from some
 /// other resource's executions. The parse is [`parse_job_target`], the one rule this
-/// service reads a caller-supplied IoT target ARN with, and the wording is the one the
-/// IoT Jobs data plane refuses `StartCommandExecution$targetArn` with, so the two
-/// planes read one ARN the same way and say the same thing about it.
+/// service reads a caller-supplied IoT target ARN with; the refusal is
+/// [`INVALID_COMMAND_EXECUTION_TARGET_MESSAGE`] whichever of those a value is, so the
+/// reader and the delete of one execution say the same thing about one member.
 pub fn command_execution_target(target_arn: &str) -> Result<String, String> {
-    let unsupported = |reading: String| format!("{reading} not supported as a target");
-    let invalid_arn = || unsupported(format!("Invalid target arn {target_arn}"));
     match parse_job_target(target_arn) {
         Ok(JobTarget::Thing(thing_name)) => Ok(thing_name),
-        Ok(JobTarget::ThingGroup(_)) => Err(unsupported("Resource type thinggroup".to_string())),
-        Err(JobTargetRejection::UnsupportedResourceType(resource_type)) => {
-            Err(unsupported(format!("Resource type {resource_type}")))
-        }
-        Err(JobTargetRejection::NotAnIotResourceArn) => Err(invalid_arn()),
-        Err(JobTargetRejection::UnaddressableName(_)) => Err(format!(
-            "targetArn names a thing whose name is not 1..{MAX_THING_NAME_LEN} characters matching ^[a-zA-Z0-9:_-]+$"
-        )),
+        Ok(JobTarget::ThingGroup(_))
+        | Err(
+            JobTargetRejection::UnsupportedResourceType(_)
+            | JobTargetRejection::NotAnIotResourceArn
+            | JobTargetRejection::UnaddressableName(_),
+        ) => Err(INVALID_COMMAND_EXECUTION_TARGET_MESSAGE.to_string()),
     }
 }
 

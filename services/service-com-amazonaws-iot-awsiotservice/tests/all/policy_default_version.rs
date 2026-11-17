@@ -442,28 +442,57 @@ async fn the_generation_token_follows_what_the_policy_holds() {
     );
 }
 
-/// RULE: a policy — or a version of one — the account does not hold is a 404, and nothing
-/// is written.
+/// RULE: a policy — or a version of one — the account does not hold is a 404 whose
+/// sentence names what was missing, and nothing is written.
 #[tokio::test]
 async fn pointing_at_what_the_account_does_not_hold_is_not_found() {
     let emulator = Emulator::new();
     let case = "a policy with one version";
     emulator.create_policy(case, "only-one").await;
 
-    // (case, the policy named, the version named)
+    // (case, the policy named, the version named, the sentence it must answer). The
+    // POLICY miss and the VERSION miss are two sentences: the policy family's names the
+    // resource, and the version family's names the policy and the version it addressed as
+    // `name=` / `versionId=`, both written out here rather than taken from the crate.
     let rows = [
-        ("a policy the account does not hold", "never-created", "1"),
-        ("another name the account does not hold", "other", "9"),
-        ("a version the policy does not hold", "only-one", "2"),
-        ("a far higher version", "only-one", "99"),
+        (
+            "a policy the account does not hold",
+            "never-created",
+            "1",
+            "Policy never-created does not exist".to_string(),
+        ),
+        (
+            "another name the account does not hold",
+            "other",
+            "9",
+            "Policy other does not exist".to_string(),
+        ),
+        (
+            "a version the policy does not hold",
+            "only-one",
+            "2",
+            "Policy version does not exist (name=only-one, versionId=2)".to_string(),
+        ),
+        (
+            "a far higher version",
+            "only-one",
+            "99",
+            "Policy version does not exist (name=only-one, versionId=99)".to_string(),
+        ),
     ];
-    for (label, policy_name, version_id) in rows {
+    for (label, policy_name, version_id, message) in rows {
         let refused = emulator.set_default(policy_name, version_id).await;
         assert_eq!(
             refused.status,
             404,
             "case {label}: expected 404, got {} body {}",
             refused.status,
+            refused.text()
+        );
+        assert_eq!(
+            refused.member("message"),
+            message,
+            "case {label}: expected the message {message:?}, got {}",
             refused.text()
         );
         assert_eq!(

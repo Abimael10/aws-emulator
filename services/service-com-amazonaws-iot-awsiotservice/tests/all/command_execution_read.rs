@@ -19,7 +19,9 @@
 //!   `lastUpdatedAt`, `startedAt` (only once a device took it up), `completedAt` (only
 //!   once it finished), `executionTimeoutSeconds` and `timeToLive` — and reading it
 //!   twice gives the same answer;
-//! * a `targetArn` that names no DEVICE is refused 400 `ValidationException`, and an
+//! * a `targetArn` that names no DEVICE is refused 400 `ValidationException` with AWS's
+//!   FIXED sentence for that member — `Invalid targetArn`, naming the member and echoing
+//!   no part of the request — and an
 //!   `executionId` the device holds no command execution under is 404
 //!   `ResourceNotFoundException`;
 //! * an execution whose armed timeout the clock has already passed is reported
@@ -621,7 +623,8 @@ async fn a_stored_command_execution_is_read_back_from_the_shared_store() {
 }
 
 /// RULE: a `targetArn` that does not name a DEVICE names no queue of command
-/// executions, so the request is refused 400 `ValidationException` and nothing is read.
+/// executions, so the request is refused 400 `ValidationException` with AWS's fixed
+/// sentence for that member and nothing is read.
 #[tokio::test]
 async fn a_target_that_names_no_device_is_refused() {
     let emulator = Emulator::new();
@@ -701,10 +704,15 @@ async fn a_target_that_names_no_device_is_refused() {
                 "case {case:?}: {operation} must refuse a target that names no device, \
                  got {reply:?}"
             );
-            assert!(
-                !reply.message().is_empty(),
-                "case {case:?}: {operation}'s refusal must say how the value was read, \
-                 got {reply:?}"
+            // The sentence is AWS's, spelled out here rather than taken from the code
+            // under test: fixed text naming the MEMBER, with no part of the request in
+            // it, so every row — another resource type, another service's ARN, a value
+            // that is no ARN at all, a name no request could address — reads the same.
+            assert_eq!(
+                reply.message(),
+                "Invalid targetArn",
+                "case {case:?}: {operation}'s refusal must state AWS's fixed sentence for \
+                 this member, got {reply:?}"
             );
         }
     }

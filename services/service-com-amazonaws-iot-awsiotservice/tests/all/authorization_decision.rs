@@ -48,6 +48,12 @@ fn signed_for_iot() -> String {
     )
 }
 
+/// `InvalidRequestException` as this service NAMES it in `x-amzn-errortype`: the shape
+/// name, a `:`, and the service's API doc namespace, which is the form a restJson1 client
+/// resolves this service's refusal shape from.
+const QUALIFIED_INVALID_REQUEST: &str =
+    "InvalidRequestException:http://iot.amazonaws.com/doc/2015-10-02/";
+
 /// One response, reduced to what a client branches on.
 #[derive(Debug)]
 struct Reply {
@@ -1274,7 +1280,7 @@ async fn an_identity_or_policy_the_account_does_not_hold_is_refused() {
             "a principal of no supported form",
             json!({ "principal": "not-a-principal", "authInfos": question }),
             400,
-            "InvalidRequestException",
+            QUALIFIED_INVALID_REQUEST,
             "Invalid Target".to_string(),
         ),
         (
@@ -1291,7 +1297,7 @@ async fn an_identity_or_policy_the_account_does_not_hold_is_refused() {
             "a cognitoIdentityPoolId of no supported form",
             json!({ "cognitoIdentityPoolId": "nope", "authInfos": question }),
             400,
-            "InvalidRequestException",
+            QUALIFIED_INVALID_REQUEST,
             "Invalid CognitoIdentityPoolId: nope. A Cognito identity pool id has the form \
              region:id"
                 .to_string(),

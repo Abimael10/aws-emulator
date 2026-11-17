@@ -36,6 +36,11 @@ const ACCOUNT_ID: &str = "000000000000";
 /// The region the harness signs for.
 const REGION: &str = "us-east-1";
 
+/// `InvalidRequestException` as this service NAMES it in `x-amzn-errortype`: the shape
+/// name, a `:`, and the service's API doc namespace.
+const QUALIFIED_INVALID_REQUEST: &str =
+    "InvalidRequestException:http://iot.amazonaws.com/doc/2015-10-02/";
+
 /// A SigV4 `Authorization` header whose credential scope names the `iot` signing name and
 /// the region: the scope is how the router picks the claiming service, and how the service
 /// picks the region its ARNs are scoped to. The signature itself is never checked here —
@@ -725,7 +730,7 @@ async fn effective_policies_refuse_a_request_that_names_no_resolvable_device() {
             cognito_identity_pool_id: Some(pool_id.clone()),
             thing_name: None,
             status: 400,
-            error_code: "InvalidRequestException",
+            error_code: QUALIFIED_INVALID_REQUEST,
             message: "Principal must be null if CognitoIdentityPoolId is provided.".to_string(),
         },
         RefusalCase {
@@ -734,7 +739,7 @@ async fn effective_policies_refuse_a_request_that_names_no_resolvable_device() {
             cognito_identity_pool_id: Some(pool_id.clone()),
             thing_name: Some("sensor-7"),
             status: 400,
-            error_code: "InvalidRequestException",
+            error_code: QUALIFIED_INVALID_REQUEST,
             message: "Principal must be null if CognitoIdentityPoolId is provided.".to_string(),
         },
         RefusalCase {
@@ -743,7 +748,7 @@ async fn effective_policies_refuse_a_request_that_names_no_resolvable_device() {
             cognito_identity_pool_id: None,
             thing_name: None,
             status: 400,
-            error_code: "InvalidRequestException",
+            error_code: QUALIFIED_INVALID_REQUEST,
             message: "Principal, CognitoIdentityPoolId or thingName must be provided."
                 .to_string(),
         },
@@ -753,7 +758,7 @@ async fn effective_policies_refuse_a_request_that_names_no_resolvable_device() {
             cognito_identity_pool_id: None,
             thing_name: None,
             status: 400,
-            error_code: "InvalidRequestException",
+            error_code: QUALIFIED_INVALID_REQUEST,
             // No address was read out of the value, so the refusal names nothing.
             message: "Invalid Target".to_string(),
         },
@@ -765,7 +770,7 @@ async fn effective_policies_refuse_a_request_that_names_no_resolvable_device() {
             cognito_identity_pool_id: None,
             thing_name: None,
             status: 400,
-            error_code: "InvalidRequestException",
+            error_code: QUALIFIED_INVALID_REQUEST,
             message: format!("Invalid Target: arn:aws:iot:{REGION}:{ACCOUNT_ID}:thing/sensor-7"),
         },
         RefusalCase {
@@ -774,7 +779,7 @@ async fn effective_policies_refuse_a_request_that_names_no_resolvable_device() {
             cognito_identity_pool_id: Some("not-a-pool".to_string()),
             thing_name: None,
             status: 400,
-            error_code: "InvalidRequestException",
+            error_code: QUALIFIED_INVALID_REQUEST,
             message: "Invalid CognitoIdentityPoolId: not-a-pool. A Cognito identity pool id \
                       has the form region:id"
                 .to_string(),

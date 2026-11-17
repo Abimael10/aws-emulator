@@ -45,8 +45,9 @@ use crate::topic_rule_kinesis_action::{form_encode, xml_text};
 /// one Region label serves every call here.
 const REGION: &str = "us-east-1";
 
-/// The modelled error a refused start carries (`@httpError 400`).
-const INVALID_REQUEST: &str = "InvalidRequestException";
+/// The modelled error a refused start carries (`@httpError 400`), as this service NAMES it
+/// in `x-amzn-errortype`: the shape name, a `:`, and the service's API doc namespace.
+const INVALID_REQUEST: &str = "InvalidRequestException:http://iot.amazonaws.com/doc/2015-10-02/";
 
 /// The modelled error a read of a task nobody started carries (`@httpError 404`).
 const NOT_FOUND: &str = "ResourceNotFoundException";

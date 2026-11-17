@@ -573,7 +573,10 @@ async fn pages_walk_every_execution_exactly_once() {
         let listed = emulator.list_with_query(thing, query).await;
         assert_eq!(
             (listed.status, listed.error_code.as_deref()),
-            (400, Some("InvalidRequestException")),
+            (
+                400,
+                Some("InvalidRequestException:http://iot.amazonaws.com/doc/2015-10-02/"),
+            ),
             "case {case:?}: expected 400 InvalidRequestException, got {} {:?} with {:?}",
             listed.status,
             listed.error_code,

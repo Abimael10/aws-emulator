@@ -40,7 +40,7 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 //!
-//! ## The error shape a request-validation refusal names
+//! ## The error shapes this service names with its API doc namespace
 //!
 //! AWS IoT names `InvalidRequestException` in `x-amzn-errortype` QUALIFIED with the
 //! service's API doc namespace ([`IOT_DOC_NAMESPACE`]) — the shape name, a `:`, and the
@@ -48,11 +48,13 @@
 //! names `SqlParseException` the same way. Every OTHER error shape of this service is
 //! named bare, which is what the framework's serializer already writes.
 //!
-//! `override_operation` below therefore serves the operations that refuse with one of
-//! those shapes — a value outside what the service recognises, a precondition of the plane
-//! that owns the resource, and a rule's SQL statement that cannot be parsed — behind
-//! [`ValidationRefusalErrorType`], each with the shape IT is known to qualify, which that
-//! wrapper qualifies on the way out while changing nothing else about the response.
+//! It is the SHAPE that is named that way, not the layer that answered it, so the name is
+//! the same wherever one of those two shapes comes from: the service's own validation
+//! layer refusing a request before any handler ran ([`validation`]), or a handler refusing
+//! one on a precondition only it can see. Every request of this service is therefore served
+//! behind [`ShapeNamespacedErrorType`], which qualifies those two names on the way out and
+//! changes nothing else about the response — a success, a not-found, a conflict and a
+//! server fault answer exactly what they answered without it.
 //!
 //! ## The authorization decision in front of every operation
 //!
@@ -66,7 +68,7 @@
 //! routing key names.
 
 use smithy_server_runtime::{
-    http, BoxFuture, ErasedOperation, Operation, OperationContext, Refusal, Refused, Service,
+    http, BoxFuture, ErasedOperation, OperationContext, Refusal, Refused, Service,
 };
 use std::sync::Arc;
 
@@ -89,31 +91,32 @@ const INVALID_REQUEST_EXCEPTION: &str = "InvalidRequestException";
 /// The error shape AWS IoT refuses a rule whose SQL statement it cannot parse with.
 const SQL_PARSE_EXCEPTION: &str = "SqlParseException";
 
-/// The namespace AWS IoT's validation layer qualifies an error-shape name with in
-/// [`ERROR_TYPE_HEADER`], appended after a `:`.
+/// The namespace AWS IoT qualifies an error-shape name with in [`ERROR_TYPE_HEADER`],
+/// appended after a `:`.
 ///
 /// It is the service's published API doc namespace, a fixed string: nothing of a request
 /// or of this emulator's state goes into it.
 const IOT_DOC_NAMESPACE: &str = "http://iot.amazonaws.com/doc/2015-10-02/";
 
-/// One modelled operation whose request-validation refusal is named the way AWS IoT's
-/// validation layer names it: the error shape qualified with [`IOT_DOC_NAMESPACE`].
+/// What this service serves a request behind so that the error SHAPE a refusal names is
+/// named the way AWS IoT names it: a shape of `qualified` carries [`IOT_DOC_NAMESPACE`],
+/// and every other shape keeps the bare name the framework's serializer writes.
 ///
-/// WHICH shapes are qualified is given per operation, because it is per operation that it
-/// is known: each entry of `qualified` is a shape this service's recorded responses name
-/// qualified for THIS operation, and a shape not named there keeps the bare name the
-/// framework's serializer writes.
+/// `qualified` is a property of the SHAPE rather than of an operation — the namespace is
+/// the one the shape is declared in — so one wrapper holding the shapes this service
+/// qualifies serves every operation of it, and no operation has to be named here to be
+/// answered correctly.
 ///
 /// Nothing else is re-implemented — the request is served by the generated
 /// [`ErasedOperation::run`], which owns deserialize -> validate -> handle -> serialize and
 /// every modelled error — and nothing but the one header is touched, so a success, a
 /// not-found and a server fault answer exactly what they answered before.
-pub struct ValidationRefusalErrorType<O> {
+pub struct ShapeNamespacedErrorType<O> {
     operation: O,
     qualified: &'static [&'static str],
 }
 
-impl<O> ValidationRefusalErrorType<O> {
+impl<O> ShapeNamespacedErrorType<O> {
     /// Serve `operation`, already constructed from the shared engine, behind this
     /// wrapper, qualifying the error shapes `qualified` names.
     pub fn new(operation: O, qualified: &'static [&'static str]) -> Self {
@@ -124,7 +127,7 @@ impl<O> ValidationRefusalErrorType<O> {
     }
 }
 
-impl<O: ErasedOperation> ErasedOperation for ValidationRefusalErrorType<O> {
+impl<O: ErasedOperation> ErasedOperation for ShapeNamespacedErrorType<O> {
     fn run<'r>(
         &'r self,
         svc: &'r dyn Service,
@@ -152,8 +155,8 @@ impl<O: ErasedOperation> ErasedOperation for ValidationRefusalErrorType<O> {
     }
 }
 
-/// An error shape as AWS IoT's validation layer names it in [`ERROR_TYPE_HEADER`]: the
-/// shape name, a `:`, and the service's API doc namespace.
+/// An error shape as AWS IoT names it in [`ERROR_TYPE_HEADER`]: the shape name, a `:`, and
+/// the service's API doc namespace.
 fn qualified_error_shape(shape: &str) -> String {
     format!("{shape}:{IOT_DOC_NAMESPACE}")
 }
@@ -166,37 +169,18 @@ fn qualified_error_shape(shape: &str) -> String {
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
     /// THE AUTHORIZATION GATE every request of this service passes through, which serves the
-    /// modelled operation the request named once IAM permits the action ([`AuthorizationGate`]).
-    gate: AuthorizationGate<Eng>,
-    /// The fleet-index reader, served behind [`ValidationRefusalErrorType`]: the
-    /// `indexName` this service does not recognise is refused `InvalidRequestException`,
-    /// so the refusal names that shape the way this service names it.
-    describe_index: ValidationRefusalErrorType<AuthorizationGate<Eng>>,
-    /// The authorizer delete, served behind [`ValidationRefusalErrorType`] for the same
-    /// reason: an authorizer the account still has in service is refused
-    /// `InvalidRequestException`.
-    delete_authorizer: ValidationRefusalErrorType<AuthorizationGate<Eng>>,
-    /// The fleet-indexing writer, served behind [`ValidationRefusalErrorType`] for the
-    /// same reason: a configuration whose members contradict each other is refused
-    /// `InvalidRequestException`.
-    update_indexing_configuration: ValidationRefusalErrorType<AuthorizationGate<Eng>>,
-    /// The topic-rule create, served behind [`ValidationRefusalErrorType`] because a
-    /// rule whose SQL statement cannot be parsed is refused `SqlParseException`, which
-    /// this service names qualified in the same way. Its OTHER refusals keep the bare
-    /// shape name: a create refused because the rule already exists names
-    /// `ResourceAlreadyExistsException` unqualified.
-    create_topic_rule: ValidationRefusalErrorType<AuthorizationGate<Eng>>,
-    /// The topic-rule replace, served behind [`ValidationRefusalErrorType`] because it
-    /// reads a statement under exactly the same rule as the create.
-    replace_topic_rule: ValidationRefusalErrorType<AuthorizationGate<Eng>>,
-    /// The policy create, served behind [`ValidationRefusalErrorType`] because a request
-    /// that breaks a modelled constraint — one carrying no `policyDocument` at all — is
-    /// refused `InvalidRequestException` by this service's validation layer
-    /// (`service::validation`), which names that shape qualified. Its other refusals keep
-    /// the bare shape name: a document that is no policy names
-    /// `MalformedPolicyException` unqualified.
-    create_policy: ValidationRefusalErrorType<AuthorizationGate<Eng>>,
+    /// modelled operation the request named once IAM permits the action
+    /// ([`AuthorizationGate`]) — behind the one wrapper that names this service's two
+    /// namespace-qualified error shapes ([`ShapeNamespacedErrorType`]), so a refusal of ANY
+    /// operation names its shape the way AWS IoT names it.
+    gate: ShapeNamespacedErrorType<AuthorizationGate<Eng>>,
 }
+
+/// The error shapes of this service that are named QUALIFIED with its API doc namespace in
+/// [`ERROR_TYPE_HEADER`], whichever operation answers one and whichever layer of it did:
+/// the legacy IoT exception the service refuses a request it will not accept with, and the
+/// one it refuses an unparsable rule statement with.
+const NAMESPACED_ERROR_SHAPES: &[&str] = &[INVALID_REQUEST_EXCEPTION, SQL_PARSE_EXCEPTION];
 
 /// THE GATE every request this service serves passes through, as an operation the dispatch
 /// path can run: whether IAM permits the ACTION the request named
@@ -285,33 +269,12 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
-            gate: AuthorizationGate::new(Arc::clone(&engine)),
-            // The SAME shared engine the entry's own operations were constructed from, so the
-            // gate behind each wrapper reads the one store — and the operation it hands an
-            // authorized request to is the entry's own, off this service's routing table.
-            describe_index: ValidationRefusalErrorType::new(
-                AuthorizationGate::new(Arc::clone(&engine)),
-                &[INVALID_REQUEST_EXCEPTION],
-            ),
-            delete_authorizer: ValidationRefusalErrorType::new(
-                AuthorizationGate::new(Arc::clone(&engine)),
-                &[INVALID_REQUEST_EXCEPTION],
-            ),
-            update_indexing_configuration: ValidationRefusalErrorType::new(
-                AuthorizationGate::new(Arc::clone(&engine)),
-                &[INVALID_REQUEST_EXCEPTION],
-            ),
-            create_topic_rule: ValidationRefusalErrorType::new(
-                AuthorizationGate::new(Arc::clone(&engine)),
-                &[SQL_PARSE_EXCEPTION],
-            ),
-            replace_topic_rule: ValidationRefusalErrorType::new(
-                AuthorizationGate::new(Arc::clone(&engine)),
-                &[SQL_PARSE_EXCEPTION],
-            ),
-            create_policy: ValidationRefusalErrorType::new(
+            // The SAME shared engine the entry's own operations were constructed from, so
+            // the gate reads the one store — and the operation it hands an authorized
+            // request to is the entry's own, off this service's routing table.
+            gate: ShapeNamespacedErrorType::new(
                 AuthorizationGate::new(engine),
-                &[INVALID_REQUEST_EXCEPTION],
+                NAMESPACED_ERROR_SHAPES,
             ),
         }
     }
@@ -347,32 +310,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // the model's own routing key names, so a key the model does not name resolves to
         // `None` here exactly as it does in the generated table.
         //
-        // The operations that refuse with `InvalidRequestException` are served behind
-        // `ValidationRefusalErrorType` (see the module docs), which names that shape the
-        // way this service names it: qualified with its API doc namespace. The wrapper wraps
-        // the gate, so those operations take the same decision first and their refusal — the
-        // authorization layer's `AccessDeniedException`, which is not one of the shapes this
-        // service qualifies — passes through it untouched.
-        let key = self.entry.protocol().routing_key(req).ok()?;
-        if key == crate::ops::describe_index::DescribeIndex::<Eng>::NAME {
-            return Some(&self.describe_index as &dyn ErasedOperation);
-        }
-        if key == crate::ops::delete_authorizer::DeleteAuthorizer::<Eng>::NAME {
-            return Some(&self.delete_authorizer as &dyn ErasedOperation);
-        }
-        if key
-            == crate::ops::update_indexing_configuration::UpdateIndexingConfiguration::<Eng>::NAME
-        {
-            return Some(&self.update_indexing_configuration as &dyn ErasedOperation);
-        }
-        if key == crate::ops::create_topic_rule::CreateTopicRule::<Eng>::NAME {
-            return Some(&self.create_topic_rule as &dyn ErasedOperation);
-        }
-        if key == crate::ops::replace_topic_rule::ReplaceTopicRule::<Eng>::NAME {
-            return Some(&self.replace_topic_rule as &dyn ErasedOperation);
-        }
-        if key == crate::ops::create_policy::CreatePolicy::<Eng>::NAME {
-            return Some(&self.create_policy as &dyn ErasedOperation);
+        // The gate is served behind `ShapeNamespacedErrorType` (see the module docs), which
+        // names this service's two namespace-qualified error shapes the way it names them —
+        // for every operation, since the namespace belongs to the SHAPE. Every other shape
+        // passes through untouched, the authorization layer's own `AccessDeniedException`
+        // included.
+        if self.entry.protocol().routing_key(req).is_err() {
+            return None;
         }
         Some(&self.gate as &dyn ErasedOperation)
     }

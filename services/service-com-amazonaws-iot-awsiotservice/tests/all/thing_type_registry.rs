@@ -874,7 +874,7 @@ async fn one_thing_type_record_is_bounded_at_its_published_ceiling() {
         );
         assert_eq!(
             refused.error_code.as_deref(),
-            Some("InvalidRequestException"),
+            Some("InvalidRequestException:http://iot.amazonaws.com/doc/2015-10-02/"),
             "case {label:?}: expected InvalidRequestException, got {refused:?}"
         );
         let described = emulator.describe_type(&thing_type_name).await;
@@ -1036,7 +1036,7 @@ async fn a_thing_may_only_name_a_thing_type_that_exists_and_is_not_deprecated() 
         );
         assert_eq!(
             refused.error_code.as_deref(),
-            Some("InvalidRequestException"),
+            Some("InvalidRequestException:http://iot.amazonaws.com/doc/2015-10-02/"),
             "case {label:?}: expected InvalidRequestException, got {refused:?}"
         );
 
