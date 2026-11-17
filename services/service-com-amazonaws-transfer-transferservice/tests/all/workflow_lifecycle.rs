@@ -9,7 +9,10 @@
 //!
 //! 1. `ListWorkflows` reports exactly the workflows state holds, in `WorkflowId` order,
 //!    one page at a time: no more than `MaxResults` per call, a `NextToken` exactly
-//!    while a further page remains, and the whole listing recovered by following it.
+//!    while a further page remains, and the whole listing recovered by following it. A
+//!    workflow is reported from the instant the create that minted it answers, and no
+//!    reporting call of the workflow plane running in between changes which workflows
+//!    the next listing reports.
 //! 2. A created workflow reads back through `DescribeWorkflow` as submitted — both step
 //!    lists in the caller's order — with each documented step-detail default
 //!    (`SourceFileLocation`, `OverwriteExisting`) resolved and each value the caller
@@ -248,7 +251,7 @@ async fn list_workflows_reports_the_stored_workflows_one_page_at_a_time() {
 
     // Seven workflows, each with its own description and a step of a different type, so
     // a listed record can only come from the one that was created.
-    let mut expected: Vec<(String, String)> = Vec::new();
+    let mut expected: Vec<(String, Option<String>)> = Vec::new();
     for index in 0..7usize {
         let description = format!("workflow-{index}");
         let step_type = STEP_TYPES[index % STEP_TYPES.len()];
@@ -258,39 +261,229 @@ async fn list_workflows_reports_the_stored_workflows_one_page_at_a_time() {
             json!({"Description": &description, "Steps": [valid_step(step_type)]}),
         )
         .await;
-        expected.push((id, description));
+        expected.push((id, Some(description)));
     }
-    let mut expected_ids: Vec<String> = expected.iter().map(|(id, _)| id.clone()).collect();
-    expected_ids.sort();
 
     for max_results in [None, Some(1), Some(2), Some(3), Some(7), Some(8)] {
         let case = format!("MaxResults {max_results:?}");
         let (ids, listed) = walk_pages(&emulator, &case, max_results, expected.len()).await;
-        assert_eq!(
-            ids, expected_ids,
-            "case {case:?}: expected every stored workflow once in WorkflowId order, got {ids:?}"
+        // Every stored workflow once, in `WorkflowId` order, each listed record carrying
+        // the identifier, description and ARN of the workflow it stands for.
+        assert_listing(&case, &ids, &listed, &expected);
+    }
+}
+
+/// An `ExecutionId` of the modelled form (`len 36..36`, pattern
+/// `^[0-9a-fA-F]{8}\-[0-9a-fA-F]{4}\-[0-9a-fA-F]{4}\-[0-9a-fA-F]{4}\-[0-9a-fA-F]{12}$`,
+/// from `smithy_query(query="operation",operation="DescribeExecution")`) that no
+/// workflow in this suite is running, so a call carrying it reaches a workflow the store
+/// HOLDS and resolves no execution of it.
+const UNRUN_EXECUTION_ID: &str = "00000000-0000-4000-8000-000000000000";
+
+/// A `WorkflowId` of the modelled form (`len 19..19`, pattern `^w-([a-z0-9]{17})$`) that
+/// no `CreateWorkflow` ever minted, so a call addressed at it resolves nothing.
+const UNMINTED_WORKFLOW_ID: &str = "w-0000000000000dead";
+
+/// One reporting call of the workflow plane, built for the workflow that was just
+/// created and for its ARN: the operation to send, and the request to send it with.
+type InterveningCall = fn(&str, &str) -> (&'static str, Value);
+
+/// The single-resource read of the very record the listing has to report.
+fn describe_the_created_workflow(workflow_id: &str, _arn: &str) -> (&'static str, Value) {
+    ("DescribeWorkflow", json!({"WorkflowId": workflow_id}))
+}
+
+/// The same read addressed at a workflow the store does not hold, so the plane answers a
+/// refusal instead of a record.
+fn describe_an_unheld_workflow(_workflow_id: &str, _arn: &str) -> (&'static str, Value) {
+    ("DescribeWorkflow", json!({"WorkflowId": UNMINTED_WORKFLOW_ID}))
+}
+
+/// The workflow plane's OTHER listing, addressed at the created workflow.
+fn list_the_workflow_executions(workflow_id: &str, _arn: &str) -> (&'static str, Value) {
+    ("ListExecutions", json!({"WorkflowId": workflow_id}))
+}
+
+/// A read of an execution the created workflow is not running.
+fn describe_an_unrun_execution(workflow_id: &str, _arn: &str) -> (&'static str, Value) {
+    (
+        "DescribeExecution",
+        json!({"WorkflowId": workflow_id, "ExecutionId": UNRUN_EXECUTION_ID}),
+    )
+}
+
+/// A custom-step callback naming an execution the created workflow is not running: the
+/// one call of this plane a client sends with a WRITE in mind, which resolves nothing
+/// here and so may touch nothing either.
+fn send_a_step_state_for_an_unrun_execution(
+    workflow_id: &str,
+    _arn: &str,
+) -> (&'static str, Value) {
+    (
+        "SendWorkflowStepState",
+        json!({
+            "WorkflowId": workflow_id,
+            "ExecutionId": UNRUN_EXECUTION_ID,
+            // `Token` is modelled `len 1..64`, pattern `^\w+$`; `Status` is a
+            // `CustomStepStatus` value.
+            "Token": "callbacktoken",
+            "Status": "SUCCESS",
+        }),
+    )
+}
+
+/// The tag plane's read of the workflow, addressed by the ARN the listing itself reports.
+fn list_the_workflow_tags(_workflow_id: &str, arn: &str) -> (&'static str, Value) {
+    ("ListTagsForResource", json!({"Arn": arn}))
+}
+
+/// The discovery call itself, so a listing cannot consume what it reported.
+fn list_the_workflows_again(_workflow_id: &str, _arn: &str) -> (&'static str, Value) {
+    ("ListWorkflows", json!({}))
+}
+
+/// Assert that one listing is exactly the workflows `created` holds — each reported once,
+/// in `WorkflowId` order, with the identifier, ARN and description of the create that
+/// minted it.
+fn assert_listing(
+    case: &str,
+    ids: &[String],
+    listed: &[Value],
+    created: &[(String, Option<String>)],
+) {
+    let mut expected_ids: Vec<String> = created.iter().map(|(id, _)| id.clone()).collect();
+    expected_ids.sort();
+    assert_eq!(
+        ids,
+        expected_ids.as_slice(),
+        "case {case:?}: expected every created workflow listed once in WorkflowId order, \
+         got {ids:?}"
+    );
+    for (id, description) in created {
+        let entry = listed
+            .iter()
+            .find(|entry| member_of(entry, "WorkflowId").as_str() == Some(id.as_str()))
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: expected {id} among the listed workflows, got {listed:?}")
+            });
+        assert_members(
+            case,
+            entry,
+            &json!({
+                "WorkflowId": id,
+                "Arn": format!("arn:aws:transfer:{REGION}:{ACCOUNT}:workflow/{id}"),
+                // `Description` is optional and carries no documented default, so a
+                // create that submitted none is reported WITHOUT the member, and one
+                // that submitted the empty string keeps it as the empty string.
+                "Description": description.clone().map_or(Value::Null, Value::from),
+            }),
         );
-        // Each listed record carries the identifier, description and ARN of the
-        // workflow it stands for.
-        for entry in &listed {
-            let id = member_of(entry, "WorkflowId")
-                .as_str()
-                .unwrap_or_default()
-                .to_string();
-            let (_, description) = expected
-                .iter()
-                .find(|(created, _)| *created == id)
-                .unwrap_or_else(|| panic!("case {case:?}: {id} was never created"));
-            assert_members(
-                &case,
-                entry,
-                &json!({
-                    "WorkflowId": &id,
-                    "Description": description,
-                    "Arn": format!("arn:aws:transfer:{REGION}:{ACCOUNT}:workflow/{id}"),
-                }),
-            );
+    }
+}
+
+/// RULE (the same listing, observed around the write that mints a record and around the
+/// plane's reads): `ListWorkflows` reports every workflow the account holds at the moment
+/// of the call — a workflow is listed from the instant the `CreateWorkflow` that minted it
+/// answers — and a reporting call of the workflow plane changes nothing about which
+/// workflows the next listing reports.
+///
+/// The rows differ along WHICH call runs between the create and the listing (none at all,
+/// the workflow's own read, that read refused for a workflow the store does not hold, the
+/// execution listing, a read of an execution nothing is running, a callback resolving to
+/// no execution, the tag plane, and the discovery call itself) and along what the create
+/// submitted: a description, the empty description, none at all, and a different step type
+/// each row — so a listed record can only have come from the create it stands for.
+#[tokio::test]
+async fn a_created_workflow_is_listed_at_once_and_no_read_unlists_it() {
+    let emulator = Emulator::new();
+
+    // (case, the Description the create submits, the call that runs in between)
+    let rows: Vec<(&str, Option<&str>, Option<InterveningCall>)> = vec![
+        (
+            "nothing between the create and the listing",
+            Some("probe workflow"),
+            None,
+        ),
+        (
+            "the created workflow's own read",
+            None,
+            Some(describe_the_created_workflow),
+        ),
+        (
+            "a read of a workflow the store does not hold",
+            Some(""),
+            Some(describe_an_unheld_workflow),
+        ),
+        (
+            "the created workflow's execution listing",
+            Some("between list executions"),
+            Some(list_the_workflow_executions),
+        ),
+        (
+            "a read of an execution nothing is running",
+            Some("between describe execution"),
+            Some(describe_an_unrun_execution),
+        ),
+        (
+            "a callback for an execution nothing is running",
+            Some("between callback"),
+            Some(send_a_step_state_for_an_unrun_execution),
+        ),
+        (
+            "the created workflow's tag plane",
+            Some("between list tags"),
+            Some(list_the_workflow_tags),
+        ),
+        (
+            "a second listing",
+            Some("between list workflows"),
+            Some(list_the_workflows_again),
+        ),
+    ];
+
+    // Every row adds one workflow and none of them removes one, so the listing has to
+    // report the whole set the rows so far created.
+    let mut created: Vec<(String, Option<String>)> = Vec::new();
+    for (index, (case, description, between)) in rows.into_iter().enumerate() {
+        let step_type = STEP_TYPES[index % STEP_TYPES.len()];
+        let mut request = json!({"Steps": [valid_step(step_type)]});
+        if let Some(text) = description {
+            request["Description"] = json!(text);
         }
+        let workflow_id = create_workflow(&emulator, case, request).await;
+        let arn = format!("arn:aws:transfer:{REGION}:{ACCOUNT}:workflow/{workflow_id}");
+        created.push((workflow_id.clone(), description.map(str::to_string)));
+
+        // The very next call reports it: nothing has to settle before a created workflow
+        // is discoverable.
+        let at_once = format!("{case}, immediately after the create");
+        let (ids, listed) = walk_pages(&emulator, &at_once, None, created.len()).await;
+        assert_listing(&at_once, &ids, &listed, &created);
+
+        let Some(build) = between else {
+            continue;
+        };
+        let (op, request) = build(&workflow_id, &arn);
+        let answer = emulator.call(op, request).await;
+        // WHICH client answer that call deserves is the business of the suites that own
+        // it; what matters here is that the service served or refused it as the plane's
+        // own operation, rather than failing it or answering it unimplemented.
+        assert!(
+            answer.status < 500,
+            "case {case:?}: expected {op} to be served or refused by the service, got {} \
+             with body {}",
+            answer.status,
+            answer.body
+        );
+
+        let after = format!("{case}, after {op}");
+        let (ids_after, listed_after) = walk_pages(&emulator, &after, None, created.len()).await;
+        assert_listing(&after, &ids_after, &listed_after, &created);
+        assert_eq!(
+            (&ids_after, &listed_after),
+            (&ids, &listed),
+            "case {case:?}: expected {op} to leave the listing exactly as it was"
+        );
     }
 }
 
