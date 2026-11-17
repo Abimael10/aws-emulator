@@ -281,6 +281,7 @@ pub struct HostedZone {
 pub struct HostedZoneFeatures {
     pub accelerated_recovery_status: Option<String>,
     pub failure_reasons: Option<HostedZoneFailureReasons>,
+    pub public_dns_fallback_status: Option<String>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.route53#HostedZoneFailureReasons")]

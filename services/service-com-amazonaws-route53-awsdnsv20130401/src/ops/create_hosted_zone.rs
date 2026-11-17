@@ -537,6 +537,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // with no features configuration and accelerated recovery off;
             // UpdateHostedZoneFeatures is what configures it afterwards.
             accelerated_recovery: None,
+            // A zone is created with public DNS fallback off; nothing in this
+            // API version turns it on.
+            public_dns_fallback_enabled: false,
         };
 
         let change = store.submit_change(None);

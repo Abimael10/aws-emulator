@@ -5,11 +5,13 @@
 //!
 //! The rule under test: `HostedZone$Features` is part of the shape Route 53
 //! projects, so every operation answering with a hosted zone carries the
-//! container — empty for a zone whose features nobody has configured, and
-//! carrying `AcceleratedRecoveryStatus` once an accepted
-//! `UpdateHostedZoneFeatures` has configured one. A client deserialising
-//! `HostedZone` into a strict shape therefore always finds the member, and
-//! "no feature configured" is distinguishable from "not reported".
+//! container, and the container reports one child per feature status that zone
+//! HOLDS, read from the zone's own state — the public-DNS fallback status on
+//! every zone, because every zone has that feature either on or off, plus
+//! `AcceleratedRecoveryStatus` once an accepted `UpdateHostedZoneFeatures` has
+//! configured one. A client deserialising `HostedZone` into a strict shape
+//! therefore always finds the member, and a feature's status is never reported
+//! as an empty container.
 //!
 //! One zone read by one operation is ONE row of that class, so the tables below
 //! span it: zones differing in label count, in public/private, in whether they
@@ -22,28 +24,43 @@
 //! harness the sibling hosted-zone suites use, so what is asserted is the
 //! HTTP/restXml behaviour a Route 53 client sees.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use smithy_server_runtime::MultiServiceRouter;
 
-use service_com_amazonaws_route53_awsdnsv20130401::state::{
-    ACCELERATED_RECOVERY_ENABLING, ACCELERATED_RECOVERY_PROPAGATION,
-};
+use service_com_amazonaws_route53_awsdnsv20130401::state::ACCELERATED_RECOVERY_ENABLING;
 
 use crate::hosted_zone_records::{call, create_zone_body, escape_xml, Reply};
 use crate::resource_tags::element_text;
 
-/// How much longer than [`ACCELERATED_RECOVERY_PROPAGATION`] a test waits
-/// before it expects an accepted features update to have settled, so the
-/// assertion does not race the span itself.
-const SETTLE_MARGIN: Duration = Duration::from_millis(250);
+/// How long a test keeps looking for an accepted features update to have
+/// settled before it gives up. Generous: the service's own span is far shorter,
+/// and the assertion waits for the CONDITION rather than for a span, so a
+/// loaded host only polls more often.
+const SETTLE_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How long one look at a settling zone waits before the next.
+const SETTLE_POLL: Duration = Duration::from_millis(25);
 
 /// The members `HostedZoneFeatures` declares, from
 /// `smithy_query(query="shape", shape="com.amazonaws.route53#HostedZoneFeatures")`:
 /// the accelerated-recovery status and the failure reasons of a features
-/// change. Neither has a default, so an unconfigured zone reports the container
-/// with neither of them in it.
-const FEATURES_MEMBERS: [&str; 2] = ["AcceleratedRecoveryStatus", "FailureReasons"];
+/// change, neither of which a zone has a status for until a features update
+/// configures one, plus the public-DNS fallback status every zone has.
+const FEATURES_MEMBERS: [&str; 3] = [
+    "AcceleratedRecoveryStatus",
+    "FailureReasons",
+    PUBLIC_DNS_FALLBACK_STATUS,
+];
+
+/// The `HostedZoneFeatures` member reporting whether a zone falls back to
+/// public DNS.
+const PUBLIC_DNS_FALLBACK_STATUS: &str = "PublicDNSFallbackStatus";
+
+/// The status Route 53 reports for a hosted-zone feature that is turned off,
+/// which is what every zone this API version creates reports for public DNS
+/// fallback: no operation it models turns that feature on.
+const FEATURE_OFF: &str = "DISABLED";
 
 /// A router with just this service mounted on a fresh shared engine.
 fn router() -> MultiServiceRouter {
@@ -117,9 +134,18 @@ fn features_of<'a>(case: &str, reply: &'a Reply, zones: usize) -> Vec<&'a str> {
 }
 
 /// Assert one `Features` container reports exactly `status` for
-/// `AcceleratedRecoveryStatus` and nothing for the members the zone's state
-/// does not fill.
+/// `AcceleratedRecoveryStatus`, the zone's public-DNS fallback status, and
+/// nothing for the members the zone's state does not fill.
 fn assert_features(case: &str, block: &str, status: Option<&str>) {
+    // A state every zone has, so every container reports it — and reports the
+    // off status, since nothing this API version models turns it on.
+    let fallback = element_text(block, PUBLIC_DNS_FALLBACK_STATUS);
+    assert_eq!(
+        fallback.as_deref(),
+        Some(FEATURE_OFF),
+        "case {case:?}: expected {PUBLIC_DNS_FALLBACK_STATUS} {FEATURE_OFF:?} in the Features \
+         container, got {fallback:?}; container {block:?}"
+    );
     let reported = element_text(block, "AcceleratedRecoveryStatus");
     assert_eq!(
         reported.as_deref(),
@@ -252,7 +278,8 @@ fn zone_rows() -> [ZoneRow; 6] {
 #[tokio::test]
 async fn every_hosted_zone_projection_carries_the_features_container() {
     // The rule: the `Features` container is serialised for every projected
-    // hosted zone, empty while nothing has configured the zone's features. The
+    // hosted zone, carrying the status of each feature the zone holds — for a
+    // zone nothing has configured, the public-DNS fallback status alone. The
     // rows span the zones; each one is asserted on the create, the single read
     // and the comment update, and the listings are asserted over all of them at
     // once.
@@ -328,8 +355,8 @@ async fn the_features_container_reports_the_configured_feature_on_every_projecti
     // The rule's other half: the container is the zone's own state, so once an
     // accepted update has configured a zone, EVERY projection of that zone
     // reports the status in the same always-present container — while the zones
-    // beside it still report it empty. The rows are the public zones of the
-    // table above, which are the zones accelerated recovery applies to.
+    // beside it report only the fallback status. The rows are the public zones of
+    // the table above, which are the zones accelerated recovery applies to.
     let router = router();
     let rows = zone_rows();
     let mut configured = Vec::new();
@@ -373,7 +400,8 @@ async fn the_features_container_reports_the_configured_feature_on_every_projecti
         assert_features(case, blocks[0], Some(ACCELERATED_RECOVERY_ENABLING));
     }
 
-    // A zone nobody configured still carries the container, empty.
+    // A zone nobody configured still carries the container, with its
+    // fallback status and no accelerated-recovery status in it.
     for (case, zone_id) in &untouched {
         let read = get_zone(&router, zone_id).await;
         let blocks = features_of(case, &read, 1);
@@ -404,19 +432,155 @@ async fn the_features_container_reports_the_configured_feature_on_every_projecti
     );
 
     // The propagation span is the service's own, and it is never zero: a read
-    // before it elapses saw the moving status above, and a read after it sees
-    // the settled one in the same container.
-    tokio::time::sleep(ACCELERATED_RECOVERY_PROPAGATION + SETTLE_MARGIN).await;
+    // before it elapses saw the moving status above, and a read once the zone
+    // has settled sees the settled status in the same container. Looked for
+    // until it holds, so the assertion does not depend on how fast the host is.
     for (case, zone_id) in &configured {
-        let read = get_zone(&router, zone_id).await;
-        let blocks = features_of(case, &read, 1);
-        let status = element_text(blocks[0], "AcceleratedRecoveryStatus");
+        let (status, body) = settled_status(&router, zone_id).await;
         assert!(
-            status.is_some_and(|value| value != ACCELERATED_RECOVERY_ENABLING),
+            status
+                .as_deref()
+                .is_some_and(|value| value != ACCELERATED_RECOVERY_ENABLING),
             "case {case:?}: the settled zone must report a settled status in its Features \
-             container, got {:?}; body {}",
-            element_text(blocks[0], "AcceleratedRecoveryStatus"),
-            read.body
+             container, got {status:?}; body {body}"
         );
     }
+}
+
+/// Look at one zone's `AcceleratedRecoveryStatus` until it reports something
+/// other than the moving status, or [`SETTLE_DEADLINE`] passes, and hand back
+/// what the last read reported, with that read's body for the message.
+async fn settled_status(router: &MultiServiceRouter, zone_id: &str) -> (Option<String>, String) {
+    let deadline = Instant::now() + SETTLE_DEADLINE;
+    loop {
+        let read = get_zone(router, zone_id).await;
+        let status = features_blocks(&read.body)
+            .first()
+            .and_then(|block| element_text(block, "AcceleratedRecoveryStatus"));
+        let settled = status
+            .as_deref()
+            .is_some_and(|value| value != ACCELERATED_RECOVERY_ENABLING);
+        if settled || Instant::now() >= deadline {
+            return (status, read.body);
+        }
+        tokio::time::sleep(SETTLE_POLL).await;
+    }
+}
+
+/// The public-DNS fallback status one `Features` container reports, which every
+/// container must carry.
+fn fallback_status(case: &str, block: &str) -> String {
+    element_text(block, PUBLIC_DNS_FALLBACK_STATUS).unwrap_or_else(|| {
+        panic!(
+            "case {case:?}: the Features container must report \
+             {PUBLIC_DNS_FALLBACK_STATUS}; container {block:?}"
+        )
+    })
+}
+
+#[tokio::test]
+async fn every_hosted_zone_projection_reports_the_zones_public_dns_fallback_status() {
+    // The other half of the container rule, and the one an empty `<Features/>`
+    // breaks: a feature status a zone HOLDS is reported as a child of the
+    // container by EVERY projection of that zone, with the value read off the
+    // zone's own state. Public DNS fallback is such a feature — every zone has
+    // it on or off — so every row of the table reports it, on the create, the
+    // single read, the comment update and both listings, and all of them agree.
+    let router = router();
+    let rows = zone_rows();
+    let mut ids = Vec::new();
+
+    for (index, row) in rows.iter().enumerate() {
+        let created = create_zone(
+            &router,
+            row.name,
+            &format!("features-fallback-{index}"),
+            row.extra,
+        )
+        .await;
+        assert_eq!(
+            created.status, 201,
+            "case {:?}: expected 201 from CreateHostedZone, got {} with body {}",
+            row.case, created.status, created.body
+        );
+        let reported = fallback_status(row.case, features_of(row.case, &created, 1)[0]);
+        assert_eq!(
+            reported, FEATURE_OFF,
+            "case {:?}: a zone nothing enabled the feature on must report {FEATURE_OFF:?}, \
+             got {reported:?}; body {}",
+            row.case, created.body
+        );
+
+        let zone_id = bare_zone_id(&created);
+        for (reader, reply) in [
+            ("GetHostedZone", get_zone(&router, &zone_id).await),
+            (
+                "UpdateHostedZoneComment",
+                update_comment(&router, &zone_id, "a later comment").await,
+            ),
+        ] {
+            let case = format!("{} read by {reader}", row.case);
+            let seen = fallback_status(&case, features_of(&case, &reply, 1)[0]);
+            assert_eq!(
+                seen, reported,
+                "case {case:?}: every projection of one zone must report the same \
+                 {PUBLIC_DNS_FALLBACK_STATUS}, got {seen:?} after {reported:?}; body {}",
+                reply.body
+            );
+        }
+
+        ids.push(zone_id);
+    }
+
+    // Both listings report it for every zone they list, so a client enumerating
+    // the account's zones reads each zone's fallback state off the listing.
+    for (case, uri) in [
+        ("ListHostedZones", "/2013-04-01/hostedzone"),
+        ("ListHostedZonesByName", "/2013-04-01/hostedzonesbyname"),
+    ] {
+        let listed = call(&router, "GET", uri, "").await;
+        assert_eq!(
+            listed.status, 200,
+            "case {case:?}: expected 200, got {} with body {}",
+            listed.status, listed.body
+        );
+        for block in features_of(case, &listed, ids.len()) {
+            let seen = fallback_status(case, block);
+            assert_eq!(
+                seen, FEATURE_OFF,
+                "case {case:?}: every listed zone must report {FEATURE_OFF:?} for \
+                 {PUBLIC_DNS_FALLBACK_STATUS}, got {seen:?}; body {}",
+                listed.body
+            );
+        }
+    }
+
+    // A zone whose OTHER feature was configured reports both statuses in the
+    // one container: reporting one feature never drops another.
+    let public = ids
+        .first()
+        .expect("the table creates at least one zone")
+        .clone();
+    let updated = update_features(&router, &public, true).await;
+    assert_eq!(
+        updated.status, 200,
+        "expected 200 from UpdateHostedZoneFeatures, got {} with body {}",
+        updated.status, updated.body
+    );
+    let (accelerated, body) = settled_status(&router, &public).await;
+    assert!(
+        accelerated.is_some(),
+        "the configured zone must report an AcceleratedRecoveryStatus; body {body}"
+    );
+    let block = features_blocks(&body)
+        .first()
+        .copied()
+        .unwrap_or_else(|| panic!("the read must carry a Features container; body {body}"))
+        .to_string();
+    let seen = fallback_status("a zone with accelerated recovery configured", &block);
+    assert_eq!(
+        seen, FEATURE_OFF,
+        "a configured zone must still report {FEATURE_OFF:?} for \
+         {PUBLIC_DNS_FALLBACK_STATUS}, got {seen:?}; body {body}"
+    );
 }
