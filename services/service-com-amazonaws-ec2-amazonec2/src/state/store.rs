@@ -668,27 +668,39 @@ pub const INVALID_MAX_RESULTS: &str = "InvalidMaxResults";
 
 /// The code and the sentence EC2 refuses a `MaxResults` below its published minimum with.
 ///
-/// The two refusals differ by what the value IS, not by which operation carries it:
+/// An operation whose OWN refusal of a page size outside its published range was recorded
+/// answers that refusal for every value below the floor, whatever the value is
+/// ([`recorded_page_size_code`] with [`page_size_outside_range_message`]) — one code and one
+/// sentence per operation, which is also what the paged reads whose bounds the model does not
+/// declare answer for a page size of none, of one or of a negative number
+/// ([`max_results_below_bound_message`]). For every other operation the refusal differs by
+/// what the value IS:
 ///
 /// * a POSITIVE page size smaller than the smallest page the operation serves is a page
-///   size the operation will not page with, which EC2 answers [`INVALID_MAX_RESULTS`] for,
-///   in the sentence [`page_size_outside_range_message`] words — `maxResults=4` against a
+///   size the operation will not page with, which EC2 answers its own [`INVALID_MAX_RESULTS`]
+///   for, in the sentence [`page_size_outside_range_message`] words — `maxResults=4` against a
 ///   published minimum of 5;
 /// * a value that is no page size at all — zero or negative, so it asks for a page of none —
 ///   is a parameter the service cannot use, which EC2 answers [`INVALID_PARAMETER`] for, in
 ///   the sentence [`value_below_required_minimum_message`] words.
 ///
-/// One function for both, so the code and the wording of a refusal cannot disagree. `path`
-/// is the member the constraint walk reports, `value` the value the caller sent and
-/// `input_shape` the input being read, which chooses the two words EC2 varies per operation
-/// in that sentence ([`RECORDED_PAGE_SIZE_WORDINGS`]). Anything that is not an integer at all
-/// never reaches here: the walk refuses it before it has a bound to compare against.
+/// One function for all of them, so the code and the wording of a refusal cannot disagree.
+/// `path` is the member the constraint walk reports, `value` the value the caller sent and
+/// `input_shape` the input being read, which chooses the recorded refusal
+/// ([`RECORDED_PAGE_SIZE_WORDINGS`]). Anything that is not an integer at all never reaches
+/// here: the walk refuses it before it has a bound to compare against.
 pub fn max_results_refusal(
     input_shape: Option<&str>,
     path: &str,
     value: &str,
     minimum: &str,
 ) -> (&'static str, String) {
+    if let Some(code) = recorded_page_size_code(input_shape, PageSizeBound::Smallest) {
+        return (
+            code,
+            page_size_outside_range_message(input_shape, value, minimum, PageSizeBound::Smallest),
+        );
+    }
     match value.trim().parse::<i64>() {
         Ok(page_size) if page_size > 0 => (
             INVALID_MAX_RESULTS,

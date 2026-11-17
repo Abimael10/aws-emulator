@@ -28,6 +28,13 @@ mod transit_gateway_attachment_propagations;
 // published bounds on the date a request may name, and what both ends refuse. Declared FIRST
 // for the reason the note above gives: the sorted neighbourhood and the tail of this file are
 // where every new ec2 suite inserts its lines.
+// How this service READS a boolean request parameter: without regard to ASCII case, so a
+// `DryRun` spelled `TRUE` carries the flag it spells and is answered the dry-run verdict,
+// while a value that is no boolean, and a non-boolean member whose value reads like one, are
+// untouched. Declared FIRST for the reason the note above gives: the sorted neighbourhood and
+// the tail of this file are where every new ec2 suite inserts its lines.
+#[path = "all/boolean_parameter_case.rs"]
+mod boolean_parameter_case;
 #[path = "all/create_vpn_gateway_availability_zone.rs"]
 mod create_vpn_gateway_availability_zone;
 // The CODE and the SENTENCE a request that left out a modelled `@required` input member is

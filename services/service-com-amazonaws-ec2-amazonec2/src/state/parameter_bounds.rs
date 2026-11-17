@@ -175,35 +175,59 @@ pub fn absent_required_member_message(input_shape: Option<&str>, path: &str) -> 
     missing_required_parameter_message(&declared_member_name(path))
 }
 
-/// The code and the words EC2 refuses a page size OUTSIDE the range an operation publishes
-/// with, for the operations whose own refusal its callers recorded:
-/// `(input shape, error code, parameter spelling, comparison clause)`.
+/// How EC2's own refusal of a page size OUTSIDE the range ONE operation publishes reads, for
+/// the operations whose refusal its callers recorded.
 ///
 /// One refusal class, several recorded answers. `DescribeSubnets` names the member as the model
 /// declares it and admits the bound itself ("smaller than or equal to 1000"), while
-/// `DescribeSecurityGroups` names it in lowerCamel and excludes it ("smaller than 1000"); both
-/// answer [`INVALID_PARAMETER_VALUE`], where the paged describes whose refusal was recorded
+/// `DescribeSecurityGroups` names it in lowerCamel and excludes it ("smaller than 1000"), and
+/// the code differs per operation and per BOUND: the paged describes whose refusal was recorded
 /// elsewhere answer EC2's own [`INVALID_MAX_RESULTS`]. WHICH an operation answers is a fact of
 /// that operation recorded by its caller and not of the bound, exactly as the two sentences for
 /// a page size below the minimum differ ([`max_results_below_bound_message`]) — so it is keyed
 /// to the INPUT SHAPE being read, the one key that names a member of one operation.
+#[derive(Debug, Clone, Copy)]
+pub struct RecordedPageSizeRefusal {
+    /// The input shape whose request this reads the refusal for, as the model names it.
+    pub input_shape: &'static str,
+    /// The code EC2 answers a page size BELOW the smallest page this operation serves with.
+    pub below_smallest_code: &'static str,
+    /// The code EC2 answers a page size ABOVE the largest page it serves with.
+    pub above_largest_code: &'static str,
+    /// How its sentence spells the parameter that carried the page size.
+    pub parameter: &'static str,
+    /// How that sentence compares the value with the bound — whether the bound itself is
+    /// admitted.
+    pub clause: &'static str,
+}
+
+/// The recorded refusals themselves, one per operation.
 ///
 /// An operation NOT named here keeps the code and the sentence every other paged operation
 /// answers: [`INVALID_MAX_RESULTS`] with [`DEFAULT_PAGE_SIZE_WORDING`] for a page size it will
 /// not page with, either side of its published range.
-pub const RECORDED_PAGE_SIZE_WORDINGS: &[(&str, &str, &str, &str)] = &[
-    (
-        "DescribeSecurityGroupsRequest",
-        INVALID_PARAMETER_VALUE,
-        "maxResults",
-        "than",
-    ),
-    (
-        "DescribeSubnetsRequest",
-        INVALID_PARAMETER_VALUE,
-        "MaxResults",
-        "than or equal to",
-    ),
+pub const RECORDED_PAGE_SIZE_WORDINGS: &[RecordedPageSizeRefusal] = &[
+    RecordedPageSizeRefusal {
+        input_shape: "DescribeSecurityGroupsRequest",
+        below_smallest_code: INVALID_MAX_RESULTS,
+        above_largest_code: INVALID_PARAMETER_VALUE,
+        parameter: "maxResults",
+        clause: "than",
+    },
+    RecordedPageSizeRefusal {
+        input_shape: "DescribeSubnetsRequest",
+        below_smallest_code: INVALID_MAX_RESULTS,
+        above_largest_code: INVALID_PARAMETER_VALUE,
+        parameter: "MaxResults",
+        clause: "than or equal to",
+    },
+    RecordedPageSizeRefusal {
+        input_shape: "DescribeVpcsRequest",
+        below_smallest_code: INVALID_PARAMETER_VALUE,
+        above_largest_code: INVALID_PARAMETER_VALUE,
+        parameter: "MaxResults",
+        clause: "than or equal to",
+    },
 ];
 
 /// The `(parameter spelling, comparison clause)` a paged operation whose own wording is not
@@ -236,13 +260,27 @@ impl PageSizeBound {
 }
 
 /// Whether EC2's own refusal of a page size outside `input_shape`'s published range is
-/// recorded, and the code it answers it with — `None` for every operation that answers the
-/// code and the sentence every other paged operation does.
-pub fn recorded_page_size_code(input_shape: Option<&str>) -> Option<&'static str> {
+/// recorded, and the code it answers it with on the side of the range the value fell
+/// `outside` — `None` for every operation that answers the code and the sentence every other
+/// paged operation does.
+pub fn recorded_page_size_code(
+    input_shape: Option<&str>,
+    outside: PageSizeBound,
+) -> Option<&'static str> {
+    let recorded = recorded_page_size_refusal(input_shape)?;
+    Some(match outside {
+        PageSizeBound::Smallest => recorded.below_smallest_code,
+        PageSizeBound::Largest => recorded.above_largest_code,
+    })
+}
+
+/// EC2's recorded refusal for `input_shape`, or `None` when that operation's own refusal was
+/// not recorded. `None` for the input shape too — a refusal given before any input shape was
+/// read — so such a refusal takes the default rather than another request's wording.
+fn recorded_page_size_refusal(input_shape: Option<&str>) -> Option<&'static RecordedPageSizeRefusal> {
     RECORDED_PAGE_SIZE_WORDINGS
         .iter()
-        .find(|(shape, _, _, _)| Some(*shape) == input_shape)
-        .map(|(_, code, _, _)| *code)
+        .find(|recorded| Some(recorded.input_shape) == input_shape)
 }
 
 /// How EC2 states a page size outside the range an operation publishes: the value the request
@@ -263,12 +301,10 @@ pub fn page_size_outside_range_message(
     bound: &str,
     outside: PageSizeBound,
 ) -> String {
-    let (parameter, clause) = RECORDED_PAGE_SIZE_WORDINGS
-        .iter()
-        .find(|(shape, _, _, _)| Some(*shape) == input_shape)
-        .map_or(DEFAULT_PAGE_SIZE_WORDING, |(_, _, parameter, clause)| {
-            (parameter, clause)
-        });
+    let (parameter, clause) = recorded_page_size_refusal(input_shape).map_or(
+        DEFAULT_PAGE_SIZE_WORDING,
+        |recorded| (recorded.parameter, recorded.clause),
+    );
     page_size_message(parameter, clause, value, bound, outside)
 }
 

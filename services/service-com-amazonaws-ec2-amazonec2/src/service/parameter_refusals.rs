@@ -159,10 +159,11 @@ fn nonexistent_instance_types(
 /// service states: EC2 answers its own code and sentence for it, naming the value and the
 /// bound ([`crate::state::max_results_refusal`]). It is keyed on the member the constraint
 /// walk reports, on the bound it failed and on the value it carried — a positive page size
-/// the operation will not page with is `InvalidMaxResults`, a value that is no page size at
-/// all is `InvalidParameter` — so every paged operation of this service answers one code and
-/// one wording for each of the two, the minimum coming from the violation rather than from a
-/// number written here.
+/// the operation will not page with is the code recorded for that operation
+/// ([`crate::state::recorded_page_size_code`]) or `InvalidMaxResults`, a value that is no
+/// page size at all is `InvalidParameter` — so every paged operation of this service answers
+/// one code and one wording for each of the two, the minimum coming from the violation rather
+/// than from a number written here.
 ///
 /// A `MaxResults` ABOVE the largest page it publishes is that refusal's other half: a page
 /// size is a parameter whose value EC2 cannot use, which it answers `InvalidParameterValue`
@@ -354,8 +355,11 @@ pub(super) fn ec2_value_refusal(violation: &aws_smithy_schema_server::Violation)
             // ([`crate::state::recorded_page_size_code`],
             // [`crate::state::page_size_outside_range_message`]).
             let input_shape = input_being_read();
-            let code = crate::state::recorded_page_size_code(input_shape.as_deref())
-                .unwrap_or(crate::state::INVALID_MAX_RESULTS);
+            let code = crate::state::recorded_page_size_code(
+                input_shape.as_deref(),
+                crate::state::PageSizeBound::Largest,
+            )
+            .unwrap_or(crate::state::INVALID_MAX_RESULTS);
             Some(Refused {
                 code: code.to_string(),
                 message: crate::state::page_size_outside_range_message(

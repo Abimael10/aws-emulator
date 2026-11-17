@@ -377,6 +377,48 @@ async fn a_page_size_outside_the_published_range_names_the_bound_it_missed() {
                 .to_string(),
         ),
         (
+            // The code is recorded PER BOUND as well as per operation: this operation was
+            // recorded answering `InvalidParameterValue` for a page size below its floor,
+            // where the two rows above answer EC2's own `InvalidMaxResults` there.
+            "below the floor DescribeVpcs publishes",
+            "DescribeVpcs",
+            "4",
+            ec2::state::INVALID_PARAMETER_VALUE,
+            "Value ( 4 ) for parameter MaxResults is invalid. Expecting a value greater than \
+             or equal to 5."
+                .to_string(),
+        ),
+        (
+            "above the ceiling DescribeVpcs publishes",
+            "DescribeVpcs",
+            "1001",
+            ec2::state::INVALID_PARAMETER_VALUE,
+            "Value ( 1001 ) for parameter MaxResults is invalid. Expecting a value smaller \
+             than or equal to 1000."
+                .to_string(),
+        ),
+        (
+            // An operation whose own refusal is recorded answers it for EVERY value below the
+            // floor, so a page of none and a negative page are refused in the same words as
+            // the positive page size above, not in another dialect.
+            "a page of none DescribeVpcs will not page with",
+            "DescribeVpcs",
+            "0",
+            ec2::state::INVALID_PARAMETER_VALUE,
+            "Value ( 0 ) for parameter MaxResults is invalid. Expecting a value greater than \
+             or equal to 5."
+                .to_string(),
+        ),
+        (
+            "a negative page DescribeVpcs will not page with",
+            "DescribeVpcs",
+            "-1",
+            ec2::state::INVALID_PARAMETER_VALUE,
+            "Value ( -1 ) for parameter MaxResults is invalid. Expecting a value greater than \
+             or equal to 5."
+                .to_string(),
+        ),
+        (
             "above the ceiling an operation with no recorded wording publishes",
             "DescribeTransitGatewayRouteTables",
             "1001",
@@ -418,6 +460,8 @@ async fn a_page_size_outside_the_published_range_names_the_bound_it_missed() {
         ("the ceiling DescribeSecurityGroups publishes", "DescribeSecurityGroups", "1000"),
         ("the floor DescribeSubnets publishes", "DescribeSubnets", "5"),
         ("the ceiling DescribeSubnets publishes", "DescribeSubnets", "1000"),
+        ("the floor DescribeVpcs publishes", "DescribeVpcs", "5"),
+        ("the ceiling DescribeVpcs publishes", "DescribeVpcs", "1000"),
     ] {
         let (status, body) = call(&router, REGION, action, &[p("MaxResults", page_size)]).await;
         assert_eq!(
