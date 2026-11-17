@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateComponentConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateComponentConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: stores the monitoring configuration of one component of the
+//! addressed application in [`crate::state`] — whether it is monitored, the stack
+//! tier it sits in, and the escaped JSON configuration itself — so
+//! `DescribeComponentConfiguration` and `DescribeComponent` report it from there,
+//! and the application's `LifeCycle` becomes `ACTIVE` once any of its components
+//! is monitored ([`crate::state::Application::life_cycle`]).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateComponentConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Only the members the request carries are written: a configuration call that
+//! names no `Monitor` leaves monitoring as it stands rather than turning it off.
+//! A `ComponentConfiguration` that is not a JSON document is refused with the
+//! modelled `ValidationException`, under a sentence that is the emulator's OWN:
+//! AWS publishes none for this class and no recording of this service carries
+//! one, so it names the member and the form the model documents for it.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +161,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateComponentConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateComponentConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateComponentConfigurationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "this service is mounted on an engine that holds no state".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `ComponentConfiguration` is "the escaped JSON of the configuration",
+        // `ComponentConfiguration` is "the escaped JSON of the configuration",
+        // so a value that is not a JSON document configures nothing: it is
+        // refused rather than stored for a later read to hand back.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateComponentConfiguration"))
+        // The SENTENCE is the emulator's own: AWS publishes no wording for this
+        // class and no recording of this service carries one, so the refusal
+        // names the member and the form the model documents for it rather than
+        // imitating a message nobody has seen. The status (400) and the error
+        // code (`ValidationException`) are the modelled ones.
+        if let Some(configuration) = input.component_configuration.as_deref() {
+            if ::serde_json::from_str::<::serde_json::Value>(configuration).is_err() {
+                return Err(UpdateComponentConfigurationErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(
+                            "ComponentConfiguration is not valid: it must be the escaped JSON of \
+                             the component configuration"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let mut store = state.lock();
+        let Some(application) = store.applications.get_mut(&input.resource_group_name) else {
+            return Err(
+                UpdateComponentConfigurationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::APPLICATION_MISSING_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let Some(component) = application.components.get_mut(&input.component_name) else {
+            return Err(
+                UpdateComponentConfigurationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::component_missing_message(
+                            &input.component_name,
+                            &input.resource_group_name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Each member the request carries is written; one it leaves out is left
+        // as it stands, so configuring the tier does not silently stop the
+        // monitoring an earlier call turned on.
+        if let Some(monitor) = input.monitor {
+            component.monitor = monitor;
+        }
+        if let Some(tier) = input.tier {
+            component.tier = tier;
+        }
+        if let Some(configuration) = input.component_configuration {
+            component.component_configuration = Some(configuration);
+        }
+
+        Ok(UpdateComponentConfigurationOutput {})
     }
 }

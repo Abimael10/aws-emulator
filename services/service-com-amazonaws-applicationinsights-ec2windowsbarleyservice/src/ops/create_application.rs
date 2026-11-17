@@ -10,6 +10,12 @@
 //! ([`crate::state::resource_groups`]) and a group that account holds none of is
 //! refused.
 //!
+//! Creating the application also ONBOARDS that group's resources: every resource
+//! the group resolves to becomes a DEFAULT (standalone) component of the
+//! application, named by the resource's own ARN and unmonitored
+//! ([`crate::state::onboarded_components`]), which is what `ListComponents`,
+//! `DescribeComponent` and `DescribeComponentConfiguration` then report.
+//!
 //! A create that names no `ResourceGroupName` is refused, including the
 //! `GroupingType=ACCOUNT_BASED` case where the real service onboards the whole
 //! account under a group name it mints itself: minting that name is part of the
@@ -225,14 +231,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let discovery_type = crate::state::discovery_type_for(input.grouping_type.as_deref());
+
+        // Creating an application over a resource group ONBOARDS the resources
+        // that group resolves to: each becomes a DEFAULT (standalone) component
+        // named by the resource's own ARN, unmonitored until a configuration
+        // turns monitoring on. Which resources those are is Resource Groups' to
+        // answer, so the membership is read from there — over the same callback
+        // the group itself was resolved through — rather than guessed here.
+        let members =
+            crate::state::resource_groups::group_resources(ctx, &region, &resource_group_name)
+                .await;
         let now = ::std::time::SystemTime::now();
 
-        // `AutoCreate` asks for the recommended configuration to be applied to
-        // every resource in the group; component configuration
-        // (`UpdateComponentConfiguration`) is a later slice and still answers
-        // 501, so nothing here claims to have applied it. `Tags` ARE stored on
-        // the record below, so the write is not discarded, even though the
-        // tagging operations that report them are also a later slice.
+        // `AutoCreate` and `AutoConfigEnabled` ask for the RECOMMENDED
+        // configuration to be applied to the resources of the group, and the
+        // operation that computes a recommendation
+        // (`DescribeComponentConfigurationRecommendation`) is a later slice that
+        // still answers 501 — so the onboarded components start unmonitored and
+        // nothing here claims to have applied a configuration nothing computed.
+        // A caller configures them through `UpdateComponentConfiguration`.
+        // `Tags` ARE stored on the record below, so the write is not discarded,
+        // even though the tagging operations that report them are also a later
+        // slice.
         let application_info = {
             let mut store = state.lock();
             if store.applications.contains_key(&resource_group_name) {
@@ -271,7 +291,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 discovery_type: Some(discovery_type.to_string()),
                 remarks: None,
                 tags: input.tags.unwrap_or_default(),
-                components: ::std::collections::BTreeMap::new(),
+                components: crate::state::onboarded_components(&members),
                 // Onboarding is owed by the clock from here, so the application
                 // this call reports is still `CREATING`.
                 onboarded_at: now + crate::state::ONBOARDING_SPAN,

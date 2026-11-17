@@ -13,6 +13,11 @@
 //! and nothing is what it refuses on ([`GroupLookup::Unknown`]). Only Resource Groups
 //! ANSWERING that the account holds no such group ([`GroupLookup::Absent`]) is grounds
 //! for refusing the create.
+//!
+//! The group's MEMBERSHIP is resolved the same way ([`group_resources`]): which
+//! resources a group holds is computed from that group's own definition, which is
+//! Resource Groups' to run, and it is what an application onboards its components
+//! from.
 
 /// What Resource Groups says about the group a request named.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +59,105 @@ fn resource_groups(
         )
         .build();
     ::aws_sdk_resourcegroups::Client::from_conf(config)
+}
+
+/// One member of a resource group: the resource's ARN, and the resource type
+/// Resource Groups reported for it (absent when it reported none).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupMember {
+    pub resource_arn: String,
+    pub resource_type: Option<String>,
+}
+
+/// How many pages of one group's membership are read.
+///
+/// The listing is paged, and the pages are followed until Resource Groups stops
+/// handing back a token — this is what bounds that walk, so a token that never
+/// runs out cannot loop. It covers far more resources than the components one
+/// application holds ([`crate::state::COMPONENT_QUOTA`]).
+const MAX_MEMBERSHIP_PAGES: usize = 32;
+
+/// Every resource the group `name` resolves to in `region`, in the order
+/// Resource Groups pages them.
+///
+/// A group's membership is Resource Groups' to compute, not this service's: a
+/// group defined by a resource query resolves that query, and a group populated
+/// by hand reports what was grouped into it. So this ASKS for the membership,
+/// over the same in-process callback the group's existence is resolved through,
+/// and reads it off `Resources` — the report the model's deprecated
+/// `ResourceIdentifiers` was replaced by.
+///
+/// Failing to ask reports no member, exactly as a group holding no resource
+/// does: an emulator with no Resource Groups mounted knows of no resource to
+/// onboard, and nothing is invented in its place.
+pub async fn group_resources(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    name: &str,
+) -> Vec<GroupMember> {
+    let client = resource_groups(ctx, region);
+    let mut members: Vec<GroupMember> = Vec::new();
+    let mut next_token: Option<String> = None;
+    for _ in 0..MAX_MEMBERSHIP_PAGES {
+        let answer = client
+            .list_group_resources()
+            .group(name)
+            .set_next_token(next_token.take())
+            .send()
+            .await;
+        let page = match answer {
+            Ok(page) => page,
+            Err(error) => {
+                let reported = ::aws_smithy_types::error::display::DisplayErrorContext(&error);
+                if error.as_service_error().is_some() {
+                    // Resource Groups ANSWERED a failure: it holds the group's
+                    // definition and could not report its membership, which is
+                    // worth a developer's attention — the application onboards
+                    // nothing rather than the resources the group holds.
+                    ::tracing::warn!(
+                        error = %reported,
+                        "Resource Groups refused to list the resources of a request's resource group"
+                    );
+                } else {
+                    // Nobody answered at all: an emulator with no Resource Groups
+                    // mounted knows of no resource to onboard, which is not a
+                    // failure of this request.
+                    ::tracing::debug!(
+                        error = %reported,
+                        "no Resource Groups answered for the resources of a request's resource group"
+                    );
+                }
+                break;
+            }
+        };
+        let mut page_members: Vec<GroupMember> = page
+            .resources()
+            .iter()
+            .filter_map(|item| item.identifier())
+            .filter_map(member_of)
+            .collect();
+        members.append(&mut page_members);
+        next_token = page
+            .next_token()
+            .map(str::to_string)
+            .filter(|token| !token.is_empty());
+        if next_token.is_none() {
+            break;
+        }
+    }
+    members
+}
+
+/// One listed identifier as a membership, or `None` for an entry that names no
+/// resource.
+fn member_of(
+    identifier: &::aws_sdk_resourcegroups::types::ResourceIdentifier,
+) -> Option<GroupMember> {
+    let resource_arn = identifier.resource_arn()?;
+    Some(GroupMember {
+        resource_arn: resource_arn.to_string(),
+        resource_type: identifier.resource_type().map(str::to_string),
+    })
 }
 
 /// What Resource Groups says about the group `name` names in `region`.

@@ -87,15 +87,48 @@ fn error_code(body: &Value) -> String {
         .to_string()
 }
 
-/// Wait out the onboarding span a create call starts, so a reader observes the
-/// lifecycle the clock owes rather than the transient one. Derived from the
-/// service's own constant, so the suite follows the span if it is ever retuned.
-async fn wait_out_onboarding() {
-    tokio::time::sleep(
-        service_com_amazonaws_applicationinsights_ec2windowsbarleyservice::state::ONBOARDING_SPAN
-            + Duration::from_millis(400),
+/// How long a poll keeps looking for the lifecycle a create owes. Generous: it
+/// bounds nothing a case asserts, it only stops a broken emulator from hanging.
+const POLL_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How long a poll waits before looking again.
+const LOOK_AGAIN: Duration = Duration::from_millis(25);
+
+/// Look again at the application over `group` until the onboarding the create
+/// started has fallen due, and report the lifecycle it settled on.
+///
+/// The onboarding is owed by the clock, so the suite waits for the CONDITION —
+/// the application reporting anything but `CREATING` — rather than for a
+/// duration, and so follows the service's span whatever it is retuned to.
+async fn poll_until_onboarded(router: &MultiServiceRouter, group: &str) -> String {
+    let since = std::time::Instant::now();
+    loop {
+        let reported = life_cycle(router, group).await;
+        if reported != "CREATING" {
+            return reported;
+        }
+        assert!(
+            since.elapsed() < POLL_DEADLINE,
+            "the application over {group:?} never finished onboarding, \
+             still reporting {reported:?}"
+        );
+        tokio::time::sleep(LOOK_AGAIN).await;
+    }
+}
+
+/// The `LifeCycle` `DescribeApplication` reports for `group`.
+async fn life_cycle(router: &MultiServiceRouter, group: &str) -> String {
+    let (status, body) = call(
+        router,
+        "DescribeApplication",
+        json!({ "ResourceGroupName": group }),
     )
     .await;
+    assert_eq!(status, 200, "DescribeApplication({group:?}): {body:?}");
+    body["ApplicationInfo"]["LifeCycle"]
+        .as_str()
+        .unwrap_or_else(|| panic!("DescribeApplication({group:?}) reported no LifeCycle: {body:?}"))
+        .to_string()
 }
 
 /// The whole slice end to end: create, re-create, describe, list with paging,
@@ -160,7 +193,14 @@ async fn application_and_component_lifecycle_round_trips() {
         "re-create must name ResourceInUseException, got {body:?}"
     );
 
-    wait_out_onboarding().await;
+    // The onboarding the create owed falls due on the clock, so the suite looks
+    // again until it has.
+    let settled = poll_until_onboarded(&router, "my-rg").await;
+    assert_eq!(
+        settled, "NOT_CONFIGURED",
+        "an onboarded application with nothing monitored reports NOT_CONFIGURED, \
+         got {settled:?}"
+    );
 
     // Describe answers from the stored record: every field the create reported,
     // with the lifecycle the clock has since moved on.
@@ -173,8 +213,8 @@ async fn application_and_component_lifecycle_round_trips() {
     assert_eq!(status, 200, "DescribeApplication: got body {described:?}");
     let seen = &described["ApplicationInfo"];
     assert_eq!(
-        seen["LifeCycle"], "ACTIVE",
-        "the onboarding the create owed is due by now, got {seen:?}"
+        seen["LifeCycle"], "NOT_CONFIGURED",
+        "the onboarding the create owed is due by now and nothing is monitored, got {seen:?}"
     );
     for member in [
         "ResourceGroupName",
@@ -1015,5 +1055,514 @@ async fn components_are_keyed_per_application() {
     assert_eq!(
         status, 400,
         "the deleted application has no component list, got {body:?}"
+    );
+}
+
+/// An EC2 instance ARN, the one resource a custom component may group, numbered
+/// so a row can group several distinct instances.
+fn instance_arn(number: u8) -> String {
+    format!(
+        "arn:aws:ec2:us-east-1:{}:instance/i-{number:017x}",
+        account_id()
+    )
+}
+
+/// Create an application over `group` and one component per entry of
+/// `components`, each grouping one EC2 instance, so a row has components to
+/// configure. No Resource Groups service is mounted here, so the application
+/// onboards no resource of its own: the components a row reads are exactly the
+/// ones it created.
+async fn application_with_components(
+    router: &MultiServiceRouter,
+    group: &str,
+    components: &[&str],
+) {
+    let (status, body) = call(
+        router,
+        "CreateApplication",
+        json!({ "ResourceGroupName": group }),
+    )
+    .await;
+    assert_eq!(status, 200, "setup: CreateApplication({group:?}): {body:?}");
+    for (number, component) in components.iter().enumerate() {
+        let (status, body) = call(
+            router,
+            "CreateComponent",
+            json!({
+                "ResourceGroupName": group,
+                "ComponentName": component,
+                "ResourceList": [instance_arn(u8::try_from(number).unwrap_or_default())],
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "setup: CreateComponent({component:?}) in {group:?}: {body:?}"
+        );
+    }
+}
+
+/// An application's `LifeCycle` is computed from its components' monitoring, not
+/// from elapsed time: `NOT_CONFIGURED` while no component is monitored, `ACTIVE`
+/// once any one is, and back again when the last monitored component is turned
+/// off.
+///
+/// The rows span what the rule generalises over: how many components the
+/// application holds (none, one, several), how many of them are monitored (none,
+/// one of several, all), and the direction of the change (monitoring turned on,
+/// then off).
+#[tokio::test]
+async fn life_cycle_follows_component_monitoring() {
+    let router = router();
+
+    /// One row: the group, the components to create, the components to configure
+    /// with `Monitor` set to the paired value, and the lifecycle that must follow.
+    struct Row {
+        case: &'static str,
+        components: &'static [&'static str],
+        configure: &'static [(&'static str, bool)],
+        expected: &'static str,
+    }
+
+    let rows = [
+        Row {
+            case: "an application with no component at all",
+            components: &[],
+            configure: &[],
+            expected: "NOT_CONFIGURED",
+        },
+        Row {
+            case: "one component, never configured",
+            components: &["web-tier"],
+            configure: &[],
+            expected: "NOT_CONFIGURED",
+        },
+        Row {
+            case: "one component, configured as not monitored",
+            components: &["web-tier"],
+            configure: &[("web-tier", false)],
+            expected: "NOT_CONFIGURED",
+        },
+        Row {
+            case: "one component, monitored",
+            components: &["web-tier"],
+            configure: &[("web-tier", true)],
+            expected: "ACTIVE",
+        },
+        Row {
+            case: "one of three components monitored",
+            components: &["web-tier", "app-tier", "db-tier"],
+            configure: &[("app-tier", true)],
+            expected: "ACTIVE",
+        },
+        Row {
+            case: "every component monitored",
+            components: &["web-tier", "app-tier"],
+            configure: &[("web-tier", true), ("app-tier", true)],
+            expected: "ACTIVE",
+        },
+        Row {
+            case: "the only monitored component turned off again",
+            components: &["web-tier", "app-tier"],
+            configure: &[("web-tier", true), ("web-tier", false)],
+            expected: "NOT_CONFIGURED",
+        },
+        Row {
+            case: "one of two monitored components turned off again",
+            components: &["web-tier", "app-tier"],
+            configure: &[("web-tier", true), ("app-tier", true), ("app-tier", false)],
+            expected: "ACTIVE",
+        },
+    ];
+
+    for (number, row) in rows.iter().enumerate() {
+        let group = format!("life-cycle-rg-{number}");
+        application_with_components(&router, &group, row.components).await;
+
+        // Onboarding is owed by the clock, so a read before it falls due reports
+        // CREATING whatever the components say.
+        let creating = life_cycle(&router, &group).await;
+        assert_eq!(
+            creating, "CREATING",
+            "case {:?}: a just-created application is still onboarding, got {creating:?}",
+            row.case
+        );
+        let settled = poll_until_onboarded(&router, &group).await;
+        assert_eq!(
+            settled, "NOT_CONFIGURED",
+            "case {:?}: an onboarded application with nothing monitored reports \
+             NOT_CONFIGURED, got {settled:?}",
+            row.case
+        );
+
+        for (component, monitor) in row.configure {
+            let (status, body) = call(
+                &router,
+                "UpdateComponentConfiguration",
+                json!({
+                    "ResourceGroupName": group,
+                    "ComponentName": component,
+                    "Monitor": monitor,
+                    "Tier": "DEFAULT",
+                    "ComponentConfiguration": "{\"subComponents\":[]}",
+                }),
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {:?}: configuring {component:?} must succeed, got {body:?}",
+                row.case
+            );
+        }
+
+        let reported = life_cycle(&router, &group).await;
+        assert_eq!(
+            reported, row.expected,
+            "case {:?}: expected LifeCycle {}, got {reported:?}",
+            row.case, row.expected
+        );
+    }
+}
+
+/// `UpdateComponentConfiguration` stores what it is given and
+/// `DescribeComponentConfiguration` reports it back: a component's monitoring,
+/// its tier and the escaped JSON configuration itself. A member the call leaves
+/// out keeps the value already stored.
+///
+/// The rows span the members a configuration carries (all three, each on its
+/// own), the tiers the modelled `Tier` enum names, and the form of the
+/// configuration document (an empty object, nested members, a list).
+#[tokio::test]
+async fn a_component_configuration_round_trips() {
+    let router = router();
+    let group = "configured-rg";
+    application_with_components(&router, group, &["web-tier"]).await;
+
+    /// One row: what the configuration call carries, and what must be stored
+    /// after it.
+    struct Row {
+        case: &'static str,
+        monitor: Option<bool>,
+        tier: Option<&'static str>,
+        configuration: Option<&'static str>,
+        expected_monitor: bool,
+        expected_tier: &'static str,
+        expected_configuration: Option<&'static str>,
+    }
+
+    // The tiers below are members of the model's `Tier` enum
+    // (`smithy_query(query="shape",shape="Tier")`).
+    let rows = [
+        Row {
+            case: "a component nothing has configured yet",
+            monitor: None,
+            tier: None,
+            configuration: None,
+            expected_monitor: false,
+            expected_tier: "DEFAULT",
+            expected_configuration: None,
+        },
+        Row {
+            case: "monitoring, a tier and a configuration together",
+            monitor: Some(true),
+            tier: Some("DOT_NET_WEB"),
+            configuration: Some("{\"subComponents\":[]}"),
+            expected_monitor: true,
+            expected_tier: "DOT_NET_WEB",
+            expected_configuration: Some("{\"subComponents\":[]}"),
+        },
+        Row {
+            case: "a tier alone leaves the monitoring and the configuration stored",
+            monitor: None,
+            tier: Some("SQL_SERVER"),
+            configuration: None,
+            expected_monitor: true,
+            expected_tier: "SQL_SERVER",
+            expected_configuration: Some("{\"subComponents\":[]}"),
+        },
+        Row {
+            case: "a nested configuration document alone",
+            monitor: None,
+            tier: None,
+            configuration: Some(
+                "{\"alarmMetrics\":[{\"alarmMetricName\":\"CPUUtilization\"}],\"logs\":[]}",
+            ),
+            expected_monitor: true,
+            expected_tier: "SQL_SERVER",
+            expected_configuration: Some(
+                "{\"alarmMetrics\":[{\"alarmMetricName\":\"CPUUtilization\"}],\"logs\":[]}",
+            ),
+        },
+        Row {
+            case: "monitoring turned off alone",
+            monitor: Some(false),
+            tier: None,
+            configuration: None,
+            expected_monitor: false,
+            expected_tier: "SQL_SERVER",
+            expected_configuration: Some(
+                "{\"alarmMetrics\":[{\"alarmMetricName\":\"CPUUtilization\"}],\"logs\":[]}",
+            ),
+        },
+        Row {
+            case: "an empty configuration document and the CUSTOM tier",
+            monitor: Some(true),
+            tier: Some("CUSTOM"),
+            configuration: Some("{}"),
+            expected_monitor: true,
+            expected_tier: "CUSTOM",
+            expected_configuration: Some("{}"),
+        },
+    ];
+
+    for row in &rows {
+        let mut request = json!({ "ResourceGroupName": group, "ComponentName": "web-tier" });
+        let members = request
+            .as_object_mut()
+            .expect("the request is a JSON object");
+        if let Some(monitor) = row.monitor {
+            members.insert("Monitor".to_string(), json!(monitor));
+        }
+        if let Some(tier) = row.tier {
+            members.insert("Tier".to_string(), json!(tier));
+        }
+        if let Some(configuration) = row.configuration {
+            members.insert("ComponentConfiguration".to_string(), json!(configuration));
+        }
+        // The first row reads the component as created, so it sends no
+        // configuration call at all.
+        if row.monitor.is_some() || row.tier.is_some() || row.configuration.is_some() {
+            let (status, body) =
+                call(&router, "UpdateComponentConfiguration", request.clone()).await;
+            assert_eq!(
+                status, 200,
+                "case {:?}: UpdateComponentConfiguration gave {body:?}",
+                row.case
+            );
+        }
+
+        let (status, read) = call(
+            &router,
+            "DescribeComponentConfiguration",
+            json!({ "ResourceGroupName": group, "ComponentName": "web-tier" }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: DescribeComponentConfiguration gave {read:?}",
+            row.case
+        );
+        assert_eq!(
+            read["Monitor"],
+            json!(row.expected_monitor),
+            "case {:?}: expected Monitor {}, got {read:?}",
+            row.case,
+            row.expected_monitor
+        );
+        assert_eq!(
+            read["Tier"],
+            json!(row.expected_tier),
+            "case {:?}: expected Tier {}, got {read:?}",
+            row.case,
+            row.expected_tier
+        );
+        assert_eq!(
+            read.get("ComponentConfiguration").and_then(Value::as_str),
+            row.expected_configuration,
+            "case {:?}: expected the stored configuration {:?}, got {read:?}",
+            row.case,
+            row.expected_configuration
+        );
+
+        // The component listing and `DescribeComponent` answer from the same
+        // stored record, so neither can disagree with the configuration read.
+        let (status, described) = call(
+            &router,
+            "DescribeComponent",
+            json!({ "ResourceGroupName": group, "ComponentName": "web-tier" }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: DescribeComponent gave {described:?}",
+            row.case
+        );
+        assert_eq!(
+            described["ApplicationComponent"]["Monitor"],
+            json!(row.expected_monitor),
+            "case {:?}: DescribeComponent must report the stored Monitor, got {described:?}",
+            row.case
+        );
+        assert_eq!(
+            described["ApplicationComponent"]["Tier"],
+            json!(row.expected_tier),
+            "case {:?}: DescribeComponent must report the stored Tier, got {described:?}",
+            row.case
+        );
+    }
+}
+
+/// A configuration call is refused when it addresses an application or a
+/// component the store does not hold, and when the configuration it carries is
+/// not the escaped JSON of a document — and a refused call stores nothing.
+///
+/// The first two sentences are the service's own fixed ones, asserted here as
+/// every other refusal of this crate is. The third is the emulator's OWN wording
+/// (AWS publishes none for a malformed `ComponentConfiguration`, and no recording
+/// carries one), so what the rows pin there is that the refusal is reported at
+/// all — under the modelled status and error code, with nothing stored — rather
+/// than any claim about AWS's phrasing.
+#[tokio::test]
+async fn a_configuration_the_service_cannot_apply_is_refused() {
+    let router = router();
+    let group = "refusing-rg";
+    application_with_components(&router, group, &["web-tier"]).await;
+
+    let cases: &[(&str, Value, &str, &str)] = &[
+        (
+            "an application no group answers to",
+            json!({
+                "ResourceGroupName": "no-such-rg",
+                "ComponentName": "web-tier",
+                "Monitor": true,
+            }),
+            "ResourceNotFoundException",
+            "Application does not exist",
+        ),
+        (
+            "a component the application does not hold",
+            json!({
+                "ResourceGroupName": group,
+                "ComponentName": "no-such-tier",
+                "Monitor": true,
+            }),
+            "ResourceNotFoundException",
+            "Custom component no-such-tier does not exist for refusing-rg",
+        ),
+        (
+            "a configuration that is not a JSON document",
+            json!({
+                "ResourceGroupName": group,
+                "ComponentName": "web-tier",
+                "Monitor": true,
+                "ComponentConfiguration": "not json at all",
+            }),
+            "ValidationException",
+            "ComponentConfiguration is not valid: it must be the escaped JSON of the component \
+             configuration",
+        ),
+        (
+            "a configuration that is a truncated JSON document",
+            json!({
+                "ResourceGroupName": group,
+                "ComponentName": "web-tier",
+                "Monitor": true,
+                "ComponentConfiguration": "{\"subComponents\":",
+            }),
+            "ValidationException",
+            "ComponentConfiguration is not valid: it must be the escaped JSON of the component \
+             configuration",
+        ),
+    ];
+
+    for (case, request, expected_code, expected_message) in cases {
+        let (status, body) = call(&router, "UpdateComponentConfiguration", request.clone()).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            *expected_code,
+            "case {case:?}: expected {expected_code}, got {body:?}"
+        );
+        let message = body
+            .get("Message")
+            .or_else(|| body.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or("<no Message>");
+        assert_eq!(
+            message, *expected_message,
+            "case {case:?}: expected the sentence {expected_message:?}, got {body:?}"
+        );
+    }
+
+    // Nothing above configured anything: the component is still unmonitored and
+    // carries no configuration.
+    let (status, read) = call(
+        &router,
+        "DescribeComponentConfiguration",
+        json!({ "ResourceGroupName": group, "ComponentName": "web-tier" }),
+    )
+    .await;
+    assert_eq!(status, 200, "DescribeComponentConfiguration: {read:?}");
+    assert_eq!(
+        read["Monitor"],
+        json!(false),
+        "a refused configuration must leave the component unmonitored, got {read:?}"
+    );
+    assert_eq!(
+        read.get("ComponentConfiguration").and_then(Value::as_str),
+        None,
+        "a refused configuration must store no document, got {read:?}"
+    );
+}
+
+/// A component configuration is read and written per component and per
+/// application: configuring one leaves every other component, and every other
+/// application, exactly as it was.
+#[tokio::test]
+async fn a_configuration_reaches_only_the_component_it_names() {
+    let router = router();
+    application_with_components(&router, "left-rg", &["web-tier", "app-tier"]).await;
+    application_with_components(&router, "right-rg", &["web-tier"]).await;
+    poll_until_onboarded(&router, "left-rg").await;
+    poll_until_onboarded(&router, "right-rg").await;
+
+    let (status, body) = call(
+        &router,
+        "UpdateComponentConfiguration",
+        json!({
+            "ResourceGroupName": "left-rg",
+            "ComponentName": "web-tier",
+            "Monitor": true,
+            "Tier": "JAVA_JMX",
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "UpdateComponentConfiguration: {body:?}");
+
+    // Each other component: unmonitored, in the DEFAULT tier it was created in.
+    for (group, component) in [("left-rg", "app-tier"), ("right-rg", "web-tier")] {
+        let case = format!("{group}/{component}");
+        let (status, read) = call(
+            &router,
+            "DescribeComponentConfiguration",
+            json!({ "ResourceGroupName": group, "ComponentName": component }),
+        )
+        .await;
+        assert_eq!(status, 200, "case {case:?}: got {read:?}");
+        assert_eq!(
+            read["Monitor"],
+            json!(false),
+            "case {case:?}: must stay unmonitored, got {read:?}"
+        );
+        assert_eq!(
+            read["Tier"],
+            json!("DEFAULT"),
+            "case {case:?}: must stay in the DEFAULT tier, got {read:?}"
+        );
+    }
+
+    // And the lifecycle of each application follows its OWN components.
+    let left = life_cycle(&router, "left-rg").await;
+    assert_eq!(
+        left, "ACTIVE",
+        "the configured application must be ACTIVE, got {left:?}"
+    );
+    let right = life_cycle(&router, "right-rg").await;
+    assert_eq!(
+        right, "NOT_CONFIGURED",
+        "the untouched application must stay NOT_CONFIGURED, got {right:?}"
     );
 }

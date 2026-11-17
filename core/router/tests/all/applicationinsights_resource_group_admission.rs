@@ -27,16 +27,16 @@
 //! exact-name, not prefix, matching.
 //!
 //! Assembling the whole router costs stack (see `boot_serve.rs`), so it is built — and
-//! the requests driven — on a sized thread.
+//! the requests driven — on a sized thread. The wire itself is
+//! `crate::applicationinsights_wire`, shared with the other suites of this service pair.
 
 use std::sync::Arc;
 
 use aws_emulator_router::{build_router, InMemoryEngine};
-use serde_json::{json, Value};
+use serde_json::json;
 use smithy_server_runtime::MultiServiceRouter;
 
-/// Keep this at or above `boot_serve.rs`'s stack: the same assembly runs here.
-const BOOT_STACK_SIZE: usize = 64 * 1024 * 1024;
+use crate::applicationinsights_wire::{application_insights, create_group, BOOT_STACK_SIZE};
 
 /// The region every request below is signed for, unless a row says otherwise.
 const REGION: &str = "eu-west-2";
@@ -44,130 +44,6 @@ const REGION: &str = "eu-west-2";
 /// Another region, for the row whose group is created through a different endpoint: a
 /// resource group is regional, so a group of another region answers no lookup here.
 const OTHER_REGION: &str = "ap-south-1";
-
-/// The `X-Amz-Target` prefix this service's awsJson1_1 operations are named by.
-const TARGET_PREFIX: &str = "EC2WindowsBarleyService";
-
-/// What one call answered: the HTTP status and the parsed JSON body (`Value::Null` for a
-/// body that is empty or not JSON).
-#[derive(Debug)]
-struct Answer {
-    status: u16,
-    body: Value,
-}
-
-impl Answer {
-    /// The awsJson error code, without its namespace.
-    fn error_code(&self) -> String {
-        self.body
-            .get("__type")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .rsplit(['#', ':'])
-            .next()
-            .unwrap_or("")
-            .to_string()
-    }
-
-    /// The error message, whichever casing the envelope carries it under.
-    fn error_message(&self) -> String {
-        self.body
-            .get("Message")
-            .or_else(|| self.body.get("message"))
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string()
-    }
-}
-
-/// Dispatch one request addressed to `signing_name` in `region`, the way a signed SDK
-/// call is: the credential scope is what names the service and the region.
-fn send(
-    router: &MultiServiceRouter,
-    runtime: &tokio::runtime::Runtime,
-    signing_name: &str,
-    region: &str,
-    path: &str,
-    target: Option<&str>,
-    body: Value,
-) -> Answer {
-    let host = format!("{signing_name}.{region}.amazonaws.com");
-    let content_type = if target.is_some() {
-        "application/x-amz-json-1.1"
-    } else {
-        "application/json"
-    };
-    let mut request = http::Request::builder()
-        .method("POST")
-        .uri(format!("https://{host}{path}"))
-        .header("host", host)
-        .header("content-type", content_type)
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDTEST/20260101/{region}/{signing_name}/\
-                 aws4_request, SignedHeaders=host, Signature=not-verified"
-            ),
-        );
-    if let Some(target) = target {
-        request = request.header("x-amz-target", format!("{TARGET_PREFIX}.{target}"));
-    }
-    let request = request
-        .body(bytes::Bytes::from(
-            serde_json::to_vec(&body).expect("serialize body"),
-        ))
-        .expect("a well-formed request");
-    let response = runtime.block_on(router.dispatch(request));
-    let status = response.status().as_u16();
-    let bytes = response.into_body();
-    let body = if bytes.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
-    };
-    Answer { status, body }
-}
-
-/// One Application Insights operation, over its awsJson1_1 wire.
-fn application_insights(
-    router: &MultiServiceRouter,
-    runtime: &tokio::runtime::Runtime,
-    operation: &str,
-    body: Value,
-) -> Answer {
-    send(
-        router,
-        runtime,
-        "applicationinsights",
-        REGION,
-        "/",
-        Some(operation),
-        body,
-    )
-}
-
-/// `POST /groups` — Resource Groups' own `CreateGroup`, in `region`.
-fn create_group(
-    router: &MultiServiceRouter,
-    runtime: &tokio::runtime::Runtime,
-    region: &str,
-    name: &str,
-) {
-    let answer = send(
-        router,
-        runtime,
-        "resource-groups",
-        region,
-        "/groups",
-        None,
-        json!({ "Name": name }),
-    );
-    assert_eq!(
-        answer.status, 200,
-        "setup: CreateGroup({name:?}) in {region} must succeed, got {} / {:?}",
-        answer.status, answer.body
-    );
-}
 
 /// The refusal AWS answers a create over a group the account does not hold.
 fn group_missing_message(name: &str) -> String {
@@ -275,6 +151,7 @@ fn application_exists(
     let read = application_insights(
         router,
         runtime,
+        REGION,
         "DescribeApplication",
         json!({ "ResourceGroupName": name }),
     );
@@ -296,12 +173,13 @@ fn an_application_is_created_only_for_a_group_resource_groups_holds() {
 
             for row in rows() {
                 if let Some((name, region)) = &row.create {
-                    create_group(&router, &runtime, region, name);
+                    create_group(&router, &runtime, region, name, None);
                 }
 
                 let created = application_insights(
                     &router,
                     &runtime,
+                    REGION,
                     "CreateApplication",
                     json!({ "ResourceGroupName": row.resource_group_name }),
                 );
@@ -359,6 +237,7 @@ fn an_application_is_created_only_for_a_group_resource_groups_holds() {
             let before = application_insights(
                 &router,
                 &runtime,
+                REGION,
                 "CreateApplication",
                 json!({ "ResourceGroupName": name }),
             );
@@ -374,11 +253,12 @@ fn an_application_is_created_only_for_a_group_resource_groups_holds() {
                 "a refused create must leave the group with no application"
             );
 
-            create_group(&router, &runtime, REGION, name);
+            create_group(&router, &runtime, REGION, name, None);
 
             let after = application_insights(
                 &router,
                 &runtime,
+                REGION,
                 "CreateApplication",
                 json!({ "ResourceGroupName": name }),
             );

@@ -8,6 +8,11 @@
 //! A custom component groups standalone EC2 instances, so a resource list naming
 //! anything else is refused rather than stored.
 //!
+//! A resource the application onboarded as a DEFAULT (standalone) component stops
+//! being one once this call groups it: a resource belongs to one component of the
+//! application, its own or a custom one
+//! ([`crate::state::Application::ungroup_discovered`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -225,14 +230,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.component_name.clone(),
             crate::state::Component {
                 component_name: input.component_name,
-                resource_list: input.resource_list,
+                resource_list: input.resource_list.clone(),
                 resource_type,
                 os_type: None,
                 tier: crate::state::TIER_DEFAULT.to_string(),
                 monitor: false,
                 component_remarks: None,
+                component_configuration: None,
+                origin: crate::state::ComponentOrigin::Custom,
             },
         );
+        // A resource of the application's resource group is a component of the
+        // application on its own or as part of a custom component, never both:
+        // the resources this call grouped stop being standalone components.
+        application.ungroup_discovered(&input.resource_list);
 
         Ok(CreateComponentOutput {})
     }

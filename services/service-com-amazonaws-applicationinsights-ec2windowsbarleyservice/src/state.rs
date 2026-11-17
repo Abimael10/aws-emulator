@@ -81,9 +81,15 @@ pub fn foreign_account(account_id: Option<&str>) -> Option<&str> {
 /// onboarding the resources it was created over.
 pub const LIFE_CYCLE_CREATING: &str = "CREATING";
 
-/// `LifeCycle` an application carries once onboarding has finished. `LifeCycle`
-/// is an unconstrained string in the model (`smithy_query(query="shape",
-/// shape="ApplicationInfo")`), so these two are the emulator's own vocabulary.
+/// `LifeCycle` an application carries once onboarding has finished and no
+/// component of it is monitored: it is onboarded, and nothing about it is
+/// configured for monitoring yet.
+pub const LIFE_CYCLE_NOT_CONFIGURED: &str = "NOT_CONFIGURED";
+
+/// `LifeCycle` an application carries once at least one of its components is
+/// monitored. `LifeCycle` is an unconstrained string in the model
+/// (`smithy_query(query="shape",shape="ApplicationInfo")`), so these three are
+/// the emulator's own vocabulary.
 pub const LIFE_CYCLE_ACTIVE: &str = "ACTIVE";
 
 /// `Tier` a component carries until a configuration gives it a stack tier.
@@ -106,10 +112,11 @@ pub const DISCOVERY_TYPE_ACCOUNT_BASED: &str = "ACCOUNT_BASED";
 /// finish.
 ///
 /// CHOSEN, not documented: AWS publishes no onboarding duration, so this is the
-/// emulator's own span. It is deliberately non-zero, so a caller that reads the
-/// application straight back still observes `CREATING`, and it is stored as a
-/// due instant on the application rather than waited for.
-pub const ONBOARDING_SPAN: Duration = Duration::from_millis(500);
+/// emulator's own span, the one every clock-owed transition in this tree uses. It
+/// is deliberately non-zero, so a caller that reads the application straight back
+/// still observes `CREATING`, and it is stored as a due instant on the
+/// application rather than waited for.
+pub const ONBOARDING_SPAN: Duration = Duration::from_secs(3);
 
 /// Page size `ListApplications` / `ListComponents` use when the caller names no
 /// `MaxResults`, and the largest either accepts: the modelled range of the
@@ -230,12 +237,49 @@ pub struct Application {
 }
 
 impl Application {
-    /// The `LifeCycle` at `now`. The clock moves it, not the act of reading.
+    /// The `LifeCycle` at `now`, computed from the onboarding the clock owes and
+    /// from the components this application holds — never from the act of
+    /// reading:
+    ///
+    /// * `CREATING` while the onboarding the create started is still outstanding;
+    /// * `NOT_CONFIGURED` once onboarded while no component is monitored, which
+    ///   is what a client branches on to decide the application still needs
+    ///   configuring;
+    /// * `ACTIVE` once any component is monitored, which only a component
+    ///   configuration turns on.
     pub fn life_cycle(&self, now: SystemTime) -> &'static str {
         if now < self.onboarded_at {
             LIFE_CYCLE_CREATING
-        } else {
+        } else if self.is_monitored() {
             LIFE_CYCLE_ACTIVE
+        } else {
+            LIFE_CYCLE_NOT_CONFIGURED
+        }
+    }
+
+    /// Whether any component of this application is monitored.
+    pub fn is_monitored(&self) -> bool {
+        self.components.values().any(|component| component.monitor)
+    }
+
+    /// Drop the DEFAULT components standing for `resources`, because a custom
+    /// component now groups them.
+    ///
+    /// A resource of the application's resource group is a component of the
+    /// application either on its own or as part of a custom component, never
+    /// both: a resource grouped into a custom component stops being a standalone
+    /// one. Only a component onboarding discovered is dropped — a custom
+    /// component is never removed by another create — and only the one standing
+    /// for exactly the grouped resource.
+    pub fn ungroup_discovered(&mut self, resources: &[String]) {
+        for resource_arn in resources {
+            let discovered = self
+                .components
+                .get(resource_arn)
+                .is_some_and(|component| component.origin == ComponentOrigin::Discovered);
+            if discovered {
+                self.components.remove(resource_arn);
+            }
         }
     }
 
@@ -258,12 +302,24 @@ impl Application {
     }
 }
 
+/// Where a component came from: a resource the application's resource group
+/// resolved to, or a `CreateComponent` call that grouped resources by hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComponentOrigin {
+    /// A DEFAULT (standalone) component: one resource of the application's
+    /// resource group, onboarded when the application was created.
+    Discovered,
+    /// A CUSTOM component: the resources one `CreateComponent` call grouped.
+    Custom,
+}
+
 /// One component of an application, keyed in [`Application::components`] by its
 /// `ComponentName`.
 #[derive(Debug, Clone)]
 pub struct Component {
     pub component_name: String,
-    /// The ARNs the component groups, exactly as `CreateComponent` supplied them.
+    /// The ARNs the component groups: the resources `CreateComponent` supplied,
+    /// or the single resource a discovered component stands for.
     pub resource_list: Vec<String>,
     /// The single resource type the grouped ARNs name; see [`resource_type_of`].
     pub resource_type: Option<String>,
@@ -271,14 +327,22 @@ pub struct Component {
     /// says what a grouped resource runs, so it stays absent rather than being
     /// guessed.
     pub os_type: Option<String>,
-    /// The stack tier; [`TIER_DEFAULT`] until a configuration slice sets one.
+    /// The stack tier; [`TIER_DEFAULT`] until a configuration sets one.
     pub tier: String,
     /// Whether the component is monitored. A component is monitored once its
-    /// configuration says so, which no implemented operation sets yet.
+    /// configuration says so (`UpdateComponentConfiguration`), and an
+    /// application is `ACTIVE` once any of its components is.
     pub monitor: bool,
     /// Whether the component has logs configured for monitoring; absent until a
-    /// configuration slice sets it.
+    /// configuration sets it.
     pub component_remarks: Option<String>,
+    /// The escaped JSON configuration the last `UpdateComponentConfiguration`
+    /// stored, reported back by `DescribeComponentConfiguration`; absent for a
+    /// component nothing has configured.
+    pub component_configuration: Option<String>,
+    /// Whether this component was discovered from the resource group or grouped
+    /// by a `CreateComponent` call; see [`ComponentOrigin`].
+    pub origin: ComponentOrigin,
 }
 
 impl Component {
@@ -295,6 +359,78 @@ impl Component {
             detected_workload: None,
         }
     }
+}
+
+/// The longest `ComponentName` the model admits (length 1..1011), which a
+/// discovered component's name — the resource's own ARN — has to fit: a resource
+/// whose ARN is longer than this has no name a component could report, so
+/// onboarding leaves it out rather than answering a name the member forbids.
+pub const MAX_COMPONENT_NAME: usize = 1011;
+
+/// The DEFAULT (standalone) components an application onboards from the
+/// resources its resource group resolves to.
+///
+/// One component per resource, keyed and named by that resource's own ARN,
+/// grouping that one resource, in the `DEFAULT` tier and UNMONITORED — a
+/// component is monitored once a configuration says so. Bounded by
+/// [`COMPONENT_QUOTA`], the same ceiling `CreateComponent` holds one
+/// application's components to.
+pub fn onboarded_components(
+    members: &[resource_groups::GroupMember],
+) -> BTreeMap<String, Component> {
+    members
+        .iter()
+        .filter(|member| {
+            !member.resource_arn.is_empty() && member.resource_arn.len() <= MAX_COMPONENT_NAME
+        })
+        .take(COMPONENT_QUOTA)
+        .map(|member| {
+            (
+                member.resource_arn.clone(),
+                discovered_component(&member.resource_arn, member.resource_type.as_deref()),
+            )
+        })
+        .collect()
+}
+
+/// The DEFAULT component one resource of the application's resource group is
+/// onboarded as.
+fn discovered_component(resource_arn: &str, resource_type: Option<&str>) -> Component {
+    Component {
+        component_name: resource_arn.to_string(),
+        resource_list: vec![resource_arn.to_string()],
+        resource_type: component_resource_type(resource_type, resource_arn),
+        os_type: None,
+        tier: TIER_DEFAULT.to_string(),
+        monitor: false,
+        component_remarks: None,
+        component_configuration: None,
+        origin: ComponentOrigin::Discovered,
+    }
+}
+
+/// The `ResourceType` a discovered component reports: the type Resource Groups
+/// reported for the resource, falling back to the one this service derives from
+/// the ARN itself ([`resource_type_of_arn`]) when the listing named none.
+///
+/// A reported value is kept only when it satisfies the modelled
+/// `ApplicationComponent$ResourceType` constraints (1..50 characters matching
+/// `^[0-9a-zA-Z:_]*$`, `smithy_query(query="shape",shape="ApplicationComponent")`),
+/// so a component never reports a type the member does not admit.
+fn component_resource_type(reported: Option<&str>, resource_arn: &str) -> Option<String> {
+    reported
+        .filter(|reported| is_reportable_resource_type(reported))
+        .map(str::to_string)
+        .or_else(|| resource_type_of_arn(resource_arn).map(str::to_string))
+}
+
+/// Whether `value` is inside the modelled `ResourceType` constraints.
+fn is_reportable_resource_type(value: &str) -> bool {
+    let length = value.chars().count();
+    (1..=50).contains(&length)
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || character == ':' || character == '_'
+        })
 }
 
 /// The `DiscoveryType` an application gets from the `GroupingType` its create

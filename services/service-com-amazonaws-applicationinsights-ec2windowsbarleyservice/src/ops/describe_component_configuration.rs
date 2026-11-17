@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeComponentConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeComponentConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeComponentConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the monitoring configuration one component of the
+//! addressed application carries in [`crate::state`] — whether it is monitored,
+//! its stack tier, and the escaped JSON configuration the last
+//! `UpdateComponentConfiguration` stored (absent for a component nothing has
+//! configured yet).
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +150,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeComponentConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeComponentConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeComponentConfiguration"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DescribeComponentConfigurationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "this service is mounted on an engine that holds no state".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `AccountId` selects the owner of the resource group the component
+        // belongs to, and this emulator serves exactly one account: another
+        // account's applications are not the caller's to read.
+        if let Some(requested) = crate::state::foreign_account(input.account_id.as_deref()) {
+            return Err(
+                DescribeComponentConfigurationErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(crate::state::foreign_account_message(requested)),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let store = state.lock();
+        let Some(application) = store.applications.get(&input.resource_group_name) else {
+            return Err(
+                DescribeComponentConfigurationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::APPLICATION_MISSING_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let Some(component) = application.components.get(&input.component_name) else {
+            return Err(
+                DescribeComponentConfigurationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::component_missing_message(
+                            &input.component_name,
+                            &input.resource_group_name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(DescribeComponentConfigurationOutput {
+            monitor: Some(component.monitor),
+            tier: Some(component.tier.clone()),
+            component_configuration: component.component_configuration.clone(),
+        })
     }
 }
