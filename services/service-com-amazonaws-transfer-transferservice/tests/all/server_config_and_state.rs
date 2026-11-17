@@ -226,27 +226,17 @@ async fn described_servers_report_every_defaulted_and_computed_member() {
     }
 }
 
-/// An OpenSSH SHA256 fingerprint: the literal `SHA256:` followed by the unpadded
-/// Base64 of a 32-byte digest, i.e. 43 Base64 characters. This is what
-/// `ssh-keygen -l` prints and what `HostKeyFingerprint` is documented to carry.
+/// A SHA256 key fingerprint, held to the one form check this crate has
+/// ([`crate::server_host_key_resource::assert_fingerprint_form`]): the literal `SHA256:`
+/// followed by the Base64 encoding of a 32-byte digest, which is what
+/// `HostKeyFingerprint` is documented to carry ("the Base64-encoded SHA256 fingerprint of
+/// the server's host key"). That the digest is the server's OWN key's is asserted in that
+/// same suite.
 fn assert_well_formed_fingerprint(case: &str, actual: &Value) {
     let fingerprint = actual.as_str().unwrap_or_else(|| {
         panic!("case {case:?}: expected a HostKeyFingerprint string, got {actual:?}")
     });
-    let digest = fingerprint.strip_prefix("SHA256:").unwrap_or_else(|| {
-        panic!("case {case:?}: expected a SHA256: fingerprint, got {fingerprint:?}")
-    });
-    assert_eq!(
-        digest.len(),
-        43,
-        "case {case:?}: expected 43 Base64 characters of SHA256 digest, got {fingerprint:?}"
-    );
-    assert!(
-        digest
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/'),
-        "case {case:?}: expected Base64 digest characters, got {fingerprint:?}"
-    );
+    crate::server_host_key_resource::assert_fingerprint_form(case, fingerprint);
 }
 
 /// RULE: a server's host key is its own — each created server reports a different

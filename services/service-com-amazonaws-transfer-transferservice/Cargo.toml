@@ -81,6 +81,10 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# Encodes the SHA-256 digest a host-key fingerprint carries, so a suite computes the
+# fingerprint it expects from the key's own bytes rather than through the code under
+# test. TEST-ONLY use of the same version `[dependencies]` pins.
+base64 = "0.22"
 # Generates the OpenSSH host key the HostKey round-trip test supplies, and computes the
 # fingerprint it expects back, independently of the handler under test.
 ssh-key = { version = "0.6", default-features = false, features = ["alloc", "ecdsa", "ed25519", "getrandom"] }

@@ -27,7 +27,7 @@
 use serde_json::json;
 use service_com_amazonaws_transfer_transferservice::state::{mint_host_key, read_host_key};
 
-use crate::harness::{generated_host_key, member_of, Emulator};
+use crate::harness::{generated_host_key, member_of, reported_fingerprint, Emulator};
 
 /// The PEM label of a PKCS#1 RSA private key (`ssh-keygen -t rsa -m PEM`).
 const LABEL_RSA_PRIVATE_KEY: &str = "RSA PRIVATE KEY";
@@ -90,16 +90,17 @@ fn pem(label: &str, der: &[u8]) -> String {
     pkcs1::pem::encode_string(label, pkcs1::pem::LineEnding::LF, der).expect("the PEM")
 }
 
-/// The fingerprint `ssh-keygen -l` prints for the RSA key with these numbers, computed
+/// The fingerprint a reader reports for the RSA key with these numbers, computed
 /// here from the key itself rather than from the code under test.
 fn expected_rsa_fingerprint(modulus: &[u8], exponent: &[u8]) -> String {
     let public = ssh_key::public::RsaPublicKey {
         e: ssh_key::Mpint::from_positive_bytes(exponent).expect("the exponent"),
         n: ssh_key::Mpint::from_positive_bytes(modulus).expect("the modulus"),
     };
-    ssh_key::PublicKey::new(ssh_key::public::KeyData::Rsa(public), "")
-        .fingerprint(ssh_key::HashAlg::Sha256)
-        .to_string()
+    reported_fingerprint(&ssh_key::PublicKey::new(
+        ssh_key::public::KeyData::Rsa(public),
+        "",
+    ))
 }
 
 /// A 2048-bit modulus, built so that its leading byte keeps it positive for the DER
@@ -125,9 +126,10 @@ fn ecdsa_key() -> (String, String, String) {
         ec.public_key.expect("the SEC1 public point"),
     )
     .expect("the ECDSA public key");
-    let fingerprint = ssh_key::PublicKey::new(ssh_key::public::KeyData::Ecdsa(public), "")
-        .fingerprint(ssh_key::HashAlg::Sha256)
-        .to_string();
+    let fingerprint = reported_fingerprint(&ssh_key::PublicKey::new(
+        ssh_key::public::KeyData::Ecdsa(public),
+        "",
+    ));
     (pem(LABEL_PRIVATE_KEY, &pkcs8), sec1, fingerprint)
 }
 
@@ -151,10 +153,10 @@ fn ed25519_pkcs8_key() -> (String, String) {
         private_key: &inner,
         public_key: None,
     };
-    let fingerprint =
-        ssh_key::PublicKey::new(ssh_key::public::KeyData::Ed25519(keypair.public), "")
-            .fingerprint(ssh_key::HashAlg::Sha256)
-            .to_string();
+    let fingerprint = reported_fingerprint(&ssh_key::PublicKey::new(
+        ssh_key::public::KeyData::Ed25519(keypair.public),
+        "",
+    ));
     (
         pem(
             LABEL_PRIVATE_KEY,
@@ -455,7 +457,7 @@ async fn a_generated_host_key_is_a_per_server_rsa_key() {
         );
         assert!(
             key.fingerprint.starts_with("SHA256:"),
-            "case {case:?}: expected the fingerprint ssh-keygen -l prints, got {key:?}"
+            "case {case:?}: expected a SHA256 fingerprint, got {key:?}"
         );
     }
     assert_ne!(

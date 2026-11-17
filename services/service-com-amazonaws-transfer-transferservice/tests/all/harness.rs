@@ -820,9 +820,9 @@ fn is_prefixed_lower_hex_id(id: &str, prefix: &str, digits: usize) -> bool {
     })
 }
 
-/// An OpenSSH Ed25519 private key and the SHA256 fingerprint `ssh-keygen -l` prints
-/// for it, both produced here by the OpenSSH key-format crate — so the expectation
-/// comes from the key, not from the handler under test.
+/// An OpenSSH Ed25519 private key and the fingerprint this service's readers report for
+/// it, both produced here from the key's own bytes — so the expectation comes from the
+/// key, not from the handler under test.
 pub(crate) fn generated_host_key() -> (String, String) {
     let keypair = ssh_key::private::Ed25519Keypair::random(&mut ssh_key::rand_core::OsRng);
     let key = ssh_key::PrivateKey::from(keypair);
@@ -830,8 +830,27 @@ pub(crate) fn generated_host_key() -> (String, String) {
         .to_openssh(ssh_key::LineEnding::LF)
         .expect("the generated key encodes as an OpenSSH private key")
         .to_string();
-    let fingerprint = key.fingerprint(ssh_key::HashAlg::Sha256).to_string();
-    (material, fingerprint)
+    (material, reported_fingerprint(key.public_key()))
+}
+
+/// The fingerprint a reader of `key` reports: the literal `SHA256:` followed by the
+/// Base64 encoding of the SHA-256 digest of the key's OpenSSH public-key blob, which is
+/// what "the Base64-encoded SHA256 fingerprint" of a key is.
+///
+/// Computed HERE, from the key's own bytes, with a hash crate and a Base64 crate rather
+/// than through anything the code under test calls: the digest is taken over the blob
+/// the key encodes to, and the encoding is the standard one, whose final group of the
+/// 32-byte digest is completed by a `=` pad.
+pub(crate) fn reported_fingerprint(key: &ssh_key::PublicKey) -> String {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+
+    let blob = key.to_bytes().expect("the key encodes as an OpenSSH blob");
+    let digest = sha2::Sha256::digest(blob);
+    format!(
+        "SHA256:{}",
+        base64::engine::general_purpose::STANDARD.encode(digest)
+    )
 }
 
 /// An OpenSSH ED25519 PUBLIC key, in the `key-type key-body comment` form

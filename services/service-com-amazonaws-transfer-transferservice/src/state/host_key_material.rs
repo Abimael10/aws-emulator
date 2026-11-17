@@ -67,8 +67,8 @@ pub(super) fn normalised_openssh_private_key(material: &str) -> Option<String> {
 /// client connecting to the server is shown.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostKeyMaterial {
-    /// The Base64 SHA256 fingerprint, in the `SHA256:<base64>` form `ssh-keygen -l`
-    /// prints.
+    /// The Base64 SHA256 fingerprint of the key, in the `SHA256:<base64>` form every
+    /// member that reports one carries — see [`fingerprint_of`].
     pub fingerprint: String,
     /// The SSH algorithm name (`ssh-rsa`, `ssh-ed25519`, `ecdsa-sha2-nistp256/384/521`).
     pub key_type: String,
@@ -204,8 +204,8 @@ pub const INVALID_HOST_KEY_FORMAT: &str = "Invalid host key format";
 /// AWS generates a host key for a server whose host key it manages — an RSA key, the
 /// kind its own documented generation command writes first (`ssh-keygen -t rsa -b 2048
 /// -N "" -m PEM`), so a reader reports `ssh-rsa` for it — and reports that key's
-/// fingerprint, "equivalent to the output of the `ssh-keygen -l -f` command", i.e.
-/// OpenSSH's `SHA256:<base64 of the SHA256 of the public key blob>`. So this GENERATES a
+/// fingerprint, the Base64-encoded SHA256 digest of its public key blob
+/// ([`fingerprint_of`]). So this GENERATES a
 /// real RSA 2048 key pair and reads that key's own properties off it; every value is
 /// computed from real key material rather than invented. The key is per-server and
 /// per-run, like the real service's, and its private half is not kept: the emulator
@@ -229,6 +229,34 @@ pub(super) fn host_key_material(key: &::ssh_key::PrivateKey) -> HostKeyMaterial 
     public_key_material(key.public_key())
 }
 
+/// The prefix the service writes a SHA-256 key fingerprint under, naming the hash the
+/// digest was taken with — the one `ssh-keygen -l` prints too.
+const FINGERPRINT_HASH_PREFIX: &str = "SHA256:";
+
+/// The fingerprint of ONE key, as every member that reports a fingerprint writes it:
+/// `SHA256:` followed by the Base64 encoding of the SHA-256 digest of the key.
+///
+/// `HostKeyFingerprint` is documented as "the Base64-encoded SHA256 fingerprint of the
+/// server's host key". The digest is the SHA-256 of the key's OpenSSH public-key BLOB —
+/// the bytes an SSH host-key exchange carries, which is what makes the value a property
+/// of the key and not of the container it arrived in — and the encoding is Base64 as RFC
+/// 4648 defines it, so the 32-byte digest renders as four-character groups throughout,
+/// the last of them completed by the `=` that pads it. (`ssh-keygen -l` prints the same
+/// digest with that padding stripped; the service reports the padded encoding.)
+///
+/// The ONE place a fingerprint is rendered, so a key reads the same whichever member
+/// reports it — a server's own `HostKeyFingerprint`, a listed or described host key — and
+/// a fingerprint computed to COMPARE two keys is the same text as the stored one.
+pub(crate) fn fingerprint_of(key: &::ssh_key::PublicKey) -> String {
+    use ::base64::Engine as _;
+
+    let digest = key.fingerprint(::ssh_key::HashAlg::Sha256);
+    format!(
+        "{FINGERPRINT_HASH_PREFIX}{}",
+        ::base64::engine::general_purpose::STANDARD.encode(digest.as_bytes())
+    )
+}
+
 /// The same three properties, read off the PUBLIC half alone.
 ///
 /// Every one of them is a property of the public key: the fingerprint is the hash of its
@@ -237,7 +265,7 @@ pub(super) fn host_key_material(key: &::ssh_key::PrivateKey) -> HostKeyMaterial 
 /// public ones are described through this one place.
 fn public_key_material(key: &::ssh_key::PublicKey) -> HostKeyMaterial {
     HostKeyMaterial {
-        fingerprint: key.fingerprint(::ssh_key::HashAlg::Sha256).to_string(),
+        fingerprint: fingerprint_of(key),
         key_type: key.algorithm().as_str().to_string(),
         // An OpenSSH public key encodes from the key data alone; the fallback is the
         // empty string, which no reader can mistake for a key, rather than a value this

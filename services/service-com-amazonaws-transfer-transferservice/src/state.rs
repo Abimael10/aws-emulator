@@ -1070,7 +1070,7 @@ pub struct HostKey {
     /// `arn:aws:transfer:<region>:<account>:host-key/<ServerId>/<HostKeyId>`.
     pub arn: String,
     /// The Base64 SHA256 fingerprint of the imported key, in the `SHA256:<base64>`
-    /// form `ssh-keygen -l` prints.
+    /// form every member that reports a fingerprint carries ([`fingerprint_of`]).
     pub fingerprint: String,
     /// `DescribedHostKey.Type`: the imported key's SSH algorithm name, one of the
     /// values that member documents (`ssh-rsa`, `ssh-ed25519`,
@@ -1186,7 +1186,8 @@ pub struct Server {
     pub pre_authentication_login_banner: Option<String>,
     pub post_authentication_login_banner: Option<String>,
     /// The Base64 SHA256 fingerprint of the server's host key, in the
-    /// `SHA256:<base64>` form `ssh-keygen -l` prints.
+    /// `SHA256:<base64>` form every member that reports a fingerprint carries
+    /// ([`fingerprint_of`]).
     ///
     /// Computed at create time from a host key the emulator GENERATES for the server
     /// (as the service does for a server whose host key it manages) — see

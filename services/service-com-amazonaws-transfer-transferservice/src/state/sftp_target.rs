@@ -424,18 +424,17 @@ fn authenticates(
     }
 }
 
-/// The OpenSSH SHA256 fingerprint of an SSH PUBLIC key, when `material` is one.
+/// The SHA256 fingerprint of an SSH PUBLIC key, when `material` is one.
 ///
 /// The identity of a key, read by the crate that implements the OpenSSH key formats:
 /// comparing fingerprints is comparing keys, where comparing the encodings would make
-/// a comment or a trailing newline a different key.
+/// a comment or a trailing newline a different key. Rendered through the service's own
+/// one renderer (`state::fingerprint_of`), so a fingerprint computed here to compare two
+/// keys is the same text as the one a reader of either key reports.
 fn key_fingerprint(material: &str) -> Option<String> {
-    Some(
-        ::ssh_key::PublicKey::from_openssh(material)
-            .ok()?
-            .fingerprint(::ssh_key::HashAlg::Sha256)
-            .to_string(),
-    )
+    Some(st::fingerprint_of(
+        &::ssh_key::PublicKey::from_openssh(material).ok()?,
+    ))
 }
 
 /// A Secrets Manager client over the IN-PROCESS callback into this same emulator: the

@@ -16,6 +16,11 @@
 //! the supplied cases, along the key material itself. A key a caller IMPORTS beside it is
 //! [`crate::host_key_lifecycle`]'s subject; what this suite asserts is that the server's
 //! own key is in the same collection, under its own algorithm.
+//!
+//! SECOND RULE, on the VALUE every one of those readers reports: a fingerprint is
+//! `SHA256:` followed by the Base64 encoding of the SHA-256 digest of the key it
+//! identifies — see
+//! [`a_reported_fingerprint_is_the_keys_sha256_digest_in_base64`].
 
 use serde_json::{json, Value};
 
@@ -220,6 +225,189 @@ async fn a_servers_active_host_key_is_one_of_its_host_keys() {
              got {listed:?}"
         );
     }
+}
+
+/// How many characters the standard Base64 encoding of a 32-byte SHA-256 digest is:
+/// four characters per three bytes, so eleven whole groups and a final group of two
+/// bytes completed by one `=` pad.
+const BASE64_SHA256_DIGEST_LENGTH: usize = 44;
+
+/// Assert that `value` is a fingerprint in the form the service reports one: the literal
+/// `SHA256:` followed by the Base64 encoding of a SHA-256 digest — 44 characters, the
+/// last of them the pad that completes the final group, decoding to exactly 32 bytes.
+///
+/// Used for the key the SERVICE generates, whose material the caller never sees and
+/// whose digest can therefore only be checked as a digest; every supplied key's
+/// fingerprint is asserted against the text computed from that key's own bytes. Shared
+/// with [`crate::server_config_and_state`], so one check decides the form.
+pub(crate) fn assert_fingerprint_form(case: &str, value: &str) {
+    use base64::Engine as _;
+
+    let digest = value.strip_prefix("SHA256:").unwrap_or_else(|| {
+        panic!("case {case:?}: expected a SHA256: fingerprint, got {value:?}")
+    });
+    assert_eq!(
+        digest.len(),
+        BASE64_SHA256_DIGEST_LENGTH,
+        "case {case:?}: expected {BASE64_SHA256_DIGEST_LENGTH} Base64 characters of \
+         SHA-256 digest, got {value:?}"
+    );
+    assert!(
+        digest.ends_with('='),
+        "case {case:?}: expected the padded Base64 encoding of the digest, got {value:?}"
+    );
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(digest)
+        .unwrap_or_else(|error| {
+            panic!("case {case:?}: expected standard Base64, got {value:?} ({error})")
+        });
+    assert_eq!(
+        decoded.len(),
+        32,
+        "case {case:?}: expected a 32-byte SHA-256 digest, got {value:?} ({} bytes)",
+        decoded.len()
+    );
+}
+
+/// RULE: a fingerprint this service reports for a key is `SHA256:` followed by the
+/// Base64 encoding of the SHA-256 digest of that key — so it is the key's own digest, in
+/// that one rendering, whichever member reports it and whichever call put the key on the
+/// server.
+///
+/// The rows differ along the key whose digest is reported (the one the service generates,
+/// two different supplied keys, an imported one — so the digest differs in every row) and
+/// along the call that put it there (a create, an update's rotation, an import). Each
+/// supplied key's expectation is the text computed from that key's own bytes by a hash
+/// crate and a Base64 crate (`harness::reported_fingerprint`), independently of the
+/// handlers under test; the generated key's material is the service's own, so its
+/// fingerprint is held to the form a digest in this rendering has.
+#[tokio::test]
+async fn a_reported_fingerprint_is_the_keys_sha256_digest_in_base64() {
+    let emulator = Emulator::new();
+
+    // Row 1: the key the SERVICE generates for a server created without one. Its
+    // material is never handed to the caller, so what is asserted is that the value is a
+    // SHA-256 digest in this rendering, and that all three readers report that one value.
+    let generated_server = emulator.create_server(json!({})).await;
+    let reported = active_fingerprint(&emulator, "a generated host key", &generated_server).await;
+    assert_fingerprint_form("a generated host key", &reported);
+    assert_active_key_is_a_resource(
+        &emulator,
+        "a generated host key",
+        &generated_server,
+        GENERATED_HOST_KEY_TYPE,
+    )
+    .await;
+
+    // Rows 2 and 3: supplied material, whose digest the test computes itself — once
+    // through a create, once through the update that rotates a server onto it.
+    let (created_material, created_fingerprint) = generated_host_key();
+    let (rotated_material, rotated_fingerprint) = generated_host_key();
+    let supplied_server = emulator
+        .create_server(json!({"HostKey": &created_material}))
+        .await;
+    let rotated_server = emulator.create_server(json!({})).await;
+    let rotation = emulator
+        .call(
+            "UpdateServer",
+            json!({"ServerId": &rotated_server, "HostKey": &rotated_material}),
+        )
+        .await;
+    assert_eq!(
+        rotation.status, 200,
+        "case \"a key supplied by a rotation\": expected UpdateServer 200, got {} with \
+         body {}",
+        rotation.status, rotation.body
+    );
+
+    for (case, server_id, expected) in [
+        (
+            "a key supplied at create",
+            &supplied_server,
+            &created_fingerprint,
+        ),
+        (
+            "a key supplied by a rotation",
+            &rotated_server,
+            &rotated_fingerprint,
+        ),
+    ] {
+        assert_fingerprint_form(case, expected);
+        let reported = active_fingerprint(&emulator, case, server_id).await;
+        assert_eq!(
+            &reported, expected,
+            "case {case:?}: expected the supplied key's own digest {expected:?}, got \
+             {reported:?}"
+        );
+        // ...and the same text from the host-key readers of that server.
+        let entry = listed_with_fingerprint(&emulator, case, server_id, &reported).await;
+        let host_key_id = member_of(&entry, "HostKeyId")
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: expected a HostKeyId, got {entry}"))
+            .to_string();
+        let described = emulator
+            .call(
+                "DescribeHostKey",
+                json!({"ServerId": server_id, "HostKeyId": &host_key_id}),
+            )
+            .await;
+        assert_eq!(
+            member_of(described.get("HostKey"), "HostKeyFingerprint").as_str(),
+            Some(expected.as_str()),
+            "case {case:?}: expected the described key to report the same digest, got {}",
+            described.body
+        );
+    }
+
+    // Row 4: a key an IMPORT adds beside the server's own reports its own digest in the
+    // same rendering, so a caller comparing the two reads one text per key.
+    let (imported_material, imported_fingerprint) = generated_host_key();
+    let imported = emulator
+        .call(
+            "ImportHostKey",
+            json!({"ServerId": &generated_server, "HostKeyBody": &imported_material}),
+        )
+        .await;
+    assert_eq!(
+        imported.status, 200,
+        "case \"an imported key\": expected ImportHostKey 200, got {} with body {}",
+        imported.status, imported.body
+    );
+    let imported_id = imported
+        .get("HostKeyId")
+        .as_str()
+        .expect("an accepted import carries its HostKeyId")
+        .to_string();
+    let described = emulator
+        .call(
+            "DescribeHostKey",
+            json!({"ServerId": &generated_server, "HostKeyId": &imported_id}),
+        )
+        .await;
+    assert_eq!(
+        member_of(described.get("HostKey"), "HostKeyFingerprint").as_str(),
+        Some(imported_fingerprint.as_str()),
+        "case \"an imported key\": expected the imported key's own digest \
+         {imported_fingerprint:?}, got {}",
+        described.body
+    );
+    let entry = listed_with_fingerprint(
+        &emulator,
+        "an imported key",
+        &generated_server,
+        &imported_fingerprint,
+    )
+    .await;
+    assert_eq!(
+        member_of(&entry, "HostKeyId").as_str(),
+        Some(imported_id.as_str()),
+        "case \"an imported key\": expected the listed entry to be the imported key, got \
+         {entry}"
+    );
+    assert_ne!(
+        imported_fingerprint, reported,
+        "case \"an imported key\": expected a digest of its own, not the generated key's"
+    );
 }
 
 /// RULE: a server's key set is BOUNDED, and a rotation is one more key in it — so a
