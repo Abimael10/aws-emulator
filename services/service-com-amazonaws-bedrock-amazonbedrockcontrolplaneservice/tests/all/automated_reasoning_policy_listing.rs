@@ -27,6 +27,11 @@
 //!    read of the same ARN answers, which words the absent policy its own way.
 //! 5. **A `nextToken` this service did not issue is refused** with `ValidationException`,
 //!    over a set of malformed tokens, while a token the listing itself issued resumes it.
+//! 6. **A revision a DELETE took away names nothing either**, so the filter refuses it in
+//!    the same sentences as rule 4 rather than answering an empty page, and rather than
+//!    borrowing the documented idempotent SUCCESS the delete of a removed revision answers
+//!    — over the forms a delete can leave behind: a whole policy gone, a versioned ARN of a
+//!    policy gone, and one numbered version taken from a policy that is still there.
 //!
 //! Every expectation is derived from the model, cited per row
 //! (`smithy_query(query="operation",operation="ListAutomatedReasoningPolicies")`,
@@ -762,5 +767,246 @@ async fn a_next_token_this_service_did_not_issue_is_refused() {
         listed_arns("a token this listing issued", &resumed),
         listed_arns("the first page", &first),
         "case a token this listing issued: the next page must start past the first one"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// 6. A revision a delete took away.
+// ---------------------------------------------------------------------------------------
+
+/// The status an accepted `DeleteAutomatedReasoningPolicy` answers with
+/// (`smithy_query(query="operation",operation="DeleteAutomatedReasoningPolicy")`: success
+/// 202), which that operation also answers for a revision one of its own calls removed.
+const DELETE_ACCEPTED: u16 = 202;
+
+/// `DeleteAutomatedReasoningPolicy` for the revision `policy_arn` names. `force` takes the
+/// policy's own artifacts with it, which is what lets a row remove a policy that still
+/// holds versions in one call.
+async fn delete_policy(emu: &Emulator, policy_arn: &str, force: bool) -> Reply {
+    emu.call(
+        "DELETE",
+        &format!(
+            "/automated-reasoning-policies/{}?force={force}",
+            label(policy_arn)
+        ),
+        None,
+    )
+    .await
+}
+
+/// Delete the revision `policy_arn` names, asserting the delete went through, so a row that
+/// is about the LISTING does not rest on a removal that never happened.
+async fn remove_revision(emu: &Emulator, case: &str, policy_arn: &str, force: bool) {
+    let removed = delete_policy(emu, policy_arn, force).await;
+    assert_eq!(
+        removed.status, DELETE_ACCEPTED,
+        "case {case:?}: deleting {policy_arn:?} must answer {DELETE_ACCEPTED}, got {} {:?}",
+        removed.status, removed.body
+    );
+}
+
+#[tokio::test]
+async fn a_revision_a_delete_took_away_is_refused_by_the_filter() {
+    let emu = emulator();
+
+    // A policy that held nothing, taken away whole.
+    let bare = policy_arn_of(
+        &emu,
+        "a policy that held nothing",
+        json!({ "name": "removed bare policy" }),
+    )
+    .await;
+    remove_revision(&emu, "a policy that held nothing", &bare, false).await;
+
+    // A policy that held two versions, taken away whole — so its versioned ARNs name
+    // nothing either.
+    let (versioned, versioned_hash) = policy_of(
+        &emu,
+        "a policy that held versions",
+        json!({
+            "name": "removed versioned policy",
+            "policyDefinition": definition(1),
+        }),
+    )
+    .await;
+    for number in 1..=2 {
+        let cut = create_version(&emu, &versioned, &versioned_hash).await;
+        assert_eq!(
+            cut.status, 200,
+            "case a policy that held versions: cutting version {number} must answer 200, got \
+             {} {:?}",
+            cut.status, cut.body
+        );
+    }
+    remove_revision(&emu, "a policy that held versions", &versioned, true).await;
+
+    // A policy that is STILL there, one of whose three versions was taken away: the half of
+    // the ARN that resolved to nothing is the version, not the policy.
+    let (surviving, surviving_hash) = policy_of(
+        &emu,
+        "one version of a surviving policy",
+        json!({
+            "name": "surviving policy",
+            "policyDefinition": definition(2),
+        }),
+    )
+    .await;
+    set_created_at(&emu, &surviving, SystemTime::now() - Duration::from_secs(60));
+    for number in 1..=3 {
+        let cut = create_version(&emu, &surviving, &surviving_hash).await;
+        assert_eq!(
+            cut.status, 200,
+            "case one version of a surviving policy: cutting version {number} must answer \
+             200, got {} {:?}",
+            cut.status, cut.body
+        );
+    }
+    remove_revision(
+        &emu,
+        "one version of a surviving policy",
+        &format!("{surviving}:2"),
+        false,
+    )
+    .await;
+
+    // Rows: an ARN a delete emptied, paired with the sentence THIS operation words that
+    // miss in — the listing's own for a policy this account no longer holds, and the one
+    // sentence every operation reports a missing VERSION of a policy that IS there in — and
+    // with whether a read of the same ARN is worded the same way.
+    let rows: Vec<(&str, String, &str, bool)> = vec![
+        (
+            "a policy that held nothing",
+            bare.clone(),
+            LISTING_POLICY_NOT_FOUND,
+            false,
+        ),
+        (
+            "a policy that held versions",
+            versioned.clone(),
+            LISTING_POLICY_NOT_FOUND,
+            false,
+        ),
+        (
+            "the first version of a policy that is gone",
+            format!("{versioned}:1"),
+            LISTING_POLICY_NOT_FOUND,
+            false,
+        ),
+        (
+            "the last version of a policy that is gone",
+            format!("{versioned}:2"),
+            LISTING_POLICY_NOT_FOUND,
+            false,
+        ),
+        (
+            "one version of a surviving policy",
+            format!("{surviving}:2"),
+            POLICY_VERSION_NOT_FOUND,
+            true,
+        ),
+    ];
+
+    for (case, policy_arn, expected, read_words_it_the_same) in &rows {
+        let filtered = list(&emu, &format!("policyArn={}", label(policy_arn))).await;
+        assert_eq!(
+            filtered.status, 404,
+            "case {case:?}: a delete took {policy_arn:?} away, so the filter must answer 404 \
+             rather than a page, got {} {:?}",
+            filtered.status, filtered.body
+        );
+        assert_eq!(
+            filtered.error.as_deref(),
+            Some("ResourceNotFoundException"),
+            "case {case:?}: expected ResourceNotFoundException, got {:?}",
+            filtered.error
+        );
+        let message = filtered.text("message");
+        assert_eq!(
+            message, *expected,
+            "case {case:?}: the listing must refuse the removed revision with its own \
+             sentence {expected:?}, got {message:?}"
+        );
+        // A refusal is not an empty page: the required output member is absent altogether.
+        assert_eq!(
+            filtered.get("automatedReasoningPolicySummaries"),
+            Value::Null,
+            "case {case:?}: the refusal must carry no listing, got {:?}",
+            filtered.body
+        );
+        // The listing and the read of one policy word the absent POLICY differently, and the
+        // missing VERSION of a policy that IS there identically — the same split rule 4
+        // asserts for an ARN nothing ever minted.
+        let read = get_policy(&emu, policy_arn).await;
+        assert_eq!(
+            read.status, 404,
+            "case {case:?}: the read of a removed revision must answer 404, got {} {:?}",
+            read.status, read.body
+        );
+        let read_message = read.text("message");
+        if *read_words_it_the_same {
+            assert_eq!(
+                read_message, message,
+                "case {case:?}: the read must word this miss as the listing does ({message:?}), \
+                 got {read_message:?}"
+            );
+        } else {
+            assert_eq!(
+                read_message, READ_POLICY_NOT_FOUND,
+                "case {case:?}: the read keeps its own sentence {READ_POLICY_NOT_FOUND:?}, got \
+                 {read_message:?}"
+            );
+            assert_ne!(
+                read_message, message,
+                "case {case:?}: the listing and the read word the absent policy differently"
+            );
+        }
+        // The delete of the very same ARN answers its documented idempotent success, so the
+        // refusal above is the LISTING's own answer rather than the delete's.
+        let repeated = delete_policy(&emu, policy_arn, false).await;
+        assert_eq!(
+            repeated.status, DELETE_ACCEPTED,
+            "case {case:?}: repeating the delete of a removed revision succeeds, got {} {:?}",
+            repeated.status, repeated.body
+        );
+        // And the refusal is stable: reading the filter again answers the same sentence.
+        let again = list(&emu, &format!("policyArn={}", label(policy_arn))).await;
+        assert_eq!(
+            (again.status, again.text("message")),
+            (404, message.clone()),
+            "case {case:?}: the filter must answer the same refusal again, got {} {:?}",
+            again.status,
+            again.body
+        );
+    }
+
+    // The policy a delete did NOT take away still lists, draft first and with the versions
+    // that are left, so the rows above refused on the revision the delete removed rather
+    // than on the whole store.
+    let surviving_list = list(&emu, &format!("policyArn={}", label(&surviving))).await;
+    assert_eq!(
+        listed_arns("the surviving policy", &surviving_list),
+        vec![
+            surviving.clone(),
+            format!("{surviving}:1"),
+            format!("{surviving}:3"),
+        ],
+        "case \"the surviving policy\": the filter reports the draft and the versions the \
+         delete left, got {:?}",
+        surviving_list.body
+    );
+    // And the unfiltered listing no longer carries the policies that are gone.
+    let unfiltered = list(&emu, "").await;
+    let reported = listed_arns("the unfiltered listing", &unfiltered);
+    for gone in [&bare, &versioned] {
+        assert!(
+            !reported.contains(gone),
+            "case \"the unfiltered listing\": {gone:?} was deleted, so it must not be listed, \
+             got {reported:?}"
+        );
+    }
+    assert!(
+        reported.contains(&surviving),
+        "case \"the unfiltered listing\": the surviving policy's draft must still be listed, \
+         got {reported:?}"
     );
 }
