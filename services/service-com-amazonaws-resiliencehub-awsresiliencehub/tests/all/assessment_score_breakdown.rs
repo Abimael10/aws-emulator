@@ -30,25 +30,25 @@ const REGION: &str = "us-east-1";
 
 /// The whole of a resiliency score: a score is the fraction of its maximum that was
 /// earned, so meeting everything an application is judged on earns exactly this.
-const WHOLE_SCORE: f64 = 1.0;
+pub(crate) const WHOLE_SCORE: f64 = 1.0;
 
 /// How close two scores have to be to count as the same, so a mean of shares is not
 /// compared for exact bit equality.
-const SCORE_TOLERANCE: f64 = 1e-9;
+pub(crate) const SCORE_TOLERANCE: f64 = 1e-9;
 
 /// The scoring components a score breaks down over, from the enum the model gives
 /// `ScoringComponentResiliencyScores`' keys (`smithy_query query="shape"
 /// shape="ResiliencyScoreType"`: Compliance | Test | Alarm | Sop).
-const SCORING_COMPONENTS: [&str; 4] = ["Alarm", "Compliance", "Sop", "Test"];
+pub(crate) const SCORING_COMPONENTS: [&str; 4] = ["Alarm", "Compliance", "Sop", "Test"];
 
 /// The one scoring component graded on the policy's objectives; the others are
 /// graded on implemented recommendations.
-const COMPLIANCE_COMPONENT: &str = "Compliance";
+pub(crate) const COMPLIANCE_COMPONENT: &str = "Compliance";
 
 /// An emulator holding only this service, over one shared engine — and that engine,
 /// so a case can move the CLOCK an assessment is waiting on instead of sleeping
 /// through its span.
-fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // These requests carry an unverifiable placeholder signature: this suite tests
@@ -60,7 +60,7 @@ fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 
 /// What a dispatched request answered.
 #[derive(Debug)]
-struct Reply {
+pub(crate) struct Reply {
     status: u16,
     /// The restJson1 error shape name, from `x-amzn-errortype`; empty on success.
     error_code: String,
@@ -69,7 +69,7 @@ struct Reply {
 
 impl Reply {
     /// The response body, asserting the call succeeded.
-    fn ok(&self, case: &str) -> &Value {
+    pub(crate) fn ok(&self, case: &str) -> &Value {
         assert_eq!(
             self.status, 200,
             "case {case:?}: expected HTTP 200, got {} {:?} {:?}",
@@ -80,7 +80,7 @@ impl Reply {
 }
 
 /// Dispatch one request through the router, exactly as the server front door does.
-async fn post(router: &MultiServiceRouter, target: &str, body: &Value) -> Reply {
+pub(crate) async fn post(router: &MultiServiceRouter, target: &str, body: &Value) -> Reply {
     let payload = serde_json::to_vec(body).expect("serializable body");
     let request = http::Request::builder()
         .method("POST")
@@ -119,7 +119,7 @@ async fn post(router: &MultiServiceRouter, target: &str, body: &Value) -> Reply 
 
 /// A resiliency policy stating `objectives` (a disruption type to its RTO/RPO
 /// target), and its ARN.
-async fn create_a_policy(
+pub(crate) async fn create_a_policy(
     router: &MultiServiceRouter,
     policy_name: &str,
     objectives: &Value,
@@ -141,7 +141,7 @@ async fn create_a_policy(
 }
 
 /// An application named `name`, pointing at `policy_arn` when the case gives one.
-async fn create_an_app(
+pub(crate) async fn create_an_app(
     router: &MultiServiceRouter,
     name: &str,
     policy_arn: Option<&str>,
@@ -158,7 +158,7 @@ async fn create_an_app(
 }
 
 /// Add one Application Component to `app_arn`'s draft version.
-async fn add_a_component(router: &MultiServiceRouter, app_arn: &str, id: &str) {
+pub(crate) async fn add_a_component(router: &MultiServiceRouter, app_arn: &str, id: &str) {
     let reply = post(
         router,
         "/create-app-version-app-component",
@@ -174,7 +174,7 @@ async fn add_a_component(router: &MultiServiceRouter, app_arn: &str, id: &str) {
 }
 
 /// Add one physical resource to `app_arn`'s draft version, mapped to `component`.
-async fn add_a_resource(router: &MultiServiceRouter, app_arn: &str, component: &str) {
+pub(crate) async fn add_a_resource(router: &MultiServiceRouter, app_arn: &str, component: &str) {
     let identifier = format!("{component}-bucket");
     let reply = post(
         router,
@@ -193,7 +193,7 @@ async fn add_a_resource(router: &MultiServiceRouter, app_arn: &str, component: &
 }
 
 /// Publish `app_arn`'s draft, so the application has a release to assess.
-async fn publish(router: &MultiServiceRouter, app_arn: &str) {
+pub(crate) async fn publish(router: &MultiServiceRouter, app_arn: &str) {
     post(router, "/publish-app-version", &json!({"appArn": app_arn}))
         .await
         .ok("publish");
@@ -201,7 +201,7 @@ async fn publish(router: &MultiServiceRouter, app_arn: &str) {
 
 /// Move the clock an assessment is waiting on into the PAST, so a case can read
 /// what the finished assessment reports without sleeping through its span.
-fn finish_the_assessment(engine: &Arc<engine::InMemoryEngine>, assessment_arn: &str) {
+pub(crate) fn finish_the_assessment(engine: &Arc<engine::InMemoryEngine>, assessment_arn: &str) {
     engine
         .state::<ComAmazonawsResiliencehubAwsresiliencehubState>()
         .lock()
@@ -241,6 +241,97 @@ async fn assess(
     )
     .await;
     read.ok(assessment_name)["assessment"].clone()
+}
+
+/// Assert how one finished assessment's `resiliencyScore` breaks down over the
+/// scoring components: one entry per member of the model's `ResiliencyScoreType`
+/// enum and nothing else, no component earning more than its share, nothing
+/// excluded, the shares adding up to the whole of a score, what the components earn
+/// adding up to `overall` (the score itself), the compliance component carrying the
+/// whole share, earning exactly that score and reporting `outstanding` Application
+/// Components as breaching the policy, and every component graded on
+/// recommendations — of which this service records none — earning nothing.
+///
+/// Answers the `componentScore` map, so a caller can compare a later read of the
+/// same assessment against the breakdown it finished with. Shared with the sibling
+/// suite that reads the same rule for successive snapshots of one application, so
+/// the two cannot drift apart.
+pub(crate) fn assert_the_score_breaks_down(
+    case: &str,
+    score: &Value,
+    overall: f64,
+    outstanding: i64,
+) -> Value {
+    let components = score["componentScore"].as_object().unwrap_or_else(|| {
+        panic!("case {case:?}: a finished assessment breaks its score down, got {score:?}")
+    });
+    assert_eq!(
+        components.keys().cloned().collect::<BTreeSet<String>>(),
+        SCORING_COMPONENTS
+            .iter()
+            .map(|component| (*component).to_string())
+            .collect::<BTreeSet<String>>(),
+        "case {case:?}: expected one entry per scoring component, got {components:?}"
+    );
+
+    let mut possible_total = 0.0;
+    let mut earned_total = 0.0;
+    for component in SCORING_COMPONENTS {
+        let entry = &components[component];
+        let earned = entry["score"].as_f64().unwrap_or(f64::NAN);
+        let possible = entry["possibleScore"].as_f64().unwrap_or(f64::NAN);
+        assert!(
+            earned <= possible,
+            "case {case:?}: {component} cannot earn more than its share {possible:?}, got \
+             {earned:?}"
+        );
+        assert_eq!(
+            entry["excludedCount"].as_i64(),
+            Some(0),
+            "case {case:?}: nothing is excluded from the assessment, got {entry:?}"
+        );
+        possible_total += possible;
+        earned_total += earned;
+    }
+    assert!(
+        (possible_total - WHOLE_SCORE).abs() < SCORE_TOLERANCE,
+        "case {case:?}: the shares must add up to {WHOLE_SCORE}, got {possible_total:?} over \
+         {components:?}"
+    );
+    assert!(
+        (earned_total - overall).abs() < SCORE_TOLERANCE,
+        "case {case:?}: what the components earn must add up to the score {overall:?}, got \
+         {earned_total:?} over {components:?}"
+    );
+
+    let compliance = &components[COMPLIANCE_COMPONENT];
+    assert_eq!(
+        (
+            compliance["possibleScore"].as_f64(),
+            compliance["score"].as_f64(),
+            compliance["outstandingCount"].as_i64()
+        ),
+        (Some(WHOLE_SCORE), Some(overall), Some(outstanding)),
+        "case {case:?}: compliance must carry the whole share {WHOLE_SCORE}, earn the score \
+         {overall:?} and report {outstanding} outstanding, got {compliance:?}"
+    );
+    for component in SCORING_COMPONENTS
+        .iter()
+        .filter(|component| **component != COMPLIANCE_COMPONENT)
+    {
+        let entry = &components[*component];
+        assert_eq!(
+            (
+                entry["possibleScore"].as_f64(),
+                entry["score"].as_f64(),
+                entry["outstandingCount"].as_i64()
+            ),
+            (Some(0.0), Some(0.0), Some(0)),
+            "case {case:?}: {component} has no recommendation to score, got {entry:?}"
+        );
+    }
+
+    score["componentScore"].clone()
 }
 
 /// A row of the table: the objectives the application's policy states, which of its
@@ -394,87 +485,13 @@ async fn the_score_breaks_down_over_the_scoring_components() {
             );
         }
 
-        // One entry per scoring component, and nothing else.
-        let components = score["componentScore"].as_object().unwrap_or_else(|| {
-            panic!("case {case:?}: a finished assessment breaks its score down, got {score:?}")
-        });
-        assert_eq!(
-            components.keys().cloned().collect::<BTreeSet<String>>(),
-            SCORING_COMPONENTS
-                .iter()
-                .map(|component| (*component).to_string())
-                .collect::<BTreeSet<String>>(),
-            "case {case:?}: expected one entry per scoring component, got {components:?}"
-        );
-
-        let mut possible_total = 0.0;
-        let mut earned_total = 0.0;
-        for component in SCORING_COMPONENTS {
-            let entry = &components[component];
-            let earned = entry["score"].as_f64().unwrap_or(f64::NAN);
-            let possible = entry["possibleScore"].as_f64().unwrap_or(f64::NAN);
-            assert!(
-                earned <= possible,
-                "case {case:?}: {component} cannot earn more than its share {possible:?}, got \
-                 {earned:?}"
-            );
-            assert_eq!(
-                entry["excludedCount"].as_i64(),
-                Some(0),
-                "case {case:?}: nothing is excluded from the assessment, got {entry:?}"
-            );
-            possible_total += possible;
-            earned_total += earned;
-        }
-
-        // The shares add up to the whole of a score, and what the components earn
-        // adds up to the score itself.
-        assert!(
-            (possible_total - WHOLE_SCORE).abs() < SCORE_TOLERANCE,
-            "case {case:?}: the shares must add up to {WHOLE_SCORE}, got {possible_total:?} over \
-             {components:?}"
-        );
-        assert!(
-            (earned_total - overall).abs() < SCORE_TOLERANCE,
-            "case {case:?}: what the components earn must add up to the score {overall:?}, got \
-             {earned_total:?} over {components:?}"
-        );
-
-        // Compliance is the one component this service grades, so it carries the
-        // whole share, earns exactly the score, and counts the Application
-        // Components that breached the policy — none while there is no objective to
-        // breach.
-        let compliance = &components[COMPLIANCE_COMPONENT];
+        // One entry per scoring component, the shares adding up to the whole of a
+        // score, what they earn adding up to the score, and compliance — the one
+        // component this service grades — carrying the whole share, earning exactly
+        // the score and counting the Application Components that breached the policy,
+        // none while there is no objective to breach.
         let outstanding = if judged { row.unmapped.len() as i64 } else { 0 };
-        assert_eq!(
-            (
-                compliance["possibleScore"].as_f64(),
-                compliance["score"].as_f64(),
-                compliance["outstandingCount"].as_i64()
-            ),
-            (Some(WHOLE_SCORE), Some(overall), Some(outstanding)),
-            "case {case:?}: compliance must carry the whole share {WHOLE_SCORE}, earn the score \
-             {overall:?} and report {outstanding} outstanding, got {compliance:?}"
-        );
-
-        // Nothing recorded a test, alarm or standard operating procedure
-        // recommendation, so those components have nothing to earn and nothing
-        // outstanding.
-        for component in SCORING_COMPONENTS
-            .iter()
-            .filter(|component| **component != COMPLIANCE_COMPONENT)
-        {
-            let entry = &components[*component];
-            assert_eq!(
-                (
-                    entry["possibleScore"].as_f64(),
-                    entry["score"].as_f64(),
-                    entry["outstandingCount"].as_i64()
-                ),
-                (Some(0.0), Some(0.0), Some(0)),
-                "case {case:?}: {component} has no recommendation to score, got {entry:?}"
-            );
-        }
+        assert_the_score_breaks_down(case, &score, overall, outstanding);
 
         // The application's own score is the one its newest finished assessment
         // reported — the same fraction, through the reader of an application.
