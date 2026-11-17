@@ -26,8 +26,10 @@
 //! and an IAM user), the OPERATION asked for (six of the actions a topic's policy can grant),
 //! what the topic's policy says (none at all, a grant of the account, a grant of another
 //! principal, a grant of another action to this caller, a grant on another topic, an explicit
-//! deny of this caller, of the account, of every principal), and what the caller's own
-//! documents say (nothing, a grant of the action, an explicit deny of it).
+//! deny of this caller, of the account, of every principal), what the caller's own
+//! documents say (nothing, a grant of the action, an explicit deny of it), and whether a grant
+//! that stood is later WITHDRAWN, leaving the topic with the policy SNS generates for one
+//! whose owner has set none.
 
 use serde_json::json;
 
@@ -661,5 +663,172 @@ async fn the_refused_subscribe_is_served_once_an_identity_grant_exists() {
                  {expected:?}, got {entry:?} in {attributes}"
             );
         }
+    }
+}
+
+/// The IAM action a `Publish` is authorized under, as SNS's policy actions and its refusals
+/// spell it.
+const PUBLISH_ACTION: &str = "SNS:Publish";
+
+/// RULE: the same attribution holds for the action a PUBLISH performs — a publish no document
+/// in force grants the caller is refused with the clause naming the identity-based policies,
+/// however the topic's own policy came to withhold that grant.
+#[tokio::test]
+async fn an_ungranted_publish_blames_the_identity_based_policy() {
+    // (case, the topic policy that withholds the publish grant from this caller)
+    let policies: &[(&str, DocumentOf)] = &[
+        // A topic whose owner set no policy carries the one SNS generates, whose only
+        // statement is conditioned on a cross-service key a directly signed call carries no
+        // value for.
+        ("no policy of its own", |_, _| None),
+        (
+            "a grant of ANOTHER action to this caller",
+            |topic, entity| {
+                Some(policy(json!({
+                    "Effect": "Allow",
+                    "Principal": {"AWS": entity},
+                    "Action": "SNS:Subscribe",
+                    "Resource": topic,
+                })))
+            },
+        ),
+        ("a grant of the publish to another principal", |topic, entity| {
+            Some(policy(json!({
+                "Effect": "Allow",
+                "Principal": {"AWS": format!("{entity}-elsewhere")},
+                "Action": PUBLISH_ACTION,
+                "Resource": topic,
+            })))
+        }),
+        (
+            "a grant of the publish to this caller on another topic",
+            |topic, entity| {
+                Some(policy(json!({
+                    "Effect": "Allow",
+                    "Principal": {"AWS": entity},
+                    "Action": PUBLISH_ACTION,
+                    "Resource": format!("{topic}-elsewhere"),
+                })))
+            },
+        ),
+        (
+            "a grant of the ACCOUNT, which delegates rather than granting",
+            |topic, entity| {
+                Some(policy(json!({
+                    "Effect": "Allow",
+                    "Principal": {"AWS": account_root_of(entity)},
+                    "Action": "SNS:*",
+                    "Resource": topic,
+                })))
+            },
+        ),
+    ];
+
+    for form in [Form::RoleSession, Form::User] {
+        let emulator = emulator();
+        let caller = given_caller(&emulator, form, "ungranted-publisher").await;
+        for (index, (policy_case, document)) in policies.iter().enumerate() {
+            let case = format!("{form:?} publishing with {policy_case}");
+            // One topic per row: a row's document decides that row's topic alone.
+            let topic =
+                given_topic(&emulator, &format!("publish-clause-{form:?}-{index:02}")).await;
+            if let Some(document) = document(&topic, &caller.entity_arn) {
+                set_topic_policy(&emulator, &topic, &document).await;
+            }
+
+            let (status, body) = sns_as(
+                &emulator,
+                &caller.access_key_id,
+                "Publish",
+                &[("TopicArn", &topic), ("Message", "probe")],
+            )
+            .await;
+            let code = text_of(&body, "Code");
+            assert_eq!(
+                (status, code.as_str()),
+                AUTHORIZATION_ERROR,
+                "case {case:?}: expected the modelled refusal, got {status} / {body}"
+            );
+            let message = text_of(&body, "Message");
+            assert_eq!(
+                message,
+                not_authorized(
+                    &caller.reported,
+                    PUBLISH_ACTION,
+                    &topic,
+                    &no_identity_policy_allows(PUBLISH_ACTION)
+                ),
+                "case {case:?}: expected IAM's default-deny sentence, got {message:?}"
+            );
+            assert!(
+                !message.contains("resource-based"),
+                "case {case:?}: the default-deny sentence must not blame the resource-based \
+                 policy, got {message:?}"
+            );
+        }
+    }
+}
+
+/// RULE: the refusal is the absence of a grant and nothing else — the identical publish is
+/// served while the topic's policy names the caller, and once that statement is WITHDRAWN the
+/// topic reports the document SNS generates for a topic whose owner has set none and the
+/// publish falls back to the same default-deny sentence.
+#[tokio::test]
+async fn a_withdrawn_topic_grant_returns_the_publish_to_the_default_deny_sentence() {
+    for form in [Form::RoleSession, Form::User] {
+        let case = format!("{form:?} whose topic grant is withdrawn");
+        let emulator = emulator();
+        let caller = given_caller(&emulator, form, "withdrawn-publisher").await;
+        let topic = given_topic(&emulator, "withdrawn-grant").await;
+        set_topic_policy(
+            &emulator,
+            &topic,
+            &policy(json!({
+                "Effect": "Allow",
+                "Principal": {"AWS": caller.entity_arn},
+                "Action": PUBLISH_ACTION,
+                "Resource": topic,
+            })),
+        )
+        .await;
+        let publish = [("TopicArn", topic.as_str()), ("Message", "probe")];
+
+        let (status, body) = sns_as(&emulator, &caller.access_key_id, "Publish", &publish).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the granted publish to be served, got {status} / {body}"
+        );
+        assert!(
+            !text_of(&body, "MessageId").is_empty(),
+            "case {case:?}: expected a MessageId, got {body}"
+        );
+
+        // An empty value removes a policy-valued attribute, so the topic is back to the
+        // document SNS generates for one whose owner has set none.
+        set_topic_policy(&emulator, &topic, "").await;
+        let attributes = fixture(&emulator, "GetTopicAttributes", &[("TopicArn", &topic)]).await;
+        assert!(
+            attributes.contains("__default_statement_ID"),
+            "case {case:?}: expected the generated default policy to be reported, got \
+             {attributes}"
+        );
+
+        let (status, body) = sns_as(&emulator, &caller.access_key_id, "Publish", &publish).await;
+        let code = text_of(&body, "Code");
+        assert_eq!(
+            (status, code.as_str()),
+            AUTHORIZATION_ERROR,
+            "case {case:?}: expected the modelled refusal, got {status} / {body}"
+        );
+        assert_eq!(
+            text_of(&body, "Message"),
+            not_authorized(
+                &caller.reported,
+                PUBLISH_ACTION,
+                &topic,
+                &no_identity_policy_allows(PUBLISH_ACTION)
+            ),
+            "case {case:?}: expected IAM's default-deny sentence, got {body}"
+        );
     }
 }

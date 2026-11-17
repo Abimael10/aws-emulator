@@ -20,7 +20,8 @@
 //! The rows differ along what the rule generalises over: WHICH key the condition is written on,
 //! which OPERATOR compares it, whether the request's value matches, which principal the
 //! statement names (the caller by name, or every principal), which effect the statement states,
-//! and whether the operation the call performs carries a value for the key at all.
+//! whether the operation the call performs carries a value for the key at all, and whether the
+//! document that carries the clause is later REWRITTEN to cover more requests.
 //!
 //! The refusal SENTENCES are the sibling suite's, so nothing of IAM's wording is spelled twice
 //! ([`crate::topic_policy_authorization`]).
@@ -28,7 +29,8 @@
 use serde_json::{json, Value};
 
 use crate::publish_authorization::{
-    emulator, given_assumed_role, policy, sns_as, Emulator, AMBIENT_KEY,
+    depth, emulator, given_assumed_role, given_topic_with_a_subscribed_queue, policy, sns_as,
+    Emulator, AMBIENT_KEY,
 };
 use crate::topic_policy_authorization::{
     no_identity_policy_allows, not_authorized, AUTHORIZATION_ERROR, RESOURCE_POLICY_DENY,
@@ -591,6 +593,256 @@ async fn an_explicit_deny_of_every_principal_refuses_the_accounts_own_credential
                      got {body}"
                 );
             }
+        }
+    }
+}
+
+/// One `Subscribe` signed by a role session, with whatever status it answered.
+///
+/// `ReturnSubscriptionArn` is asked for so a served call answers the subscription's own ARN
+/// whether or not the endpoint has confirmed yet.
+async fn subscribe_as(
+    emulator: &Emulator,
+    access_key_id: &str,
+    topic: &str,
+    protocol: &str,
+    endpoint: &str,
+) -> (u16, String) {
+    sns_as(
+        emulator,
+        access_key_id,
+        "Subscribe",
+        &[
+            ("TopicArn", topic),
+            ("Protocol", protocol),
+            ("Endpoint", endpoint),
+            ("ReturnSubscriptionArn", "true"),
+        ],
+    )
+    .await
+}
+
+/// The topic's own listing of its subscriptions, read by its owner.
+async fn listed_subscriptions(emulator: &Emulator, topic: &str) -> String {
+    let (status, body) = sns_as(
+        emulator,
+        AMBIENT_KEY,
+        "ListSubscriptionsByTopic",
+        &[("TopicArn", topic)],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the owner's ListSubscriptionsByTopic must succeed, got {status} / {body}"
+    );
+    body
+}
+
+/// One row of the endpoint-scoped table: the case, the protocol the subscribe asks for, the
+/// endpoint the clause names, and another endpoint of the same form.
+type EndpointRow<'a> = (&'a str, &'a str, String, String);
+
+/// RULE: a statement conditioned on a request key applies to exactly the requests whose value
+/// for that key the clause covers, and it FOLLOWS the document — so a grant of `SNS:Subscribe`
+/// scoped by `sns:Endpoint` ("the URL, email address, or ARN from a `Subscribe` request")
+/// admits the subscribe of the endpoint it names, refuses any other endpoint with the modelled
+/// `AuthorizationErrorException` while creating nothing, and admits the very subscribe it
+/// refused once the clause is widened to name that endpoint too.
+///
+/// The rows differ along the FORM of the endpoint the key carries, which the rule generalises
+/// over: an ARN naming a queue, and a URL naming an HTTPS subscriber.
+#[tokio::test]
+async fn an_endpoint_scoped_grant_admits_the_named_endpoint_and_follows_a_widened_clause() {
+    let emulator = emulator();
+    let account = engine::emulator_account_id().to_string();
+    let (role_arn, session_arn, access_key_id) =
+        given_assumed_role(&emulator, "endpoint-scoped").await;
+    let by_name = json!({"AWS": role_arn});
+
+    let rows: Vec<EndpointRow<'_>> = vec![
+        (
+            "an sqs subscriber named by its queue ARN",
+            "sqs",
+            format!("arn:aws:sqs:us-east-1:{account}:scoped-one"),
+            format!("arn:aws:sqs:us-east-1:{account}:scoped-two"),
+        ),
+        (
+            "an https subscriber named by its URL",
+            "https",
+            ONE_ENDPOINT.to_string(),
+            OTHER_ENDPOINT.to_string(),
+        ),
+    ];
+
+    for (index, (case, protocol, named, other)) in rows.iter().enumerate() {
+        let topic = given_topic(&emulator, &format!("endpoint-scoped-{index:02}")).await;
+        // The clause names ONE endpoint, written as a list of one: the form a policy pins a
+        // subscriber to a single destination in.
+        set_policy(
+            &emulator,
+            &topic,
+            &conditioned(
+                "Allow",
+                by_name.clone(),
+                SUBSCRIBE_ACTION,
+                &topic,
+                Some(json!({"StringEquals": {"sns:Endpoint": [named]}})),
+            ),
+        )
+        .await;
+
+        let (status, body) = subscribe_as(&emulator, &access_key_id, &topic, protocol, named).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the subscribe of the named endpoint to be served, got \
+             {status} / {body}"
+        );
+        let subscription = text_of(&body, "SubscriptionArn");
+        assert!(
+            subscription.starts_with(&format!("{topic}:")),
+            "case {case:?}: expected a subscription ARN under the topic, got {subscription:?}"
+        );
+
+        // Any OTHER endpoint is outside the clause, so the identical call is refused and
+        // creates nothing.
+        let (status, body) = subscribe_as(&emulator, &access_key_id, &topic, protocol, other).await;
+        assert_eq!(
+            (status, code_of(&body).as_str()),
+            AUTHORIZATION_ERROR,
+            "case {case:?}: expected the subscribe of the other endpoint to be refused, got \
+             {status} / {body}"
+        );
+        assert_eq!(
+            message_of(&body),
+            not_authorized(
+                &session_arn,
+                SUBSCRIBE_ACTION,
+                &topic,
+                &no_identity_policy_allows(SUBSCRIBE_ACTION)
+            ),
+            "case {case:?}: unexpected refusal sentence, got {body}"
+        );
+        let listed = listed_subscriptions(&emulator, &topic).await;
+        assert!(
+            listed.contains(named.as_str()) && !listed.contains(other.as_str()),
+            "case {case:?}: expected the topic to hold only the named endpoint {named:?}, got \
+             {listed}"
+        );
+
+        // The clause widened to name both endpoints: the very call that was refused is now
+        // admitted, with nothing else about it changed.
+        set_policy(
+            &emulator,
+            &topic,
+            &conditioned(
+                "Allow",
+                by_name.clone(),
+                SUBSCRIBE_ACTION,
+                &topic,
+                Some(json!({"StringEquals": {"sns:Endpoint": [named, other]}})),
+            ),
+        )
+        .await;
+        let (status, body) = subscribe_as(&emulator, &access_key_id, &topic, protocol, other).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the widened clause to admit the second endpoint, got \
+             {status} / {body}"
+        );
+        let listed = listed_subscriptions(&emulator, &topic).await;
+        assert!(
+            listed.contains(named.as_str()) && listed.contains(other.as_str()),
+            "case {case:?}: expected the topic to hold both endpoints, got {listed}"
+        );
+    }
+}
+
+/// RULE: the same condition rule holds for a statement that names EVERY principal and scopes
+/// the grant by the caller instead — a `Principal` of `"*"` with `ArnLike` on
+/// `aws:PrincipalArn` ("the ARN of the principal that made the request") admits exactly the
+/// callers whose role ARN matches the pattern, so their publishes are served AND delivered to
+/// the topic's subscriber, and a caller outside the pattern is refused with the modelled
+/// `AuthorizationErrorException` and delivers nothing.
+///
+/// The rows differ along which role signs: two of the family the pattern covers — one of them
+/// a name the pattern admits beyond the first — and one outside it.
+#[tokio::test]
+async fn a_principal_arn_pattern_grant_admits_the_matching_roles_and_delivers_their_publishes() {
+    let emulator = emulator();
+    let account = engine::emulator_account_id().to_string();
+    let (topic, queue) = given_topic_with_a_subscribed_queue(&emulator, "arn-pattern").await;
+    // The grant names no principal of its own: it admits whoever the condition admits.
+    set_policy(
+        &emulator,
+        &topic,
+        &conditioned(
+            "Allow",
+            json!("*"),
+            PUBLISH_ACTION,
+            &topic,
+            Some(json!({"ArnLike": {
+                "aws:PrincipalArn": format!("arn:aws:iam::{account}:role/fleet-pub-*"),
+            }})),
+        ),
+    )
+    .await;
+
+    // (case, the role's name, whether the pattern admits it)
+    let rows: &[(&str, &str, bool)] = &[
+        ("a role of the family the pattern names", "fleet-pub-a", true),
+        (
+            "another role of that family, which the pattern names as well",
+            "fleet-pub-b",
+            true,
+        ),
+        ("a role outside the pattern", "fleet-ops-a", false),
+    ];
+
+    for (case, role_name, admitted) in rows {
+        let (_, session_arn, access_key_id) = given_assumed_role(&emulator, role_name).await;
+        let (status, body) = sns_as(
+            &emulator,
+            &access_key_id,
+            "Publish",
+            &[("TopicArn", &topic), ("Message", "a message")],
+        )
+        .await;
+        let delivered = depth(&emulator, &queue).await;
+        if *admitted {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the publish to be served, got {status} / {body}"
+            );
+            assert!(
+                !text_of(&body, "MessageId").is_empty(),
+                "case {case:?}: expected a MessageId, got {body}"
+            );
+            assert_eq!(
+                delivered, 1,
+                "case {case:?}: expected the subscribed queue to receive the message, got \
+                 {delivered} message(s)"
+            );
+        } else {
+            assert_eq!(
+                (status, code_of(&body).as_str()),
+                AUTHORIZATION_ERROR,
+                "case {case:?}: expected the publish to be refused, got {status} / {body}"
+            );
+            assert_eq!(
+                message_of(&body),
+                not_authorized(
+                    &session_arn,
+                    PUBLISH_ACTION,
+                    &topic,
+                    &no_identity_policy_allows(PUBLISH_ACTION)
+                ),
+                "case {case:?}: unexpected refusal sentence, got {body}"
+            );
+            assert_eq!(
+                delivered, 0,
+                "case {case:?}: a refused publish must deliver nothing, got {delivered} \
+                 message(s)"
+            );
         }
     }
 }

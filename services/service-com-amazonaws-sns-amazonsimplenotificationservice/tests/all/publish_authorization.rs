@@ -221,7 +221,10 @@ async fn sqs(emulator: &Emulator, operation: &str, body: &Value) -> Value {
 
 /// A topic, with a queue subscribed to it: the ARN of the topic, and the url of the queue a
 /// delivery is counted on.
-async fn given_topic_with_a_subscribed_queue(emulator: &Emulator, name: &str) -> (String, String) {
+pub(crate) async fn given_topic_with_a_subscribed_queue(
+    emulator: &Emulator,
+    name: &str,
+) -> (String, String) {
     let topic = text_of(&sns(emulator, "CreateTopic", &[("Name", name)]).await, "TopicArn");
     let created = sqs(
         emulator,
@@ -328,7 +331,7 @@ pub(crate) async fn given_assumed_role(
 }
 
 /// How many messages the queue at `url` holds, DELETED as they are read.
-async fn depth(emulator: &Emulator, url: &str) -> usize {
+pub(crate) async fn depth(emulator: &Emulator, url: &str) -> usize {
     let received = sqs(
         emulator,
         "ReceiveMessage",
