@@ -39,8 +39,9 @@ use serde_json::{json, Value};
 /// Keep this at or above `boot_serve.rs`'s stack: the same assembly runs here.
 pub(crate) const BOOT_STACK_SIZE: usize = 64 * 1024 * 1024;
 
-/// The region every request below is signed for.
-const REGION: &str = "us-east-1";
+/// The region every request below is signed for, and so the one every ARN the emulator mints
+/// for them is scoped to — shared with the sibling SageMaker suites that assert on an ARN.
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The account the emulator serves, which is the only registry and the only IAM it holds.
 pub(crate) const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
@@ -170,6 +171,17 @@ pub(crate) fn error_message(body: &Value) -> String {
         .or_else(|| body.get("message"))
         .and_then(Value::as_str)
         .unwrap_or("")
+        .to_string()
+}
+
+/// A top-level string member of an answer, or the empty string when the answer carries none.
+///
+/// Shared with the sibling SageMaker suites, so one reading of a response member serves them
+/// all.
+pub(crate) fn str_field(body: &Value, member: &str) -> String {
+    body.get(member)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
         .to_string()
 }
 
@@ -308,7 +320,10 @@ fn role_cases() -> Vec<RoleCase> {
 /// which also covers the hosting reading: the behavioural corpus records `CreateModel`
 /// ACCEPTING a role this account's IAM holds nothing under, so that operation refuses only
 /// what a STORED trust document withholds.
-fn could_not_assume(role_arn: &str) -> String {
+///
+/// The AutoML creates word it the same way, so `sagemaker_automl_job_role_admission` asserts
+/// against this one sentence rather than restating it.
+pub(crate) fn could_not_assume(role_arn: &str) -> String {
     format!(
         "Could not assume role {role_arn}. Please ensure that the role exists and allows \
          principal 'sagemaker.amazonaws.com' to assume the role."
