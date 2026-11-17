@@ -138,7 +138,7 @@ fn due_at(now: SystemTime, span: Duration) -> SystemTime {
 /// `TargetHealthReasonEnum` reason and description each is reported with — the model's
 /// own words for the condition, so one state cannot be worded two ways.
 const INITIAL: (&str, &str, &str) = (
-    "initial",
+    INITIAL_STATE,
     "Elb.RegistrationInProgress",
     "Target registration is in progress",
 );
@@ -182,7 +182,7 @@ const UNHEALTHY_FAILED_CHECKS: (&str, &str, &str) = (
 /// the target the minimum number of health checks required to determine its health status"
 /// (`TargetHealth$Reason`).
 const INITIAL_HEALTH_CHECKING: (&str, &str, &str) = (
-    "initial",
+    INITIAL_STATE,
     "Elb.InitialHealthChecking",
     "Health checks in progress",
 );
@@ -214,6 +214,14 @@ pub const HEALTHY_STATE: &str = "healthy";
 /// The `TargetHealthStateEnum` value of a registration whose health checks the load balancer
 /// could not get an answer to.
 pub const UNHEALTHY_STATE: &str = "unhealthy";
+
+/// The `TargetHealthStateEnum` value of a registration whose health the load balancer has NOT
+/// determined yet: the one it reports both while the registration is coming up and while its
+/// checks have begun without reaching a verdict ([`INITIAL`], [`INITIAL_HEALTH_CHECKING`]).
+///
+/// A registration in it is in neither host count, and a group holding one has no count to
+/// report at all ([`TargetGroupRecord::reported_host_counts`]).
+pub const INITIAL_STATE: &str = "initial";
 
 /// Where the periodic health check of ONE registration has got to: what the checks have
 /// observed in a row, and the verdict those runs have reached.

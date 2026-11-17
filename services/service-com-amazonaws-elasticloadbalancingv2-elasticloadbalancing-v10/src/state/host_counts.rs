@@ -80,6 +80,16 @@
 //! series that has been running. What each datapoint COUNTS is the health the checks have
 //! reached by then, on their own schedule above.
 //!
+//! So a datapoint is published only once there is a count to report: while the checks have
+//! determined the health of NO registration of the group, the load balancer has found out
+//! nothing to count ([`super::TargetGroupRecord::reported_host_counts`]), and the datapoint
+//! stays owed rather than being published as a zero — a count of no unhealthy targets among
+//! registrations nothing has yet been observed about is a verdict no check reached, and an
+//! alarm over the series would be graded from it. The series therefore begins at the first
+//! verdict the checks reached, which is also the earliest instant AWS's own series could
+//! report one; a group some of whose registrations are decided keeps reporting the counts it
+//! has, so one registration coming up never silences a series.
+//!
 //! What makes that observable without any further call is [`drive_host_count_metrics`]: the
 //! write that changes what a load balancer routes to, or which targets are registered,
 //! publishes what is due at that instant and starts the one bounded in-process task that
@@ -98,7 +108,7 @@ use ::service_com_amazonaws_cloudwatch_graniteserviceversion20100801::state as c
 use ::service_com_amazonaws_ec2_amazonec2::ops::types as ec2_types;
 use ::service_com_amazonaws_ec2_amazonec2::state as ec2;
 
-use super::target_health::{HEALTHY_STATE, UNHEALTHY_STATE};
+use super::target_health::{HEALTHY_STATE, INITIAL_STATE, UNHEALTHY_STATE};
 use super::{
     load_balancer_type_code,
     ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State as ElbState, GuardingGroups,
@@ -234,6 +244,12 @@ struct SeriesClock {
     next_stamp: SystemTime,
     /// The instant the next datapoint comes due; see [`ACCELERATED_SPACING`].
     next_datapoint_at: Instant,
+    /// Whether a datapoint of this series has been PUBLISHED yet.
+    ///
+    /// What keeps the run-up a series opens with to the periods before its FIRST datapoint: a
+    /// series that has already published stands where its schedule has reached, so a period it
+    /// has reported is never re-stamped ([`hold`]).
+    published: bool,
 }
 
 /// Where every host-count series of this store has got to, and the one in-process clock that
@@ -531,7 +547,7 @@ fn sync_series(store: &mut ElbState, now: SystemTime, instant: Instant) {
         .host_counts
         .series
         .retain(|pair, _| routed.contains(pair));
-    let run_up = PUBLISH_INTERVAL.saturating_mul(RUN_UP_PERIODS);
+    let run_up = run_up();
     for pair in routed {
         store
             .host_counts
@@ -540,8 +556,16 @@ fn sync_series(store: &mut ElbState, now: SystemTime, instant: Instant) {
             .or_insert_with(|| SeriesClock {
                 next_stamp: now.checked_sub(run_up).unwrap_or(now),
                 next_datapoint_at: instant,
+                published: false,
             });
     }
+}
+
+/// How far back the stamp of a series' FIRST datapoint is: the run-up it opens with
+/// ([`RUN_UP_PERIODS`] periods of [`PUBLISH_INTERVAL`] each), which is the same span a series
+/// that has reported nothing yet keeps ([`hold`]).
+fn run_up() -> Duration {
+    PUBLISH_INTERVAL.saturating_mul(RUN_UP_PERIODS)
 }
 
 /// Every registration of a target group some load balancer of this store routes to, up to
@@ -937,6 +961,10 @@ fn fold_observations(
 
 /// Take the datapoints every series that is due at `instant` is published as, and advance
 /// each of those series to its next check.
+///
+/// A series whose target group has no count to report yet publishes no datapoint and keeps
+/// its place in the run-up instead ([`hold`]), so the counts a client reads are the verdicts
+/// the group's checks reached.
 fn due_datapoints(
     store: &mut ElbState,
     now: SystemTime,
@@ -969,8 +997,14 @@ fn due_datapoints(
         // What the clock already owes the group: a registration whose draining span is over
         // has left it, so it is counted in neither host count.
         group.settle_draining(now);
-        let (healthy, unhealthy) = group.host_counts(now);
+        let reported = group.reported_host_counts(now);
+        // What can make an undetermined count determined: the next check of the group.
+        let next_check = group.next_check_in(now);
         let Some(series) = store.host_counts.series.get_mut(&pair) else {
+            continue;
+        };
+        let Some((healthy, unhealthy)) = reported else {
+            hold(series, now, instant, next_check);
             continue;
         };
         let stamp = advance(series);
@@ -1012,9 +1046,37 @@ fn due_datapoints(
     published
 }
 
+/// Leave a due datapoint UNPUBLISHED because the load balancer has determined no counts for
+/// the group yet, and bring the series due again when the next check of it could determine
+/// them.
+///
+/// A series that has published NOTHING keeps its run-up rather than its place in the schedule:
+/// the periods it reports once a verdict is in are the ones before THAT instant — the same
+/// run-up a series opens with ([`RUN_UP_PERIODS`]), which is what gives an alarm over it the
+/// evaluation periods it asks for. One that has already published keeps the stamp its schedule
+/// has reached, so no period it has already reported is stamped a second time.
+///
+/// `next_check` is the span to the next check of the group, and a group owing none is looked at
+/// again one publish interval later.
+fn hold(
+    series: &mut SeriesClock,
+    now: SystemTime,
+    instant: Instant,
+    next_check: Option<Duration>,
+) {
+    if !series.published {
+        series.next_stamp = now.checked_sub(run_up()).unwrap_or(now);
+    }
+    let wait = next_check
+        .unwrap_or(PUBLISH_INTERVAL)
+        .clamp(MIN_PUBLISH_WAIT, PUBLISH_INTERVAL);
+    series.next_datapoint_at = instant.checked_add(wait).unwrap_or(instant);
+}
+
 /// Take the time stamp of the datapoint that is due and schedule the next one.
 fn advance(series: &mut SeriesClock) -> SystemTime {
     let stamp = series.next_stamp;
+    series.published = true;
     series.next_stamp = stamp.checked_add(PUBLISH_INTERVAL).unwrap_or(stamp);
     // While the series is still behind the present it is published at the accelerated
     // spacing; once it has caught up, the next datapoint is due when the clock reaches its
@@ -1103,11 +1165,204 @@ impl super::TargetGroupRecord {
         }
         (f64::from(healthy), f64::from(unhealthy))
     }
+
+    /// The counts the load balancer REPORTS for this group at `now` — `None` while its checks
+    /// have determined the health of NO registration it holds.
+    ///
+    /// A host count is a number of targets the load balancer CONSIDERS healthy or unhealthy,
+    /// so a registration whose health its checks have not determined yet — the `initial` the
+    /// model words as the load balancer still sending "the minimum number of health checks
+    /// required to determine its health status" — belongs in neither total
+    /// ([`Self::host_counts`]). While that is true of EVERY registration of the group, the two
+    /// totals report nothing the checks established: a count of no unhealthy target among
+    /// registrations the load balancer has found nothing about yet is a verdict no check
+    /// reached, so there is nothing to report for such a group and its series begins at the
+    /// first verdict the checks did reach ([`hold`]).
+    ///
+    /// A group some of whose registrations ARE decided reports the counts it has — the
+    /// undetermined ones are simply in neither total, which is what both counts leave out —
+    /// so one registration coming up never silences the series of a group the load balancer is
+    /// already counting. A group holding no registration at all likewise reports the counts it
+    /// has: no healthy target and no unhealthy one.
+    #[must_use]
+    pub fn reported_host_counts(&self, now: SystemTime) -> Option<(f64, f64)> {
+        let nothing_determined = !self.targets.is_empty()
+            && self.targets.values().all(|target| {
+                self.health_of(target, now).state.as_deref() == Some(INITIAL_STATE)
+            });
+        if nothing_determined {
+            return None;
+        }
+        Some(self.host_counts(now))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A routed target group whose health checks are ON, checked at [`PROBE_INTERVAL`] with a
+    /// threshold of [`PROBE_THRESHOLD`] consecutive checks to either verdict.
+    fn checked_group() -> TargetGroupRecord {
+        TargetGroupRecord {
+            protocol: Some("HTTP".to_string()),
+            target_type: "ip".to_string(),
+            port: Some(80),
+            load_balancer_arns: vec!["an-attached-load-balancer".to_string()],
+            health_check: super::super::HealthCheckConfig {
+                enabled: true,
+                interval_seconds: i32::try_from(PROBE_INTERVAL.as_secs()).unwrap_or(5),
+                healthy_threshold: PROBE_THRESHOLD,
+                unhealthy_threshold: PROBE_THRESHOLD,
+                ..super::super::HealthCheckConfig::default()
+            },
+            ..TargetGroupRecord::default()
+        }
+    }
+
+    /// The cadence and threshold the rows below configure: the shortest interval
+    /// `HealthCheckIntervalSeconds` admits, and the `UnhealthyThresholdCount` a target group
+    /// defaults to.
+    const PROBE_INTERVAL: Duration = Duration::from_secs(5);
+    const PROBE_THRESHOLD: i32 = 2;
+
+    /// Register `id` with `group` as a `RegisterTargets` caller's own registration, made at
+    /// `at`: its settling span and its first check run from there.
+    fn registered(group: &mut TargetGroupRecord, id: &str, at: SystemTime) {
+        group.targets.insert(
+            (id.to_string(), group.port),
+            RegisteredTarget {
+                id: id.to_string(),
+                port: group.port,
+                availability_zone: None,
+                registered_at: at,
+                healthy_at: at + super::super::SETTLE_AFTER,
+                draining_until: None,
+                checks_due_at: at + PROBE_INTERVAL,
+                probe: Default::default(),
+                registered_for: None,
+                serves_ports: super::super::ServedPorts::from(Vec::new()),
+                guarded_by: GuardingGroups::from(Vec::new()),
+            },
+        );
+    }
+
+    /// RULE: a load balancer reports a host count for a target group once its checks have
+    /// determined the health of at least one registration it holds — while EVERY one of them
+    /// is still `initial` there is nothing to report at all — and a group holding none reports
+    /// the counts it has.
+    ///
+    /// The rows span what the checks observed (nothing answering, an answer, nothing at all),
+    /// how far through the threshold of checks the registrations are, how many registrations
+    /// the group holds, and whether one of them was registered after the others were already
+    /// decided. The clock each row reads at is PASSED IN, so no row waits for one.
+    #[test]
+    fn a_group_reports_the_counts_its_checks_determined_and_nothing_sooner() {
+        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        for (case, registrations, observed, checks, late, expected) in [
+            (
+                "a registration no check has looked at yet",
+                1,
+                None,
+                0,
+                false,
+                None,
+            ),
+            (
+                "one failing check of the two a verdict takes",
+                1,
+                Some(false),
+                1,
+                false,
+                None,
+            ),
+            (
+                "the threshold of failing checks",
+                1,
+                Some(false),
+                2,
+                false,
+                Some((0.0, 1.0)),
+            ),
+            (
+                "two registrations past that threshold",
+                2,
+                Some(false),
+                2,
+                false,
+                Some((0.0, 2.0)),
+            ),
+            (
+                "a registration whose check was answered",
+                1,
+                Some(true),
+                1,
+                false,
+                Some((1.0, 0.0)),
+            ),
+            (
+                "a registration nothing was observed about",
+                1,
+                None,
+                2,
+                false,
+                Some((1.0, 0.0)),
+            ),
+            (
+                "a group holding no registration",
+                0,
+                None,
+                0,
+                false,
+                Some((0.0, 0.0)),
+            ),
+            (
+                "a registration still coming up beside a decided one",
+                1,
+                Some(false),
+                2,
+                true,
+                Some((0.0, 1.0)),
+            ),
+            (
+                "a registration still coming up beside two decided ones",
+                2,
+                Some(false),
+                2,
+                true,
+                Some((0.0, 2.0)),
+            ),
+        ] {
+            let mut group = checked_group();
+            for index in 0..registrations {
+                registered(&mut group, &format!("10.0.1.{}", index + 10), start);
+            }
+            let keys: Vec<TargetKey> = group.targets.keys().cloned().collect();
+            let mut at = start;
+            for _ in 0..checks {
+                at += PROBE_INTERVAL;
+                for key in &keys {
+                    group.observed_check(key, observed, at);
+                }
+            }
+            if late {
+                // Registered once the others are decided, so its own health is still being
+                // determined at the instant the counts are read.
+                registered(&mut group, "10.0.1.99", at);
+            }
+            let reported = group.reported_host_counts(at);
+            assert_eq!(
+                reported, expected,
+                "case {case:?}: expected the group to report {expected:?}, got {reported:?} \
+                 with the registrations {:?}",
+                group
+                    .targets
+                    .values()
+                    .map(|target| group.health_of(target, at).state)
+                    .collect::<Vec<Option<String>>>()
+            );
+        }
+    }
 
     /// RULE: a dimension names each resource by its ARN from the resource type onwards, and
     /// the namespace follows the load balancer's FAMILY.
