@@ -9,21 +9,33 @@
 //! one name-addressed operation resolves.** The message is a constant — the error CODE
 //! (`AWS.SimpleQueueService.NonExistentQueue` / `QueueDoesNotExist`, from the model's
 //! `awsQueryError`) is what identifies the condition — so a client matching on AWS's
-//! documented text recognises the absence, and the queue the caller probed for is never
-//! reported back to it.
+//! text recognises the absence, and the queue the caller probed for is never reported
+//! back to it. No clause of the retired Query/XML endpoint is appended to it.
 //!
 //! The table spans what the rule generalises over: the OPERATION (every one that resolves
 //! a queue, addressed by url and by name), and the FORM of the absence (a name never
 //! created, a url of another account, an owner id that is not this emulator's, a value
 //! that is not a url at all, and a queue that was deleted). The expected message is the
-//! constant exported by [`service_com_amazonaws_sqs_amazonsqs::state`], never a string
-//! copied out of an answer.
+//! constant exported by [`service_com_amazonaws_sqs_amazonsqs::state`], which one test
+//! pins to AWS's own sentence written out literally.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_sqs_amazonsqs::state::QUEUE_DOES_NOT_EXIST_MESSAGE;
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::support::{account, call, create_ok, emulator, error_code, HOST, OTHER_ACCOUNT};
+
+/// AWS's own sentence for a queue the account does not hold, written out here rather than
+/// read off the service, so the constant the service exports stays pinned to it.
+///
+/// RECORDED: a `SendMessage` on the url of a queue that was deleted is refused HTTP 400
+/// `AWS.SimpleQueueService.NonExistentQueue` with exactly this text, and a `GetQueueUrl`
+/// for a name the account holds no queue under with the same. The model
+/// (`smithy_query(query="shape", shape="QueueDoesNotExist",
+/// model_path="services/service-com-amazonaws-sqs-amazonsqs/smithy-model/com-amazonaws-sqs-amazonsqs.json")`)
+/// fixes no text, so the served sentence is the requirement; it names no queue, so it has
+/// no variable part.
+const AWS_SENTENCE: &str = "The specified queue does not exist.";
 
 /// The `message` member of a refusal, as awsJson renders it.
 fn message_of(body: &Value) -> String {
@@ -54,7 +66,23 @@ fn url_requests(url: &str) -> Vec<(&'static str, Value)> {
             json!({"QueueUrl": url, "Label": "shared"}),
         ),
         ("SendMessage", json!({"QueueUrl": url, "MessageBody": "hello"})),
+        (
+            "SendMessageBatch",
+            json!({"QueueUrl": url,
+                   "Entries": [{"Id": "one", "MessageBody": "hello"}]}),
+        ),
         ("ReceiveMessage", json!({"QueueUrl": url})),
+        (
+            "ChangeMessageVisibility",
+            json!({"QueueUrl": url, "ReceiptHandle": "not-a-handle",
+                   "VisibilityTimeout": 30}),
+        ),
+        (
+            "ChangeMessageVisibilityBatch",
+            json!({"QueueUrl": url,
+                   "Entries": [{"Id": "one", "ReceiptHandle": "not-a-handle",
+                                "VisibilityTimeout": 30}]}),
+        ),
         (
             "DeleteMessage",
             json!({"QueueUrl": url, "ReceiptHandle": "not-a-handle"}),
@@ -227,4 +255,66 @@ async fn a_deleted_queue_is_refused_exactly_as_one_that_never_existed() {
         QUEUE_DOES_NOT_EXIST_MESSAGE,
     )
     .await;
+}
+
+/// Every refusal of an absent queue carries AWS's own sentence and nothing after it —
+/// asserted against the literal text rather than the service's constants, so a wording
+/// that drifts away from what AWS serves (the retired Query/XML endpoint's trailing
+/// clause, say) fails here.
+///
+/// The rows span both forms of address (`QueueUrl` and `QueueName`), every operation that
+/// resolves a queue, and both ways a queue can be absent (never created, and created then
+/// deleted): one sentence answers all of them.
+#[tokio::test]
+async fn every_refusal_of_an_absent_queue_carries_awss_own_sentence() {
+    let router = emulator();
+    let deleted = create_ok(&router, "sentence-deleted", &json!({})).await;
+    let (status, parsed) = call(&router, "DeleteQueue", &json!({"QueueUrl": deleted})).await;
+    assert_eq!(
+        status, 200,
+        "case deleting the queue: expected HTTP 200, got {status} with {parsed}"
+    );
+    let never_created = format!("https://{HOST}/{}/sentence-never-created", account());
+
+    let mut requests: Vec<(&str, &'static str, Value)> = Vec::new();
+    for (case, url) in [
+        ("a url that was deleted", &deleted),
+        ("a url that was never created", &never_created),
+    ] {
+        for (operation, request) in url_requests(url) {
+            requests.push((case, operation, request));
+        }
+    }
+    requests.push((
+        "a name that was never created",
+        "GetQueueUrl",
+        json!({"QueueName": "sentence-never-created"}),
+    ));
+    requests.push((
+        "a name that was deleted",
+        "GetQueueUrl",
+        json!({"QueueName": "sentence-deleted"}),
+    ));
+
+    for (case, operation, request) in &requests {
+        let (status, parsed) = call(&router, operation, request).await;
+        let message = message_of(&parsed);
+        assert_eq!(
+            (status, error_code(&parsed).as_str(), message.as_str()),
+            (400, "QueueDoesNotExist", AWS_SENTENCE),
+            "case {operation} on {case}: expected a 400 QueueDoesNotExist reading \
+             {AWS_SENTENCE:?}, got {status} with {parsed}"
+        );
+    }
+}
+
+/// The sentence this service exports for the absence is AWS's own, so every operation that
+/// renders it renders what AWS serves.
+#[test]
+fn the_exported_refusal_message_is_awss_own_sentence() {
+    assert_eq!(
+        QUEUE_DOES_NOT_EXIST_MESSAGE, AWS_SENTENCE,
+        "case the exported refusal message: expected {AWS_SENTENCE:?}, got {:?}",
+        QUEUE_DOES_NOT_EXIST_MESSAGE
+    );
 }
