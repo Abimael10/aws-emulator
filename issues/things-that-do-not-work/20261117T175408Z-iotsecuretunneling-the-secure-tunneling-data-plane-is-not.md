@@ -1,0 +1,49 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: iotsecuretunneling.access-token-mode-mismatch-rejected iotsecuretunneling.close-tunnel-disconnects-active-websocket-connections iotsecuretunneling.native-local-proxy-stream-relay-round-trip iotsecuretunneling.rotate-all-mode-reissues-both-tokens iotsecuretunneling.source-access-token-single-use-reconnect-rejected
+Issue-Shape-Id: com.amazonaws.iotsecuretunneling#IoTSecuredTunneling
+Issue-Key: iotsecuretunneling.access-token-mode-mismatch-rejected|_ws_connect#11|WebSocketBadStatusException|return websocket.create_connection(
+Issue-Key: iotsecuretunneling.close-tunnel-disconnects-active-websocket-connections|_ws_connect#6|WebSocketBadStatusException|return websocket.create_connection(
+Issue-Key: iotsecuretunneling.native-local-proxy-stream-relay-round-trip|_ws_connect#8|WebSocketBadStatusException|return websocket.create_connection(
+Issue-Key: iotsecuretunneling.rotate-all-mode-reissues-both-tokens|_ws_connect#8|WebSocketBadStatusException|return websocket.create_connection(
+Issue-Key: iotsecuretunneling.source-access-token-single-use-reconnect-rejected|_ws_connect#8|WebSocketBadStatusException|return websocket.create_connection(
+Issue-Commit: c19026fddc546a37c1d4d3954f77370ec86334b1
+
+# iotsecuretunneling: the secure-tunneling data plane is not served — the local-proxy WebSocket upgrade is answered HTTP 404 UnknownService instead of 101 Switching Protocols (1 cause)
+
+> _Note: this issue was identified against the code base at commit `c19026fddc546a37c1d4d3954f77370ec86334b1`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+OpenTunnel
+
+## Description
+Cause 1 of 1: the emulator serves the IoT Secure Tunneling control plane but not its data plane, so every local-proxy connection is refused by the front door before any tunnel behaviour can be exercised. Failing checks: iotsecuretunneling.access-token-mode-mismatch-rejected, iotsecuretunneling.close-tunnel-disconnects-active-websocket-connections, iotsecuretunneling.native-local-proxy-stream-relay-round-trip, iotsecuretunneling.rotate-all-mode-reissues-both-tokens, iotsecuretunneling.source-access-token-single-use-reconnect-rejected.
+
+AWS: Smithy (com.amazonaws.iotsecuretunneling#IoTSecuredTunneling, awsJson1_1) models only the 8 control-plane operations; OpenTunnel returns OpenTunnelResponse with the sensitive members sourceAccessToken and destinationAccessToken, documented respectively as "The access token the source local proxy uses to connect to IoT Secure Tunneling" and "...the destination local proxy uses...", and Tunnel carries sourceConnectionState / destinationConnectionState of shape ConnectionState{status: ConnectionStatus, lastUpdatedAt}, with ConnectionStatus enum values CONNECTED and DISCONNECTED (member doc: "The connection status of the tunnel. Valid values are CONNECTED and DISCONNECTED."). RotateTunnelAccessToken is documented as "Revokes the current client access token (CAT) and returns new CAT for clients to use when reconnecting to secure tunneling to access the same tunnel." The transport those tokens are redeemed on is NOT in the Smithy model — recorded behavior only: a local proxy opens a WebSocket to the regional data-plane host data.tunneling.iot.<region>.amazonaws.com at path /tunnel with query local-proxy-mode=source|destination, the token in an `access-token` request header, and subprotocol aws.iot.securetunneling-3.0 (fallback aws.iot.securetunneling-2.0); AWS answers 101 Switching Protocols with the negotiated Sec-WebSocket-Protocol, then speaks the tunnel protocol (2-byte big-endian length prefix + protobuf body, field 1 = message type). Per the recordings the service additionally sends a SERVICE_IDS control frame (type 5) on each accepted connection, flips the matching connection state to CONNECTED, relays STREAM_START/DATA frames between the source and destination peers preserving streamId and payload bytes, sends the in-band session-termination frame (type 5, no streamId) to a connected local proxy on CloseTunnel, and refuses a handshake (non-101) when the token is spent, revoked by rotation, or paired with the wrong local-proxy-mode.
+
+Emulator: every such handshake is answered HTTP 404 Not Found with headers content-type: application/x-amz-json-1.1 and x-amzn-errortype: UnknownService and the body {"__type":"UnknownService","message":"could not resolve a target service from the request (no SigV4 credential scope, X-Amz-Target, or Host header)"} — fixed text, no variable parts. The front door's service resolution only recognises SigV4 credential scope / X-Amz-Target / a mapped Host; the secure-tunneling data-plane host and its /tunnel path are mapped to nothing, and a WebSocket upgrade carries no X-Amz-Target and is not SigV4-signed (it authenticates with the access-token header). So the emulator never reaches an iotsecuretunneling data-plane component at all — none appears to exist. Consequently none of the behaviours above is observable: no connection state ever leaves DISCONNECTED, no frame is relayed, CloseTunnel sends no termination frame, and the token-authorisation refusals (single-use source token, rotated-token revocation, token/mode mismatch) cannot be distinguished from this blanket 404.
+
+Why: a client using the AWS IoT local proxy (or any SDK-driven equivalent) gets OpenTunnel tokens it can never redeem — the handshake fails with a JSON control-plane error on a WebSocket endpoint, so the proxy reports an unknown-service failure rather than connecting or being authoritatively rejected. End-to-end device-tunnel flows (relay a stream, observe CONNECTED, react to CloseTunnel termination) cannot run, and because the refusal is indiscriminate, a client cannot tell an expired/spent/mis-paired token from an unroutable endpoint. A security-sensitive property is also unverifiable: nothing in the emulator enforces that an access token is single-use, mode-bound, or revoked by RotateTunnelAccessToken.
+
+Fix: the front door's host/path-based service resolution must route the regional secure-tunneling data-plane host and its /tunnel path to iotsecuretunneling instead of falling through to the UnknownService responder, and the service needs a data-plane component that (a) performs the RFC 6455 upgrade with subprotocol negotiation, (b) authorises the `access-token` header against the tunnel's issued source/destination tokens, honouring local-proxy-mode binding, single-use redemption and rotation-based revocation, refusing non-conforming handshakes without a 101, (c) updates sourceConnectionState/destinationConnectionState (and lastUpdatedAt) in the tunnel state on connect and disconnect so DescribeTunnel reflects them, and (d) implements the tunnel-protocol framing: the on-connect SERVICE_IDS frame, source<->destination frame relay preserving type/streamId/payload, and the session-termination frame emitted on CloseTunnel.
+
+Traces: the five failing checks listed above, all erroring identically at websocket.create_connection with WebSocketBadStatusException: Handshake status 404 Not Found.
+
+## Evidence
+Expected (AWS, recorded local-proxy behaviour): GET /tunnel?local-proxy-mode=source to the regional data-plane host data.tunneling.iot.<region>.amazonaws.com, header `access-token: <OpenTunnel sourceAccessToken>`, Sec-WebSocket-Protocol: aws.iot.securetunneling-3.0 -> HTTP 101 Switching Protocols with the negotiated subprotocol echoed; a SERVICE_IDS frame arrives; DescribeTunnel then reports sourceConnectionState.status == "CONNECTED". A spent, rotated-away or mode-mismatched token is refused at the handshake (non-101) and leaves the connection state DISCONNECTED.
+
+Actual (emulator): the same handshake is answered
+  HTTP 404 Not Found
+  content-type: application/x-amz-json-1.1
+  x-amzn-errortype: UnknownService
+  {"__type":"UnknownService","message":"could not resolve a target service from the request (no SigV4 credential scope, X-Amz-Target, or Host header)"}
+The status (404), the error code (UnknownService) and that message are entirely fixed text — no part of it is derived from the request — so nothing in the response identifies the tunnel or the token. websocket-client raises websocket._exceptions.WebSocketBadStatusException: "Handshake status 404 Not Found" from _handshake.py:_get_resp_headers, and all five checks error there. The control-plane calls in the same checks (OpenTunnel, DescribeTunnel, RotateTunnelAccessToken, CloseTunnel) succeed, so only the data plane is missing. Date/time, host and port values in the recorded failures are per-run and not part of the requirement.
+
+## Steps to Reproduce
+1. Call OpenTunnel (awsJson1_1, control plane) and keep tunnelId, sourceAccessToken, destinationAccessToken.
+2. Open a WebSocket to the emulator's endpoint for host data.tunneling.iot.<region>.amazonaws.com with path /tunnel?local-proxy-mode=source, request header `access-token: <sourceAccessToken>` and subprotocols [aws.iot.securetunneling-3.0, aws.iot.securetunneling-2.0].
+3. Observe HTTP 404 Not Found with x-amzn-errortype: UnknownService and body {"__type":"UnknownService",...} instead of 101 Switching Protocols.
+4. Call DescribeTunnel(tunnelId): sourceConnectionState.status never becomes CONNECTED.
+5. Repeat with local-proxy-mode=destination and destinationAccessToken, with a token already used once, and with a token revoked by RotateTunnelAccessToken(clientMode=ALL): every attempt gets the same 404 UnknownService, so no accept path and no token-specific refusal path exists.
+6. With a (hypothetically) connected source proxy, call CloseTunnel(tunnelId) and observe that no in-band termination frame (type 5) can be delivered.
