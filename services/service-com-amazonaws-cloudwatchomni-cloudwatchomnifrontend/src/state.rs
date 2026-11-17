@@ -1347,6 +1347,16 @@ mod view_definition;
 /// projections above are reads of this one's.
 mod principal_search;
 
+/// How a refusal names a resource the store holds nothing under. It lives beside the
+/// store because every operation that addresses one of those resources reports the same
+/// miss for it.
+mod resource_not_found;
+
+pub use resource_not_found::{
+    dashboard_not_found_message, view_not_found_message, DASHBOARD_NOT_FOUND_RESOURCE,
+    VIEW_NOT_FOUND_RESOURCE,
+};
+
 pub use view_definition::{view_definition_rejection, INVALID_VIEW_DEFINITION};
 
 pub use principal_search::{
@@ -1356,8 +1366,8 @@ pub use principal_search::{
 
 pub use dashboard_body::{
     dashboard_body_rejection, dashboard_body_violations, DashboardBodyViolation,
-    DASHBOARD_BODY_PANELS, DOCUMENT_ROOT, NOT_VALID_JSON_PREFIX, PANEL_CLAUSE_BUDGET,
-    PANEL_REQUIRED_MEMBERS,
+    DASHBOARD_BODY_DECLARED_MEMBERS, DASHBOARD_BODY_PANELS, DOCUMENT_ROOT, NOT_VALID_JSON_PREFIX,
+    PANEL_CLAUSE_BUDGET, PANEL_DECLARED_MEMBERS, PANEL_REQUIRED_MEMBERS,
 };
 
 /// Project a stored dashboard into the `OmniDashboardSummary` the list operation

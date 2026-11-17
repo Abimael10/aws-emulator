@@ -145,10 +145,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // An unknown id and a deleted one are the same answer: the record is gone.
             None => Err(GetOmniDashboardErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
-                        "Dashboard '{}' does not exist in space '{}'.",
-                        input.dashboard_id, input.space_id
-                    ),
+                    // The miss is worded by the service's one dashboard template, so an
+                    // absent dashboard reads the same here as on the patch that cannot
+                    // find it either.
+                    message: crate::state::dashboard_not_found_message(&input.dashboard_id),
                     resource_type: Some("OmniDashboard".to_string()),
                     resource_id: Some(input.dashboard_id.clone()),
                     error_code: None,

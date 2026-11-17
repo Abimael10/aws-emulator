@@ -148,7 +148,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }),
             None => Err(GetViewErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!("View '{}' does not exist.", input.name),
+                    message: crate::state::view_not_found_message(&input.name),
                     resource_type: Some(crate::state::VIEW_RESOURCE_TYPE.to_string()),
                     resource_id: Some(input.name.clone()),
                     error_code: None,

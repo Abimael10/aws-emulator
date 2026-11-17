@@ -201,10 +201,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 UpdateOmniDashboardErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: format!(
-                            "Dashboard '{}' does not exist in space '{}'.",
-                            input.dashboard_id, input.space_id
-                        ),
+                        // The miss is worded by the service's one dashboard template, so
+                        // this patch reports an absent dashboard exactly as its reader
+                        // does.
+                        message: crate::state::dashboard_not_found_message(&input.dashboard_id),
                         resource_type: Some("OmniDashboard".to_string()),
                         resource_id: Some(input.dashboard_id.clone()),
                         error_code: None,

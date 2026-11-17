@@ -5,9 +5,14 @@
 //!
 //! `body`'s model doc is "The dashboard definition, as a JSON document", and the model
 //! can express only its length — the document's own schema is not modelled, so it is
-//! stated here: the definition is a JSON OBJECT, CLOSED at the top level, whose single
-//! member `panels` is required and is a list of panel objects, and every panel object
-//! carries the members a panel is laid out by — its `type` and its `layout`.
+//! stated here: the definition is a JSON OBJECT whose single member `panels` is required
+//! and is a list of panel objects, and every panel object carries the members a panel is
+//! laid out by — its `type` and its `layout`. The schema is CLOSED at every object it
+//! declares: the document declares `panels` and a panel declares the two members above,
+//! so a member either of them carries beyond those violates that object's
+//! `additionalProperties`. The VALUE of a declared member the schema does not describe
+//! further — a panel's `layout`, say — is not held to any shape of its own, so a panel
+//! may lay itself out as deeply as it likes inside it.
 //!
 //! A body is validated against that schema as a whole rather than up to its first
 //! problem: EVERY constraint it violates is collected, and the refusal names each one as
@@ -15,9 +20,13 @@
 //! is `<location>: does not satisfy the '<constraint>' constraint of the dashboard body
 //! schema`, and the clauses are joined with `; `. A location is the document root
 //! ([`DOCUMENT_ROOT`]) for a constraint the whole document violates, the member's name
-//! for one a named member violates, and `panels[<index>].<member>` for one a member of a
-//! panel violates. A constraint is named as the JSON-schema keyword it is: `type`,
-//! `required`, `items`, `additionalProperties`.
+//! for one a named member violates, `panels[<index>]` for one the panel OBJECT at that
+//! position violates and `panels[<index>].<member>` for one a member of a panel
+//! violates. A constraint is named as the JSON-schema keyword it is: `type`, `required`,
+//! `items`, `additionalProperties`.
+//!
+//! Within one object the clauses come in schema order: what the object is REQUIRED to
+//! carry first, then what it carries that the schema does not declare.
 //!
 //! Text that is not JSON at all is refused one step earlier, and reported as what it is:
 //! there is no document to hold to the schema, so the refusal carries the position the
@@ -34,6 +43,19 @@ pub const DASHBOARD_BODY_PANELS: &str = "panels";
 /// either is not a panel the dashboard can be laid out from, so each absence is its own
 /// `required` violation at that panel's position.
 pub const PANEL_REQUIRED_MEMBERS: &[&str] = &["type", "layout"];
+
+/// The members the schema DECLARES of a panel object.
+///
+/// The schema gives a panel the two members it is laid out by and declares no other, so
+/// the declared set is the required set: a panel carrying any further member carries one
+/// the schema cannot lay out, which is that panel's own `additionalProperties`
+/// violation. What a declared member HOLDS is not narrowed here, so a `layout` may carry
+/// whatever structure the caller writes inside it.
+pub const PANEL_DECLARED_MEMBERS: &[&str] = PANEL_REQUIRED_MEMBERS;
+
+/// The members the schema DECLARES of the document itself: the panels it lays out, and
+/// nothing else — the document is closed for the same reason a panel is.
+pub const DASHBOARD_BODY_DECLARED_MEMBERS: &[&str] = &[DASHBOARD_BODY_PANELS];
 
 /// How many panel clauses one refusal names.
 ///
@@ -103,6 +125,15 @@ impl DashboardBodyViolation {
         }
     }
 
+    /// A constraint the panel OBJECT at `index` violates, as opposed to one of its
+    /// members.
+    fn at_panel(index: usize, constraint: &'static str) -> Self {
+        Self {
+            location: format!("{DASHBOARD_BODY_PANELS}[{index}]"),
+            constraint,
+        }
+    }
+
     /// A constraint the member of the panel at `index` violates.
     fn at_panel_member(index: usize, member: &str, constraint: &'static str) -> Self {
         Self {
@@ -110,6 +141,18 @@ impl DashboardBodyViolation {
             constraint,
         }
     }
+}
+
+/// Whether `members` carries a member `declared` does not name — the
+/// `additionalProperties` constraint of an object the schema closes, asked the same way
+/// of the document and of a panel.
+fn carries_undeclared_member(
+    members: &::serde_json::Map<String, ::serde_json::Value>,
+    declared: &[&str],
+) -> bool {
+    members
+        .keys()
+        .any(|name| !declared.contains(&name.as_str()))
 }
 
 /// Every constraint of the dashboard-body schema `body` violates, in document order:
@@ -151,7 +194,7 @@ fn document_violations(document: &::serde_json::Value) -> Vec<DashboardBodyViola
             Some(panels) => violations.extend(panel_violations(panels)),
         },
     }
-    if members.keys().any(|name| name != DASHBOARD_BODY_PANELS) {
+    if carries_undeclared_member(members, DASHBOARD_BODY_DECLARED_MEMBERS) {
         violations.push(DashboardBodyViolation::at_root(
             CONSTRAINT_ADDITIONAL_PROPERTIES,
         ));
@@ -164,8 +207,9 @@ fn document_violations(document: &::serde_json::Value) -> Vec<DashboardBodyViola
 ///
 /// An entry that is not an object at all is not admitted as an entry of the list, which
 /// is the list's own `items` constraint and is reported once however many entries break
-/// it; an entry that IS an object is held to the panel's required members, each absence
-/// reported at that panel's own position.
+/// it; an entry that IS an object is held to the panel schema — first to the members it
+/// requires, each absence reported at that panel's own position, then to its closedness,
+/// reported once at the panel itself however many undeclared members it carries.
 fn panel_violations(panels: &[::serde_json::Value]) -> Vec<DashboardBodyViolation> {
     let mut violations = Vec::new();
     let mut reported_items = false;
@@ -195,9 +239,19 @@ fn panel_violations(panels: &[::serde_json::Value]) -> Vec<DashboardBodyViolatio
                         ));
                     }
                 }
+                if carries_undeclared_member(panel, PANEL_DECLARED_MEMBERS) {
+                    violations.push(DashboardBodyViolation::at_panel(
+                        index,
+                        CONSTRAINT_ADDITIONAL_PROPERTIES,
+                    ));
+                }
             }
         }
     }
+    // One panel can carry more than one clause, so the walk can step past the bound on
+    // its last entry: the list is cut back to it, which is what keeps the clause count a
+    // property of the SCHEMA rather than of the body's length.
+    violations.truncate(PANEL_CLAUSE_BUDGET);
     violations
 }
 
@@ -278,6 +332,33 @@ mod tests {
                 r#"{"panels":[{"type":"logs"}]}"#,
                 vec![("panels[0].layout", "required")],
             ),
+            // A panel is closed too, so a member the schema does not declare is that
+            // panel's own `additionalProperties` violation, reported after what it is
+            // required to carry.
+            (
+                r#"{"panels":[{"type":"logs","layout":{},"title":"p99"}]}"#,
+                vec![("panels[0]", "additionalProperties")],
+            ),
+            (
+                r#"{"panels":[{"x":1}]}"#,
+                vec![
+                    ("panels[0].type", "required"),
+                    ("panels[0].layout", "required"),
+                    ("panels[0]", "additionalProperties"),
+                ],
+            ),
+            // However many members a panel carries beyond the two it declares, the
+            // closedness of that panel is ONE violation.
+            (
+                r#"{"panels":[{"type":"logs","layout":{},"title":"p99","id":3}]}"#,
+                vec![("panels[0]", "additionalProperties")],
+            ),
+            // The value of a declared member is not narrowed, so a layout may nest as
+            // deeply as the caller writes it.
+            (
+                r#"{"panels":[{"type":"logs","layout":{"rows":[{"cells":[1,2]}]}}]}"#,
+                vec![],
+            ),
             (
                 r#"{"panels":[{"type":"logs","layout":{}},{"layout":{}}]}"#,
                 vec![("panels[1].type", "required")],
@@ -287,6 +368,7 @@ mod tests {
                 vec![
                     ("panels[0].type", "required"),
                     ("panels[0].layout", "required"),
+                    ("panels[0]", "additionalProperties"),
                     ("panels", "items"),
                     ("$", "additionalProperties"),
                 ],
@@ -329,6 +411,17 @@ mod tests {
                  the dashboard body schema"
             ),
             "a panel missing both required members reports one clause for each"
+        );
+        assert_eq!(
+            dashboard_body_rejection(r#"{"panels":[{"x":1}]}"#).as_deref(),
+            Some(
+                "panels[0].type: does not satisfy the 'required' constraint of the dashboard \
+                 body schema; panels[0].layout: does not satisfy the 'required' constraint of \
+                 the dashboard body schema; panels[0]: does not satisfy the \
+                 'additionalProperties' constraint of the dashboard body schema"
+            ),
+            "a panel missing both required members and carrying an undeclared one reports \
+             all three clauses, the closedness last"
         );
         assert_eq!(
             dashboard_body_rejection(r#"{"panels":[]}"#),
@@ -374,12 +467,15 @@ mod tests {
 
     #[test]
     fn a_refusal_names_at_most_the_panel_clause_budget() {
-        // Rows: a panels list that fills the budget exactly, one far past it, and one of
-        // entries that are not panels at all. Each clause is about 90 characters, so the
-        // bound on the clause count is what bounds the message a body can cost.
+        // Rows: a panels list that fills the budget exactly, one far past it, one whose
+        // entries each cost the most clauses one panel can (both required members absent
+        // and an undeclared one present), and one of entries that are not panels at all.
+        // Each clause is about 90 characters, so the bound on the clause count is what
+        // bounds the message a body can cost.
         for (case, panels, entry) in [
             ("a list that fills the budget", PANEL_CLAUSE_BUDGET / 2, "{}"),
             ("a list far past the budget", 500, "{}"),
+            ("entries costing the most clauses a panel can", 500, r#"{"x":1}"#),
             ("entries that are not panels", 500, "1"),
         ] {
             let body = format!(r#"{{"panels":[{}]}}"#, vec![entry; panels].join(","));

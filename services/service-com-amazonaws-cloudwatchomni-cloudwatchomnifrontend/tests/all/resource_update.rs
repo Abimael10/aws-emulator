@@ -19,7 +19,11 @@
 //!
 //! The refusals are asserted the same way: a record the store does not hold is the
 //! modelled 404, a rename onto a sibling's name is the modelled 409, a definition that
-//! violates its own rule is the modelled 400 — and none of them writes anything.
+//! violates its own rule is the modelled 400 — and none of them writes anything. The
+//! MESSAGE each refusal carries is a requirement too, so the suite also asserts it over a
+//! table: a miss names the kind of resource that is missing and then the identifier the
+//! request addressed it by, and a dashboard body is held to a schema CLOSED at every
+//! object it declares, one clause per violated constraint.
 //!
 //! Each assertion names its case and the actual value, so a failure identifies the row of
 //! the table that broke.
@@ -41,19 +45,25 @@ use omni::ops::create_domain::CreateDomain;
 use omni::ops::create_omni_dashboard::CreateOmniDashboard;
 use omni::ops::create_space::CreateSpace;
 use omni::ops::create_view::CreateView;
+use omni::ops::delete_view::{DeleteView, DeleteViewError, DeleteViewErrorModeled};
 use omni::ops::get_access_profile::{GetAccessProfile, GetAccessProfileError};
-use omni::ops::get_omni_dashboard::{GetOmniDashboard, GetOmniDashboardError};
-use omni::ops::get_view::{GetView, GetViewError};
+use omni::ops::get_omni_dashboard::{
+    GetOmniDashboard, GetOmniDashboardError, GetOmniDashboardErrorModeled,
+};
+use omni::ops::get_view::{GetView, GetViewError, GetViewErrorModeled};
 use omni::ops::types::{
     AccessProfile, CreateAccessProfileInput, CreateDomainInput, CreateOmniDashboardInput,
-    CreateSpaceInput, CreateViewInput, GetAccessProfileInput, GetAccessProfileOutput,
-    GetOmniDashboardInput, GetViewInput, GetViewOutput, OmniDashboard, UpdateAccessProfileInput,
-    UpdateAccessProfileOutput, UpdateOmniDashboardInput, UpdateViewInput, UpdateViewOutput,
-    GET_ACCESS_PROFILE_INPUT_SCHEMA, UPDATE_ACCESS_PROFILE_INPUT_SCHEMA,
+    CreateSpaceInput, CreateViewInput, DeleteViewInput, DeleteViewOutput, GetAccessProfileInput,
+    GetAccessProfileOutput, GetOmniDashboardInput, GetViewInput, GetViewOutput, OmniDashboard,
+    UpdateAccessProfileInput, UpdateAccessProfileOutput, UpdateOmniDashboardInput, UpdateViewInput,
+    UpdateViewOutput, GET_ACCESS_PROFILE_INPUT_SCHEMA, UPDATE_ACCESS_PROFILE_INPUT_SCHEMA,
 };
 use omni::ops::update_access_profile::{UpdateAccessProfile, UpdateAccessProfileError};
-use omni::ops::update_omni_dashboard::{UpdateOmniDashboard, UpdateOmniDashboardError};
-use omni::ops::update_view::{UpdateView, UpdateViewError};
+use omni::ops::update_omni_dashboard::{
+    UpdateOmniDashboard, UpdateOmniDashboardError, UpdateOmniDashboardErrorModeled,
+};
+use omni::ops::update_view::{UpdateView, UpdateViewError, UpdateViewErrorModeled};
+use omni::scaffolded::Scaffolded;
 use omni::state::{ASSUME_STATUS_ALLOWED, VIEW_TYPE_USER};
 
 /// The region the suite signs for.
@@ -335,6 +345,17 @@ impl Omni {
         GetView::new(Arc::clone(&self.engine))
             .handle(
                 GetViewInput {
+                    name: name.to_string(),
+                },
+                &self.ctx(),
+            )
+            .await
+    }
+
+    async fn delete_view(&self, name: &str) -> Result<DeleteViewOutput, DeleteViewError> {
+        DeleteView::new(Arc::clone(&self.engine))
+            .handle(
+                DeleteViewInput {
                     name: name.to_string(),
                 },
                 &self.ctx(),
@@ -671,7 +692,7 @@ fn dashboard_patches() -> Vec<DashboardPatch> {
         r#"{{"panels":[{}]}}"#,
         (0..12)
             .map(|index| format!(
-                r#"{{"type":"timeSeries","layout":{{"row":{index}}},"title":"p{index}"}}"#
+                r#"{{"type":"timeSeries","layout":{{"row":{index},"title":"p{index}"}}}}"#
             ))
             .collect::<Vec<String>>()
             .join(",")
@@ -1565,4 +1586,314 @@ async fn an_update_and_the_read_that_follows_it_agree_over_the_rpcv2cbor_wire() 
         untouched_profile(&created),
         "the wire update changed a member its input cannot name"
     );
+}
+
+/// The `message` of a modelled refusal, with its error code and HTTP status checked
+/// first.
+///
+/// Each operation carries its OWN error enum, so the variant is named per call site; the
+/// error struct behind every one of them carries the `message` the caller reads.
+macro_rules! refusal_message {
+    ($case:expr, $result:expr, $variant:path, $code:expr, $status:expr) => {{
+        let case: &str = $case;
+        match $result {
+            Ok(output) => {
+                panic!("case {case:?}: expected {} ({}), got Ok({output:?})", $code, $status)
+            }
+            Err(error) => {
+                assert_eq!(
+                    (error.shape_name(), error.http_status()),
+                    ($code, $status),
+                    "case {case:?}: expected {} ({}), got {error:?}",
+                    $code,
+                    $status
+                );
+                match error {
+                    Scaffolded::Modeled($variant(modeled)) => modeled.message,
+                    other => panic!(
+                        "case {case:?}: expected the modelled {}, got {other:?}",
+                        $code
+                    ),
+                }
+            }
+        }
+    }};
+}
+
+/// The error code a miss carries, and its modelled status.
+const NOT_FOUND: (&str, u16) = ("ResourceNotFoundException", 404);
+
+#[tokio::test]
+async fn a_dashboard_the_store_does_not_hold_is_named_by_its_id_alone() {
+    let omni = Omni::new();
+    let space_id = omni.space("miss-wording", "dashboard-miss").await;
+    let other_space = omni.space("miss-wording", "dashboard-miss-other").await;
+    let elsewhere = omni
+        .create_dashboard(
+            "miss-wording",
+            &other_space,
+            "dashboard-elsewhere",
+            PANELS_BODY,
+            None,
+        )
+        .await;
+
+    // Rows span the ids the miss can be reported for: a `DashboardId` of nil digits, one
+    // of mixed digits, one of the highest digit the pattern admits, and a LIVE id
+    // addressed under a space that does not hold it — the identifier is taken from the
+    // REQUEST, so the last row is reported under the id the request carried even though
+    // the store holds a dashboard under it elsewhere.
+    for (case, dashboard_id) in [
+        (
+            "an id of nil digits",
+            // A `DashboardId` of the lowest digits its pattern admits, which names
+            // nothing.
+            "00000000-0000-4000-8000-000000000000".to_string(),
+        ),
+        ("an id of mixed digits", MISSING_DASHBOARD_ID.to_string()),
+        (
+            "an id at the top of the pattern's alphabet",
+            "ffffffff-ffff-4fff-bfff-ffffffffffff".to_string(),
+        ),
+        (
+            "a live id addressed under another space",
+            elsewhere.dashboard_id.clone(),
+        ),
+    ] {
+        // The template: the fixed "Dashboard not found: " and the dashboard id the
+        // request carried — no space id, no quoting, no trailing period.
+        let expected = format!("Dashboard not found: {dashboard_id}");
+        let patched = refusal_message!(
+            case,
+            omni.update_dashboard(&UpdateOmniDashboardInput {
+                space_id: space_id.clone(),
+                dashboard_id: dashboard_id.clone(),
+                name: Some("renamed".to_string()),
+                body: Some(ONE_PANEL_BODY.to_string()),
+                description: Some("second".to_string()),
+            })
+            .await,
+            UpdateOmniDashboardErrorModeled::ResourceNotFoundException,
+            NOT_FOUND.0,
+            NOT_FOUND.1
+        );
+        assert_eq!(
+            patched, expected,
+            "case {case:?}: UpdateOmniDashboard expected {expected:?}, got {patched:?}"
+        );
+        // The reader of the same resource words the same miss the same way.
+        let read = refusal_message!(
+            case,
+            omni.get_dashboard(&space_id, &dashboard_id).await,
+            GetOmniDashboardErrorModeled::ResourceNotFoundException,
+            NOT_FOUND.0,
+            NOT_FOUND.1
+        );
+        assert_eq!(
+            read, expected,
+            "case {case:?}: GetOmniDashboard expected {expected:?}, got {read:?}"
+        );
+    }
+
+    // The dashboard the other space DOES hold is untouched by the refusals above.
+    let stored = omni
+        .stored_dashboard("miss-wording", &other_space, &elsewhere.dashboard_id)
+        .await;
+    assert_eq!(
+        (stored.name.as_str(), stored.body.as_str()),
+        ("dashboard-elsewhere", PANELS_BODY),
+        "a refused patch changed the dashboard it could not find: {stored:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_view_the_store_does_not_hold_is_named_by_its_name_alone() {
+    let omni = Omni::new();
+    omni.create_view("miss-wording", "view.live-view", "SELECT 1", None)
+        .await;
+
+    // Rows span the `ViewName` class (`@length(6..256)`,
+    // `^view\.[a-z0-9][a-z0-9_-]{0,250}$`): the shortest name the model admits, one
+    // carrying the punctuation the pattern allows, one starting with a digit and the
+    // longest name the model admits.
+    for (case, name) in [
+        ("the shortest name the model admits", "view.a".to_string()),
+        ("a name with punctuation", MISSING_VIEW_NAME.to_string()),
+        (
+            "a name starting with a digit",
+            "view.0_errors-by-service".to_string(),
+        ),
+        (
+            "the longest name the model admits",
+            format!("view.{}", "v".repeat(251)),
+        ),
+    ] {
+        // The template: the fixed "View not found: " and the name the request carried —
+        // unquoted, with no trailing period.
+        let expected = format!("View not found: {name}");
+        let patched = refusal_message!(
+            case,
+            omni.update_view(&UpdateViewInput {
+                name: name.clone(),
+                definition: Some("SELECT count(*) FROM logs".to_string()),
+                description: Some("second".to_string()),
+            })
+            .await,
+            UpdateViewErrorModeled::ResourceNotFoundException,
+            NOT_FOUND.0,
+            NOT_FOUND.1
+        );
+        assert_eq!(
+            patched, expected,
+            "case {case:?}: UpdateView expected {expected:?}, got {patched:?}"
+        );
+        let read = refusal_message!(
+            case,
+            omni.get_view(&name).await,
+            GetViewErrorModeled::ResourceNotFoundException,
+            NOT_FOUND.0,
+            NOT_FOUND.1
+        );
+        assert_eq!(
+            read, expected,
+            "case {case:?}: GetView expected {expected:?}, got {read:?}"
+        );
+        let deleted = refusal_message!(
+            case,
+            omni.delete_view(&name).await,
+            DeleteViewErrorModeled::ResourceNotFoundException,
+            NOT_FOUND.0,
+            NOT_FOUND.1
+        );
+        assert_eq!(
+            deleted, expected,
+            "case {case:?}: DeleteView expected {expected:?}, got {deleted:?}"
+        );
+    }
+
+    // The view the store DOES hold is still there, and its name is not what any refusal
+    // above reported.
+    let stored = omni.stored_view("miss-wording", "view.live-view").await;
+    assert_eq!(
+        (stored.name.as_str(), stored.definition.as_str()),
+        ("view.live-view", "SELECT 1"),
+        "a refused patch changed the view it could not find: {stored:?}"
+    );
+}
+
+/// One clause of a dashboard-body refusal: WHERE the document violates the schema and
+/// WHICH constraint it violates there.
+fn clause(location: &str, constraint: &str) -> String {
+    format!("{location}: does not satisfy the '{constraint}' constraint of the dashboard body schema")
+}
+
+#[tokio::test]
+async fn a_patched_body_is_held_to_the_whole_closed_schema_and_names_every_violation() {
+    let omni = Omni::new();
+    let space_id = omni.space("closed", "update-closed").await;
+    let dashboard = omni
+        .create_dashboard("closed", &space_id, "dashboard", PANELS_BODY, Some("kept"))
+        .await;
+
+    // Rows span the objects the schema closes and the violations one body can collect at
+    // once: a panel carrying a member the panel schema does not declare, a panel also
+    // missing what it is required to carry, several undeclared members in one panel, an
+    // undeclared member in a LATER panel, and the document's own closedness beside a
+    // panel's. The clauses come in schema order — within one object, what it must carry
+    // before what it carries that is not declared.
+    for (case, body, clauses) in [
+        (
+            "a panel carrying what it must and one member more",
+            r#"{"panels":[{"type":"logs","layout":{},"title":"p99"}]}"#,
+            vec![clause("panels[0]", "additionalProperties")],
+        ),
+        (
+            "a panel missing both required members and carrying an undeclared one",
+            r#"{"panels":[{"x":1}]}"#,
+            vec![
+                clause("panels[0].type", "required"),
+                clause("panels[0].layout", "required"),
+                clause("panels[0]", "additionalProperties"),
+            ],
+        ),
+        (
+            "a panel carrying several undeclared members",
+            r#"{"panels":[{"type":"logs","layout":{},"title":"p99","id":7,"query":{}}]}"#,
+            vec![clause("panels[0]", "additionalProperties")],
+        ),
+        (
+            "the second panel carrying an undeclared member",
+            r#"{"panels":[{"type":"logs","layout":{}},{"type":"logs","layout":{},"x":1}]}"#,
+            vec![clause("panels[1]", "additionalProperties")],
+        ),
+        (
+            "an undeclared member in a panel and one in the document",
+            r#"{"panels":[{"type":"logs","layout":{},"x":1}],"widgets":[]}"#,
+            vec![
+                clause("panels[0]", "additionalProperties"),
+                clause("$", "additionalProperties"),
+            ],
+        ),
+    ] {
+        let expected = clauses.join("; ");
+        let actual = refusal_message!(
+            case,
+            omni.update_dashboard(&UpdateOmniDashboardInput {
+                space_id: space_id.clone(),
+                dashboard_id: dashboard.dashboard_id.clone(),
+                body: Some(body.to_string()),
+                // The description rides along, so the refusal is shown to roll back the
+                // whole patch.
+                description: Some("second".to_string()),
+                ..Default::default()
+            })
+            .await,
+            UpdateOmniDashboardErrorModeled::ValidationException,
+            "ValidationException",
+            400
+        );
+        assert_eq!(
+            actual, expected,
+            "case {case:?}: expected the message {expected:?}, got {actual:?}"
+        );
+        let stored = omni
+            .stored_dashboard(case, &space_id, &dashboard.dashboard_id)
+            .await;
+        assert_eq!(
+            (stored.body.as_str(), stored.description.as_deref()),
+            (PANELS_BODY, Some("kept")),
+            "case {case:?}: the refused patch changed the dashboard: {stored:?}"
+        );
+    }
+
+    // A panel carrying exactly the members the schema declares is accepted, however
+    // deeply it nests inside the ones it declares, and the body round-trips through the
+    // reader that answers from the same store.
+    for (case, body) in [
+        ("a panel with an empty layout", r#"{"panels":[{"type":"logs","layout":{}}]}"#),
+        (
+            "a panel whose layout nests whatever it likes",
+            r#"{"panels":[{"type":"timeSeries","layout":{"rows":[{"cells":[{"title":"p99"}]}]}}]}"#,
+        ),
+    ] {
+        let patched = omni
+            .update_dashboard(&UpdateOmniDashboardInput {
+                space_id: space_id.clone(),
+                dashboard_id: dashboard.dashboard_id.clone(),
+                body: Some(body.to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap_or_else(|error| panic!("case {case:?}: the body was refused: {error:?}"));
+        let stored = omni
+            .stored_dashboard(case, &space_id, &dashboard.dashboard_id)
+            .await;
+        assert_eq!(
+            (patched.body.as_str(), stored.body.as_str()),
+            (body, body),
+            "case {case:?}: expected the body {body:?} back, got {:?} and {:?}",
+            patched.body,
+            stored.body
+        );
+    }
 }
