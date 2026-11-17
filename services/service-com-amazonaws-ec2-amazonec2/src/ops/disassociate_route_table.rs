@@ -2,7 +2,8 @@
 
 //! @op DisassociateRouteTable
 //! IMPLEMENTED: drops the explicit association between a stored route table and a subnet,
-//! so that subnet uses its VPC's main route table again (see
+//! so that subnet uses its VPC's main route table again, and answers the state the
+//! association moved into (see
 //! [`crate::state::ComAmazonawsEc2Amazonec2State::disassociate_route_table`]).
 //!
 //! This is the ONLY file to touch for this operation.
@@ -68,12 +69,51 @@ use super::types::*;
 // `DisassociateRouteTableError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-ec2-amazonec2.json");
 
+/// The response's `associationState` element, as an ec2Query member schema.
+///
+/// A member schema rather than a modelled one, the same way the envelope's `<return>`
+/// flag is built: this operation's modelled output is `smithy.api#Unit`
+/// (`smithy_query(query="operation",operation="DisassociateRouteTable")` answers
+/// `output_shape: Unit`), so the element has no modelled member to borrow a schema from,
+/// while the state of the association the call moved is part of the body EC2 writes. The
+/// XML codec names an element from the member name, which is what makes this write
+/// `<associationState>`; the value's own members (`state`, `statusMessage`) come from
+/// `RouteTableAssociationState`'s schema, so this element is shaped exactly like the one
+/// `AssociateRouteTable` and `ReplaceRouteTableAssociation` answer with.
+///
+/// An element the live wire renders on a SHAPE, whichever operation reports that shape, is
+/// written at the envelope seam instead — see `crate::service::recorded_response_members`,
+/// which walks a reported shape's modelled members to recognise it. That seam has nothing
+/// to recognise here: this operation's output declares no members at all, and the element
+/// belongs to this one call's answer rather than to a shape every reporter of it writes.
+static ASSOCIATION_STATE_MEMBER: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+    ::aws_smithy_schema::ShapeId::from_static(
+        "com.amazonaws.ec2#DisassociateRouteTableResponse$associationState",
+        "com.amazonaws.ec2",
+        "associationState",
+    ),
+    ::aws_smithy_schema::ShapeType::Structure,
+    "associationState",
+    0,
+);
+
 #[derive(Debug, Clone, Default)]
-pub struct DisassociateRouteTableOutput;
+pub struct DisassociateRouteTableOutput {
+    /// The state the association this call took away moved into. `None` is a body with
+    /// no `associationState` element at all, which is what an output built by `default()`
+    /// reports; the handler always fills it.
+    pub association_state: Option<RouteTableAssociationState>,
+}
 
 impl DisassociateRouteTableOutput {
     // `with_http` carries this operation's modelled response status. Remove it and
     // the status falls back to the protocol default, so a modelled 204 answers 200.
+    //
+    // The modelled output declares NO members (`smithy.api#Unit`), and this stays that
+    // way: the service's envelope writer reads this schema's members to decide whether
+    // the body carries the `<return>` flag, and an EC2 mutation modelled with a Unit
+    // output carries it. The `associationState` element is written beside it from
+    // [`ASSOCIATION_STATE_MEMBER`], not declared here.
     pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
         ::aws_smithy_schema::ShapeId::from_static("smithy.api#Unit", "smithy.api", "Unit"),
         ::aws_smithy_schema::ShapeType::Structure,
@@ -84,7 +124,12 @@ impl DisassociateRouteTableOutput {
 pub static DISASSOCIATE_ROUTE_TABLE_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema = &DisassociateRouteTableOutput::SCHEMA;
 
 impl ::aws_smithy_schema::serde::SerializableStruct for DisassociateRouteTableOutput {
-    fn serialize_members(&self, _s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer) -> Result<(), ::aws_smithy_schema::serde::SerdeError> { Ok(()) }
+    fn serialize_members(&self, s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer) -> Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        match self.association_state.as_ref() {
+            Some(association_state) => s.write_struct(&ASSOCIATION_STATE_MEMBER, association_state),
+            None => Ok(()),
+        }
+    }
 }
 
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
@@ -179,11 +224,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(state::dry_run_operation());
         }
 
-        if !store.disassociate_route_table(&input.association_id) {
+        // The answer is the state the association moved INTO, read back off the move the
+        // store made rather than restated here, so this call and the state cannot disagree
+        // about what happened to the association.
+        let Some(association_state) = store.disassociate_route_table(&input.association_id) else {
             return Err(state::internal_error(
                 "the route table association checked a moment ago could not be removed",
             ));
-        }
-        Ok(DisassociateRouteTableOutput)
+        };
+        Ok(DisassociateRouteTableOutput {
+            association_state: Some(association_state),
+        })
     }
 }

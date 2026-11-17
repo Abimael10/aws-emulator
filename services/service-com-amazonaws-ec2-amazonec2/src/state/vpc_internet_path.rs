@@ -75,6 +75,11 @@ pub const LOCAL_ROUTE_GATEWAY_ID: &str = "local";
 /// (`smithy_query(query="shape",shape="RouteTableAssociationStateCode"`)).
 pub const ROUTE_TABLE_ASSOCIATION_STATE_ASSOCIATED: &str = "associated";
 
+/// The state a route table association is reported in by the call that takes it away: the
+/// `RouteTableAssociationStateCode` enum's `disassociating` member
+/// (`smithy_query(query="shape",shape="RouteTableAssociationStateCode"`)).
+pub const ROUTE_TABLE_ASSOCIATION_STATE_DISASSOCIATING: &str = "disassociating";
+
 /// How many routes one route table holds before a create must refuse.
 ///
 /// "Routes per route table (non-propagated routes)" is 50 by default, adjustable to 1,000
@@ -988,7 +993,15 @@ impl ComAmazonawsEc2Amazonec2State {
     /// action, the subnet no longer uses the routes in the route table" — the association is
     /// the pair, so taking it away is removing the record of it. The records hold no
     /// caller-supplied bytes, so there is nothing to give back to the budget.
-    pub fn disassociate_route_table(&mut self, association_id: &str) -> bool {
+    ///
+    /// The answer is the state the association moved INTO
+    /// (`disassociating_route_table_association_state`), or `None` when no explicit
+    /// association carried that id and nothing was taken away — so a caller can report the
+    /// move it made and tell it from the one it did not.
+    pub fn disassociate_route_table(
+        &mut self,
+        association_id: &str,
+    ) -> Option<RouteTableAssociationState> {
         let mut dropped = false;
         for route_table in self.route_tables.values_mut() {
             if let Some(associations) = route_table.associations.as_mut() {
@@ -1001,7 +1014,7 @@ impl ComAmazonawsEc2Amazonec2State {
                 });
             }
         }
-        dropped
+        dropped.then(disassociating_route_table_association_state)
     }
 
     /// Drop the routes of ONE table whose GATEWAY target is `gateway_id`, and answer how many
@@ -1103,6 +1116,17 @@ impl ComAmazonawsEc2Amazonec2State {
 fn associated_state() -> RouteTableAssociationState {
     RouteTableAssociationState {
         state: Some(ROUTE_TABLE_ASSOCIATION_STATE_ASSOCIATED.to_string()),
+        status_message: None,
+    }
+}
+
+/// The state an association that has just been taken away is reported in:
+/// [`ROUTE_TABLE_ASSOCIATION_STATE_DISASSOCIATING`], the move the disassociating call
+/// started. The record itself is gone with the call, so this is the only place the state is
+/// reported from, and the ONE place it is built.
+fn disassociating_route_table_association_state() -> RouteTableAssociationState {
+    RouteTableAssociationState {
+        state: Some(ROUTE_TABLE_ASSOCIATION_STATE_DISASSOCIATING.to_string()),
         status_message: None,
     }
 }
