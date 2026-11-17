@@ -3,7 +3,7 @@
 //! The refusals and the reported boundary type this service words AWS's way rather than its
 //! own, end to end over the awsQuery wire.
 //!
-//! Six rules, each over a FAMILY of operations rather than over one call:
+//! Seven rules, each over a FAMILY of operations rather than over one call:
 //!
 //! 1. a value outside the PATTERN its member's shape publishes is refused HTTP 400
 //!    `ValidationError` with AWS's one sentence for that FORM, naming the member the value
@@ -25,7 +25,11 @@
 //! 6. `GetPolicyVersion` is addressed by a `PolicyArn` AND a `VersionId`, so an ARN it
 //!    resolves nothing under is refused in the sentence naming both, and a key outside the
 //!    published form of an account property is refused under `ValidationError` with the
-//!    constraint envelope AWS states for a map whose KEYS failed.
+//!    constraint envelope AWS states for a map whose KEYS failed;
+//! 7. a refused call writes nothing and is repeatable: the same request answers the same
+//!    status, code and sentence however often it is made, and the state it addressed reads
+//!    back carrying exactly what it carried before — which is what makes the sentences above
+//!    a report of state rather than a side effect of asking.
 //!
 //! Each suite is a TABLE whose rows differ along what its rule generalises over: which
 //! operation and which member carry the value, which published form it breaks and HOW
@@ -932,4 +936,369 @@ async fn an_account_property_key_outside_its_published_form_is_refused() {
         "Unsupported namespace: NotAServedNamespace",
     )
     .await;
+}
+
+/// One call that must succeed, for the fixtures the refusal table below is read against.
+async fn served(
+    router: &MultiServiceRouter,
+    case: &str,
+    action: &str,
+    params: &[(String, String)],
+) -> String {
+    let (status, body) = call(router, action, &borrowed(params)).await;
+    assert_eq!(
+        status, 200,
+        "the {case} fixture must succeed, got {status}: {body}"
+    );
+    body
+}
+
+/// The read a refusal must leave untouched: the call to make after it, and the text its
+/// body must and must not carry.
+struct AfterRead {
+    action: &'static str,
+    params: Vec<(String, String)>,
+    carries: Vec<String>,
+    withholds: Vec<String>,
+}
+
+/// One row of the refusal table: the call that must be refused, how it must be refused, and
+/// the read that must report the same thing afterwards.
+struct RepeatedRefusal {
+    case: &'static str,
+    action: &'static str,
+    params: Vec<(String, String)>,
+    status: u16,
+    code: &'static str,
+    message: String,
+    read: AfterRead,
+}
+
+/// RULE 7: a refused call writes nothing, so it is repeatable — the same request answers the
+/// same status, code and sentence every time it is made, and the state it addressed carries
+/// afterwards exactly what it carried before.
+///
+/// The rows span what the refusal is ABOUT (an attachment the entity does not carry, a scope
+/// it does not have, a binding the profile does not hold, the one-role quota, a policy the
+/// account no longer holds, a user it never held), how the call is ADDRESSED (by a name, by
+/// an ARN, by an ARN and a version), and both the status and the code those families answer
+/// under — one table, because the invariant is the same for all of them.
+#[tokio::test]
+async fn a_refusal_is_repeatable_and_writes_nothing() {
+    let router = router();
+    let account = account_id();
+
+    // One customer-managed policy the entities below carry, so the refusals are read against
+    // an attachment that must survive them, and one the account held and deleted, so an ARN
+    // that resolved once resolves nothing now.
+    let held = element(
+        &served(
+            &router,
+            "held policy",
+            "CreatePolicy",
+            &[
+                param("PolicyName", "HeldPolicy"),
+                param("PolicyDocument", POLICY_DOCUMENT),
+            ],
+        )
+        .await,
+        "Arn",
+    );
+    let gone = format!("arn:aws:iam::{account}:policy/GonePolicy");
+    served(
+        &router,
+        "deleted policy",
+        "CreatePolicy",
+        &[
+            param("PolicyName", "GonePolicy"),
+            param("PolicyDocument", POLICY_DOCUMENT),
+        ],
+    )
+    .await;
+    served(
+        &router,
+        "policy deletion",
+        "DeletePolicy",
+        &[param("PolicyArn", &gone)],
+    )
+    .await;
+
+    // A user, a role and a group, each carrying that one attachment.
+    for (create, attach, member, name) in [
+        ("CreateUser", "AttachUserPolicy", "UserName", "keep-user"),
+        ("CreateRole", "AttachRolePolicy", "RoleName", "keep-role"),
+        ("CreateGroup", "AttachGroupPolicy", "GroupName", "KeepGroup"),
+    ] {
+        let mut params = vec![param(member, name)];
+        if create == "CreateRole" {
+            params.push(param("AssumeRolePolicyDocument", TRUST_POLICY));
+        }
+        served(&router, name, create, &params).await;
+        served(
+            &router,
+            name,
+            attach,
+            &[param(member, name), param("PolicyArn", &held)],
+        )
+        .await;
+    }
+
+    // An instance profile holding one role, with another role held by no profile.
+    served(
+        &router,
+        "instance profile",
+        "CreateInstanceProfile",
+        &[param("InstanceProfileName", "keep-profile")],
+    )
+    .await;
+    for role in ["profile-role", "spare-role"] {
+        served(
+            &router,
+            role,
+            "CreateRole",
+            &[
+                param("RoleName", role),
+                param("AssumeRolePolicyDocument", TRUST_POLICY),
+            ],
+        )
+        .await;
+    }
+    served(
+        &router,
+        "role binding",
+        "AddRoleToInstanceProfile",
+        &[
+            param("InstanceProfileName", "keep-profile"),
+            param("RoleName", "profile-role"),
+        ],
+    )
+    .await;
+
+    // And a role carrying no permissions boundary, whose own unique id the scope refusal
+    // names.
+    let scope_role_id = element(
+        &served(
+            &router,
+            "unbounded role",
+            "CreateRole",
+            &[
+                param("RoleName", "scope-role"),
+                param("AssumeRolePolicyDocument", TRUST_POLICY),
+            ],
+        )
+        .await,
+        "RoleId",
+    );
+
+    let rows = vec![
+        RepeatedRefusal {
+            case: "detaching a policy the user does not carry",
+            action: "DetachUserPolicy",
+            params: vec![
+                param("UserName", "keep-user"),
+                param("PolicyArn", AWS_MANAGED_POLICY),
+            ],
+            status: 404,
+            code: "NoSuchEntity",
+            message: format!("Policy {AWS_MANAGED_POLICY} was not found."),
+            read: AfterRead {
+                action: "ListAttachedUserPolicies",
+                params: vec![param("UserName", "keep-user")],
+                carries: vec![held.clone()],
+                withholds: vec![AWS_MANAGED_POLICY.to_string()],
+            },
+        },
+        RepeatedRefusal {
+            case: "detaching a policy the role does not carry",
+            action: "DetachRolePolicy",
+            params: vec![
+                param("RoleName", "keep-role"),
+                param("PolicyArn", AWS_MANAGED_POLICY),
+            ],
+            status: 404,
+            code: "NoSuchEntity",
+            message: format!("Policy {AWS_MANAGED_POLICY} was not found."),
+            read: AfterRead {
+                action: "ListAttachedRolePolicies",
+                params: vec![param("RoleName", "keep-role")],
+                carries: vec![held.clone()],
+                withholds: vec![AWS_MANAGED_POLICY.to_string()],
+            },
+        },
+        RepeatedRefusal {
+            case: "detaching a policy the group does not carry",
+            action: "DetachGroupPolicy",
+            params: vec![
+                param("GroupName", "KeepGroup"),
+                param("PolicyArn", AWS_MANAGED_POLICY),
+            ],
+            status: 404,
+            code: "NoSuchEntity",
+            message: format!("Policy {AWS_MANAGED_POLICY} was not found."),
+            read: AfterRead {
+                action: "ListAttachedGroupPolicies",
+                params: vec![param("GroupName", "KeepGroup")],
+                carries: vec![held.clone()],
+                withholds: vec![AWS_MANAGED_POLICY.to_string()],
+            },
+        },
+        RepeatedRefusal {
+            case: "clearing a scope the role does not have",
+            action: "DeleteRolePermissionsBoundary",
+            params: vec![param("RoleName", "scope-role")],
+            status: 404,
+            code: "NoSuchEntity",
+            message: format!("Principal {scope_role_id} does not have scope"),
+            read: AfterRead {
+                action: "GetRole",
+                params: vec![param("RoleName", "scope-role")],
+                carries: vec![scope_role_id.clone()],
+                // The refusal sets no boundary: the role still reports none at all.
+                withholds: vec!["PermissionsBoundary".to_string()],
+            },
+        },
+        RepeatedRefusal {
+            case: "removing a role the profile does not hold",
+            action: "RemoveRoleFromInstanceProfile",
+            params: vec![
+                param("InstanceProfileName", "keep-profile"),
+                param("RoleName", "spare-role"),
+            ],
+            status: 404,
+            code: "NoSuchEntity",
+            message: "Role spare-role in Instance Profile keep-profile cannot be found."
+                .to_string(),
+            read: AfterRead {
+                action: "GetInstanceProfile",
+                params: vec![param("InstanceProfileName", "keep-profile")],
+                carries: vec!["profile-role".to_string()],
+                withholds: vec!["spare-role".to_string()],
+            },
+        },
+        RepeatedRefusal {
+            case: "adding a second role to the profile",
+            action: "AddRoleToInstanceProfile",
+            params: vec![
+                param("InstanceProfileName", "keep-profile"),
+                param("RoleName", "spare-role"),
+            ],
+            status: 409,
+            code: "LimitExceeded",
+            message: "Cannot exceed quota for InstanceSessionsPerInstanceProfile: 1".to_string(),
+            read: AfterRead {
+                action: "GetInstanceProfile",
+                params: vec![param("InstanceProfileName", "keep-profile")],
+                carries: vec!["profile-role".to_string()],
+                withholds: vec!["spare-role".to_string()],
+            },
+        },
+        RepeatedRefusal {
+            case: "adding a version to a policy the account no longer holds",
+            action: "CreatePolicyVersion",
+            params: vec![
+                param("PolicyArn", &gone),
+                param("PolicyDocument", POLICY_DOCUMENT),
+            ],
+            status: 404,
+            code: "NoSuchEntity",
+            message: format!("Policy {gone} does not exist or is not attachable."),
+            read: AfterRead {
+                action: "ListPolicies",
+                params: vec![param("Scope", "Local")],
+                carries: vec!["HeldPolicy".to_string()],
+                withholds: vec!["GonePolicy".to_string()],
+            },
+        },
+        RepeatedRefusal {
+            case: "listing the versions of a policy the account no longer holds",
+            action: "ListPolicyVersions",
+            params: vec![param("PolicyArn", &gone)],
+            status: 404,
+            code: "NoSuchEntity",
+            message: format!("Policy {gone} does not exist or is not attachable."),
+            read: AfterRead {
+                action: "ListPolicies",
+                params: vec![param("Scope", "Local")],
+                carries: vec!["HeldPolicy".to_string()],
+                withholds: vec!["GonePolicy".to_string()],
+            },
+        },
+        RepeatedRefusal {
+            case: "reading one version of a policy the account no longer holds",
+            action: "GetPolicyVersion",
+            params: vec![param("PolicyArn", &gone), param("VersionId", "v1")],
+            status: 404,
+            code: "NoSuchEntity",
+            message: format!("Policy {gone} version v1 does not exist or is not attachable."),
+            read: AfterRead {
+                action: "ListPolicies",
+                params: vec![param("Scope", "Local")],
+                carries: vec!["HeldPolicy".to_string()],
+                withholds: vec!["GonePolicy".to_string()],
+            },
+        },
+        RepeatedRefusal {
+            case: "clearing the scope of a user the account never held",
+            action: "DeleteUserPermissionsBoundary",
+            params: vec![param("UserName", "never-held-user")],
+            status: 404,
+            code: "NoSuchEntity",
+            message: "User never-held-user was not found.".to_string(),
+            read: AfterRead {
+                action: "ListUsers",
+                params: Vec::new(),
+                carries: vec!["keep-user".to_string()],
+                // The refusal creates nothing: the account still holds no such user.
+                withholds: vec!["never-held-user".to_string()],
+            },
+        },
+    ];
+
+    for row in &rows {
+        // Twice: the second call sees whatever the first one wrote, so an identical answer is
+        // what shows the first wrote nothing.
+        for attempt in [1, 2] {
+            let (status, body) = call(&router, row.action, &borrowed(&row.params)).await;
+            assert_eq!(
+                status, row.status,
+                "case {:?} attempt {attempt}: expected HTTP {}, got {status}: {body}",
+                row.case, row.status
+            );
+            let code = error_code(&body);
+            assert_eq!(
+                code, row.code,
+                "case {:?} attempt {attempt}: expected the code {:?}, got {code:?}: {body}",
+                row.case, row.code
+            );
+            let message = element(&body, "Message");
+            assert_eq!(
+                message, row.message,
+                "case {:?} attempt {attempt}: expected {:?}, got {message:?}",
+                row.case, row.message
+            );
+        }
+
+        let (status, body) = call(&router, row.read.action, &borrowed(&row.read.params)).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: the read after the refusal must be served, got {status}: {body}",
+            row.case
+        );
+        for text in &row.read.carries {
+            assert!(
+                body.contains(text.as_str()),
+                "case {:?}: {} must still report {text:?}, got {body}",
+                row.case,
+                row.read.action
+            );
+        }
+        for text in &row.read.withholds {
+            assert!(
+                !body.contains(text.as_str()),
+                "case {:?}: {} must not report {text:?}, got {body}",
+                row.case,
+                row.read.action
+            );
+        }
+    }
 }
