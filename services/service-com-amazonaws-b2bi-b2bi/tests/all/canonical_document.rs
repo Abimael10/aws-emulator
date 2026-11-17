@@ -12,9 +12,9 @@
 //! into ONE `<SEGMENT>-8000_loop` entry of that transaction's `segments`, holding one
 //! object per occurrence. Every operation that answers the canonical document answers the
 //! same member names: `TestParsing`'s `parsedFileContent` and the `mappingTemplate`
-//! `CreateStarterMappingTemplate` derives from a sample, which carries the sample's
-//! envelope values verbatim and each transaction-set business element under the
-//! `PLACEHOLDER: ` marker over the value the sample held there.
+//! `CreateStarterMappingTemplate` generates, whose envelope `outputSampleLocation` fills
+//! from the sample and whose transaction-set elements are the bare placeholder the caller
+//! replaces.
 //!
 //! Each test states that rule over a TABLE whose rows differ along what it generalises
 //! over: the element (and so its canonical name), the transaction set (and so the segment
@@ -26,6 +26,9 @@ use serde_json::{json, Value};
 use crate::edi_parsing::{given_object, BUCKET};
 use crate::onboarding_loop::{b2bi_router, call};
 use crate::test_parsing::body_segments_in_order;
+// The handler's own placeholder constant, so this suite cannot drift from the value it
+// asserts on.
+use service_com_amazonaws_b2bi_b2bi::ops::create_starter_mapping_template::PLACEHOLDER;
 
 /// An X12 interchange carrying one transaction set of `transaction_set` whose body is
 /// `body`, written with the classic delimiters (`*`, `>`, `~`).
@@ -81,7 +84,7 @@ async fn parsed_document(
     })
 }
 
-/// The `mappingTemplate` `CreateStarterMappingTemplate` derives from the sample at `key`,
+/// The `mappingTemplate` `CreateStarterMappingTemplate` generates for the sample at `key`,
 /// as JSON.
 async fn derived_template(
     router: &smithy_server_runtime::MultiServiceRouter,
@@ -137,7 +140,9 @@ fn detail_loop(segments: &[Value]) -> Option<(String, Vec<Value>)> {
 /// interchange carries at that position, so the assertion is about the NAME the value
 /// arrives under. Both operations that answer the canonical document are asserted with the
 /// same table: a starter template describes the very document the reader builds, so the two
-/// cannot name an element differently.
+/// cannot name an element differently. The envelope TRAILERS and ISA16 are asserted of the
+/// parsed document alone, because a template leaves to the EDI writer what the writer
+/// derives itself (`tests/all/starter_template_round_trip.rs`).
 #[tokio::test]
 async fn every_envelope_element_carries_its_canonical_member_name() {
     let router = b2bi_router();
@@ -163,9 +168,6 @@ async fn every_envelope_element_carries_its_canonical_member_name() {
         ("ISA_13_InterchangeControlNumber", "000000007"),
         ("ISA_14_AcknowledgmentRequested", "0"),
         ("ISA_15_TestIndicator", "P"),
-        ("ISA_16_ComponentSeparator", ">"),
-        ("IEA_01_NumberOfIncludedFunctionalGroups", "1"),
-        ("IEA_02_InterchangeControlNumber", "000000007"),
     ];
     let group_elements: &[(&str, &str)] = &[
         ("GS_01_FunctionalIdentifierCode", "PO"),
@@ -176,12 +178,22 @@ async fn every_envelope_element_carries_its_canonical_member_name() {
         ("GS_06_GroupControlNumber", "1"),
         ("GS_07_ResponsibleAgencyCode", "X"),
         ("GS_08_Version", "004010"),
-        ("GE_01_NumberOfTransactionSetsIncluded", "1"),
-        ("GE_02_GroupControlNumber", "1"),
     ];
     let transaction_elements: &[(&str, &str)] = &[
         ("ST_01_TransactionSetIdentifierCode", "850"),
         ("ST_02_TransactionSetControlNumber", "0001"),
+    ];
+    // The members a parsed document carries and a template leaves to the writer.
+    let trailer_elements: &[(&str, &str)] = &[
+        ("ISA_16_ComponentSeparator", ">"),
+        ("IEA_01_NumberOfIncludedFunctionalGroups", "1"),
+        ("IEA_02_InterchangeControlNumber", "000000007"),
+    ];
+    let group_trailer_elements: &[(&str, &str)] = &[
+        ("GE_01_NumberOfTransactionSetsIncluded", "1"),
+        ("GE_02_GroupControlNumber", "1"),
+    ];
+    let transaction_trailer_elements: &[(&str, &str)] = &[
         ("SE_01_NumberOfIncludedSegments", "3"),
         ("SE_02_TransactionSetControlNumber", "0001"),
     ];
@@ -207,6 +219,29 @@ async fn every_envelope_element_carries_its_canonical_member_name() {
                      {object}"
                 );
             }
+        }
+    }
+
+    // The trailers and the component element separator: the parsed document carries them
+    // under their canonical names, and a template carries none of them at all.
+    let reported = &parsed["interchanges"][0];
+    let group = &reported["functional_groups"][0];
+    let transaction = &group["transactions"][0];
+    for (scope, object, elements) in [
+        ("interchange", reported, trailer_elements),
+        ("functional group", group, group_trailer_elements),
+        ("transaction set", transaction, transaction_trailer_elements),
+    ] {
+        for (member, value) in elements {
+            assert_eq!(
+                object[member].as_str(),
+                Some(*value),
+                "the parsed {scope}'s {member} must carry {value:?}, got {object}"
+            );
+            assert!(
+                !template.to_string().contains(member),
+                "a template leaves {member} to the EDI writer, got {template}"
+            );
         }
     }
 
@@ -391,7 +426,7 @@ async fn a_detail_loop_is_grouped_as_one_entry_per_occurrence() {
 
 /// One row of the sample table: the case, the sample's sender (ISA06), its interchange
 /// control number (ISA13), its body segments, and the (member, sample value) pairs of the
-/// transaction-set business fields the derived template must mark.
+/// transaction-set business fields the template must NOT carry the value of.
 type SampleCase<'a> = (
     &'a str,
     &'a str,
@@ -400,16 +435,16 @@ type SampleCase<'a> = (
     Vec<(&'a str, &'a str)>,
 );
 
-/// RULE: a starter mapping template derived from `outputSampleLocation` is the canonical
-/// document of THAT sample — its envelope values carried through verbatim, and every
-/// transaction-set business element replaced by the `PLACEHOLDER: ` marker over the value
-/// the sample carried there — so a caller's mapping addresses the members its own documents
-/// really hold.
+/// RULE: a starter mapping template generated for `outputSampleLocation` carries THAT
+/// sample's envelope values — so a caller's mapping writes the envelope its own documents
+/// really have — while the transaction's body stays the requested transaction set's table:
+/// one entry per segment of it, every element position the bare placeholder, and none of
+/// the sample's own transaction-set values or of the reader's loop members.
 ///
-/// The rows differ along the sample's envelope values, how many line items it holds (and so
-/// how many loop occurrences the template describes) and which business elements it fills.
+/// The rows differ along the sample's envelope values, how many line items it holds and
+/// which business elements it fills.
 #[tokio::test]
-async fn a_template_derived_from_a_sample_echoes_its_envelope_and_marks_its_business_fields() {
+async fn a_template_generated_for_a_sample_carries_its_envelope_and_bare_placeholders() {
     let router = b2bi_router();
 
     let cases: Vec<SampleCase> = vec![
@@ -437,7 +472,7 @@ async fn a_template_derived_from_a_sample_echoes_its_envelope_and_marks_its_busi
         ),
     ];
 
-    for (case, sender, control, body, marked) in cases {
+    for (case, sender, control, body, unmapped) in cases {
         let key = format!("canonical/sample-{control}.edi");
         let sample = interchange("850", sender, control, &body);
         given_object(&router, &key, &sample).await;
@@ -458,37 +493,38 @@ async fn a_template_derived_from_a_sample_echoes_its_envelope_and_marks_its_busi
             "case {case:?}: ISA13 must carry the sample's control number, got {reported}"
         );
 
-        // …and every business element of the transaction set is the marker over the
-        // sample's own value.
+        // …and every element of the transaction set's own segments is the bare placeholder,
+        // whatever the sample held there.
         let transaction = &reported["functional_groups"][0]["transactions"][0];
         let segments = transaction["segments"]
             .as_array()
             .cloned()
             .unwrap_or_else(|| panic!("case {case:?}: expected the transaction's segments"));
-        let flattened = body_segments_in_order(&segments);
-        for (member, value) in &marked {
-            let expected = format!("PLACEHOLDER: {value}");
-            let found = flattened
-                .iter()
-                .filter_map(|segment| segment[member].as_str())
-                .next();
-            assert_eq!(
-                found,
-                Some(expected.as_str()),
-                "case {case:?}: {member} must be marked {expected:?}, got {flattened:?}"
+        for segment in &segments {
+            let elements = segment
+                .as_object()
+                .unwrap_or_else(|| panic!("case {case:?}: a segment is an object, got {segment}"));
+            for (member, value) in elements {
+                assert_eq!(
+                    value.as_str(),
+                    Some(PLACEHOLDER),
+                    "case {case:?}: {member} must be the bare placeholder, got {segment}"
+                );
+            }
+        }
+        let rendered = template.to_string();
+        for (member, value) in &unmapped {
+            assert!(
+                !rendered.contains(*value),
+                "case {case:?}: the template must not carry the sample's {member} value \
+                 {value:?}, got {rendered}"
             );
         }
-        // The line items the sample holds are the occurrences the template describes.
-        let (_, occurrences) = detail_loop(&segments)
-            .unwrap_or_else(|| panic!("case {case:?}: expected the detail loop, got {segments:?}"));
-        let line_items = body
-            .iter()
-            .filter(|segment| segment.starts_with("PO1*"))
-            .count();
-        assert_eq!(
-            occurrences.len(),
-            line_items,
-            "case {case:?}: expected {line_items} loop occurrences, got {occurrences:?}"
+        // A detail-table loop is the READER's grouping of a sample's occurrences; a
+        // template describes the segment, not how many times this sample repeated it.
+        assert!(
+            detail_loop(&segments).is_none(),
+            "case {case:?}: a template carries no loop entry, got {segments:?}"
         );
     }
 }

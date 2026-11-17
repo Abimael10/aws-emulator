@@ -6,7 +6,7 @@
 //! b2bi — every EDI document these operations read is an S3 object.
 //!
 //! The rule under test: the operations that read an EDI document — `TestParsing`,
-//! `CreateStarterMappingTemplate`'s sample-driven path and `StartTransformerJob`'s
+//! `CreateStarterMappingTemplate`'s `outputSampleLocation` and `StartTransformerJob`'s
 //! `inputConversion` — read it through the SAME reader
 //! (`ops::test_parsing::parse_x12`), so one file is parsed the same way whichever
 //! operation reads it: content that is an X12 interchange is parsed by all of them and
@@ -141,16 +141,17 @@ fn message(body: &Value) -> String {
         .to_string()
 }
 
-/// One row: the case, the object key, its content, and — for content that parses — a
-/// business value of the transaction set the reader must carry through, or `None` when
+/// One row: the case, the object key, its content, and — for content that parses — the
+/// transaction-set value `TestParsing` must carry through beside the ENVELOPE value
+/// `CreateStarterMappingTemplate` must fill its template's envelope with, or `None` when
 /// the content is not an interchange at all.
-type ReaderCase<'a> = (&'a str, &'a str, &'a str, Option<&'a str>);
+type ReaderCase<'a> = (&'a str, &'a str, &'a str, Option<(&'a str, &'a str)>);
 
 /// RULE: a file that is an X12 interchange is parsed by every operation that reads one,
-/// and its transaction-set values reach each operation's own answer — `TestParsing`
-/// carries the value itself, `CreateStarterMappingTemplate` carries it under the
-/// `PLACEHOLDER: ` marker of the field the caller must map — while a file that is not an
-/// interchange is refused by both with the reader's own sentence.
+/// and its values reach each operation's own answer — `TestParsing` carries the
+/// transaction set's own values, `CreateStarterMappingTemplate` fills its template's
+/// envelope from the interchange's envelope — while a file that is not an interchange is
+/// refused by both with the reader's own sentence.
 #[tokio::test]
 async fn one_reader_answers_for_every_operation_that_reads_an_edi_document() {
     let router = b2bi_router();
@@ -160,19 +161,19 @@ async fn one_reader_answers_for_every_operation_that_reads_an_edi_document() {
             "an X12 850 with the classic delimiters",
             "shared/850.edi",
             X12_850,
-            Some("PO12345"),
+            Some(("PO12345", "000000001")),
         ),
         (
             "an X12 810 at release 005010 with pipe delimiters and newline terminators",
             "shared/810-pipe.edi",
             X12_810_PIPE,
-            Some("INV-9"),
+            Some(("INV-9", "000000002")),
         ),
         (
             "two transaction sets in one functional group",
             "shared/850-two.edi",
             X12_850_TWO_TRANSACTIONS,
-            Some("PO-ONE"),
+            Some(("PO-ONE", "000000003")),
         ),
         ("content that is not EDI", "shared/not-edi.txt", NOT_EDI, None),
         (
@@ -190,7 +191,7 @@ async fn one_reader_answers_for_every_operation_that_reads_an_edi_document() {
         ("an empty object", "shared/empty.txt", "", None),
     ];
 
-    for (case, key, content, business_value) in cases {
+    for (case, key, content, parsed_values) in cases {
         given_object(&router, key, content).await;
 
         let (parse_status, parsed) =
@@ -198,8 +199,8 @@ async fn one_reader_answers_for_every_operation_that_reads_an_edi_document() {
         let (template_status, template) =
             call(&router, "CreateStarterMappingTemplate", starter_template_request(key)).await;
 
-        match business_value {
-            Some(value) => {
+        match parsed_values {
+            Some((value, control_number)) => {
                 assert_eq!(
                     parse_status, 200,
                     "case {case:?}: TestParsing must parse the file, got {parse_status} \
@@ -213,21 +214,22 @@ async fn one_reader_answers_for_every_operation_that_reads_an_edi_document() {
 
                 assert_eq!(
                     template_status, 200,
-                    "case {case:?}: CreateStarterMappingTemplate must derive a template \
-                     from the sample, got {template_status} {template}"
+                    "case {case:?}: CreateStarterMappingTemplate must generate a template \
+                     for the sample, got {template_status} {template}"
                 );
                 let mapping = template["mappingTemplate"].as_str().unwrap_or_default();
+                // The sample's envelope reaches the template: its interchange control
+                // number tells each of these files apart.
                 assert!(
-                    mapping.contains(&format!("PLACEHOLDER: {value}")),
-                    "case {case:?}: the derived template must mark {value:?} as a \
-                     placeholder, got {mapping}"
+                    mapping.contains(control_number),
+                    "case {case:?}: the template's envelope must carry the sample's \
+                     {control_number:?}, got {mapping}"
                 );
-                // The sample's envelope values are carried through verbatim, NOT marked:
-                // the caller does not map the interchange envelope.
+                // Its transaction-set values do not: those are the caller's to map.
                 assert!(
-                    mapping.contains("SENDER"),
-                    "case {case:?}: the derived template must carry the sample's \
-                     envelope values, got {mapping}"
+                    !mapping.contains(value),
+                    "case {case:?}: the template must not carry the sample's {value:?}, got \
+                     {mapping}"
                 );
             }
             None => {
@@ -309,6 +311,7 @@ async fn a_sample_that_does_not_resolve_is_told_from_one_that_does_not_parse() {
     let mapping = response["mappingTemplate"].as_str().unwrap_or_default();
     assert!(
         !mapping.contains("PLACEHOLDER: "),
-        "a template generated without a sample carries no sample value, got {mapping}"
+        "a template carries the bare placeholder sentinel, never a value after it, got \
+         {mapping}"
     );
 }

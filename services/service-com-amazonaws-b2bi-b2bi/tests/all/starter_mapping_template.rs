@@ -6,12 +6,16 @@
 //!
 //! The rule under test: a starter mapping template is a document in the requested
 //! `mappingType` (a JSON document for `JSONATA`, an XSLT stylesheet for `XSLT`) whose
-//! X12 envelope carries the values the requested transaction set and version determine —
-//! ST01 the transaction set code, ST03 the implementation convention reference when the
-//! transaction set names one, GS08 the six-digit version/release code followed by that
-//! convention — with a placeholder wherever the caller must supply an expression, and with
-//! nothing an EDI writer derives itself (no envelope trailer, no ISA16); and it persists
-//! nothing, so the same request always answers with the same template.
+//! X12 envelope carries the value the X12 standard or the request fixes for each of its
+//! elements — ST01 the transaction set code, ST03 the implementation convention reference
+//! when the transaction set names one, GS01 the functional identifier code of the group the
+//! transaction set is sent in, GS08 the six-digit version/release code followed by that
+//! convention, the interchange header's own standard codes and the control numbers of the
+//! one interchange, group and transaction it describes — with a placeholder wherever the
+//! caller must supply an expression (its own trading parties, dates and times, and every
+//! element of the transaction set's own segments), and with nothing an EDI writer derives
+//! itself (no envelope trailer, no ISA16); and it persists nothing, so the same request
+//! always answers with the same template.
 //!
 //! Each test asserts that rule over a TABLE whose rows differ along what it generalises
 //! over: mapping type, transaction set (with and without an implementation guide) and
@@ -481,8 +485,8 @@ async fn the_same_request_always_answers_with_the_same_template() {
 }
 
 /// One row of the sample table: the case, the sample's key and content, the mapping type,
-/// then what the derived template must carry — the sample's ST01, ISA06 and GS08, and the
-/// (business field, sample value) pair that must have become a placeholder.
+/// then what the generated template must carry — the sample's ST02, ISA06 and GS08 — and
+/// the (business field, sample value) pair the template must NOT carry the value of.
 type SampleCase<'a> = (
     &'a str,
     &'a str,
@@ -494,17 +498,18 @@ type SampleCase<'a> = (
     (&'a str, &'a str),
 );
 
-/// RULE: when `outputSampleLocation` names a readable sample EDI object, the template is
-/// DERIVED FROM THAT SAMPLE — the sample's envelope values (ISA/GS/ST…) are carried
-/// through verbatim and each transaction-set business field becomes a marker over the
-/// value the sample carried there — rather than generated from `templateDetails` alone.
+/// RULE: `outputSampleLocation` fills the ENVELOPE element values of the template the
+/// requested transaction set and version determine, and nothing else: the sample's ISA/GS/ST
+/// values reach the template, while the document's members, its segments and their element
+/// positions stay the requested transaction set's — so no transaction-set value of the
+/// sample, and none of the X12 reader's own members (a `segment_id`, a detail-table loop,
+/// an envelope trailer), reaches the template, and every element of a body segment is the
+/// bare placeholder.
 ///
 /// The rows differ along what the rule generalises over: the sample's transaction set and
 /// release, the delimiters it is written with, and the requested mapping type.
 #[tokio::test]
-async fn a_template_generated_from_a_sample_carries_the_samples_own_values() {
-    use service_com_amazonaws_b2bi_b2bi::ops::create_starter_mapping_template::SAMPLE_PLACEHOLDER_PREFIX;
-
+async fn a_sample_fills_the_envelope_values_of_the_generated_template() {
     let router = b2bi_router();
 
     /// A sample 810 invoice at release 005010, written with `|` between elements — the
@@ -521,15 +526,15 @@ async fn a_template_generated_from_a_sample_carries_the_samples_own_values() {
     );
 
     // Each row: the case, the sample's key and content, the mapping type, and what the
-    // template must carry — the sample's ST01, its ISA06, its GS08 and the
-    // (business field, sample value) pair that must have become a placeholder.
+    // template must carry — the sample's ST02 control number, its ISA06 sender and its GS08
+    // version — plus the (business field, sample value) pair the template must not carry.
     let cases: Vec<SampleCase<'_>> = vec![
         (
             "an 850 sample, JSONATA",
             "samples/sample-850.edi",
             X12_850_SAMPLE,
             "JSONATA",
-            "850",
+            "0001",
             "SENDER",
             "004010",
             ("BEG_03", "PO12345"),
@@ -539,7 +544,7 @@ async fn a_template_generated_from_a_sample_carries_the_samples_own_values() {
             "samples/sample-850.edi",
             X12_850_SAMPLE,
             "XSLT",
-            "850",
+            "0001",
             "SENDER",
             "004010",
             ("BEG_03", "PO12345"),
@@ -549,39 +554,268 @@ async fn a_template_generated_from_a_sample_carries_the_samples_own_values() {
             "samples/sample-810.edi",
             SAMPLE_810,
             "JSONATA",
-            "810",
+            "0009",
             "INVSENDER",
             "005010",
             ("BIG_02", "INV-42"),
         ),
     ];
 
-    for (case, key, body, mapping_type, st01, isa06, gs08, (field, sample_value)) in cases {
+    for (case, key, body, mapping_type, st02, isa06, gs08, (field, sample_value)) in cases {
         given_object(&router, key, body).await;
         let mut request = request(mapping_type, "X12_850", "VERSION_4010");
         request["outputSampleLocation"] = json!({ "bucketName": BUCKET, "key": key });
         let (status, response) = call(&router, "CreateStarterMappingTemplate", request).await;
         let template = mapping_template(case, status, &response);
 
-        // The envelope values come from the SAMPLE, not from the request: the request
-        // names X12_850 / VERSION_4010 in every row, so an 810 sample at release 5010
-        // proves the template was derived from the file.
-        for expected in [st01, isa06, gs08] {
+        // The envelope values come from the SAMPLE, not from the request: the request names
+        // X12_850 / VERSION_4010 in every row, so an 810 sample at release 5010 proves the
+        // envelope was filled from the file.
+        for expected in [st02, isa06, gs08] {
             assert!(
                 template.contains(expected),
                 "case {case:?}: the template must carry the sample's {expected:?}, got {template}"
             );
         }
-        let marker = format!("{SAMPLE_PLACEHOLDER_PREFIX}{sample_value}");
-        assert!(
-            template.contains(&marker),
-            "case {case:?}: the business field {field} must become {marker:?}, got {template}"
-        );
-        assert!(
-            !template.contains(&format!("\"{PLACEHOLDER}\"")),
-            "case {case:?}: a sample-derived template carries the sample's values, not the \
-             bare placeholders of a template generated without one, got {template}"
-        );
+        // …and NOTHING else is: no transaction-set value of the sample, no marker over one,
+        // and none of the X12 reader's own members.
+        for absent in [
+            sample_value,
+            "PLACEHOLDER: ",
+            "segment_id",
+            "_loop",
+            "SE_01",
+            "GE_01",
+            "IEA_01",
+        ] {
+            assert!(
+                !template.contains(absent),
+                "case {case:?}: a template carries no {absent:?} (the sample fills envelope \
+                 values only; {field} is the caller's to map), got {template}"
+            );
+        }
+        // The body is the REQUESTED transaction set's table, every element position of its
+        // opening segment a bare placeholder — the 850's BEG, whatever the sample held.
+        if mapping_type == "JSONATA" {
+            let (transaction, _, _) = segments(case, &template);
+            let opening = &transaction["segments"][0];
+            let positions = opening
+                .as_object()
+                .unwrap_or_else(|| panic!("case {case:?}: a segment is an object, got {opening}"));
+            for (index, (position, value)) in positions.iter().enumerate() {
+                assert_eq!(
+                    position,
+                    &format!("BEG_{:02}", index + 1),
+                    "case {case:?}: the body opens with the 850's BEG segment, got {opening}"
+                );
+                assert_eq!(
+                    value.as_str(),
+                    Some(PLACEHOLDER),
+                    "case {case:?}: {position} must be the bare placeholder, got {value}"
+                );
+            }
+        }
+    }
+}
+
+/// One row of the body-table test: the case, the `X12TransactionSet` and `X12Version`
+/// values, and the (segment id, element count) pairs the first segments of that transaction
+/// set's body carry.
+type BodyTableCase<'a> = (&'a str, &'a str, &'a str, Vec<(&'a str, usize)>);
+
+/// RULE: every element of a segment INSIDE the transaction is the bare placeholder, one per
+/// element position of that segment's X12 table — the recorded 850 template carries BEG_01
+/// through BEG_12 and CUR_01 through CUR_09 — so a caller's mapping can address every field
+/// the standard defines for the segment, not only the ones a sample happened to fill.
+///
+/// The rows are the segments of the requested transaction set's table, with the count the
+/// X12 segment directory gives each one.
+#[tokio::test]
+async fn a_body_segment_carries_every_element_position_of_its_table() {
+    let router = b2bi_router();
+
+    // Each row: the case, the `X12TransactionSet`, and the (segment id, element count)
+    // pairs the first segments of its body carry. Counts: the ASC X12 segment directory,
+    // except the currency segment, whose nine elements are the recorded template's.
+    let cases: Vec<BodyTableCase<'_>> = vec![
+        (
+            "850 purchase order",
+            "X12_850",
+            "VERSION_4010",
+            vec![("BEG", 12), ("CUR", 9), ("REF", 4)],
+        ),
+        (
+            "997 functional acknowledgment",
+            "X12_997",
+            "VERSION_4010",
+            vec![("AK1", 3), ("AK2", 3), ("AK9", 9)],
+        ),
+    ];
+
+    for (case, transaction_set, version, expected) in cases {
+        let (status, body) = call(
+            &router,
+            "CreateStarterMappingTemplate",
+            request("JSONATA", transaction_set, version),
+        )
+        .await;
+        let template = mapping_template(case, status, &body);
+        let (transaction, _, _) = segments(case, &template);
+        for (index, (segment, count)) in expected.iter().enumerate() {
+            let reported = &transaction["segments"][index];
+            let positions: Vec<String> = reported
+                .as_object()
+                .unwrap_or_else(|| panic!("case {case:?}: a segment is an object, got {reported}"))
+                .keys()
+                .cloned()
+                .collect();
+            let wanted: Vec<String> = (1..=*count)
+                .map(|position| format!("{segment}_{position:02}"))
+                .collect();
+            assert_eq!(
+                positions, wanted,
+                "case {case:?}: segment {index} must carry every element position of \
+                 {segment}, got {positions:?}"
+            );
+            for position in &positions {
+                assert_eq!(
+                    reported[position].as_str(),
+                    Some(PLACEHOLDER),
+                    "case {case:?}: {position} must be the bare placeholder, got {reported}"
+                );
+            }
+        }
+    }
+}
+
+/// RULE: the envelope of a generated template carries the value the X12 standard or the
+/// request fixes for each of its elements — the qualifiers that say no authorization or
+/// security information is present, the control standards identifier, the interchange
+/// control version number of the requested release, the acknowledgment and test indicators,
+/// the control numbers of the one interchange, group and transaction it describes, the
+/// functional identifier code of the group the requested transaction set is sent in, and the
+/// responsible agency and version codes — and the placeholder wherever the element is the
+/// caller's own data.
+///
+/// The rows differ along what the rule generalises over: the transaction set (and so its
+/// functional group), including one this emulator has no group for, and the release (and so
+/// the interchange control version number and whether ISA11 is data at all).
+#[tokio::test]
+async fn the_envelope_carries_the_values_the_standard_and_the_request_fix() {
+    let router = b2bi_router();
+
+    // Each row: the case, the `X12TransactionSet` and `X12Version` values, the functional
+    // identifier code (GS01) of the group that transaction set is sent in, the interchange
+    // control version number (ISA12) of that release, and the ISA11 member name with the
+    // value it must carry. GS01 codes: the ASC X12 code list of the functional identifier
+    // code element; the 810 invoice's `IN` is not a code the issue cited.
+    let cases: Vec<(&str, &str, &str, &str, &str, &str, &str)> = vec![
+        (
+            "850 purchase order at release 4010",
+            "X12_850",
+            "VERSION_4010",
+            "PO",
+            "00401",
+            ISA11_PRE_4020,
+            "U",
+        ),
+        (
+            "810 invoice at release 5010",
+            "X12_810",
+            "VERSION_5010",
+            "IN",
+            "00501",
+            ISA11_FROM_4020,
+            PLACEHOLDER,
+        ),
+        (
+            "997 functional acknowledgment at release 4030",
+            "X12_997",
+            "VERSION_4030",
+            "FA",
+            "00403",
+            ISA11_FROM_4020,
+            PLACEHOLDER,
+        ),
+        (
+            "100 insurance plan description, a transaction set with no group here",
+            "X12_100",
+            "VERSION_4010",
+            PLACEHOLDER,
+            "00401",
+            ISA11_PRE_4020,
+            "U",
+        ),
+    ];
+
+    for (case, transaction_set, version, gs01, isa12, isa11, isa11_value) in cases {
+        let (status, body) = call(
+            &router,
+            "CreateStarterMappingTemplate",
+            request("JSONATA", transaction_set, version),
+        )
+        .await;
+        let template = mapping_template(case, status, &body);
+        let (transaction, group, interchange) = segments(case, &template);
+
+        for (scope, object, member, expected) in [
+            ("interchange", &interchange, "ISA_01_AuthorizationQualifier", "00"),
+            ("interchange", &interchange, "ISA_03_SecurityQualifier", "00"),
+            ("interchange", &interchange, isa11, isa11_value),
+            ("interchange", &interchange, "ISA_12_Version", isa12),
+            (
+                "interchange",
+                &interchange,
+                "ISA_13_InterchangeControlNumber",
+                "000000001",
+            ),
+            (
+                "interchange",
+                &interchange,
+                "ISA_14_AcknowledgmentRequested",
+                "0",
+            ),
+            ("interchange", &interchange, "ISA_15_TestIndicator", "P"),
+            ("functional group", &group, "GS_01_FunctionalIdentifierCode", gs01),
+            ("functional group", &group, "GS_06_GroupControlNumber", "1"),
+            ("functional group", &group, "GS_07_ResponsibleAgencyCode", "X"),
+            (
+                "transaction set",
+                &transaction,
+                "ST_02_TransactionSetControlNumber",
+                "000001",
+            ),
+        ] {
+            assert_eq!(
+                object[member].as_str(),
+                Some(expected),
+                "case {case:?}: the {scope}'s {member} must carry {expected:?}, got {object}"
+            );
+        }
+
+        // The elements that carry the caller's own data are the caller's to map.
+        for (scope, object, member) in [
+            (
+                "interchange",
+                &interchange,
+                "ISA_02_AuthorizationInformation",
+            ),
+            ("interchange", &interchange, "ISA_04_SecurityInformation"),
+            ("interchange", &interchange, "ISA_05_SenderQualifier"),
+            ("interchange", &interchange, "ISA_06_SenderId"),
+            ("interchange", &interchange, "ISA_08_ReceiverId"),
+            ("interchange", &interchange, "ISA_09_Date"),
+            ("interchange", &interchange, "ISA_10_Time"),
+            ("functional group", &group, "GS_02_ApplicationSenderCode"),
+            ("functional group", &group, "GS_04_Date"),
+            ("functional group", &group, "GS_05_Time"),
+        ] {
+            assert_eq!(
+                object[member].as_str(),
+                Some(PLACEHOLDER),
+                "case {case:?}: the {scope}'s {member} is the caller's to supply, got {object}"
+            );
+        }
     }
 }
 

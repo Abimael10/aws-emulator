@@ -16,13 +16,13 @@
 //! * WITHOUT `outputSampleLocation` the template comes from `templateDetails`: the X12
 //!   envelope the requested transaction set and version determine, with the
 //!   [`PLACEHOLDER`] value wherever the caller must supply an expression.
-//! * WITH `outputSampleLocation` it is DERIVED FROM THAT SAMPLE — "if you provide a sample
-//!   EDI file with the same structure as the EDI files that you wish to generate, then the
-//!   service can generate a mapping template". The object is read through the emulator's
-//!   own Amazon S3 service and parsed as an X12 interchange
-//!   ([`super::test_parsing::parse_x12`]); the template keeps the sample's structure and
-//!   its envelope values, and marks each transaction-set business field with
-//!   [`SAMPLE_PLACEHOLDER_PREFIX`] over the value the sample carried there. Only a sample
+//! * WITH `outputSampleLocation` the template is the SAME document — "if you provide a
+//!   sample EDI file with the same structure as the EDI files that you wish to generate,
+//!   then the service can generate a mapping template" — with the ENVELOPE element values
+//!   taken from that sample. The object is read through the emulator's own Amazon S3
+//!   service and parsed as an X12 interchange ([`super::test_parsing::parse_x12`]), and
+//!   only its element VALUES are read: the sample names no member and no element position
+//!   the requested transaction set does not ([`fill_envelope_from_sample`]). Only a sample
 //!   that genuinely does not resolve is the modelled `ResourceNotFoundException`.
 //!
 //! ## The generated document
@@ -49,11 +49,11 @@
 //! elements keyed `<SEGMENT>_<position>` (`BEG_01`) — which is also what NAMES the segment,
 //! as the X12 reader's `segment_id` marker does for a parsed document
 //! ([`super::test_parsing::parse_x12`]), because a mapping written against this template is
-//! evaluated into a document that reader's own output is compared with. A template DERIVED
-//! FROM A SAMPLE is the sample's own parsed document with its business fields marked, so it
-//! carries that reader's members as the reader wrote them — the envelope trailers it read,
-//! the `segment_id` of each segment, and its detail-table loops (`PO1-8000_loop`), one
-//! entry per occurrence in the sample.
+//! evaluated into a document that reader's own output is compared with. A template
+//! generated FOR A SAMPLE carries the same members: the sample fills envelope VALUES only,
+//! so none of the reader's own members (the `segment_id` of a segment, its detail-table
+//! loops such as `PO1-8000_loop`, the envelope trailers it read) reaches a template, and
+//! every element of a body segment is the [`PLACEHOLDER`] its table position asks for.
 //!
 //! ## Shape of an operation
 //!
@@ -214,8 +214,7 @@ impl MappingFormat {
 /// The longest template this operation answers with: the modelled `MappingTemplate` bound
 /// (`len 0..350000`), the member `TestMapping`, `CreateTransformer` and `UpdateTransformer`
 /// accept a template in. A template past it could not be used with the operations it is
-/// generated for, so the request is refused instead of answered with one — which is also
-/// what bounds the amplification from a sample, whose parsed form is larger than the file.
+/// generated for, so the request is refused instead of answered with one.
 const MAX_TEMPLATE_CHARS: usize = 350_000;
 
 /// The XSLT namespace every generated stylesheet declares.
@@ -246,10 +245,9 @@ use super::test_parsing::{
 /// "the starter template contains placeholder values which you can replace with JSONata
 /// or XSLT expressions to take data from your input file".
 ///
-/// One fixed word, carrying neither the element's name nor the expression language: it is
-/// what the generated template reads for every such field, and it is the word the
-/// sample-driven path writes the sample's own value after ([`SAMPLE_PLACEHOLDER_PREFIX`]),
-/// so a caller recognises a field it must fill in the same way on both paths.
+/// One fixed word, carrying neither the element's name nor the expression language nor any
+/// value: it is what a generated template reads for every such field on both paths, so a
+/// caller recognises a field it must fill the same way whether or not it named a sample.
 pub const PLACEHOLDER: &str = "PLACEHOLDER";
 
 /// One node of a starter template's document tree, rendered to JSON for a `JSONATA`
@@ -258,7 +256,8 @@ pub const PLACEHOLDER: &str = "PLACEHOLDER";
 /// It mirrors the tree a PARSED X12 interchange takes ([`super::test_parsing::Node`], the
 /// reader's own): the keys a starter template carries placeholders under are the keys a
 /// parsed interchange carries values under, which is what lets
-/// [`sample_derived_document`] turn one into the other member for member.
+/// [`fill_envelope_from_sample`] read a sample's value for the element a template key
+/// names.
 ///
 /// A map keeps its members in INSERTION order — the positional order of an X12 segment's
 /// elements — which a `serde_json::Value` (a sorted map) would lose.
@@ -345,9 +344,10 @@ const BEGINNING_SEGMENTS: &[(&str, BeginningSegment)] = &[
                 "ContractNumber",
                 "AcknowledgmentType",
                 "InvoiceTypeCode",
-                "PurchaseCategory",
+                "ContractTypeCode",
                 "SecurityLevelCode",
                 "TransactionTypeCode",
+                "PurchaseCategory",
             ],
         },
     ),
@@ -838,15 +838,6 @@ fn placeholder() -> Node {
     Node::Text(PLACEHOLDER.to_string())
 }
 
-/// `names` as the elements of `segment`, in positional order, each one a placeholder.
-fn placeholder_elements(segment: &str, names: &[&str]) -> Vec<(String, Node)> {
-    names
-        .iter()
-        .enumerate()
-        .map(|(index, name)| (element_key(segment, index + 1, name), placeholder()))
-        .collect()
-}
-
 /// One segment INSIDE the transaction — the transaction set's own body, which the X12
 /// schema of that transaction set defines — as the object a `segments` list holds.
 ///
@@ -862,14 +853,16 @@ fn body_segment(segment: &BodySegment) -> Node {
     )
 }
 
-/// The interchange control header (ISA) as a template carries it: the fifteen DATA elements,
-/// all of them the caller's to supply.
+/// The interchange control header (ISA) as a template carries it: its fifteen DATA
+/// elements, each one the value the X12 standard or the request fixes for it
+/// ([`isa_element_value`]) and the placeholder wherever the element carries the caller's
+/// own data (the trading parties, the interchange's date and time).
 ///
 /// ISA16 is left out: it declares the component element SEPARATOR the interchange is written
 /// with, a delimiter of the file rather than data in it, so a template that asked the caller
 /// for an expression there would describe a document whose ISA16 is not a delimiter at all
 /// — which this service's X12 writer refuses (`super::test_conversion`).
-fn isa_elements(release: u32) -> Vec<(String, Node)> {
+fn isa_elements(release: u32, version_release_industry_code: &str) -> Vec<(String, Node)> {
     let names = isa_element_names(release);
     // Every element but the component element separator, taken out BY NAME rather than by
     // position, so a reader whose element list changes still has its data elements written
@@ -879,35 +872,194 @@ fn isa_elements(release: u32) -> Vec<(String, Node)> {
         .into_iter()
         .filter(|name| *name != COMPONENT_SEPARATOR_ELEMENT)
         .collect();
-    placeholder_elements("ISA", &data_elements)
+    data_elements
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            let position = index + 1;
+            let element = match isa_element_value(position, name, version_release_industry_code) {
+                Some(value) => Node::Text(value),
+                None => placeholder(),
+            };
+            (element_key("ISA", position, name), element)
+        })
+        .collect()
 }
+
+/// The value of the interchange header element at `position`, or `None` when the element
+/// carries the caller's own data and so stays a placeholder.
+///
+/// Source: the ASC X12 interchange control header, whose element code lists fix the value of
+/// every element a generated interchange does not take from its trading parties — the
+/// qualifier that says no authorization or security information is present (and the
+/// fixed-width blank that goes with it), the control standards identifier, the interchange
+/// control version number the requested release names, whether an acknowledgment is asked
+/// for, and whether the interchange is a production one.
+fn isa_element_value(position: usize, name: &str, version_code: &str) -> Option<String> {
+    match position {
+        1 | 3 => Some(NO_INFORMATION_QUALIFIER.to_string()),
+        // ISA11 is the control standards identifier up to the release where the repetition
+        // separator takes its position; a separator is a delimiter of the file, so from
+        // that release on the element is left to the writer the way ISA16 is.
+        11 if name == INTERCHANGE_CONTROL_STANDARDS_ELEMENT => {
+            Some(INTERCHANGE_CONTROL_STANDARDS_ID.to_string())
+        }
+        // The interchange control version number: the five-digit form of the version X12
+        // carries in GS08 (`004010` → `00401`).
+        12 => Some(
+            version_code
+                .chars()
+                .take(INTERCHANGE_VERSION_CHARS)
+                .collect(),
+        ),
+        13 => Some(FIRST_INTERCHANGE_CONTROL_NUMBER.to_string()),
+        14 => Some(NO_ACKNOWLEDGMENT_REQUESTED.to_string()),
+        15 => Some(PRODUCTION_TEST_INDICATOR.to_string()),
+        _ => None,
+    }
+}
+
+/// ISA01 and ISA03, the qualifiers of the interchange header: `00`, no authorization and no
+/// security information is present — the authorization and security information elements
+/// themselves (ISA02 and ISA04) stay the caller's, the way every other element a mapping
+/// supplies does.
+const NO_INFORMATION_QUALIFIER: &str = "00";
+
+/// The name the X12 reader gives ISA11 up to the release where the repetition separator
+/// takes that position, which is where the element is data rather than a delimiter.
+const INTERCHANGE_CONTROL_STANDARDS_ELEMENT: &str = "InterchangeControlStandardsId";
+
+/// ISA11, the interchange control standards identifier: `U`, the U.S. EDI community of ASC
+/// X12, TDCC and UCS.
+const INTERCHANGE_CONTROL_STANDARDS_ID: &str = "U";
+
+/// How many characters of the version/release code ISA12, the interchange control version
+/// number, carries.
+const INTERCHANGE_VERSION_CHARS: usize = 5;
+
+/// ISA14: no interchange acknowledgment is requested for the interchange a template
+/// describes.
+const NO_ACKNOWLEDGMENT_REQUESTED: &str = "0";
+
+/// ISA15: the interchange a template describes is a production one, not a test.
+const PRODUCTION_TEST_INDICATOR: &str = "P";
+
+/// ISA13, the interchange control number of the ONE interchange a template describes: the
+/// first one, at the nine-digit fixed width X12 gives the element.
+const FIRST_INTERCHANGE_CONTROL_NUMBER: &str = "000000001";
+
+/// GS06, the group control number of the ONE functional group a template describes.
+const FIRST_GROUP_CONTROL_NUMBER: &str = "1";
+
+/// ST02, the transaction set control number of the ONE transaction set a template
+/// describes: the first one, in the six-digit form a generated template carries it in.
+const FIRST_TRANSACTION_SET_CONTROL_NUMBER: &str = "000001";
 
 /// The name the X12 reader gives ISA16, the element that declares the component element
 /// separator the interchange is written with — the one element of the interchange header a
 /// template leaves out ([`isa_elements`]).
 const COMPONENT_SEPARATOR_ELEMENT: &str = "ComponentSeparator";
 
-/// The functional group header (GS). GS07 is fixed at [`X12_RESPONSIBLE_AGENCY_CODE`] and
-/// GS08 is the version/release/industry identifier code the request determines; the first
-/// six elements are the caller's.
-fn gs_elements(version_release_industry_code: &str) -> Vec<(String, Node)> {
-    let caller_supplied = GS_ELEMENTS.len() - 2;
-    let mut members = placeholder_elements("GS", &GS_ELEMENTS[..caller_supplied]);
-    members.push((
-        element_key("GS", 7, GS_ELEMENTS[6]),
-        Node::Text(X12_RESPONSIBLE_AGENCY_CODE.to_string()),
-    ));
-    members.push((
-        element_key("GS", 8, GS_ELEMENTS[7]),
-        Node::Text(version_release_industry_code.to_string()),
-    ));
-    members
+/// The functional group header (GS): GS01 is the functional identifier code of the group the
+/// requested transaction set is sent in ([`FUNCTIONAL_IDENTIFIER_CODES`]), GS06 the group's
+/// control number, GS07 the fixed [`X12_RESPONSIBLE_AGENCY_CODE`] and GS08 the
+/// version/release/industry identifier code the request determines; the application sender
+/// and receiver codes and the group's date and time are the caller's.
+fn gs_elements(
+    transaction_set_code: &str,
+    version_release_industry_code: &str,
+) -> Vec<(String, Node)> {
+    GS_ELEMENTS
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            let position = index + 1;
+            let element = match gs_element_value(
+                position,
+                transaction_set_code,
+                version_release_industry_code,
+            ) {
+                Some(value) => Node::Text(value),
+                None => placeholder(),
+            };
+            (element_key("GS", position, name), element)
+        })
+        .collect()
+}
+
+/// The value of the functional group header element at `position`, or `None` when the
+/// element carries the caller's own data and so stays a placeholder.
+fn gs_element_value(
+    position: usize,
+    transaction_set_code: &str,
+    version_release_industry_code: &str,
+) -> Option<String> {
+    match position {
+        1 => functional_identifier_code(transaction_set_code).map(str::to_string),
+        6 => Some(FIRST_GROUP_CONTROL_NUMBER.to_string()),
+        7 => Some(X12_RESPONSIBLE_AGENCY_CODE.to_string()),
+        8 => Some(version_release_industry_code.to_string()),
+        _ => None,
+    }
+}
+
+/// The functional identifier code (GS01) of the group each X12 transaction set is sent in,
+/// by the transaction set code the request names.
+///
+/// Source: the ASC X12 code list of the functional identifier code element, which assigns
+/// each transaction set to its functional group. A transaction set that is not listed leaves
+/// GS01 a placeholder, because this emulator has no group for it.
+const FUNCTIONAL_IDENTIFIER_CODES: &[(&str, &str)] = &[
+    ("204", "SM"),
+    ("210", "IM"),
+    ("214", "QM"),
+    ("270", "HS"),
+    ("271", "HB"),
+    ("276", "HR"),
+    ("277", "HN"),
+    ("278", "HI"),
+    ("810", "IN"),
+    ("820", "RA"),
+    ("824", "AG"),
+    ("830", "PS"),
+    ("832", "SC"),
+    ("834", "BE"),
+    ("835", "HP"),
+    ("837", "HC"),
+    ("840", "RQ"),
+    ("843", "RR"),
+    ("846", "IB"),
+    ("850", "PO"),
+    ("852", "PD"),
+    ("855", "PR"),
+    ("856", "SH"),
+    ("860", "PC"),
+    ("861", "RC"),
+    ("862", "SS"),
+    ("864", "TX"),
+    ("865", "PA"),
+    ("867", "PT"),
+    ("869", "RS"),
+    ("870", "RS"),
+    ("940", "OW"),
+    ("945", "SW"),
+    ("997", "FA"),
+    ("999", "FA"),
+];
+
+/// The functional identifier code [`FUNCTIONAL_IDENTIFIER_CODES`] holds for
+/// `transaction_set_code`, if any.
+fn functional_identifier_code(transaction_set_code: &str) -> Option<&'static str> {
+    FUNCTIONAL_IDENTIFIER_CODES
+        .iter()
+        .find(|(code, _)| *code == transaction_set_code)
+        .map(|(_, functional_identifier)| *functional_identifier)
 }
 
 /// The transaction set header (ST): ST01 is the transaction set code the request names,
-/// ST02 is the caller's control number, and ST03 — the implementation convention
-/// reference, an optional element — is present only when the requested transaction set
-/// names an implementation guide.
+/// ST02 the control number of the one transaction set the template describes, and ST03 —
+/// the implementation convention reference, an optional element — is present only when the
+/// requested transaction set names an implementation guide.
 fn st_elements(
     transaction_set_code: &str,
     implementation_convention: Option<&str>,
@@ -917,7 +1069,10 @@ fn st_elements(
             element_key("ST", 1, ST_ELEMENTS[0]),
             Node::Text(transaction_set_code.to_string()),
         ),
-        (element_key("ST", 2, ST_ELEMENTS[1]), placeholder()),
+        (
+            element_key("ST", 2, ST_ELEMENTS[1]),
+            Node::Text(FIRST_TRANSACTION_SET_CONTROL_NUMBER.to_string()),
+        ),
     ];
     if let Some(convention) = implementation_convention {
         members.push((
@@ -935,8 +1090,10 @@ fn st_elements(
 /// The transaction's body — the segments between ST and SE, which differ with every
 /// transaction set — sits in its `segments` list, one object per segment of the requested
 /// transaction set's X12 table ([`transaction_set_segments`]); the segments after those are
-/// what the caller adds to the template. Every element this operation does not determine is
-/// a placeholder.
+/// what the caller adds to the template. The envelope carries the value the X12 standard or
+/// the request fixes for each of its elements, and every element this operation does not
+/// determine — the caller's own data, and every element of a body segment — is a
+/// placeholder.
 ///
 /// No envelope TRAILER is written: IEA, GE and SE carry the count of what the envelope
 /// encloses and the echo of its control number, which the EDI writer derives from the
@@ -959,7 +1116,7 @@ fn starter_document(
         ));
     }
 
-    let mut functional_group = gs_elements(version_release_industry_code);
+    let mut functional_group = gs_elements(transaction_set_code, version_release_industry_code);
     functional_group.push((
         TRANSACTIONS_KEY.to_string(),
         Node::List {
@@ -968,7 +1125,7 @@ fn starter_document(
         },
     ));
 
-    let mut interchange = isa_elements(release);
+    let mut interchange = isa_elements(release, version_release_industry_code);
     interchange.push((
         FUNCTIONAL_GROUPS_KEY.to_string(),
         Node::List {
@@ -1102,71 +1259,96 @@ fn write_xml_node(
     Ok(())
 }
 
-/// How a template derived FROM A SAMPLE marks a field the caller must supply an
-/// expression for: the marker, then the value the sample carried in that field, so the
-/// caller sees what the field holds in a real document while replacing it.
-///
-/// This is the recorded form for the sample-driven path (trace
-/// `b2bi.create-starter-mapping-template-with-output-sample`: "each transaction-set
-/// business field becomes a `PLACEHOLDER: <sample value>` marker"); the template generated
-/// WITHOUT a sample has no sample value to name, so it carries [`PLACEHOLDER`] alone.
-pub const SAMPLE_PLACEHOLDER_PREFIX: &str = "PLACEHOLDER: ";
+/// The X12 reader's parsed document ([`super::test_parsing::parse_x12`]), which a sample is
+/// read as.
+use super::test_parsing::Node as Parsed;
 
-/// Whether `key` names an element of a segment INSIDE the transaction (`BEG_01`) rather
-/// than an envelope element (`ISA_01_AuthorizationQualifier`).
+/// The nested levels a starter template's envelope takes, outermost first: an interchange
+/// holds functional groups, a functional group holds transactions.
 ///
-/// The two keyings are what tell the two kinds of field apart: an envelope element's key
-/// carries the element's name after its position, a transaction-set element's key does
-/// not ([`element_key`] vs [`body_element_key`]).
-fn is_body_element_key(key: &str) -> bool {
-    let mut parts = key.split('_');
-    let segment = parts.next().unwrap_or_default();
-    let position = parts.next().unwrap_or_default();
-    parts.next().is_none()
-        && !segment.is_empty()
-        && position.len() == 2
-        && position.chars().all(|digit| digit.is_ascii_digit())
+/// One envelope segment's elements sit at each level (ISA, GS, ST), so this is also the path
+/// [`fill_envelope_from_sample`] walks a sample down alongside the document it fills.
+const ENVELOPE_LEVELS: &[&str] = &[INTERCHANGES_KEY, FUNCTIONAL_GROUPS_KEY, TRANSACTIONS_KEY];
+
+/// The element a document key names, without the element's NAME: the segment id and the
+/// two-digit position (`ISA_01_AuthorizationQualifier` → `ISA_01`).
+///
+/// That pair is the element's identity in the X12 standard, while the name is the reading of
+/// it at one release (ISA11 is the control standards identifier below release 4020 and the
+/// repetition separator from it), so comparing keys by it finds a sample's value for the
+/// element a template asks about however either was written.
+fn element_position(key: &str) -> &str {
+    let Some(after_segment) = key.find('_').map(|segment| segment + 1) else {
+        return key;
+    };
+    match key[after_segment..].find('_') {
+        Some(offset) => &key[..after_segment + offset],
+        None => key,
+    }
 }
 
-/// The template derived from a parsed sample interchange: the sample's envelope values
-/// (ISA/GS/ST/SE/GE/IEA) carried through verbatim, and every transaction-set business
-/// field replaced by a [`SAMPLE_PLACEHOLDER_PREFIX`] marker over the value the sample
-/// carried there.
-///
-/// The structure is the sample's own — as many interchanges, functional groups and
-/// transactions as it holds, each segment's elements in positional order — because the
-/// template a caller gets back has to generate documents shaped like the one it provided.
-/// The input is the tree this service's one X12 reader builds
-/// ([`super::test_parsing::parse_x12`]), walked member for member: a BUSINESS field is
-/// told from an envelope field by its key alone ([`is_body_element_key`]), and the
-/// components of a composite business element inherit their element's verdict.
-fn sample_derived_document(parsed: &super::test_parsing::Node) -> Node {
-    use super::test_parsing::Node as Parsed;
+/// The value the parsed sample carries for the element `key` names, among the members of the
+/// envelope level it was read at, or `None` when the sample carries no value there.
+fn sampled_element<'a>(members: &'a [(String, Parsed)], key: &str) -> Option<&'a str> {
+    let wanted = element_position(key);
+    members.iter().find_map(|(member, child)| match child {
+        Parsed::Text(value) if element_position(member) == wanted => Some(value.as_str()),
+        _ => None,
+    })
+}
 
-    fn derive(node: &Parsed, business: bool) -> Node {
-        match node {
-            Parsed::Text(value) if business => {
-                Node::Text(format!("{SAMPLE_PLACEHOLDER_PREFIX}{value}"))
+/// The sample's FIRST repetition of the level `key` names — the interchange, functional
+/// group or transaction a generated template describes one of.
+fn first_repetition<'a>(members: &'a [(String, Parsed)], key: &str) -> Option<&'a Parsed> {
+    members.iter().find_map(|(member, child)| match child {
+        Parsed::List { items, .. } if member == key => items.first(),
+        _ => None,
+    })
+}
+
+/// Fills the ENVELOPE element values of a generated starter template from the sample the
+/// request named: at each level of `levels` the value the sample carries for the element a
+/// key names replaces the one the request determined, or the placeholder, and the level
+/// below is read from the sample's first repetition of it.
+///
+/// Nothing but a value is taken from the sample. The members the document holds, the segments
+/// the transaction carries and the element positions each of them asks for are the requested
+/// transaction set's ([`starter_document`]), so no member of the reader's own parsed document
+/// — a `segment_id`, a detail-table loop, an envelope trailer — reaches a template, every
+/// element of a body segment stays the [`PLACEHOLDER`] its table position asks for, and an
+/// envelope element the sample left empty stays the value the request determined.
+fn fill_envelope_from_sample(document: &mut Node, sample: Option<&Parsed>, levels: &[&str]) {
+    let Node::Map(members) = document else {
+        return;
+    };
+    let sampled = match sample {
+        Some(Parsed::Map(sampled)) => Some(sampled.as_slice()),
+        _ => None,
+    };
+    if let Some(sampled) = sampled {
+        for (key, child) in members.iter_mut() {
+            if let Node::Text(value) = child {
+                if let Some(carried) = sampled_element(sampled, key) {
+                    *value = carried.to_string();
+                }
             }
-            Parsed::Text(value) => Node::Text(value.clone()),
-            Parsed::Map(members) => Node::Map(
-                members
-                    .iter()
-                    .map(|(member, child)| {
-                        (
-                            member.clone(),
-                            derive(child, business || is_body_element_key(member)),
-                        )
-                    })
-                    .collect(),
-            ),
-            Parsed::List { item, items } => Node::List {
-                item: item.clone(),
-                items: items.iter().map(|child| derive(child, business)).collect(),
-            },
         }
     }
-    derive(parsed, false)
+
+    let Some((level, deeper)) = levels.split_first() else {
+        return;
+    };
+    let nested = sampled.and_then(|sampled| first_repetition(sampled, level));
+    for (key, child) in members.iter_mut() {
+        if key.as_str() != *level {
+            continue;
+        }
+        if let Node::List { items, .. } = child {
+            for item in items.iter_mut() {
+                fill_envelope_from_sample(item, nested, deeper);
+            }
+        }
+    }
 }
 
 /// The modelled refusal for a sample this service could not read, with each failure
@@ -1346,51 +1528,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => version_code,
         };
 
-        // With `outputSampleLocation` the template is DERIVED FROM THE SAMPLE: "if you
-        // provide a sample EDI file with the same structure as the EDI files that you wish
-        // to generate, then the service can generate a mapping template". The sample is
-        // read through the emulator's own S3 service and parsed as an X12 interchange, and
-        // the template is that document with its envelope values carried through and each
-        // transaction-set business field marked as a placeholder over the sample's value
-        // ([`sample_derived_document`]). `ResourceNotFoundException` is kept for a sample
-        // that genuinely cannot be read. Without `outputSampleLocation` the template comes
-        // from `templateDetails`, which is what the operation documents for that case.
-        let document = match input.output_sample_location.as_ref() {
-            None => starter_document(
-                &transaction_set_code,
-                implementation_convention.as_deref(),
-                release,
-                &version_release_industry_code,
-            ),
-            Some(sample) => {
-                let region = crate::state::request_region(ctx.parts());
-                let text =
-                    crate::state::read_edi_object(ctx, &region, sample, "outputSampleLocation")
-                        .await
-                        .map_err(sample_unreadable)?;
-                // Parsing a caller-supplied document is synchronous CPU work, so it runs
-                // on a blocking thread: the `.await` leaves a cancelled request, a request
-                // timeout and graceful shutdown a point to land on while it runs.
-                let parsed = ::tokio::task::spawn_blocking(move || {
-                    super::test_parsing::parse_x12(&text).map(|parsed| sample_derived_document(&parsed))
-                })
+        // The template is the document the requested transaction set and version determine,
+        // whether or not the request names a sample: the segments it carries, the element
+        // positions each of them asks for and the placeholder in every field the caller
+        // supplies come from that transaction set's X12 table.
+        let mut document = starter_document(
+            &transaction_set_code,
+            implementation_convention.as_deref(),
+            release,
+            &version_release_industry_code,
+        );
+
+        // `outputSampleLocation` fills the ENVELOPE values of that document: "if you provide
+        // a sample EDI file with the same structure as the EDI files that you wish to
+        // generate, then the service can generate a mapping template". The sample is read
+        // through the emulator's own S3 service, parsed as an X12 interchange, and read for
+        // the value of each envelope element alone ([`fill_envelope_from_sample`]), so the
+        // document a caller maps is the same one either way. `ResourceNotFoundException` is
+        // kept for a sample that genuinely cannot be read.
+        if let Some(sample) = input.output_sample_location.as_ref() {
+            let region = crate::state::request_region(ctx.parts());
+            let text = crate::state::read_edi_object(ctx, &region, sample, "outputSampleLocation")
                 .await
-                .map_err(|error| {
-                    CreateStarterMappingTemplateErrorModeled::InternalServerException(
-                        InternalServerException {
-                            message: format!("the sample EDI file could not be parsed: {error}"),
-                            retry_after_seconds: None,
-                        },
-                    )
-                })?;
-                parsed.map_err(|failure| {
-                    crate::scaffolded::Scaffolded::validation(format!(
-                        "the sample EDI file at outputSampleLocation could not be parsed: \
-                         {failure}"
-                    ))
-                })?
-            }
-        };
+                .map_err(sample_unreadable)?;
+            // Parsing a caller-supplied document is synchronous CPU work, so it runs on a
+            // blocking thread: the `.await` leaves a cancelled request, a request timeout and
+            // graceful shutdown a point to land on while it runs.
+            let parsed =
+                ::tokio::task::spawn_blocking(move || super::test_parsing::parse_x12(&text))
+                    .await
+                    .map_err(|error| {
+                        CreateStarterMappingTemplateErrorModeled::InternalServerException(
+                            InternalServerException {
+                                message: format!(
+                                    "the sample EDI file could not be parsed: {error}"
+                                ),
+                                retry_after_seconds: None,
+                            },
+                        )
+                    })?
+                    .map_err(|failure| {
+                        crate::scaffolded::Scaffolded::validation(format!(
+                            "the sample EDI file at outputSampleLocation could not be parsed: \
+                             {failure}"
+                        ))
+                    })?;
+            fill_envelope_from_sample(&mut document, Some(&parsed), ENVELOPE_LEVELS);
+        }
         let mapping_template = match format {
             MappingFormat::Jsonata => render_json(&document).map_err(render_failed)?,
             MappingFormat::Xslt => xslt_template(
@@ -1400,13 +1584,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )?,
         };
         // A template is used with the operations that take a `MappingTemplate`
-        // (`len 0..350000`), so one past that bound could not be used at all: a sample
-        // whose structure describes a larger template than that is refused rather than
-        // answered with one. This is also what bounds the amplification from a sample —
-        // the parsed form of a file is larger than the file.
+        // (`len 0..350000`), so one past that bound could not be used at all: a transaction
+        // set whose table describes a larger template than that is refused rather than
+        // answered with one.
         if mapping_template.chars().count() > MAX_TEMPLATE_CHARS {
             return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "the template this sample describes is longer than the \
+                "the template this transaction set describes is longer than the \
                  {MAX_TEMPLATE_CHARS} characters a mappingTemplate carries"
             )));
         }
