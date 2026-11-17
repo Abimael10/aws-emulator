@@ -1084,3 +1084,235 @@ async fn dial(published: &str, target: &str, cookie: Option<&str>) -> Answered {
         .map(|(_, value)| value.trim().to_string());
     Answered { status, set_cookie }
 }
+
+/// A second listener port the updates below add, so the load balancer a client holds an
+/// address for is one whose configuration has really changed since it was handed that
+/// address.
+const SECOND_LISTENER_PORT: i32 = 8081;
+
+/// One row of the table below: the load balancer a case creates, and the input shape it
+/// varies.
+struct PublishedCase {
+    /// What this row is, as every assertion below names it.
+    case: &'static str,
+    /// The load balancer's name.
+    name: &'static str,
+    /// `Scheme`, or `None` for a create that names none.
+    scheme: Option<&'static str>,
+    /// The protocol of the listener the create carries.
+    protocol: &'static str,
+    /// The Availability Zones the load balancer is placed in.
+    zones: &'static [&'static str],
+}
+
+/// RULE 1, over the WRITES that follow the create and over the load balancers of one
+/// region: the address a load balancer publishes is the address this emulator answers on
+/// for THAT load balancer, it stays that address for the load balancer's whole life, and
+/// only that load balancer's own delete closes it.
+///
+/// A client is handed `DNSName` once — it is the only address a Classic client ever gets —
+/// and goes on using it while it configures the load balancer, so a listener added, a zone
+/// enabled, the health check configured, an attribute modified or a tag written must leave
+/// `DescribeLoadBalancers` reporting the SAME address and that address still answering out
+/// of this load balancer's own state. Each load balancer of a region therefore answers on
+/// an address of its own, and one load balancer's delete leaves every other one's where it
+/// was.
+///
+/// The rows span what the rule generalises over: the scheme (the default and `internal`,
+/// whose client is inside this emulator too), the listener protocol a connection in the
+/// clear reaches, and how many Availability Zones the load balancer is placed in. Every
+/// address is DIALLED over TCP, as a client handed it does, rather than only addressed
+/// through the emulator's own endpoint.
+#[tokio::test]
+async fn a_published_address_stays_the_address_its_load_balancer_answers_on() {
+    let (router, _engine) = emulator_with_ec2();
+    let rows: &[PublishedCase] = &[
+        PublishedCase {
+            case: "the default scheme in one zone",
+            name: "stable-web-elb",
+            scheme: None,
+            protocol: "HTTP",
+            zones: &[NODE_ZONE],
+        },
+        PublishedCase {
+            case: "an internal load balancer in two zones",
+            name: "stable-internal-elb",
+            scheme: Some("internal"),
+            protocol: "HTTP",
+            zones: &[NODE_ZONE, OTHER_ZONE],
+        },
+        PublishedCase {
+            case: "a TCP listener",
+            name: "stable-tcp-elb",
+            scheme: None,
+            protocol: "TCP",
+            zones: &[OTHER_ZONE],
+        },
+    ];
+
+    // What each row's create published, in the order the rows name them.
+    let mut published: Vec<String> = Vec::new();
+    for row in rows {
+        let case = row.case;
+        let dns = create_load_balancer(
+            &router,
+            REGION,
+            row.name,
+            row.scheme,
+            row.protocol,
+            row.zones,
+        )
+        .await;
+        assert!(
+            dns.parse::<SocketAddr>().is_ok(),
+            "case {case:?}: the published DNSName must be an address a client dials, got {dns:?}"
+        );
+        assert!(
+            !dns.contains("elb.amazonaws.com"),
+            "case {case:?}: the published DNSName must not be a host in AWS's own zone, got \
+             {dns:?}"
+        );
+        // A client DIALS it, over TCP, carrying no AWS credential: nothing is registered
+        // yet, so what answers there is this load balancer's own "no instance to send this
+        // to" — an address nothing served would not answer at all.
+        let dialled = dial(&dns, "/", None).await;
+        assert_eq!(
+            dialled.status, NO_INSTANCE,
+            "case {case:?}: the published address must be served by the load balancer, got {}",
+            dialled.status
+        );
+        published.push(dns);
+    }
+    let distinct: BTreeSet<&String> = published.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        rows.len(),
+        "each load balancer must publish an address of its own, got {published:?}"
+    );
+
+    // Every later write a client makes to the load balancer, each through its own
+    // operation, and then the address READ BACK and DIALLED again.
+    for (row, dns) in rows.iter().zip(&published) {
+        let case = row.case;
+        write_through_every_update(&router, REGION, row.name).await;
+        let reported = described_dns_name(&router, REGION, row.name).await;
+        assert_eq!(
+            reported.as_deref(),
+            Some(dns.as_str()),
+            "case {case:?}: a describe after every update must report the address the create \
+             published, got {reported:?}"
+        );
+        let dialled = dial(dns, "/", None).await;
+        assert_eq!(
+            dialled.status, NO_INSTANCE,
+            "case {case:?}: the published address must still be served after every update, got \
+             {}",
+            dialled.status
+        );
+    }
+
+    // And the address belongs to ONE load balancer: deleting that load balancer closes it,
+    // and leaves every other load balancer's address answering.
+    let deleted_case = rows[1].case;
+    let deleted = call(
+        &router,
+        REGION,
+        "DeleteLoadBalancer",
+        &[param("LoadBalancerName", rows[1].name)],
+    )
+    .await;
+    assert_eq!(
+        deleted.status, 200,
+        "case {deleted_case:?}: DeleteLoadBalancer must answer 200, got {}",
+        deleted.body
+    );
+    // Addressed through the emulator's own endpoint rather than dialled, because the socket
+    // the delete closed accepts no connection at all any more.
+    let after = send(&router, &published[1], "/", None).await;
+    assert!(
+        after.status != NO_INSTANCE && after.status != INSTANCE_UNREACHABLE,
+        "case {deleted_case:?}: a deleted load balancer must answer on no address, got {}",
+        after.status
+    );
+    for index in [0_usize, 2] {
+        let case = rows[index].case;
+        let dialled = dial(&published[index], "/", None).await;
+        assert_eq!(
+            dialled.status, NO_INSTANCE,
+            "case {case:?}: another load balancer's delete must leave this address answering, \
+             got {}",
+            dialled.status
+        );
+    }
+}
+
+/// Make every WRITE a client makes to a load balancer after the create that handed it the
+/// address: a listener added, a zone enabled, a tag written, the health check configured
+/// and an attribute modified. Each is its own operation, and each must be accepted, so what
+/// the published address is read against afterwards is a load balancer that has really
+/// changed.
+async fn write_through_every_update(router: &MultiServiceRouter, region: &str, name: &str) {
+    let updates: [(&str, Vec<(String, String)>); 3] = [
+        (
+            "CreateLoadBalancerListeners",
+            vec![
+                param("LoadBalancerName", name),
+                param("Listeners.member.1.Protocol", "HTTP"),
+                param(
+                    "Listeners.member.1.LoadBalancerPort",
+                    &SECOND_LISTENER_PORT.to_string(),
+                ),
+                param(
+                    "Listeners.member.1.InstancePort",
+                    &INSTANCE_PORT.to_string(),
+                ),
+            ],
+        ),
+        (
+            "EnableAvailabilityZonesForLoadBalancer",
+            vec![
+                param("LoadBalancerName", name),
+                param("AvailabilityZones.member.1", OTHER_ZONE),
+            ],
+        ),
+        (
+            "AddTags",
+            vec![
+                param("LoadBalancerNames.member.1", name),
+                param("Tags.member.1.Key", "published"),
+                param("Tags.member.1.Value", "address"),
+            ],
+        ),
+    ];
+    for (operation, params) in &updates {
+        let answered = call(router, region, operation, params).await;
+        assert_eq!(
+            answered.status, 200,
+            "case {name:?}: {operation} must answer 200, got {}",
+            answered.body
+        );
+    }
+    configure_health_check(router, region, name).await;
+    set_cross_zone(router, region, name, true).await;
+}
+
+/// The `DNSName` `DescribeLoadBalancers` reports for one load balancer, which is the
+/// address a client that did not keep the create's answer reads.
+async fn described_dns_name(
+    router: &MultiServiceRouter,
+    region: &str,
+    name: &str,
+) -> Option<String> {
+    let described = call(
+        router,
+        region,
+        "DescribeLoadBalancers",
+        &[param("LoadBalancerNames.member.1", name)],
+    )
+    .await;
+    let doc = parse(&described.body);
+    let description = *members(described.result(&doc), "LoadBalancerDescriptions")
+        .first()
+        .unwrap_or_else(|| panic!("case {name:?}: no description in {}", described.body));
+    kid_text(description, "DNSName")
+}
