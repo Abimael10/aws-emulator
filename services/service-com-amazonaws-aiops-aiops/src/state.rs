@@ -104,9 +104,11 @@ pub const DEFAULT_CLOUD_TRAIL_EVENT_HISTORY_ENABLED: bool = true;
 // `ChatConfigurationArns` list (1..5) and its SNS topic key (20..2048), each tag key
 // (1..128) and value (1..256), each `tagKeyBoundaries` entry (1..128), `roleArn`
 // (20..2048), `name` (1..512) and the policy document (1..32768). The centralized
-// walk refuses every one of those BUT a map's KEY, which it never reaches; those are
-// applied by [`map_key_rejection`] instead, so no caller-sized member reaches the
-// store unchecked.
+// walk refuses every one of those BUT the two classes it never reaches — a map's KEY,
+// and a collection nested inside another collection, whose own `@length` the walk
+// cannot tell from the enclosing collection's; both are applied by
+// [`map_entry_rejection`] instead, so no caller-sized member reaches the store
+// unchecked.
 // ---------------------------------------------------------------------------
 
 /// The most investigation groups one account may hold in one Region.
@@ -895,7 +897,7 @@ static TAG_KEY_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
 /// The member schema carrying [`TAG_KEY_TRAITS`].
 static M_TAG_KEY: Schema = Schema::new_member(
     ShapeId::from_static(
-        "com.amazonaws.aiops#CheckedMapKey$tagKey",
+        "com.amazonaws.aiops#CheckedMapEntry$tagKey",
         NAMESPACE,
         "tagKey",
     ),
@@ -918,7 +920,7 @@ static SNS_TOPIC_ARN_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
 /// The member schema carrying [`SNS_TOPIC_ARN_TRAITS`].
 static M_SNS_TOPIC_ARN: Schema = Schema::new_member(
     ShapeId::from_static(
-        "com.amazonaws.aiops#CheckedMapKey$snsTopicArn",
+        "com.amazonaws.aiops#CheckedMapEntry$snsTopicArn",
         NAMESPACE,
         "snsTopicArn",
     ),
@@ -941,14 +943,14 @@ static CHATBOT_NOTIFICATION_CHANNEL_KEYS: MapKeyShape = MapKeyShape {
 };
 
 /// The root of the shadow input the walk is driven over. Its member list is empty on
-/// purpose: the walk visits what [`CheckedKey`] WRITES, and a root struct schema
-/// contributes no path segment. The shape id is deliberately one the model does not
-/// declare, so it cannot collide with a modelled shape.
-static CHECKED_MAP_KEY_SCHEMA: Schema = Schema::new_struct(
+/// purpose: the walk visits what [`CheckedKey`] (or [`CheckedValueCollection`]) WRITES,
+/// and a root struct schema contributes no path segment. The shape id is deliberately
+/// one the model does not declare, so it cannot collide with a modelled shape.
+static CHECKED_MAP_ENTRY_SCHEMA: Schema = Schema::new_struct(
     ShapeId::from_static(
-        "com.amazonaws.aiops#CheckedMapKey",
+        "com.amazonaws.aiops#CheckedMapEntry",
         NAMESPACE,
-        "CheckedMapKey",
+        "CheckedMapEntry",
     ),
     ShapeType::Structure,
     &[],
@@ -975,7 +977,7 @@ fn satisfies_key_shape(member: &'static Schema, key: &str) -> bool {
             member,
             value: key,
         },
-        &CHECKED_MAP_KEY_SCHEMA,
+        &CHECKED_MAP_ENTRY_SCHEMA,
     )
     .is_empty()
 }
@@ -999,8 +1001,133 @@ fn map_keys_clause<'a>(
         })
 }
 
-/// Why the KEYS of the maps a request carries are unacceptable, or `None` when every
-/// one of them satisfies its key shape's modelled constraints.
+// ---------------------------------------------------------------------------
+// A map VALUE that is itself a COLLECTION: the other modelled constraint no request
+// boundary applies
+//
+// Codegen emits no schema for one LEVEL of a nested collection, so the centralized walk
+// writes a collection nested inside another collection against the ENCLOSING member's
+// schema — the schema whose `@length` counts the enclosing level's items. It therefore
+// applies the enclosing collection's bound and leaves the nested collection's OWN
+// `@length` unapplied; the walk's own comment in
+// `vendor/smithy-schema-server/src/constraints.rs` says as much. A map whose value shape
+// is a bounded list consequently reaches a handler with an entry of any size, none at
+// all included.
+//
+// Every such bound is therefore applied here, by each operation that accepts the map,
+// before anything is written: an entry the model does not admit is otherwise stored and
+// reported back as if the service had accepted it.
+//
+// Nothing about constraint checking is reimplemented, exactly as for a map's keys above:
+// the value shape is re-declared in the framework's own form — a [`LengthTrait`] hung on
+// a list member schema — and the decision is [`validate`], the same walk the request
+// boundary runs, driven over a list of that entry's size. The clause names the map
+// MEMBER and bundles the value shape's requirements, the wording every other refusal
+// about a map entry's value already uses ([`MAP_VALUE_REQUIREMENT_PREFIX`]).
+// ---------------------------------------------------------------------------
+
+/// `ChatConfigurationArns`' own modelled `@length`, as the model declares it
+/// (`smithy_query(query="shape",shape="ChatbotNotificationChannel")`: the map's value
+/// targets `ChatConfigurationArns`, a list of `@length` 1..5 — the shape itself carries
+/// the same bound, `smithy_query(query="shape",shape="ChatConfigurationArns")`).
+static CHAT_CONFIGURATION_ARNS_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(LengthTrait::new(Some(1), Some(5))));
+    traits
+});
+
+/// The LIST member schema carrying [`CHAT_CONFIGURATION_ARNS_TRAITS`]. Its own name is
+/// never reported: a clause about an entry names the map member that holds it.
+static M_CHAT_CONFIGURATION_ARNS: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.aiops#CheckedMapEntry$chatConfigurationArns",
+        NAMESPACE,
+        "chatConfigurationArns",
+    ),
+    ShapeType::List,
+    "chatConfigurationArns",
+    0,
+)
+.with_traits(&CHAT_CONFIGURATION_ARNS_TRAITS);
+
+/// One map member whose VALUE is a collection the model bounds: the member a clause
+/// names, and the value collection's own modelled constraints as the framework's walk
+/// reads them.
+struct MapValueCollectionShape {
+    /// The map member the entries arrived on, which is what a clause names — the same
+    /// rule the key bundle and the walk's own map-value clause follow.
+    member: &'static str,
+    /// A collection member schema carrying the value shape's own modelled constraints.
+    value: &'static Schema,
+}
+
+/// The `chatbotNotificationChannel` map, whose entries hold the one collection this model
+/// nests inside another collection.
+static CHATBOT_NOTIFICATION_CHANNEL_VALUES: MapValueCollectionShape = MapValueCollectionShape {
+    member: "chatbotNotificationChannel",
+    value: &M_CHAT_CONFIGURATION_ARNS,
+};
+
+/// One entry's value collection written for the validating walk the way the codec writes
+/// a list member of `size` elements, against the member schema whose re-declared
+/// constraints the walk is to apply.
+struct CheckedValueCollection {
+    member: &'static Schema,
+    size: usize,
+}
+
+impl SerializableStruct for CheckedValueCollection {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_list(self.member, &|elements| {
+            // What is judged here is the entry's SIZE: every constraint on an ELEMENT is
+            // one the boundary walk already applied, and this shadow schema declares
+            // none, so an element is written as the empty string and contributes nothing
+            // but its position.
+            for _ in 0..self.size {
+                elements.write_string(self.member, "")?;
+            }
+            Ok(())
+        })
+    }
+}
+
+/// Whether a value collection of `size` elements satisfies every constraint the value
+/// shape `member` carries, decided by the framework's own constraint walk rather than by
+/// comparing numbers here.
+fn satisfies_value_collection_shape(member: &'static Schema, size: usize) -> bool {
+    validate(
+        &CheckedValueCollection { member, size },
+        &CHECKED_MAP_ENTRY_SCHEMA,
+    )
+    .is_empty()
+}
+
+/// The clause a map member states when any of `values` is a collection outside its value
+/// shape's modelled bound, or `None` when every one of them is within it.
+fn map_value_collections_clause<'a>(
+    shape: &MapValueCollectionShape,
+    values: impl IntoIterator<Item = &'a Vec<String>>,
+) -> Option<String> {
+    values
+        .into_iter()
+        .any(|value| !satisfies_value_collection_shape(shape.value, value.len()))
+        .then(|| {
+            constraint_clause(
+                shape.member,
+                &format!(
+                    "{MAP_VALUE_REQUIREMENT_PREFIX}[{}]",
+                    requirement_bundle(shape.value.traits()).join(", ")
+                ),
+            )
+        })
+}
+
+/// Why the ENTRIES of the maps a request carries are unacceptable, or `None` when every
+/// one of them satisfies the modelled constraints its key and value shapes declare.
+///
+/// The two classes the centralized walk never applies, in one rule: a map entry's KEY,
+/// which the walk captures as a path segment and never checks, and a value that is itself
+/// a COLLECTION, whose own `@length` the walk cannot tell from the enclosing collection's.
 ///
 /// Every operation that accepts either map applies this one rule — before its own
 /// unmodelled rules, because a modelled constraint is one the boundary would have
@@ -1008,10 +1135,11 @@ fn map_keys_clause<'a>(
 /// modelled `ValidationException`. Pass `None` for a member the operation does not
 /// accept.
 ///
-/// The clauses are ordered as the inputs declare the members and counted in the
-/// envelope ([`validation_envelope`]), so a request breaking both members' rules reads
-/// exactly as a boundary refusal of two members does.
-pub fn map_key_rejection(
+/// The clauses are ordered as the inputs declare the members, a member's key clause
+/// before its value clause as an entry is written, and counted in the envelope
+/// ([`validation_envelope`]), so a request breaking more than one of these rules reads
+/// exactly as a boundary refusal of that many facts does.
+pub fn map_entry_rejection(
     tags: Option<&HashMap<String, String>>,
     chatbot_notification_channel: Option<&HashMap<String, Vec<String>>>,
 ) -> Option<String> {
@@ -1019,6 +1147,9 @@ pub fn map_key_rejection(
         tags.and_then(|tags| map_keys_clause(&TAGS_KEYS, tags.keys())),
         chatbot_notification_channel.and_then(|channel| {
             map_keys_clause(&CHATBOT_NOTIFICATION_CHANNEL_KEYS, channel.keys())
+        }),
+        chatbot_notification_channel.and_then(|channel| {
+            map_value_collections_clause(&CHATBOT_NOTIFICATION_CHANNEL_VALUES, channel.values())
         }),
     ]
     .into_iter()
@@ -1439,8 +1570,8 @@ const SOURCE_ROLE_ARN_MEMBER: &str = "sourceRoleArn";
 ///
 /// Pass `None` for a member the operation does not accept.
 ///
-/// The modelled constraints on a map's KEYS are NOT part of this chain:
-/// [`map_key_rejection`] states them, and every operation applies that rule before this
+/// The modelled constraints on a map's ENTRIES are NOT part of this chain:
+/// [`map_entry_rejection`] states them, and every operation applies that rule before this
 /// one, because a modelled constraint is what the request boundary would have refused
 /// the request with first.
 ///

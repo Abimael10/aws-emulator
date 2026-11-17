@@ -230,24 +230,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // length and every string length and pattern on a VALUE in this input are
         // modelled constraints, so the centralized walk has already refused anything
         // outside them with a 400 `ValidationException` before this body runs. A map
-        // KEY's constraints are modelled too but the walk never reaches them, so they
-        // are applied below. The `tags` and `chatbotNotificationChannel` maps and the
-        // `tagKeyBoundaries` list carry NO modelled length, so their bounds are checked
-        // here, and so is the one rule the model cannot express about a cross-account
-        // source role. The `roleArn` the group would RUN AS is resolved below: the model
-        // can express its form, not whether the role exists and admits this service.
+        // entry's KEY constraints, and the `@length` of the list an entry of the channel
+        // holds, are modelled too but the walk never reaches either, so they are applied
+        // below. The `tags` and `chatbotNotificationChannel` maps and the
+        // `tagKeyBoundaries` list carry NO modelled length of their own, so their bounds
+        // are checked here, and so is the one rule the model cannot express about a
+        // cross-account source role. The `roleArn` the group would RUN AS is resolved
+        // below: the model can express its form, not whether the role exists and admits
+        // this service.
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateInvestigationGroupErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the investigation group store is unavailable".to_string()),
             })
         })?;
 
-        // The modelled constraints on the KEYS of the `tags` and
-        // `chatbotNotificationChannel` maps are the one class the centralized walk never
-        // reaches, so they are applied here (`crate::state::map_key_rejection`) and
-        // applied FIRST: a modelled constraint is what the boundary would have refused
-        // the request with before any rule of this operation's own ran.
-        if let Some(why) = crate::state::map_key_rejection(
+        // The modelled constraints on the ENTRIES of the `tags` and
+        // `chatbotNotificationChannel` maps — a key's own constraints, and the bound on
+        // the list an entry of the channel holds — are the two classes the centralized
+        // walk never reaches, so they are applied here
+        // (`crate::state::map_entry_rejection`) and applied FIRST: a modelled constraint
+        // is what the boundary would have refused the request with before any rule of
+        // this operation's own ran.
+        if let Some(why) = crate::state::map_entry_rejection(
             input.tags.as_ref(),
             input.chatbot_notification_channel.as_ref(),
         ) {

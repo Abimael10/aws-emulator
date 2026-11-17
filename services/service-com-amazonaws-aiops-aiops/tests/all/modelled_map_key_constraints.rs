@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The modelled constraints a MAP's KEY shape declares, applied to every entry key a
-//! request carries.
+//! The modelled constraints a MAP's ENTRIES declare, applied to every entry a request
+//! carries: the KEY shape's constraints, and the `@length` of a value that is itself a
+//! collection.
 //!
 //! Every case drives the real wire path — the production `MultiServiceRouter`, restJson1
 //! deserialization (including the `@httpLabel` `resourceArn`/`identifier`), the
@@ -14,6 +15,13 @@
 //! nothing of the request is stored. The centralized walk never reaches a map key, so the
 //! rule is applied by the handlers that accept a map; `tests/all/map_member_refusal_paths.rs`
 //! pins how a map VALUE's refusal is worded, and this suite pins the key side of it.
+//!
+//! The second half of the same class is the other constraint no request boundary applies:
+//! a collection the model nests inside another collection, whose own modelled `@length`
+//! the walk cannot tell from the enclosing collection's. An entry of
+//! `chatbotNotificationChannel` holds such a list, so a request whose entry holds fewer
+//! or more configuration ARNs than that list's published bounds admit is refused the same
+//! way, and nothing of it is stored — the last two tests below.
 //!
 //! The rows differ along what the rule generalises over: the MEMBER and its key shape
 //! (`tags`, keyed by `TagKey`; `chatbotNotificationChannel`, keyed by `SNSTopicArn`), the
@@ -83,6 +91,28 @@ const TAG_VALUE_REQUIREMENTS: &[&str] = &[
     "Member must have length less than or equal to 256",
     "Member must have length greater than or equal to 1",
     r"Member must satisfy regular expression pattern: ([\p{L}\p{Z}\p{N}_.:/=+\-@]*)",
+];
+
+/// The shortest and longest list a `chatbotNotificationChannel` ENTRY may hold
+/// (`smithy_query(query="shape",shape="ChatbotNotificationChannel")`: the map's value
+/// targets `ChatConfigurationArns`, `@length` 1..5).
+const CHAT_ARNS_MIN_LENGTH: usize = 1;
+const CHAT_ARNS_MAX_LENGTH: usize = 5;
+
+/// The requirements an entry's value LIST states, as a clause bundles them at the map
+/// member: both published bounds `ChatConfigurationArns` itself carries.
+const CHAT_ARNS_REQUIREMENTS: &[&str] = &[
+    "Member must have length less than or equal to 5",
+    "Member must have length greater than or equal to 1",
+];
+
+/// The requirements an ELEMENT of that list states, from `ChatConfigurationArn`
+/// (`@length` 20..2048, `@pattern` `^arn:.*$`) — a control row's expectation, unchanged
+/// by the rule under test.
+const CHAT_ARN_REQUIREMENTS: &[&str] = &[
+    "Member must have length less than or equal to 2048",
+    "Member must have length greater than or equal to 20",
+    "Member must satisfy regular expression pattern: arn:.*",
 ];
 
 /// The error code a modelled-constraint refusal carries.
@@ -205,12 +235,20 @@ fn key_clause(member_path: &str, requirements: &[&str]) -> String {
     )
 }
 
-/// The whole message a map member's VALUE refusal states — the control rows'
-/// expectation.
+/// The whole message a map member's VALUE refusal states: the member, and the bundle of
+/// requirements its value shape states.
 fn value_message(member_path: &str, requirements: &[&str]) -> String {
     format!(
-        "1 validation error detected: Value at '{member_path}' failed to satisfy constraint: \
-         Map value must satisfy constraint: [{}]",
+        "1 validation error detected: {}",
+        value_clause(member_path, requirements)
+    )
+}
+
+/// One clause of a VALUE refusal.
+fn value_clause(member_path: &str, requirements: &[&str]) -> String {
+    format!(
+        "Value at '{member_path}' failed to satisfy constraint: Map value must satisfy \
+         constraint: [{}]",
         requirements.join(", ")
     )
 }
@@ -611,4 +649,346 @@ async fn a_map_key_inside_its_modelled_key_shape_is_accepted_and_persisted() {
             "case {case:?}: expected the stored channel entry, got {body:?}"
         );
     }
+}
+
+/// An SNS topic key every modelled `SNSTopicArn` admits, for the rows about an ENTRY's
+/// value rather than about its key.
+const TOPIC_ARN: &str = "arn:aws:sns:us-west-2:000000000000:my-private-topic";
+
+/// A second such key, for the rows that send more than one entry at a time.
+const OTHER_TOPIC_ARN: &str = "arn:aws:sns:us-west-2:000000000000:my-other-topic";
+
+/// `count` distinct Chatbot configuration ARNs, each satisfying the modelled
+/// `ChatConfigurationArn`, so the only rule a row breaks is the one it is about.
+fn chat_configuration_arns(count: usize) -> Vec<String> {
+    (0..count)
+        .map(|index| format!("{CHAT_CONFIGURATION_ARN}-{index}"))
+        .collect()
+}
+
+/// The entry sizes no modelled `ChatConfigurationArns` admits, as `(case, size)`: each
+/// published bound missed by one and by far more.
+fn refused_entry_sizes() -> Vec<(String, usize)> {
+    vec![
+        (
+            "an entry one element below the minimum".to_string(),
+            CHAT_ARNS_MIN_LENGTH - 1,
+        ),
+        (
+            "an entry one element past the maximum".to_string(),
+            CHAT_ARNS_MAX_LENGTH + 1,
+        ),
+        (
+            "an entry two elements past the maximum".to_string(),
+            CHAT_ARNS_MAX_LENGTH + 2,
+        ),
+        (
+            "an entry far past the maximum".to_string(),
+            4 * CHAT_ARNS_MAX_LENGTH,
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn a_map_entrys_value_collection_outside_its_modelled_length_is_refused() {
+    // The other half of the class this suite covers: the value shape of
+    // `chatbotNotificationChannel` is a LIST the model bounds, and the centralized walk
+    // cannot apply a nested collection's own `@length`, so each entry's size is held to
+    // the published bounds by the operations that accept the map.
+    let router = emulator();
+    let arn = create_group(&router, REGION, Vec::new()).await;
+    let group_uri = format!("/investigationGroups/{}", label(&arn));
+    let mut cases: Vec<Case> = Vec::new();
+
+    // Every refused size, on both operations that accept the map.
+    for (case, size) in refused_entry_sizes() {
+        let channel = json!({ TOPIC_ARN: chat_configuration_arns(size) });
+        cases.push(Case {
+            name: format!("CreateInvestigationGroup with {case}"),
+            region: CREATE_REGION,
+            method: "POST",
+            uri: "/investigationGroups".to_string(),
+            body: Some(create_body(vec![(
+                "chatbotNotificationChannel",
+                channel.clone(),
+            )])),
+            code: VALIDATION_EXCEPTION,
+            expected: Some(value_message(
+                "chatbotNotificationChannel",
+                CHAT_ARNS_REQUIREMENTS,
+            )),
+        });
+        cases.push(Case {
+            name: format!("UpdateInvestigationGroup with {case}"),
+            region: REGION,
+            method: "PATCH",
+            uri: group_uri.clone(),
+            body: Some(json!({ "chatbotNotificationChannel": channel })),
+            code: VALIDATION_EXCEPTION,
+            expected: Some(value_message(
+                "chatbotNotificationChannel",
+                CHAT_ARNS_REQUIREMENTS,
+            )),
+        });
+    }
+
+    // The rule is about EVERY entry, so a map whose other entries are within the bounds
+    // is refused for the one that is not, whichever position it sits in.
+    for (case, channel) in [
+        (
+            "a broken entry after an acceptable one",
+            json!({
+                TOPIC_ARN: chat_configuration_arns(CHAT_ARNS_MAX_LENGTH),
+                OTHER_TOPIC_ARN: chat_configuration_arns(CHAT_ARNS_MAX_LENGTH + 1),
+            }),
+        ),
+        (
+            "a broken entry before an acceptable one",
+            json!({
+                TOPIC_ARN: chat_configuration_arns(CHAT_ARNS_MIN_LENGTH - 1),
+                OTHER_TOPIC_ARN: chat_configuration_arns(CHAT_ARNS_MIN_LENGTH),
+            }),
+        ),
+        (
+            "two broken entries, which are one fact about one member",
+            json!({
+                TOPIC_ARN: chat_configuration_arns(CHAT_ARNS_MIN_LENGTH - 1),
+                OTHER_TOPIC_ARN: chat_configuration_arns(CHAT_ARNS_MAX_LENGTH + 1),
+            }),
+        ),
+    ] {
+        cases.push(Case {
+            name: format!("UpdateInvestigationGroup with {case}"),
+            region: REGION,
+            method: "PATCH",
+            uri: group_uri.clone(),
+            body: Some(json!({ "chatbotNotificationChannel": channel })),
+            code: VALIDATION_EXCEPTION,
+            expected: Some(value_message(
+                "chatbotNotificationChannel",
+                CHAT_ARNS_REQUIREMENTS,
+            )),
+        });
+    }
+
+    // Two facts in one request are two clauses, counted by the envelope: the same
+    // member's key rule and entry-size rule, and then one member's key rule beside the
+    // other member's entry-size rule.
+    cases.push(Case {
+        name: "CreateInvestigationGroup with a broken key and a broken entry size".to_string(),
+        region: CREATE_REGION,
+        method: "POST",
+        uri: "/investigationGroups".to_string(),
+        body: Some(create_body(vec![(
+            "chatbotNotificationChannel",
+            json!({ "not-an-arn-but-long-enough": Vec::<String>::new() }),
+        )])),
+        code: VALIDATION_EXCEPTION,
+        expected: Some(format!(
+            "2 validation errors detected: {}; {}",
+            key_clause("chatbotNotificationChannel", TOPIC_KEY_REQUIREMENTS),
+            value_clause("chatbotNotificationChannel", CHAT_ARNS_REQUIREMENTS),
+        )),
+    });
+    cases.push(Case {
+        name: "CreateInvestigationGroup with a broken tag key and a broken entry size".to_string(),
+        region: CREATE_REGION,
+        method: "POST",
+        uri: "/investigationGroups".to_string(),
+        body: Some(create_body(vec![
+            ("tags", json!({ "bad key!": "v" })),
+            (
+                "chatbotNotificationChannel",
+                json!({ TOPIC_ARN: chat_configuration_arns(CHAT_ARNS_MAX_LENGTH + 1) }),
+            ),
+        ])),
+        code: VALIDATION_EXCEPTION,
+        expected: Some(format!(
+            "2 validation errors detected: {}; {}",
+            key_clause("tags", TAG_KEY_REQUIREMENTS),
+            value_clause("chatbotNotificationChannel", CHAT_ARNS_REQUIREMENTS),
+        )),
+    });
+
+    // Control. A constraint the request boundary DOES reach is still what refuses the
+    // request first: an entry past the maximum one of whose elements is no configuration
+    // ARN at all states the ELEMENT's bundle, which the centralized walk built, and
+    // states it once.
+    let mut with_a_broken_element = chat_configuration_arns(CHAT_ARNS_MAX_LENGTH + 1);
+    with_a_broken_element[0] = "arn:aws".to_string();
+    cases.push(Case {
+        name: "an oversized entry holding an element outside its own shape".to_string(),
+        region: REGION,
+        method: "PATCH",
+        uri: group_uri.clone(),
+        body: Some(json!({
+            "chatbotNotificationChannel": { TOPIC_ARN: with_a_broken_element },
+        })),
+        code: VALIDATION_EXCEPTION,
+        expected: Some(value_message(
+            "chatbotNotificationChannel",
+            CHAT_ARN_REQUIREMENTS,
+        )),
+    });
+
+    for case in cases {
+        let Case {
+            name,
+            region,
+            method,
+            uri,
+            body,
+            code: expected_code,
+            expected,
+        } = case;
+        let (status, code, message, _) = call(&router, region, method, &uri, body.as_ref()).await;
+        assert_eq!(
+            status, 400,
+            "case {name:?}: expected 400, got {status} / {code} / {message:?}"
+        );
+        assert_eq!(
+            code, expected_code,
+            "case {name:?}: expected {expected_code}, got {code} / {message:?}"
+        );
+        if let Some(expected) = expected {
+            assert_eq!(
+                message, expected,
+                "case {name:?}: expected {expected:?}, got {message:?}"
+            );
+        }
+    }
+
+    // Nothing a refused request named was written: the group reports no channel at all,
+    // so no entry the model's own bound forbids can be read back.
+    let (status, code, message, body) = call(&router, REGION, "GET", &group_uri, None).await;
+    assert_eq!(
+        status, 200,
+        "reading the group back: expected 200, got {status} / {code} / {message:?}"
+    );
+    assert_eq!(
+        body.get("chatbotNotificationChannel")
+            .unwrap_or(&Value::Null),
+        &Value::Null,
+        "after the refusals: expected no stored notification channel, got {body:?}"
+    );
+    let (status, code, message, body) =
+        call(&router, CREATE_REGION, "GET", "/investigationGroups", None).await;
+    assert_eq!(
+        status, 200,
+        "listing the create Region: expected 200, got {status} / {code} / {message:?}"
+    );
+    let listed = body
+        .get("investigationGroups")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    assert_eq!(
+        listed, 0,
+        "after the refused creates: expected no group in {CREATE_REGION}, got {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_map_entrys_value_collection_inside_its_modelled_length_is_accepted_and_persisted() {
+    // The rule refuses what the value shape's bounds exclude and NOTHING else, so every
+    // entry size on or inside them is stored and read back — each published bound
+    // included.
+    let router = emulator();
+    let arn = create_group(&router, REGION, Vec::new()).await;
+    let group_uri = format!("/investigationGroups/{}", label(&arn));
+
+    for (case, size) in [
+        ("an entry at the minimum", CHAT_ARNS_MIN_LENGTH),
+        ("an entry between the bounds", CHAT_ARNS_MIN_LENGTH + 1),
+        ("an entry at the maximum", CHAT_ARNS_MAX_LENGTH),
+    ] {
+        let arns = chat_configuration_arns(size);
+        let (status, code, message, _) = call(
+            &router,
+            REGION,
+            "PATCH",
+            &group_uri,
+            Some(&json!({
+                "chatbotNotificationChannel": { TOPIC_ARN: arns.clone() },
+            })),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200, got {status} / {code} / {message:?}"
+        );
+        let (status, code, message, body) = call(&router, REGION, "GET", &group_uri, None).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: reading the group back expected 200, got {status} / {code} / \
+             {message:?}"
+        );
+        assert_eq!(
+            body.get("chatbotNotificationChannel")
+                .and_then(|channel| channel.get(TOPIC_ARN)),
+            Some(&json!(arns)),
+            "case {case:?}: expected the stored entry {arns:?}, got {body:?}"
+        );
+    }
+
+    // Several entries at once, each at one of the bounds: every one of them is stored.
+    let smallest = chat_configuration_arns(CHAT_ARNS_MIN_LENGTH);
+    let largest = chat_configuration_arns(CHAT_ARNS_MAX_LENGTH);
+    let (status, code, message, _) = call(
+        &router,
+        REGION,
+        "PATCH",
+        &group_uri,
+        Some(&json!({
+            "chatbotNotificationChannel": {
+                TOPIC_ARN: smallest.clone(),
+                OTHER_TOPIC_ARN: largest.clone(),
+            },
+        })),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "two entries at the bounds: expected 200, got {status} / {code} / {message:?}"
+    );
+    let (status, code, message, body) = call(&router, REGION, "GET", &group_uri, None).await;
+    assert_eq!(
+        status, 200,
+        "two entries at the bounds: reading the group back expected 200, got {status} / {code} \
+         / {message:?}"
+    );
+    assert_eq!(
+        body.get("chatbotNotificationChannel"),
+        Some(&json!({ TOPIC_ARN: smallest, OTHER_TOPIC_ARN: largest })),
+        "two entries at the bounds: expected both stored, got {body:?}"
+    );
+
+    // A create carries the same map, so the sizes the update path accepts are the sizes a
+    // create accepts: the maximum, in its own Region's group.
+    let created_arns = chat_configuration_arns(CHAT_ARNS_MAX_LENGTH);
+    let created = create_group(
+        &router,
+        CREATE_REGION,
+        vec![(
+            "chatbotNotificationChannel",
+            json!({ TOPIC_ARN: created_arns.clone() }),
+        )],
+    )
+    .await;
+    let (status, code, message, body) = call(
+        &router,
+        CREATE_REGION,
+        "GET",
+        &format!("/investigationGroups/{}", label(&created)),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "reading a created group back: expected 200, got {status} / {code} / {message:?}"
+    );
+    assert_eq!(
+        body.get("chatbotNotificationChannel"),
+        Some(&json!({ TOPIC_ARN: created_arns })),
+        "a created entry at the maximum: expected it stored, got {body:?}"
+    );
 }
