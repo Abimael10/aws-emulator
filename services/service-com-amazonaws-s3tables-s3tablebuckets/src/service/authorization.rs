@@ -1,0 +1,261 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! Whether the RESOURCE-BASED policy a table bucket carries refuses the request
+//! that addresses it — the decision every operation of this service is served
+//! behind.
+//!
+//! A table bucket policy is not a document the control plane merely stores and
+//! reads back: "a table bucket policy is a resource-based AWS Identity and Access
+//! Management (IAM) policy" and it is part of the authorization decision for
+//! every call that acts on that bucket or on anything inside it. IAM's order
+//! makes one half of that decision belong here, in front of the handler: "an
+//! explicit deny in any policy overrides any allow", so a statement of the
+//! bucket's own policy that denies the requested action on the resource the
+//! request addresses refuses the call whatever the caller's identity-based
+//! documents grant — and the call has NO effect, which is why the decision is
+//! taken before the handler reads or writes anything.
+//!
+//! The other half — whether a caller holding no grant at all may act — is the
+//! identity-based question [`crate::state::authorization::refusal`] answers, for
+//! the operations whose own model declares the error that carries it. This gate
+//! answers only the deny, because a resource policy that states nothing about a
+//! request withholds nothing: within one account "access is granted if either"
+//! the identity-based or the resource-based policy allows it.
+//!
+//! Three pieces:
+//!
+//! 1. **which resource the request acts on** ([`addressed`]) — read off the
+//!    BUILT input through the tree's one rendering of a shape as a document, so
+//!    an operation is decided against the resource its own input names rather
+//!    than through a second hand-kept table of URI templates. The ARN is the one
+//!    this service MINTS for that resource: a table's own ARN when the store
+//!    holds the table the request names, and otherwise the table bucket it is
+//!    addressed within, which is the only resource such a request names — the
+//!    same reading `src/ops/get_table_encryption.rs` takes for the identity-based
+//!    decision;
+//! 2. **the document in force** — the policy that bucket carries, read through
+//!    this service's own store, so the document a decision is taken on is the one
+//!    `PutTableBucketPolicy` wrote and `DeleteTableBucketPolicy` removed;
+//! 3. **the decision and the sentence**
+//!    ([`crate::state::authorization::resource_policy_refusal`]), which is the
+//!    shared evaluation of a policy document against `(action, resource,
+//!    principal)` and IAM's own wording for a refusal — so nothing of either is
+//!    spelled here.
+//!
+//! A request that addresses no table bucket this store holds, or one whose bucket
+//! carries no policy, is served: there is no document to refuse it.
+
+use ::std::sync::Arc;
+
+use ::service_common::management_events::{recorded_member_name, recorded_shape, WithheldFromRecord};
+use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
+use smithy_server_runtime::{BoxFuture, ErasedOperation, Operation, OperationContext, Service};
+
+/// The input members this gate never reads a resource out of, and which are left
+/// out of the document it reads: the values a write CARRIES — a policy document,
+/// a table's Iceberg metadata, a tag map, a configuration value. None of them
+/// names the resource the request acts on, and a caller controls their size.
+const PAYLOAD_MEMBERS: &[&str] = &[
+    "resourcePolicy",
+    "metadata",
+    "tags",
+    "tagKeys",
+    "value",
+    "configuration",
+    "encryptionConfiguration",
+    "storageClassConfiguration",
+];
+
+/// The resource a request acts on and the resource-based policy in force on the
+/// table bucket that holds it.
+struct Governed {
+    /// The ARN of what the operation acts on, as this service mints it.
+    resource: String,
+    /// The table bucket's policy document, as the store reads at this instant.
+    policy: String,
+}
+
+/// The resource the request's `input` addresses and the policy in force on it, or
+/// `None` when no stored document can decide the request: an input that addresses
+/// no table bucket (the create of one, a listing of them), a bucket or table this
+/// store does not hold, or a bucket carrying no policy.
+///
+/// The members are this model's own (`smithy_query(query="operation")`), read in
+/// the order a request narrows what it addresses:
+///
+/// * `resourceArn` — the tagging operations, which address a table bucket or a
+///   table by ARN ("The tagged resource can be a table bucket or a table");
+/// * `tableArn` — a table's own ARN, which the replication and record-expiration
+///   operations address one by;
+/// * `tableBucketARN`, with `namespace` and `name` when the operation addresses a
+///   table inside that bucket by its coordinates.
+///
+/// The store is read ONCE, under one guard, and nothing in it is written.
+fn addressed<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    input: &dyn ::aws_smithy_schema::serde::SerializableStruct,
+    schema: &::aws_smithy_schema::Schema,
+) -> Option<Governed> {
+    let document = recorded_shape(
+        input,
+        schema,
+        WithheldFromRecord {
+            omitted: PAYLOAD_MEMBERS,
+            ..WithheldFromRecord::default()
+        },
+    );
+    let text = |member: &str| {
+        document
+            .get(recorded_member_name(member))
+            .and_then(::serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    let state = crate::state::service_state(engine)?;
+    let store = state.lock();
+    // The policy of the bucket a table ARN names: a table's permissions are
+    // decided against the table, under the policy of the bucket holding it.
+    let by_table_arn = |arn: String| {
+        let bucket = &store.tables_by_arn.get(&arn)?.table_bucket_arn;
+        let policy = store.table_buckets.get(bucket)?.policy.clone()?;
+        Some(Governed {
+            resource: arn,
+            policy,
+        })
+    };
+    if let Some(arn) = text("resourceArn") {
+        return match crate::state::taggable_resource_kind(&arn)? {
+            crate::state::TaggableResourceKind::TableBucket => {
+                let policy = store.table_buckets.get(&arn)?.policy.clone()?;
+                Some(Governed {
+                    resource: arn,
+                    policy,
+                })
+            }
+            crate::state::TaggableResourceKind::Table => by_table_arn(arn),
+        };
+    }
+    if let Some(arn) = text("tableArn") {
+        return by_table_arn(arn);
+    }
+    let bucket_arn = text("tableBucketARN")?;
+    let bucket = store.table_buckets.get(&bucket_arn)?;
+    let policy = bucket.policy.clone()?;
+    // A table operation addresses the table by name inside the bucket; the
+    // decision is taken on the table's OWN ARN, and falls back to the bucket for
+    // a request naming a table this account does not hold — which is the only
+    // resource such a request names.
+    let resource = match (text("namespace"), text("name")) {
+        (Some(namespace), Some(name)) => bucket
+            .namespaces
+            .get(&namespace)
+            .and_then(|namespace| namespace.tables.get(&name))
+            .map_or(bucket_arn, |table| table.table_arn.clone()),
+        _ => bucket_arn,
+    };
+    Some(Governed { resource, policy })
+}
+
+/// The sentence a request to `operation` is refused with when the resource-based
+/// policy in force on what it addresses explicitly denies it, and `None` when
+/// nothing of that document refuses it.
+///
+/// `input` is the request's own built input and `schema` that operation's input
+/// schema, which is where the resource the decision is taken on comes from. The
+/// store guard is released before the decision is asked.
+#[must_use]
+pub fn refusal<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &OperationContext<'_>,
+    operation: &str,
+    input: &dyn ::aws_smithy_schema::serde::SerializableStruct,
+    schema: &::aws_smithy_schema::Schema,
+) -> Option<String> {
+    let governed = addressed(engine, input, schema)?;
+    crate::state::authorization::resource_policy_refusal(
+        engine,
+        ctx,
+        operation,
+        &governed.resource,
+        &governed.policy,
+    )
+}
+
+/// One modelled operation served behind this gate: the resource's own policy
+/// decides the call, and only a call it does not deny reaches the operation.
+///
+/// It wraps the operation at the TYPED seam ([`Operation`]), so the gate is handed
+/// the deserialized input and reads the resource the request addresses off the
+/// built shape rather than parsing the request a second time; and the refusal
+/// travels through the operation's own error channel, so it is rendered in this
+/// service's envelope like every other failure.
+pub struct Authorized<O, Eng> {
+    /// The operation that serves a call the policy does not deny.
+    operation: O,
+    /// The shared engine: this service's store, and the IAM and STS stores the
+    /// caller is resolved from, live there.
+    engine: Arc<Eng>,
+}
+
+impl<O, Eng> Authorized<O, Eng> {
+    /// Wrap one operation, already constructed from the shared engine.
+    pub fn new(operation: O, engine: Arc<Eng>) -> Self {
+        Self { operation, engine }
+    }
+}
+
+impl<O, E, Eng> Operation for Authorized<O, Eng>
+where
+    O: Operation<Error = crate::scaffolded::Scaffolded<E>>,
+    E: smithy_server_runtime::OperationError + Send + 'static,
+    Eng: Send + Sync + 'static,
+{
+    type Input = O::Input;
+    type Output = O::Output;
+    type Error = O::Error;
+
+    const NAME: &'static str = O::NAME;
+    const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = O::INPUT_SCHEMA;
+    const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = O::OUTPUT_SCHEMA;
+    const SUCCESS_STATUS: u16 = O::SUCCESS_STATUS;
+
+    async fn handle(
+        &self,
+        input: Self::Input,
+        ctx: &OperationContext<'_>,
+    ) -> Result<Self::Output, Self::Error> {
+        if let Some(message) = refusal(&*self.engine, ctx, O::NAME, &input, O::INPUT_SCHEMA) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(message));
+        }
+        self.operation.handle(input, ctx).await
+    }
+}
+
+impl<O, E, Eng> ErasedOperation for Authorized<O, Eng>
+where
+    O: Operation<Error = crate::scaffolded::Scaffolded<E>> + ErasedOperation,
+    E: smithy_server_runtime::OperationError + Send + 'static,
+    Eng: Send + Sync + 'static,
+{
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        // The framework's own per-request sequence, driven with THIS wrapper as
+        // the operation, so the handler it calls is the gated one — and in the
+        // envelope the generated shim passes, so a framework-level failure is
+        // rendered exactly as it is for an ungated operation.
+        let envelope = svc.definition().wire_protocol(req).envelope();
+        Box::pin(async move {
+            smithy_server_runtime::run_operation_http(self, svc, req, ctx, envelope).await
+        })
+    }
+
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        // The wrapped operation's modelled schemes: gating a call must not change
+        // which credentials sign it.
+        self.operation.auth_schemes()
+    }
+}

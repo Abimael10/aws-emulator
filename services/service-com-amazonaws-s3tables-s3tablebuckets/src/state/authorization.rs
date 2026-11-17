@@ -1,8 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Whether the CALLER's own identity-based IAM policies let a request to this
-//! service perform the action it asks for — the decision an operation takes
-//! before it reads or writes anything.
+//! Whether IAM lets a request to this service perform the action it asks for —
+//! the decision an operation takes before it reads or writes anything.
+//!
+//! Two questions, decided from documents collected in two places and answered by
+//! the one shared evaluator: whether the CALLER's own identity-based policies
+//! allow the action ([`refusal`]), and whether the RESOURCE's own resource-based
+//! policy refuses it ([`resource_policy_refusal`], which this service's
+//! request-time gate asks for every operation it serves).
 //!
 //! Every operation of this service documents the permission it takes ("You must
 //! have the s3tables:GetTableEncryption permission to use this operation"), and
@@ -181,12 +186,63 @@ pub fn caller_arn<Eng: Send + Sync + 'static>(
     caller(engine, ctx).arn
 }
 
+/// `Some(message)` when the resource-based policy `policy` — the document
+/// attached to the table bucket that holds the resource the request addresses —
+/// explicitly DENIES `s3tables:<operation>` on `resource` for the calling
+/// principal, and `None` when it does not.
+///
+/// Only an explicit `Deny` is answered here, and that is IAM's own order: "an
+/// explicit deny in any policy overrides any allow", so a statement of the
+/// resource's own policy that denies the action refuses the request whatever the
+/// caller's identity-based documents grant. A document that states nothing about
+/// the request, or allows it, withholds nothing — within one account a grant from
+/// either side is enough ("the resource-based policy and the identity-based
+/// policy are evaluated together, and access is granted if either allows it"), so
+/// whether a caller holding NO grant at all may act is the identity-based
+/// question [`refusal`] answers for the operations whose model declares that
+/// error.
+///
+/// `resource` is the ARN of what the operation acts on, as the operation resolved
+/// it for this request. Asked with no store guard of this service held, and
+/// before the operation reads or writes anything.
+#[must_use]
+pub fn resource_policy_refusal<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    operation: &str,
+    resource: &str,
+    policy: &str,
+) -> Option<String> {
+    let action = action_for(operation);
+    let caller = caller(engine, ctx);
+    // A resource-based statement is about the request only when its `Principal`
+    // element names the calling principal, so the decision is handed every
+    // spelling that principal is named by.
+    let request = iam::Request::new(&action, resource, &caller.principals);
+    if iam::resource_decision(policy, &request) != Decision::Denied {
+        return None;
+    }
+    // The deny is a fact about THAT document, so the clause names it rather than
+    // the principal's own policies.
+    Some(iam::not_authorized_by_identity_policy(
+        &caller.arn,
+        &action,
+        resource,
+        iam::RESOURCE_POLICY_EXPLICIT_DENY,
+    ))
+}
+
 /// The principal a request speaks for, and everything the decision is made from.
 #[derive(Debug, Clone, Default)]
 struct Caller {
     /// The principal's ARN, as `sts:GetCallerIdentity` reports it — what a
     /// refusal names.
     arn: String,
+    /// Every spelling of the principal a resource-based policy's `Principal`
+    /// element can name it by: the ARN STS reports for the credential, the ARN of
+    /// the IAM role behind an assumed-role session, and the account the principal
+    /// belongs to — which is how such a document names a whole account.
+    principals: Vec<String>,
     /// The identity-based policy documents in force on the principal.
     documents: Vec<String>,
     /// The permissions boundary in force on the principal, when it carries one
@@ -270,6 +326,7 @@ fn caller<Eng: Send + Sync + 'static>(
     };
     let mut caller = Caller {
         account_credential: identity.arn == sts_store::ambient_identity().arn,
+        principals: vec![identity.arn.clone()],
         arn: identity.arn,
         ..Caller::default()
     };
@@ -291,6 +348,7 @@ fn caller<Eng: Send + Sync + 'static>(
         {
             caller.account_credential = false;
             caller.arn = user.arn.clone();
+            caller.principals = vec![user.arn.clone()];
         }
     }
     // Which IAM identity the principal's policies are held under is read through
@@ -305,6 +363,7 @@ fn caller<Eng: Send + Sync + 'static>(
             .get(&iam_store::name_key(role_name))
             .map(|held| held.arn.clone())
         {
+            caller.principals.push(role_arn.clone());
             caller.read_policies_of(&store, &role_arn);
         }
     } else if ::service_common::iam_role::user_name(&caller.arn).is_some() {
@@ -313,6 +372,12 @@ fn caller<Eng: Send + Sync + 'static>(
         let user_arn = caller.arn.clone();
         caller.read_policies_of(&store, &user_arn);
     }
+    // The account the principal belongs to, which is how a resource-based policy
+    // denies or delegates to a whole account rather than to one of its
+    // principals.
+    caller
+        .principals
+        .extend(iam::account_principals(&caller.arn));
     caller
 }
 

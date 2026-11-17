@@ -59,6 +59,10 @@ use std::sync::Arc;
 
 use crate::ops::types::{BadRequestException, SCHEMA_BAD_REQUEST_EXCEPTION};
 
+/// Whether the resource-based policy a table bucket carries refuses a request —
+/// the decision every operation this service serves is taken behind.
+mod authorization;
+
 /// How this service refuses a request body it cannot read into the operation's
 /// modelled input at all — a layer in FRONT of the generated walk, because the
 /// framework states that failure in its own codec's words under an error code
@@ -377,6 +381,25 @@ fn constraint_refusal(refusal: &Refusal, violations: &[Violation]) -> Option<Ref
     }
 }
 
+/// Wire one `crate::ops::<module>::<Operation>` per line into `$table`, each
+/// wrapped in [`authorization::Authorized`] (the resource-based policy on the
+/// table bucket the request addresses decides the call) and keyed by its
+/// operation shape name — the routing key `ServerHttpProtocol::routing_key`
+/// resolves and the generated table is keyed by.
+macro_rules! gate_operations {
+    ($table:expr, $engine:expr, $($module:ident :: $operation:ident),+ $(,)?) => {
+        $(
+            $table.add_operation(
+                stringify!($operation),
+                ::std::boxed::Box::new(authorization::Authorized::new(
+                    crate::ops::$module::$operation::new(::std::sync::Arc::clone(&$engine)),
+                    ::std::sync::Arc::clone(&$engine),
+                )) as ::std::boxed::Box<dyn ErasedOperation>,
+            );
+        )+
+    };
+}
+
 /// The `com-amazonaws-s3tables-s3tablebuckets` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -384,6 +407,13 @@ fn constraint_refusal(refusal: &Refusal, violations: &[Violation]) -> Option<Ref
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The same operations the generated table holds, each wrapped in
+    /// [`authorization::Authorized`] so the resource-based policy on the table
+    /// bucket a request addresses decides the call before the handler runs.
+    /// Keyed by the routing key the protocol resolves — the key the generated
+    /// table uses — and built from the SAME shared engine, so a wrapped
+    /// operation reads and writes the one store.
+    gated: smithy_server_runtime::OperationRoutingTable,
     /// This service's wire protocol, built ONCE here because
     /// [`Service::override_protocol`] hands back a borrow of it.
     protocol: service_common::date_time_json::DateTimeRestJson,
@@ -411,8 +441,71 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
+        let mut gated = smithy_server_runtime::OperationRoutingTable::new();
+        // EVERY operation this crate serves (one per file in `src/ops/`), because
+        // the decision is the SERVICE's and not one operation's: a bucket policy
+        // governs every call that acts on that bucket or on anything inside it,
+        // and an operation whose input addresses no table bucket simply has no
+        // document to be decided against, which the gate reads off that
+        // operation's own input. An operation added later is added here as well,
+        // or it is served with its bucket's policy ignored; the test below fails
+        // when one is missing.
+        gate_operations!(
+            gated,
+            engine,
+            create_namespace::CreateNamespace,
+            create_table::CreateTable,
+            create_table_bucket::CreateTableBucket,
+            delete_namespace::DeleteNamespace,
+            delete_table::DeleteTable,
+            delete_table_bucket::DeleteTableBucket,
+            delete_table_bucket_encryption::DeleteTableBucketEncryption,
+            delete_table_bucket_metrics_configuration::DeleteTableBucketMetricsConfiguration,
+            delete_table_bucket_policy::DeleteTableBucketPolicy,
+            delete_table_bucket_replication::DeleteTableBucketReplication,
+            delete_table_policy::DeleteTablePolicy,
+            delete_table_replication::DeleteTableReplication,
+            get_namespace::GetNamespace,
+            get_table::GetTable,
+            get_table_bucket::GetTableBucket,
+            get_table_bucket_encryption::GetTableBucketEncryption,
+            get_table_bucket_maintenance_configuration::GetTableBucketMaintenanceConfiguration,
+            get_table_bucket_metrics_configuration::GetTableBucketMetricsConfiguration,
+            get_table_bucket_policy::GetTableBucketPolicy,
+            get_table_bucket_replication::GetTableBucketReplication,
+            get_table_bucket_storage_class::GetTableBucketStorageClass,
+            get_table_encryption::GetTableEncryption,
+            get_table_maintenance_configuration::GetTableMaintenanceConfiguration,
+            get_table_maintenance_job_status::GetTableMaintenanceJobStatus,
+            get_table_metadata_location::GetTableMetadataLocation,
+            get_table_policy::GetTablePolicy,
+            get_table_record_expiration_configuration::GetTableRecordExpirationConfiguration,
+            get_table_record_expiration_job_status::GetTableRecordExpirationJobStatus,
+            get_table_replication::GetTableReplication,
+            get_table_replication_status::GetTableReplicationStatus,
+            get_table_storage_class::GetTableStorageClass,
+            list_namespaces::ListNamespaces,
+            list_table_buckets::ListTableBuckets,
+            list_tables::ListTables,
+            list_tags_for_resource::ListTagsForResource,
+            put_table_bucket_encryption::PutTableBucketEncryption,
+            put_table_bucket_maintenance_configuration::PutTableBucketMaintenanceConfiguration,
+            put_table_bucket_metrics_configuration::PutTableBucketMetricsConfiguration,
+            put_table_bucket_policy::PutTableBucketPolicy,
+            put_table_bucket_replication::PutTableBucketReplication,
+            put_table_bucket_storage_class::PutTableBucketStorageClass,
+            put_table_maintenance_configuration::PutTableMaintenanceConfiguration,
+            put_table_policy::PutTablePolicy,
+            put_table_record_expiration_configuration::PutTableRecordExpirationConfiguration,
+            put_table_replication::PutTableReplication,
+            rename_table::RenameTable,
+            tag_resource::TagResource,
+            untag_resource::UntagResource,
+            update_table_metadata_location::UpdateTableMetadataLocation,
+        );
         Self {
             entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            gated,
             protocol: service_common::date_time_json::DateTimeRestJson::new(),
             unreadable_body: request_layer::UnreadableBody::new(),
             iceberg_catalog: iceberg_rest::IcebergCatalog::new(Arc::clone(&engine)),
@@ -498,6 +591,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             if name_lookups::resolves_names::<Eng>(key, codec, req) {
                 return Some(&self.name_lookups);
             }
+            // Everything the model names is served out of the gated table: the
+            // SAME operation the generated table holds, behind the
+            // resource-policy decision (see [`authorization`]). The key is the
+            // one that table's own protocol resolved, so this is no re-route —
+            // and a key no handler serves resolves to `None` here exactly as it
+            // does in the generated table, leaving the router's routing-error
+            // path unchanged.
+            return self.gated.get(key);
         }
         None
     }
@@ -558,5 +659,77 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // protocol's default epoch-seconds number. The codec that applies it is
         // otherwise the model's own `restJson1`.
         Some(&self.protocol)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The one thing about the wiring above a wire test cannot see: that the
+    //! hand-maintained `gate_operations!` list is the WHOLE surface this crate
+    //! serves.
+
+    use super::*;
+
+    /// This service's Smithy model, as it ships beside this crate.
+    const MODEL_PATH: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/smithy-model/com-amazonaws-s3tables-s3tablebuckets.json"
+    );
+
+    /// Every operation name the MODEL declares, read from the model this crate
+    /// was generated from rather than from a hand-kept list — so a rule stated
+    /// over "every operation of this service" is checked over the surface the
+    /// model publishes.
+    fn modelled_operations() -> Vec<String> {
+        let model = std::fs::read_to_string(MODEL_PATH)
+            .expect("the model that generated this crate ships beside it");
+        let model: serde_json::Value =
+            serde_json::from_str(&model).expect("the model that generated this crate is JSON");
+        let operations: Vec<String> = model["shapes"]
+            .as_object()
+            .expect("a Smithy model declares shapes")
+            .iter()
+            .filter(|(_, shape)| shape["type"] == "operation")
+            .filter_map(|(id, _)| id.rsplit('#').next().map(str::to_string))
+            .collect();
+        assert!(
+            operations.len() >= 49,
+            "case \"the model's surface\": expected this service's operations, got {operations:?}"
+        );
+        operations
+    }
+
+    /// RULE applied to the whole surface: every operation the generated routing
+    /// table serves is also served behind the authorization gate, under the same
+    /// key that table is keyed by.
+    ///
+    /// The names come from the MODEL rather than from a second hand list, so an
+    /// operation that gains a handler and not an entry in `gate_operations!`
+    /// fails here instead of silently serving a call the addressed bucket's
+    /// policy denies — and a key spelled differently from the generated table's
+    /// fails here instead of silently never being reached by
+    /// `override_operation`.
+    #[test]
+    fn every_operation_this_crate_serves_is_served_behind_the_authorization_gate() {
+        let service = EmulatedService::new(Arc::new(engine::InMemoryEngine::new()));
+        let mut served = 0usize;
+        for operation in modelled_operations() {
+            let operation = operation.as_str();
+            if service.entry.routing_table().get(operation).is_none() {
+                continue;
+            }
+            served += 1;
+            assert!(
+                service.gated.get(operation).is_some(),
+                "case {operation:?}: every operation this crate serves is served behind the \
+                 authorization gate; this one is missing from gate_operations!, so a request it \
+                 serves ignores the policy on the table bucket it addresses"
+            );
+        }
+        assert_eq!(
+            served, 49,
+            "case \"the served surface\": expected the 49 operations this crate has a handler \
+             for, got {served}"
+        );
     }
 }

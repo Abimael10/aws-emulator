@@ -220,7 +220,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The put REPLACES the bucket's policy with the document it carries —
         // the operation is `@idempotent`, so the same put twice leaves the same
-        // one policy.
+        // one policy. What is stored DECIDES later calls rather than only being
+        // read back (`crate::service::authorization`): a statement of it that
+        // denies an action refuses the requests it names.
         bucket.policy = Some(policy);
         let resource = bucket.arn.clone();
         // The lock covers the state change only; everything below is owned.
