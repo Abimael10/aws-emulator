@@ -27,10 +27,11 @@ const REGION: &str = "us-west-2";
 /// per-shape `@httpError` being inert on an RPC protocol.
 const CLIENT_FAULT_STATUS: u16 = 400;
 
-/// Names spanning the class `CreateParameterGroup` accepts (the model constrains
-/// `ParameterGroupName` to no pattern or length): a short name, a hyphenated one, a
-/// dotted one as the default group has, and one with mixed case and a digit.
-const CREATED_GROUPS: [&str; 4] = ["pg", "my-dax-parameters", "params.v2", "Group9"];
+/// Names spanning the class a create accepts (the name is read as a parameter-group
+/// identifier, and the model constrains `ParameterGroupName` to no pattern or length): a
+/// short name, a hyphenated one, one of letters and digits, and one with mixed case and a
+/// digit.
+const CREATED_GROUPS: [&str; 4] = ["pg", "my-dax-parameters", "params-v2", "Group9"];
 
 /// A router carrying only this service, over its own engine, so each test starts from a
 /// fresh store.

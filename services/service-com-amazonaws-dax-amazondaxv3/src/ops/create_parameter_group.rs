@@ -4,9 +4,11 @@
 //!
 //! Stores a new parameter group — "a collection of parameters that you apply to all of
 //! the nodes in a DAX cluster" — under the requested name, and returns the stored record
-//! so `DescribeParameterGroups` reports exactly what this call persisted. A name that is
-//! already taken (including the default group DAX provides) is refused with
-//! `ParameterGroupAlreadyExistsFault` and nothing is written.
+//! so `DescribeParameterGroups` reports exactly what this call persisted. The name is read
+//! as a parameter-group identifier (`crate::state::is_parameter_group_identifier`) before
+//! the store is consulted, so a name that is not one is refused with
+//! `InvalidParameterValueException` carrying that rule; a name that is already taken is
+//! refused with `ParameterGroupAlreadyExistsFault`, and neither writes anything.
 //!
 //! ## Shape of an operation
 //!
@@ -153,14 +155,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         let state = crate::state::store(&*self.engine, Self::NAME)?;
 
-        // A group must be named: the model's `@required` is satisfied by the empty
-        // string, which names nothing a later describe or delete could resolve.
-        if input.parameter_group_name.is_empty() {
+        // The name a group is created under is read as a parameter-group identifier: a
+        // name that is not one (the empty name the model's `@required` admits included) is
+        // refused on that rule, before this store is consulted, so no group is ever stored
+        // under a name a later change could not address it by.
+        if !crate::state::is_parameter_group_identifier(&input.parameter_group_name) {
             return Err(
                 CreateParameterGroupErrorModeled::InvalidParameterValueException(
-                    InvalidParameterValueException {
-                        message: Some("ParameterGroupName must not be empty".to_string()),
-                    },
+                    crate::state::parameter_group_name_not_an_identifier(),
                 )
                 .into(),
             );

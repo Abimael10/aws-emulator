@@ -106,15 +106,18 @@ fn reported_names(body: &Value) -> Vec<String> {
 /// request that names none).
 type GroupCase = (&'static str, Option<&'static str>);
 
-/// Names and descriptions spanning the class `CreateParameterGroup` accepts: the model
-/// puts no constraint on either member (`smithy_query(query="shape",
-/// shape="CreateParameterGroupRequest")` — both target the unconstrained `String`), so a
-/// short name, a long one, hyphens, dots, digits, mixed case and an absent or empty
+/// Names and descriptions spanning the class a create accepts: the name a group is
+/// created under is read as a parameter-group IDENTIFIER (see
+/// `creating_or_changing_a_parameter_group_named_by_a_non_identifier_is_refused` for the
+/// class that is refused), and the model constrains the description to no pattern or
+/// length (`smithy_query(query="shape", shape="CreateParameterGroupRequest")` — both
+/// members target the unconstrained `String`), so a one-character name, a short one, a
+/// hyphenated one, mixed case with a digit, a long one and an absent, present or empty
 /// description are all one class.
 const GROUP_CASES: [GroupCase; 6] = [
+    ("p", Some("one character name")),
     ("pg", Some("two character name")),
     ("my-dax-parameters", Some("hyphenated name")),
-    ("params.v2", Some("a dotted name, as the default group has")),
     ("Group9", Some("mixed case and a digit")),
     ("no-description", None),
     (
@@ -371,7 +374,13 @@ async fn an_unknown_parameter_group_name_is_refused_with_not_found() {
             "case {absent:?}: a read of a group it addresses answers that path's own \
              template, got {body:?}"
         );
+    }
 
+    // The same absent names on the path that REMOVES a group. The empty name is not one of
+    // its rows: a name a change is addressed by is read as an identifier before the store
+    // is consulted, so it is refused on that rule instead — see
+    // `creating_or_changing_a_parameter_group_named_by_a_non_identifier_is_refused`.
+    for absent in ["never-created", "STORED-GROUP", "stored-grou"] {
         let (status, body) = call(
             &router,
             "DeleteParameterGroup",
@@ -402,7 +411,9 @@ async fn an_unknown_parameter_group_name_is_refused_with_not_found() {
 }
 
 /// A name may hold one parameter group: a second create under a taken name is refused and
-/// writes nothing, whether the name is one a caller created or the default group's.
+/// writes nothing. The provided group's name is not among the rows: it is not an
+/// identifier, so a create naming it is refused on that rule before the store is consulted
+/// (`creating_or_changing_a_parameter_group_named_by_a_non_identifier_is_refused`).
 #[tokio::test]
 async fn creating_a_parameter_group_under_a_taken_name_is_refused() {
     let router = emulator();
@@ -416,14 +427,7 @@ async fn creating_a_parameter_group_under_a_taken_name_is_refused() {
         assert_eq!(status, 200, "case {name:?}: first create got {created:?}");
     }
 
-    for (name, taken_description) in [
-        ("taken", Some("the first create")),
-        ("also-taken", None),
-        (
-            state::DEFAULT_PARAMETER_GROUP,
-            Some(state::DEFAULT_PARAMETER_GROUP_DESCRIPTION),
-        ),
-    ] {
+    for (name, taken_description) in [("taken", Some("the first create")), ("also-taken", None)] {
         let (status, body) = call(
             &router,
             "CreateParameterGroup",
@@ -704,6 +708,281 @@ async fn deleting_the_default_parameter_group_is_refused() {
         vec![state::DEFAULT_PARAMETER_GROUP.to_string()],
         "a refused delete leaves the default group in place, got {all:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The name a parameter group is CREATED or CHANGED by, read as an identifier.
+//
+// Rule: the name a request creates a parameter group under, or addresses the group it
+// changes by, is read as a parameter-group IDENTIFIER — it must begin with a letter, carry
+// only ASCII letters, digits and hyphens, not end with a hyphen and not contain two
+// consecutive hyphens — before the rest of the request and before the store is consulted
+// for it. A name that is not one is refused 400 `InvalidParameterValueException` carrying
+// the identifier rule itself, in text that is ENTIRELY fixed and interpolates no part of
+// the request, and nothing is stored or changed. The group this service provides is named
+// `default.` followed by its family, so the dot in its name is why no caller can change it.
+//
+// Source: the identifier rule the refusal states, and the paths that create or change a
+// group by name — `CreateParameterGroup$ParameterGroupName`,
+// `DeleteParameterGroup$ParameterGroupName` and `UpdateParameterGroup$ParameterGroupName`
+// (`smithy_query(query="operation",operation="CreateParameterGroup,DeleteParameterGroup,
+// UpdateParameterGroup")`, which models `InvalidParameterValueException` on all three). A
+// path that READS a group is not one of them: the provided group is described and its
+// parameters listed under its own `default.<family>` name, as the suites for those
+// operations assert.
+// ---------------------------------------------------------------------------
+
+/// AWS's wording for a parameter-group name that is not a valid identifier, written out
+/// here so what the wire carries is pinned to that text rather than to whatever the
+/// service happens to build.
+const NAME_NOT_AN_IDENTIFIER: &str = "The parameter CacheParameterGroupName is not a valid \
+     identifier. Identifiers must begin with a letter; must contain only ASCII letters, \
+     digits, and hyphens; and must not end with a hyphen or contain two consecutive \
+     hyphens.";
+
+/// Names that are NOT parameter-group identifiers, one row per way the rule can break: a
+/// dotted name (the shape the provided group's own name has), an underscore, a space, a
+/// leading digit, a leading hyphen, a trailing hyphen, two consecutive hyphens, a
+/// non-ASCII letter, and the empty name the model's `@required` admits.
+const NON_IDENTIFIER_NAMES: [&str; 9] = [
+    "my.group",
+    "has_underscore",
+    "has space",
+    "1leading-digit",
+    "-leading-hyphen",
+    "trailing-",
+    "double--hyphen",
+    "grüppe",
+    "",
+];
+
+/// The group this service provides, resolved the way a client resolves it: the name
+/// `DescribeParameterGroups` reports that begins `default.`.
+async fn provided_group(router: &MultiServiceRouter) -> String {
+    let (status, all) = call(router, "DescribeParameterGroups", json!({})).await;
+    assert_eq!(status, 200, "describe all: got {status} {all:?}");
+    reported_names(&all)
+        .into_iter()
+        .find(|name| name.starts_with("default."))
+        .unwrap_or_else(|| panic!("the account has a provided parameter group, got {all:?}"))
+}
+
+/// Every path that CREATES a parameter group under `group` or CHANGES the one it names,
+/// over bodies carrying different amounts of other content — including content that would
+/// be refused on its own, which the NAME being read first takes precedence over.
+fn create_or_change_requests(group: &str) -> Vec<(&'static str, Value)> {
+    let published = state::DEFAULT_PARAMETERS[0].name.to_string();
+    let every_published: Vec<(String, String)> = state::DEFAULT_PARAMETERS
+        .iter()
+        .map(|definition| (definition.name.to_string(), "1000".to_string()))
+        .collect();
+    vec![
+        (
+            "CreateParameterGroup",
+            json!({ "ParameterGroupName": group }),
+        ),
+        (
+            "CreateParameterGroup",
+            json!({ "ParameterGroupName": group, "Description": "a description" }),
+        ),
+        (
+            "DeleteParameterGroup",
+            json!({ "ParameterGroupName": group }),
+        ),
+        (
+            "UpdateParameterGroup",
+            json!({
+                "ParameterGroupName": group,
+                "ParameterNameValues": name_values(&[(published, "1000".to_string())]),
+            }),
+        ),
+        (
+            "UpdateParameterGroup",
+            json!({
+                "ParameterGroupName": group,
+                "ParameterNameValues": name_values(&every_published),
+            }),
+        ),
+        // A pair naming a parameter the catalog does not publish, and a list naming no
+        // parameter at all, are each refused on their own; the NAME is read first, so both
+        // of these requests are refused on the name.
+        (
+            "UpdateParameterGroup",
+            json!({
+                "ParameterGroupName": group,
+                "ParameterNameValues": name_values(&[(
+                    "no-such-parameter".to_string(),
+                    "1000".to_string(),
+                )]),
+            }),
+        ),
+        (
+            "UpdateParameterGroup",
+            json!({ "ParameterGroupName": group, "ParameterNameValues": [] }),
+        ),
+    ]
+}
+
+/// Every request that creates or changes a parameter group under a name that is not an
+/// identifier is refused with the identifier rule, in fixed text that echoes nothing of the
+/// request, and the store is left exactly as it was — whether that name is the provided
+/// group's own (so nothing about it can be changed) or one no group is held under (so the
+/// name is refused before the store is consulted, instead of answering not-found).
+#[tokio::test]
+async fn creating_or_changing_a_parameter_group_named_by_a_non_identifier_is_refused() {
+    let router = emulator();
+    let provided = provided_group(&router).await;
+    // WHY the provided group's name is one of this class: a dot is not one of the
+    // characters an identifier may carry.
+    assert!(
+        provided.contains('.'),
+        "case {provided:?}: the provided group's name is not a valid identifier"
+    );
+    // A group held under a valid identifier, so the store is not empty while the class is
+    // driven: no refusal below may touch it either.
+    let held = "held-group";
+    let (status, body) = call(
+        &router,
+        "CreateParameterGroup",
+        json!({ "ParameterGroupName": held }),
+    )
+    .await;
+    assert_eq!(status, 200, "case {held:?}: create got {status} {body:?}");
+    let stored_names = vec![provided.clone(), held.to_string()];
+
+    for name in NON_IDENTIFIER_NAMES
+        .iter()
+        .copied()
+        .chain([provided.as_str()])
+    {
+        for (operation, body) in create_or_change_requests(name) {
+            let case = format!("{operation} {body}");
+            let (status, answered) = call(&router, operation, body).await;
+            assert_eq!(
+                (status, error_code(&answered).as_str()),
+                (400, "InvalidParameterValueException"),
+                "case {case}: expected 400 InvalidParameterValueException, got {status} \
+                 {answered:?}"
+            );
+            let message = answered["message"].as_str().unwrap_or_default();
+            assert_eq!(
+                message, NAME_NOT_AN_IDENTIFIER,
+                "case {case}: expected the identifier rule, got {message:?}"
+            );
+            // The text is entirely fixed: no part of the request appears in it.
+            if !name.is_empty() {
+                assert!(
+                    !message.contains(name),
+                    "case {case}: the refusal interpolates the name it was given, got \
+                     {message:?}"
+                );
+            }
+        }
+
+        // Nothing was stored under that name, and nothing the store held was removed.
+        let (status, all) = call(&router, "DescribeParameterGroups", json!({})).await;
+        assert_eq!(status, 200, "case {name:?}: describe all got {status} {all:?}");
+        assert_eq!(
+            reported_names(&all),
+            stored_names,
+            "case {name:?}: a refused create or change leaves the store alone, got {all:?}"
+        );
+    }
+
+    // Every value of the provided group and of the held one is still the catalog's.
+    for group in [provided.as_str(), held] {
+        let stored = reported_values(&router, group).await;
+        assert_eq!(
+            stored,
+            catalog_defaults(),
+            "case {group:?}: a refused change leaves every value alone, got {stored:?}"
+        );
+    }
+}
+
+/// The identifier rule is not the answer to every refusal: a name that IS an identifier is
+/// resolved against the store, so it either names a group (and the create, change or
+/// removal is carried out) or names none (and the refusal is that path's own not-found).
+#[tokio::test]
+async fn a_name_that_is_an_identifier_is_resolved_instead_of_refused_on_the_rule() {
+    let router = emulator();
+
+    // Rows: a one-letter name, a hyphenated one, one carrying digits, and a mixed-case one
+    // — each a valid identifier that names no group of this account.
+    let pairs = vec![(
+        state::DEFAULT_PARAMETERS[0].name.to_string(),
+        "1000".to_string(),
+    )];
+    for absent in ["a", "my-group", "group9", "Params"] {
+        let (status, answered) = call(
+            &router,
+            "DeleteParameterGroup",
+            json!({ "ParameterGroupName": absent }),
+        )
+        .await;
+        assert_eq!(
+            error_code(&answered).as_str(),
+            "ParameterGroupNotFoundFault",
+            "case {absent:?}: expected the not-found refusal, got {status} {answered:?}"
+        );
+        let message = answered["message"].as_str().unwrap_or_default();
+        assert_eq!(
+            message,
+            state::parameter_group_not_found_message(),
+            "case {absent:?}: expected the not-found template, got {message:?}"
+        );
+
+        // The path that changes a group resolves such a name too, and names it in its own
+        // not-found template.
+        let (status, answered) = call(
+            &router,
+            "UpdateParameterGroup",
+            json!({
+                "ParameterGroupName": absent,
+                "ParameterNameValues": name_values(&pairs),
+            }),
+        )
+        .await;
+        assert_eq!(
+            error_code(&answered).as_str(),
+            "ParameterGroupNotFoundFault",
+            "case {absent:?}: expected the not-found refusal, got {status} {answered:?}"
+        );
+        assert_eq!(
+            answered["message"].as_str().unwrap_or_default(),
+            state::parameter_group_not_found_named_message(absent),
+            "case {absent:?}: expected the update path's template, got {answered:?}"
+        );
+    }
+
+    // And a group the caller creates under a valid identifier is the caller's to change
+    // and to remove: the rule refuses names, not these operations.
+    for created in ["b", "Removable-group9", "a-rather-long-but-valid-name-0123"] {
+        let (status, body) = call(
+            &router,
+            "CreateParameterGroup",
+            json!({ "ParameterGroupName": created }),
+        )
+        .await;
+        assert_eq!(status, 200, "case {created:?}: create got {status} {body:?}");
+        let (status, body) = call(
+            &router,
+            "UpdateParameterGroup",
+            json!({
+                "ParameterGroupName": created,
+                "ParameterNameValues": name_values(&pairs),
+            }),
+        )
+        .await;
+        assert_eq!(status, 200, "case {created:?}: update got {status} {body:?}");
+        let (status, body) = call(
+            &router,
+            "DeleteParameterGroup",
+            json!({ "ParameterGroupName": created }),
+        )
+        .await;
+        assert_eq!(status, 200, "case {created:?}: delete got {status} {body:?}");
+    }
 }
 
 /// "You cannot delete a parameter group if it is associated with any DAX clusters"
@@ -1201,12 +1480,13 @@ async fn updating_a_parameter_group_that_does_not_exist_is_refused() {
         "1000".to_string(),
     )];
     // Absent names spanning the class: never created, one that differs only in case from
-    // a stored one, the empty name, one a single character off, and one whose group was
-    // just deleted.
+    // a stored one, one a single character off, and one whose group was just deleted. The
+    // empty name is not among them: it is not an identifier, so an update naming it is
+    // refused on that rule before the store is consulted
+    // (`creating_or_changing_a_parameter_group_named_by_a_non_identifier_is_refused`).
     for absent in [
         "never-created",
         "STORED-GROUP",
-        "",
         "stored-grou",
         "deleted-group",
     ] {

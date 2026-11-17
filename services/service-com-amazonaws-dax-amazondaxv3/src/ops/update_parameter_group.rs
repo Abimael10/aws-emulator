@@ -10,6 +10,12 @@
 //! named twice, or more names than one request may carry leaves every stored value as it
 //! was.
 //!
+//! The name a request addresses the group to change by is read as a parameter-group
+//! IDENTIFIER (`crate::state::is_parameter_group_identifier`), before the rest of the
+//! request and before the store is consulted for it, so a name that is not one is refused
+//! with 400 `InvalidParameterValueException` carrying the identifier rule itself — which
+//! is why a group this service PROVIDES, named `default.<family>`, cannot be changed.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -153,6 +159,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::store(&*self.engine, Self::NAME)?;
         let now = ::std::time::SystemTime::now();
 
+        // The name the group to change is addressed by is read as a parameter-group
+        // identifier, before the rest of the request and before this store is consulted
+        // for it: a name that is not one names nothing this service could have stored, so
+        // it is refused on the rule it breaks. It is why a group this SERVICE provides
+        // cannot be changed — it is named `default.` followed by its family, and a dot is
+        // not an identifier character.
+        if !crate::state::is_parameter_group_identifier(&input.parameter_group_name) {
+            return Err(
+                UpdateParameterGroupErrorModeled::InvalidParameterValueException(
+                    crate::state::parameter_group_name_not_an_identifier(),
+                )
+                .into(),
+            );
+        }
+
         // "You can modify up to 20 parameters in a single request": a longer list asks
         // for more than this operation accepts, so it is refused before anything is read.
         if input.parameter_name_values.len() > crate::state::MAX_PARAMETERS_PER_UPDATE {
@@ -197,18 +218,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-        // A parameter group AWS provides carries the family's own defaults, so it is not
-        // the caller's to change — as it is not the caller's to delete.
-        if group.default_group {
-            return Err(
-                UpdateParameterGroupErrorModeled::InvalidParameterValueException(
-                    InvalidParameterValueException {
-                        message: Some("Default parameter group cannot be modified.".to_string()),
-                    },
-                )
-                .into(),
-            );
-        }
 
         // Resolve the WHOLE request against the catalog first and only then write, so a
         // request carrying one unacceptable pair changes nothing at all.

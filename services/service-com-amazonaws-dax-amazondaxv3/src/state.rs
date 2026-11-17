@@ -1037,6 +1037,42 @@ pub fn parameter_group_not_found_message() -> String {
     "Parameter Group not found.".to_string()
 }
 
+/// The message a request that CREATES or CHANGES a parameter group is refused with when
+/// the name it addresses the group by is not a valid parameter-group identifier.
+///
+/// The name is read as an IDENTIFIER: it "must begin with a letter; must contain only ASCII
+/// letters, digits, and hyphens; and must not end with a hyphen or contain two consecutive
+/// hyphens" ([`is_parameter_group_identifier`]), and the member the validation reports is
+/// the parameter-group name member of the parameter-group API this service's control plane
+/// shares (`CacheParameterGroupName`). The text is ENTIRELY fixed: it states the rule that
+/// was broken and interpolates nothing from the request, so a caller is told WHY the name
+/// was rejected rather than being handed its own input back.
+pub const PARAMETER_GROUP_NAME_NOT_AN_IDENTIFIER_MESSAGE: &str =
+    "The parameter CacheParameterGroupName is not a valid identifier. Identifiers must \
+     begin with a letter; must contain only ASCII letters, digits, and hyphens; and must \
+     not end with a hyphen or contain two consecutive hyphens.";
+
+/// Whether `name` is a valid parameter-group identifier, which is the rule
+/// [`PARAMETER_GROUP_NAME_NOT_AN_IDENTIFIER_MESSAGE`] states: it must begin with a letter,
+/// carry only ASCII letters, digits and hyphens, not end with a hyphen and not contain two
+/// consecutive hyphens. The empty name the model's `@required` admits begins with no
+/// letter, so it is not one either.
+///
+/// A request that CREATES a parameter group or CHANGES one is read this way BEFORE the
+/// store is consulted, so such a name is refused on the rule it breaks rather than on what
+/// the store happens to hold under it. A request that READS a group is not: the group this
+/// service provides is named `default.` followed by its family
+/// ([`DEFAULT_PARAMETER_GROUP`]), so it is described and its parameters listed under a name
+/// that is NOT an identifier — and that same dot is why nothing about it can be changed.
+pub fn is_parameter_group_identifier(name: &str) -> bool {
+    name.starts_with(|first: char| first.is_ascii_alphabetic())
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-')
+        && !name.ends_with('-')
+        && !name.contains("--")
+}
+
 /// The message `ParameterGroupNotFoundFault` carries when a request names a parameter
 /// group it MODIFIES THROUGH — a cluster's `ParameterGroupName`, or the group an
 /// `UpdateParameterGroup` changes the parameters of: the fixed text
@@ -1218,6 +1254,16 @@ pub fn parameter_group_not_found() -> ParameterGroupNotFoundFault {
 pub fn parameter_group_not_found_named(name: &str) -> ParameterGroupNotFoundFault {
     ParameterGroupNotFoundFault {
         message: Some(parameter_group_not_found_named_message(name)),
+    }
+}
+
+/// `InvalidParameterValueException` for a request that asks to CREATE a parameter group,
+/// or to CHANGE one, under a name which is not a valid parameter-group identifier
+/// ([`is_parameter_group_identifier`]), carrying
+/// [`PARAMETER_GROUP_NAME_NOT_AN_IDENTIFIER_MESSAGE`].
+pub fn parameter_group_name_not_an_identifier() -> InvalidParameterValueException {
+    InvalidParameterValueException {
+        message: Some(PARAMETER_GROUP_NAME_NOT_AN_IDENTIFIER_MESSAGE.to_string()),
     }
 }
 

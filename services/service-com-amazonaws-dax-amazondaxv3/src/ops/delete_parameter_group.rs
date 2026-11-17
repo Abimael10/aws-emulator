@@ -4,7 +4,10 @@
 //!
 //! Removes a stored parameter group, so a later `DescribeParameterGroups` no longer
 //! reports it. Two refusals keep the store consistent, and neither writes anything: the
-//! default group DAX provides is not deletable (`InvalidParameterValueException`), and
+//! name the group to remove is addressed by is read as a parameter-group identifier
+//! (`crate::state::is_parameter_group_identifier`) before the store is consulted, so a
+//! name that is not one — the `default.<family>` name of a group this service provides
+//! included — is refused with `InvalidParameterValueException` carrying that rule, and
 //! "You cannot delete a parameter group if it is associated with any DAX clusters"
 //! (`InvalidParameterGroupStateFault`). An unknown name answers
 //! `ParameterGroupNotFoundFault`.
@@ -153,28 +156,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::store(&*self.engine, Self::NAME)?;
         let now = ::std::time::SystemTime::now();
 
+        // The name the group to remove is addressed by is read as a parameter-group
+        // identifier, before this store is consulted for it at all: a name that is not one
+        // names nothing this service could have stored, so it is refused on the rule it
+        // breaks rather than on what the store holds. It is why a group this SERVICE
+        // provides cannot be removed — it is named `default.` followed by its family, and a
+        // dot is not an identifier character.
+        if !crate::state::is_parameter_group_identifier(&input.parameter_group_name) {
+            return Err(
+                DeleteParameterGroupErrorModeled::InvalidParameterValueException(
+                    crate::state::parameter_group_name_not_an_identifier(),
+                )
+                .into(),
+            );
+        }
+
         let mut store = state.lock();
         // The clock's due cluster transitions first: a cluster whose deletion was
         // already owed holds nothing any more.
         store.settle_due(now);
 
-        let Some(group) = store.parameter_groups.get(&input.parameter_group_name) else {
+        if !store
+            .parameter_groups
+            .contains_key(&input.parameter_group_name)
+        {
             return Err(
                 DeleteParameterGroupErrorModeled::ParameterGroupNotFoundFault(
                     crate::state::parameter_group_not_found(),
-                )
-                .into(),
-            );
-        };
-        // A parameter group AWS provides is not the caller's to remove.
-        if group.default_group {
-            return Err(
-                DeleteParameterGroupErrorModeled::InvalidParameterValueException(
-                    InvalidParameterValueException {
-                        message: Some(
-                            "Default parameter group cannot be deleted.".to_string(),
-                        ),
-                    },
                 )
                 .into(),
             );
