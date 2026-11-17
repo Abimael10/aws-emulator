@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutAttributes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutAttributes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutAttributes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes the attributes each entry names onto the resource of one cluster it names — "if
+//! the attribute doesn't exist, it's created. If the attribute exists, its value is
+//! replaced with the specified value" — and reports what it applied. A MUTATION, bounded
+//! by the ceiling the API states for the RESOURCE: a resource carries at most
+//! [`crate::state::MAX_CUSTOM_ATTRIBUTES_PER_TARGET`] of the caller's own custom
+//! attributes, and a write that would take one past it is refused with
+//! `AttributeLimitExceededException` and applies nothing at all.
 //!
 //! ## Shape of an operation
 //!
@@ -91,6 +89,34 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The refusal every unusable `attributes` entry of this operation carries: "The specified
+/// parameter isn't valid" is the condition each of them meets, so the error is built in one
+/// place and only the sentence differs.
+fn invalid_parameter(message: String) -> PutAttributesError {
+    PutAttributesErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled refusal an `attributes` entry that names no reachable resource earns, from
+/// the shared resolution's reading of why ([`crate::state::resolve_attribute_targets`]).
+fn attribute_target_refusal(
+    refusal: crate::state::AttributeTargetRefusal,
+) -> PutAttributesError {
+    match refusal {
+        crate::state::AttributeTargetRefusal::InvalidParameter(message) => {
+            invalid_parameter(message)
+        }
+        crate::state::AttributeTargetRefusal::TargetNotFound => {
+            PutAttributesErrorModeled::TargetNotFoundException(TargetNotFoundException {
+                message: Some(crate::state::TARGET_NOT_FOUND_MESSAGE.to_string()),
+            })
+            .into()
+        }
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -165,18 +191,198 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutAttributes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutAttributesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutAttributesErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx);
+        // "If you do not specify a cluster, the default cluster is assumed."
+        // An ARN is a WHOLE identifier, Region and account included, so both segments are
+        // checked before the identifier is resolved
+        // ([`crate::state::request_arn_violation`]).
+        if let Some(message) = crate::state::request_arn_violation(ctx, input.cluster.as_deref()) {
+            return Err(invalid_parameter(message.to_string()));
+        }
+
+        let cluster_name = crate::state::cluster_name_from_reference(input.cluster.as_deref());
+
+        // "You can specify up to 10 attributes in a single call."
+        if input.attributes.len() > crate::state::MAX_ATTRIBUTES_PER_REQUEST {
+            return Err(invalid_parameter(crate::state::at_most_items_message(
+                "attributes",
+                crate::state::MAX_ATTRIBUTES_PER_REQUEST,
+            )));
+        }
+
+        // The capacity the account's Amazon EC2 instances owe this cluster: an instance
+        // launched into it was registered by the agent on it at the instant that fell due,
+        // whether or not anybody called, so a resource of the cluster this write addresses
+        // is there to be written to ([`crate::state::settle_ec2_capacity`]). Taken with NO
+        // guard of this store held, since it reads the Amazon EC2 store under that store's
+        // own lock.
+        let now = ::std::time::SystemTime::now();
+        crate::state::settle_ec2_capacity(&*self.engine, now);
+
+        let mut guard = state.lock();
+        guard.advance_clock(now);
+
+        if !guard.has_active_cluster(&cluster_name) {
+            return Err(PutAttributesErrorModeled::ClusterNotFoundException(
+                ClusterNotFoundException {
+                    message: Some(crate::state::cluster_refusal_message(
+                        guard.clusters.get(&cluster_name),
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Every entry is read and its target resolved BEFORE anything is written, so a
+        // request carrying one unusable entry applies none of them. The resolution is the
+        // one the delete makes too ([`crate::state::resolve_attribute_targets`]).
+        for attribute in &input.attributes {
+            // A write STORES what the entry carries, so the name and the value have to be
+            // ones their members admit ([`crate::state::attribute_name_violation`]).
+            if let Some(message) = crate::state::attribute_name_violation(&attribute.name) {
+                return Err(invalid_parameter(message));
+            }
+            if let Some(message) = attribute
+                .value
+                .as_deref()
+                .and_then(crate::state::attribute_value_violation)
+            {
+                return Err(invalid_parameter(message));
+            }
+        }
+        let targets = crate::state::resolve_attribute_targets(
+            &guard,
+            &region,
+            &cluster_name,
+            &input.attributes,
+        )
+        .map_err(attribute_target_refusal)?;
+        let writes: Vec<(String, Attribute)> = targets
+            .into_iter()
+            .zip(input.attributes.iter())
+            .map(|(arn, attribute)| {
+                (
+                    arn,
+                    Attribute {
+                        name: attribute.name.clone(),
+                        value: attribute.value.clone(),
+                        // An attribute is stored against the resource it is on, so the
+                        // stored copy carries no target of its own: the reads report the
+                        // resource's own ARN beside it.
+                        target_type: None,
+                        target_id: None,
+                    },
+                )
+            })
+            .collect();
+
+        // The ceiling the API states for the RESOURCE: "You can apply up to 10 custom
+        // attributes for each resource" (`AttributeLimitExceededException`). An attribute
+        // is identified by the resource it is on and its NAME — writing one that is
+        // already there "replaces" its value rather than adding a second — so what is
+        // counted is the SET of custom names the resource would carry once this call was
+        // applied, and the attributes Amazon ECS publishes about the resource itself do
+        // not consume it ([`crate::state::is_custom_attribute_name`]).
+        let mut targets: Vec<&str> = Vec::new();
+        for (arn, _) in &writes {
+            if !targets.contains(&arn.as_str()) {
+                targets.push(arn.as_str());
+            }
+        }
+        for target in targets {
+            let mut carried: ::std::collections::BTreeSet<&str> = guard
+                .container_instances
+                .get(target)
+                .into_iter()
+                .flat_map(|instance| instance.attributes.iter())
+                .map(|stored| stored.name.as_str())
+                .collect();
+            carried.extend(
+                writes
+                    .iter()
+                    .filter(|(arn, _)| arn.as_str() == target)
+                    .map(|(_, attribute)| attribute.name.as_str()),
+            );
+            let custom = carried
+                .iter()
+                .filter(|name| crate::state::is_custom_attribute_name(name))
+                .count();
+            // The ceiling the API publishes, under the error it models for it.
+            if custom > crate::state::MAX_CUSTOM_ATTRIBUTES_PER_TARGET {
+                return Err(PutAttributesErrorModeled::AttributeLimitExceededException(
+                    AttributeLimitExceededException {
+                        message: Some(
+                            crate::state::ATTRIBUTE_LIMIT_EXCEEDED_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+            // And THIS emulator's own bound on the record, which keeps it finite for the
+            // names the published ceiling does not count
+            // ([`crate::state::MAX_ATTRIBUTES_PER_TARGET`]). Amazon ECS publishes no such
+            // bound, so the refusal is NOT the modelled sentence of the ceiling above: it is
+            // worded as this emulator's own, under the error for a condition the client's
+            // call caused that the API models no error for.
+            if carried.len() > crate::state::MAX_ATTRIBUTES_PER_TARGET {
+                return Err(PutAttributesErrorModeled::ClientException(ClientException {
+                    message: Some(crate::state::at_most_items_message(
+                        "attributes of a resource",
+                        crate::state::MAX_ATTRIBUTES_PER_TARGET,
+                    )),
+                })
+                .into());
+            }
+        }
+
+        // "If the attribute doesn't exist, it's created. If the attribute exists, its
+        // value is replaced with the specified value."
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutAttributes"))
+        // "The attributes applied to your resource": what is reported is what this call
+        // applied, against the full ARN of the resource it is on — the form
+        // `Attribute$targetType` is not required beside.
+        let mut applied: Vec<Attribute> = Vec::with_capacity(writes.len());
+        for (arn, attribute) in writes {
+            let instance = guard
+                .container_instances
+                .get_mut(&arn)
+                .expect("the ARN was just resolved out of the map under this lock");
+            let changed = match instance
+                .attributes
+                .iter_mut()
+                .find(|stored| stored.name == attribute.name)
+            {
+                Some(stored) => {
+                    let replaced = stored.value != attribute.value;
+                    stored.value = attribute.value.clone();
+                    replaced
+                }
+                None => {
+                    instance.attributes.push(attribute.clone());
+                    true
+                }
+            };
+            // `ContainerInstance$version`: "Every time a container instance experiences a
+            // change ... the version counter is incremented."
+            if changed {
+                instance.version += 1;
+            }
+            applied.push(Attribute {
+                name: attribute.name,
+                value: attribute.value,
+                target_type: None,
+                target_id: Some(arn),
+            });
+        }
+
+        Ok(PutAttributesOutput {
+            attributes: Some(applied),
+        })
     }
 }

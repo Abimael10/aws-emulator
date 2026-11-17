@@ -93,6 +93,24 @@ fn invalid_parameter(message: String) -> DeleteAttributesError {
     .into()
 }
 
+/// The modelled refusal an `attributes` entry that names no reachable resource earns, from
+/// the shared resolution's reading of why ([`crate::state::resolve_attribute_targets`]).
+fn attribute_target_refusal(
+    refusal: crate::state::AttributeTargetRefusal,
+) -> DeleteAttributesError {
+    match refusal {
+        crate::state::AttributeTargetRefusal::InvalidParameter(message) => {
+            invalid_parameter(message)
+        }
+        crate::state::AttributeTargetRefusal::TargetNotFound => {
+            DeleteAttributesErrorModeled::TargetNotFoundException(TargetNotFoundException {
+                message: Some(crate::state::TARGET_NOT_FOUND_MESSAGE.to_string()),
+            })
+            .into()
+        }
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -211,47 +229,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Every entry's target is resolved BEFORE anything is removed, so a request that
-        // names one resource this cluster does not hold deletes nothing at all.
-        let mut targeted: Vec<(String, String)> = Vec::with_capacity(input.attributes.len());
-        for attribute in &input.attributes {
-            // "For custom attributes, specify the attribute name and target ID": an entry
-            // with no target names no resource to delete the attribute from.
-            let target_id = attribute
-                .target_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|target_id| !target_id.is_empty())
-                .ok_or_else(|| {
-                    invalid_parameter(
-                        crate::state::ATTRIBUTE_TARGET_ID_REQUIRED_MESSAGE.to_string(),
-                    )
-                })?;
-            // `Attribute$targetType`: "This parameter is required if you use the short
-            // form ID for a resource instead of the full ARN."
-            if !target_id.starts_with("arn:") && attribute.target_type.is_none() {
-                return Err(invalid_parameter(
-                    crate::state::ATTRIBUTE_TARGET_TYPE_REQUIRED_MESSAGE.to_string(),
-                ));
-            }
-            // `TargetType` models ONE value, `container-instance`, and the schema refuses
-            // any other before this handler runs, so the resources an entry can name are
-            // the container instances REGISTERED into this cluster. A deregistered one is
-            // not among them — "Deregistering a container instance removes the instance
-            // from a cluster" — which is the same set `ListAttributes` reports.
-            let resolved = guard
-                .resolve_container_instance(&region, &cluster_name, target_id)
-                .filter(|instance| instance.is_registered())
-                .map(|instance| instance.arn.clone());
-            let Some(arn) = resolved else {
-                return Err(DeleteAttributesErrorModeled::TargetNotFoundException(
-                    TargetNotFoundException {
-                        message: Some(crate::state::TARGET_NOT_FOUND_MESSAGE.to_string()),
-                    },
-                )
-                .into());
-            };
-            targeted.push((arn, attribute.name.clone()));
-        }
+        // names one resource this cluster does not hold deletes nothing at all. The
+        // resolution is the one the write makes too
+        // ([`crate::state::resolve_attribute_targets`]).
+        let targeted: Vec<(String, String)> = crate::state::resolve_attribute_targets(
+            &guard,
+            &region,
+            &cluster_name,
+            &input.attributes,
+        )
+        .map_err(attribute_target_refusal)?
+        .into_iter()
+        .zip(input.attributes.iter())
+        .map(|(arn, attribute)| (arn, attribute.name.clone()))
+        .collect();
 
         // An attribute is identified by the resource it is on and its NAME — `PutAttributes`
         // describes writing one that is already there as "its value is replaced with the

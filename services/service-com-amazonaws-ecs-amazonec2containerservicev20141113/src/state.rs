@@ -1703,6 +1703,54 @@ pub const LOG_DRIVER_AWSLOGS: &str = "awslogs";
 /// specify up to 10 attributes in a single call"), so both read it from here.
 pub const MAX_ATTRIBUTES_PER_REQUEST: usize = 10;
 
+/// How many CUSTOM attributes ONE resource may carry at once.
+/// `AttributeLimitExceededException`: "You can apply up to 10 custom attributes for each
+/// resource" — the ceiling `PutAttributes$attributes` states for the resource rather than
+/// for the request ("You can specify up to 10 custom attributes for each resource").
+pub const MAX_CUSTOM_ATTRIBUTES_PER_TARGET: usize = 10;
+
+/// `AttributeLimitExceededException$message`: the ONE sentence Amazon ECS refuses a write
+/// that would take a resource past [`MAX_CUSTOM_ATTRIBUTES_PER_TARGET`] with. Fixed text,
+/// with no part read off the request or the store — the condition is the same for every
+/// resource that meets it.
+pub const ATTRIBUTE_LIMIT_EXCEEDED_MESSAGE: &str = "Attribute per target limit exceeded.";
+
+/// The namespaces Amazon ECS publishes its OWN attributes of a resource in: the built-in
+/// attributes of the machine a container instance runs on
+/// ([`ATTRIBUTE_AVAILABILITY_ZONE`], [`ATTRIBUTE_CPU_ARCHITECTURE`]) and the
+/// capabilities its agent reports
+/// ([`ATTRIBUTE_PRIVILEGED_CONTAINER`], [`ATTRIBUTE_ENV_FILES_S3`]) are each named under
+/// one of them, and nothing a caller writes to extend "the Amazon ECS data model by adding
+/// custom metadata to your resources" (`Attribute`) is.
+const SERVICE_ATTRIBUTE_NAMESPACES: [&str; 2] = ["ecs.", "com.amazonaws.ecs."];
+
+/// Whether an attribute named `name` is one of the CALLER's own custom attributes, as
+/// against one Amazon ECS publishes about the resource itself
+/// ([`SERVICE_ATTRIBUTE_NAMESPACES`]).
+///
+/// What [`MAX_CUSTOM_ATTRIBUTES_PER_TARGET`] bounds: the ceiling is stated for "custom
+/// attributes", so the attributes the service reports about a resource do not consume it —
+/// a container instance whose agent published its machine's built-ins still takes the full
+/// ten.
+pub fn is_custom_attribute_name(name: &str) -> bool {
+    !SERVICE_ATTRIBUTE_NAMESPACES
+        .iter()
+        .any(|namespace| name.starts_with(namespace))
+}
+
+/// How many attributes ONE resource may carry at once, counting the ones Amazon ECS
+/// publishes about it.
+///
+/// EMULATOR-CHOSEN, and far above both the ten custom attributes a caller's writes are
+/// bounded by ([`MAX_CUSTOM_ATTRIBUTES_PER_TARGET`]) and the built-ins and capabilities an
+/// agent publishes for a machine: what it keeps is a write loop over names in the service's
+/// own namespaces — which the published ceiling does not count — from growing ONE record
+/// without limit, the same reason every other caller-sized collection in this store is
+/// bounded. Amazon ECS publishes no such bound, so a write past it is refused as THIS
+/// emulator's own limit ([`at_most_items_message`]) rather than under the modelled sentence
+/// of the ceiling above.
+pub const MAX_ATTRIBUTES_PER_TARGET: usize = 200;
+
 /// `TargetNotFoundException$message`: the shape's own doc sentence, which names no
 /// target (`smithy_query` query="shape" shape="TargetNotFoundException"). No recording
 /// fixes this one; what the rule fixes is that the sentence is the SAME for every
@@ -1722,6 +1770,111 @@ pub const ATTRIBUTE_TARGET_ID_REQUIRED_MESSAGE: &str =
 /// ARN."
 pub const ATTRIBUTE_TARGET_TYPE_REQUIRED_MESSAGE: &str =
     "attributes.targetType is required when targetId is the short form id of a resource";
+
+/// How long `Attribute$name` and `Attribute$value` may each be: both members document
+/// "must contain between 1 and 128 characters".
+pub const MAX_ATTRIBUTE_TEXT_LENGTH: usize = 128;
+
+/// The rule `Attribute$name` states, as a refusal quotes it: "The `name` must contain
+/// between 1 and 128 characters. The name may contain letters (uppercase and lowercase),
+/// numbers, hyphens (-), underscores (_), forward slashes (/), back slashes (\), or
+/// periods (.)."
+pub const ATTRIBUTE_NAME_PATTERN: &str = r"^[a-zA-Z0-9\-_/\\.]{1,128}$";
+
+/// The rule `Attribute$value` states: "The `value` must contain between 1 and 128
+/// characters. It can contain letters (uppercase and lowercase), numbers, hyphens (-),
+/// underscores (_), periods (.), at signs (@), forward slashes (/), back slashes (\),
+/// colons (:), or spaces. The value can't start or end with a space." — the space is in
+/// the set, and the ends are not it, which is what the two anchored classes say.
+pub const ATTRIBUTE_VALUE_PATTERN: &str =
+    r"^[a-zA-Z0-9\-_.@/\\:]([a-zA-Z0-9\-_.@/\\: ]{0,126}[a-zA-Z0-9\-_.@/\\:])?$";
+
+/// The refusal an attribute WRITE's `name` earns when it falls outside
+/// [`ATTRIBUTE_NAME_PATTERN`], or `None` when the member's documented rule accepts it. A
+/// write stores the name, so a name the member does not admit cannot be stored under it.
+pub fn attribute_name_violation(name: &str) -> Option<String> {
+    let legal = (1..=MAX_ATTRIBUTE_TEXT_LENGTH).contains(&name.chars().count())
+        && name
+            .chars()
+            .all(|letter| letter.is_ascii_alphanumeric() || r"-_/\.".contains(letter));
+    (!legal).then(|| pattern_message("attributes.name", ATTRIBUTE_NAME_PATTERN))
+}
+
+/// The same for an attribute write's `value`, under [`ATTRIBUTE_VALUE_PATTERN`]. An
+/// attribute carrying NO value at all is a different thing from one carrying an unusable
+/// one — `DeleteAttributes$attributes` has the caller "not specify the value" — so this is
+/// read only for a value the request did carry.
+pub fn attribute_value_violation(value: &str) -> Option<String> {
+    let legal = (1..=MAX_ATTRIBUTE_TEXT_LENGTH).contains(&value.chars().count())
+        && value
+            .chars()
+            .all(|letter| letter.is_ascii_alphanumeric() || r"-_.@/\: ".contains(letter))
+        && !value.starts_with(' ')
+        && !value.ends_with(' ');
+    (!legal).then(|| pattern_message("attributes.value", ATTRIBUTE_VALUE_PATTERN))
+}
+
+/// Why an entry of an attribute WRITE or DELETE names no resource this request can reach:
+/// the two conditions both operations refuse such an entry under, so each states them the
+/// same way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttributeTargetRefusal {
+    /// The entry is unusable as written — it names no target, or names one by short form id
+    /// with no `targetType` beside it. `InvalidParameterException`, with this sentence.
+    InvalidParameter(String),
+    /// The entry names a resource the cluster does not hold: `TargetNotFoundException`,
+    /// whose sentence is [`TARGET_NOT_FOUND_MESSAGE`].
+    TargetNotFound,
+}
+
+/// The stored container instance each entry of `attributes` names, by ARN and in the order
+/// the entries were given, or the refusal the FIRST unusable entry earns.
+///
+/// The ONE resolution of the `Attributes` member against this store, shared by the write and
+/// the delete: both take the same list, scope it to the same cluster and refuse the same
+/// entries, so an entry that one of them accepts cannot be one the other rejects. Every
+/// entry is resolved BEFORE either operation touches the store, which is what lets a request
+/// carrying one unusable entry change nothing at all.
+///
+/// `Attribute$targetId` ("You can specify the short form ID for a resource or the full
+/// Amazon Resource Name (ARN)") and `Attribute$targetType` ("This parameter is required if
+/// you use the short form ID for a resource instead of the full ARN") are the two forms;
+/// `TargetType` models ONE value, `container-instance`, and the schema refuses any other
+/// before a handler runs, so the resources an entry can name are the container instances
+/// REGISTERED into this cluster — a deregistered one is not among them
+/// ("Deregistering a container instance removes the instance from a cluster"), which is the
+/// same set `ListAttributes` reports.
+pub fn resolve_attribute_targets(
+    store: &ComAmazonawsEcsAmazonec2containerservicev20141113State,
+    region: &str,
+    cluster_name: &str,
+    attributes: &[Attribute],
+) -> Result<Vec<String>, AttributeTargetRefusal> {
+    let mut resolved = Vec::with_capacity(attributes.len());
+    for attribute in attributes {
+        let target_id = attribute
+            .target_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|target_id| !target_id.is_empty())
+            .ok_or_else(|| {
+                AttributeTargetRefusal::InvalidParameter(
+                    ATTRIBUTE_TARGET_ID_REQUIRED_MESSAGE.to_string(),
+                )
+            })?;
+        if !target_id.starts_with("arn:") && attribute.target_type.is_none() {
+            return Err(AttributeTargetRefusal::InvalidParameter(
+                ATTRIBUTE_TARGET_TYPE_REQUIRED_MESSAGE.to_string(),
+            ));
+        }
+        let instance = store
+            .resolve_container_instance(region, cluster_name, target_id)
+            .filter(|instance| instance.is_registered())
+            .ok_or(AttributeTargetRefusal::TargetNotFound)?;
+        resolved.push(instance.arn.clone());
+    }
+    Ok(resolved)
+}
 
 /// `healthStatus` this emulator reports. The `Container$healthStatus` doc: "If health
 /// checks aren't configured for this container in its task definition, then it reports

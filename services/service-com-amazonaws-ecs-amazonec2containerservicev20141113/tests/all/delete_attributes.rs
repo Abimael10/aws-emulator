@@ -31,6 +31,34 @@
 //!   ... the version counter is incremented."
 //! * `DeregisterContainerInstance`: "Deregistering a container instance removes the
 //!   instance from a cluster."
+//!
+//! # The attribute WRITE, and the ceiling it is bounded by
+//!
+//! `PutAttributes` is the other half of the same mutation pair, and its own rule is only
+//! observable through this one: a resource carries at most ten of the CALLER's custom
+//! attributes ("you can apply up to 10 custom attributes for each resource",
+//! `AttributeLimitExceededException`), a write that would take it past that count is refused
+//! with HTTP 400 `AttributeLimitExceededException` and applies nothing, and a slot freed
+//! with `DeleteAttributes` takes the refused write. The suites at the end of this file pin
+//! that rule and every request `PutAttributes` refuses; they share this file rather than
+//! taking a `put_attributes.rs` of their own because this crate's `tests/all.rs` is a
+//! hand-maintained declaration list that a new suite file would have to be added to.
+//!
+//! * `PutAttributes`: "Create or update an attribute on an Amazon ECS resource. If the
+//!   attribute doesn't exist, it's created. If the attribute exists, its value is replaced
+//!   with the specified value."
+//! * `PutAttributes$attributes`: "You can specify up to 10 custom attributes for each
+//!   resource. You can specify up to 10 attributes in a single call."
+//! * `PutAttributesResponse$attributes`: "The attributes applied to your resource."
+//! * `Attribute`: "Use attributes to extend the Amazon ECS data model by adding custom
+//!   metadata to your resources."
+//! * `Attribute$name`: "The `name` must contain between 1 and 128 characters. The name may
+//!   contain letters (uppercase and lowercase), numbers, hyphens (-), underscores (_),
+//!   forward slashes (/), back slashes (\), or periods (.)."
+//! * `Attribute$value`: "The `value` must contain between 1 and 128 characters. It can
+//!   contain letters (uppercase and lowercase), numbers, hyphens (-), underscores (_),
+//!   periods (.), at signs (@), forward slashes (/), back slashes (\), colons (:), or
+//!   spaces. The value can't start or end with a space."
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -574,5 +602,654 @@ async fn an_unusable_request_is_refused_and_deletes_nothing() {
         listed,
         seeded_listing(&arn, &[]),
         "case {case:?}: expected a refused request to delete nothing, got {listed:?}"
+    );
+}
+
+/// How many CUSTOM attributes one resource may carry: "You can apply up to 10 custom
+/// attributes for each resource" (`AttributeLimitExceededException`).
+const CEILING: usize = 10;
+
+/// The sentence `AttributeLimitExceededException` carries, whichever resource the write
+/// addressed: fixed text, with no part read off the request or the store.
+const LIMIT_EXCEEDED: &str = "Attribute per target limit exceeded.";
+
+/// The names of the attributes a fresh registration carries, as the agent publishes them,
+/// read through this crate's own reading of which names are the CALLER's
+/// (`state::is_custom_attribute_name`) rather than through a second copy of that rule.
+fn is_custom_attribute(name: &str) -> bool {
+    service_com_amazonaws_ecs_amazonec2containerservicev20141113::state::is_custom_attribute_name(
+        name,
+    )
+}
+
+/// The sentence a `name` outside the rule `Attribute$name` documents is refused with.
+const NAME_PATTERN_MESSAGE: &str = r"attributes.name must match ^[a-zA-Z0-9\-_/\\.]{1,128}$";
+
+/// The same for a `value` outside the rule `Attribute$value` documents.
+const VALUE_PATTERN_MESSAGE: &str = concat!(
+    r"attributes.value must match ",
+    r"^[a-zA-Z0-9\-_.@/\\:]([a-zA-Z0-9\-_.@/\\: ]{0,126}[a-zA-Z0-9\-_.@/\\:])?$",
+);
+
+/// The attributes the agent of a fresh registration publishes about the machine it runs on:
+/// every one of them in Amazon ECS's own namespaces, so none is a custom attribute.
+fn published() -> Value {
+    json!([
+        { "name": "ecs.instance-type", "value": "t3.micro" },
+        { "name": "ecs.availability-zone", "value": "us-west-2a" },
+        { "name": "ecs.os-type", "value": "linux" },
+        { "name": "com.amazonaws.ecs.capability.privileged-container" },
+    ])
+}
+
+/// The CUSTOM attributes `ListAttributes` reports for the resource at `arn`, as name and
+/// value, in name order — walked page by page, so a listing longer than one page cannot
+/// hide one.
+async fn custom_attributes(
+    router: &MultiServiceRouter,
+    arn: &str,
+    case: &str,
+) -> Vec<(String, String)> {
+    let mut custom: Vec<(String, String)> = Vec::new();
+    let mut token: Option<String> = None;
+    for _ in 0..50 {
+        let mut request = json!({ "cluster": CLUSTER, "targetType": "container-instance" });
+        if let Some(token) = &token {
+            request["nextToken"] = json!(token);
+        }
+        let (listed, next) = list_attributes(router, request, case).await;
+        custom.extend(
+            listed
+                .into_iter()
+                .filter(|(target_id, name, _)| target_id == arn && is_custom_attribute(name))
+                .map(|(_, name, value)| (name, value)),
+        );
+        match next {
+            Some(next) => token = Some(next),
+            None => {
+                custom.sort();
+                return custom;
+            }
+        }
+    }
+    panic!("case {case:?}: the listing of {CLUSTER:?} did not terminate");
+}
+
+/// The attributes one `PutAttributes` reports as applied, each reduced to the target ARN,
+/// the name and the value a client keys on — the same shape [`crate::list_attributes`]
+/// reduces a listing to.
+///
+/// Every entry is checked to carry no `targetType`: the response names its target by full
+/// ARN, which is the form `Attribute$targetType` is NOT required beside.
+async fn put_attributes(router: &MultiServiceRouter, request: Value, case: &str) -> Vec<Listed> {
+    let body = ok(router, "PutAttributes", request, case).await;
+    let mut applied: Vec<Listed> = list(&body, "attributes", case)
+        .iter()
+        .map(|attribute| {
+            assert!(
+                attribute.get("targetType").and_then(Value::as_str).is_none(),
+                "case {case:?}: expected no targetType beside a full-ARN targetId, \
+                 got {attribute}"
+            );
+            let target_id = attribute["targetId"]
+                .as_str()
+                .unwrap_or_else(|| panic!("case {case:?}: expected a targetId, got {attribute}"))
+                .to_string();
+            let name = attribute["name"]
+                .as_str()
+                .unwrap_or_else(|| panic!("case {case:?}: expected a name, got {attribute}"))
+                .to_string();
+            let value = attribute["value"].as_str().unwrap_or_default().to_string();
+            (target_id, name, value)
+        })
+        .collect();
+    applied.sort();
+    applied
+}
+
+/// The name and the value of the `index`th attribute a write row applies.
+fn probe(index: usize) -> (String, String) {
+    (format!("probe-{index}"), format!("v{index}"))
+}
+
+/// One row of the attribute-WRITE table: how its ten custom attributes are spread over
+/// calls, and which of the two documented forms its entries name the target in.
+struct WriteRow {
+    case: &'static str,
+    /// The EC2 instance the row's own container instance is registered for.
+    instance_id: &'static str,
+    /// How many of the ten each successive `PutAttributes` carries; the batches sum to ten.
+    batches: &'static [usize],
+    /// Whether the entries name the target by its short form id (with a `targetType` beside
+    /// it) rather than by its full ARN.
+    by_short_id: bool,
+}
+
+/// The rows differ along what the rule generalises over: how many calls the ten attributes
+/// arrive in (one call carrying the documented per-call bound, one at a time, and two
+/// uneven batches either way round) and the form the entry names its target in.
+const WRITE_ROWS: [WriteRow; 4] = [
+    WriteRow {
+        case: "ten in one call, the target named by full ARN",
+        instance_id: "i-0a110000000000001",
+        batches: &[10],
+        by_short_id: false,
+    },
+    WriteRow {
+        case: "ten written one at a time, the target named by short form id",
+        instance_id: "i-0a110000000000002",
+        batches: &[1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+        by_short_id: true,
+    },
+    WriteRow {
+        case: "ten in two uneven batches, the target named by full ARN",
+        instance_id: "i-0a110000000000003",
+        batches: &[4, 6],
+        by_short_id: false,
+    },
+    WriteRow {
+        case: "ten in two batches the other way round, by short form id",
+        instance_id: "i-0a110000000000004",
+        batches: &[7, 3],
+        by_short_id: true,
+    },
+];
+
+impl WriteRow {
+    /// One `attributes` entry of this row: the target named the way the row names it.
+    fn entry(&self, target: &str, name: &str, value: &str) -> Value {
+        if self.by_short_id {
+            json!({
+                "name": name,
+                "value": value,
+                "targetId": short_id(target),
+                "targetType": "container-instance",
+            })
+        } else {
+            json!({ "name": name, "value": value, "targetId": target })
+        }
+    }
+}
+
+#[tokio::test]
+async fn ten_custom_attributes_apply_to_one_target_and_an_eleventh_is_refused() {
+    for row in WRITE_ROWS {
+        let case = row.case;
+        let router = service();
+        create_cluster(&router, CLUSTER, case).await;
+        let arn =
+            register_with_attributes(&router, CLUSTER, row.instance_id, &published(), case).await;
+
+        // The attributes the agent published are in Amazon ECS's own namespaces, so the
+        // resource starts with no CUSTOM attribute and the full ten are available.
+        let custom = custom_attributes(&router, &arn, case).await;
+        assert!(
+            custom.is_empty(),
+            "case {case:?}: expected a fresh registration to carry no custom attribute, \
+             got {custom:?}"
+        );
+
+        let mut written = 0_usize;
+        let mut expected: Vec<(String, String)> = Vec::new();
+        for size in row.batches.iter().copied() {
+            let entries: Vec<Value> = (1..=size)
+                .map(|offset| {
+                    let (name, value) = probe(written + offset);
+                    expected.push((name.clone(), value.clone()));
+                    row.entry(&arn, &name, &value)
+                })
+                .collect();
+            let applied = put_attributes(
+                &router,
+                json!({ "cluster": CLUSTER, "attributes": entries }),
+                case,
+            )
+            .await;
+            let mut wanted: Vec<Listed> = (1..=size)
+                .map(|offset| {
+                    let (name, value) = probe(written + offset);
+                    (arn.clone(), name, value)
+                })
+                .collect();
+            wanted.sort();
+            assert_eq!(
+                applied, wanted,
+                "case {case:?}: expected the call to report the attributes it applied, \
+                 got {applied:?}"
+            );
+            written += size;
+        }
+        assert_eq!(
+            written, CEILING,
+            "case {case:?}: the row's batches write the ceiling, got {written}"
+        );
+        expected.sort();
+        let custom = custom_attributes(&router, &arn, case).await;
+        assert_eq!(
+            custom, expected,
+            "case {case:?}: expected the ten written attributes on the resource, got {custom:?}"
+        );
+        // The attributes the agent published are still there: a caller's writes do not
+        // replace what Amazon ECS reports about the resource.
+        let (_, version_before) = described(&router, &arn, case).await;
+
+        // One more CUSTOM attribute on the same resource is past the ceiling: refused, with
+        // nothing of the call applied — not the refused attribute, and not the version
+        // counter of the resource it addressed.
+        let (over_name, over_value) = probe(CEILING + 1);
+        let eleventh = json!({
+            "cluster": CLUSTER,
+            "attributes": [row.entry(&arn, &over_name, &over_value)],
+        });
+        let (code, message) = refusal(&router, "PutAttributes", eleventh.clone(), case).await;
+        assert_eq!(
+            (code.as_str(), message.as_str()),
+            ("AttributeLimitExceededException", LIMIT_EXCEEDED),
+            "case {case:?}: expected the documented refusal past the ceiling"
+        );
+        let after = custom_attributes(&router, &arn, case).await;
+        assert_eq!(
+            after, expected,
+            "case {case:?}: expected a refused write to apply nothing, got {after:?}"
+        );
+        let (_, version_after) = described(&router, &arn, case).await;
+        assert_eq!(
+            version_after, version_before,
+            "case {case:?}: expected a refused write to leave the resource unchanged, \
+             got version {version_after}"
+        );
+
+        // A write that REPLACES the value of one of the ten is not past the ceiling: "if the
+        // attribute exists, its value is replaced with the specified value", so the resource
+        // still carries ten.
+        let (replaced_name, _) = probe(3);
+        put_attributes(
+            &router,
+            json!({
+                "cluster": CLUSTER,
+                "attributes": [row.entry(&arn, &replaced_name, "replaced")],
+            }),
+            case,
+        )
+        .await;
+        for (name, value) in expected.iter_mut() {
+            if *name == replaced_name {
+                *value = "replaced".to_string();
+            }
+        }
+        let replaced = custom_attributes(&router, &arn, case).await;
+        assert_eq!(
+            replaced, expected,
+            "case {case:?}: expected the replacement to keep the resource at the ceiling, \
+             got {replaced:?}"
+        );
+
+        // And once `DeleteAttributes` frees exactly one slot, the identical write succeeds:
+        // "you can remove existing attributes on a resource with DeleteAttributes".
+        let (freed_name, _) = probe(5);
+        ok(
+            &router,
+            "DeleteAttributes",
+            json!({
+                "cluster": CLUSTER,
+                "attributes": [{ "name": freed_name, "targetId": arn }],
+            }),
+            case,
+        )
+        .await;
+        expected.retain(|(name, _)| *name != freed_name);
+        let applied = put_attributes(&router, eleventh, case).await;
+        assert_eq!(
+            applied,
+            vec![(arn.clone(), over_name.clone(), over_value.clone())],
+            "case {case:?}: expected the freed slot to take the write, got {applied:?}"
+        );
+        expected.push((over_name, over_value));
+        expected.sort();
+        let converged = custom_attributes(&router, &arn, case).await;
+        assert_eq!(
+            converged.len(),
+            CEILING,
+            "case {case:?}: expected the resource back at the ceiling, got {converged:?}"
+        );
+        assert_eq!(
+            converged, expected,
+            "case {case:?}: expected the deleted attribute absent and the new one present, \
+             got {converged:?}"
+        );
+
+        // The attributes the agent published are reported throughout: the ceiling bounds the
+        // caller's attributes, not what Amazon ECS says about the resource.
+        let (names, _) = described(&router, &arn, case).await;
+        for attribute in published().as_array().expect("the published set is a list") {
+            let name = attribute["name"]
+                .as_str()
+                .expect("each published attribute is named")
+                .to_string();
+            assert!(
+                names.contains(&name),
+                "case {case:?}: expected {name:?} to survive the caller's writes, got {names:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_write_in_the_services_own_namespace_cannot_grow_one_record_without_limit() {
+    let case = "the record's own bound";
+    let router = service();
+    create_cluster(&router, CLUSTER, case).await;
+    let arn =
+        register_with_attributes(&router, CLUSTER, "i-0a330000000000001", &published(), case).await;
+    let start = published().as_array().expect("the published set is a list").len();
+
+    // A name in Amazon ECS's own namespaces is not one of the caller's custom attributes, so
+    // the modelled ceiling does not count it — the record keeps its own bound instead, which
+    // a write loop reaches in calls of the documented ten.
+    let bound = service_com_amazonaws_ecs_amazonec2containerservicev20141113::state::MAX_ATTRIBUTES_PER_TARGET;
+    let mut written = start;
+    while written + CEILING <= bound {
+        let entries: Vec<Value> = (1..=CEILING)
+            .map(|offset| {
+                json!({
+                    "name": format!("ecs.probe-{}", written + offset),
+                    "value": "published",
+                    "targetId": arn,
+                })
+            })
+            .collect();
+        put_attributes(
+            &router,
+            json!({ "cluster": CLUSTER, "attributes": entries }),
+            case,
+        )
+        .await;
+        written += CEILING;
+    }
+    let (names, _) = described(&router, &arn, case).await;
+    assert_eq!(
+        names.len(),
+        written,
+        "case {case:?}: expected the record to hold every write up to its bound, got {}",
+        names.len()
+    );
+    // None of them consumed the modelled ceiling: the ten custom attributes still go on.
+    let custom = custom_attributes(&router, &arn, case).await;
+    assert!(
+        custom.is_empty(),
+        "case {case:?}: expected a write in the service's namespaces to leave the custom \
+         ceiling untouched, got {custom:?}"
+    );
+
+    // The write that would take the record past its bound is refused, and applies nothing.
+    let over: Vec<Value> = (1..=CEILING)
+        .map(|offset| {
+            json!({
+                "name": format!("ecs.probe-{}", written + offset),
+                "value": "published",
+                "targetId": arn,
+            })
+        })
+        .collect();
+    let (code, message) = refusal(
+        &router,
+        "PutAttributes",
+        json!({ "cluster": CLUSTER, "attributes": over }),
+        case,
+    )
+    .await;
+    assert_eq!(
+        (code.as_str(), message.as_str()),
+        (
+            "ClientException",
+            format!("attributes of a resource can have at most {bound} items.").as_str()
+        ),
+        "case {case:?}: expected the refusal of a write past the record's own bound"
+    );
+    let (after, _) = described(&router, &arn, case).await;
+    assert_eq!(
+        after.len(),
+        written,
+        "case {case:?}: expected a refused write to apply nothing, got {} attributes",
+        after.len()
+    );
+}
+
+#[tokio::test]
+async fn an_unusable_attribute_write_is_refused_and_applies_nothing() {
+    let case = "write refusals";
+    let router = service();
+    create_cluster(&router, CLUSTER, case).await;
+    let arn =
+        register_with_attributes(&router, CLUSTER, "i-0a220000000000001", &published(), case).await;
+
+    // A resource of ANOTHER cluster, and one this cluster no longer holds: neither is a
+    // target of a write addressed to `CLUSTER`.
+    create_cluster(&router, "other", case).await;
+    let other_arn = register_with_attributes(
+        &router,
+        "other",
+        "i-0a220000000000002",
+        &published(),
+        case,
+    )
+    .await;
+    let deregistered = register_with_attributes(
+        &router,
+        CLUSTER,
+        "i-0a220000000000003",
+        &published(),
+        case,
+    )
+    .await;
+    ok(
+        &router,
+        "DeregisterContainerInstance",
+        json!({ "cluster": CLUSTER, "containerInstance": deregistered }),
+        case,
+    )
+    .await;
+
+    // A cluster that is not there — including the default cluster, which this router has
+    // none of.
+    let missing: [(&str, Value); 3] = [
+        ("a cluster that was never created", json!("no-such-cluster")),
+        (
+            "a cluster ARN that names no cluster",
+            json!(format!(
+                "arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:cluster/no-such-cluster"
+            )),
+        ),
+        ("the assumed default cluster", Value::Null),
+    ];
+    for (row, cluster) in missing {
+        let mut request = json!({
+            "attributes": [{ "name": "stack", "value": "production", "targetId": arn }],
+        });
+        if let Value::String(cluster) = &cluster {
+            request["cluster"] = json!(cluster);
+        }
+        refused(
+            &router,
+            "PutAttributes",
+            request,
+            "ClusterNotFoundException",
+            row,
+        )
+        .await;
+    }
+
+    // The rows differ along what makes the request unusable: the SIZE of the list, the
+    // target an entry names (absent, blank, a short form id with no type, a resource of
+    // another cluster, one this cluster no longer holds, one nothing minted) and the NAME or
+    // VALUE it carries (empty, one character past the documented length, a character the
+    // member does not admit, a space at an end).
+    let too_many: Vec<Value> = (1..=CEILING + 1)
+        .map(|index| {
+            let (name, value) = probe(index);
+            json!({ "name": name, "value": value, "targetId": arn })
+        })
+        .collect();
+    let unusable: Vec<(String, Value, &str, String)> = vec![
+        (
+            "eleven attributes in a single call".to_string(),
+            json!(too_many),
+            "InvalidParameterException",
+            "attributes can have at most 10 items.".to_string(),
+        ),
+        (
+            "an entry that names no target".to_string(),
+            json!([{ "name": "stack", "value": "production" }]),
+            "InvalidParameterException",
+            "attributes.targetId is required to name the resource the attribute is on"
+                .to_string(),
+        ),
+        (
+            "an entry whose targetId is blank".to_string(),
+            json!([{
+                "name": "stack",
+                "value": "production",
+                "targetId": "   ",
+                "targetType": "container-instance",
+            }]),
+            "InvalidParameterException",
+            "attributes.targetId is required to name the resource the attribute is on"
+                .to_string(),
+        ),
+        (
+            "a short form id with no targetType".to_string(),
+            json!([{ "name": "stack", "value": "production", "targetId": short_id(&arn) }]),
+            "InvalidParameterException",
+            "attributes.targetType is required when targetId is the short form id of a resource"
+                .to_string(),
+        ),
+        (
+            "a container-instance ARN of another cluster".to_string(),
+            json!([{ "name": "stack", "value": "production", "targetId": other_arn }]),
+            "TargetNotFoundException",
+            TARGET_NOT_FOUND.to_string(),
+        ),
+        (
+            "a container-instance ARN this cluster no longer holds".to_string(),
+            json!([{ "name": "stack", "value": "production", "targetId": deregistered }]),
+            "TargetNotFoundException",
+            TARGET_NOT_FOUND.to_string(),
+        ),
+        (
+            "a container-instance ARN nothing minted".to_string(),
+            json!([{
+                "name": "stack",
+                "value": "production",
+                "targetId": format!(
+                    "arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:container-instance/{CLUSTER}/{}",
+                    "f".repeat(32)
+                ),
+            }]),
+            "TargetNotFoundException",
+            TARGET_NOT_FOUND.to_string(),
+        ),
+        (
+            "a short form id nothing minted".to_string(),
+            json!([{
+                "name": "stack",
+                "value": "production",
+                "targetId": "0".repeat(32),
+                "targetType": "container-instance",
+            }]),
+            "TargetNotFoundException",
+            TARGET_NOT_FOUND.to_string(),
+        ),
+        (
+            "a name with no character at all".to_string(),
+            json!([{ "name": "", "value": "production", "targetId": arn }]),
+            "InvalidParameterException",
+            NAME_PATTERN_MESSAGE.to_string(),
+        ),
+        (
+            "a name one character past its documented length".to_string(),
+            json!([{ "name": "n".repeat(129), "value": "production", "targetId": arn }]),
+            "InvalidParameterException",
+            NAME_PATTERN_MESSAGE.to_string(),
+        ),
+        (
+            "a name carrying a character the member does not admit".to_string(),
+            json!([{ "name": "stack tier", "value": "production", "targetId": arn }]),
+            "InvalidParameterException",
+            NAME_PATTERN_MESSAGE.to_string(),
+        ),
+        (
+            "a value with no character at all".to_string(),
+            json!([{ "name": "stack", "value": "", "targetId": arn }]),
+            "InvalidParameterException",
+            VALUE_PATTERN_MESSAGE.to_string(),
+        ),
+        (
+            "a value one character past its documented length".to_string(),
+            json!([{ "name": "stack", "value": "v".repeat(129), "targetId": arn }]),
+            "InvalidParameterException",
+            VALUE_PATTERN_MESSAGE.to_string(),
+        ),
+        (
+            "a value that starts with a space".to_string(),
+            json!([{ "name": "stack", "value": " production", "targetId": arn }]),
+            "InvalidParameterException",
+            VALUE_PATTERN_MESSAGE.to_string(),
+        ),
+        (
+            "a value carrying a character the member does not admit".to_string(),
+            json!([{ "name": "stack", "value": "production,staging", "targetId": arn }]),
+            "InvalidParameterException",
+            VALUE_PATTERN_MESSAGE.to_string(),
+        ),
+        (
+            "one usable entry beside an unusable one".to_string(),
+            json!([
+                { "name": "stack", "value": "production", "targetId": arn },
+                { "name": "tier", "value": "gpu", "targetId": other_arn },
+            ]),
+            "TargetNotFoundException",
+            TARGET_NOT_FOUND.to_string(),
+        ),
+    ];
+
+    for (row, attributes, expected_code, expected_message) in unusable {
+        let (code, message) = refusal(
+            &router,
+            "PutAttributes",
+            json!({ "cluster": CLUSTER, "attributes": attributes }),
+            &row,
+        )
+        .await;
+        assert_eq!(
+            (code.as_str(), message.as_str()),
+            (expected_code, expected_message.as_str()),
+            "case {row:?}: expected the documented refusal for this request"
+        );
+    }
+
+    // Every refusal above applied nothing, and the documented per-call bound is accepted
+    // afterwards.
+    let custom = custom_attributes(&router, &arn, case).await;
+    assert!(
+        custom.is_empty(),
+        "case {case:?}: expected a refused write to apply nothing, got {custom:?}"
+    );
+    let entries: Vec<Value> = (1..=CEILING)
+        .map(|index| {
+            let (name, value) = probe(index);
+            json!({ "name": name, "value": value, "targetId": arn })
+        })
+        .collect();
+    put_attributes(
+        &router,
+        json!({ "cluster": CLUSTER, "attributes": entries }),
+        case,
+    )
+    .await;
+    let applied = custom_attributes(&router, &arn, case).await;
+    assert_eq!(
+        applied.len(),
+        CEILING,
+        "case {case:?}: expected the documented bound to be accepted, got {applied:?}"
     );
 }
