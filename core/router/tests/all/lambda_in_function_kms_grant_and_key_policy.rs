@@ -48,6 +48,17 @@
 //! action of the service, none) and WHOSE access it denies (the function's role, another role) —
 //! each row probed on BOTH operations the handler performs, so a deny wider or narrower than the
 //! action it names fails here.
+//!
+//! The rows of the third test hold the denied ACTION fixed and differ along the two elements of the
+//! statement the second test keeps constant: WHICH spelling of the caller its `Principal` names —
+//! the execution role's own ARN, and the assumed-role session ARN the function's own calls are made
+//! as — and WHICH resources its `Resource` element covers: every resource, the key carrying the
+//! statement, a wildcard over this account's keys in any Region, and ANOTHER key of the account,
+//! which the request's key is not. Beside every row the same invocation probes an untouched control
+//! key, and the account's own credential asks both operations on each denied key afterwards: a deny
+//! reaches one principal, one action and one resource, so a key whose policy denies the role's
+//! decrypt still serves that role's encrypt on the same key, the control key, and the account the
+//! policy delegates to.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -1144,4 +1155,273 @@ async fn an_explicit_key_policy_deny_overrides_a_handlers_identity_allow() {
         "case {case:?}: expected the material the key holds, got {:?}",
         reports[0]
     );
+}
+
+/// Which resources one deny row's `Resource` element covers.
+enum DenyScope {
+    /// `"Resource": "*"` — every resource.
+    EveryResource,
+    /// The ARN of the key whose own policy carries the statement.
+    TheKeyItself,
+    /// A wildcard ARN over every key of this account, in any Region.
+    EveryKeyOfTheAccount,
+    /// The ARN of the control key, which the key carrying the statement is not — so the statement
+    /// does not cover the request at all.
+    AnotherKeyOfTheAccount,
+}
+
+/// How one deny row spells the principal it denies. Both spellings name the same caller: a call a
+/// function makes is made by a session of its execution role, and a session of a role is the role
+/// it is a session of.
+enum DenyPrincipal {
+    /// The execution role's own ARN, the spelling an operator copies out of IAM.
+    TheExecutionRole,
+    /// The assumed-role session ARN the function's own calls are made as.
+    TheSessionItself,
+}
+
+/// One row of the deny-scope table: how the statement on this row's key names the caller and which
+/// resources it covers, and so whether the handler's decrypt under that key is refused.
+struct ScopeRow {
+    case: &'static str,
+    principal: DenyPrincipal,
+    scope: DenyScope,
+    /// Whether the handler's decrypt under this row's key must be served.
+    decrypt_served: bool,
+}
+
+/// The deny-scope rows. Every row denies the SAME action to the SAME caller under a different
+/// spelling or resource scope, so what each one shows is how far that statement reaches.
+const SCOPE_ROWS: &[ScopeRow] = &[
+    ScopeRow {
+        case: "the execution role's own ARN, over every resource",
+        principal: DenyPrincipal::TheExecutionRole,
+        scope: DenyScope::EveryResource,
+        decrypt_served: false,
+    },
+    ScopeRow {
+        case: "the assumed-role session ARN the function calls as, over every resource",
+        principal: DenyPrincipal::TheSessionItself,
+        scope: DenyScope::EveryResource,
+        decrypt_served: false,
+    },
+    ScopeRow {
+        case: "the execution role's ARN, scoped to the key carrying the statement",
+        principal: DenyPrincipal::TheExecutionRole,
+        scope: DenyScope::TheKeyItself,
+        decrypt_served: false,
+    },
+    ScopeRow {
+        case: "the session ARN, scoped by a wildcard over the account's keys",
+        principal: DenyPrincipal::TheSessionItself,
+        scope: DenyScope::EveryKeyOfTheAccount,
+        decrypt_served: false,
+    },
+    ScopeRow {
+        case: "the execution role's ARN, scoped to another key of the account",
+        principal: DenyPrincipal::TheExecutionRole,
+        scope: DenyScope::AnotherKeyOfTheAccount,
+        decrypt_served: true,
+    },
+];
+
+/// RULE, the reach of the deny: an explicit `Deny` in a key's policy withholds the action it names
+/// from the principal it names on the resources it covers, and nothing else — so the handler's
+/// decrypt is refused under either spelling of its own identity and under every resource element
+/// that covers the key, served under one that covers only another key, and in every row its encrypt
+/// on that same key, its decrypt of an untouched control key, and the account's own two operations
+/// on the denied key are all still served.
+#[tokio::test]
+async fn a_key_policy_deny_reaches_only_the_principal_action_and_keys_it_names() {
+    let router = build_router();
+    let setup = "the deny-scope table's keys, role and function";
+    let role = "xsvc-in-fn-kms-scope-caller";
+    let function = "xsvc-in-fn-kms-scope-probe";
+
+    // The identity-based half allows both operations on every resource, so only a key's own
+    // document can refuse a call the handler makes.
+    let role_arn_minted = given_role(
+        &router,
+        setup,
+        role,
+        json!([
+            logs_only(),
+            {
+                "Effect": "Allow",
+                "Action": [DECRYPT_ACTION, ENCRYPT_ACTION],
+                "Resource": "*",
+            },
+        ]),
+    )
+    .await;
+    given_function(
+        &router,
+        setup,
+        "xsvc-in-fn-kms-scope-stack",
+        function,
+        &role_arn_minted,
+    )
+    .await;
+    let session = session_arn(role, function);
+
+    // The control key: no row ever writes a statement to its policy, so what decides a call on it
+    // is the delegation it was created with plus the role's identity allow.
+    let control_case = "the untouched control key";
+    let control_key = given_key(&router, control_case, None).await;
+    let control_ciphertext = given_ciphertext(&router, control_case, &control_key, PLAINTEXT).await;
+
+    // Each row's key is created with the default policy and then has the row's document written to
+    // it by `PutKeyPolicy` — the call an operator makes to revoke in bulk — which is also what lets
+    // a row scope its statement to the key's OWN ARN.
+    let mut keys = Vec::new();
+    let mut probes = Vec::new();
+    for row in SCOPE_ROWS {
+        let key_arn = given_key(&router, row.case, None).await;
+        let resource = match row.scope {
+            DenyScope::EveryResource => "*".to_string(),
+            DenyScope::TheKeyItself => key_arn.clone(),
+            DenyScope::EveryKeyOfTheAccount => format!("arn:aws:kms:*:{ACCOUNT}:key/*"),
+            DenyScope::AnotherKeyOfTheAccount => control_key.clone(),
+        };
+        let principal = match row.principal {
+            DenyPrincipal::TheExecutionRole => role_arn(role),
+            DenyPrincipal::TheSessionItself => session.clone(),
+        };
+        let document = json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                delegates_to_the_account(),
+                {
+                    "Effect": "Deny",
+                    "Principal": {"AWS": principal},
+                    "Action": DECRYPT_ACTION,
+                    "Resource": resource,
+                },
+            ],
+        })
+        .to_string();
+        kms(
+            &router,
+            row.case,
+            "PutKeyPolicy",
+            &json!({
+                "KeyId": key_arn,
+                "PolicyName": "default",
+                "Policy": document,
+                "BypassPolicyLockoutSafetyCheck": true,
+            }),
+        )
+        .await;
+        let ciphertext = given_ciphertext(&router, row.case, &key_arn, PLAINTEXT).await;
+        probes.push(json!({
+            "case": row.case,
+            "encrypt": true,
+            "decrypt": true,
+            "key_arn": key_arn,
+            "plaintext": HANDLER_PLAINTEXT,
+            "ciphertext_b64": ciphertext,
+            "encryption_context": context(),
+        }));
+        keys.push(key_arn);
+    }
+    // The control key travels in the SAME invocation as the denied ones: one run of the handler, so
+    // what separates the rows is the policy each key carries and nothing about the call.
+    probes.push(json!({
+        "case": control_case,
+        "decrypt": true,
+        "key_arn": control_key,
+        "ciphertext_b64": control_ciphertext,
+        "encryption_context": context(),
+    }));
+
+    let reports = probe(&router, "the deny-scope table", function, probes).await;
+    for ((row, report), key_arn) in SCOPE_ROWS.iter().zip(&reports).zip(&keys) {
+        let case = row.case;
+        assert_eq!(
+            report["case"],
+            json!(case),
+            "case {case:?}: expected the handler to report this row, got {report}"
+        );
+        if row.decrypt_served {
+            assert_eq!(
+                report["decrypt"]["denied"],
+                json!(false),
+                "case {case:?}: the statement covers another key, so this decrypt must be served, \
+                 got {report}"
+            );
+            assert_eq!(
+                report["decrypt"]["plaintext"],
+                json!(PLAINTEXT),
+                "case {case:?}: expected the material the key holds, got {report}"
+            );
+        } else {
+            assert_refused(
+                case,
+                report,
+                "decrypt",
+                &explicit_resource_deny_message(&session, DECRYPT_ACTION, key_arn),
+            );
+        }
+        // The statement names ONE action, so the other operation on the very same key is served,
+        // whatever the row's spelling and scope.
+        assert_eq!(
+            report["encrypt"]["denied"],
+            json!(false),
+            "case {case:?}: a deny of the decrypt must leave the encrypt on that key served, got \
+             {report}"
+        );
+    }
+
+    // The control key, asked in the same run by the same session: a deny lives in one key's policy
+    // and withholds nothing under another.
+    let control = reports
+        .last()
+        .expect("the invocation reports the control probe");
+    assert_eq!(
+        control["case"],
+        json!(control_case),
+        "case {control_case:?}: expected the handler to report the control probe last, got \
+         {control}"
+    );
+    assert_eq!(
+        control["decrypt"]["denied"],
+        json!(false),
+        "case {control_case:?}: the control key carries no deny, so its decrypt must be served, \
+         got {control}"
+    );
+    assert_eq!(
+        control["decrypt"]["plaintext"],
+        json!(PLAINTEXT),
+        "case {control_case:?}: expected the material the control key holds, got {control}"
+    );
+
+    // The deny names a principal, so the account the policy still delegates to keeps both
+    // operations on every denied key — asked with the account's own credential while every row's
+    // statement is in force.
+    for (row, key_arn) in SCOPE_ROWS.iter().zip(&keys) {
+        let case = row.case;
+        let sealed = given_ciphertext(&router, case, key_arn, PLAINTEXT).await;
+        let opened = kms(
+            &router,
+            case,
+            "Decrypt",
+            &json!({
+                "KeyId": key_arn,
+                "CiphertextBlob": sealed,
+                "EncryptionContext": context(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            opened["Plaintext"],
+            json!(::aws_smithy_types::base64::encode(PLAINTEXT.as_bytes())),
+            "case {case:?}: the deny names a principal the account is not, so the account's own \
+             decrypt must open the key, got {opened}"
+        );
+        assert_eq!(
+            opened["KeyId"],
+            json!(key_arn),
+            "case {case:?}: the plaintext is answered under the key that sealed it, got {opened}"
+        );
+    }
 }
