@@ -9,12 +9,29 @@
 //! own attributes and SKU — priced under the terms it is offered under, with each price
 //! dimension stating the rate it charges and the usage it prices; and a matched set
 //! longer than the requested page is carried on a `NextToken`.
+//!
+//! The same rule is also stated for the price lookup a cost-estimation client makes:
+//! a filter set pinning one published value of every attribute that identifies an
+//! on-demand compute SKU selects exactly ONE product, in EVERY Region the catalog
+//! publishes and whichever of the two attributes names that Region.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Value};
+use smithy_server_runtime::MultiServiceRouter;
 
-use super::pricing_support::{offer_attribute, offer_documents, ok, product_sku, router};
+use super::pricing_support::{
+    all_attribute_values, all_offer_documents, offer_attribute, offer_documents, ok, product_sku,
+    product_skus, router,
+};
+
+/// The `licenseModel` of an operating system that needs no license, as
+/// `GetAttributeValues(AmazonEC2, licenseModel)` publishes it.
+const NO_LICENSE_REQUIRED: &str = "No License required";
+
+/// The `preInstalledSw` of an instance carrying no pre-installed software, as
+/// `GetAttributeValues(AmazonEC2, preInstalledSw)` publishes it.
+const NO_PRE_INSTALLED_SW: &str = "NA";
 
 /// A `TERM_MATCH` filter per `(field, value)` pair: the comparison the `FilterType`
 /// member documents for an exact value.
@@ -72,6 +89,367 @@ fn dimensions_of(term: &Value) -> Vec<(String, Value)> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// One price lookup: the values it pins for the attributes that identify an on-demand
+/// compute SKU.
+#[derive(Clone, Copy)]
+struct OnDemandLookup<'a> {
+    instance_type: &'a str,
+    operating_system: &'a str,
+    license_model: &'a str,
+    /// `location` (the Region display name) or `regionCode` — the two attributes a
+    /// product names its Region by.
+    location_field: &'a str,
+    location_value: &'a str,
+    tenancy: &'a str,
+    capacity_status: &'a str,
+}
+
+impl<'a> OnDemandLookup<'a> {
+    /// The attribute values this lookup pins.
+    fn pinned(&self) -> Vec<(&'a str, &'a str)> {
+        vec![
+            ("instanceType", self.instance_type),
+            ("operatingSystem", self.operating_system),
+            (self.location_field, self.location_value),
+            ("tenancy", self.tenancy),
+            ("preInstalledSw", NO_PRE_INSTALLED_SW),
+            ("capacitystatus", self.capacity_status),
+            ("licenseModel", self.license_model),
+        ]
+    }
+
+    /// Those values as the `TERM_MATCH` filter set a client sends.
+    fn filters(&self) -> Value {
+        term_matches(&self.pinned())
+    }
+}
+
+/// The filters that select the on-demand compute products of one Region under one
+/// operating system, leaving the instance type, the tenancy and the capacity status
+/// free.
+fn region_compute_filters(location: &str, operating_system: &str, license_model: &str) -> Value {
+    term_matches(&[
+        ("operatingSystem", operating_system),
+        ("location", location),
+        ("preInstalledSw", NO_PRE_INSTALLED_SW),
+        ("licenseModel", license_model),
+    ])
+}
+
+/// Every `location` the compute catalog publishes.
+///
+/// Enumerated through `GetAttributeValues(AmazonEC2, location)` — the operation that
+/// publishes an attribute's value set — so the rows below are the catalog's own Regions
+/// rather than a hand-written list.
+async fn published_locations(router: &MultiServiceRouter) -> Vec<String> {
+    let mut locations = all_attribute_values(
+        router,
+        &json!({ "ServiceCode": "AmazonEC2", "AttributeName": "location" }),
+    )
+    .await;
+    locations.sort();
+    locations.dedup();
+    locations
+}
+
+/// The offer documents a `GetProducts` query selects, paged to the end.
+async fn selected(router: &MultiServiceRouter, filters: &Value) -> Vec<Value> {
+    all_offer_documents(
+        router,
+        &json!({ "ServiceCode": "AmazonEC2", "Filters": filters }),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn the_on_demand_lookup_selects_one_sku_in_every_published_location() {
+    let router = router();
+
+    // Rows: EVERY Region the catalog publishes compute prices in, not one of them.
+    let locations = published_locations(&router).await;
+    assert!(
+        locations.len() > 10,
+        "the catalog must publish compute prices in more Regions than a handful, got \
+         {locations:?}"
+    );
+    // Two display names the enumeration must carry, so a Region named by the catalog is
+    // reachable by the name it publishes.
+    for expected in ["US East (N. Virginia)", "US West (Oregon)"] {
+        assert!(
+            locations.contains(&expected.to_string()),
+            "case {expected}: the enumeration must carry this published Region, got \
+             {locations:?}"
+        );
+    }
+
+    // No two lookups may land on the same product: the pinned attributes identify a SKU.
+    let mut selected_by_case: BTreeMap<String, String> = BTreeMap::new();
+
+    for location in &locations {
+        // The Region's own Linux on-demand products, paged to the end: the instance
+        // types sampled below are the ones THIS Region publishes, so no row names a
+        // type the catalog does not price there.
+        let published = selected(
+            &router,
+            &term_matches(&[
+                ("operatingSystem", "Linux"),
+                ("location", location.as_str()),
+                ("tenancy", "Shared"),
+                ("capacitystatus", "Used"),
+                ("preInstalledSw", NO_PRE_INSTALLED_SW),
+                ("licenseModel", NO_LICENSE_REQUIRED),
+            ]),
+        )
+        .await;
+        let by_type: BTreeMap<String, String> = published
+            .iter()
+            .filter_map(|document| {
+                Some((
+                    offer_attribute(document, "instanceType")?,
+                    product_sku(document),
+                ))
+            })
+            .collect();
+        assert!(
+            !by_type.is_empty(),
+            "case {location}: a Region the catalog publishes products in must price \
+             on-demand compute there, got {} products",
+            published.len()
+        );
+        assert_eq!(
+            by_type.len(),
+            published.len(),
+            "case {location}: leaving only the instance type free must leave one SKU per \
+             published type, got {} SKUs over {} types",
+            published.len(),
+            by_type.len()
+        );
+
+        // Three sizes per Region — the smallest, a middle one and the largest the Region
+        // publishes — so the rule is read off more than one instance family.
+        let types: Vec<&String> = by_type.keys().collect();
+        let samples: BTreeSet<usize> =
+            BTreeSet::from([0, types.len() / 2, types.len().saturating_sub(1)]);
+        for index in samples {
+            let instance_type = types[index].as_str();
+            let case = format!("{location}/{instance_type}");
+            let lookup = OnDemandLookup {
+                instance_type,
+                operating_system: "Linux",
+                license_model: NO_LICENSE_REQUIRED,
+                location_field: "location",
+                location_value: location.as_str(),
+                tenancy: "Shared",
+                capacity_status: "Used",
+            };
+
+            let response = ok(
+                &router,
+                "GetProducts",
+                &json!({
+                    "ServiceCode": "AmazonEC2",
+                    "Filters": lookup.filters(),
+                    "MaxResults": 10,
+                }),
+            )
+            .await;
+            let documents = offer_documents(&response);
+            assert_eq!(
+                documents.len(),
+                1,
+                "case {case}: the lookup must select exactly one SKU, got {}: {:?}",
+                documents.len(),
+                product_skus(&response)
+            );
+            let document = &documents[0];
+            let sku = product_sku(document);
+
+            // The selected product echoes every attribute the lookup pinned, and is the
+            // same product the Region's own listing reports for that type.
+            for (field, value) in lookup.pinned() {
+                assert_eq!(
+                    offer_attribute(document, field).as_deref(),
+                    Some(value),
+                    "case {case}: the selected SKU must carry {field}={value}, got \
+                     {document}"
+                );
+            }
+            assert_eq!(
+                by_type.get(instance_type),
+                Some(&sku),
+                "case {case}: the lookup must select the SKU the Region's listing reports, \
+                 got {sku}"
+            );
+            assert_eq!(
+                document
+                    .pointer("/product/productFamily")
+                    .and_then(Value::as_str),
+                Some("Compute Instance"),
+                "case {case}: a priced instance is a compute instance, got {document}"
+            );
+
+            // The hourly on-demand rate a cost estimate reads is there and positive.
+            let on_demand = terms_of(document, "OnDemand");
+            assert_eq!(
+                on_demand.len(),
+                1,
+                "case {case}: an instance is offered on demand once, got {on_demand:?}"
+            );
+            let dimensions = dimensions_of(&on_demand[0].1);
+            assert_eq!(
+                dimensions.len(),
+                1,
+                "case {case}: the on-demand term prices one dimension, got {dimensions:?}"
+            );
+            let (_, dimension) = &dimensions[0];
+            assert_eq!(
+                dimension.get("unit").and_then(Value::as_str),
+                Some("Hrs"),
+                "case {case}: on-demand instance usage is priced per hour, got {dimension}"
+            );
+            let rate = dimension_rate(dimension);
+            assert!(
+                rate.parse::<f64>().is_ok_and(|rate| rate > 0.0),
+                "case {case}: expected a positive USD on-demand rate, got {rate:?}"
+            );
+
+            // Naming the same Region by the other attribute it publishes selects the
+            // same SKU.
+            let region_code = offer_attribute(document, "regionCode").unwrap_or_default();
+            assert!(
+                !region_code.is_empty(),
+                "case {case}: a Region-scoped product must name its Region code, got \
+                 {document}"
+            );
+            let by_region_code = OnDemandLookup {
+                location_field: "regionCode",
+                location_value: region_code.as_str(),
+                ..lookup
+            };
+            let same = ok(
+                &router,
+                "GetProducts",
+                &json!({
+                    "ServiceCode": "AmazonEC2",
+                    "Filters": by_region_code.filters(),
+                    "MaxResults": 10,
+                }),
+            )
+            .await;
+            assert_eq!(
+                product_skus(&same),
+                vec![sku.clone()],
+                "case {case}: naming the Region by regionCode={region_code} must select the \
+                 same SKU, got {:?}",
+                product_skus(&same)
+            );
+
+            if let Some(previous) = selected_by_case.insert(sku.clone(), case.clone()) {
+                panic!(
+                    "case {case}: the pinned attributes must identify one SKU of its own, \
+                     but {sku} was already selected by case {previous}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn tenancy_and_capacity_status_separate_a_regions_remaining_skus() {
+    let router = router();
+
+    // The value sets the catalog publishes for the two attributes, read off the API
+    // rather than written out here.
+    let tenancies = all_attribute_values(
+        &router,
+        &json!({ "ServiceCode": "AmazonEC2", "AttributeName": "tenancy" }),
+    )
+    .await;
+    let capacity_statuses = all_attribute_values(
+        &router,
+        &json!({ "ServiceCode": "AmazonEC2", "AttributeName": "capacitystatus" }),
+    )
+    .await;
+    assert!(
+        tenancies.len() > 1 && capacity_statuses.len() > 1,
+        "the catalog must price more than one tenancy and capacity status, got \
+         {tenancies:?} and {capacity_statuses:?}"
+    );
+
+    // Rows: the first and the last Region the catalog publishes, so the rule is not read
+    // off the one Region the other suites pin.
+    let locations = published_locations(&router).await;
+    let sampled: BTreeSet<&String> = [locations.first(), locations.last()]
+        .into_iter()
+        .flatten()
+        .collect();
+    assert_eq!(
+        sampled.len(),
+        2,
+        "the catalog must publish more than one Region, got {locations:?}"
+    );
+
+    for location in sampled {
+        let region_products = selected(
+            &router,
+            &region_compute_filters(location, "Linux", NO_LICENSE_REQUIRED),
+        )
+        .await;
+        let instance_type = region_products
+            .iter()
+            .filter_map(|document| offer_attribute(document, "instanceType"))
+            .min()
+            .unwrap_or_else(|| panic!("case {location}: the Region must price compute"));
+        let case = format!("{location}/{instance_type}");
+
+        // Every SKU this Region publishes for that type and operating system: the set
+        // the two attributes have to separate.
+        let expected: BTreeSet<String> = region_products
+            .iter()
+            .filter(|document| {
+                offer_attribute(document, "instanceType").as_deref() == Some(&instance_type)
+            })
+            .map(product_sku)
+            .collect();
+        assert!(
+            expected.len() > 1,
+            "case {case}: the Region must publish more than one SKU for a type, got \
+             {expected:?}"
+        );
+
+        let mut covered: BTreeSet<String> = BTreeSet::new();
+        for tenancy in &tenancies {
+            for capacity_status in &capacity_statuses {
+                let lookup = OnDemandLookup {
+                    instance_type: instance_type.as_str(),
+                    operating_system: "Linux",
+                    license_model: NO_LICENSE_REQUIRED,
+                    location_field: "location",
+                    location_value: location.as_str(),
+                    tenancy: tenancy.as_str(),
+                    capacity_status: capacity_status.as_str(),
+                };
+                let skus: Vec<String> = selected(&router, &lookup.filters())
+                    .await
+                    .iter()
+                    .map(product_sku)
+                    .collect();
+                assert!(
+                    skus.len() <= 1,
+                    "case {case} {tenancy}/{capacity_status}: the pinned attributes must \
+                     identify at most one SKU, got {skus:?}"
+                );
+                covered.extend(skus);
+            }
+        }
+        assert_eq!(
+            covered, expected,
+            "case {case}: the published tenancy and capacity statuses must account for \
+             every SKU of that type, got {covered:?}"
+        );
+    }
 }
 
 #[tokio::test]
