@@ -277,6 +277,8 @@ async fn serve_session(
         read_only: facts.read_only,
         runtime: facts.runtime.clone(),
         sessions: context.sessions.clone(),
+        insert_id: super::mysql_insert_id::SessionInsertId::default(),
+        diagnostics: super::mysql_diagnostics::SessionDiagnostics::default(),
     };
     // `max_connections` bounds the sessions a MySQL server holds at once too, and the
     // server refuses the connection that would exceed it.
@@ -885,7 +887,10 @@ fn refusal_sentence(
 ///
 /// Source: the server error numbers and SQLSTATE values in the MySQL reference manual's
 /// "Server Error Message Reference", which is what a client branches on.
-fn statement_error(kind: EngineErrorKind) -> (u16, &'static str) {
+///
+/// `pub` so the session's own diagnostics area reports a refusal under the SAME number the
+/// client was refused with ([`super::mysql_diagnostics`]).
+pub fn statement_error(kind: EngineErrorKind) -> (u16, &'static str) {
     match kind {
         EngineErrorKind::Syntax => (1064, "42000"),
         EngineErrorKind::UndefinedObject => (1146, "42S02"),

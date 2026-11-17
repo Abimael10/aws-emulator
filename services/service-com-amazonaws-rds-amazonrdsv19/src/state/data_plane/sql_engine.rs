@@ -405,6 +405,11 @@ pub struct ServerView {
     /// When the statement running now must be cancelled, which is what `pg_sleep` waits
     /// against.
     pub deadline: Option<Instant>,
+    /// The value `LAST_INSERT_ID()` answers with for the session running this statement,
+    /// shared with that session so the one-argument form's write reaches it
+    /// ([`super::mysql_insert_id`]). `None` for one of the server's own statements, which
+    /// runs under no session.
+    pub insert_id: Option<super::mysql_insert_id::SessionInsertId>,
 }
 
 /// How many rows ONE statement's row ids are read for, which is how many rows it may take
@@ -1407,6 +1412,7 @@ fn open_confined_database(view: &Arc<Mutex<ServerView>>) -> Result<Connection, E
         .map_err(unavailable)?;
     register_server_functions(&conn, view)?;
     super::engine_time::register_time_functions(&conn, view)?;
+    super::mysql_insert_id::register_insert_id_function(&conn, view)?;
     super::pg_numeric::register_numeric_functions(&conn)?;
     Ok(conn)
 }
@@ -2016,6 +2022,7 @@ fn confine_to_the_instance(context: AuthContext<'_>) -> Authorization {
                 || super::pg_server::is_server_function(function_name)
                 || super::pg_numeric::is_engine_function(function_name)
                 || super::engine_time::is_time_function(function_name)
+                || super::mysql_insert_id::is_mysql_only_function(function_name)
             {
                 Authorization::Allow
             } else {

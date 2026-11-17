@@ -1122,3 +1122,552 @@ async fn a_postgresql_endpoint_names_the_constraint_a_refused_row_violated() {
         "an installed extension must report its version, got {installed:?}"
     );
 }
+
+/// One row of the `LAST_INSERT_ID()` table: a statement the session runs, and the key its
+/// `LAST_INSERT_ID()` answers with once it has.
+struct InsertIdCase {
+    case: &'static str,
+    /// The statement to run first, or `None` to read the value as it stands.
+    runs: Option<&'static str>,
+    /// What `LAST_INSERT_ID()` answers afterwards.
+    reports: &'static str,
+}
+
+#[tokio::test]
+async fn a_mysql_session_answers_the_auto_increment_key_it_was_assigned() {
+    let router = emulator();
+    let (address, port) = available_instance(
+        &router,
+        "emu-dialect-insert-id",
+        "mysql",
+        &params!["EngineVersion" => "8.0.39"],
+    )
+    .await;
+    let mut session = mysql_login(
+        &address,
+        port,
+        Transport::Plaintext,
+        MASTER_USER,
+        MASTER_PASSWORD,
+        Some(DATABASE),
+    )
+    .await
+    .expect("the master user must be admitted");
+    for statement in [
+        "CREATE TABLE gauges (id INT AUTO_INCREMENT PRIMARY KEY, label VARCHAR(16) NOT NULL) \
+         ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+        "CREATE TABLE notes (id BIGINT AUTO_INCREMENT PRIMARY KEY, body VARCHAR(16)) \
+         ENGINE=InnoDB",
+        "CREATE TABLE plain (code VARCHAR(8) PRIMARY KEY, note VARCHAR(16)) ENGINE=InnoDB",
+    ] {
+        session
+            .query(statement)
+            .await
+            .unwrap_or_else(|refusal| panic!("{statement:?} must run, got {refusal:?}"));
+    }
+
+    // The table spans what the rule generalises over: how many rows one statement inserts,
+    // which table it inserts into, the statements that insert none, and the form that SETS
+    // the session's value.
+    let cases: &[InsertIdCase] = &[
+        InsertIdCase {
+            case: "a session that has inserted nothing",
+            runs: None,
+            reports: "0",
+        },
+        InsertIdCase {
+            case: "one row inserted",
+            runs: Some("INSERT INTO gauges (label) VALUES ('pressure')"),
+            reports: "1",
+        },
+        InsertIdCase {
+            case: "a second single row",
+            runs: Some("INSERT INTO gauges (label) VALUES ('flow')"),
+            reports: "2",
+        },
+        InsertIdCase {
+            case: "three rows in ONE statement, whose FIRST key is reported",
+            runs: Some("INSERT INTO gauges (label) VALUES ('a'), ('b'), ('c')"),
+            reports: "3",
+        },
+        InsertIdCase {
+            case: "an update, which is assigned no key",
+            runs: Some("UPDATE gauges SET label = 'tide' WHERE id = 1"),
+            reports: "3",
+        },
+        InsertIdCase {
+            case: "a delete, which is assigned no key",
+            runs: Some("DELETE FROM gauges WHERE id = 4"),
+            reports: "3",
+        },
+        InsertIdCase {
+            case: "a read, which is assigned no key",
+            runs: Some("SELECT count(*) FROM gauges"),
+            reports: "3",
+        },
+        InsertIdCase {
+            case: "an insert into another table, which has its own keys",
+            runs: Some("INSERT INTO notes (body) VALUES ('first')"),
+            reports: "1",
+        },
+        InsertIdCase {
+            case: "the one-argument form, which sets the session's value",
+            runs: Some("SELECT LAST_INSERT_ID(99)"),
+            reports: "99",
+        },
+        InsertIdCase {
+            case: "an insert after that form, whose own key is reported again",
+            runs: Some("INSERT INTO notes (body) VALUES ('second')"),
+            reports: "2",
+        },
+        InsertIdCase {
+            case: "an insert that SUPPLIES the key itself, which generates none",
+            runs: Some("INSERT INTO notes (id, body) VALUES (100, 'explicit')"),
+            reports: "2",
+        },
+        InsertIdCase {
+            case: "an insert that writes the key column as NULL, asking for one",
+            runs: Some("INSERT INTO notes (id, body) VALUES (NULL, 'generated')"),
+            reports: "101",
+        },
+        InsertIdCase {
+            case: "an insert into a table with no auto-increment column",
+            runs: Some("INSERT INTO plain (code, note) VALUES ('a1', 'first')"),
+            reports: "101",
+        },
+        InsertIdCase {
+            case: "the row holding the highest key deleted",
+            runs: Some("DELETE FROM gauges WHERE id = 5"),
+            reports: "101",
+        },
+        InsertIdCase {
+            case: "an insert after that delete, which does not reuse the key",
+            runs: Some("INSERT INTO gauges (label) VALUES ('after')"),
+            reports: "6",
+        },
+    ];
+    for row in cases {
+        if let Some(statement) = row.runs {
+            let answer = session
+                .query(statement)
+                .await
+                .unwrap_or_else(|refusal| {
+                    panic!("case {:?}: {statement:?} must run, got {refusal:?}", row.case)
+                });
+            // The one-argument form ANSWERS the value it set, as MySQL's own does.
+            if statement.contains("LAST_INSERT_ID(99)") {
+                assert_eq!(
+                    answer.only(),
+                    Some(row.reports),
+                    "case {:?}: the call must answer the value it set, got {answer:?}",
+                    row.case
+                );
+            }
+        }
+        // Every spelling of the read is the same value, and the column is named after the
+        // function as MySQL names it.
+        for read in [
+            "SELECT LAST_INSERT_ID()",
+            "select last_insert_id()",
+            "SELECT LAST_INSERT_ID() AS assigned",
+        ] {
+            let answer = rows(&mut session, read).await;
+            assert_eq!(
+                answer.only(),
+                Some(row.reports),
+                "case {:?}: {read:?} must answer {:?}, got {answer:?}",
+                row.case,
+                row.reports
+            );
+        }
+        let named = rows(&mut session, "SELECT LAST_INSERT_ID()").await;
+        assert_eq!(
+            named.columns,
+            vec!["LAST_INSERT_ID()".to_string()],
+            "case {:?}: the column must be named after the call, got {named:?}",
+            row.case
+        );
+    }
+
+    // The keys really are the rows' own: what the reads above reported is what the table
+    // holds, and a key the counter has handed out is not handed out again.
+    let held = rows(&mut session, "SELECT id, label FROM gauges ORDER BY id").await;
+    assert_eq!(
+        held.rows,
+        vec![
+            vec![Some("1".to_string()), Some("tide".to_string())],
+            vec![Some("2".to_string()), Some("flow".to_string())],
+            vec![Some("3".to_string()), Some("a".to_string())],
+            vec![Some("6".to_string()), Some("after".to_string())],
+        ],
+        "the assigned keys must be the keys the rows carry, got {held:?}"
+    );
+    let noted = rows(&mut session, "SELECT id, body FROM notes ORDER BY id").await;
+    assert_eq!(
+        noted.rows,
+        vec![
+            vec![Some("1".to_string()), Some("first".to_string())],
+            vec![Some("2".to_string()), Some("second".to_string())],
+            vec![Some("100".to_string()), Some("explicit".to_string())],
+            vec![Some("101".to_string()), Some("generated".to_string())],
+        ],
+        "a supplied key must be the row's own, and the next generated key must follow it, \
+         got {noted:?}"
+    );
+
+    // The value belongs to the SESSION: another session on the same endpoint has its own,
+    // and neither reads the other's.
+    let mut other = mysql_login(
+        &address,
+        port,
+        Transport::Plaintext,
+        MASTER_USER,
+        MASTER_PASSWORD,
+        Some(DATABASE),
+    )
+    .await
+    .expect("the master user must be admitted");
+    let fresh = rows(&mut other, "SELECT LAST_INSERT_ID()").await;
+    assert_eq!(
+        fresh.only(),
+        Some("0"),
+        "a second session must answer its own value, got {fresh:?}"
+    );
+    rows(&mut other, "INSERT INTO gauges (label) VALUES ('other')").await;
+    let theirs = rows(&mut other, "SELECT LAST_INSERT_ID()").await;
+    assert_eq!(
+        theirs.only(),
+        Some("7"),
+        "the second session must answer the key ITS insert was assigned, got {theirs:?}"
+    );
+    let mine = rows(&mut session, "SELECT LAST_INSERT_ID()").await;
+    assert_eq!(
+        mine.only(),
+        Some("6"),
+        "another session's insert must not change this one's value, got {mine:?}"
+    );
+
+    // The counter belongs to the COLUMN however the client declared its key: MySQL takes the
+    // keyword before or after the key on the column itself, and takes the key as a clause of
+    // its own.
+    for (case, declaration, table) in [
+        (
+            "the key declared after the keyword",
+            "CREATE TABLE forms_a (id INT AUTO_INCREMENT PRIMARY KEY, label VARCHAR(8)) \
+             ENGINE=InnoDB",
+            "forms_a",
+        ),
+        (
+            "the key declared before the keyword",
+            "CREATE TABLE forms_b (id INT PRIMARY KEY AUTO_INCREMENT, label VARCHAR(8)) \
+             ENGINE=InnoDB",
+            "forms_b",
+        ),
+        (
+            "the key declared as a clause of its own",
+            "CREATE TABLE forms_c (id INT AUTO_INCREMENT, label VARCHAR(8), PRIMARY KEY (id)) \
+             ENGINE=InnoDB",
+            "forms_c",
+        ),
+    ] {
+        session
+            .query(declaration)
+            .await
+            .unwrap_or_else(|refusal| panic!("case {case:?}: {declaration:?} must run, got {refusal:?}"));
+        for label in ["one", "two"] {
+            let insert = format!("INSERT INTO {table} (label) VALUES ('{label}')");
+            session
+                .query(&insert)
+                .await
+                .unwrap_or_else(|refusal| panic!("case {case:?}: {insert:?} must run, got {refusal:?}"));
+        }
+        let assigned = rows(&mut session, "SELECT LAST_INSERT_ID()").await;
+        assert_eq!(
+            assigned.only(),
+            Some("2"),
+            "case {case:?}: the column must be assigned keys, got {assigned:?}"
+        );
+        for statement in [
+            format!("DELETE FROM {table} WHERE id = 2"),
+            format!("INSERT INTO {table} (label) VALUES ('three')"),
+        ] {
+            session
+                .query(&statement)
+                .await
+                .unwrap_or_else(|refusal| panic!("case {case:?}: {statement:?} must run, got {refusal:?}"));
+        }
+        let next = rows(&mut session, "SELECT LAST_INSERT_ID()").await;
+        assert_eq!(
+            next.only(),
+            Some("3"),
+            "case {case:?}: the counter must not hand out the deleted key again, got {next:?}"
+        );
+    }
+
+    // The function is the MySQL family's: a PostgreSQL endpoint has no such function and
+    // refuses the call in its own words.
+    let (_pg_router, mut postgres) = postgres_instance("emu-dialect-insert-id-pg").await;
+    let refusal = postgres
+        .query("SELECT LAST_INSERT_ID()")
+        .await
+        .expect_err("a PostgreSQL session must have no such function");
+    assert_eq!(
+        (refusal.code.as_str(), refusal.message.as_str()),
+        ("42883", "function LAST_INSERT_ID() does not exist"),
+        "expected PostgreSQL's undefined-function refusal, got {refusal:?}"
+    );
+}
+
+/// One row of the declared-type table: a statement the session runs, and what the column's
+/// declared type makes of the value it writes.
+struct DeclaredTypeCase {
+    case: &'static str,
+    runs: &'static str,
+    /// The refusal the statement is answered with, as the error number and its sentence, or
+    /// `None` for a statement the column admits.
+    refused: Option<(&'static str, &'static str)>,
+    /// What the table holds for the row afterwards, where the statement ran.
+    holds: Option<&'static str>,
+    /// The condition the server reports for it: its level, number and sentence.
+    reports: Option<(&'static str, &'static str, &'static str)>,
+}
+
+#[tokio::test]
+async fn a_mysql_column_admits_the_values_its_declared_type_does() {
+    let (_router, mut session) =
+        mysql_instance("emu-dialect-strict", "mysql", "8.0.39").await;
+    for statement in [
+        "CREATE TABLE readings (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(5) NOT NULL, \
+         level TINYINT, tally INT UNSIGNED, note TEXT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+    ] {
+        session
+            .query(statement)
+            .await
+            .unwrap_or_else(|refusal| panic!("{statement:?} must run, got {refusal:?}"));
+    }
+
+    // The table spans what the rule generalises over: the kind of bound the declaration
+    // carries (a length, a signed range, an unsigned one, none at all), the end of the range
+    // the value passes, and which row of the statement wrote it.
+    let strict: &[DeclaredTypeCase] = &[
+        DeclaredTypeCase {
+            case: "a string the length admits",
+            runs: "INSERT INTO readings (name) VALUES ('fits5')",
+            refused: None,
+            holds: Some("fits5"),
+            reports: None,
+        },
+        DeclaredTypeCase {
+            case: "a string one character too long",
+            runs: "INSERT INTO readings (name) VALUES ('abcdef')",
+            refused: Some(("1406", "Data too long for column 'name' at row 1")),
+            holds: None,
+            reports: Some((
+                "Error",
+                "1406",
+                "Data too long for column 'name' at row 1",
+            )),
+        },
+        DeclaredTypeCase {
+            case: "a string too long in the SECOND row of the statement",
+            runs: "INSERT INTO readings (name) VALUES ('ok'), ('abcdefgh')",
+            refused: Some(("1406", "Data too long for column 'name' at row 2")),
+            holds: None,
+            reports: Some((
+                "Error",
+                "1406",
+                "Data too long for column 'name' at row 2",
+            )),
+        },
+        DeclaredTypeCase {
+            case: "a number past the signed type's maximum",
+            runs: "INSERT INTO readings (name, level) VALUES ('n', 128)",
+            refused: Some(("1264", "Out of range value for column 'level' at row 1")),
+            holds: None,
+            reports: Some((
+                "Error",
+                "1264",
+                "Out of range value for column 'level' at row 1",
+            )),
+        },
+        DeclaredTypeCase {
+            case: "the signed type's own minimum",
+            runs: "INSERT INTO readings (name, level) VALUES ('m', -128)",
+            refused: None,
+            holds: Some("m"),
+            reports: None,
+        },
+        DeclaredTypeCase {
+            case: "a negative number in an unsigned column",
+            runs: "INSERT INTO readings (name, tally) VALUES ('u', -1)",
+            refused: Some(("1264", "Out of range value for column 'tally' at row 1")),
+            holds: None,
+            reports: Some((
+                "Error",
+                "1264",
+                "Out of range value for column 'tally' at row 1",
+            )),
+        },
+        DeclaredTypeCase {
+            case: "a long value in a column whose declaration bounds none",
+            runs: "INSERT INTO readings (name, note) VALUES ('t', 'far longer than five')",
+            refused: None,
+            holds: Some("t"),
+            reports: None,
+        },
+        DeclaredTypeCase {
+            case: "an UPDATE whose value the column admits",
+            runs: "UPDATE readings SET note = 'noted' WHERE name = 't'",
+            refused: None,
+            holds: Some("t"),
+            reports: None,
+        },
+        DeclaredTypeCase {
+            case: "an UPDATE whose value is too long for the column",
+            runs: "UPDATE readings SET name = 'abcdefgh' WHERE name = 't'",
+            refused: Some(("1406", "Data too long for column 'name' at row 1")),
+            holds: Some("t"),
+            reports: None,
+        },
+        DeclaredTypeCase {
+            case: "an UPDATE whose number is outside the column's range",
+            runs: "UPDATE readings SET level = 999 WHERE name = 't'",
+            refused: Some(("1264", "Out of range value for column 'level' at row 1")),
+            holds: Some("t"),
+            reports: None,
+        },
+    ];
+    for row in strict {
+        let answer = session.query(row.runs).await;
+        match (row.refused, &answer) {
+            (Some((code, message)), Err(refusal)) => assert_eq!(
+                (refusal.code.as_str(), refusal.message.as_str()),
+                (code, message),
+                "case {:?}: expected the server's own refusal, got {refusal:?}",
+                row.case
+            ),
+            (Some(expected), Ok(answered)) => panic!(
+                "case {:?}: {:?} must be refused with {expected:?}, got {answered:?}",
+                row.case, row.runs
+            ),
+            (None, Err(refusal)) => panic!(
+                "case {:?}: {:?} must run, got {refusal:?}",
+                row.case, row.runs
+            ),
+            (None, Ok(_)) => {}
+        }
+        if let Some(held) = row.holds {
+            let found = rows(
+                &mut session,
+                &format!("SELECT name FROM readings WHERE name = '{held}'"),
+            )
+            .await;
+            assert_eq!(
+                found.only(),
+                Some(held),
+                "case {:?}: the row the statement wrote must be there, got {found:?}",
+                row.case
+            );
+        }
+        // What the server has to say about the statement, which a client reads back.
+        let reported = rows(&mut session, "SHOW WARNINGS").await;
+        let expected: Vec<Vec<Option<String>>> = row
+            .reports
+            .map(|(level, code, message)| {
+                vec![vec![
+                    Some(level.to_string()),
+                    Some(code.to_string()),
+                    Some(message.to_string()),
+                ]]
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            reported.rows, expected,
+            "case {:?}: the diagnostics must be this statement's own, got {reported:?}",
+            row.case
+        );
+        assert_eq!(
+            reported.columns,
+            vec![
+                "Level".to_string(),
+                "Code".to_string(),
+                "Message".to_string()
+            ],
+            "case {:?}: the columns must be the ones the server reports, got {reported:?}",
+            row.case
+        );
+    }
+
+    // The same values WITHOUT strict mode: the statement runs, the column holds the value it
+    // admits, and the server says what it did.
+    session
+        .query("SET sql_mode = 'NO_ENGINE_SUBSTITUTION'")
+        .await
+        .expect("a session may set its own sql_mode");
+    let lenient: &[DeclaredTypeCase] = &[
+        DeclaredTypeCase {
+            case: "a string too long, cut to the declared length",
+            runs: "INSERT INTO readings (name) VALUES ('abcdefgh')",
+            refused: None,
+            holds: Some("abcde"),
+            reports: Some((
+                "Warning",
+                "1265",
+                "Data truncated for column 'name' at row 1",
+            )),
+        },
+        DeclaredTypeCase {
+            case: "a number past the type's maximum, held to it",
+            runs: "INSERT INTO readings (name, level) VALUES ('held', 300)",
+            refused: None,
+            holds: Some("held"),
+            reports: Some((
+                "Warning",
+                "1264",
+                "Out of range value for column 'level' at row 1",
+            )),
+        },
+    ];
+    for row in lenient {
+        session
+            .query(row.runs)
+            .await
+            .unwrap_or_else(|refusal| {
+                panic!(
+                    "case {:?}: {:?} must run without strict mode, got {refusal:?}",
+                    row.case, row.runs
+                )
+            });
+        let reported = rows(&mut session, "SHOW WARNINGS").await;
+        let expected: Vec<Vec<Option<String>>> = row
+            .reports
+            .map(|(level, code, message)| {
+                vec![vec![
+                    Some(level.to_string()),
+                    Some(code.to_string()),
+                    Some(message.to_string()),
+                ]]
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            reported.rows, expected,
+            "case {:?}: the server must report what it did to the value, got {reported:?}",
+            row.case
+        );
+    }
+    // The values the columns HOLD: the string cut to the declared length and the number held
+    // to the end of its range, which is what a client reads back.
+    let held = rows(
+        &mut session,
+        "SELECT name, level FROM readings WHERE name IN ('abcde', 'held') ORDER BY name",
+    )
+    .await;
+    assert_eq!(
+        held.rows,
+        vec![
+            vec![Some("abcde".to_string()), None],
+            vec![Some("held".to_string()), Some("127".to_string())],
+        ],
+        "the columns must hold the values they admit, got {held:?}"
+    );
+}

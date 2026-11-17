@@ -45,10 +45,10 @@ const MYSQL_SYSTEM_VARIABLE_PREFIX: &str = "@@";
 ///   refusal is this server's rather than the embedded engine's so that it carries
 ///   PostgreSQL's own sentence for a token its grammar cannot read.
 /// * A FUNCTION only the other family defines (`current_setting` and the `pg_*` functions on
-///   PostgreSQL, `UTC_TIMESTAMP` and the rest on MySQL) is refused as the engine refuses an
-///   undefined function, in that engine's own words. The embedded engine has both families'
-///   functions registered on one connection, which is exactly what a client probing which
-///   engine it is talking to must not see.
+///   PostgreSQL, `UTC_TIMESTAMP` and `LAST_INSERT_ID` and the rest on MySQL) is refused as
+///   the engine refuses an undefined function, in that engine's own words. The embedded
+///   engine has both families' functions registered on one connection, which is exactly what
+///   a client probing which engine it is talking to must not see.
 #[must_use]
 pub fn dialect_refusal(facts: &SessionFacts, tokens: &[Token]) -> Option<EngineError> {
     if facts.wire == EngineWire::Postgres {
@@ -82,6 +82,10 @@ pub fn dialect_refusal(facts: &SessionFacts, tokens: &[Token]) -> Option<EngineE
 /// OTHER engine family; see [`dialect_refusal`].
 fn other_familys_function(wire: EngineWire, function: &str) -> bool {
     if super::engine_time::is_defined_on(function, wire) == Some(false) {
+        return true;
+    }
+    // The MySQL SESSION function, which no PostgreSQL server has.
+    if wire == EngineWire::Postgres && super::mysql_insert_id::is_mysql_only_function(function) {
         return true;
     }
     // The PostgreSQL SERVER functions, which no MySQL server has. `md5` is absent from this:
@@ -192,10 +196,19 @@ fn render_at(facts: &SessionFacts, tokens: &[Token], depth: usize) -> String {
     };
     // Where a MySQL `CREATE TABLE`'s table-constraint clauses are, and what each becomes in
     // the engine's own grammar ([`mysql_table_constraints`]).
-    let table_constraints = match column_list_close {
+    let mut table_constraints = match column_list_close {
         Some(close) => mysql_table_constraints(tokens, close),
         None => Vec::new(),
     };
+    // The PRIMARY KEY of an auto-increment column, where the client declared it as a clause
+    // of its own: the engine declares that key — and the counter behind it — on the column
+    // itself, so the clause leaves the list ([`mysql_auto_increment_key_clause`]).
+    let auto_increment_key_clause = column_list_close
+        .and_then(|close| mysql_auto_increment_key_clause(tokens, close))
+        .inspect(|clause| table_constraints.push(clause.rewrite()));
+    // Whether the auto-increment column being declared is still waiting for the PRIMARY KEY
+    // its counter is declared with, which the client may write after the keyword.
+    let mut counter_pending = false;
     while index < tokens.len() {
         let token = &tokens[index];
         let text = token.to_string();
@@ -256,9 +269,18 @@ fn render_at(facts: &SessionFacts, tokens: &[Token], depth: usize) -> String {
                     continue;
                 }
                 // A MySQL auto-increment column is the engine's own rowid column, which it
-                // declares by the column's TYPE rather than with a keyword.
+                // declares by the column's TYPE rather than with a keyword — and whose
+                // KEYS come from a counter of its own, which the engine keeps for a column
+                // declared `AUTOINCREMENT`.
                 if facts.wire == EngineWire::MySql && lowered == "auto_increment" {
                     widen_to_rowid_type(&mut out);
+                    counter_pending = !declare_the_counter(&mut out);
+                    // The key the client declared as a clause of its own is declared here
+                    // instead, because that is where the engine declares the counter.
+                    if counter_pending && auto_increment_key_clause.is_some() {
+                        out.push(" PRIMARY KEY AUTOINCREMENT".to_string());
+                        counter_pending = false;
+                    }
                     index += 1;
                     continue;
                 }
@@ -332,6 +354,14 @@ fn render_at(facts: &SessionFacts, tokens: &[Token], depth: usize) -> String {
                 }
             }
             _ => out.push(text),
+        }
+        // The PRIMARY KEY the auto-increment column was waiting for, which the client may
+        // write anywhere in that column's definition: the counter is declared with it, and a
+        // definition that ends without one declares none.
+        if counter_pending
+            && (matches!(token, Token::Comma) || declare_the_counter(&mut out))
+        {
+            counter_pending = false;
         }
         index += 1;
     }
@@ -489,26 +519,13 @@ struct TableConstraintRewrite {
     declared: Option<String>,
 }
 
-/// The TABLE-CONSTRAINT clauses of the MySQL `CREATE TABLE` whose column list closes at
-/// `close`, each with what the engine is handed for it.
+/// The CLAUSES of the column list of a MySQL `CREATE TABLE` that closes at `close`: the
+/// significant tokens of each, and the index of what ends it — the comma that separates it
+/// from the next, or the parenthesis that closes the list.
 ///
-/// MySQL declares a table constraint with its own `KEY`/`INDEX` vocabulary, where the engine
-/// (and the SQL standard) declares the same constraint with `CONSTRAINT <name>`:
-///
-/// * `UNIQUE [KEY|INDEX] [<name>] (<columns>)` is a NAMED UNIQUE CONSTRAINT — "a UNIQUE
-///   index … creates a constraint such that all values in the index must be distinct" — so
-///   it is declared as `CONSTRAINT <name> UNIQUE (<columns>)`, which is the same rule under
-///   the same name. The name matters past the DDL: it is what the server names in the
-///   refusal of a row that violates it (`super::constraint_names`).
-/// * `[KEY|INDEX] <name> (<columns>)`, and the `FULLTEXT`/`SPATIAL` forms, declare an INDEX
-///   and no constraint: MySQL's manual separates the two, and an index changes which rows a
-///   query reads rather than which rows the table admits. The engine has no inline index
-///   declaration, so the clause leaves the table definition and the table it creates holds
-///   exactly the rows MySQL's would.
-///
-/// Every other clause — a column definition, `PRIMARY KEY`, `FOREIGN KEY`, `CHECK` — is
-/// already written in a form the engine declares, and carries no entry here.
-fn mysql_table_constraints(tokens: &[Token], close: usize) -> Vec<TableConstraintRewrite> {
+/// One clause is one column definition or one table constraint, which is the unit both of
+/// the rewritings below read.
+fn mysql_column_list_clauses(tokens: &[Token], close: usize) -> Vec<(Vec<usize>, usize)> {
     let significant: Vec<usize> = (0..close)
         .filter(|at| !matches!(tokens.get(*at), Some(Token::Whitespace(_))))
         .collect();
@@ -532,46 +549,183 @@ fn mysql_table_constraints(tokens: &[Token], close: usize) -> Vec<TableConstrain
     let Some(open) = open else {
         return Vec::new();
     };
-    // The clauses: the spans of the list separated by its own commas.
-    let mut rewrites = Vec::new();
+    let mut clauses = Vec::new();
     let mut depth = 0usize;
     let mut clause: Vec<usize> = Vec::new();
-    let mut first = true;
-    let push = |clause: &[usize], at: usize, first: bool, rewrites: &mut Vec<TableConstraintRewrite>| {
-        if let Some(declared) = table_constraint_declaration(tokens, clause) {
-            let from = clause.first().copied().unwrap_or(at);
-            // A clause that LEAVES the list first takes the separator after it with it, so
-            // the list the engine reads has no empty entry where it was. Only a separator:
-            // the parenthesis that closes the list is the list's own.
-            let separates = matches!(tokens.get(at), Some(Token::Comma));
-            let until = if declared.is_none() && first && separates {
-                at + 1
-            } else {
-                at
-            };
-            rewrites.push(TableConstraintRewrite {
-                from,
-                until,
-                declared,
-            });
-        }
-    };
     for at in significant.iter().copied().filter(|at| *at > open) {
         match tokens.get(at) {
             Some(Token::LParen) => depth += 1,
             Some(Token::RParen) => depth = depth.saturating_sub(1),
             Some(Token::Comma) if depth == 0 => {
-                push(&clause, at, first, &mut rewrites);
-                clause.clear();
-                first = false;
+                clauses.push((std::mem::take(&mut clause), at));
                 continue;
             }
             _ => {}
         }
         clause.push(at);
     }
-    push(&clause, close, first, &mut rewrites);
+    clauses.push((clause, close));
+    clauses
+}
+
+/// The TABLE-CONSTRAINT clauses of the MySQL `CREATE TABLE` whose column list closes at
+/// `close`, each with what the engine is handed for it.
+///
+/// MySQL declares a table constraint with its own `KEY`/`INDEX` vocabulary, where the engine
+/// (and the SQL standard) declares the same constraint with `CONSTRAINT <name>`:
+///
+/// * `UNIQUE [KEY|INDEX] [<name>] (<columns>)` is a NAMED UNIQUE CONSTRAINT — "a UNIQUE
+///   index … creates a constraint such that all values in the index must be distinct" — so
+///   it is declared as `CONSTRAINT <name> UNIQUE (<columns>)`, which is the same rule under
+///   the same name. The name matters past the DDL: it is what the server names in the
+///   refusal of a row that violates it (`super::constraint_names`).
+/// * `[KEY|INDEX] <name> (<columns>)`, and the `FULLTEXT`/`SPATIAL` forms, declare an INDEX
+///   and no constraint: MySQL's manual separates the two, and an index changes which rows a
+///   query reads rather than which rows the table admits. The engine has no inline index
+///   declaration, so the clause leaves the table definition and the table it creates holds
+///   exactly the rows MySQL's would.
+///
+/// Every other clause — a column definition, `PRIMARY KEY`, `FOREIGN KEY`, `CHECK` — is
+/// already written in a form the engine declares, and carries no entry here.
+fn mysql_table_constraints(tokens: &[Token], close: usize) -> Vec<TableConstraintRewrite> {
+    let mut rewrites = Vec::new();
+    for (position, (clause, at)) in mysql_column_list_clauses(tokens, close)
+        .into_iter()
+        .enumerate()
+    {
+        let Some(declared) = table_constraint_declaration(tokens, &clause) else {
+            continue;
+        };
+        let from = clause.first().copied().unwrap_or(at);
+        // A clause that LEAVES the list first takes the separator after it with it, so
+        // the list the engine reads has no empty entry where it was. Only a separator:
+        // the parenthesis that closes the list is the list's own.
+        let separates = matches!(tokens.get(at), Some(Token::Comma));
+        let until = if declared.is_none() && position == 0 && separates {
+            at + 1
+        } else {
+            at
+        };
+        rewrites.push(TableConstraintRewrite {
+            from,
+            until,
+            declared,
+        });
+    }
     rewrites
+}
+
+/// The PRIMARY KEY clause of a MySQL `CREATE TABLE` that is over its AUTO_INCREMENT column
+/// alone, where the client declared that key as a clause of its own rather than on the
+/// column itself.
+///
+/// MySQL requires the two to go together — "there can be only one AUTO_INCREMENT column per
+/// table, it must be indexed" — and lets the index be declared either way. The engine
+/// declares the COUNTER behind that column's keys as part of the column's own primary key,
+/// which is the only place its grammar takes it, so a key declared as a clause is declared
+/// there instead and the clause leaves the list.
+struct AutoIncrementKeyClause {
+    /// The index of the clause's first significant token.
+    from: usize,
+    /// The index the rendering carries on at: the separator after the clause.
+    until: usize,
+}
+
+impl AutoIncrementKeyClause {
+    /// The clause as a rewrite that takes it OUT of the list, which is how the walk reads
+    /// one.
+    fn rewrite(&self) -> TableConstraintRewrite {
+        TableConstraintRewrite {
+            from: self.from,
+            until: self.until,
+            declared: None,
+        }
+    }
+}
+
+/// See [`AutoIncrementKeyClause`]; `None` where the statement declares no such clause.
+fn mysql_auto_increment_key_clause(
+    tokens: &[Token],
+    close: usize,
+) -> Option<AutoIncrementKeyClause> {
+    let word_at = |at: usize| match tokens.get(at) {
+        Some(Token::Word(word)) => Some(word.value.clone()),
+        _ => None,
+    };
+    let clauses = mysql_column_list_clauses(tokens, close);
+    // The column the keyword is on: the name the definition carrying it opens with.
+    let mut column = None;
+    for (clause, _) in &clauses {
+        let carries = clause.iter().any(|at| {
+            word_at(*at).is_some_and(|word| word.eq_ignore_ascii_case("auto_increment"))
+        });
+        if carries {
+            column = clause.first().copied().and_then(word_at);
+            break;
+        }
+    }
+    let column = column?;
+    // The clause that declares the primary key over that one column, and nothing else.
+    for (clause, at) in &clauses {
+        let words: Vec<Option<String>> = clause.iter().map(|at| word_at(*at)).collect();
+        let named = |position: usize| words.get(position).cloned().flatten();
+        // The clause may name the constraint, which the key is declared without.
+        let position = if named(0).is_some_and(|word| word.eq_ignore_ascii_case("constraint")) {
+            2
+        } else {
+            0
+        };
+        if !named(position).is_some_and(|word| word.eq_ignore_ascii_case("primary"))
+            || !named(position + 1).is_some_and(|word| word.eq_ignore_ascii_case("key"))
+        {
+            continue;
+        }
+        let over: Vec<usize> = clause.get(position + 2..)?.to_vec();
+        let [open, named_column, closing] = over.as_slice() else {
+            continue;
+        };
+        if !matches!(tokens.get(*open), Some(Token::LParen))
+            || !matches!(tokens.get(*closing), Some(Token::RParen))
+            || !word_at(*named_column).is_some_and(|word| word.eq_ignore_ascii_case(&column))
+        {
+            continue;
+        }
+        return Some(AutoIncrementKeyClause {
+            from: clause.first().copied().unwrap_or(*at),
+            until: *at,
+        });
+    }
+    None
+}
+
+/// Declare the engine's own COUNTER on the primary key of the column definition being
+/// emitted, answering whether that definition carries one at all.
+///
+/// The engine takes `AUTOINCREMENT` as part of a column's `PRIMARY KEY`, so the keyword is
+/// inserted right after it rather than appended: what it adds is that the counter never hands
+/// out a key it has handed out before, which is what MySQL's own counter does — "the value of
+/// an AUTO_INCREMENT column is not reused" after the row holding it is deleted.
+fn declare_the_counter(out: &mut Vec<String>) -> bool {
+    let from = out
+        .iter()
+        .rposition(|piece| {
+            let piece = piece.trim();
+            piece == "," || piece == "("
+        })
+        .map_or(0, |at| at + 1);
+    let mut primary = false;
+    for at in from..out.len() {
+        let piece = out[at].trim();
+        if piece.is_empty() {
+            continue;
+        }
+        if piece.eq_ignore_ascii_case("key") && primary {
+            out.insert(at + 1, " AUTOINCREMENT".to_string());
+            return true;
+        }
+        primary = piece.eq_ignore_ascii_case("primary");
+    }
+    false
 }
 
 /// How the engine declares the table-constraint clause whose significant tokens are at

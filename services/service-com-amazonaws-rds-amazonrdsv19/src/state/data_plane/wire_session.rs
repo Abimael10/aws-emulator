@@ -1119,6 +1119,12 @@ pub struct SessionFacts {
     pub runtime: EngineRuntime,
     /// The sessions open on this endpoint, this one included.
     pub sessions: super::pg_sessions::SessionRegistry,
+    /// The value this session's `LAST_INSERT_ID()` answers with, shared with the engine
+    /// connection its statements run on ([`super::mysql_insert_id`]).
+    pub insert_id: super::mysql_insert_id::SessionInsertId,
+    /// What the server has to say about this session's last statement, which its
+    /// `SHOW WARNINGS` reports ([`super::mysql_diagnostics`]).
+    pub diagnostics: super::mysql_diagnostics::SessionDiagnostics,
 }
 
 impl SessionFacts {
@@ -1490,13 +1496,23 @@ pub fn run_statement(
     sql: &str,
     params: &[Option<String>],
 ) -> Result<StatementAnswer, EngineError> {
-    run_statement_at(
+    let answer = run_statement_at(
         database,
         facts,
         sql,
         params,
         &mut super::pg_code_block::BlockBudget::default(),
-    )
+    );
+    // What the server has to say about the statement it has just run: a refusal leaves its
+    // own condition in the session's diagnostics area, where a MySQL client reads it back
+    // with `SHOW WARNINGS` ([`super::mysql_diagnostics`]). A statement that succeeded has
+    // already cleared the list ([`run_statement_at`]).
+    if facts.wire == EngineWire::MySql {
+        if let Err(error) = &answer {
+            facts.diagnostics.record(error);
+        }
+    }
+    answer
 }
 
 /// [`run_statement`] under a BUDGET, which is what a statement run from inside a code block
@@ -1536,6 +1552,11 @@ pub(super) fn run_statement_at(
         return Ok(StatementAnswer::new(String::new(), ResultSet::default()));
     }
     let words = leading_words(&tokens, 3);
+    // The session's diagnostics are the LAST statement's: this one replaces them, unless it
+    // is one of the statements that READ the list ([`super::mysql_diagnostics`]).
+    if facts.wire == EngineWire::MySql && !super::mysql_diagnostics::reads_the_list(&words) {
+        facts.diagnostics.clear();
+    }
     // A statement written in a form the SESSION'S OWN dialect does not define is refused as
     // that engine's parse error, before anything is served for it: the two engines are not
     // one generic SQL front end, and a client that probes which one it is talking to has to
@@ -1633,6 +1654,20 @@ pub(super) fn run_statement_at(
     super::mysql_server::refresh_catalogs(database, facts, &named)?;
     // Where the statement's own names put it, and the statement as the engine reads it.
     let (target, stream) = resolve_qualifiers(database, facts, &stream)?;
+    // A value a column of the table does not admit: in strict mode a MySQL server refuses the
+    // statement in the words of the condition the value broke, and without it the statement
+    // runs with the value the column DOES admit ([`super::mysql_strict_mode`]). Decided
+    // before the statement runs, so no row a column would not hold reaches the storage behind
+    // it.
+    let fitted = super::mysql_strict_mode::fitted(database, facts, &target, sql)?;
+    let adjusted = match &fitted {
+        Some(adjustment) => {
+            let stream = statement_tokens(facts.wire, &adjustment.sql)?;
+            Some(resolve_qualifiers(database, facts, &stream)?.1)
+        }
+        None => None,
+    };
+    let stream = adjusted.unwrap_or(stream);
     let prepared = dialect::render_for_engine(facts, &stream);
     // The EXACT-DECIMAL arithmetic in it, computed exactly: a cast to `numeric` and the
     // operators over it are the engine's own decimal functions rather than its binary
@@ -1680,6 +1715,32 @@ pub(super) fn run_statement_at(
         database.locks().release_rows(facts.connection_id, &held.rows);
     }
     let answer = result?;
+    // What the server ADJUSTED to run the statement, which it says in the session's
+    // diagnostics area: only for a statement that ran, and after it has.
+    if let Some(adjustment) = &fitted {
+        for (code, message) in &adjustment.warnings {
+            facts.diagnostics.warn(*code, message.clone());
+        }
+    }
+    // The AUTO_INCREMENT key an insert was assigned is this session's `LAST_INSERT_ID()` from
+    // here on, and it is the insert id the wire reports for the statement — one value, read
+    // two ways ([`super::mysql_insert_id`]). A statement that was assigned no key reports
+    // none, which is what a MySQL server answers for one.
+    let answer = match facts.wire {
+        EngineWire::MySql => {
+            let assigned = super::mysql_insert_id::assigned_key(
+                database, facts, &verb, &target, sql, &answer,
+            );
+            if let Some(key) = assigned {
+                facts.insert_id.set(key);
+            }
+            ResultSet {
+                last_insert_id: assigned.unwrap_or_default(),
+                ..answer
+            }
+        }
+        EngineWire::Postgres => answer,
+    };
     // A MySQL table's columns carry a CHARACTER SET and a COLLATION the engine declares
     // nothing for, so what the client declared is recorded for the column catalog to report
     // ([`super::mysql_server::record_column_charsets`]). Only for a create that SUCCEEDED,
@@ -1970,6 +2031,7 @@ pub fn server_view(facts: &SessionFacts) -> super::sql_engine::ServerView {
             .unwrap_or(0),
         wire: Some(facts.wire),
         deadline: None,
+        insert_id: Some(facts.insert_id.clone()),
     }
 }
 
@@ -2343,6 +2405,13 @@ fn mysql_show(
         "GRANTS" => Ok(StatementAnswer::new(
             "SHOW",
             mysql_grants(database, facts, tokens)?,
+        )),
+        // `SHOW WARNINGS` / `SHOW ERRORS` — "information about the conditions resulting from
+        // the most recent statement in the current session", which this server keeps for the
+        // session ([`super::mysql_diagnostics`]).
+        "WARNINGS" | "ERRORS" => Ok(StatementAnswer::new(
+            "SHOW",
+            super::mysql_diagnostics::show(&facts.diagnostics, subject == "ERRORS"),
         )),
         // `SHOW TABLES`, `SHOW COLUMNS`, `SHOW CREATE TABLE` and the rest read the
         // schema, which is the ENGINE's to report; the engine has no `SHOW`, so the

@@ -263,6 +263,8 @@ async fn serve_session(
         read_only: facts.read_only,
         runtime: facts.runtime.clone(),
         sessions: context.sessions.clone(),
+        insert_id: super::mysql_insert_id::SessionInsertId::default(),
+        diagnostics: super::mysql_diagnostics::SessionDiagnostics::default(),
     };
     // `max_connections` — "the maximum number of concurrent connections to the database
     // server" — is what a PostgreSQL server bounds its session table by, and it refuses the
