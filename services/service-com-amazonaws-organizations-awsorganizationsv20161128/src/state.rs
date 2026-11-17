@@ -23,9 +23,9 @@ use crate::ops::types::{Organization, OrganizationalUnit, PolicyTypeSummary, Roo
 ///
 /// `organization` is the whole "is this account in an organization" flag: `None` means
 /// not in use, and every operation other than `CreateOrganization` answers
-/// `AWSOrganizationsNotInUseException` for it. A store this control plane is MOUNTED on
-/// holds one from the moment it is mounted — see `crate::service::EmulatedService::new`,
-/// which establishes the organization the emulated account belongs to.
+/// `AWSOrganizationsNotInUseException` for it. A fresh store holds `None` however this
+/// control plane was mounted — see `crate::service::EmulatedService::new`: the account is
+/// in an organization only once a `CreateOrganization` request has put it in one.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsOrganizationsAwsorganizationsv20161128State {
     /// The singleton organization `CreateOrganization` persists, or `None` while this
@@ -376,10 +376,10 @@ impl ComAmazonawsOrganizationsAwsorganizationsv20161128State {
     /// Persist an organization with `feature_set`, its single root, and the emulated
     /// account as the management account.
     ///
-    /// The ONE writer of the organization slot: `CreateOrganization` takes it for a
-    /// caller's create and `crate::service::EmulatedService::new` takes it for the
-    /// organization the emulated account already belongs to, so neither can build a
-    /// record the other would not.
+    /// The ONE writer of the organization slot, reached from the `CreateOrganization`
+    /// handler alone: membership is state that request writes, so mounting this control
+    /// plane establishes no organization and no other operation builds a record this one
+    /// would not.
     ///
     /// The management account is the calling account — "The account whose user is calling
     /// the CreateOrganization operation automatically becomes the management account of
