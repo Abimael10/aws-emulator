@@ -20,6 +20,12 @@
 //! effect lands while the run is still starting or while it is running, the lifecycle a client
 //! polling the run observes is the same.
 //!
+//! The rule is about the RUN and not about one read of it, so the second test here polls the
+//! same lifecycle through EVERY operation that reports a job run — the read of one run, that
+//! same read asking for the run's predecessors, and the read of the job's runs — because a run
+//! is "reported by `GetJobRun`/`GetJobRuns`" in the state its own lifecycle has reached,
+//! whichever of them a client keyed its wait loop on.
+//!
 //! Amazon S3 and Amazon SQS are mounted BESIDE Glue on the SAME engine, so the script is read
 //! from the object store a test staged it in and the message it sends travels the real
 //! in-process callback to a real queue — the effect asserted here is one a client can receive.
@@ -36,12 +42,12 @@ use std::time::SystemTime;
 use serde_json::{json, Value};
 use service_com_amazonaws_glue_awsglue::state::{
     JOB_RUN_SETTLES_AFTER, JOB_RUN_STATE_RUNNING, JOB_RUN_STATE_STARTING,
-    JOB_RUN_STATE_SUCCEEDED, JOB_SCRIPT_RUN_CEILING,
+    JOB_RUN_STATE_SUCCEEDED, JOB_SCRIPT_RUN_CEILING, TERMINAL_JOB_RUN_STATES,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::job_run_state_change_events::{given_queue, sqs};
-use crate::job_runs::{at_rest, get_run, RUN_AT_REST_DEADLINE, RUN_POLL_INTERVAL};
+use crate::job_runs::{at_rest, get_run, start_run, RUN_AT_REST_DEADLINE, RUN_POLL_INTERVAL};
 use crate::job_script_execution::{create_bucket, stage_script, ROLE_ARN, SCRIPTS};
 use crate::wire::{emulator_on, ok};
 
@@ -146,15 +152,75 @@ struct Observed {
     at_rest: Value,
 }
 
-/// Poll the run `run_id` of `job_name` until it has come to rest, recording every state it
-/// goes through and what the queue held the first time it was seen running.
+/// WHICH read of a job run a client polls its lifecycle through.
+///
+/// Every one of these reports the same run, so each has to report the state that run's own
+/// lifecycle has reached.
+#[derive(Debug, Clone, Copy)]
+enum Reader {
+    /// `GetJobRun`, addressing the run by the `JobName`/`RunId` pair.
+    OneRun,
+    /// The same read, asking for the run's predecessors as well
+    /// (`GetJobRunRequest$PredecessorsIncluded`).
+    OneRunWithPredecessors,
+    /// `GetJobRuns`, which reports every run of the job — the run under test among them.
+    EveryRunOfTheJob,
+}
+
+/// Read the run `run_id` of `job_name` through `reader`, and answer the `JobRun` it reports.
+async fn read_through(
+    router: &MultiServiceRouter,
+    reader: Reader,
+    case: &str,
+    job_name: &str,
+    run_id: &str,
+) -> Value {
+    match reader {
+        Reader::OneRun => get_run(router, job_name, run_id).await,
+        Reader::OneRunWithPredecessors => {
+            let body = ok(
+                router,
+                "GetJobRun",
+                &json!({
+                    "JobName": job_name,
+                    "RunId": run_id,
+                    "PredecessorsIncluded": true,
+                }),
+            )
+            .await;
+            body.get("JobRun").cloned().unwrap_or_else(|| {
+                panic!("case {case:?}: GetJobRun must report a JobRun, got {body}")
+            })
+        }
+        Reader::EveryRunOfTheJob => {
+            let page = ok(router, "GetJobRuns", &json!({ "JobName": job_name })).await;
+            page.get("JobRuns")
+                .and_then(Value::as_array)
+                .and_then(|runs| {
+                    runs.iter()
+                        .find(|run| run.get("Id").and_then(Value::as_str) == Some(run_id))
+                        .cloned()
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "case {case:?}: the runs of {job_name:?} must hold {run_id:?}, got {page}"
+                    )
+                })
+        }
+    }
+}
+
+/// Poll the run `run_id` of `job_name` THROUGH `reader` until it has come to rest, recording
+/// every state it goes through and what the queue held the first time it was seen running.
 ///
 /// Nothing is made due through the store: this suite is asking what the run's OWN lifecycle
 /// does, so the states fall due on the service's own clock. The wait is a poll for the
 /// condition — that the run has come to rest — against a generous deadline, and nothing is
-/// asserted about how long any of it took.
+/// asserted about how long any of it took. Every read is also asked the two questions a run
+/// that has not finished answers the same way whichever read reports it.
 async fn observe_run(
     router: &MultiServiceRouter,
+    reader: Reader,
     case: &str,
     job_name: &str,
     run_id: &str,
@@ -164,7 +230,7 @@ async fn observe_run(
     let mut states: Vec<String> = Vec::new();
     let mut held_when_running: Option<u64> = None;
     loop {
-        let run = get_run(router, job_name, run_id).await;
+        let run = read_through(router, reader, case, job_name, run_id).await;
         let state = run
             .get("JobRunState")
             .and_then(Value::as_str)
@@ -184,9 +250,14 @@ async fn observe_run(
             };
         }
         assert!(
+            run.get("CompletedOn").is_none() && run.get("ErrorMessage").is_none(),
+            "case {case:?}: a run read through {reader:?} while it is in flight reports neither \
+             CompletedOn nor an ErrorMessage, got {run}"
+        );
+        assert!(
             SystemTime::now() < deadline,
-            "case {case:?}: run {run_id:?} of {job_name:?} must come to rest, and it reports \
-             {run}"
+            "case {case:?}: run {run_id:?} of {job_name:?}, read through {reader:?}, must come \
+             to rest, and it reports {run}"
         );
         tokio::time::sleep(RUN_POLL_INTERVAL).await;
     }
@@ -280,7 +351,8 @@ async fn a_run_is_observable_while_its_script_runs_and_its_effect_lands_then() {
              ErrorMessage, got {straight_after}"
         );
 
-        let observed = observe_run(&router, case, &name, &run_id, &queue_url).await;
+        let observed =
+            observe_run(&router, Reader::OneRun, case, &name, &run_id, &queue_url).await;
 
         // The run passed THROUGH the state a run whose script is running is in, before the
         // state it came to rest in: a client polling it observes the in-flight phase.
@@ -360,5 +432,129 @@ async fn a_run_is_observable_while_its_script_runs_and_its_effect_lands_then() {
                 observed.held_when_running
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn every_read_of_a_run_reports_the_lifecycle_it_has_reached() {
+    // (case, the read the client polls through, the seconds the script waits before it sends)
+    let rows: [(&str, Reader, u64); 4] = [
+        ("polled through the read of one run", Reader::OneRun, 0),
+        (
+            "polled through the read of one run, asking for its predecessors",
+            Reader::OneRunWithPredecessors,
+            JOB_RUN_SETTLES_AFTER.as_secs(),
+        ),
+        (
+            "polled through the read of the job's runs",
+            Reader::EveryRunOfTheJob,
+            0,
+        ),
+        (
+            "polled through the read of the job's runs, whose script waits a span",
+            Reader::EveryRunOfTheJob,
+            JOB_RUN_SETTLES_AFTER.as_secs(),
+        ),
+    ];
+
+    let (router, _engine) = emulator_with_a_queue();
+    create_bucket(&router).await;
+
+    for (index, (case, reader, waits)) in rows.into_iter().enumerate() {
+        // As above: a row's wait has to stay inside the span one run of a script is given, or
+        // the row would be asking for the state a terminated script reports instead.
+        assert!(
+            waits < JOB_SCRIPT_RUN_CEILING.as_secs(),
+            "case {case:?}: a row of this suite waits {waits}s, inside the \
+             {JOB_SCRIPT_RUN_CEILING:?} span one run of a script is given"
+        );
+
+        let name = format!("read-through-{index}");
+        let tag = format!("read-through-tag-{index}");
+        let (queue_url, _arn) = given_queue(&router, &format!("read-through-queue-{index}")).await;
+        let location =
+            stage_script(&router, &format!("{SCRIPTS}{name}.py"), WAITS_THEN_SENDS).await;
+        create_job(&router, &name, &location).await;
+
+        let run_id = start_run(
+            &router,
+            &json!({
+                "JobName": name,
+                "Arguments": {
+                    "--QUEUE_URL": queue_url,
+                    "--RUN_TAG": tag,
+                    "--WAIT_SECONDS": waits.to_string(),
+                },
+            }),
+        )
+        .await;
+
+        let observed = observe_run(&router, reader, case, &name, &run_id, &queue_url).await;
+        let states = observed.states;
+
+        // Whichever read the client polled through, it observed the whole lifecycle: the state
+        // a start puts a run in, then the state a run whose script is running is in, then the
+        // state that execution came to — and nothing outside it.
+        assert_eq!(
+            states.first().map(String::as_str),
+            Some(JOB_RUN_STATE_STARTING),
+            "case {case:?}: the lifecycle begins in {JOB_RUN_STATE_STARTING}, and {reader:?} \
+             reported {states:?}"
+        );
+        assert_eq!(
+            states.last().map(String::as_str),
+            Some(JOB_RUN_STATE_SUCCEEDED),
+            "case {case:?}: a script that exited cleanly brings its run to rest in \
+             {JOB_RUN_STATE_SUCCEEDED}, and {reader:?} reported {states:?}"
+        );
+        // Checked, so a lifecycle with fewer states than that — the very collapse this suite
+        // is about — is REPORTED rather than panicking on the arithmetic.
+        assert_eq!(
+            states.iter().position(|state| state == JOB_RUN_STATE_RUNNING),
+            states.len().checked_sub(2),
+            "case {case:?}: {reader:?} must report {JOB_RUN_STATE_RUNNING} as the state just \
+             before the terminal one, and it reported {states:?}"
+        );
+        for state in &states {
+            assert!(
+                [
+                    JOB_RUN_STATE_STARTING,
+                    JOB_RUN_STATE_RUNNING,
+                    JOB_RUN_STATE_SUCCEEDED,
+                ]
+                .contains(&state.as_str()),
+                "case {case:?}: {reader:?} reported the unexpected state {state:?} in \
+                 {states:?}"
+            );
+        }
+        assert_eq!(
+            states
+                .iter()
+                .filter(|state| TERMINAL_JOB_RUN_STATES.contains(&state.as_str()))
+                .count(),
+            1,
+            "case {case:?}: a run leaves no terminal state again, so {reader:?} reports exactly \
+             one of them, and it reported {states:?}"
+        );
+        assert!(
+            observed
+                .at_rest
+                .get("CompletedOn")
+                .and_then(Value::as_f64)
+                .is_some()
+                && observed.at_rest.get("ErrorMessage").is_none(),
+            "case {case:?}: {reader:?} must report a finished run's CompletedOn and no \
+             ErrorMessage for a script that failed at nothing, got {}",
+            observed.at_rest
+        );
+
+        // And the run really ran: the message its script sends is on the queue a client reads.
+        let bodies = received_bodies(&router, case, &queue_url).await;
+        assert_eq!(
+            bodies,
+            BTreeSet::from([format!("completed:{tag}")]),
+            "case {case:?}: the run's script sends exactly the message its arguments name, got \
+             {bodies:?}"
+        );
     }
 }
