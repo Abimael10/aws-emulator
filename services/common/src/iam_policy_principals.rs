@@ -194,6 +194,65 @@ fn is_provider_url(value: &str) -> bool {
     is_host(host) && !path.contains(char::is_whitespace)
 }
 
+/// The first value the statements of the policy document `text` name as a principal that is
+/// in NONE of the forms the policy language defines for its principal type, or `None` when
+/// every one of them names a principal.
+///
+/// [`unreadable_principal`] is this reading for a statement the caller has already parsed;
+/// a service that holds the document as TEXT reads it here, so it parses once and walks the
+/// same statements the grammar beside it walks ([`super::iam_policy`]) rather than carrying a
+/// second reading of the `Statement` element. A text that is no policy names no principal and
+/// is answered `None`: that it is no policy is the grammar's clause, not this one's.
+#[must_use]
+pub fn unreadable_policy_principal(text: &str) -> Option<String> {
+    let document = ::serde_json::from_str::<::serde_json::Value>(text).ok()?;
+    super::iam_policy::statements(&document)
+        .into_iter()
+        .filter_map(::serde_json::Value::as_object)
+        .find_map(unreadable_principal)
+}
+
+/// Every identity the statements of the policy document `text` grant to: the values their
+/// principal elements ([`PRINCIPAL_STATEMENT_ELEMENTS`]) name, in the order the document
+/// names them.
+///
+/// A service that RESOLVES the identities a document grants to — against its account's IAM
+/// ([`super::iam_principal`]) or against its own records — reads them here, so every such
+/// service resolves the same values this module reads the forms of. Empty for a text that is
+/// no policy, and for a document whose statements name no principal.
+#[must_use]
+pub fn policy_principals(text: &str) -> Vec<String> {
+    let Ok(document) = ::serde_json::from_str::<::serde_json::Value>(text) else {
+        return Vec::new();
+    };
+    super::iam_policy::statements(&document)
+        .into_iter()
+        .flat_map(|statement| {
+            PRINCIPAL_STATEMENT_ELEMENTS
+                .into_iter()
+                .filter_map(|element| statement.get(element))
+                .flat_map(named_principals)
+                .collect::<Vec<String>>()
+        })
+        .collect()
+}
+
+/// The principals one principal element names, in whichever of the language's two forms it
+/// is written: the untyped shorthand, or a map from a principal type to one value or a list
+/// of them. A value under a name the language does not define as a type names no principal,
+/// because nothing is granted to a type that does not exist.
+fn named_principals(element: &::serde_json::Value) -> Vec<String> {
+    match element {
+        ::serde_json::Value::String(value) => vec![value.clone()],
+        ::serde_json::Value::Object(types) => types
+            .iter()
+            .filter(|(principal_type, _)| PRINCIPAL_TYPES.contains(&principal_type.as_str()))
+            .flat_map(|(_, named)| values(named))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// `element`'s values: a principal type names one string or a list of them, and anything
 /// else names no value — a nested object under a type is not a principal, so it is reported
 /// through its own rendering rather than ignored, which is the one way this differs from the
@@ -402,5 +461,69 @@ mod tests {
             Some("nobody"),
             "a NotPrincipal value outside the AWS forms must be reported, got {read:?}"
         );
+    }
+
+    /// RULE: the same two readings over a document held as TEXT — the statements are the
+    /// ones the grammar beside this module walks, in both forms it writes them.
+    ///
+    /// The rows differ along what the readings generalise over: the form `Statement` takes
+    /// (a list, the one statement as the object itself), which element names the principals,
+    /// how many statements name them, and a text that is no policy at all.
+    #[test]
+    fn a_document_held_as_text_is_read_over_the_same_statements() {
+        let rows: [(&str, &str, Vec<&str>, Option<&str>); 6] = [
+            (
+                "one statement naming two identities",
+                "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\
+                 \"Action\":\"svc:A\",\"Principal\":{\"AWS\":[\"123456789012\",\
+                 \"arn:aws:iam::123456789012:root\"]}}]}",
+                vec!["123456789012", "arn:aws:iam::123456789012:root"],
+                None,
+            ),
+            (
+                "the statement written as the object itself",
+                "{\"Version\":\"2012-10-17\",\"Statement\":{\"Effect\":\"Allow\",\
+                 \"Action\":\"svc:A\",\"Principal\":\"*\"}}",
+                vec!["*"],
+                None,
+            ),
+            (
+                "two statements, one naming the complement",
+                "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\
+                 \"Action\":\"svc:A\",\"Principal\":{\"Service\":\"svc.amazonaws.com\"}},\
+                 {\"Effect\":\"Deny\",\"Action\":\"svc:B\",\
+                 \"NotPrincipal\":{\"AWS\":\"arn:aws:iam::123456789012:user/one\"}}]}",
+                vec!["svc.amazonaws.com", "arn:aws:iam::123456789012:user/one"],
+                None,
+            ),
+            (
+                "a value outside its type's forms",
+                "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\
+                 \"Action\":\"svc:A\",\"Principal\":{\"AWS\":\"nobody\"}}]}",
+                vec!["nobody"],
+                Some("nobody"),
+            ),
+            (
+                "a document naming no principal at all",
+                "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Deny\"}]}",
+                vec![],
+                None,
+            ),
+            ("a text that is no policy", "not a policy", vec![], None),
+        ];
+
+        for (case, document, named, unreadable) in rows {
+            let principals = policy_principals(document);
+            assert_eq!(
+                principals, named,
+                "case {case:?}: expected the identities {named:?}, got {principals:?}"
+            );
+            let read = unreadable_policy_principal(document);
+            assert_eq!(
+                read.as_deref(),
+                unreadable,
+                "case {case:?}: expected {unreadable:?}, got {read:?}"
+            );
+        }
     }
 }

@@ -327,51 +327,55 @@ struct PolicyCase {
 
 /// The policy rows: documents on both sides of the publicness derivation, each
 /// differing in HOW it does or does not open the access point to everyone.
+///
+/// Each names the access point it is attached to with the wildcard the policy
+/// language admits in a name, so one row serves every access point this suite
+/// creates — a policy applies to the access point it is attached to.
 fn policy_cases() -> Vec<PolicyCase> {
     vec![
         PolicyCase {
             case: "a bare wildcard principal",
-            document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:us-west-2:123456789012:accesspoint/ap/object/*"}]}"#,
+            document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:us-west-2:123456789012:accesspoint/*/object/*"}]}"#,
             public: true,
         },
         PolicyCase {
             case: "a wildcard AWS principal",
-            document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:aws:s3:us-west-2:123456789012:accesspoint/ap/object/*"}]}"#,
+            document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:aws:s3:us-west-2:123456789012:accesspoint/*/object/*"}]}"#,
             public: true,
         },
         PolicyCase {
             case: "a wildcard among named principals",
-            document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":["arn:aws:iam::123456789012:root","*"]},"Action":"s3:*","Resource":"arn:aws:s3:us-west-2:123456789012:accesspoint/ap/object/*"}]}"#,
+            document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":["arn:aws:iam::123456789012:root","*"]},"Action":"s3:*","Resource":"arn:aws:s3:us-west-2:123456789012:accesspoint/*/object/*"}]}"#,
             public: true,
         },
         PolicyCase {
             case: "an allow that names who it excludes rather than who it admits",
-            document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","NotPrincipal":{"AWS":"arn:aws:iam::210987654321:root"},"Action":"s3:GetObject","Resource":"arn:aws:s3:us-west-2:123456789012:accesspoint/ap/object/*"}]}"#,
+            document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","NotPrincipal":{"AWS":"arn:aws:iam::210987654321:root"},"Action":"s3:GetObject","Resource":"arn:aws:s3:us-west-2:123456789012:accesspoint/*/object/*"}]}"#,
             public: true,
         },
         PolicyCase {
             case: "a single statement written as an object rather than a list",
-            document: r#"{"Version":"2012-10-17","Statement":{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:aws:s3:us-west-2:123456789012:accesspoint/ap/object/*"}}"#,
+            document: r#"{"Version":"2012-10-17","Statement":{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:aws:s3:us-west-2:123456789012:accesspoint/*/object/*"}}"#,
             public: true,
         },
         PolicyCase {
             case: "a principal scoped to one account",
-            document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::123456789012:root"},"Action":"s3:GetObject","Resource":"arn:aws:s3:us-west-2:123456789012:accesspoint/ap/object/*"}]}"#,
+            document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::123456789012:root"},"Action":"s3:GetObject","Resource":"arn:aws:s3:us-west-2:123456789012:accesspoint/*/object/*"}]}"#,
             public: false,
         },
         PolicyCase {
             case: "a wildcard principal on a deny",
-            document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:us-west-2:123456789012:accesspoint/ap/object/*"}]}"#,
+            document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:us-west-2:123456789012:accesspoint/*/object/*"}]}"#,
             public: false,
         },
         PolicyCase {
             case: "a wildcard principal narrowed to the requester's account",
-            document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:us-west-2:123456789012:accesspoint/ap/object/*","Condition":{"StringEquals":{"aws:PrincipalAccount":"123456789012"}}}]}"#,
+            document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:us-west-2:123456789012:accesspoint/*/object/*","Condition":{"StringEquals":{"aws:PrincipalAccount":"123456789012"}}}]}"#,
             public: false,
         },
         PolicyCase {
             case: "a wildcard principal narrowed to one VPC",
-            document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:aws:s3:us-west-2:123456789012:accesspoint/ap/object/*","Condition":{"StringEquals":{"aws:SourceVpc":"vpc-0a1b2c3d4e5f67890"}}}]}"#,
+            document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:aws:s3:us-west-2:123456789012:accesspoint/*/object/*","Condition":{"StringEquals":{"aws:SourceVpc":"vpc-0a1b2c3d4e5f67890"}}}]}"#,
             public: false,
         },
         PolicyCase {

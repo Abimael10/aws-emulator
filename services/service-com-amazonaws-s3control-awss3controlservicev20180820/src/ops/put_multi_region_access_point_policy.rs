@@ -8,6 +8,13 @@
 //! the token of the request that put it. Each access point has one policy, so a
 //! later put replaces what an earlier one left.
 //!
+//! The document is read against the policy language and against the identities it
+//! grants to, exactly as a single-Region access point's policy is
+//! (`crate::state::access_point_policy_actions`). Its RESOURCE elements are the one
+//! clause not read here: what this document is attached to is a Multi-Region Access
+//! Point, whose resource ARN this emulator has no recorded reading of, so a value naming
+//! something else is stored rather than refused.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -155,7 +162,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::MAX_POLICY_BYTES
             )));
         }
-        if let Some(refusal) = crate::state::access_point_policy_refusal(&input.details.policy) {
+        if let Some(refusal) =
+            crate::state::access_point_policy_actions::access_point_policy_refusal(
+                &input.details.policy,
+            )
+        {
+            return Err(refusal);
+        }
+        // And the identities it grants to are resolved against this account's IAM, as
+        // they are for a single-Region access point's policy: a grant to an identity
+        // that is not there is a grant to nobody, whichever access point surface the
+        // document is attached through. Resolved before this service's own guard is
+        // taken, which is the lock order it keeps for every record it reads out of
+        // another store.
+        let signed_for = crate::state::signing_region(ctx.parts());
+        if let Some(refusal) =
+            crate::state::access_point_policy_actions::unresolved_policy_principal(
+                ctx,
+                &signed_for,
+                &input.details.policy,
+            )
+            .await
+        {
             return Err(refusal);
         }
 

@@ -28,6 +28,9 @@ use aws_smithy_schema::{Schema, ShapeId, ShapeType};
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// Which ACTIONS a policy attached to an access point may name, and the refusals
+/// a document naming anything else earns.
+pub mod access_point_policy_actions;
 /// Publishing an access point's DATA PATH into the object store that serves it.
 pub mod access_point_routes;
 /// The ACCOUNT-level `PublicAccessBlock` configuration, held in the object store
@@ -3644,51 +3647,6 @@ pub fn policy_document_refusal<E>(document: &str) -> Option<crate::scaffolded::S
         Some(::service_common::iam_policy::AttachedPolicyDefect::NotAPolicyObject)
     )
     .then(|| malformed_policy_stating(::service_common::iam_policy::NOT_A_JSON_POLICY_MESSAGE))
-}
-
-/// The refusal a document the ACCESS POINT policy surface will not attach is
-/// answered with, or `None` for one it stores.
-///
-/// The whole reading the validator that surface runs applies
-/// ([`::service_common::iam_policy::attached_policy_defect`]), each clause
-/// answered with AWS's own sentence for it: the text is a policy object, every
-/// member name it carries is one the policy language defines, it carries the
-/// element the language requires, it declares a version string the language
-/// defines, and every action its statements name is one the language can read
-/// and this surface can grant ([`grantable_action`]).
-///
-/// A document breaking any clause describes nothing an access point's policy
-/// could enforce, so it is refused rather than attached. The whole reading is
-/// this surface's and not every policy surface's: the Access Grants instance
-/// resource policy accepts a member the language does not define and reports it
-/// back in the document it renders, so that operation reads only
-/// [`policy_document_refusal`].
-pub fn access_point_policy_refusal<E>(document: &str) -> Option<crate::scaffolded::Scaffolded<E>> {
-    ::service_common::iam_policy::attached_policy_defect(document, |action| {
-        grantable_action(action)
-    })
-    .map(|defect| malformed_policy_stating(defect.message()))
-}
-
-/// The IAM service namespaces an action an access point policy grants is named
-/// in: the prefixes of the S3 family.
-///
-/// An access point fronts S3 storage, so a statement of its policy grants an
-/// action of S3's own API; an action named in another service's namespace names
-/// nothing the access point could allow. The prefixes are the ones the S3 family
-/// publishes for its APIs — general-purpose and directory buckets (`s3`,
-/// `s3express`), Object Lambda access points (`s3-object-lambda`) and S3 on
-/// Outposts (`s3-outposts`).
-pub const S3_ACTION_NAMESPACES: [&str; 4] = ["s3", "s3-object-lambda", "s3-outposts", "s3express"];
-
-/// Whether `action` names an action an access point policy can grant: the policy
-/// language's wildcard, or a `<namespace>:<action>` pair whose namespace is one
-/// of [`S3_ACTION_NAMESPACES`].
-pub fn grantable_action(action: &str) -> bool {
-    action == ::service_common::iam_policy::ANY_ACTION
-        || action
-            .split_once(':')
-            .is_some_and(|(namespace, _)| S3_ACTION_NAMESPACES.contains(&namespace))
 }
 
 /// `AccessDenied` (HTTP 403): the store already holds

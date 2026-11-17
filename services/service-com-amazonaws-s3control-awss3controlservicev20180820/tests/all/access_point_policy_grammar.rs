@@ -12,10 +12,12 @@
 //!   words that clause, and a document carrying a member name the language does
 //!   not define — at its own level or inside a statement — is refused
 //!   `MalformedPolicy` naming that member, as is one that carries none of the
-//!   element the language requires, declares no version the language defines, or
-//!   names an action the language cannot read or this surface cannot grant; a
-//!   refused put stores nothing, so the document already on the access point is
-//!   what the next read answers, byte for byte;
+//!   element the language requires or declares no version the language defines;
+//!   an action element the language has no reading for leaves the document with
+//!   no policy syntax to read, and one that reads as an action but names none
+//!   the S3 APIs publish is refused as an invalid action, naming the offending
+//!   token; a refused put stores nothing, so the document already on the access
+//!   point is what the next read answers, byte for byte;
 //! * an access point that carries no policy is reported as such naming the
 //!   access point the request addressed;
 //! * an access point is a resource OF a bucket, so a listing scoped to a bucket
@@ -48,13 +50,24 @@ const NOT_A_POLICY: &str = service_common::iam_policy::NOT_A_JSON_POLICY_MESSAGE
 /// defines with.
 const BAD_VERSION: &str = service_common::iam_policy::INVALID_POLICY_VERSION_MESSAGE;
 
-/// The sentence AWS words a document naming an action its validator will not
-/// read with.
+/// The sentence AWS words a document naming an action no S3 API publishes with.
 const BAD_ACTION: &str = service_common::iam_policy::POLICY_INVALID_ACTION_MESSAGE;
+
+/// The sentence AWS words a document whose elements the policy language has no
+/// reading for with, read from the surface that states this service's clauses.
+const SYNTAX_INVALID: &str = service_com_amazonaws_s3control_awss3controlservicev20180820::state::access_point_policy_actions::POLICY_SYNTAX_INVALID_MESSAGE;
 
 /// A document the language defines every member of, used wherever a row needs a
 /// policy that is simply accepted.
-const GOOD_POLICY: &str = r#"{"Version":"2012-10-17","Statement":[{"Sid":"read","Effect":"Allow","Principal":{"AWS":"arn:aws:iam::123456789012:root"},"Action":"s3:GetObject","Resource":"arn:aws:s3:us-west-2:123456789012:accesspoint/ap/object/*","Condition":{"StringEquals":{"aws:PrincipalAccount":"123456789012"}}}]}"#;
+///
+/// Its resource names [`ACCESS_POINT`], the access point every suite below
+/// attaches it to — a policy applies to the access point it is attached to. The
+/// account and Region fields of the ARN are not read: the request already names
+/// the account and is signed for the Region.
+const GOOD_POLICY: &str = r#"{"Version":"2012-10-17","Statement":[{"Sid":"read","Effect":"Allow","Principal":{"AWS":"arn:aws:iam::123456789012:root"},"Action":"s3:GetObject","Resource":"arn:aws:s3:us-west-2:123456789012:accesspoint/grammar-ap/object/*","Condition":{"StringEquals":{"aws:PrincipalAccount":"123456789012"}}}]}"#;
+
+/// The access point the documents of these suites are attached to.
+const ACCESS_POINT: &str = "grammar-ap";
 
 /// Create one access point fronting `bucket`, with every public-access setting
 /// spelled off so this suite stays about the document rather than about
@@ -298,54 +311,10 @@ fn rows() -> Vec<Row> {
             document: r#"{"Version":2012,"Statement":[{"Effect":"Deny"}]}"#,
             refused: Some(BAD_VERSION.to_string()),
         },
-        // Every row below names an action the language cannot read or this
-        // surface cannot grant: one per form a value can take — no service
-        // namespace, a namespace of another service, a namespace with no action
-        // name, characters an action name is not written in, a value that is not
-        // a string, and an element naming nothing at all.
-        Row {
-            case: "an action naming no service namespace",
-            document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"GetObject"}]}"#,
-            refused: Some(BAD_ACTION.to_string()),
-        },
-        Row {
-            case: "an action of another service's namespace",
-            document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"ec2:RunInstances"}]}"#,
-            refused: Some(BAD_ACTION.to_string()),
-        },
-        Row {
-            case: "an action naming a namespace and no action name",
-            document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:"}]}"#,
-            refused: Some(BAD_ACTION.to_string()),
-        },
-        Row {
-            case: "an action name carrying a space",
-            document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:Get Object"}]}"#,
-            refused: Some(BAD_ACTION.to_string()),
-        },
-        Row {
-            case: "one readable action beside one that is not, in a list",
-            document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject","nope"]}]}"#,
-            refused: Some(BAD_ACTION.to_string()),
-        },
-        Row {
-            case: "an action that is not a string",
-            document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":5}]}"#,
-            refused: Some(BAD_ACTION.to_string()),
-        },
-        Row {
-            case: "an action element naming nothing at all",
-            document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":[]}]}"#,
-            refused: Some(BAD_ACTION.to_string()),
-        },
-        Row {
-            case: "the complement of the action element, unreadable",
-            document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","NotAction":"arn:aws:s3:::b"}]}"#,
-            refused: Some(BAD_ACTION.to_string()),
-        },
-        // Accepted beside them: the forms the language and this surface DO
-        // admit, including the wildcards an action name may carry and the S3
-        // namespaces beside `s3` itself.
+        // The action clause has a table of its own below, because its two
+        // readings earn two different refusals. Here are the forms the language
+        // and this surface DO admit: the wildcards an action name may carry, and
+        // the published actions of the S3 namespaces beside `s3` itself.
         Row {
             case: "the wildcard that stands for every action",
             document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*"}]}"#,
@@ -361,20 +330,181 @@ fn rows() -> Vec<Row> {
             document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3-object-lambda:GetObject"}]}"#,
             refused: None,
         },
+        Row {
+            case: "a published action of each namespace of the family",
+            document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:ListBucket","s3-outposts:PutObject","s3express:CreateSession","s3-object-lambda:WriteGetObjectResponse"]}]}"#,
+            refused: None,
+        },
     ]
+}
+
+/// One action element and the refusal the document carrying it earns.
+struct ActionRow {
+    case: &'static str,
+    /// The action element, written as the statement member it is in the
+    /// document — the element's name and its JSON value.
+    element: &'static str,
+    /// The sentence the refusal states.
+    message: &'static str,
+    /// The action the refusal names beside its message, or `None` for a refusal
+    /// that names none.
+    detail: Option<&'static str>,
+}
+
+/// A one-statement document whose statement carries `element` beside the effect
+/// and principal every statement of this suite states.
+fn action_policy(element: &str) -> String {
+    format!(
+        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":"*",{element}}}]}}"#
+    )
+}
+
+/// Every way an action element earns a refusal, with the refusal it earns.
+///
+/// Two readings, so two sentences: a value the policy language has no reading
+/// for leaves the document with no policy syntax to interpret, while a value
+/// that DOES read as an action but names none the S3 APIs publish is an invalid
+/// action, reported with the offending token. The rows of each differ along what
+/// its reading generalises over — the JSON form the element takes and the
+/// characters the token is written in, and how a readable token fails to name a
+/// published action.
+fn action_rows() -> Vec<ActionRow> {
+    let unreadable = |case, element| ActionRow {
+        case,
+        element,
+        message: SYNTAX_INVALID,
+        detail: None,
+    };
+    let unpublished = |case, element, detail| ActionRow {
+        case,
+        element,
+        message: BAD_ACTION,
+        detail: Some(detail),
+    };
+    vec![
+        unreadable(
+            "an action naming no service namespace",
+            r#""Action":"GetObject""#,
+        ),
+        unreadable(
+            "an action naming a namespace and no action name",
+            r#""Action":"s3:""#,
+        ),
+        unreadable(
+            "an action name carrying a space",
+            r#""Action":"s3:Get Object""#,
+        ),
+        unreadable(
+            "one readable action beside one that is not, in a list",
+            r#""Action":["s3:GetObject","nope"]"#,
+        ),
+        unreadable("an action that is not a string", r#""Action":5"#),
+        unreadable("an action element naming nothing at all", r#""Action":[]"#),
+        unreadable(
+            "an action written as an ARN rather than as an action",
+            r#""Action":"arn:aws:s3:::b""#,
+        ),
+        unreadable(
+            "the complement of the action element, unreadable",
+            r#""NotAction":"nope""#,
+        ),
+        unpublished(
+            "an action name no S3 API publishes",
+            r#""Action":"s3:Frobnicate""#,
+            "s3:Frobnicate",
+        ),
+        unpublished(
+            "a misspelling of a published action name",
+            r#""Action":"s3:GetObjectt""#,
+            "s3:GetObjectt",
+        ),
+        unpublished(
+            "a wildcard matching no published action name",
+            r#""Action":"s3:Zz*""#,
+            "s3:Zz*",
+        ),
+        unpublished(
+            "an action of another service's namespace",
+            r#""Action":"ec2:RunInstances""#,
+            "ec2:RunInstances",
+        ),
+        unpublished(
+            "an action name no API of the family publishes",
+            r#""Action":"s3express:Frobnicate""#,
+            "s3express:Frobnicate",
+        ),
+        unpublished(
+            "the first unpublished action of a list",
+            r#""Action":["s3:GetObject","s3-outposts:Frobnicate"]"#,
+            "s3-outposts:Frobnicate",
+        ),
+        unpublished(
+            "an unpublished action in the complement of the action element",
+            r#""NotAction":"s3:Frobnicate""#,
+            "s3:Frobnicate",
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn an_action_element_is_read_for_its_form_and_for_the_actions_it_names() {
+    let emulator = Emulator::start();
+    create(&emulator, ACCESS_POINT, "reports").await;
+    // A document already on the access point, so every refusal below is shown to
+    // have stored nothing: the access point keeps the policy it carried.
+    let stored = put_policy(&emulator, ACCESS_POINT, GOOD_POLICY).await;
+    assert_eq!(
+        stored.status,
+        service_com_amazonaws_s3control_awss3controlservicev20180820::state::NO_CONTENT_SUCCESS_STATUS,
+        "expected the first document to be stored, got {} with body {}",
+        stored.status,
+        stored.body
+    );
+
+    for row in action_rows() {
+        let document = action_policy(row.element);
+        let put = put_policy(&emulator, ACCESS_POINT, &document).await;
+        assert_eq!(
+            (put.status, put.code().as_str(), put.text("Message")),
+            (400, MALFORMED_POLICY, Some(row.message.to_string())),
+            "case {:?}: expected 400 {MALFORMED_POLICY} stating {:?}, got {} with body {}",
+            row.case,
+            row.message,
+            put.status,
+            put.body
+        );
+        assert_eq!(
+            put.text("Detail").as_deref(),
+            row.detail,
+            "case {:?}: expected the refusal to name {:?}, got body {}",
+            row.case,
+            row.detail,
+            put.body
+        );
+        assert_names_the_request(row.case, &put);
+
+        let read = get_policy(&emulator, ACCESS_POINT).await;
+        assert_eq!(
+            read.text("Policy").as_deref(),
+            Some(GOOD_POLICY),
+            "case {:?}: expected the refused put to store nothing, got body {}",
+            row.case,
+            read.body
+        );
+    }
 }
 
 #[tokio::test]
 async fn a_policy_document_is_held_to_the_policy_language_before_it_is_stored() {
     let emulator = Emulator::start();
-    create(&emulator, "grammar-ap", "reports").await;
+    create(&emulator, ACCESS_POINT, "reports").await;
 
     // The document on the access point at each point in the table: a refused put
     // stores nothing, so it stays what the last ACCEPTED put left.
     let mut stored: Option<&str> = None;
 
     for row in rows() {
-        let put = put_policy(&emulator, "grammar-ap", row.document).await;
+        let put = put_policy(&emulator, ACCESS_POINT, row.document).await;
         match &row.refused {
             None => {
                 assert_eq!(
@@ -401,7 +531,7 @@ async fn a_policy_document_is_held_to_the_policy_language_before_it_is_stored() 
 
         // Whatever the put answered, what the access point carries now is the
         // document the last accepted put left, byte for byte.
-        let read = get_policy(&emulator, "grammar-ap").await;
+        let read = get_policy(&emulator, ACCESS_POINT).await;
         match stored {
             None => assert_eq!(
                 (read.status, read.code().as_str()),

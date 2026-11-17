@@ -171,7 +171,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         // The document is retained verbatim on the record, so its size is
         // bounded before anything is stored: Amazon S3 documents a 20 KB
         // maximum for a bucket or access point policy.
@@ -185,8 +184,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An access point policy is a document in the IAM JSON policy language,
         // so one that is not a policy at all is a malformed policy rather than a
         // stored value — the one reading of that language this service applies
-        // wherever it takes a policy document.
-        if let Some(refusal) = crate::state::access_point_policy_refusal(&input.policy) {
+        // wherever it takes a policy document, together with the actions an
+        // access point's policy can grant.
+        if let Some(refusal) =
+            crate::state::access_point_policy_actions::access_point_policy_refusal(&input.policy)
+        {
+            return Err(refusal);
+        }
+
+        // And the identities it grants to are resolved against this account's IAM: a
+        // grant to an identity that is not there is a grant to nobody. Resolved before
+        // this service's own guard is taken, which is the lock order it keeps for every
+        // record it reads out of another store.
+        let region = crate::state::signing_region(ctx.parts());
+        if let Some(refusal) =
+            crate::state::access_point_policy_actions::unresolved_policy_principal(
+                ctx,
+                &region,
+                &input.policy,
+            )
+            .await
+        {
             return Err(refusal);
         }
 
@@ -212,6 +230,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = store.access_points.get_mut(&key) else {
             return Err(crate::state::no_such_access_point(&input.name));
         };
+        // A resource-based policy governs the resource it is attached to, so this
+        // document's statements name THIS access point — read once the access
+        // point the request addresses is known, which is why this clause of the
+        // document follows the lookup rather than preceding it.
+        if let Some(refusal) =
+            crate::state::access_point_policy_actions::access_point_resource_refusal(
+                &input.policy,
+                &input.name,
+            )
+        {
+            return Err(refusal);
+        }
         // A `BlockPublicPolicy` setting in force for this access point refuses a
         // document that grants public access, and nothing is stored: the
         // caller's next read finds the access point's policy exactly as it was.

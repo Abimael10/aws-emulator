@@ -65,6 +65,9 @@ percent-encoding = "2"
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# `tests/all/main.rs` declares one module per suite beside it, so a new suite is
+# a new file and nothing else.
+automod = { workspace = true }
 # IAM is mounted beside Amazon S3 and S3 Control on one engine in the batch-job
 # role suite, and the roles that suite names are created through IAM's own
 # operations, over this client.

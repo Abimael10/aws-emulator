@@ -59,10 +59,14 @@ impl Case {
 
 /// A document that opens the access point to everyone, so a row carrying it
 /// pins that publicness is no obstacle to removing it.
-const PUBLIC_POLICY: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:aws:s3:us-west-2:123456789012:accesspoint/ap/object/*"}]}"#;
+///
+/// Its resource names the access point it is attached to with the wildcard the
+/// policy language admits in a name, so the one document serves every row below
+/// whatever that row's access point is called.
+const PUBLIC_POLICY: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:aws:s3:us-west-2:123456789012:accesspoint/*/object/*"}]}"#;
 
 /// The same grant narrowed to one account: not public.
-const ACCOUNT_POLICY: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::123456789012:root"},"Action":"s3:*","Resource":"arn:aws:s3:us-west-2:123456789012:accesspoint/ap/object/*"}]}"#;
+const ACCOUNT_POLICY: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::123456789012:root"},"Action":"s3:*","Resource":"arn:aws:s3:us-west-2:123456789012:accesspoint/*/object/*"}]}"#;
 
 /// The rows. No row is a renaming of another: each varies the document, the
 /// access point's shape, or both.

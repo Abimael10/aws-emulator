@@ -56,9 +56,14 @@ const NO_CONFIGURATION_CODE: &str = "NoSuchPublicAccessBlockConfiguration";
 const PUBLIC_ACCESS_BLOCK_URI: &str = "/v20180820/configuration/publicAccessBlock";
 
 /// A policy document, for the rows that put one and then remove it.
+///
+/// Its resource names the access point it is attached to with the wildcard the
+/// policy language admits in a name, so the one document serves every access
+/// point this suite creates — a policy applies to the access point it is
+/// attached to.
 const POLICY: &str = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\
                       \"Principal\":{\"AWS\":\"123456789012\"},\"Action\":[\"s3:GetObject\"],\
-                      \"Resource\":\"*\"}]}";
+                      \"Resource\":\"arn:aws:s3:us-west-2:123456789012:accesspoint/*\"}]}";
 
 /// The two routes that read the policy of an access point by name
 /// (`/v20180820/accesspoint/{Name}/policy` and its `policyStatus` sibling), as
