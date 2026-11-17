@@ -252,6 +252,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // body alone: the guard is not `Send`, and the publication that follows is awaited.
         let (output, pushed, scan) =
             Self::store_pushed_image(&state, &input, &region, digest, now, planned_signings)?;
+        // The copies this push started under the registry's replication configuration are
+        // MADE at the instant the clock owes each one its completion, by a delivery task of
+        // the registry's: a copy is the registry's own work rather than the caller's, so it
+        // happens whether or not anybody reads the destination Region again. The call is
+        // inert when this push started no copy, and when a task of this registry's is
+        // already making them.
+        crate::state::replication::deliver_when_due(::std::sync::Arc::clone(&self.engine));
         // The push STORED an image, so the registry publishes the image action it
         // performed, with the store's lock released — EventBridge delivers the event to the
         // rules that match it, and a target of one may call back into this service.

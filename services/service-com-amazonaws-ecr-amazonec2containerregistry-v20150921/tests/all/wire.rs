@@ -224,6 +224,60 @@ pub async fn ok_until(
     }
 }
 
+/// The same poll as [`ok_until`], made against `region` and over the WHOLE answer — the
+/// status included — so a suite can wait for a call that is refused until the state it
+/// waits for exists.
+///
+/// The one poll loop of this harness, parameterised: [`ok_until`] waits for a successful
+/// answer to say something, and this waits for an answer at all, which is what a read of a
+/// resource another Region's registry is still receiving needs.
+pub async fn call_until_in_region(
+    router: &MultiServiceRouter,
+    case: &str,
+    region: &str,
+    operation: &str,
+    body: &Value,
+    settled: impl Fn(&Answer) -> bool,
+) -> Answer {
+    let since = ::std::time::Instant::now();
+    loop {
+        let answer = call_in_region(router, region, operation, body).await;
+        if settled(&answer) {
+            return answer;
+        }
+        assert!(
+            since.elapsed() < POLL_DEADLINE,
+            "case {case:?}: {operation} in {region} never answered what this poll waits \
+             for; its last answer was HTTP {} with {:?}",
+            answer.status,
+            answer.body
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Follow a URL this emulator handed out exactly as a client follows a pre-signed one — the
+/// address it names, no credential of any kind — and answer the status and the bytes served.
+///
+/// The address is taken apart here rather than in a suite: a URL this emulator announces
+/// carries the endpoint the caller reached it on, so the authority to send and the path to
+/// request both come out of the URL itself.
+pub async fn fetch_url(router: &MultiServiceRouter, case: &str, url: &str) -> (u16, Vec<u8>) {
+    let (authority, path) = url
+        .strip_prefix("https://")
+        .and_then(|rest| rest.split_once('/'))
+        .unwrap_or_else(|| panic!("case {case:?}: {url:?} is not an https URL with a path"));
+    let request = ::http::Request::builder()
+        .method("GET")
+        .uri(format!("/{path}"))
+        .header("host", authority)
+        .body(Bytes::new())
+        .expect("the test request is well formed");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    (status, response.into_body().to_vec())
+}
+
 /// A refused call: HTTP 400 with the wire error code `code`, or a panic naming the case
 /// and what came back instead. The refusal's body is returned for a caller that wants to
 /// look at its message.

@@ -6,6 +6,10 @@
 //! destination naming this registry itself (its own account id in the Region the request
 //! was made against) is refused — there is no replication from a registry to itself.
 //!
+//! The configuration stored here is an instruction about CONTENT: a push into a repository
+//! one of these rules covers is copied into each destination registry the rule names, which
+//! is `crate::state::replication`'s work.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements

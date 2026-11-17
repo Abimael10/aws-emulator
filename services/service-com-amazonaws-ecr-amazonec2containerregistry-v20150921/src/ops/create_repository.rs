@@ -292,37 +292,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let mut repo = crate::state::Repo {
-            arn: crate::state::repository_arn(&region, &name),
-            // The registry this repository belongs to is this account's IN THIS REGION:
-            // the Region is part of the repository's identity, so it is stored with it
-            // and keys it ([`crate::state::repository_key`]).
-            region: region.clone(),
-            registry_id: crate::state::registry_id().to_string(),
-            name: name.clone(),
-            created_at: now,
-            image_tag_mutability: mutability,
-            image_tag_mutability_exclusion_filters: exclusion_filters,
-            // "If this parameter is not specified, it will default to false and images
-            // will not be scanned unless a scan is manually started" — the modelled
-            // `@default(false)` on `ImageScanningConfiguration$scanOnPush`. A request
-            // that names no scanning configuration still creates a repository that
-            // reports one, with scanning off.
-            image_scanning_config: input.image_scanning_configuration.unwrap_or_default(),
-            encryption_config: encryption,
-            tags: Vec::new(),
-            // A new repository carries no repository policy until
-            // `SetRepositoryPolicy` applies one.
-            policy_text: None,
-            images: ::std::collections::BTreeMap::new(),
-            tag_index: ::std::collections::BTreeMap::new(),
-            // A new repository holds no blobs: a layer is in a repository once an
-            // upload against it is completed.
-            layer_blobs: ::std::collections::BTreeMap::new(),
-            // A new repository carries no lifecycle policy, and no preview of one.
-            lifecycle_policy: None,
-            lifecycle_preview: None,
-        };
+        let mut repo = crate::state::Repo::created(&region, &name, now);
+        repo.image_tag_mutability = mutability;
+        repo.image_tag_mutability_exclusion_filters = exclusion_filters;
+        // "If this parameter is not specified, it will default to false and images
+        // will not be scanned unless a scan is manually started" — the modelled
+        // `@default(false)` on `ImageScanningConfiguration$scanOnPush`. A request
+        // that names no scanning configuration still creates a repository that
+        // reports one, with scanning off.
+        repo.image_scanning_config = input.image_scanning_configuration.unwrap_or_default();
+        repo.encryption_config = encryption;
 
         // The create's tags go in through the same merge `TagResource` uses, so one key
         // carries one value here too: a request naming a key twice stores the last value

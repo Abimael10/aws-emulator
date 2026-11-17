@@ -661,6 +661,14 @@ pub struct ImageReplication {
     /// When the clock owes this copy its `IN_PROGRESS` -> `COMPLETE` transition:
     /// `started_at` + [`IMAGE_REPLICATION_DELAY`].
     pub complete_due_at: SystemTime,
+    /// Whether the copy has been MADE: whether the destination registry holds the
+    /// same-named repository with this image's manifest bytes, the blobs it references and
+    /// the tags pointing at it ([`replication`]).
+    ///
+    /// `false` while the clock has not made the copy due yet, which is every copy a push
+    /// has just started, and `false` for a copy into a registry this emulator does not hold
+    /// — another account's — where there is no repository of anybody's to copy into.
+    pub copied: bool,
 }
 
 impl ImageReplication {
@@ -2168,6 +2176,50 @@ pub struct Repo {
 }
 
 impl Repo {
+    /// A repository as it stands the moment it is created: every setting at the default a
+    /// repository nobody configured carries — tags mutable
+    /// ([`DEFAULT_IMAGE_TAG_MUTABILITY`]), images not scanned on push (the modelled
+    /// `@default(false)` on `ImageScanningConfiguration$scanOnPush`), encryption with an
+    /// Amazon S3-managed key ([`DEFAULT_ENCRYPTION_TYPE`]) — no policy, no metadata tags
+    /// and nothing stored in it.
+    ///
+    /// The ONE place a repository record is born, so the two paths that create one cannot
+    /// disagree about what a new repository carries: `CreateRepository`, which then applies
+    /// the settings the request named, and the replication of an image into a destination
+    /// registry that holds no repository of that name yet ([`replication`]).
+    pub fn created(region: &str, name: &str, created_at: SystemTime) -> Self {
+        Self {
+            arn: repository_arn(region, name),
+            // The registry this repository belongs to is this account's IN THIS REGION:
+            // the Region is part of the repository's identity, so it is stored with it and
+            // keys it ([`repository_key`]).
+            region: region.to_string(),
+            registry_id: registry_id().to_string(),
+            name: name.to_string(),
+            created_at,
+            image_tag_mutability: DEFAULT_IMAGE_TAG_MUTABILITY.to_string(),
+            // Exclusion filters belong only to a setting that has an exclusion to apply.
+            image_tag_mutability_exclusion_filters: Vec::new(),
+            image_scanning_config: ImageScanningConfiguration::default(),
+            encryption_config: EncryptionConfiguration {
+                encryption_type: DEFAULT_ENCRYPTION_TYPE.to_string(),
+                kms_key: None,
+            },
+            tags: Vec::new(),
+            // A new repository carries no repository policy until `SetRepositoryPolicy`
+            // applies one.
+            policy_text: None,
+            images: BTreeMap::new(),
+            tag_index: BTreeMap::new(),
+            // A new repository holds no blobs: a layer is in a repository once an upload
+            // against it is completed.
+            layer_blobs: BTreeMap::new(),
+            // A new repository carries no lifecycle policy, and no preview of one.
+            lifecycle_policy: None,
+            lifecycle_preview: None,
+        }
+    }
+
     /// The `Repository` every operation that reports this repository returns.
     ///
     /// `repositoryUri` is composed here rather than stored on the record, from the
@@ -2861,6 +2913,14 @@ pub struct ComAmazonawsEcrAmazonec2containerregistryV20150921State {
     /// in-flight publications never count against another's. See
     /// `state/scan_events.rs`.
     pub armed_scan_publications: usize,
+    /// Whether a delivery task of this registry's is currently making the copies the
+    /// replication configuration asks for.
+    ///
+    /// One task per registry makes every copy still owed, so this is the slot it holds:
+    /// taken and given back under this store's lock, which is what makes a push that
+    /// arrives while a task is stopping arm one of its own. See
+    /// [`replication::deliver_when_due`].
+    pub replication_delivery_running: bool,
 }
 
 impl ComAmazonawsEcrAmazonec2containerregistryV20150921State {
@@ -3058,6 +3118,9 @@ impl ComAmazonawsEcrAmazonec2containerregistryV20150921State {
                         registry_id: destination.registry_id.clone(),
                         started_at: now,
                         complete_due_at: now + IMAGE_REPLICATION_DELAY,
+                        // The copy is MADE when the clock makes it due, by the registry's
+                        // own delivery task (see [`replication`]); the push records it.
+                        copied: false,
                     },
                 );
             }
@@ -4587,6 +4650,12 @@ pub mod pull_metrics;
 /// handler names the part of the store it reads) here, so a handler reaches it as
 /// `crate::state::signing::…` like every other part of this store.
 pub mod signing;
+/// The copies the registry's replication configuration asks for — how an image pushed into
+/// a repository a rule covers reaches the destination registry it names — in
+/// `state/replication.rs`. Declared (and not glob re-exported, so a handler names the part
+/// of the store it reaches) here, so it is reached as `crate::state::replication::…` like
+/// every other part of this store.
+pub mod replication;
 mod image_scan;
 mod layer_download;
 /// What ECR judges about a `repositoryName` a request addresses an existing repository by,

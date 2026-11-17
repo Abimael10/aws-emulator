@@ -575,7 +575,10 @@ pub fn import_covered_image(
     let repository = store
         .repositories
         .entry(repository_key(region, repository_name))
-        .or_insert_with(|| cache_repository(region, repository_name, now));
+        // The repository a first pull through the cache creates, with the settings a
+        // repository this registry creates without a request carries: tags mutable, nothing
+        // scanned on push, and the service-default encryption ([`Repo::created`]).
+        .or_insert_with(|| Repo::created(region, repository_name, now));
     // The configuration document the imported manifest describes is held as the blob it
     // describes, under the digest of its own bytes, so the manifest references nothing the
     // repository does not have.
@@ -649,33 +652,6 @@ fn upstream_reference(rule: &PullThroughCacheRule, repository_name: &str, tag: &
         .unwrap_or_default()
         .trim_end_matches('/');
     format!("{host}/{upstream_prefix}{path}:{tag}")
-}
-
-/// The repository a first pull through the cache creates, with the settings a repository
-/// this registry creates without a request carries: tags mutable, nothing scanned on push,
-/// and the service-default encryption.
-fn cache_repository(region: &str, name: &str, now: SystemTime) -> Repo {
-    Repo {
-        arn: repository_arn(region, name),
-        region: region.to_string(),
-        registry_id: registry_id().to_string(),
-        name: name.to_string(),
-        created_at: now,
-        image_tag_mutability: DEFAULT_IMAGE_TAG_MUTABILITY.to_string(),
-        image_tag_mutability_exclusion_filters: Vec::new(),
-        image_scanning_config: ImageScanningConfiguration::default(),
-        encryption_config: EncryptionConfiguration {
-            encryption_type: DEFAULT_ENCRYPTION_TYPE.to_string(),
-            kms_key: None,
-        },
-        tags: Vec::new(),
-        policy_text: None,
-        images: BTreeMap::new(),
-        tag_index: BTreeMap::new(),
-        layer_blobs: BTreeMap::new(),
-        lifecycle_policy: None,
-        lifecycle_preview: None,
-    }
 }
 
 /// The manifest an import stores for the cached image, with the configuration document it
