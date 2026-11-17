@@ -39,11 +39,16 @@ const REGION: &str = "us-east-1";
 
 /// An access key id neither IAM nor the token service holds a record for: it resolves to the
 /// account's own identity, which no identity-based document bounds, so every fixture call is
-/// made with it and no row's own credential decides the setup.
-const ACCOUNT_KEY: &str = "EMULATORSETUPKEY0001";
+/// made with it and no row's own credential decides the setup. `pub(crate)` so the complement
+/// suite makes its fixtures with the SAME setup credential rather than a second spelling of one.
+pub(crate) const ACCOUNT_KEY: &str = "EMULATORSETUPKEY0001";
 
 /// Where Lambda binds the function collection, one invocation and a function's policy.
-const FUNCTIONS_URI: &str = "/2015-03-31/functions";
+///
+/// `pub(crate)` because the complement of this suite — the invocation TYPES one grant admits
+/// (`crate::lambda_resource_policy_admits_each_invocation_type`) — addresses the same routes
+/// through this one harness rather than carrying a second copy of it.
+pub(crate) const FUNCTIONS_URI: &str = "/2015-03-31/functions";
 
 /// The function every row invokes, the stack that deploys it, and the handler module
 /// CloudFormation archives inline source under.
@@ -61,7 +66,7 @@ const SOURCE: &str = "def handler(event, context):\n    return {'ran': True}\n";
 
 /// The action a synchronous invocation performs, as the IAM Service Authorization Reference
 /// publishes it for `Invoke` ("Actions defined by AWS Lambda").
-const INVOKE_ACTION: &str = "lambda:InvokeFunction";
+pub(crate) const INVOKE_ACTION: &str = "lambda:InvokeFunction";
 
 /// The name a row's inline identity document is embedded under, and the statement id its
 /// resource-policy grant is written under.
@@ -87,7 +92,7 @@ const FUNCTION_TIMEOUT: u64 = 120;
 /// The emulator as it is ASSEMBLED, on one engine: Lambda, IAM, the token service and
 /// CloudFormation all reach the same store, so the documents one writes are the ones another
 /// decides against.
-fn build_router() -> MultiServiceRouter {
+pub(crate) fn build_router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = aws_emulator_router::build_router(engine);
     // The suite signs nothing: what names the caller is the access key id in the credential
@@ -106,18 +111,18 @@ fn authorization(service: &str, access_key_id: &str) -> String {
 }
 
 /// What one call answered.
-struct Answer {
-    status: u16,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
     error_code: Option<String>,
     body: Vec<u8>,
 }
 
 impl Answer {
-    fn text(&self) -> String {
+    pub(crate) fn text(&self) -> String {
         String::from_utf8_lossy(&self.body).into_owned()
     }
 
-    fn json(&self) -> Value {
+    pub(crate) fn json(&self) -> Value {
         if self.body.is_empty() {
             Value::Null
         } else {
@@ -137,22 +142,29 @@ impl Answer {
     }
 }
 
-/// One Lambda `restJson1` call presenting `access_key_id`.
-async fn lambda_as(
+/// One Lambda `restJson1` call presenting `access_key_id`, carrying the headers `headers` names
+/// beside the standing ones — which is how a caller asks for an invocation TYPE, the axis the
+/// complement suite varies.
+pub(crate) async fn lambda_as(
     router: &MultiServiceRouter,
     access_key_id: &str,
     method: &str,
     uri: &str,
     body: Option<&Value>,
+    headers: &[(&str, &str)],
 ) -> Answer {
     let host = format!("lambda.{REGION}.amazonaws.com");
     let payload = body.map_or_else(Vec::new, |document| document.to_string().into_bytes());
-    let request = http::Request::builder()
+    let mut builder = http::Request::builder()
         .method(method)
         .uri(format!("https://{host}{uri}"))
         .header("host", host)
         .header("content-type", "application/json")
-        .header("authorization", authorization("lambda", access_key_id))
+        .header("authorization", authorization("lambda", access_key_id));
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    let request = builder
         .body(Bytes::from(payload))
         .expect("the test request is well formed");
     let response = router.dispatch(request).await;
@@ -177,7 +189,7 @@ async fn lambda(
     uri: &str,
     body: Option<&Value>,
 ) -> Answer {
-    let answer = lambda_as(router, ACCOUNT_KEY, method, uri, body).await;
+    let answer = lambda_as(router, ACCOUNT_KEY, method, uri, body, &[]).await;
     assert!(
         (200..300).contains(&answer.status),
         "case {case:?}: {what} must be served, got {} with {}",
@@ -287,22 +299,22 @@ enum Entity {
 }
 
 /// A principal a row's invocations are signed as.
-struct Principal {
+pub(crate) struct Principal {
     /// The access key id its calls present.
-    access_key_id: String,
+    pub(crate) access_key_id: String,
     /// The ARN a refusal must blame it by — what the token service reports for that key.
-    arn: String,
+    pub(crate) arn: String,
     /// The entity whose inline document an identity grant is written on.
     entity: Entity,
     /// The spelling the FUNCTION's own policy names it by: a user by its own ARN, and a session
     /// by the ARN of the role it is a session of, which is the principal a resource-based
     /// policy of a role's caller names.
-    statement_principal: String,
+    pub(crate) statement_principal: String,
 }
 
 /// Create the IAM user `name`, holding no policy at all, and mint a long-term access key for
 /// it.
-async fn given_user(router: &MultiServiceRouter, case: &str, name: &str) -> Principal {
+pub(crate) async fn given_user(router: &MultiServiceRouter, case: &str, name: &str) -> Principal {
     let created = iam(router, case, "CreateUser", &[("UserName", name)]).await;
     let arn = element(&created, "Arn");
     let minted = credential_query(
@@ -360,19 +372,26 @@ async fn given_session(router: &MultiServiceRouter, case: &str, name: &str) -> P
     }
 }
 
-/// Deploy the function every row invokes and answer its ARN.
+/// Deploy the function `function`, declared by the stack `stack`, and answer its ARN.
 ///
 /// The handler is declared as a stack's inline source, which CloudFormation archives into the
 /// deployment package — the way a function whose handler is written out in a suite comes to
-/// exist at all.
-async fn given_function(router: &MultiServiceRouter, case: &str, role_arn: &str) -> String {
+/// exist at all. The names are parameters so the complement suite deploys a function of its own
+/// through this one deploy-and-wait rather than through a second copy of it.
+pub(crate) async fn given_function(
+    router: &MultiServiceRouter,
+    case: &str,
+    role_arn: &str,
+    function: &str,
+    stack: &str,
+) -> String {
     let template = json!({
         "AWSTemplateFormatVersion": "2010-09-09",
         "Resources": {
             "Probe": {
                 "Type": "AWS::Lambda::Function",
                 "Properties": {
-                    "FunctionName": FUNCTION,
+                    "FunctionName": function,
                     "Runtime": RUNTIME,
                     "Handler": HANDLER,
                     "Role": role_arn,
@@ -389,7 +408,7 @@ async fn given_function(router: &MultiServiceRouter, case: &str, role_arn: &str)
         "cloudformation",
         "2010-05-15",
         "CreateStack",
-        &[("StackName", STACK), ("TemplateBody", &template)],
+        &[("StackName", stack), ("TemplateBody", &template)],
     )
     .await;
     // The stack's completion and the function's own provisioning window are owed by the clock,
@@ -402,7 +421,7 @@ async fn given_function(router: &MultiServiceRouter, case: &str, role_arn: &str)
             "cloudformation",
             "2010-05-15",
             "DescribeStacks",
-            &[("StackName", STACK)],
+            &[("StackName", stack)],
         )
         .await;
         if element(&last, "StackStatus") == CREATE_COMPLETE {
@@ -423,7 +442,7 @@ async fn given_function(router: &MultiServiceRouter, case: &str, role_arn: &str)
             case,
             "GetFunctionConfiguration",
             "GET",
-            &format!("{FUNCTIONS_URI}/{FUNCTION}/configuration"),
+            &format!("{FUNCTIONS_URI}/{function}/configuration"),
             None,
         )
         .await
@@ -449,7 +468,11 @@ fn looks() -> u32 {
 
 /// The execution role the function runs as: trusted by Lambda, which `CreateFunction` checks,
 /// and carrying nothing else — what it may do is not what this suite is about.
-async fn given_execution_role(router: &MultiServiceRouter, case: &str, name: &str) -> String {
+pub(crate) async fn given_execution_role(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+) -> String {
     let trust = json!({
         "Version": "2012-10-17",
         "Statement": [{
@@ -521,11 +544,18 @@ fn rows() -> Vec<Row> {
 
 /// The one sentence AWS words an authorization failure with, written out here rather than built
 /// from the service's own helper so the wording has something to be wrong about.
-fn refusal_message(caller_arn: &str, function_arn: &str) -> String {
+pub(crate) fn refusal_message(caller_arn: &str, function_arn: &str) -> String {
     format!(
         "User: {caller_arn} is not authorized to perform: {INVOKE_ACTION} on resource: \
          {function_arn} because no identity-based policy allows the {INVOKE_ACTION} action"
     )
+}
+
+/// What the deployed handler returns, which is what an ADMITTED synchronous invocation answers:
+/// the package really ran for it, where a refused call carries no such answer. Published beside
+/// the harness so the complement suite cannot drift from the source deployed here.
+pub(crate) fn handler_answer() -> Value {
+    json!({"ran": true})
 }
 
 /// A document allowing the invoking action on `resource` and nothing else.
@@ -649,12 +679,13 @@ async fn invoke(router: &MultiServiceRouter, access_key_id: &str) -> Answer {
         "POST",
         &format!("{FUNCTIONS_URI}/{FUNCTION}/invocations"),
         Some(&json!({"probe": true})),
+        &[],
     )
     .await
 }
 
 /// Assert that `answer` is the authorization refusal, and that no handler ran for it.
-fn assert_refused(case: &str, phase: &str, answer: &Answer, expected: &str) {
+pub(crate) fn assert_refused(case: &str, phase: &str, answer: &Answer, expected: &str) {
     assert_eq!(
         answer.status,
         403,
@@ -692,7 +723,7 @@ fn assert_ran(case: &str, phase: &str, answer: &Answer) {
     );
     assert_eq!(
         answer.json(),
-        json!({"ran": true}),
+        handler_answer(),
         "case {case:?} {phase}: expected the handler's own result, got {}",
         answer.text()
     );
@@ -705,7 +736,7 @@ async fn an_invocation_is_served_only_while_a_document_in_force_grants_it() {
     let router = build_router();
     let setup = "the shared function";
     let role = given_execution_role(&router, setup, "xsvc-invoke-grant-lifetime-exec").await;
-    let function_arn = given_function(&router, setup, &role).await;
+    let function_arn = given_function(&router, setup, &role, FUNCTION, STACK).await;
 
     for (index, row) in rows().iter().enumerate() {
         let case = row.case;
