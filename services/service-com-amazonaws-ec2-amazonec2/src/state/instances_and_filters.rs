@@ -1861,18 +1861,52 @@ impl ComAmazonawsEc2Amazonec2State {
         });
         // The end of the `pending` a `CreateVpcEndpoint` answers with: the endpoint is in
         // service once its instant has passed, whether or not anybody called again — the
-        // same contract, on the same clock, as the connection move above.
-        let endpoints = &mut self.vpc_endpoints;
-        self.vpc_endpoint_moves.retain(|endpoint_id, pending| {
-            if now < pending.due_at {
-                return true;
-            }
-            if let Some(endpoint) = endpoints.get_mut(endpoint_id) {
-                endpoint.state = Some(pending.to.clone());
-            }
+        // same contract, on the same clock, as the connection move above. An endpoint in
+        // service also HAS the private hosted zones its private DNS names are answered by, so
+        // every name still reported as unpublished ([`HOSTED_ZONE_ID_PENDING`]) is given the
+        // zone that now answers it — one zone per name, a hosted zone answering one domain.
+        let due_endpoint_moves: Vec<(String, String)> = self
+            .vpc_endpoint_moves
+            .iter()
+            .filter(|(_, pending)| now >= pending.due_at)
+            .map(|(endpoint_id, pending)| (endpoint_id.clone(), pending.to.clone()))
+            .collect();
+        for (endpoint_id, moved_to) in due_endpoint_moves {
             // The move is applied once; nothing is owed on this endpoint any more.
-            false
-        });
+            self.vpc_endpoint_moves.remove(&endpoint_id);
+            let unpublished_names = self
+                .vpc_endpoints
+                .get(&endpoint_id)
+                .map(|endpoint| {
+                    endpoint
+                        .dns_entries
+                        .iter()
+                        .flatten()
+                        .filter(|entry| {
+                            entry.hosted_zone_id.as_deref() == Some(HOSTED_ZONE_ID_PENDING)
+                        })
+                        .count()
+                })
+                .unwrap_or_default();
+            let published_zones: Vec<String> = if moved_to == VPC_ENDPOINT_STATE_AVAILABLE {
+                (0..unpublished_names)
+                    .map(|_| self.mint_hosted_zone_id())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            if let Some(endpoint) = self.vpc_endpoints.get_mut(&endpoint_id) {
+                endpoint.state = Some(moved_to);
+                let mut zones = published_zones.into_iter();
+                for entry in endpoint.dns_entries.iter_mut().flatten() {
+                    if entry.hosted_zone_id.as_deref() == Some(HOSTED_ZONE_ID_PENDING) {
+                        if let Some(zone) = zones.next() {
+                            entry.hosted_zone_id = Some(zone);
+                        }
+                    }
+                }
+            }
+        }
         // A NAT gateway address an association or an assignment left in a transient
         // `NatGatewayAddressStatus` reaches its terminal status once its instant has
         // passed, whether or not anybody called again — the same contract as the moves

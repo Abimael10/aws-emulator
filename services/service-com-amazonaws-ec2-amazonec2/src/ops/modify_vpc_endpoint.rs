@@ -177,8 +177,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use super::create_vpc_endpoint::{
-            EndpointPlacement, FULL_ACCESS_POLICY, dns_entries, dns_payload_bound,
-            release_interfaces,
+            EndpointPlacement, dns_entries, dns_payload_bound, release_interfaces,
         };
         use crate::scaffolded::Scaffolded;
         use crate::state;
@@ -320,19 +319,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "ResetPolicy cannot be specified together with PolicyDocument",
             ));
         }
-        // The policy this call leaves attached, or `None` for a request that named none and
-        // therefore leaves the one the endpoint already carries.
-        let replacement_policy: Option<String> = if reset_policy {
-            // "The default policy allows full access to the service" (`ResetPolicy`) — the
-            // document the create attaches to an endpoint whose request named none, so a
-            // reset and a create agree on what "the default policy" is.
-            Some(FULL_ACCESS_POLICY.to_string())
-        } else {
-            // Read through the ONE reading of this member, which both bounds the document by
-            // the published policy quota and parses it, so a modify and a create cannot hold
-            // one caller's document to different terms.
-            state::requested_vpc_endpoint_policy(input.policy_document.as_deref())?
-        };
+        // The document the REQUEST attached, if any, read through the ONE reading of this
+        // member, which both bounds the document by the published policy quota and parses it,
+        // so a modify and a create cannot hold one caller's document to different terms.
+        let requested_policy: Option<String> =
+            state::requested_vpc_endpoint_policy(input.policy_document.as_deref())?;
 
         let endpoints = state::require_service_state(&*self.engine)?;
         let region = state::request_region(ctx.parts());
@@ -821,6 +812,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // what the record gives back — the policy it carried and the names it answered on.
         // The budget is asked about the NET change, since this call stores no further
         // endpoint.
+        //
+        // The policy this call leaves attached is `None` for a request that named none and
+        // asked for no reset, which leaves the one the endpoint already carries.
+        let replacement_policy: Option<String> = if reset_policy {
+            // "The default policy allows full access to the service" (`ResetPolicy`) — the
+            // document the create attaches to an endpoint of this TYPE whose request named
+            // none, so a reset and a create agree on what "the default policy" is.
+            Some(state::default_vpc_endpoint_policy(&endpoint_type).to_string())
+        } else {
+            requested_policy.clone()
+        };
         let endpoint_service = state::parse_endpoint_service_name(&service_name);
         let service_region = endpoint.service_region.clone().unwrap_or_default();
         let held_entries: Vec<DnsEntry> = endpoint.dns_entries.clone().unwrap_or_default();
@@ -863,6 +865,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // been refused was refused above with its own reason.
         if input.dry_run.unwrap_or(false) {
             return Err(state::dry_run_operation());
+        }
+
+        // "Indicates whether the service supports endpoint policies"
+        // (`ServiceDetail$VpcEndpointPolicySupported`): the same refusal the create answers
+        // for a document that grants less than full access on a service that supports no
+        // endpoint policy — such an endpoint allows full access whatever is attached to it, so
+        // a narrowing document is refused rather than stored as a restriction nothing applies.
+        // Asked after the dry-run probe for the reason the create's own arm gives: it refuses
+        // the attachment this call would carry out rather than the request as read.
+        if let (Some(false), Some(requested)) = (
+            state::endpoint_service_supports_endpoint_policy(&store, &service_name),
+            requested_policy.as_deref(),
+        ) {
+            if !state::policy_document_grants_full_access(requested) {
+                return Err(state::endpoint_policy_unsupported(&service_name));
+            }
         }
 
         // ------------------------------------------------------------------
@@ -1084,42 +1102,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "(Interface endpoint) The DNS entries for the endpoint"
         // (`VpcEndpoint$DnsEntries`): the names the endpoint answers on, rebuilt from the
-        // subnets it is now served through. The hosted zones are the endpoint's OWN — the
-        // ones its stored entries already name — so the names it answered on before this call
-        // keep resolving in the same zone, and a zone is minted only when the endpoint has
-        // none yet (a private hosted zone this call is the one to associate).
+        // subnets it is now served through. The endpoint's OWN hosted zone is the one its
+        // stored entries already name — so the names it answered on before this call keep
+        // resolving in the same zone, and a zone is minted only when the endpoint has none yet
+        // — while each of the service's published names keeps the private hosted zone it is
+        // already answered in and a name this call is the FIRST to intercept is reported as
+        // not published yet, the clock publishing it when the endpoint is back in service.
         let mut rebuilt_entries: Option<Vec<DnsEntry>> = None;
         if let Some(parsed) = endpoint_service.as_ref().filter(|_| interface) {
-            let endpoint_prefix = format!("{endpoint_id}.");
             let zonal_prefix = format!("{endpoint_id}-");
             let held_zone = held_entries
-                .iter()
-                .find(|entry| {
-                    entry.dns_name.as_deref().is_some_and(|name| {
-                        name.starts_with(&endpoint_prefix) || name.starts_with(&zonal_prefix)
-                    })
-                })
-                .and_then(|entry| entry.hosted_zone_id.clone());
-            let held_private_zone = held_entries
                 .iter()
                 .find(|entry| {
                     entry
                         .dns_name
                         .as_deref()
-                        .is_some_and(|name| !name.starts_with(endpoint_id))
+                        .is_some_and(|name| name.starts_with(&zonal_prefix))
                 })
                 .and_then(|entry| entry.hosted_zone_id.clone());
             let hosted_zone_id = match held_zone {
                 Some(held) => held,
                 None => store.mint_hosted_zone_id(),
             };
-            let private_hosted_zone_id = if private_dns_enabled {
-                Some(match held_private_zone {
-                    Some(held) => held,
-                    None => store.mint_hosted_zone_id(),
-                })
+            let private_dns_names: Vec<String> = if private_dns_enabled {
+                state::endpoint_service_private_dns_names(&store, &service_name)
             } else {
-                None
+                Vec::new()
             };
             rebuilt_entries = Some(dns_entries(
                 endpoint_id,
@@ -1127,13 +1135,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &service_region,
                 &placements,
                 &hosted_zone_id,
-                match (
-                    service_private_dns_name.as_deref(),
-                    private_hosted_zone_id.as_deref(),
-                ) {
-                    (Some(name), Some(zone)) => Some((name, zone)),
-                    _ => None,
-                },
+                &private_dns_names,
+                &held_entries,
             ));
         }
 
@@ -1144,6 +1147,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ([`crate::ops::create_vpc_endpoint`]). The span is never zero, so a caller reading
         // the endpoint straight after this call still sees it `pending`.
         let interfaces_changed = !add_subnets.is_empty() || !remove_subnets.is_empty();
+
+        // A private DNS name the endpoint is the FIRST to intercept is answered by a private
+        // hosted zone from the moment the endpoint is in service, so a call that leaves it in
+        // service publishes that zone now; one that moves the endpoint back to `pending`, and
+        // one that finds a move already owed, leaves it to the clock — the same instant the
+        // create leaves it to ([`crate::state::HOSTED_ZONE_ID_PENDING`]).
+        if !interfaces_changed && !store.vpc_endpoint_moves.contains_key(endpoint_id) {
+            if let Some(entries) = rebuilt_entries.as_mut() {
+                for entry in entries.iter_mut() {
+                    if entry.hosted_zone_id.as_deref() == Some(state::HOSTED_ZONE_ID_PENDING) {
+                        entry.hosted_zone_id = Some(store.mint_hosted_zone_id());
+                    }
+                }
+            }
+        }
 
         // The record itself, written through the one map `DescribeVpcEndpoints` reports from,
         // so the modification this call made and the endpoint that describe shows cannot

@@ -298,9 +298,12 @@ async fn private_dns_defaults_to_what_the_service_publishes() {
         );
         let names = dns_names(case, &described);
         assert!(
-            names
-                .iter()
-                .any(|name| name == &format!("{endpoint_id}.{}", row.base_dns_name)),
+            names.iter().any(|name| name
+                == &format!(
+                    "{endpoint_id}-{suffix}.{base}",
+                    suffix = ec2::state::vpc_endpoint_dns_suffix(&endpoint_id),
+                    base = row.base_dns_name,
+                )),
             "case {case:?}: expected the endpoint's regional name under {:?}, got {names:?}",
             row.base_dns_name
         );

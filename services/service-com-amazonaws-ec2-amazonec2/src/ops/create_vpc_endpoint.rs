@@ -26,7 +26,17 @@
 //! yielding an endpoint to a service that does not exist. The resolved service also decides
 //! which endpoint TYPES it can be reached through, so a type that service does not offer is
 //! refused with `InvalidParameter` naming the requested type and the service's own
-//! ([`crate::state::endpoint_type_mismatch`]). An endpoint to one of the
+//! ([`crate::state::endpoint_type_mismatch`]). It decides TWO more things about the endpoint:
+//! whether an endpoint to it takes a policy that narrows access at all — a service that
+//! supports no endpoint policy allows full access to itself whatever document were attached,
+//! so a document granting less is refused with `InvalidParameter`
+//! ([`crate::state::endpoint_policy_unsupported`]) rather than stored as a restriction nothing
+//! applies — and which DNS names private DNS resolves for it
+//! ([`crate::state::endpoint_service_private_dns_names`]), which are the names an interface
+//! endpoint reports after its own ([`dns_entries`]). A request that names no policy gets the
+//! document the service installs on an endpoint of its type
+//! ([`crate::state::default_vpc_endpoint_policy`]), held as the bytes it was installed as. An
+//! endpoint to one of the
 //! account's own services also owes the `pendingAcceptance` state and a
 //! `VpcEndpointConnection` row, which is that operation's change rather than this one's.
 //!
@@ -271,27 +281,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The DNS records created for the endpoint" (`DnsOptions$DnsRecordIpType`): the
         // records resolve the endpoint's own addresses, so a records type names a family the
         // endpoint has to be reached over — and the records an endpoint gets when the request
-        // says nothing are of the families it HAS. `service-defined` records are the
-        // Resource and ServiceNetwork endpoint types' own option, and those types are refused
-        // above, so that value is still unwritten here.
+        // says nothing are of the families it HAS. An endpoint that stands up no endpoint
+        // network interface mints no record of its own at all: it resolves the records the
+        // SERVICE defines ([`crate::state::DNS_RECORD_IP_TYPE_SERVICE_DEFINED`]), which is the
+        // records type a gateway endpoint created without `DnsOptions` reports.
         let dns_record_ip_type = requested_dns_options
             .dns_record_ip_type
             .clone()
-            .unwrap_or_else(|| ip_address_type.to_string());
-        let records_ipv4 = dns_record_ip_type == state::DNS_RECORD_IP_TYPE_IPV4
-            || dns_record_ip_type == state::IP_ADDRESS_TYPE_DUALSTACK;
-        let records_ipv6 = dns_record_ip_type == state::IP_ADDRESS_TYPE_IPV6
-            || dns_record_ip_type == state::IP_ADDRESS_TYPE_DUALSTACK;
-        if !(records_ipv4 || records_ipv6) {
-            return Err(Scaffolded::not_implemented(&format!(
-                "CreateVpcEndpoint with the {dns_record_ip_type} DNS record IP type"
-            )));
-        }
-        if (records_ipv4 && !endpoint_ipv4) || (records_ipv6 && !endpoint_ipv6) {
-            return Err(state::invalid_parameter_combination(format!(
-                "DnsRecordIpType {dns_record_ip_type} cannot be specified for a \
-                 {ip_address_type} endpoint"
-            )));
+            .unwrap_or_else(|| {
+                if gateway {
+                    state::DNS_RECORD_IP_TYPE_SERVICE_DEFINED.to_string()
+                } else {
+                    ip_address_type.to_string()
+                }
+            });
+        // The two refusals below are about a records type the REQUEST named — the endpoint's
+        // own records have to be of a family it is reached over. `service-defined` records are
+        // the Resource and ServiceNetwork endpoint types' own option, and those types are
+        // refused above, so a REQUEST naming that value is still unwritten here; the gateway
+        // endpoint's own records type, defaulted above, is the service's rather than a family
+        // of the endpoint's, so it is not held to either question.
+        if let Some(requested) = requested_dns_options.dns_record_ip_type.as_deref() {
+            let records_ipv4 = requested == state::DNS_RECORD_IP_TYPE_IPV4
+                || requested == state::IP_ADDRESS_TYPE_DUALSTACK;
+            let records_ipv6 = requested == state::IP_ADDRESS_TYPE_IPV6
+                || requested == state::IP_ADDRESS_TYPE_DUALSTACK;
+            if !(records_ipv4 || records_ipv6) {
+                return Err(Scaffolded::not_implemented(&format!(
+                    "CreateVpcEndpoint with the {requested} DNS record IP type"
+                )));
+            }
+            if (records_ipv4 && !endpoint_ipv4) || (records_ipv6 && !endpoint_ipv6) {
+                return Err(state::invalid_parameter_combination(format!(
+                    "DnsRecordIpType {requested} cannot be specified for a \
+                     {ip_address_type} endpoint"
+                )));
+            }
         }
         if requested_dns_options.private_dns_preference.is_some()
             || requested_dns_options.private_dns_specified_domains.is_some()
@@ -492,16 +517,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "PolicyDocument cannot be specified for a GatewayLoadBalancer endpoint",
             ));
         }
+        // The document the REQUEST attached, if any, read once here: both the refusal below —
+        // for a service that supports no endpoint policy — and the stored document are about
+        // this one value.
+        let requested_policy: Option<String> =
+            state::requested_vpc_endpoint_policy(input.policy_document.as_deref())?;
         let policy_document: Option<String> = if load_balancer {
             None
         } else {
             // Read through the ONE reading of this member, which both bounds the document by
             // the published policy quota and parses it, so a create and a modify cannot hold
             // one caller's document to different terms. A request that named none gets the
-            // default, which is this operation's own answer to "no document".
+            // default, which is this operation's own answer to "no document" — the document
+            // the SERVICE installs on an endpoint of this type
+            // ([`crate::state::default_vpc_endpoint_policy`]), stored as the bytes it was
+            // installed as so a later read returns exactly the document the endpoint carries.
             Some(
-                state::requested_vpc_endpoint_policy(input.policy_document.as_deref())?
-                    .unwrap_or_else(|| FULL_ACCESS_POLICY.to_string()),
+                requested_policy
+                    .clone()
+                    .unwrap_or_else(|| state::default_vpc_endpoint_policy(&endpoint_type).to_string()),
             )
         };
 
@@ -878,6 +912,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(state::dry_run_operation());
         }
 
+        // "Indicates whether the service supports endpoint policies"
+        // (`ServiceDetail$VpcEndpointPolicySupported`): an endpoint to a service that supports
+        // none allows full access to that service whatever document were attached to it, so a
+        // document granting LESS than full access is refused rather than stored as a
+        // restriction nothing would apply — a caller must not be told it has locked an endpoint
+        // down to a policy the service would ignore. A document that grants full access asks
+        // for what such an endpoint already has, so it is accepted
+        // ([`crate::state::policy_document_grants_full_access`] answers that question about the
+        // document's GRANT rather than about its spelling). Asked off the one catalogue the
+        // describe reports the capability from, so the two cannot disagree, and a service whose
+        // capabilities this emulator cannot know — one another account or a Marketplace partner
+        // offers — is held to nothing here.
+        //
+        // Asked AFTER the dry-run probe above, because this is a refusal of the attachment
+        // this call would carry out rather than a reading of the request: a recorded `DryRun`
+        // probe carrying such a document is answered `DryRunOperation` rather than this
+        // refusal, so the probe tells a caller about its permissions and the real call tells it
+        // about the service's policy support.
+        if let (Some(false), Some(requested)) = (
+            state::endpoint_service_supports_endpoint_policy(&store, service_name),
+            requested_policy.as_deref(),
+        ) {
+            if !state::policy_document_grants_full_access(requested) {
+                return Err(state::endpoint_policy_unsupported(service_name));
+            }
+        }
+
         // "An endpoint network interface is created … in an Availability Zone"
         // (`SubnetIds`): one interface per subnet, taking a private address out of that
         // subnet's own range through the store's one choice-and-take, so no two resources of
@@ -1014,14 +1075,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     })
                     .collect(),
             ),
-            ip_address_type: (!gateway).then(|| ip_address_type.to_string()),
-            dns_options: (!gateway).then(|| DnsOptions {
+            ip_address_type: Some(ip_address_type.to_string()),
+            dns_options: Some(DnsOptions {
                 dns_record_ip_type: Some(dns_record_ip_type.clone()),
                 ..Default::default()
             }),
-            private_dns_enabled: interface.then_some(private_dns_enabled),
+            private_dns_enabled: Some(private_dns_enabled),
             requester_managed: Some(false),
             network_interface_ids: Some(network_interface_ids.clone()),
+            // "(Interface endpoint) The DNS entries for the endpoint" (`DnsEntries`), reported
+            // as a LIST whichever type the endpoint is — EMPTY for a type that mints no name of
+            // its own, the way every other id list of the record is reported. The names
+            // themselves are filled in below, once the endpoint has the id they are built from.
+            dns_entries: Some(Vec::new()),
             creation_timestamp: Some(state::system_time_to_date_time(SystemTime::now())),
             tags: Some(tags.clone()),
             owner_id: Some(::engine::emulator_account_id().to_string()),
@@ -1105,10 +1171,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and the zones its interfaces sit in.
         if interface {
             let hosted_zone_id = store.mint_hosted_zone_id();
-            let private_hosted_zone_id = if private_dns_enabled {
-                Some(store.mint_hosted_zone_id())
+            // The service's own published names, which are what a private hosted zone answers
+            // — resolved above against the one catalogue the describe reports from. An endpoint
+            // created without private DNS intercepts none of them, so it reports none.
+            let private_dns_names: Vec<String> = if private_dns_enabled {
+                state::endpoint_service_private_dns_names(&store, service_name)
             } else {
-                None
+                Vec::new()
             };
             let entries = dns_entries(
                 &endpoint_id,
@@ -1116,15 +1185,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &service_region,
                 &placements,
                 &hosted_zone_id,
-                // The private entry is the SERVICE's own public name, resolved above against
-                // the one catalogue the describe reports from, and the zone minted for it.
-                match (
-                    service_private_dns_name.as_deref(),
-                    private_hosted_zone_id.as_deref(),
-                ) {
-                    (Some(name), Some(zone)) => Some((name, zone)),
-                    _ => None,
-                },
+                &private_dns_names,
+                // Nothing is held yet: every private hosted zone of this endpoint is one the
+                // clock publishes when the endpoint reaches `available`.
+                &[],
             );
             store.add_stored_bytes(state::dns_entry_list_bytes(&entries));
             if let Some(stored) = store.vpc_endpoints.get_mut(&endpoint_id) {
@@ -1180,12 +1244,6 @@ fn created_state(gateway: bool) -> &'static str {
     }
 }
 
-/// The policy a request that named none gets: "If this parameter is not specified, we attach
-/// a default policy that allows full access to the service" (`PolicyDocument`) — every
-/// action, by every principal, on every resource of the service.
-pub(crate) const FULL_ACCESS_POLICY: &str =
-    r#"{"Statement":[{"Action":"*","Effect":"Allow","Principal":"*","Resource":"*"}]}"#;
-
 /// One subnet the endpoint is created in, as the resolution above read it off the stored
 /// subnet: what an endpoint network interface's zone and address range come from, beside the
 /// address the request asked for in that subnet, if it asked for one.
@@ -1212,50 +1270,70 @@ pub(crate) struct EndpointPlacement {
 /// The DNS names an interface endpoint answers on.
 ///
 /// AWS gives an interface endpoint endpoint-specific regional and zonal names under
-/// [`crate::state::ENDPOINT_DNS_SUFFIX`] — `<endpoint>.<service>.<region>.vpce.amazonaws.com`
-/// and one `<endpoint>-<zone>.…` per Availability Zone its interfaces sit in — and, when a
-/// private hosted zone was asked for, "the default public DNS name for the service for the
-/// Region (for example, kinesis.us-east-1.amazonaws.com)"
-/// (`CreateVpcEndpointRequest$PrivateDnsEnabled`) in that zone. Every part is derived: the
-/// endpoint's own id, the service name's labels, and the zones of the stored subnets — never
-/// a value read off a clock or a random source.
+/// [`crate::state::ENDPOINT_DNS_SUFFIX`] —
+/// `<endpoint>-<suffix>.<service>.<region>.vpce.amazonaws.com` and one
+/// `<endpoint>-<suffix>-<zone>.…` per Availability Zone its interfaces sit in, where `<suffix>`
+/// is the endpoint's own DNS suffix ([`crate::state::vpc_endpoint_dns_suffix`]) — and, when a
+/// private hosted zone was asked for, the names the SERVICE publishes: "the default public DNS
+/// name for the service for the Region (for example, kinesis.us-east-1.amazonaws.com)"
+/// (`CreateVpcEndpointRequest$PrivateDnsEnabled`) and its dual-stack sibling
+/// ([`crate::state::endpoint_service_private_dns_names`]). They are reported in that ORDER —
+/// the endpoint's own regional name first, then its zonal names, then the service's — so a
+/// client that takes the first entry as the name to put in its own resolver or in TLS SNI gets
+/// the name that reaches THIS endpoint rather than the service's public one. Every part is
+/// derived: the endpoint's own id, the service name's labels, and the zones of the stored
+/// subnets — never a value read off a clock or a random source.
 ///
 /// `service` is the service's LABEL as its name carries it; the host those names sit under is
 /// that label's host form ([`crate::state::endpoint_service_dns_label`]), since an endpoint
 /// service name is the reverse-domain spelling of the host the service answers on.
 ///
-/// `private_dns` is that public name and the zone that answers it, which is the name the
-/// SERVICE publishes ([`crate::state::endpoint_service_private_dns_name`], the one
-/// `DescribeVpcEndpointServices` reports) rather than one rebuilt here, so the zone's record
-/// set and the catalogue cannot disagree about what it resolves.
+/// `private_dns_names` are the service's own published names, which are the names a private
+/// hosted zone answers — read off the one catalogue `DescribeVpcEndpointServices` reports from
+/// rather than rebuilt here, so the zone's record set and the catalogue cannot disagree about
+/// what it resolves. Each keeps the hosted zone it is ALREADY answered in where `held` carries
+/// one for it, and is otherwise reported as not published yet
+/// ([`crate::state::HOSTED_ZONE_ID_PENDING`]): the private hosted zone of a name exists once the
+/// endpoint is in service, which is when the clock publishes it.
 pub(crate) fn dns_entries(
     endpoint_id: &str,
     service: &str,
     service_region: &str,
     placements: &[EndpointPlacement],
     hosted_zone_id: &str,
-    private_dns: Option<(&str, &str)>,
+    private_dns_names: &[String],
+    held: &[DnsEntry],
 ) -> Vec<DnsEntry> {
     let suffix = crate::state::ENDPOINT_DNS_SUFFIX;
     let service = crate::state::endpoint_service_dns_label(service);
-    let mut entries: Vec<DnsEntry> = Vec::with_capacity(placements.len() + 2);
-    if let Some((private_dns_name, private_hosted_zone_id)) = private_dns {
-        entries.push(DnsEntry {
-            dns_name: Some(private_dns_name.to_string()),
-            hosted_zone_id: Some(private_hosted_zone_id.to_string()),
-        });
-    }
+    let endpoint = format!(
+        "{endpoint_id}-{dns_suffix}",
+        dns_suffix = crate::state::vpc_endpoint_dns_suffix(endpoint_id),
+    );
+    let mut entries: Vec<DnsEntry> =
+        Vec::with_capacity(placements.len() + private_dns_names.len() + 1);
     entries.push(DnsEntry {
-        dns_name: Some(format!("{endpoint_id}.{service}.{service_region}.{suffix}")),
+        dns_name: Some(format!("{endpoint}.{service}.{service_region}.{suffix}")),
         hosted_zone_id: Some(hosted_zone_id.to_string()),
     });
     for placement in placements {
         entries.push(DnsEntry {
             dns_name: Some(format!(
-                "{endpoint_id}-{zone}.{service}.{service_region}.{suffix}",
+                "{endpoint}-{zone}.{service}.{service_region}.{suffix}",
                 zone = placement.availability_zone,
             )),
             hosted_zone_id: Some(hosted_zone_id.to_string()),
+        });
+    }
+    for private_dns_name in private_dns_names {
+        let held_zone = held
+            .iter()
+            .find(|entry| entry.dns_name.as_deref() == Some(private_dns_name.as_str()))
+            .and_then(|entry| entry.hosted_zone_id.clone())
+            .unwrap_or_else(|| crate::state::HOSTED_ZONE_ID_PENDING.to_string());
+        entries.push(DnsEntry {
+            dns_name: Some(private_dns_name.clone()),
+            hosted_zone_id: Some(held_zone),
         });
     }
     entries
@@ -1273,9 +1351,10 @@ pub(crate) fn dns_payload_bound(
     service_region: &str,
     placements: &[EndpointPlacement],
 ) -> usize {
-    // `vpce-` and 17 hexadecimal digits (`ComAmazonawsEc2Amazonec2State::next_id`), and a
-    // hosted zone id of `Z` and 13 (`mint_hosted_zone_id`).
-    const MINTED_ID_BYTES: usize = 32;
+    // `vpce-` and 17 hexadecimal digits (`ComAmazonawsEc2Amazonec2State::next_id`), a hosted
+    // zone id of `Z` and 13 (`mint_hosted_zone_id`), and the endpoint's own DNS suffix
+    // (`crate::state::VPC_ENDPOINT_DNS_SUFFIX_CHARS`).
+    const MINTED_ID_BYTES: usize = 32 + crate::state::VPC_ENDPOINT_DNS_SUFFIX_CHARS;
     let longest_zone = placements
         .iter()
         .map(|placement| placement.availability_zone.len())
@@ -1289,7 +1368,10 @@ pub(crate) fn dns_payload_bound(
         + crate::state::SERVICE_DNS_SUFFIX.len()
         // The separating dots and dashes of the longest form.
         + 8;
-    per_entry.saturating_mul(placements.len().saturating_add(2))
+    // One regional name, one name per zone, and the service's own published names — of which
+    // there are at most two, its default public name and that name's dual-stack sibling
+    // ([`crate::state::endpoint_service_private_dns_names`]).
+    per_entry.saturating_mul(placements.len().saturating_add(3))
 }
 
 /// Hand back every endpoint network interface this call had already created.

@@ -335,15 +335,15 @@ async fn each_endpoint_type_is_created_persisted_and_read_back() {
             "case {case:?}: expected one endpoint network interface per subnet, got {body}"
         );
         // "(Interface endpoint) The DNS entries for the endpoint" (`DnsEntries`): the
-        // regional name plus one per zone, the service's own default public name beside them
-        // when the endpoint associates a private hosted zone for it — which an interface
-        // endpoint to a service that publishes one does by default — and nothing at all for
-        // the other types.
+        // regional name plus one per zone, the service's own default public names beside them
+        // — its public regional name and that name's dual-stack `api.aws` sibling — when the
+        // endpoint associates a private hosted zone for them, which an interface endpoint to a
+        // service that publishes them does by default, and nothing at all for the other types.
         let dns_names = set_members(case, &body, "dnsEntrySet", "dnsName");
         let publishes_private_name = row.service_name.starts_with("com.amazonaws.")
             && !row.service_name.starts_with("com.amazonaws.vpce.");
         let expected_names = if row.reported_type == "Interface" {
-            subnets.len() + 1 + usize::from(publishes_private_name)
+            subnets.len() + 1 + if publishes_private_name { 2 } else { 0 }
         } else {
             0
         };
@@ -1188,4 +1188,490 @@ async fn a_service_name_is_resolved_against_the_one_endpoint_service_catalogue()
         names, expected,
         "expected one endpoint per offered service name, got {created}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The DNS entries an interface endpoint answers on
+// ---------------------------------------------------------------------------
+
+/// The hosted zone id a name whose private hosted zone does not exist yet is reported under
+/// (`DnsEntry$HostedZoneId`), which is what an endpoint still being provisioned reports for
+/// every name the service has not published for it yet.
+const ZONE_ID_PENDING: &str = "ZONEIDPENDING";
+
+/// One row of the DNS-entry table: a service whose name is read a different way, and an
+/// endpoint served in a different number of Availability Zones.
+struct DnsCase {
+    case: &'static str,
+    /// The endpoint service the endpoint is created to.
+    service_name: &'static str,
+    /// That service's label in HOST form — the reverse-domain reading of its name — under
+    /// which the endpoint's own names sit.
+    dns_host: &'static str,
+    /// How many of the network's subnets the endpoint is created in, which is how many zonal
+    /// names it answers on.
+    subnets: usize,
+    /// The names the SERVICE publishes, which the endpoint's private hosted zones answer:
+    /// empty for a service that publishes none, so such an endpoint answers only on its own
+    /// names. Each row's names are the ones `DescribeVpcEndpointServices` reports for that
+    /// service (`ServiceDetail$PrivateDnsName`) plus, for a name under `amazonaws.com`, that
+    /// name's dual-stack `api.aws` sibling.
+    private_dns_names: &'static [&'static str],
+}
+
+/// The rows: a one-component service label, a two-component one (whose host form reverses
+/// it), a service published under the `api.aws` label — whose public name is already in that
+/// domain, so it publishes the one name — and a service that publishes no private DNS name at
+/// all. Two of them are served in one zone and one in two, since the zonal names are one per
+/// zone.
+fn dns_cases() -> Vec<DnsCase> {
+    vec![
+        DnsCase {
+            case: "a one-component service label in one subnet",
+            service_name: "com.amazonaws.us-east-1.logs",
+            dns_host: "logs",
+            subnets: 1,
+            private_dns_names: &["logs.us-east-1.amazonaws.com", "logs.us-east-1.api.aws"],
+        },
+        DnsCase {
+            case: "a two-component service label in two subnets",
+            service_name: "com.amazonaws.us-east-1.ecr.dkr",
+            dns_host: "dkr.ecr",
+            subnets: 2,
+            private_dns_names: &[
+                "dkr.ecr.us-east-1.amazonaws.com",
+                "dkr.ecr.us-east-1.api.aws",
+            ],
+        },
+        DnsCase {
+            case: "a service published under the api.aws label",
+            service_name: "api.aws.us-east-1.cassandra-streams",
+            dns_host: "cassandra-streams",
+            subnets: 1,
+            private_dns_names: &["cassandra-streams.us-east-1.api.aws"],
+        },
+        DnsCase {
+            case: "a service that publishes no private DNS name",
+            service_name: "com.amazonaws.us-east-1.iot.data",
+            dns_host: "data.iot",
+            subnets: 1,
+            private_dns_names: &[],
+        },
+    ]
+}
+
+/// The names `endpoint_id` must answer on, in the order AWS reports them: the endpoint's own
+/// regional name, then one per Availability Zone it is served in, then every name the service
+/// publishes.
+fn expected_dns_names(row: &DnsCase, endpoint_id: &str, zones: &[&str]) -> Vec<String> {
+    let endpoint = format!(
+        "{endpoint_id}-{suffix}",
+        suffix = ec2::state::vpc_endpoint_dns_suffix(endpoint_id),
+    );
+    let host = format!("{}.{REGION}.vpce.amazonaws.com", row.dns_host);
+    let mut expected = vec![format!("{endpoint}.{host}")];
+    for zone in zones.iter().take(row.subnets) {
+        expected.push(format!("{endpoint}-{zone}.{host}"));
+    }
+    expected.extend(
+        row.private_dns_names
+            .iter()
+            .map(|name| (*name).to_string()),
+    );
+    expected
+}
+
+/// An interface endpoint reports its OWN names first — each carrying the per-endpoint suffix
+/// the service gives it, in one hosted zone of its own — then one name per zone it is served
+/// in, then the names the service publishes, each in a private hosted zone that exists only
+/// once the endpoint is in service.
+#[tokio::test]
+async fn dns_entries_are_the_endpoints_own_names_then_the_services() {
+    let router = emulator();
+    let zones = ["us-east-1a", "us-east-1b"];
+    let built = network("the DNS table", &router, &zones).await;
+
+    // Every row is created first, so each endpoint's names and the zones they sit in are
+    // asserted while the endpoint is still being provisioned, before the clock has published
+    // anything.
+    let mut created: Vec<(DnsCase, String, Vec<String>)> = Vec::new();
+    let mut suffixes: BTreeSet<String> = BTreeSet::new();
+    for row in dns_cases() {
+        let case = row.case;
+        let subnets: Vec<&str> = built
+            .subnets
+            .iter()
+            .take(row.subnets)
+            .map(String::as_str)
+            .collect();
+        let mut params = vec![
+            param("VpcId", &built.vpc_id),
+            param("ServiceName", row.service_name),
+            param("VpcEndpointType", "Interface"),
+        ];
+        params.extend(indexed("SubnetId", &subnets));
+        let body = ok(case, &router, "CreateVpcEndpoint", &params).await;
+        let endpoint_id = member(case, &body, "vpcEndpointId");
+
+        // The suffix is the endpoint's own: a DNS label of its own alphabet, and a different
+        // one per endpoint.
+        let suffix = ec2::state::vpc_endpoint_dns_suffix(&endpoint_id);
+        assert_eq!(
+            suffix.len(),
+            ec2::state::VPC_ENDPOINT_DNS_SUFFIX_CHARS,
+            "case {case:?}: expected a {chars}-character DNS suffix, got {suffix:?}",
+            chars = ec2::state::VPC_ENDPOINT_DNS_SUFFIX_CHARS
+        );
+        assert!(
+            suffix
+                .chars()
+                .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit()),
+            "case {case:?}: expected a lowercase alphanumeric DNS suffix, got {suffix:?}"
+        );
+        assert!(
+            suffixes.insert(suffix.clone()),
+            "case {case:?}: expected a suffix of this endpoint's own, got {suffix:?} again"
+        );
+
+        let expected = expected_dns_names(&row, &endpoint_id, &zones);
+        assert_eq!(
+            set_members(case, &body, "dnsEntrySet", "dnsName"),
+            expected,
+            "case {case:?}: expected the endpoint's own names before the service's, got {body}"
+        );
+        // The endpoint's own names sit in ONE hosted zone of its own, and every name the
+        // service publishes is still unpublished while the endpoint is being provisioned.
+        let zone_ids = set_members(case, &body, "dnsEntrySet", "hostedZoneId");
+        let own = row.subnets + 1;
+        assert_eq!(
+            zone_ids.len(),
+            expected.len(),
+            "case {case:?}: expected a hosted zone per DNS entry, got {zone_ids:?}"
+        );
+        assert!(
+            zone_ids[..own]
+                .iter()
+                .all(|zone| zone == &zone_ids[0] && zone.starts_with('Z') && zone != ZONE_ID_PENDING),
+            "case {case:?}: expected the endpoint's own names in one hosted zone of its own, \
+             got {zone_ids:?}"
+        );
+        assert!(
+            zone_ids[own..].iter().all(|zone| zone == ZONE_ID_PENDING),
+            "case {case:?}: expected the service's names reported as unpublished, got \
+             {zone_ids:?}"
+        );
+
+        // The describe reports the record the create answered rather than a set assembled per
+        // reply.
+        let described = describe_endpoint(case, &router, &endpoint_id).await;
+        assert_eq!(
+            set_members(case, &described, "dnsEntrySet", "dnsName"),
+            expected,
+            "case {case:?}: the describe must report the same DNS entries, got {described}"
+        );
+        created.push((row, endpoint_id, expected));
+    }
+
+    // Once the clock has carried an endpoint into service, the private hosted zones its
+    // private DNS names are answered by exist: the names are unchanged and each carries a
+    // zone id of its own rather than the pending sentinel.
+    for (row, endpoint_id, expected) in &created {
+        let case = row.case;
+        let deadline = tokio::time::Instant::now() + SETTLE_DEADLINE;
+        loop {
+            let described = describe_endpoint(case, &router, endpoint_id).await;
+            if element(&described, "state").as_deref()
+                == Some(ec2::state::VPC_ENDPOINT_STATE_AVAILABLE)
+            {
+                assert_eq!(
+                    set_members(case, &described, "dnsEntrySet", "dnsName"),
+                    *expected,
+                    "case {case:?}: the names an endpoint answers on do not change when it \
+                     comes into service, got {described}"
+                );
+                let zone_ids = set_members(case, &described, "dnsEntrySet", "hostedZoneId");
+                assert!(
+                    zone_ids.iter().all(|zone| zone.starts_with('Z')),
+                    "case {case:?}: expected every name in a hosted zone, got {zone_ids:?}"
+                );
+                assert!(
+                    !zone_ids.iter().any(|zone| zone == ZONE_ID_PENDING),
+                    "case {case:?}: an endpoint in service has published every name, got \
+                     {zone_ids:?}"
+                );
+                let published: BTreeSet<&String> =
+                    zone_ids[row.subnets + 1..].iter().collect();
+                assert_eq!(
+                    published.len(),
+                    row.private_dns_names.len(),
+                    "case {case:?}: expected a private hosted zone per published name, got \
+                     {zone_ids:?}"
+                );
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "case {case:?}: the endpoint never reached {state}: {described}",
+                state = ec2::state::VPC_ENDPOINT_STATE_AVAILABLE
+            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The policy an endpoint carries
+// ---------------------------------------------------------------------------
+
+/// The document the service installs on a GATEWAY endpoint whose request named no policy
+/// (recorded behaviour: the model constrains `PolicyDocument` only as a string).
+const GATEWAY_DEFAULT_POLICY: &str =
+    r#"{"Version":"2008-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"*","Resource":"*"}]}"#;
+
+/// The document the service installs on an INTERFACE endpoint whose request named no policy —
+/// a different document from [`GATEWAY_DEFAULT_POLICY`]: it carries no policy-grammar date and
+/// is installed pretty-printed (recorded behaviour).
+const INTERFACE_DEFAULT_POLICY: &str = concat!(
+    "{\n  \"Statement\": [\n    {\n",
+    "      \"Action\": \"*\", \n",
+    "      \"Effect\": \"Allow\", \n",
+    "      \"Principal\": \"*\", \n",
+    "      \"Resource\": \"*\"\n",
+    "    }\n  ]\n}",
+);
+
+/// One row of the policy-document table: which endpoint the request creates, the document it
+/// attaches if any, and the document the endpoint must then carry.
+struct PolicyCase {
+    case: &'static str,
+    /// The endpoint service the endpoint is created to.
+    service_name: &'static str,
+    /// `VpcEndpointType`.
+    endpoint_type: &'static str,
+    /// How many of the network's subnets the endpoint is created in.
+    subnets: usize,
+    /// `PolicyDocument`, or `None` to leave the member out — "If this parameter is not
+    /// specified, we attach a default policy that allows full access to the service".
+    policy: Option<&'static str>,
+    /// The document the endpoint must report, byte for byte.
+    expected: &'static str,
+}
+
+/// The policy an endpoint carries is BYTES: the document the service installed when the
+/// request named none — which differs by endpoint type — or the caller's own document exactly
+/// as it was sent, reported the same way by the create and by every later read.
+#[tokio::test]
+async fn the_policy_document_is_reported_as_the_bytes_the_endpoint_carries() {
+    let router = emulator();
+    let built = network("the policy document table", &router, &["us-east-1a"]).await;
+    // A document of the caller's own, laid out their way: what comes back must be these
+    // bytes, not a re-serialization of them.
+    let supplied = concat!(
+        "{\n",
+        "  \"Version\" : \"2012-10-17\",\n",
+        "  \"Statement\" : [ {\n",
+        "    \"Effect\" : \"Deny\",\n",
+        "    \"Principal\" : \"*\",\n",
+        "    \"Action\" : [ \"s3:DeleteObject\" ],\n",
+        "    \"Resource\" : \"*\"\n",
+        "  } ]\n",
+        "}",
+    );
+
+    // Rows: the two endpoint types that carry a policy, each with and without a document of
+    // the caller's own, and a second service per type so the document is not read off the
+    // service.
+    let rows: Vec<PolicyCase> = vec![
+        PolicyCase {
+            case: "a gateway endpoint to the object store",
+            service_name: "com.amazonaws.us-east-1.s3",
+            endpoint_type: "Gateway",
+            subnets: 0,
+            policy: None,
+            expected: GATEWAY_DEFAULT_POLICY,
+        },
+        PolicyCase {
+            case: "a gateway endpoint to the key-value store",
+            service_name: "com.amazonaws.us-east-1.dynamodb",
+            endpoint_type: "Gateway",
+            subnets: 0,
+            policy: None,
+            expected: GATEWAY_DEFAULT_POLICY,
+        },
+        PolicyCase {
+            case: "a gateway endpoint carrying the caller's document",
+            service_name: "com.amazonaws.us-east-1.s3",
+            endpoint_type: "Gateway",
+            subnets: 0,
+            policy: Some(supplied),
+            expected: supplied,
+        },
+        PolicyCase {
+            case: "an interface endpoint to the log service",
+            service_name: "com.amazonaws.us-east-1.logs",
+            endpoint_type: "Interface",
+            subnets: 1,
+            policy: None,
+            expected: INTERFACE_DEFAULT_POLICY,
+        },
+        PolicyCase {
+            case: "an interface endpoint to the queue service",
+            service_name: "com.amazonaws.us-east-1.sqs",
+            endpoint_type: "Interface",
+            subnets: 1,
+            policy: None,
+            expected: INTERFACE_DEFAULT_POLICY,
+        },
+        PolicyCase {
+            case: "an interface endpoint carrying the caller's document",
+            service_name: "com.amazonaws.us-east-1.monitoring",
+            endpoint_type: "Interface",
+            subnets: 1,
+            policy: Some(supplied),
+            expected: supplied,
+        },
+    ];
+
+    for PolicyCase {
+        case,
+        service_name,
+        endpoint_type,
+        subnets,
+        policy,
+        expected,
+    } in rows
+    {
+        let mut params = vec![
+            param("VpcId", &built.vpc_id),
+            param("ServiceName", service_name),
+            param("VpcEndpointType", endpoint_type),
+            // The private hosted zone of a service belongs to at most one endpoint per VPC,
+            // and this table creates two endpoints to some services, so no row asks for one.
+            param("PrivateDnsEnabled", "false"),
+        ];
+        let named: Vec<&str> = built
+            .subnets
+            .iter()
+            .take(subnets)
+            .map(String::as_str)
+            .collect();
+        params.extend(indexed("SubnetId", &named));
+        if let Some(policy) = policy {
+            params.push(param("PolicyDocument", policy));
+        }
+        let body = ok(case, &router, "CreateVpcEndpoint", &params).await;
+        let endpoint_id = member(case, &body, "vpcEndpointId");
+        let answered = super::ec2_query::unescaped(&member(case, &body, "policyDocument"));
+        assert_eq!(
+            answered, expected,
+            "case {case:?}: expected the document the endpoint carries, got {answered:?}"
+        );
+        assert!(
+            ::serde_json::from_str::<::serde_json::Value>(&answered).is_ok(),
+            "case {case:?}: expected a JSON document, got {answered:?}"
+        );
+        let described = describe_endpoint(case, &router, &endpoint_id).await;
+        let read_back = super::ec2_query::unescaped(&member(case, &described, "policyDocument"));
+        assert_eq!(
+            read_back, expected,
+            "case {case:?}: a read must return the same bytes, got {read_back:?}"
+        );
+    }
+}
+
+/// "Indicates whether the service supports endpoint policies"
+/// (`ServiceDetail$VpcEndpointPolicySupported`): an endpoint to a service that supports none
+/// allows full access to it whatever document is attached, so a document granting LESS is
+/// refused — and one granting full access, however it is written, is not.
+#[tokio::test]
+async fn a_service_without_endpoint_policy_support_refuses_a_narrowing_document() {
+    let router = emulator();
+    let built = network("the policy support table", &router, &["us-east-1a"]).await;
+    // The one service of the catalogue that supports no endpoint policy, and one that does.
+    let unsupported = "com.amazonaws.us-east-1.iot.data";
+    let supported = "com.amazonaws.us-east-1.logs";
+
+    // Rows: two documents that grant less than full access, two spellings of the full-access
+    // document — one pretty-printed, one with each grant as a single-entry list — and the same
+    // narrowing document on a service that DOES support endpoint policies.
+    let rows: [(&str, &str, &str, bool); 5] = [
+        (
+            "a document that denies everything",
+            unsupported,
+            r#"{"Statement":[{"Effect":"Deny","Principal":"*","Action":"*","Resource":"*"}]}"#,
+            false,
+        ),
+        (
+            "a document that allows one action",
+            unsupported,
+            r#"{"Statement":[{"Effect":"Allow","Principal":"*","Action":"iot:Connect","Resource":"*"}]}"#,
+            false,
+        ),
+        (
+            "the full-access document, pretty-printed by the caller",
+            unsupported,
+            INTERFACE_DEFAULT_POLICY,
+            true,
+        ),
+        (
+            "the full-access document, each grant a single-entry list",
+            unsupported,
+            r#"{"Statement":[{"Effect":"Allow","Principal":["*"],"Action":["*"],"Resource":["*"]}]}"#,
+            true,
+        ),
+        (
+            "a narrowing document on a service that supports endpoint policies",
+            supported,
+            r#"{"Statement":[{"Effect":"Deny","Principal":"*","Action":"*","Resource":"*"}]}"#,
+            true,
+        ),
+    ];
+
+    let mut accepted = 0usize;
+    for (case, service_name, policy, allowed) in rows {
+        let mut params = vec![
+            param("VpcId", &built.vpc_id),
+            param("ServiceName", service_name),
+            param("VpcEndpointType", "Interface"),
+            param("PolicyDocument", policy),
+            param("PrivateDnsEnabled", "false"),
+        ];
+        params.extend(indexed("SubnetId", &[built.subnets[0].as_str()]));
+        let (status, body) = call(&router, "CreateVpcEndpoint", &params).await;
+        if allowed {
+            accepted += 1;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the create to be served, got {status} with {body}"
+            );
+            let stored = super::ec2_query::unescaped(&member(case, &body, "policyDocument"));
+            assert_eq!(
+                stored, policy,
+                "case {case:?}: expected the document as supplied, got {stored:?}"
+            );
+        } else {
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected HTTP 400, got {status} with {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                ec2::state::INVALID_PARAMETER,
+                "case {case:?}: expected {code}, got {body}",
+                code = ec2::state::INVALID_PARAMETER
+            );
+            assert_eq!(
+                super::ec2_query::error_message(&body),
+                format!("Service {service_name} only supports the full-access endpoint policy."),
+                "case {case:?}: the refusal must name the service the request asked for, got \
+                 {body}"
+            );
+        }
+        // A refused create stores nothing, so the store holds one endpoint per served row.
+        assert_eq!(
+            described_endpoints(case, &router).await.len(),
+            accepted,
+            "case {case:?}: expected {accepted} stored endpoints"
+        );
+    }
 }

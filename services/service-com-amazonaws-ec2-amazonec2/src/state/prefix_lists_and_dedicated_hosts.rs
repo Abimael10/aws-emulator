@@ -2013,6 +2013,14 @@ pub const RESOURCE_TYPE_VPC_ENDPOINT: &str = "vpc-endpoint";
 /// address type is [`IP_ADDRESS_TYPE_IPV4`] has records for.
 pub const DNS_RECORD_IP_TYPE_IPV4: &str = "ipv4";
 
+/// DNS records the SERVICE decides: the `DnsRecordIpType` enum's `service-defined` member
+/// ([`crate::ops::types::DNS_RECORD_IP_TYPE_VALUES`]).
+///
+/// The record type of an endpoint that creates no endpoint network interface and so mints no
+/// DNS record of its own — a gateway endpoint, which is reached through its route-table prefix
+/// list and resolves the service's own published records.
+pub const DNS_RECORD_IP_TYPE_SERVICE_DEFINED: &str = "service-defined";
+
 /// The prefix of every endpoint service name Amazon Web Services itself offers, as the
 /// `ServiceName` doc's own examples spell it (`com.amazonaws.us-east-1.s3`).
 pub const AWS_ENDPOINT_SERVICE_PREFIX: &str = "com.amazonaws.";
@@ -2055,6 +2063,99 @@ pub fn requested_vpc_endpoint_policy<E>(
     Ok(Some(document.to_string()))
 }
 
+/// The default policy a GATEWAY endpoint created without a `PolicyDocument` is given: "If this
+/// parameter is not specified, we attach a default policy that allows full access to the
+/// service" (`CreateVpcEndpointRequest$PolicyDocument`).
+///
+/// The document's TEXT is recorded behaviour — the model constrains the member only as a string
+/// — and the document a gateway endpoint is installed with is the full-access one dated with the
+/// policy grammar the service installs it under, written compactly. It is held as the bytes the
+/// service installed rather than rebuilt per read, so a caller that byte-compares or re-submits
+/// the document it just read gets the same document back.
+pub const GATEWAY_ENDPOINT_DEFAULT_POLICY: &str =
+    r#"{"Version":"2008-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"*","Resource":"*"}]}"#;
+
+/// The default policy an INTERFACE endpoint created without a `PolicyDocument` is given.
+///
+/// Recorded behaviour, like [`GATEWAY_ENDPOINT_DEFAULT_POLICY`], and a DIFFERENT document: the
+/// one installed on an interface endpoint carries no policy-grammar date and is installed
+/// pretty-printed, two spaces per level with its statement's keys in alphabetical order. Held
+/// as those bytes for the same reason: the document a read returns is the document that was
+/// installed.
+pub const INTERFACE_ENDPOINT_DEFAULT_POLICY: &str = "{\n  \"Statement\": [\n    {\n      \
+     \"Action\": \"*\", \n      \"Effect\": \"Allow\", \n      \"Principal\": \"*\", \n      \
+     \"Resource\": \"*\"\n    }\n  ]\n}";
+
+/// The document the service installs on an endpoint of type `endpoint_type` whose request named
+/// none, or whose `ModifyVpcEndpoint` asked for the policy to be reset.
+///
+/// The ONE answer to "the default policy", so a create, a reset and every later read agree about
+/// what an endpoint that was never given a policy carries. A Gateway Load Balancer endpoint takes
+/// no policy at all, so only the two types that do have one here and every other type falls to
+/// the gateway document.
+pub fn default_vpc_endpoint_policy(endpoint_type: &str) -> &'static str {
+    if endpoint_type == VPC_ENDPOINT_TYPE_INTERFACE {
+        INTERFACE_ENDPOINT_DEFAULT_POLICY
+    } else {
+        GATEWAY_ENDPOINT_DEFAULT_POLICY
+    }
+}
+
+/// Whether `document` grants FULL ACCESS to the service — every action, by every principal, on
+/// every resource — whatever whitespace, key order or statement form it is written in.
+///
+/// "we attach a default policy that allows full access to the service"
+/// (`CreateVpcEndpointRequest$PolicyDocument`) is a question about what a document GRANTS, so it
+/// is answered by reading the parsed document rather than by comparing it to one spelling of it:
+/// a caller that writes the full-access policy out itself has written the full-access policy.
+/// A statement's `Action`, `Principal` and `Resource` may each be the string `*` or a list whose
+/// only entry is, which are the same grant.
+pub fn policy_document_grants_full_access(document: &str) -> bool {
+    let Ok(parsed) = ::serde_json::from_str::<::serde_json::Value>(document) else {
+        return false;
+    };
+    let Some(statement) = parsed.get("Statement") else {
+        return false;
+    };
+    let statements: Vec<&::serde_json::Value> = match statement.as_array() {
+        Some(entries) => entries.iter().collect(),
+        None => vec![statement],
+    };
+    if statements.is_empty() {
+        return false;
+    }
+    let grants_everything = |value: Option<&::serde_json::Value>| -> bool {
+        match value {
+            Some(::serde_json::Value::String(text)) => text == "*",
+            Some(::serde_json::Value::Array(entries)) => {
+                entries.len() == 1 && entries[0].as_str() == Some("*")
+            }
+            _ => false,
+        }
+    };
+    statements.iter().all(|statement| {
+        statement.get("Effect").and_then(::serde_json::Value::as_str) == Some("Allow")
+            && grants_everything(statement.get("Action"))
+            && grants_everything(statement.get("Principal"))
+            && grants_everything(statement.get("Resource"))
+    })
+}
+
+/// Refuse a narrowing endpoint policy for a service that supports no endpoint policy: HTTP 400
+/// [`INVALID_PARAMETER`], naming the service the request asked for.
+///
+/// "Indicates whether the service supports endpoint policies"
+/// (`ServiceDetail$VpcEndpointPolicySupported`): an endpoint to a service that supports none
+/// allows full access to it whatever document were attached, so a document that grants less is
+/// refused rather than stored as a restriction nothing would apply.
+pub fn endpoint_policy_unsupported<E>(service_name: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_PARAMETER,
+        400,
+        format!("Service {service_name} only supports the full-access endpoint policy."),
+    )
+}
+
 /// The further label a partner or Marketplace endpoint service name carries between that
 /// prefix and its Region (`com.amazonaws.vpce.<region>.vpce-svc-…`).
 pub const PARTNER_ENDPOINT_SERVICE_LABEL: &str = "vpce.";
@@ -2078,6 +2179,45 @@ pub const API_AWS_ENDPOINT_SERVICE_PREFIX: &str = "api.aws.";
 /// The DNS suffix of the endpoint-specific names an interface endpoint answers on, under
 /// which the Region's own label sits (`<endpoint>.<service>.<region>.vpce.amazonaws.com`).
 pub const ENDPOINT_DNS_SUFFIX: &str = "vpce.amazonaws.com";
+
+/// How many characters the per-endpoint suffix of an interface endpoint's own DNS names
+/// carries.
+///
+/// An interface endpoint's names are `<vpce-id>-<suffix>.<service>.<region>.vpce.amazonaws.com`
+/// and one `<vpce-id>-<suffix>-<zone>.…` per Availability Zone it is served in: the service
+/// gives each endpoint a short suffix of its own beside the endpoint's id, so two endpoints of
+/// one service in one Region never answer on the same name even where an id is reused.
+pub const VPC_ENDPOINT_DNS_SUFFIX_CHARS: usize = 8;
+
+/// The per-endpoint suffix the DNS names of the endpoint `endpoint_id` carry.
+///
+/// DERIVED from the endpoint's own id ([`stable_derived_id_hash`]) rather than minted or read
+/// off a random source, exactly as [`endpoint_service_id`] derives a service's id from its name:
+/// every read of one endpoint answers the same suffix without the store holding it, and two
+/// endpoints get different suffixes. It is [`VPC_ENDPOINT_DNS_SUFFIX_CHARS`] characters of the
+/// lowercase alphanumeric alphabet a DNS label is made of.
+pub fn vpc_endpoint_dns_suffix(endpoint_id: &str) -> String {
+    const ALPHABET: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    const BASE: u64 = 36;
+    let mut digest = stable_derived_id_hash(endpoint_id);
+    let mut suffix = String::with_capacity(VPC_ENDPOINT_DNS_SUFFIX_CHARS);
+    for _ in 0..VPC_ENDPOINT_DNS_SUFFIX_CHARS {
+        let index = usize::try_from(digest % BASE).unwrap_or_default();
+        suffix.push(char::from(ALPHABET[index.min(ALPHABET.len() - 1)]));
+        digest /= BASE;
+    }
+    suffix
+}
+
+/// The hosted zone id a DNS name the service has NOT published yet is reported under
+/// (`DnsEntry$HostedZoneId`).
+///
+/// A private DNS name an interface endpoint intercepts is answered by a private hosted zone,
+/// and that zone exists only once the endpoint is in service: until then the entry names the
+/// sentinel below instead of a zone id, which is what tells a caller the name does not resolve
+/// yet. [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] replaces it with the
+/// zone's own id when the clock moves the endpoint to [`VPC_ENDPOINT_STATE_AVAILABLE`].
+pub const HOSTED_ZONE_ID_PENDING: &str = "ZONEIDPENDING";
 
 /// The DNS suffix of the default public name of a service of a Region, which private DNS
 /// resolves inside the VPC — "the default public DNS name for the service for the Region
@@ -3050,6 +3190,63 @@ pub fn endpoint_service_private_dns_name(
         .into_iter()
         .find(|service| service.service_name == service_name)
         .and_then(|service| service.private_dns_name)
+}
+
+/// EVERY default public DNS name of the endpoint service called `service_name` that private DNS
+/// resolves inside the VPC, in the order an endpoint to it reports them.
+///
+/// "The private hosted zone contains a record set for the default public DNS name for the
+/// service for the Region" (`CreateVpcEndpointRequest$PrivateDnsEnabled`) — the name
+/// [`endpoint_service_private_dns_name`] reports — and a service Amazon Web Services publishes
+/// under `<host>.<region>.amazonaws.com` answers the same API on its dual-stack name
+/// `<host>.<region>.api.aws` ([`API_SERVICE_DNS_SUFFIX`], the domain this workspace serves such
+/// a host under), so private DNS for that service intercepts both and an endpoint to it reports
+/// a DNS entry for each. A service whose name is already under that domain, and one whose
+/// private name is its OWNER's rather than Amazon Web Services' own, publishes the one name it
+/// publishes.
+///
+/// Empty for a service that publishes no private DNS name at all, which is what makes
+/// `PrivateDnsEnabled` unavailable for it.
+pub fn endpoint_service_private_dns_names(
+    store: &ComAmazonawsEc2Amazonec2State,
+    service_name: &str,
+) -> Vec<String> {
+    let Some(private_dns_name) = endpoint_service_private_dns_name(store, service_name) else {
+        return Vec::new();
+    };
+    let dual_stack = private_dns_name
+        .strip_suffix(SERVICE_DNS_SUFFIX)
+        .map(|host| format!("{host}{API_SERVICE_DNS_SUFFIX}"));
+    ::std::iter::once(private_dns_name)
+        .chain(dual_stack)
+        .collect()
+}
+
+/// Whether an endpoint to the service called `service_name` takes an endpoint POLICY, or `None`
+/// for a name this service holds no catalogue entry for — a service another account or a
+/// Marketplace partner offers, whose capabilities are not enumerable here.
+///
+/// "Indicates whether the service supports endpoint policies"
+/// (`ServiceDetail$VpcEndpointPolicySupported`), read from the same two sources, in the same
+/// order, as [`endpoint_service_types`], so the answer a create is held to is the one
+/// `DescribeVpcEndpointServices` reports for that service.
+pub fn endpoint_service_supports_endpoint_policy(
+    store: &ComAmazonawsEc2Amazonec2State,
+    service_name: &str,
+) -> Option<bool> {
+    let parsed = parse_endpoint_service_name(service_name)?;
+    if let Some(service) = store
+        .vpc_endpoint_services
+        .values()
+        .filter_map(account_endpoint_service_record)
+        .find(|service| service.service_name == service_name)
+    {
+        return Some(service.vpc_endpoint_policy_supported);
+    }
+    endpoint_services_in_region(&parsed.region)
+        .into_iter()
+        .find(|service| service.service_name == service_name)
+        .map(|service| service.vpc_endpoint_policy_supported)
 }
 
 /// Refuse an endpoint of a type the service it names is not reachable through: HTTP 400

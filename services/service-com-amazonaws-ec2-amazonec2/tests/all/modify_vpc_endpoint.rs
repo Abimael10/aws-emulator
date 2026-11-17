@@ -411,21 +411,22 @@ async fn the_subnets_an_endpoint_serves_follow_the_additions_and_removals() {
         );
         // "(Interface endpoint) The DNS entries for the endpoint" (`DnsEntries`): the
         // endpoint's regional name plus one per zone it is served in, and the service's own
-        // default public name beside them for the private hosted zone this endpoint
+        // default public names beside them — its public regional name and that name's
+        // dual-stack `api.aws` sibling — for the private hosted zones this endpoint
         // associates.
         let dns_names = set_members(case, &described, "dnsEntrySet", "dnsName");
         assert_eq!(
             dns_names.len(),
-            expected.len() + 2,
-            "case {case:?}: expected the service's name, the regional name and one per zone, \
+            expected.len() + 3,
+            "case {case:?}: expected the service's names, the regional name and one per zone, \
              got {dns_names:?}"
         );
         assert!(
             dns_names
                 .iter()
-                .all(|name| name.starts_with(&format!("{endpoint_id}."))
-                    || name.starts_with(&format!("{endpoint_id}-"))
-                    || name == &format!("logs.{REGION}.amazonaws.com")),
+                .all(|name| name.starts_with(&format!("{endpoint_id}-"))
+                    || name == &format!("logs.{REGION}.amazonaws.com")
+                    || name == &format!("logs.{REGION}.api.aws")),
             "case {case:?}: expected every name to be the endpoint's own or the service's, \
              got {dns_names:?}"
         );
