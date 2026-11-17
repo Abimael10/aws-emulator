@@ -371,7 +371,7 @@ pub fn serve<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> RtRes
     };
     // Who the request speaks for, resolved against the account's identity records BEFORE
     // this service's own store is locked, so no two service stores are ever held at once.
-    let caller = authorization::caller(engine, req.headers().get("authorization"));
+    let caller = authorization::caller(engine, req.headers().get("authorization"), &addressed.query);
     // The method of a runtime-API request arrives as a string; the router hands this seam a
     // request whose body it has already buffered (it reads the body itself to resolve a
     // routing key), so an absent one is an empty body rather than a stream this plane
@@ -409,6 +409,7 @@ pub fn serve_published<Eng: Send + Sync + 'static>(
         req.headers()
             .get("authorization")
             .and_then(|value| value.to_str().ok()),
+        req.uri().query().unwrap_or_default(),
     );
     let method = req.method().as_str().to_ascii_uppercase();
     let request = Request {

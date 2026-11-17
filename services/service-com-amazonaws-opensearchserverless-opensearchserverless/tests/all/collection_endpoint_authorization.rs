@@ -13,14 +13,19 @@
 //! * a `data` access policy is what grants a PRINCIPAL a permission on the collection and
 //!   its indexes (AWS's "Data access control for Amazon OpenSearch Serverless"), so a
 //!   request a policy grants no covering permission to is refused even where the endpoint is
-//!   reachable.
+//!   reachable;
+//! * a SigV4 credential is bound to the service its scope names, so a request to a collection
+//!   endpoint is authenticated only under this service's own signing name — one presenting a
+//!   credential (or a presigned query) scoped to another signing service is refused at the
+//!   front door, whatever route it asks for.
 //!
 //! Each table spans what the rule generalises over rather than one recorded request: the
 //! first over which resources a network policy names (none at all, another collection,
 //! the collection itself, every collection, a wildcarded prefix), the second over which
 //! principal and which permissions a data access policy grants, crossed with the route the
 //! request asks for — an index create, a search and a document write take three different
-//! permissions.
+//! permissions — and the last over the signing name a presented credential scope names,
+//! crossed with the route and with how the credential is presented.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -258,6 +263,20 @@ pub(crate) async fn rest_bytes(
     path: &str,
     body: Option<&Value>,
 ) -> (u16, Vec<u8>) {
+    rest_scoped_bytes(router, host, akid, SIGNING_NAME, method, path, body).await
+}
+
+/// [`rest_bytes`] with the signing name its credential scope names left to the caller: the
+/// one part of a presented credential the scope rule varies over.
+async fn rest_scoped_bytes(
+    router: &MultiServiceRouter,
+    host: &str,
+    akid: &str,
+    signing_name: &str,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+) -> (u16, Vec<u8>) {
     let request = http::Request::builder()
         .method(method)
         .uri(path)
@@ -266,7 +285,7 @@ pub(crate) async fn rest_bytes(
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential={akid}/20260101/{REGION}/{SIGNING_NAME}/aws4_request, \
+                "AWS4-HMAC-SHA256 Credential={akid}/20260101/{REGION}/{signing_name}/aws4_request, \
                  SignedHeaders=host, Signature=deadbeef"
             ),
         )
@@ -277,6 +296,51 @@ pub(crate) async fn rest_bytes(
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
     (status, response.body().to_vec())
+}
+
+/// One OpenSearch REST request signed for `signing_name` ([`rest_scoped_bytes`]), whose
+/// answer is read as the JSON document it carries.
+async fn rest_scoped(
+    router: &MultiServiceRouter,
+    host: &str,
+    akid: &str,
+    signing_name: &str,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+) -> (u16, Value) {
+    let (status, payload) =
+        rest_scoped_bytes(router, host, akid, signing_name, method, path, body).await;
+    let parsed: Value = serde_json::from_slice(&payload).unwrap_or(Value::Null);
+    (status, parsed)
+}
+
+/// One OpenSearch REST request that presents its SigV4 credential the way a PRESIGNED
+/// request does: no `Authorization` header at all, and the credential scope and signature in
+/// the query string, scoped to `signing_name`.
+async fn rest_presigned(
+    router: &MultiServiceRouter,
+    host: &str,
+    akid: &str,
+    signing_name: &str,
+    method: &str,
+    path: &str,
+) -> (u16, Value) {
+    let uri = format!(
+        "{path}?X-Amz-Algorithm=AWS4-HMAC-SHA256\
+         &X-Amz-Credential={akid}%2F20260101%2F{REGION}%2F{signing_name}%2Faws4_request\
+         &X-Amz-SignedHeaders=host&X-Amz-Signature=deadbeef"
+    );
+    let request = http::Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("host", host)
+        .body(bytes::Bytes::new())
+        .expect("a well-formed presigned data-plane request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let parsed: Value = serde_json::from_slice(response.body()).unwrap_or(Value::Null);
+    (status, parsed)
 }
 
 /// One OpenSearch REST request ([`rest_bytes`]) whose answer is read as the JSON document it
@@ -767,5 +831,282 @@ async fn a_request_no_data_access_policy_admits_is_refused_with_the_forbidden_do
             held, 404,
             "case {case}: the refused write must have landed nothing, got {held} with {body}"
         );
+    }
+}
+
+/// How the endpoint's own authorization layer states a refusal: the status, the fixed error
+/// type and reason of its OpenSearch error document, and the status that document repeats.
+fn refusal_parts(status: u16, answer: &Value) -> (u16, String, String, Option<u64>) {
+    (
+        status,
+        text(answer, "error.type"),
+        text(answer, "error.reason"),
+        answer["status"].as_u64(),
+    )
+}
+
+/// The refusal a request this endpoint does not authorize is answered with, as
+/// [`refusal_parts`] reads it.
+fn forbidden_parts() -> (u16, String, String, Option<u64>) {
+    (
+        403,
+        "forbidden".to_string(),
+        "403 Forbidden".to_string(),
+        Some(403),
+    )
+}
+
+/// RULE: a request reaches a collection's data plane only under a SigV4 credential whose
+/// scope names this service's own signing name; one presenting a scope that names any other
+/// signing service is refused at the front door with 403 and the fixed `forbidden` error
+/// document, whatever route it asks for and whatever the collection's policies grant it.
+///
+/// The rows span the signing name the presented scope names — this endpoint's own, the
+/// managed OpenSearch service's, another service's, the FIPS host label of this service and a
+/// name no service answers — and each is asked for two routes that take two different
+/// permissions, a document write and a document read, so the refusal is pinned to the
+/// credential rather than to one route.
+#[tokio::test]
+async fn a_credential_scoped_to_another_signing_service_is_refused_at_the_front_door() {
+    /// One case: the signing name the request's credential scope names, and whether the
+    /// endpoint authenticates it at all.
+    struct Row {
+        case: &'static str,
+        signing_name: &'static str,
+        admitted: bool,
+    }
+    // A client of a collection endpoint signs with this service's own signing name
+    // (`smithy_query(query="service_info")` -> `sigv4Name`). `es` is the MANAGED OpenSearch
+    // service's signing name, and `aoss-fips` is a host label of this service's FIPS
+    // endpoint, which is the same service reached at another host and so is signed for under
+    // the same name — neither is a signing name of this endpoint.
+    let rows: &[Row] = &[
+        Row {
+            case: "this endpoint's own signing name",
+            signing_name: SIGNING_NAME,
+            admitted: true,
+        },
+        Row {
+            case: "the managed OpenSearch service's signing name",
+            signing_name: "es",
+            admitted: false,
+        },
+        Row {
+            case: "another AWS service's signing name",
+            signing_name: "s3",
+            admitted: false,
+        },
+        Row {
+            case: "the FIPS host label, which is no signing name of its own",
+            signing_name: "aoss-fips",
+            admitted: false,
+        },
+        Row {
+            case: "a signing name no service answers",
+            signing_name: "not-a-service",
+            admitted: false,
+        },
+    ];
+    for Row {
+        case,
+        signing_name,
+        admitted,
+    } in rows
+    {
+        let router = emulator();
+        create_security_policy(
+            &router,
+            "network",
+            "net-policy",
+            &network_policy(&["collection/*"]),
+        )
+        .await;
+        let collection = active_collection(&router, "scope-gated").await;
+        let host = endpoint_host(&collection);
+        // The index is created under the endpoint's own signing name by the account's own
+        // published credential, which the data access policies do not bound — so each row is
+        // about the SCOPE of the request it then makes, and neither a missing index nor a
+        // missing grant is in the way.
+        let (status, answer) = rest(
+            &router,
+            &host,
+            AMBIENT_ACCESS_KEY_ID,
+            "PUT",
+            "/scoped-index",
+            Some(&knn_index_body(4)),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case}: setup expected the index create accepted, got {status} with {answer}"
+        );
+
+        let (status, answer) = rest_scoped(
+            &router,
+            &host,
+            AMBIENT_ACCESS_KEY_ID,
+            signing_name,
+            "PUT",
+            "/scoped-index/_doc/scoped",
+            Some(&json!({ "vector": [1.0, 0.0, 0.0, 0.0] })),
+        )
+        .await;
+        if *admitted {
+            assert_eq!(
+                status, 201,
+                "case {case}: a write scoped to this endpoint's own signing name must be \
+                 served, got {status} with {answer}"
+            );
+        } else {
+            assert_eq!(
+                refusal_parts(status, &answer),
+                forbidden_parts(),
+                "case {case}: expected the write refused 403 with the forbidden document, got \
+                 {status} with {answer}"
+            );
+            // Nothing the refused write asked for landed: a correctly scoped read, which may
+            // read every document, finds none.
+            let (held, body) = rest(
+                &router,
+                &host,
+                AMBIENT_ACCESS_KEY_ID,
+                "GET",
+                "/scoped-index/_doc/scoped",
+                None,
+            )
+            .await;
+            assert_eq!(
+                held, 404,
+                "case {case}: the refused write must have landed nothing, got {held} with {body}"
+            );
+        }
+
+        let (status, answer) = rest_scoped(
+            &router,
+            &host,
+            AMBIENT_ACCESS_KEY_ID,
+            signing_name,
+            "GET",
+            "/scoped-index/_doc/scoped",
+            None,
+        )
+        .await;
+        if *admitted {
+            assert_eq!(
+                status, 200,
+                "case {case}: expected the read of the document just written served, got \
+                 {status} with {answer}"
+            );
+        } else {
+            assert_eq!(
+                refusal_parts(status, &answer),
+                forbidden_parts(),
+                "case {case}: a read is refused for the same credential as a write, got \
+                 {status} with {answer}"
+            );
+        }
+    }
+}
+
+/// RULE: the signing name a PRESIGNED request carries in its query (`X-Amz-Credential`) is
+/// the scope of the credential it presents, so the same rule decides it: a presigned request
+/// scoped to another signing service is refused 403 with the `forbidden` document, and one
+/// scoped to this endpoint's own signing name is served.
+///
+/// The rows span where the scope names this endpoint and where it names another service,
+/// which is what the scope rule generalises over — a credential minted for one service is no
+/// credential for another, however it is presented.
+#[tokio::test]
+async fn a_presigned_request_is_bounded_by_the_same_credential_scope_rule() {
+    /// One case: the signing name the presigned query's credential scope names, and whether
+    /// the endpoint authenticates it.
+    struct Row {
+        case: &'static str,
+        signing_name: &'static str,
+        admitted: bool,
+    }
+    let rows: &[Row] = &[
+        Row {
+            case: "a presigned request scoped to this endpoint's own signing name",
+            signing_name: SIGNING_NAME,
+            admitted: true,
+        },
+        Row {
+            case: "a presigned request scoped to the managed OpenSearch service",
+            signing_name: "es",
+            admitted: false,
+        },
+        Row {
+            case: "a presigned request scoped to another AWS service",
+            signing_name: "s3",
+            admitted: false,
+        },
+    ];
+    for Row {
+        case,
+        signing_name,
+        admitted,
+    } in rows
+    {
+        let router = emulator();
+        create_security_policy(
+            &router,
+            "network",
+            "net-policy",
+            &network_policy(&["collection/*"]),
+        )
+        .await;
+        let collection = active_collection(&router, "presigned-scope").await;
+        let host = endpoint_host(&collection);
+        let (status, answer) = rest(
+            &router,
+            &host,
+            AMBIENT_ACCESS_KEY_ID,
+            "PUT",
+            "/presigned-index",
+            Some(&knn_index_body(4)),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case}: setup expected the index create accepted, got {status} with {answer}"
+        );
+        let (status, answer) = rest(
+            &router,
+            &host,
+            AMBIENT_ACCESS_KEY_ID,
+            "PUT",
+            "/presigned-index/_doc/one",
+            Some(&json!({ "vector": [0.0, 1.0, 0.0, 0.0] })),
+        )
+        .await;
+        assert_eq!(
+            status, 201,
+            "case {case}: setup expected the document write accepted, got {status} with {answer}"
+        );
+
+        let (status, answer) = rest_presigned(
+            &router,
+            &host,
+            AMBIENT_ACCESS_KEY_ID,
+            signing_name,
+            "GET",
+            "/presigned-index/_doc/one",
+        )
+        .await;
+        if *admitted {
+            assert_eq!(
+                (status, text(&answer, "_id").as_str()),
+                (200, "one"),
+                "case {case}: expected the stored document answered, got {status} with {answer}"
+            );
+        } else {
+            assert_eq!(
+                refusal_parts(status, &answer),
+                forbidden_parts(),
+                "case {case}: expected 403 with the forbidden document, got {status} with \
+                 {answer}"
+            );
+        }
     }
 }
