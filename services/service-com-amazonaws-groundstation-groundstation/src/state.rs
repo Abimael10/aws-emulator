@@ -472,29 +472,26 @@ pub fn bucket_name_of(bucket_arn: &str) -> Option<&str> {
     (!name.is_empty()).then_some(name)
 }
 
-/// What `s3RecordingConfig`'s bucket resolution answers when there IS no such bucket: the
-/// service's fixed refusal text for that condition. It is the answer whenever the bucket
-/// the `bucketArn` names is not there — a bucket S3 reports this account does not hold,
-/// and a `bucketArn` that names no bucket at all, are both a bucket that does not exist.
+/// What `s3RecordingConfig`'s bucket resolution answers when the bucket cannot be
+/// resolved, whatever stopped the resolution: the service's ONE fixed refusal text for an
+/// unresolvable recording bucket.
+///
+/// Ground Station reads the bucket's location in its OWN name rather than the caller's, so
+/// every way that read can fail to hand over a location — S3 reporting no such bucket, S3
+/// refusing the read, and a `bucketArn` that names no bucket at all, which is the same
+/// thing settled without asking — reaches the caller as the single answer "the location
+/// could not be obtained", whose remedy is the permission this text names. The caller is
+/// never told which of them it was, because the caller cannot see the difference: it is
+/// not the caller's read that failed.
+///
 /// Entirely fixed text: it interpolates no bucket, ARN, account or region. As with every
 /// other refusal here the status (431) and the error code (`InvalidParameterException`)
 /// are the contract, and this is the wording that goes with them.
-pub const RECORDING_BUCKET_DOES_NOT_EXIST: &str =
-    "Unable to create new S3 endpoint config - bucket does not exist.";
-
-/// What the same resolution answers for the OTHER condition it can fail on: a bucket S3
-/// answered about without handing over its location — the read of the location itself was
-/// refused, which is the condition whose remedy is a permission on the bucket, and why
-/// this text names that permission while [`RECORDING_BUCKET_DOES_NOT_EXIST`] does not.
-/// Telling the two apart is what tells a caller whether to fix a name or a policy.
-///
-/// Fixed text in the same way, and carried with the same status and error code.
-pub const RECORDING_BUCKET_LOCATION_UNREADABLE: &str =
+pub const RECORDING_BUCKET_UNRESOLVABLE: &str =
     "Unable to create new S3 endpoint config - unable to get location of bucket. Ensure \
      that Ground Station has s3:GetBucketLocation permissions on the bucket.";
 
-/// Refuse a `configData` whose recording bucket cannot be resolved — and only then,
-/// naming the condition that stopped the resolution.
+/// Refuse a `configData` whose recording bucket cannot be resolved — and only then.
 ///
 /// An `s3RecordingConfig` names the bucket to record to by ARN, and Ground Station
 /// resolves that bucket — it has to know where the bucket is before it can record to it —
@@ -502,13 +499,11 @@ pub const RECORDING_BUCKET_LOCATION_UNREADABLE: &str =
 /// modelled `InvalidParameterException` (HTTP 431) instead of being stored, so a caller
 /// never holds a recording config that cannot record. A bucket that RESOLVES is accepted.
 ///
-/// WHICH refusal is decided by what S3 answered, because the two conditions are remedied
-/// differently. A bucket S3 reports is not there — and a `bucketArn` that names no bucket
-/// at all, which is the same thing settled without asking — carries
-/// [`RECORDING_BUCKET_DOES_NOT_EXIST`]; a bucket S3 answered about while withholding its
-/// location carries [`RECORDING_BUCKET_LOCATION_UNREADABLE`], the text that names the
-/// permission such a read needs. A caller is told to fix the name it typed only when the
-/// name is what is wrong.
+/// There is ONE refusal, [`RECORDING_BUCKET_UNRESOLVABLE`], for every condition that
+/// stops the resolution: a bucket S3 reports is not there, a bucket S3 answers about while
+/// withholding its location, and a `bucketArn` that names no bucket at all. The read is
+/// Ground Station's own, so a failed read is reported to the caller as exactly that and
+/// nothing finer.
 ///
 /// S3 is reached the way the framework documents a handler reaching another emulated
 /// service ([`smithy_server_runtime::OperationContext::callback`]): an AWS SDK client
@@ -534,18 +529,18 @@ pub async fn unresolvable_recording_bucket(
     let ConfigTypeData::s3RecordingConfig(recording) = config_data else {
         return None;
     };
-    let refusal = |message: &str| {
+    let refusal = || {
         invalid_parameter(
             "configData.s3RecordingConfig.bucketArn",
-            message.to_string(),
+            RECORDING_BUCKET_UNRESOLVABLE.to_string(),
         )
     };
     // A value that is not an S3 bucket ARN names no bucket, and that is settled without
-    // asking S3: there is nothing to ask about, and no such bucket exists. An ARN of any
-    // other service names no bucket either, however its resource part is spelled (see
-    // [`bucket_name_of`]).
+    // asking S3: there is nothing to ask about, so there is no location to be had. An ARN
+    // of any other service names no bucket either, however its resource part is spelled
+    // (see [`bucket_name_of`]).
     let Some(bucket) = bucket_name_of(&recording.bucket_arn) else {
-        return Some(refusal(RECORDING_BUCKET_DOES_NOT_EXIST));
+        return Some(refusal());
     };
     let answer = s3_client(ctx, region, ctx.callback().aws_credentials_provider())
         .head_bucket()
@@ -555,17 +550,15 @@ pub async fn unresolvable_recording_bucket(
     match answer {
         // S3 holds the bucket and reported where it is, so the config can record to it.
         Ok(_) => None,
-        Err(error) => match unresolved_bucket_condition(&error) {
-            Some(message) => Some(refusal(message)),
-            None => {
-                ::tracing::warn!(
-                    bucket_arn = %recording.bucket_arn,
-                    error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
-                    "the recording config's bucket could not be resolved against S3"
-                );
-                None
-            }
-        },
+        Err(error) if s3_answered_about_bucket(&error) => Some(refusal()),
+        Err(error) => {
+            ::tracing::warn!(
+                bucket_arn = %recording.bucket_arn,
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "the recording config's bucket could not be resolved against S3"
+            );
+            None
+        }
     }
 }
 
@@ -609,30 +602,28 @@ fn s3_client(
 /// S3 holds the bucket for.
 const BUCKET_READ_DENIED_STATUS: u16 = 403;
 
-/// WHICH condition an S3 `HeadBucket` failure reports about the recording bucket, as the
-/// text the refusal carries — `None` when S3 reported no condition about the bucket at
-/// all, which grounds no refusal.
+/// Whether an S3 `HeadBucket` failure is S3 ANSWERING about the recording bucket — the
+/// answer that settles that no location for it was obtained, and so grounds the one
+/// refusal.
 ///
-/// S3 answering `NotFound` (the only error that operation models) is the bucket not being
-/// there. S3 REFUSING the read — the access denial a missing permission on the bucket
-/// earns, which is the condition AWS names a remedy for — is an answer about a bucket
-/// whose location the caller may not have. Anything else settles nothing: the call may
-/// never have reached S3 (a deployment with no object storage behind it answers the
-/// request itself), and a refusal has to be grounded in what S3 said.
-fn unresolved_bucket_condition(
+/// S3 answering `NotFound` (the only error that operation models) and S3 REFUSING the read
+/// (the access denial a missing permission on the bucket earns) are both answers from S3,
+/// and either leaves Ground Station without the bucket's location. Anything else settles
+/// nothing: the call may never have reached S3 (a deployment with no object storage behind
+/// it answers the request itself), and a refusal has to be grounded in what S3 said.
+fn s3_answered_about_bucket(
     error: &::aws_sdk_s3::error::SdkError<
         ::aws_sdk_s3::operation::head_bucket::HeadBucketError,
         ::aws_smithy_runtime_api::client::orchestrator::HttpResponse,
     >,
-) -> Option<&'static str> {
-    let answered = error.as_service_error()?;
-    if ::aws_sdk_s3::operation::head_bucket::HeadBucketError::is_not_found(answered) {
-        return Some(RECORDING_BUCKET_DOES_NOT_EXIST);
-    }
-    error
-        .raw_response()
-        .is_some_and(|answer| answer.status().as_u16() == BUCKET_READ_DENIED_STATUS)
-        .then_some(RECORDING_BUCKET_LOCATION_UNREADABLE)
+) -> bool {
+    let Some(answered) = error.as_service_error() else {
+        return false;
+    };
+    ::aws_sdk_s3::operation::head_bucket::HeadBucketError::is_not_found(answered)
+        || error
+            .raw_response()
+            .is_some_and(|answer| answer.status().as_u16() == BUCKET_READ_DENIED_STATUS)
 }
 
 /// How long an upload URL `GetAgentTaskResponseUrl` hands out stays signed for.

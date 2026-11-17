@@ -229,8 +229,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // An `s3RecordingConfig` an update stores has to name a bucket this account
-        // holds exactly as one a create stores does, and the bucket lives in another
+        // An `s3RecordingConfig` an update stores has to name a bucket Ground Station can
+        // locate exactly as one a create stores does, and the bucket lives in another
         // service: it is resolved against S3 with this service's store UNLOCKED, since
         // the call crosses an await.
         if let Some(refusal) = crate::state::unresolvable_recording_bucket(

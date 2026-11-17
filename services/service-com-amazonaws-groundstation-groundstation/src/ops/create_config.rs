@@ -173,10 +173,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .validate_config_data(&input.config_data)
             .map_err(CreateConfigErrorModeled::InvalidParameterException)?;
 
-        // An `s3RecordingConfig` records to a bucket this account has to actually hold:
-        // Ground Station resolves it against S3 — another service — before it will store
-        // the config, and only a bucket S3 reports absent is refused. The store is
-        // UNLOCKED here, since the call crosses an await.
+        // An `s3RecordingConfig` records to a bucket Ground Station has to be able to
+        // locate: it resolves it against S3 — another service — before it will store the
+        // config, and only a bucket S3 answers about without handing over a location is
+        // refused. The store is UNLOCKED here, since the call crosses an await.
         if let Some(refusal) =
             crate::state::unresolvable_recording_bucket(ctx, &region, &input.config_data).await
         {
