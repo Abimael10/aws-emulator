@@ -27,6 +27,19 @@
 //!
 //! The `confirmationUrl` a create will not take is refused in the one sentence this service
 //! states for a value that is no HTTPS URL, over a table of the ways a URL can fail it.
+//!
+//! Two more rules about what a create LEAVES BEHIND, each over its own table:
+//!
+//! * `CreateTopicRuleDestination` records the destination it answers with: the `arn` it
+//!   mints, `status` `IN_PROGRESS` ("The destination must be confirmed prior to use"),
+//!   `createdAt`/`lastUpdatedAt` and `httpUrlProperties.confirmationUrl` are read back
+//!   member for member through `GetTopicRuleDestination`, and every destination the account
+//!   creates is its own record under its own ARN — so a create persists a store rather than
+//!   answering the request it was handed;
+//! * a destination's identity is the endpoint it confirms, so a second create for a
+//!   `confirmationUrl` this account already holds a destination for is refused
+//!   `ResourceAlreadyExistsException` ("The resource already exists", HTTP 409) naming the
+//!   record that exists, and mints and changes nothing.
 
 use std::sync::Arc;
 
@@ -595,4 +608,231 @@ async fn a_confirmation_url_that_is_no_https_url_is_refused() {
         "an HTTPS confirmationUrl must be taken, got {} {:?}",
         created.status, created.body
     );
+}
+
+/// The ARN namespace an HTTP topic rule destination of this account is minted under, which
+/// a create mints the destination's own identifier within.
+fn http_destination_arn_prefix() -> String {
+    format!("arn:aws:iot:{REGION}:{ACCOUNT_ID}:ruledestination/http/")
+}
+
+/// What a create RECORDED is what a later read reports: the destination the create answered
+/// with is readable back member for member, and every destination the account creates is its
+/// own record under its own ARN.
+///
+/// The rows differ along the form of the confirmation URL — a path-only URL, one carrying a
+/// query string, one naming a port, a deeper path, and one on another host — none of which
+/// the record's shape depends on. All of them are created against ONE emulator, so the final
+/// pass over them reads a store holding every row rather than the last request's answer.
+#[tokio::test]
+async fn a_created_destination_is_persisted_and_read_back_member_for_member() {
+    let emulator = Emulator::new();
+    let rows = [
+        ("a path-only URL", "https://example.test/iot/one"),
+        (
+            "a URL with a query string",
+            "https://example.test/iot/two?tenant=7",
+        ),
+        ("a URL naming a port", "https://example.test:8443/iot/three"),
+        (
+            "a deeper path",
+            "https://example.test/iot/four/destinations/confirm",
+        ),
+        ("another host", "https://endpoints.example.test/iot/five"),
+    ];
+
+    // (case, the URL the row created a destination for, the ARN the create minted)
+    let mut recorded: Vec<(&str, &str, String)> = Vec::new();
+    for (case, url) in rows {
+        let created = emulator.create_http_destination(url).await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: CreateTopicRuleDestination answered {} {:?}",
+            created.status, created.body
+        );
+        let destination = created
+            .destination()
+            .cloned()
+            .unwrap_or_else(|| panic!("case {case:?}: the create reported no destination"));
+
+        let arn = created.arn();
+        let prefix = http_destination_arn_prefix();
+        assert!(
+            arn.starts_with(&prefix) && arn.len() > prefix.len(),
+            "case {case:?}: expected an ARN under {prefix:?} carrying an identifier, got \
+             {arn:?}"
+        );
+        assert_eq!(
+            destination["httpUrlProperties"]["confirmationUrl"],
+            json!(url),
+            "case {case:?}: expected the created destination to report the URL the request \
+             named, got {:?}",
+            destination
+        );
+        assert_eq!(
+            (
+                destination["status"].clone(),
+                destination["statusReason"].clone()
+            ),
+            (json!(IN_PROGRESS), json!(AWAITING_CONFIRMATION)),
+            "case {case:?}: expected a created destination to be {IN_PROGRESS} and to say \
+             why, got {destination:?}"
+        );
+        assert!(
+            destination.get("vpcProperties").is_none()
+                && destination.get("influxDBProperties").is_none(),
+            "case {case:?}: an HTTP destination must report no other kind's properties, got \
+             {destination:?}"
+        );
+
+        // `TopicRuleDestination$createdAt` and `$lastUpdatedAt` are timestamps of the
+        // instant the record was written, so both are reported and a record nothing has
+        // updated since reports one instant for the two.
+        let created_at = destination["createdAt"].as_f64();
+        let last_updated_at = destination["lastUpdatedAt"].as_f64();
+        assert!(
+            created_at.is_some_and(|instant| instant > 0.0),
+            "case {case:?}: expected the create to report when the destination was created, \
+             got {:?}",
+            destination["createdAt"]
+        );
+        assert_eq!(
+            created_at, last_updated_at,
+            "case {case:?}: expected a destination nothing has updated to report its \
+             creation instant as its last update, got {destination:?}"
+        );
+
+        let read = emulator.get_destination(&arn).await;
+        assert_eq!(
+            read.status, 200,
+            "case {case:?}: GetTopicRuleDestination answered {} {:?}",
+            read.status, read.body
+        );
+        assert_eq!(
+            read.destination(),
+            Some(&destination),
+            "case {case:?}: expected the reader to report the created destination member for \
+             member, got {:?}",
+            read.body
+        );
+
+        recorded.push((case, url, arn));
+    }
+
+    for (case, url, arn) in &recorded {
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|(_, _, other)| other == arn)
+                .count(),
+            1,
+            "case {case:?}: expected every destination to be minted under an ARN of its own, \
+             got {arn:?} more than once"
+        );
+        let read = emulator.get_destination(arn).await;
+        assert_eq!(
+            read.destination()
+                .map(|destination| destination["httpUrlProperties"]["confirmationUrl"].clone()),
+            Some(json!(url)),
+            "case {case:?}: expected {arn} to still report the URL it was created for, got \
+             {:?}",
+            read.body
+        );
+    }
+}
+
+/// A destination's identity is the endpoint it confirms, so a second create for a
+/// `confirmationUrl` this account already holds a destination for is refused — and the
+/// refusal names the record that exists, mints nothing and changes nothing.
+///
+/// The rows differ along the form of the URL the collision is on, and each row's second
+/// create is made after the next row's destination exists too, so the refusal is about the
+/// URL and not about the store holding exactly one record.
+#[tokio::test]
+async fn a_second_create_for_a_held_confirmation_url_is_refused_and_changes_nothing() {
+    let emulator = Emulator::new();
+    let rows = [
+        ("a path-only URL", "https://example.test/iot/alpha"),
+        (
+            "a URL with a query string",
+            "https://example.test/iot/beta?tenant=3",
+        ),
+        ("a URL naming a port", "https://example.test:9443/iot/gamma"),
+        ("another host", "https://other.example.test/iot/delta"),
+    ];
+
+    // (case, the URL, the ARN the first create minted, the record it left)
+    let mut held: Vec<(&str, &str, String, Value)> = Vec::new();
+    for (case, url) in rows {
+        let created = emulator.create_http_destination(url).await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: CreateTopicRuleDestination answered {} {:?}",
+            created.status, created.body
+        );
+        let arn = created.arn();
+        let record = created
+            .destination()
+            .cloned()
+            .unwrap_or_else(|| panic!("case {case:?}: the create reported no destination"));
+        held.push((case, url, arn, record));
+    }
+
+    for (case, url, arn, record) in &held {
+        let duplicate = emulator.create_http_destination(url).await;
+        assert_eq!(
+            (duplicate.status, duplicate.error_code.as_deref()),
+            (409, Some("ResourceAlreadyExistsException")),
+            "case {case:?}: expected a second create for a held confirmation URL to be \
+             refused 409 ResourceAlreadyExistsException, got {} {:?}",
+            duplicate.status,
+            duplicate.body
+        );
+        assert!(
+            duplicate.message().contains(url) && duplicate.message().contains("already exists"),
+            "case {case:?}: expected the refusal to say the destination for {url} already \
+             exists, got {:?}",
+            duplicate.message()
+        );
+        assert_eq!(
+            (
+                duplicate.body["resourceId"].clone(),
+                duplicate.body["resourceArn"].clone()
+            ),
+            (json!(arn), json!(arn)),
+            "case {case:?}: expected the refusal to name the destination that already \
+             exists, got {:?}",
+            duplicate.body
+        );
+        assert!(
+            duplicate.destination().is_none(),
+            "case {case:?}: a refused create must report no destination, got {:?}",
+            duplicate.body
+        );
+
+        // The record the collision was on is exactly as the first create left it: nothing
+        // was re-stamped, re-challenged or minted beside it.
+        let read = emulator.get_destination(arn).await;
+        assert_eq!(
+            read.destination(),
+            Some(record),
+            "case {case:?}: expected a refused create to leave the held record as it stands, \
+             got {:?}",
+            read.body
+        );
+    }
+
+    // Every URL the account holds a destination for still holds exactly the one it was
+    // created with, so no refusal above moved a record onto another row's ARN.
+    for (case, url, arn, _) in &held {
+        let read = emulator.get_destination(arn).await;
+        assert_eq!(
+            read.destination()
+                .map(|destination| destination["httpUrlProperties"]["confirmationUrl"].clone()),
+            Some(json!(url)),
+            "case {case:?}: expected {arn} to still report the URL it was created for, got \
+             {:?}",
+            read.body
+        );
+    }
 }
