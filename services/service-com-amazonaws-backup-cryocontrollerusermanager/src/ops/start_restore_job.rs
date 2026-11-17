@@ -218,8 +218,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The authorization decision on the recovery point this restore reads,
         // taken BEFORE it is resolved: an ARN of another account is refused for
         // lack of privileges rather than reported as a value that names no
-        // stored point (`crate::state::authorized_recovery_point`).
-        crate::state::authorized_recovery_point(&input.recovery_point_arn)?;
+        // stored point, and the refusal names the principal that signed, the
+        // action `backup:StartRestoreJob` and the ARN the request carried
+        // (`crate::state::authorized_recovery_point`).
+        crate::state::authorized_recovery_point(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.recovery_point_arn,
+        )?;
         // And the CALLER's own policies on that same point, read at the IAM layer
         // ahead of the request's own input, so a caller they do not allow starts
         // no restore at all (`crate::state::caller_authorization`).

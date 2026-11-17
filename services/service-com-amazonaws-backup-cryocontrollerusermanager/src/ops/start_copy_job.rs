@@ -204,7 +204,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // addresses — the same resource the cross-account decision below is taken
         // on (`crate::state::caller_authorization`).
         crate::state::authorized_call(&*self.engine, ctx, Self::NAME, &input.recovery_point_arn)?;
-        let output = self.started_copy_job(input, &region)?;
+        let output = self.started_copy_job(input, &region, ctx)?;
         crate::state::publish_job_state_changes(ctx, &*self.engine).await;
         // The transition this copy job is owed falls due on the clock, not on the
         // next call: the pump publishes it when it does, so a client watching the
@@ -222,11 +222,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartCopyJob<Eng>
     /// Separate from `handle` so this store's lock lives for exactly this call: the
     /// publication `handle` makes afterwards awaits, and a guard must not be held
     /// across an await. `region` is the Region of the call, which is the region the
-    /// SOURCE vault — named by name alone — is resolved in.
+    /// SOURCE vault — named by name alone — is resolved in; `ctx` is this request's,
+    /// for the principal an authorization refusal below names.
     fn started_copy_job(
         &self,
         input: StartCopyJobInput,
         region: &str,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<StartCopyJobOutput, StartCopyJobError> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             StartCopyJobErrorModeled::ServiceUnavailableException(ServiceUnavailableException {
@@ -285,9 +287,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartCopyJob<Eng>
         // The authorization decision on the recovery point this copy reads,
         // taken BEFORE the store is reached: an ARN of another account is
         // refused for lack of privileges rather than reported absent, so a copy
-        // the service refused never reads as a source that is not there
+        // the service refused never reads as a source that is not there, and the
+        // refusal names the principal that signed, the action
+        // `backup:StartCopyJob` and the ARN the request carried
         // (`crate::state::authorized_recovery_point`).
-        crate::state::authorized_recovery_point(&input.recovery_point_arn)?;
+        crate::state::authorized_recovery_point(
+            &*self.engine,
+            ctx,
+            <Self as smithy_server_runtime::Operation>::NAME,
+            &input.recovery_point_arn,
+        )?;
 
         let mut store = state.lock();
         // The one store whose KEYS a caller chooses: forget expired records and

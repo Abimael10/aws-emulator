@@ -156,6 +156,20 @@ fn not_authorized(
     }
 }
 
+/// The ARN of the principal THIS request speaks for, as `sts:GetCallerIdentity` reports it
+/// for the credentials it signed with.
+///
+/// It is what an authorization refusal blames, so it is read here — beside the gate that
+/// already resolves it ([`caller`]) — rather than resolved a second way by the other
+/// decisions this service refuses a call with ([`super::authorized_recovery_point`]): two
+/// refusals of one request must not name two principals.
+pub fn caller_principal_arn<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+) -> String {
+    caller(engine, ctx).arn
+}
+
 /// The principal a request speaks for, and everything the decision is made from.
 #[derive(Debug, Clone)]
 struct Caller {

@@ -74,7 +74,9 @@
 //! [`authorized_recovery_point`] is the same shape of decision for a call AWS
 //! Backup authorizes against the RECOVERY POINT the request names by ARN — the
 //! delete, the read and the two jobs that take one as input: an ARN of another
-//! account is refused for lack of privileges before the point is resolved.
+//! account is refused for lack of privileges before the point is resolved, with
+//! the sentence IAM states when nothing the named resource carries grants the
+//! calling principal the action it asked for.
 
 pub mod schedule;
 

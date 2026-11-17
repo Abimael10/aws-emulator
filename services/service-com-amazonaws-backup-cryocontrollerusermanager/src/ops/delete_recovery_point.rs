@@ -197,8 +197,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // taken BEFORE the point is resolved: an ARN of another account is
         // refused for lack of privileges rather than reported absent, so a
         // delete the service refused never reads as a point that is already
-        // gone (`crate::state::authorized_recovery_point`).
-        crate::state::authorized_recovery_point(&input.recovery_point_arn)?;
+        // gone. The refusal names the principal that signed, the action
+        // `backup:DeleteRecoveryPoint` and the ARN the request carried
+        // (`crate::state::authorized_recovery_point`).
+        crate::state::authorized_recovery_point(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.recovery_point_arn,
+        )?;
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteRecoveryPointErrorModeled::ServiceUnavailableException(

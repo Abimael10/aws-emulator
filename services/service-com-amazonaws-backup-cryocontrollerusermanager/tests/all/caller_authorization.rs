@@ -41,10 +41,10 @@ use crate::vault_and_backup_job::{error_code, string_at, ACCOUNT, REGION};
 
 /// The access key id of the account's own published credential: a key neither STS nor IAM
 /// holds a record for, which is the position AWS account root credentials are in.
-const ACCOUNT_KEY_ID: &str = "AKIDTESTONLY";
+pub(crate) const ACCOUNT_KEY_ID: &str = "AKIDTESTONLY";
 
 /// The access key id of the assumed-role session the cases sign with.
-const SESSION_KEY_ID: &str = "ASIAEXAMPLESESSION01";
+pub(crate) const SESSION_KEY_ID: &str = "ASIAEXAMPLESESSION01";
 
 /// The role that session is assumed from, and the session's own name.
 const ROLE: &str = "backup-operator";
@@ -66,7 +66,7 @@ const DENIED_CODE: &str = "AccessDeniedException";
 
 /// Backup, IAM and STS on ONE shared engine, with the engine kept so a case can seed the
 /// role, its policy and the session those services hold.
-fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -90,7 +90,7 @@ fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 
 /// One Backup request signed with `access_key_id` — what names the principal the request
 /// speaks for.
-async fn call_as(
+pub(crate) async fn call_as(
     router: &MultiServiceRouter,
     access_key_id: &str,
     method: &str,
@@ -127,7 +127,7 @@ async fn call_as(
 }
 
 /// The principal ARN the seeded session speaks for — what a refusal must name.
-fn session_arn() -> String {
+pub(crate) fn session_arn() -> String {
     format!("arn:aws:sts::{ACCOUNT}:assumed-role/{ROLE}/{SESSION}")
 }
 
@@ -155,7 +155,7 @@ fn job_role_arn() -> String {
 
 /// Record the role and the assumed-role session [`SESSION_KEY_ID`] speaks for, as
 /// `iam:CreateRole` and `sts:AssumeRole` record them.
-fn given_session(engine: &Arc<engine::InMemoryEngine>) {
+pub(crate) fn given_session(engine: &Arc<engine::InMemoryEngine>) {
     let now = SystemTime::now();
     let role_arn = role_arn();
     let iam_store = iam::service_state(&**engine).expect("the IAM store");
