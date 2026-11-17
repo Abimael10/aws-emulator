@@ -310,8 +310,9 @@ pub async fn performed_integration(
 /// `passthroughBehavior` says.
 ///
 /// Every other type names a backend whose answer is not this api's records to produce: an
-/// `HTTP_PROXY` naming an endpoint of this emulator is served by passing the request on
-/// ([`passed_through`], which [`serve_resolved`] reaches before this), an `AWS` integration
+/// `HTTP` or `HTTP_PROXY` naming an endpoint of this emulator is served by carrying its
+/// integration request to it ([`onward_request`], which [`serve_resolved`] reaches before
+/// this), an `AWS` integration
 /// naming an action this emulator serves is served by MAKING that call
 /// ([`aws_integration`]), an `AWS_PROXY` is served by INVOKING the function its `uri` names
 /// ([`lambda_proxy`]) — both of which [`performed_integration`] reaches before this — and

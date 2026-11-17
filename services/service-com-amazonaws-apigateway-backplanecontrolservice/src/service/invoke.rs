@@ -135,30 +135,41 @@
 //! template rendered against the call, so that is the payload its response template reads
 //! `$input` off.
 //!
-//! An `HTTP_PROXY` integration — the type `IntegrationType` gives "for integrating with the
-//! HTTP proxy integration" — is PASSED THROUGH rather than mapped: its answer is the
-//! endpoint's own. Where its `uri` names an endpoint THIS EMULATOR serves, which is every
-//! `execute-api` invoke endpoint of this account, that pass-through is performed IN PROCESS
-//! ([`passed_through`]): the caller's own request is re-addressed at the endpoint the `uri`
-//! names, carrying the headers `requestParameters` maps onto it, and handed back to
-//! [`serve_resolved`] to be served by that endpoint's own records — including its api's
-//! resource policy, which is how a REGIONAL api fronting a PRIVATE one through a VPC link is
-//! gated on the interface endpoint the request ARRIVES through: the endpoint the link's own
-//! targets are the network interfaces of ([`private_delivery`]), since for a private
-//! integration "the URI is not used for routing" (`Integration$uri`). No socket is opened
+//! The two types that name an HTTP ENDPOINT — `HTTP_PROXY`, "for integrating with the HTTP
+//! proxy integration", and `HTTP`, "for integrating an API method with an HTTP backend"
+//! (`IntegrationType`) — are both performed by carrying the INTEGRATION REQUEST to the
+//! endpoint the `uri` names IN PROCESS ([`onward_request`]), and they differ in the mapping.
+//! A PROXY integration maps nothing: the caller's own request is re-addressed at that
+//! endpoint, carrying what it sent plus the headers `requestParameters` map onto it, and the
+//! endpoint's own answer IS the method response. A STANDARD integration maps both halves from
+//! the api's own records: the integration request carries the body its `requestTemplates`
+//! render and nothing of the caller's its `requestParameters` do not map, and the status the
+//! backend answered selects the integration response that maps the answer
+//! ([`integration_response`]) — so a response header the method response does not declare, or
+//! that no `responseParameters` entry maps, does not reach the caller, while through a proxy
+//! integration it does.
+//!
+//! Where the `uri` names an endpoint THIS EMULATOR serves, which is every `execute-api`
+//! invoke endpoint of this account, the request is handed back to [`serve_resolved`] to be
+//! served by that endpoint's own records — including its api's resource policy, which is how
+//! a REGIONAL api fronting a PRIVATE one through a VPC link is gated on the interface
+//! endpoint the request ARRIVES through: the endpoint the link's own targets are the network
+//! interfaces of ([`private_delivery`]), since for a private integration "the URI is not used
+//! for routing" (`Integration$uri`). Every other endpoint this emulator publishes is reached
+//! over the in-process transport instead ([`onward_endpoint`]). No socket is opened
 //! and no name is
 //! resolved: an address outside this emulator's own endpoints is never dialled, it is
 //! refused, and nothing is invented either — the response is the one this data plane
-//! computes for the request it passed on, whatever that is. What the onward request does NOT
-//! carry is the caller's own SigV4 credential, in either the header or the presigned-query
+//! computes for the request it carried, whatever that is. What the integration request does
+//! NOT carry is the caller's own SigV4 credential, in either the header or the presigned-query
 //! form ([`HEADERS_NOT_PASSED_THROUGH`]): a signature over the address the caller used
-//! authenticates nothing at the address the request is passed on to. A private integration
+//! authenticates nothing at the address the request is carried to. A private integration
 //! is carried only over a VPC link this account holds that has finished provisioning
 //! ([`unusable_vpc_link`]), the chain of hops is bounded ([`MAX_PASSED_THROUGH_HOPS`]), and a
 //! `requestParameters` entry outside the mapping forms below is an integration this call
 //! cannot perform rather than a mapping silently dropped.
 //!
-//! Every other integration type names a backend outside this api's own records:
+//! The other integration types name a backend outside this api's own records:
 //!
 //! * an `AWS` integration names ANOTHER SERVICE'S ACTION, and where that action is one this
 //!   emulator serves it is PERFORMED by making the call, in process, over the transport the
@@ -173,12 +184,9 @@
 //!   nothing, because "the client request [is] passed through as-is" (`IntegrationType`).
 //!   The grant that admits the invocation is the function's own resource policy, read from
 //!   Lambda itself ([`lambda_proxy`]);
-//! * `HTTP`, and an `HTTP_PROXY` whose `uri` names an endpoint outside this emulator,
-//!   address an endpoint over the network, and this emulator makes no outbound connection.
-//!   The standard `HTTP` integration is not served even against an endpoint of this
-//!   emulator, because its response is chosen by matching the BACKEND's response against
-//!   each integration response's `selectionPattern` and then rendered through that
-//!   response's templates — a mapping half a proxy integration has none of.
+//! * an `HTTP` or `HTTP_PROXY` integration whose `uri` names an endpoint OUTSIDE this
+//!   emulator addresses it over the network, and this emulator makes no outbound connection,
+//!   so no backend answer exists for it at all.
 //!
 //! None of those is faked: a body, a status or a header invented for a backend that never
 //! ran would be indistinguishable from a real one. They are answered as API Gateway
@@ -294,8 +302,8 @@ use aws_smithy_types::body::SdkBody;
 use smithy_server_runtime::{http, BoxFuture, OperationContext};
 
 use crate::ops::put_integration::{
-    DEFAULT_CONNECTION_TYPE, HTTP_PROXY_INTEGRATION_TYPE, MOCK_INTEGRATION_TYPE,
-    VPC_LINK_CONNECTION_TYPE,
+    DEFAULT_CONNECTION_TYPE, HTTP_INTEGRATION_TYPE, HTTP_PROXY_INTEGRATION_TYPE,
+    MOCK_INTEGRATION_TYPE, VPC_LINK_CONNECTION_TYPE,
 };
 use crate::ops::put_integration_response::static_mapping_literal;
 use crate::ops::put_method::wire_verb;
@@ -2175,17 +2183,19 @@ async fn serving<Eng: Send + Sync + 'static>(
         }
     }
 
-    // An integration that PASSES THE REQUEST THROUGH to an endpoint this emulator serves is
-    // performed by serving the request it passes on, so the answer is that endpoint's own.
-    // It is reached before the api's own records are asked to produce a response, because
-    // for such an integration they produce none.
-    let passed_on = integration
+    // An integration that names an HTTP ENDPOINT this emulator serves is performed by
+    // carrying its integration request to that endpoint, so the answer is that endpoint's
+    // own. It is reached before the api's own records are asked to produce a response,
+    // because for such an integration they produce none.
+    let record = integration
         .method
         .as_ref()
-        .and_then(|method| method.integration.as_ref())
-        .and_then(|record| {
-            passed_through(record, req, hop, &integration.call.inputs.path, &integration.api_id)
-        });
+        .and_then(|method| method.integration.as_ref());
+    // WHICH of the two types that name an HTTP endpoint this is, which decides both what the
+    // integration request carries and what becomes of the answer ([`http_integration`]).
+    let endpoint_type = record.and_then(http_endpoint);
+    let passed_on = record
+        .and_then(|record| onward_request(record, req, hop, &integration.call, &integration.api_id));
     // The INTEGRATION response this call was answered from, which is what the stage's cache
     // holds: filled by the integration below, and left for the passed-on half to read off
     // the response the endpoint it reached answered ([`integration_response::served_answer`]).
@@ -2200,7 +2210,7 @@ async fn serving<Eng: Send + Sync + 'static>(
                 recorded,
             );
         }
-        match passed_on {
+        let reached = match passed_on {
             PassedThrough::Unserved(unserved) => return refuse(unserved, recorded),
             PassedThrough::Request(onward) => {
                 // The onward request is a request of its own at another endpoint, so it is
@@ -2238,12 +2248,59 @@ async fn serving<Eng: Send + Sync + 'static>(
                 .await
             }
             // Another endpoint of this emulator: the request crosses the in-process
-            // transport, and what the service claiming that endpoint answered IS the
-            // method response.
-            PassedThrough::Onward(onward) => match onward_endpoint::answered(ctx, *onward).await {
-                Ok(answered) => answered,
-                Err(unserved) => return refuse(unserved, recorded),
-            },
+            // transport, and what the service claiming that endpoint answered is the
+            // method response for a PROXY integration and the answer to map for a standard
+            // one, which is why the proxy's is read with the api's own reserved response
+            // header remapped onto it and the standard one's is read whole.
+            PassedThrough::Onward(onward) => {
+                let reached = match endpoint_type {
+                    Some(HttpEndpoint::Mapped) => {
+                        onward_endpoint::backend_answered(ctx, *onward).await
+                    }
+                    _ => onward_endpoint::answered(ctx, *onward).await,
+                };
+                match reached {
+                    Ok(answered) => answered,
+                    Err(unserved) => return refuse(unserved, recorded),
+                }
+            }
+        };
+        match endpoint_type {
+            // A STANDARD `HTTP` integration: the endpoint answered the integration request,
+            // and that answer is the BACKEND's, which the integration's own responses map to
+            // the method response — the integration response its `selectionPattern` selects
+            // for the status, its `responseTemplates` for the body and the headers the method
+            // response declares for its `responseParameters`. So a header the backend sent
+            // that nothing maps does not reach the caller.
+            Some(HttpEndpoint::Mapped) => {
+                let Some(answer) = integration_response::backend_answer(&reached) else {
+                    return refuse(
+                        UnservedIntegration {
+                            refusal: API_CONFIGURATION_ERROR,
+                            reason: "the endpoint the integration's uri names answered a body \
+                                     this api cannot read, so there is no backend answer to \
+                                     map"
+                                .to_string(),
+                        },
+                        recorded,
+                    );
+                };
+                let mapped = match integration_response::mapped(
+                    integration.method.as_ref(),
+                    &integration.call,
+                    &answer,
+                ) {
+                    Ok(mapped) => served_response(mapped),
+                    Err(unserved) => return refuse(unserved, recorded),
+                };
+                // What the integration answered is what the stage's cache holds, so the
+                // mapping is applied afresh to every later request that entry answers.
+                answered = Some(answer);
+                mapped
+            }
+            // A PROXY integration, and every endpoint a request was passed on to: the
+            // response IS the method response, mapped by nothing.
+            _ => reached,
         }
     } else {
         match performed_integration(
@@ -3326,7 +3383,7 @@ pub fn carries_stage_variable_reference(value: &str) -> bool {
 /// Text that opens a reference and never closes it is not one: it stands as the
 /// configuration carries it, and whatever reads the value decides what to make of it (a
 /// `uri` still carrying a brace is an address this emulator will not guess at —
-/// [`passed_through`]).
+/// [`onward_request`]).
 ///
 /// A substituted value is NOT rescanned: scanning continues after the reference it
 /// replaced, so a variable whose own value spells a reference cannot expand again, and the
@@ -3353,290 +3410,6 @@ fn resolved_references(
     }
     resolved.push_str(rest);
     Ok(Some(resolved))
-}
-
-/// What a PASSED-THROUGH integration makes of this request.
-#[derive(Debug)]
-enum PassedThrough {
-    /// The request to serve against the endpoint the integration's `uri` names: the
-    /// caller's own request, re-addressed at that endpoint and carrying the headers the
-    /// integration maps onto it.
-    ///
-    /// Boxed: a whole request is far larger than the refusal beside it, and this value
-    /// is returned by value from the resolution below.
-    Request(Box<RtRequest>),
-    /// The same request, addressed at an endpoint of this emulator that is NOT a stage of
-    /// this api plane (a Lambda function URL, another service's data plane): it is passed
-    /// on over the in-process transport instead, and what that endpoint answered is the
-    /// method response ([`onward_endpoint`]).
-    Onward(Box<RtRequest>),
-    /// The integration passes the request to a backend, or through a mapping, this
-    /// emulator cannot perform.
-    Unserved(UnservedIntegration),
-}
-
-/// How `integration` passes this request on, or `None` when it passes nothing on — so the
-/// call is performed from the api's own records instead ([`perform_integration`]).
-///
-/// Only an `HTTP_PROXY` passes anything on here. A `uri` naming an `execute-api` INVOKE
-/// ENDPOINT is a stage of THIS api plane, so the pass-through is a request handed back to
-/// [`serve_resolved`] in process — no connection is opened, no name is resolved and no
-/// address the caller chose is dialled. The endpoint's own records then decide the answer —
-/// which api, which stage, which method, and that api's resource policy — exactly as they
-/// would for a client that addressed the endpoint directly, so a proxy integration's answer
-/// is never assembled here.
-///
-/// A `uri` naming ANY OTHER endpoint is passed on just the same, over the in-process
-/// transport, because this emulator publishes data planes other than this one — a Lambda
-/// function URL is an HTTP endpoint a proxy integration names — and the answer is whichever
-/// service CLAIMS that endpoint ([`onward_endpoint`]), or the refusal of an integration this
-/// stage cannot perform when nothing claims it at all. The two differ only in how the
-/// request is carried: one re-enters this plane's own serving, the other crosses the
-/// transport, and neither invents a backend answer.
-///
-/// The endpoint the request is passed on to, and what the api names ITSELF to that endpoint,
-/// are the integration's own: the `uri`'s authority is the `Host` the onward request carries
-/// and the api's id travels in [`INTEGRATION_API_ID_HEADER`], both of which replace whatever
-/// the caller sent under those names.
-///
-/// An `HTTP` integration's response is chosen by a mapping this emulator does not evaluate,
-/// so it is left to [`perform_integration`]'s refusal. The integration's own
-/// `requestParameters` are applied on the way: each entry maps "a method request parameter
-/// value or static value" onto a header, a path parameter or a query-string parameter of the
-/// integration request, the three locations that member names, and the `uri`'s own `{name}`
-/// placeholders are addressed from the path ones ([`expanded_uri`]). An entry whose KEY names
-/// none of those three locations, one whose VALUE is in neither documented form, and a `uri`
-/// placeholder no mapping names are each stated as an integration this call cannot perform
-/// rather than silently dropped. A mapping whose SOURCE the request simply does not carry is
-/// a different thing from one written in a form that is not read: the parameter is left off,
-/// and the request is still passed on ([`MappedParameter`]).
-///
-/// `hop` is how many integrations of this emulator's own endpoints this request has already
-/// been passed through, and it is checked HERE, before any onward request is built: an
-/// integration whose `uri` names the very endpoint it is reached at — or two that name each
-/// other — would otherwise re-enter the serving path for ever, so the chain is refused once
-/// it reaches [`MAX_PASSED_THROUGH_HOPS`]. The bound sits at the construction site because
-/// that is where the loop would be made: nothing can pass a request on without passing it.
-fn passed_through(
-    integration: &GetIntegrationOutput,
-    req: &RtRequest,
-    hop: u8,
-    path_parameters: &BTreeMap<String, String>,
-    api_id: &str,
-) -> Option<PassedThrough> {
-    if integration.r#type.as_deref() != Some(HTTP_PROXY_INTEGRATION_TYPE) {
-        return None;
-    }
-    if hop >= MAX_PASSED_THROUGH_HOPS {
-        return Some(PassedThrough::Unserved(UnservedIntegration {
-            refusal: API_CONFIGURATION_ERROR,
-            reason: format!(
-                "the request has been passed through {MAX_PASSED_THROUGH_HOPS} integrations \
-                 of this emulator's own endpoints and this one passes it on again, so it is \
-                 not followed further"
-            ),
-        }));
-    }
-    let uri = integration.uri.as_deref().unwrap_or_default();
-    // A `uri` with no authority at all addresses nothing, so nothing is passed on for it.
-    // Asked here, before any mapping is read: an integration naming no endpoint is one this
-    // plane passes no request through, whatever its parameters map.
-    authority_of(uri)?;
-
-    // What `requestParameters` maps onto the integration request, read BEFORE anything is
-    // built from it: the PATH parameters decide the address itself, so the mappings are
-    // resolved first and the request is addressed from them.
-    let mut mapped = MappedRequest::default();
-    for (key, value) in integration.request_parameters.iter().flatten() {
-        let Some((location, name)) = integration_request_parameter(key) else {
-            return Some(PassedThrough::Unserved(UnservedIntegration {
-                refusal: API_CONFIGURATION_ERROR,
-                reason: format!(
-                    "the integration maps {key}, which is not a parameter of the integration \
-                     request's header, path or query string, so the mapping is not applied \
-                     and the request is not sent"
-                ),
-            }));
-        };
-        let value = match mapped_request_parameter(value, req, path_parameters) {
-            MappedParameter::Value(mapped) => mapped,
-            // The source names a location this emulator reads and the request carries
-            // nothing there, so the mapping maps nothing: the backend is called without
-            // that parameter, which is what it would be called with on AWS.
-            MappedParameter::SourceAbsent => continue,
-            MappedParameter::NotRead => {
-                return Some(PassedThrough::Unserved(UnservedIntegration {
-                    refusal: API_CONFIGURATION_ERROR,
-                    reason: format!(
-                        "the integration maps {key} from {value}, which is neither a static \
-                         value in single quotes nor a method request parameter this emulator \
-                         reads"
-                    ),
-                }));
-            }
-        };
-        match location {
-            ParameterIn::Header => mapped.headers.push((name.to_string(), value)),
-            ParameterIn::Path => {
-                mapped.path.insert(name.to_string(), value);
-            }
-            ParameterIn::Query => mapped.querystring.push((name.to_string(), value)),
-        }
-    }
-
-    // The address the backend is called at: the `uri`, with each `{name}` placeholder
-    // replaced by the path parameter the integration maps onto that name, and then the
-    // query string the call carries onward. A placeholder still left after that names a
-    // path parameter the integration maps nothing onto, so the address is unknown.
-    let addressed = expanded_uri(uri, &mapped.path);
-    if addressed.contains('{') {
-        return Some(PassedThrough::Unserved(UnservedIntegration {
-            refusal: API_CONFIGURATION_ERROR,
-            reason: "the integration's uri carries a placeholder its requestParameters map \
-                     no path parameter onto: no request is passed on to a guessed-at address"
-                .to_string(),
-        }));
-    }
-    // The endpoint the request is passed on to, read off the ADDRESS it is passed on at and
-    // not off the stored spelling: a `{name}` placeholder is filled from a value the CALLER
-    // controls ([`mapped_request_parameter`]), so the two can name different endpoints, and
-    // what decides this is the address the request is actually made at.
-    //
-    // An endpoint that is a stage of THIS plane is served by re-entering it, and any other is
-    // reached over the in-process transport. A stage of this plane is named in EITHER of the
-    // two addressings this plane publishes for one: the `execute-api` endpoint host AWS gives
-    // it, and the prefixed path-style address this emulator announces it at
-    // ([`announced_address`], `/_aws/execute-api/{api-id}/{stage}/…`) — which is the invoke
-    // URL a client of an emulator holds, and so the one an integration naming a stage of this
-    // plane carries. Both re-enter this plane's own serving rather than crossing the transport
-    // to come back in through the claim: re-entry is what carries `hop`, the count this
-    // function is bounded by, and what lets what THIS plane did with the request — the
-    // endpoint it delivered it through — travel with it as an argument rather than on the
-    // wire. So the question is put below, once the request is built, against the host and
-    // path it will be CLAIMED under.
-    let Some(host) = authority_of(&addressed) else {
-        return Some(PassedThrough::Unserved(UnservedIntegration {
-            refusal: API_CONFIGURATION_ERROR,
-            reason: "the integration's uri names no endpoint once its path parameters are \
-                     applied, so there is no address to pass the request on to"
-                .to_string(),
-        }));
-    };
-    let mut passed = RtRequest::new(SdkBody::from(request_payload(req)));
-    if passed
-        .set_uri(onward_uri(&addressed, req.uri(), &mapped.querystring).as_str())
-        .is_err()
-    {
-        return Some(PassedThrough::Unserved(UnservedIntegration {
-            refusal: API_CONFIGURATION_ERROR,
-            reason: "the integration's uri is not a URI a request can be addressed at"
-                .to_string(),
-        }));
-    }
-    // "Specifies the integration's HTTP method type" (`Integration$httpMethod`): the verb
-    // the backend is called with, which is the caller's own where the integration names
-    // none — and where it names the `ANY` catch-all, which is a verb no backend is called
-    // with but the stand-in for every one of them, exactly as it is on a method.
-    let verb = integration
-        .http_method
-        .as_deref()
-        .filter(|declared| !declared.eq_ignore_ascii_case(ANY_METHOD))
-        .unwrap_or_else(|| req.method());
-    if passed.set_method(verb).is_err() {
-        return Some(PassedThrough::Unserved(UnservedIntegration {
-            refusal: API_CONFIGURATION_ERROR,
-            reason: "the integration's httpMethod is not an HTTP method a request can be \
-                     made with"
-                .to_string(),
-        }));
-    }
-    for (name, value) in req.headers().iter() {
-        if HEADERS_NOT_PASSED_THROUGH.contains(&name.to_ascii_lowercase().as_str()) {
-            continue;
-        }
-        // `append`, not `insert`: `iter` yields one entry per value, so a repeated header
-        // reaches the backend with every value it arrived with. Through the FALLIBLE form:
-        // these are bytes the caller chose, and one the HTTP layer cannot represent must
-        // leave the header off rather than abort the request.
-        if let Err(refused) = passed
-            .headers_mut()
-            .try_append(name.to_string(), value.to_string())
-        {
-            tracing::warn!(
-                header = %name,
-                error = %refused,
-                "the caller's header cannot be carried onward and is left off the request \
-                 the integration passes on"
-            );
-        }
-    }
-    // The endpoint the request is passed on to is the one the `uri` names, so that is the
-    // host the onward request is ADDRESSED to — the header a client sets from the URL it
-    // dials, and what the service claiming that endpoint reads the address off. Set before
-    // the integration's own mapped headers, so a mapping onto `host` still has the last
-    // word.
-    if let Err(refused) = passed.headers_mut().try_insert("host", host.to_string()) {
-        tracing::warn!(
-            host = %host,
-            error = %refused,
-            "the endpoint the integration's uri names is not a host a request can carry"
-        );
-    }
-    // The api the request came through, which API Gateway names to the endpoint it passes
-    // the request on to ([`INTEGRATION_API_ID_HEADER`]). It is the api's own record rather
-    // than anything the caller sent, so it REPLACES a header of that name the caller
-    // carried.
-    if let Err(refused) = passed
-        .headers_mut()
-        .try_insert(INTEGRATION_API_ID_HEADER, api_id.to_string())
-    {
-        tracing::warn!(
-            api_id = %api_id,
-            error = %refused,
-            "the api id is not a value a header can carry, so the integration request does \
-             not name the api"
-        );
-    }
-    for (name, value) in mapped.headers {
-        // A mapped header REPLACES what the caller sent under that name, which is what a
-        // mapping onto it declares; a value the wire cannot carry is stated rather than
-        // dropped, because the backend would then be called without it.
-        if passed
-            .headers_mut()
-            .try_insert(name.clone(), value)
-            .is_err()
-        {
-            return Some(PassedThrough::Unserved(UnservedIntegration {
-                refusal: API_CONFIGURATION_ERROR,
-                reason: format!(
-                    "the value the integration maps onto \
-                     {INTEGRATION_REQUEST_HEADER_PREFIX}{name} is not one a header can carry"
-                ),
-            }));
-        }
-    }
-    // WHICH of the two the request is passed on as, decided on the request as it will
-    // actually be CLAIMED — after the integration's own mapped headers, which have the last
-    // word over the `host` set above. A service reads an onward request's endpoint off that
-    // header, so a request whose final host or path names a stage of THIS plane re-enters
-    // this plane's own serving, where `hop` travels with it; deciding it on the address
-    // before the mappings were applied would let a mapping onto `host` send the request out
-    // over the transport and back in through the claim with the count reset, which is a
-    // chain nothing then bounds.
-    let within_this_plane = {
-        let claimed_host = passed.headers().get("host").unwrap_or(host);
-        endpoint_labels(claimed_host).is_some()
-            || split_execute_api_prefix(path_of(passed.uri())).is_some()
-    };
-    Some(if within_this_plane {
-        PassedThrough::Request(Box::new(passed))
-    } else {
-        // Passed on over the IN-PROCESS transport, which dispatches it back into this same
-        // emulator ([`onward_endpoint`]): no socket is opened, no name is resolved and no
-        // address this configuration named is dialled, so the endpoint the `uri` names is
-        // reached only if a service of this emulator CLAIMS it.
-        PassedThrough::Onward(Box::new(passed))
-    })
 }
 
 /// The response headers the call answers with: API Gateway returns only the headers the
@@ -4931,5 +4704,10 @@ pub use browser_invoke::*;
 /// own with the tests of that key's own property.
 mod authorizer_cache;
 mod integration_mapping;
+/// The two integration types that name an HTTP ENDPOINT and the integration request each
+/// makes of a method request, in a file of its own; its names are reached unqualified by the
+/// resolution above, as every other part of this module's own work is.
+mod http_integration;
+use http_integration::*;
 pub use integration_mapping::*;
 use authorizer_cache::authorizer_cache_key;

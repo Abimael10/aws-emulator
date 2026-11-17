@@ -219,3 +219,21 @@ pub(super) fn served_answer(served: &RtResponse) -> Option<IntegrationAnswer> {
         headers,
     })
 }
+
+/// The response a BACKEND answered an integration request, as an integration response the
+/// integration's OWN RESPONSES map — or `None` for a response whose body is not readable as
+/// bytes, which is no answer to map.
+///
+/// The one thing it differs from [`served_answer`] in is the mapping: the status the backend
+/// answered is what `IntegrationResponse$selectionPattern` is matched against ("for all other
+/// HTTP and Amazon Web Services back ends, the HTTP status code is matched"), where a
+/// passed-on response is the method response already. Everything else about an answer is read
+/// the one way, so a backend answer and a passed-on one cannot be read two ways; the headers
+/// travel because a `responseParameters` mapping names one of them as its source, not because
+/// any of them is sent to the caller.
+pub(super) fn backend_answer(answered: &RtResponse) -> Option<IntegrationAnswer> {
+    Some(IntegrationAnswer {
+        mapping: AnswerMapping::Backend(answered.status().as_u16()),
+        ..served_answer(answered)?
+    })
+}

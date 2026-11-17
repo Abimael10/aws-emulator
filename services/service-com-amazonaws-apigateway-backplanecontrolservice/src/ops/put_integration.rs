@@ -218,6 +218,14 @@ pub const MOCK_INTEGRATION_TYPE: &str = "MOCK";
 /// HTTP backend", whose response IS mapped (by `selectionPattern`).
 pub const HTTP_PROXY_INTEGRATION_TYPE: &str = "HTTP_PROXY";
 
+/// The HTTP integration whose answer the integration's OWN RESPONSES map: `IntegrationType`
+/// gives `HTTP` as the type "for integrating an API method with an HTTP backend", and
+/// `IntegrationResponse$selectionPattern` is "the regular expression (regex) pattern used to
+/// choose an integration response based on the response from the back end" — "for all other
+/// HTTP and Amazon Web Services back ends, the HTTP status code is matched" — which is the
+/// mapping half [`HTTP_PROXY_INTEGRATION_TYPE`] has none of.
+pub const HTTP_INTEGRATION_TYPE: &str = "HTTP";
+
 /// The integration types whose `uri` is an AWS integration ARN: `uri` documents it as
 /// "of the form arn:aws:apigateway:{region}:{subdomain.service|service}:path|action/
 /// {service_api}" "for AWS or AWS_PROXY integrations".
@@ -227,7 +235,7 @@ pub const AWS_INTEGRATION_TYPES: &[&str] = &["AWS", "AWS_PROXY"];
 /// fully formed, encoded HTTP(S) URL according to the RFC-3986 specification" "for HTTP
 /// or HTTP_PROXY integrations" — for the standard integration, "where connectionType is
 /// not VPC_LINK".
-pub const HTTP_INTEGRATION_TYPES: &[&str] = &["HTTP", "HTTP_PROXY"];
+pub const HTTP_INTEGRATION_TYPES: &[&str] = &[HTTP_INTEGRATION_TYPE, HTTP_PROXY_INTEGRATION_TYPE];
 
 /// The Lambda proxy integration, which `IntegrationType` defines as "AWS_PROXY for
 /// integrating with the Lambda proxy integration".

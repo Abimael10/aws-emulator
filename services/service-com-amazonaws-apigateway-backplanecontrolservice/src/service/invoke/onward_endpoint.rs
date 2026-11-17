@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! An `HTTP_PROXY` integration whose `uri` names an endpoint THIS EMULATOR serves that is
-//! not a stage of this api plane: how the request is passed on to it, and how what it
-//! answered becomes the method response.
+//! An integration naming an HTTP endpoint THIS EMULATOR serves that is not a stage of this
+//! api plane: how the integration request is carried to it, and how what it answered becomes
+//! the backend answer.
 //!
 //! `IntegrationType` gives `HTTP_PROXY` as "for integrating the API method request with an
 //! HTTP endpoint, including a third party API, with the client request passed through
 //! as-is", so a proxy integration ANSWERS WITH THE ENDPOINT'S OWN RESPONSE: its status, its
 //! headers and its body, mapped by nothing. A Lambda function URL — "a dedicated HTTP(S)
 //! endpoint that you can use to invoke your function" — is such an endpoint, and so is every
-//! other data plane a service of this emulator publishes.
+//! other data plane a service of this emulator publishes. A STANDARD `HTTP` integration
+//! reaches the same endpoints the same way; what differs is only what is made of the answer,
+//! which its own integration responses MAP ([`super::integration_response`]) — so this module
+//! answers with what the endpoint said and nothing else either way.
 //!
 //! The request is passed on over the IN-PROCESS transport `OperationContext::callback` hands
 //! a handler, which dispatches it back into this same emulator: no socket is opened, no name
@@ -28,9 +31,12 @@
 //! — the same `API_CONFIGURATION_ERROR` every other unperformable integration earns, rather
 //! than that refusal envelope passed off as a backend answer.
 //!
-//! One thing about the endpoint's response does not travel verbatim: a header the API itself
-//! sets on every response it sends is the API's to report, so the backend's own value for it
-//! is remapped rather than dropped ([`remapped`]).
+//! One thing about the endpoint's response does not travel verbatim to a caller it is PASSED
+//! THROUGH to: a header the API itself sets on every response it sends is the API's to
+//! report, so the backend's own value for it is remapped rather than dropped ([`remapped`]).
+//! An answer a standard integration's own responses MAP is read whole instead
+//! ([`backend_answered`]): none of it is sent as it stands, and a mapping that names a header
+//! of it must find the value the backend sent under that name.
 
 use ::aws_smithy_runtime_api::client::http::HttpConnector as _;
 use ::aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
@@ -38,12 +44,33 @@ use ::smithy_server_runtime::OperationContext;
 
 use super::{UnservedIntegration, API_CONFIGURATION_ERROR};
 
+/// The response the endpoint `passed` is addressed at answered, with the one header the api
+/// itself sets on every response it sends remapped ([`remapped`]) — what a PROXY integration
+/// answers the caller with, whole, because it maps nothing in either direction.
+pub(super) async fn answered(
+    ctx: &OperationContext<'_>,
+    passed: RtRequest,
+) -> Result<RtResponse, UnservedIntegration> {
+    reached(ctx, passed).await.map(remapped)
+}
+
+/// The response that endpoint answered as the BACKEND ANSWER of a standard `HTTP`
+/// integration: whole, and with no header of it remapped.
+///
+/// Nothing of this response reaches the caller as it stands — the integration's own responses
+/// map it ([`super::integration_response`]) — so every header the backend sent is left under
+/// the name it sent it under, which is the name a `responseParameters` mapping over
+/// `integration.response.header.{name}` resolves against.
+pub(super) async fn backend_answered(
+    ctx: &OperationContext<'_>,
+    passed: RtRequest,
+) -> Result<RtResponse, UnservedIntegration> {
+    reached(ctx, passed).await
+}
+
 /// The response the endpoint `passed` is addressed at answered, or why the integration
 /// could not be performed through it at all.
-///
-/// The answer is returned WHOLE — status, headers and body as the endpoint wrote them —
-/// because a proxy integration maps nothing in either direction.
-pub(super) async fn answered(
+async fn reached(
     ctx: &OperationContext<'_>,
     passed: RtRequest,
 ) -> Result<RtResponse, UnservedIntegration> {
@@ -52,14 +79,14 @@ pub(super) async fn answered(
         Err(error) => {
             ::tracing::warn!(
                 error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
-                "the endpoint the HTTP_PROXY integration names did not answer the request \
-                 passed on to it"
+                "the endpoint the integration's uri names did not answer the integration \
+                 request carried to it"
             );
             return Err(UnservedIntegration {
                 refusal: API_CONFIGURATION_ERROR,
-                reason: "the endpoint the HTTP_PROXY integration's uri names did not answer \
-                         the request passed on to it, so there is no backend response to \
-                         pass through"
+                reason: "the endpoint the integration's uri names did not answer the \
+                         integration request carried to it, so there is no backend response \
+                         to map"
                     .to_string(),
             });
         }
@@ -73,12 +100,12 @@ pub(super) async fn answered(
     if refused {
         return Err(UnservedIntegration {
             refusal: API_CONFIGURATION_ERROR,
-            reason: "the HTTP_PROXY integration's uri names an endpoint nothing in this \
-                     emulator serves, so no backend answer exists to pass through"
+            reason: "the integration's uri names an endpoint nothing in this emulator serves, \
+                     so no backend answer exists at all"
                 .to_string(),
         });
     }
-    Ok(remapped(answer))
+    Ok(answer)
 }
 
 /// The header API Gateway reports the request IT answered in, on every response of this data
