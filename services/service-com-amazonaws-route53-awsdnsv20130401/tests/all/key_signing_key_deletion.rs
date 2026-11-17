@@ -4,7 +4,7 @@
 //! `DeactivateKeySigningKey` and `DeleteKeySigningKey` — and of the WORDING of
 //! the key-signing key refusals.
 //!
-//! Three rules are under test.
+//! Four rules are under test.
 //!
 //! The first is the delete: a key-signing key is addressed by
 //! `(HostedZoneId, Name)` against the keys the addressed zone holds, and the
@@ -32,8 +32,16 @@
 //! this service cannot sign with — rather than restating what the modelled error
 //! shape's documentation says the error CLASS means. One request is one row of
 //! that class, so the tables below span every status a key can be refused in,
-//! every way an address can resolve to no key, and every kind of customer
-//! managed key ARN the create rejects.
+//! every way a `Name` can resolve to no key of a zone the store holds, and every
+//! kind of customer managed key ARN the create rejects.
+//!
+//! The fourth is the ORDER the two halves of a key's address are resolved in: the
+//! hosted zone the path names is resolved FIRST, so a request whose
+//! `HostedZoneId` names no zone is refused for the missing ZONE — in the one
+//! sentence this service reports an unknown zone with — and the key's `Name` is
+//! never reported as the thing that is missing. Only the MESSAGE follows the
+//! zone: the error CLASS stays the 404 these operations model for a key, since
+//! neither declares a zone-level error at all.
 //!
 //! The harness, the key creation and the DNSSEC reads and writes all come from
 //! the suites that own them, so these tests drive the service through the same
@@ -50,6 +58,7 @@ use crate::key_signing_keys::{
     emulator, emulator_with_store, ksk_count, member, REPORTED_KEY,
 };
 use crate::refusal_message_rules::message_of;
+use crate::zone_refusal_messages::missing_zone_message;
 
 /// Delete one key-signing key: `DELETE /2013-04-01/keysigningkey/{HostedZoneId}/{Name}`
 /// (`smithy_query(query="operation",operation="DeleteKeySigningKey")`).
@@ -127,8 +136,9 @@ fn not_inactive_message(name: &str) -> String {
     )
 }
 
-/// The message a key-addressed operation answers an address that resolves to no
-/// key-signing key with: fixed text around the `Name` the request addressed.
+/// The message a key-addressed operation answers a `Name` that names no key of
+/// the addressed (and existing) hosted zone with: fixed text around the `Name`
+/// the request addressed.
 fn not_found_message(name: &str) -> String {
     format!("The Key Signing Key with name '{name}', could not be found.")
 }
@@ -334,40 +344,29 @@ async fn a_key_that_is_not_inactive_cannot_be_deleted_and_survives() {
     }
 }
 
-/// One row of the not-found table: an address that resolves to no key-signing
-/// key of the addressed zone.
+/// One row of the not-found table: a `Name` that names no key-signing key of the
+/// addressed zone, which the store HOLDS (a `HostedZoneId` that names no zone at
+/// all is the zone-resolution rule at the bottom of this suite).
 struct MissingRow {
     case: &'static str,
-    /// Whether the request addresses the zone the row created, or an id no zone
-    /// in the store carries.
-    missing_zone: bool,
     /// The `Name` the request addresses.
     requested: &'static str,
 }
 
-/// The rows span the ways an address resolves to no key: a name no key of the
-/// zone carries, a name another zone's key carries (the keys are held per zone),
-/// and a zone id that names no zone at all — this operation models no zone-level
-/// error, so the key it addresses simply does not exist.
+/// The rows span the ways a name resolves to no key of an existing zone: a name
+/// no key of the zone carries, a name another zone's key carries (the keys are
+/// held per zone), and the longest name `SigningKeyName` allows.
 const MISSING_ROWS: &[MissingRow] = &[
     MissingRow {
         case: "a name no key of the zone carries",
-        missing_zone: false,
         requested: "absent_key",
     },
     MissingRow {
         case: "a name only another zone's key carries",
-        missing_zone: false,
         requested: "neighbours_key",
     },
     MissingRow {
-        case: "the name of the zone's own key, under a zone id no zone carries",
-        missing_zone: true,
-        requested: "held_key",
-    },
-    MissingRow {
         case: "the longest name a key may carry",
-        missing_zone: false,
         requested: "a_name_of_one_hundred_and_twenty_eight_characters_\
                     0123456789_0123456789_0123456789_0123456789_0123456789_0123456789_01234567",
     },
@@ -394,14 +393,7 @@ async fn an_address_that_resolves_to_no_key_is_not_found() {
         )
         .await;
 
-        // A well-formed zone id (`ResourceId` is at most 32 characters) that no
-        // zone in this store carries.
-        let addressed = if row.missing_zone {
-            "Z00000000000000MISSING".to_string()
-        } else {
-            zone_id.clone()
-        };
-        let refused = delete_ksk(&router, &addressed, row.requested).await;
+        let refused = delete_ksk(&router, &zone_id, row.requested).await;
 
         assert_eq!(
             refused.status, 404,
@@ -833,12 +825,7 @@ async fn a_deactivation_of_an_address_that_resolves_to_no_key_is_not_found() {
         )
         .await;
 
-        let addressed = if row.missing_zone {
-            "Z00000000000000MISSING".to_string()
-        } else {
-            zone_id.clone()
-        };
-        let refused = deactivate_ksk(&router, &addressed, row.requested).await;
+        let refused = deactivate_ksk(&router, &zone_id, row.requested).await;
 
         assert_eq!(
             refused.status, 404,
@@ -870,4 +857,234 @@ async fn a_deactivation_of_an_address_that_resolves_to_no_key_is_not_found() {
             "case {case:?}: a refused deactivation leaves the neighbouring zone's key as it was"
         );
     }
+}
+
+/// The two key-addressed operations the zone-resolution rule below covers: the
+/// ones that take `(HostedZoneId, Name)` as `@httpLabel`s.
+#[derive(Debug, Clone, Copy)]
+enum KeyOperation {
+    /// `POST /2013-04-01/keysigningkey/{HostedZoneId}/{Name}/deactivate`.
+    Deactivate,
+    /// `DELETE /2013-04-01/keysigningkey/{HostedZoneId}/{Name}`.
+    Delete,
+}
+
+/// Both of them, so every row below is driven through each.
+const KEY_OPERATIONS: [KeyOperation; 2] = [KeyOperation::Deactivate, KeyOperation::Delete];
+
+impl KeyOperation {
+    /// The operation's modelled name, for the case a failing assertion names.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Deactivate => "DeactivateKeySigningKey",
+            Self::Delete => "DeleteKeySigningKey",
+        }
+    }
+
+    /// Address `(zone_id, name)` through this operation.
+    async fn call(self, router: &MultiServiceRouter, zone_id: &str, name: &str) -> Reply {
+        match self {
+            Self::Deactivate => deactivate_ksk(router, zone_id, name).await,
+            Self::Delete => delete_ksk(router, zone_id, name).await,
+        }
+    }
+}
+
+/// One `HostedZoneId` that names no zone: the spelling the request carries in
+/// its path, and the bare id the refusal has to name.
+struct ZoneRow {
+    case: &'static str,
+    /// The `{HostedZoneId}` label as the request writes it (URI-encoded where
+    /// needed).
+    requested: String,
+    /// The id the message must name — always the BARE one, because the bare and
+    /// the `/hostedzone/`-prefixed spelling name the same zone.
+    bare: String,
+}
+
+/// The `Name`s a row sends beside a missing zone. `SigningKeyName` is
+/// `len 3..128` (`smithy_query(query="shape",shape="SigningKeyName")`), so these
+/// are the shortest a request may carry, a name a key of an EXISTING zone in the
+/// store carries, and the longest.
+const NAMES_BESIDE_A_MISSING_ZONE: &[(&str, &str)] = &[
+    ("the shortest name a key may carry", "abc"),
+    ("a name a key of a real zone carries", "held_key"),
+    (
+        "the longest name a key may carry",
+        "a_name_of_one_hundred_and_twenty_eight_characters_\
+         0123456789_0123456789_0123456789_0123456789_0123456789_0123456789_01234567",
+    ),
+];
+
+/// A router whose store really holds one zone with one key-signing key on it,
+/// and that zone's id: what a request addressing a MISSING zone must leave
+/// untouched, and what the key half of the rule is asserted against.
+async fn emulator_holding_a_key() -> (MultiServiceRouter, String) {
+    let case = "the zone's own key";
+    let router = emulator();
+    let zone_id = create_zone_ok(&router, "example.com", "ref-zone-resolution").await;
+    let arn = create_signing_kms_key(&router, case).await;
+    create_ksk_ok(&router, case, &zone_id, "held_key", "INACTIVE", &arn).await;
+    (router, zone_id)
+}
+
+#[tokio::test]
+async fn a_key_addressed_at_a_missing_zone_reports_the_missing_zone() {
+    let (router, zone_id) = emulator_holding_a_key().await;
+
+    // A zone that exists until it is deleted, so one row asks about an id that
+    // DID name a zone. It carries only its default records, so it deletes.
+    let deleted = create_zone_ok(&router, "gone.example.com", "ref-zone-resolution-gone").await;
+    let dropped = call(
+        &router,
+        "DELETE",
+        &format!("/2013-04-01/hostedzone/{deleted}"),
+        "",
+    )
+    .await;
+    assert_eq!(
+        dropped.status, 200,
+        "the zone must delete so its id names no zone, got {} with body {}",
+        dropped.status, dropped.body
+    );
+
+    // `ResourceId` is `len 0..32`
+    // (`smithy_query(query="shape",shape="ResourceId")`), so every spelling here
+    // is one the request boundary lets through: the rows cross the id's length
+    // (including the member's upper bound), whether it ever named a zone, and the
+    // two spellings of one id.
+    let zone_rows = vec![
+        ZoneRow {
+            case: "an id that was never minted",
+            requested: "Z00000000000000NOTREAL".to_string(),
+            bare: "Z00000000000000NOTREAL".to_string(),
+        },
+        ZoneRow {
+            case: "a short id that was never minted",
+            requested: "ZABC123".to_string(),
+            bare: "ZABC123".to_string(),
+        },
+        ZoneRow {
+            case: "an unminted id at the member's 32-character bound",
+            requested: format!("Z{}", "0".repeat(31)),
+            bare: format!("Z{}", "0".repeat(31)),
+        },
+        ZoneRow {
+            case: "the id of a zone that was deleted",
+            requested: deleted.clone(),
+            bare: deleted.clone(),
+        },
+        ZoneRow {
+            case: "the /hostedzone/-prefixed spelling a response hands back",
+            requested: "%2Fhostedzone%2FZABC123".to_string(),
+            bare: "ZABC123".to_string(),
+        },
+    ];
+
+    for row in &zone_rows {
+        for (name_case, name) in NAMES_BESIDE_A_MISSING_ZONE {
+            for operation in KEY_OPERATIONS {
+                let case = format!(
+                    "{} on {} ({}) with {name_case}",
+                    operation.name(),
+                    row.requested,
+                    row.case
+                );
+                let refused = operation.call(&router, &row.requested, name).await;
+
+                assert_eq!(
+                    refused.status, 404,
+                    "case {case:?}: expected 404, got {} with body {}",
+                    refused.status, refused.body
+                );
+                // The class is the operation's own 404: neither operation models
+                // a zone-level error, so the zone is reported in the MESSAGE and
+                // not in the code.
+                assert_eq!(
+                    refused.error_code(),
+                    "NoSuchKeySigningKey",
+                    "case {case:?}: expected the NoSuchKeySigningKey refusal, got body {}",
+                    refused.body
+                );
+                let message = message_of(&refused, &case);
+                let expected = missing_zone_message(&row.bare);
+                assert_eq!(
+                    message, expected,
+                    "case {case:?}: expected {expected:?}, got {message:?}"
+                );
+                assert!(
+                    !message.contains(*name),
+                    "case {case:?}: the refusal must report the zone, not the key name {name:?}, \
+                     got {message:?}"
+                );
+            }
+        }
+    }
+
+    // Nothing the store really holds was touched by any of those refusals.
+    assert_eq!(
+        ksk_count(&router, &zone_id).await,
+        1,
+        "a refusal for a missing zone leaves the real zone's key where it was"
+    );
+    assert_eq!(
+        reported_status(&router, &zone_id, "held_key").await,
+        Some("INACTIVE".to_string()),
+        "a refusal for a missing zone moves no key of the zone the store does hold"
+    );
+}
+
+#[tokio::test]
+async fn a_missing_key_of_an_existing_zone_reports_the_missing_key() {
+    let (router, zone_id) = emulator_holding_a_key().await;
+
+    // Once the zone resolves, the KEY half is what the refusal is about — which
+    // is the only case the key-not-found wording is correct in.
+    for (name_case, name) in [
+        ("the shortest name a key may carry", "abc"),
+        ("a name no key of the zone carries", "absent_key"),
+    ] {
+        for operation in KEY_OPERATIONS {
+            let case = format!("{} with {name_case}", operation.name());
+            let refused = operation.call(&router, &zone_id, name).await;
+
+            assert_eq!(
+                refused.status, 404,
+                "case {case:?}: expected 404, got {} with body {}",
+                refused.status, refused.body
+            );
+            assert_eq!(
+                refused.error_code(),
+                "NoSuchKeySigningKey",
+                "case {case:?}: expected the NoSuchKeySigningKey refusal, got body {}",
+                refused.body
+            );
+            let message = message_of(&refused, &case);
+            let expected = not_found_message(name);
+            assert_eq!(
+                message, expected,
+                "case {case:?}: expected {expected:?}, got {message:?}"
+            );
+        }
+    }
+
+    // And the key the zone DOES hold is addressed by the same operation, in
+    // either spelling of the zone's id: the zone resolving is what the refusals
+    // above were about, not the key.
+    for spelling in [zone_id.clone(), format!("%2Fhostedzone%2F{zone_id}")] {
+        let case = format!("the zone's own key under {spelling}");
+        let deactivated = KeyOperation::Deactivate
+            .call(&router, &spelling, "held_key")
+            .await;
+        assert_eq!(
+            deactivated.status, 200,
+            "case {case:?}: the held key is addressable, got {} with body {}",
+            deactivated.status, deactivated.body
+        );
+    }
+    assert_eq!(
+        ksk_count(&router, &zone_id).await,
+        1,
+        "the refusals left the zone's key where it was"
+    );
 }

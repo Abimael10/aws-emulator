@@ -36,7 +36,11 @@ use crate::vpc_disassociation::{associate_ok, disassociate};
 
 /// The fixed form AWS words a missing hosted zone in, with the id the request
 /// asked about filled in (`crate::state::no_such_hosted_zone`).
-fn missing_zone_message(bare_id: &str) -> String {
+///
+/// `pub(crate)` so the sibling suite over the key-signing-key operations — which
+/// report a missing zone in this same sentence, under their own error class —
+/// asserts it through this ONE reading of the rule.
+pub(crate) fn missing_zone_message(bare_id: &str) -> String {
     format!("No hosted zone found with ID: {bare_id}")
 }
 

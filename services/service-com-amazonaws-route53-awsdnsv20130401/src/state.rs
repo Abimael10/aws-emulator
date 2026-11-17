@@ -3703,7 +3703,10 @@ pub fn hosted_zone_not_found(requested_id: &str) -> HostedZoneNotFound {
 }
 
 /// The one sentence this service reports a zone id that names no zone with,
-/// whichever modelled shape carries it.
+/// whichever modelled shape carries it — including the key-addressed shape
+/// [`signing_key::no_such_key_signing_key_for_missing_zone`] builds, so this
+/// stays one function rather than being inlined into the zone-level shapes
+/// above.
 fn missing_hosted_zone_message(requested_id: &str) -> String {
     format!(
         "No hosted zone found with ID: {}",

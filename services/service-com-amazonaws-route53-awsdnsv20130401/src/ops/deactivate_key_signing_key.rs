@@ -181,13 +181,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // HostedZone handed it back; both name the same zone.
         let zone_id = normalize_zone_id(&input.hosted_zone_id);
         let mut store = state.lock();
-        // A key is addressed by `(HostedZoneId, Name)` and the keys are held ON
-        // the zone, so a zone this store does not hold holds no key of that name
-        // either: this operation models no zone-level error, so an address that
-        // resolves to nothing is a key that does not exist.
+        // A key is addressed by `(HostedZoneId, Name)` and the ZONE half of that
+        // address is resolved FIRST: a zone id no zone carries is refused for the
+        // missing ZONE, naming the id the request sent, because a zone that does
+        // not exist can hold no key of any name and the zone id is the input to
+        // correct. The error CLASS is unchanged — this operation models no
+        // zone-level error, so the 404 it declares for a key is the one it
+        // answers — only what the refusal reports as missing.
         let zone = store.zones.get_mut(zone_id).ok_or_else(|| {
             DeactivateKeySigningKeyErrorModeled::NoSuchKeySigningKey(
-                signing_key::no_such_key_signing_key(&input.name),
+                signing_key::no_such_key_signing_key_for_missing_zone(&input.hosted_zone_id),
             )
         })?;
         if !zone.key_signing_keys.contains_key(&input.name) {

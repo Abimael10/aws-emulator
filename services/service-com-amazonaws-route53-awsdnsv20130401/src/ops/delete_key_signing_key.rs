@@ -182,20 +182,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // HostedZone handed it back; both name the same zone.
         let zone_id = normalize_zone_id(&input.hosted_zone_id);
         let mut store = state.lock();
-        // A key is addressed by `(HostedZoneId, Name)` and the keys are held ON
-        // the zone, so a zone this store does not hold holds no key of that name
-        // either: the key the request addressed does not exist, which is what
-        // this operation models for an address that resolves to nothing — it
-        // declares no zone-level error at all
-        // (`smithy_query(query="operation",operation="DeleteKeySigningKey")`).
-        let zone = store
-            .zones
-            .get_mut(zone_id)
-            .ok_or_else(|| {
-                DeleteKeySigningKeyErrorModeled::NoSuchKeySigningKey(
-                    signing_key::no_such_key_signing_key(&input.name),
-                )
-            })?;
+        // A key is addressed by `(HostedZoneId, Name)` and the ZONE half of that
+        // address is resolved FIRST: a zone id no zone carries is refused for the
+        // missing ZONE, naming the id the request sent, because a zone that does
+        // not exist can hold no key of any name and the zone id is the input to
+        // correct. The error CLASS is unchanged — this operation declares no
+        // zone-level error at all
+        // (`smithy_query(query="operation",operation="DeleteKeySigningKey")`), so
+        // the 404 it models for a key is the one it answers — only what the
+        // refusal reports as missing.
+        let zone = store.zones.get_mut(zone_id).ok_or_else(|| {
+            DeleteKeySigningKeyErrorModeled::NoSuchKeySigningKey(
+                signing_key::no_such_key_signing_key_for_missing_zone(&input.hosted_zone_id),
+            )
+        })?;
         let key = zone.key_signing_keys.get(&input.name).ok_or_else(|| {
             DeleteKeySigningKeyErrorModeled::NoSuchKeySigningKey(
                 signing_key::no_such_key_signing_key(&input.name),

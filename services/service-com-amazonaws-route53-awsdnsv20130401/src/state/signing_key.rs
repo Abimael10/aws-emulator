@@ -68,6 +68,25 @@ pub fn no_such_key_signing_key(name: &str) -> NoSuchKeySigningKey {
     }
 }
 
+/// The modelled `NoSuchKeySigningKey` (HTTP 404) for a key addressed at a hosted
+/// zone this store does not hold.
+///
+/// A key is addressed by `(HostedZoneId, Name)`, and the ZONE half of that
+/// address is resolved first: when no zone carries the id, the refusal reports
+/// the zone as the resource that is missing — in the one sentence this service
+/// reports an unknown zone with ([`super::no_such_hosted_zone`]) — and says
+/// nothing about the key, because a zone that does not exist can carry no key of
+/// any name and the zone id is the input the caller has to correct. Only the
+/// MESSAGE follows the zone: the error class stays the 404 the key-addressed
+/// operations model, since the deactivate and the delete declare no zone-level
+/// error at all
+/// (`smithy_query(query="operation",operation="DeactivateKeySigningKey")`).
+pub fn no_such_key_signing_key_for_missing_zone(requested_zone_id: &str) -> NoSuchKeySigningKey {
+    NoSuchKeySigningKey {
+        message: Some(super::missing_hosted_zone_message(requested_zone_id)),
+    }
+}
+
 /// The refusal of a key-signing key status that is not one this API accepts, in
 /// `InvalidKeySigningKeyStatus`'s own wording: "The key-signing key (KSK) status
 /// isn't valid or another KSK has the status INTERNAL_FAILURE."
