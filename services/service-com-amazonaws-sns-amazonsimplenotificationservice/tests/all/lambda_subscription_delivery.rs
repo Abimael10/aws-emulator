@@ -32,6 +32,11 @@ use std::time::{Duration, Instant, SystemTime};
 
 use base64::Engine as _;
 use serde_json::{json, Value};
+use service_com_amazonaws_lambda_awsgirapiservice::state::async_delivery::FIRST_ASYNC_RETRY_DELAY;
+use service_com_amazonaws_lambda_awsgirapiservice::state::async_invocation::ASYNC_DELIVERY_DELAY;
+use service_com_amazonaws_lambda_awsgirapiservice::state::execution::{
+    ABANDON_GRACE, HOST_WAIT_CEILING, INIT_PHASE_LIMIT, PERMIT_WAIT,
+};
 use service_com_amazonaws_lambda_awsgirapiservice::state::ComAmazonawsLambdaAwsgirapiserviceState;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -57,16 +62,35 @@ pub(crate) const ROLE: &str = "arn:aws:iam::000000000000:role/service-role/lambd
 /// Nothing here runs it: what this suite asserts is the event SNS handed the function.
 pub(crate) const ZIP_FILE: &str = "UEsDBAoAAAAAAAAAAAA=";
 
+/// The longest ONE delivery attempt may take, as the bounds the LAMBDA SERVICE ITSELF puts on
+/// it add up: the attempt waits for its share of this process's run capacity ([`PERMIT_WAIT`]),
+/// initializes the execution environment the handler is called in ([`INIT_PHASE_LIMIT`]), runs
+/// the handler ([`HOST_WAIT_CEILING`]) and is still waited for [`ABANDON_GRACE`] after that
+/// deadline.
+///
+/// Read from that service's own constants rather than restated here, so neither this number
+/// nor the wait built on it can drift from the spans the work is really allowed.
+const ONE_ATTEMPT_CEILING: Duration = PERMIT_WAIT
+    .saturating_add(INIT_PHASE_LIMIT)
+    .saturating_add(HOST_WAIT_CEILING)
+    .saturating_add(ABANDON_GRACE);
+
 /// How long a wait for an invocation lasts before giving up — the span after which a wait
 /// reports that what it looked for never arrived, rather than a span anything here waits out.
 ///
 /// Every such wait LOOKS for its condition and returns the moment it holds, so this only
-/// bounds the failing case: it is deliberately far longer than the whole chain a publish sets
-/// off (the queued delivery attempt, the execution environment a subscribed function's run is
-/// initialized in, that run, and what it wrote), so a machine running many of these suites at
-/// once cannot turn a wait that would have been answered into a failure. A row that expects
-/// NOTHING to arrive does not pay it: those wait out [`QUIET_BUDGET`] instead.
-pub(crate) const DELIVERY_BUDGET: Duration = Duration::from_secs(60);
+/// bounds the failing case. It is derived from the spans the chain a publish sets off is
+/// ALLOWED, never picked as a round number: an accepted event waits its queueing delay
+/// ([`ASYNC_DELIVERY_DELAY`]) and is then delivered by an attempt bounded by
+/// [`ONE_ATTEMPT_CEILING`], and an attempt whose run was cut off is followed by another after
+/// the wait AWS publishes between them ([`FIRST_ASYNC_RETRY_DELAY`]) — so this holds two whole
+/// attempts and that wait. A wait shorter than what it waits on is answered by how loaded the
+/// host is rather than by what the emulator did, and every one of these spans is shared with
+/// every other suite of a whole-workspace run. A row that expects NOTHING to arrive does not
+/// pay it: those wait out [`QUIET_BUDGET`] instead.
+pub(crate) const DELIVERY_BUDGET: Duration = ASYNC_DELIVERY_DELAY
+    .saturating_add(FIRST_ASYNC_RETRY_DELAY)
+    .saturating_add(ONE_ATTEMPT_CEILING.saturating_mul(2));
 
 /// How long a wait lasts before concluding that NOTHING was invoked.
 const QUIET_BUDGET: Duration = Duration::from_millis(1_500);
@@ -355,6 +379,54 @@ pub(crate) async fn quiet(emulator: &Emulator, function: &str) -> Vec<Value> {
         tokio::time::sleep(LOOK_INTERVAL).await;
     }
     events_of(emulator, function)
+}
+
+/// Every wait this harness gives a delivery OUTLASTS the spans the Lambda service is itself
+/// allowed for making it, so what a wait reports is what the emulator did rather than how fast
+/// the host that ran it was.
+///
+/// A subscribed function's run happens off the publishing request's response path, and the
+/// service that makes it bounds every leg of that chain: the queueing delay, the wait for a
+/// share of this process's run capacity, the initialization of the execution environment, the
+/// handler's own run and the grace after its deadline, plus the published wait before a retried
+/// attempt. A wait shorter than the sum of the legs it covers expires while the work it waits
+/// for is still inside its own allowance — which makes its outcome a measurement of the host,
+/// and is why [`DELIVERY_BUDGET`] is derived from those spans instead of being picked.
+///
+/// The rows differ along how much of that chain has to fit: the queueing delay alone, one whole
+/// delivery attempt, and a second attempt after the wait AWS publishes between them.
+#[test]
+fn every_wait_a_delivery_is_given_outlasts_the_spans_it_is_allowed() {
+    // (case, the span the service may spend before what the wait looks for can exist)
+    let rows: &[(&str, Duration)] = &[
+        (
+            "the queueing delay an accepted event waits out",
+            ASYNC_DELIVERY_DELAY,
+        ),
+        (
+            "the queueing delay and one whole delivery attempt",
+            ASYNC_DELIVERY_DELAY.saturating_add(ONE_ATTEMPT_CEILING),
+        ),
+        (
+            "a second attempt, after the wait published between them",
+            ASYNC_DELIVERY_DELAY
+                .saturating_add(FIRST_ASYNC_RETRY_DELAY)
+                .saturating_add(ONE_ATTEMPT_CEILING.saturating_mul(2)),
+        ),
+    ];
+    for (case, allowed) in rows {
+        assert!(
+            DELIVERY_BUDGET >= *allowed,
+            "case {case:?}: expected the wait a delivery is given to outlast the {allowed:?} \
+             the service may spend on it, got {DELIVERY_BUDGET:?}"
+        );
+    }
+    assert!(
+        !LOOK_INTERVAL.is_zero() && LOOK_INTERVAL < ONE_ATTEMPT_CEILING,
+        "case \"the interval a wait looks again on\": expected an interval that only decides \
+         how often a wait looks, not what bounds it, got {LOOK_INTERVAL:?} against the \
+         {ONE_ATTEMPT_CEILING:?} one attempt is allowed"
+    );
 }
 
 /// One row of the permission table: the statement the function carries, and whether a publish

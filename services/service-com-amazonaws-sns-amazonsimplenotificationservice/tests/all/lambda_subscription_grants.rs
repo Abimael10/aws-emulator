@@ -53,7 +53,14 @@ const INVOKE_ACTION: &str = "lambda:InvokeFunction";
 
 /// How long this suite watches a function's sink queue for the event its handler forwarded:
 /// the invocation is asynchronous, so the run happens off the publish's response path.
-const WATCH_BUDGET: Duration = Duration::from_secs(40);
+///
+/// A ceiling on patience, never a span anything here waits out — every watch below looks again
+/// and answers the moment the forwarded event is there. It is the span the DELIVERY itself is
+/// allowed by the service that makes it ([`DELIVERY_BUDGET`], derived from that service's own
+/// bounds), because a watch shorter than the work it watches expires while that work is still
+/// inside its allowance, which makes the outcome a measurement of the host rather than of what
+/// the emulator did.
+const WATCH_BUDGET: Duration = crate::lambda_subscription_delivery::DELIVERY_BUDGET;
 
 /// How long to look again at a sink that is still empty.
 const LOOK_AGAIN: Duration = Duration::from_millis(100);

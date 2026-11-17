@@ -557,8 +557,11 @@ async fn a_subscriber_reaches_the_certificate_at_the_address_it_was_given() {
     // The event is queued as the publish is answered and the handler runs a moment later, so
     // both waits below LOOK for what they wait on — the queued event, then the report the
     // handler's own fetch wrote — and are answered the moment it is there. Neither waits out a
-    // span, and the budget they give up after is many times the whole chain, so how loaded the
-    // machine is decides when this test finishes and never whether it passes.
+    // span, and the ceiling they give up after is the one the LAMBDA SERVICE's own bounds set
+    // for this chain (`DELIVERY_BUDGET`: the queueing delay, the wait for run capacity, the
+    // initialization of the execution environment, the handler's run, and a retried attempt
+    // after the published wait between them). So how loaded the machine is decides when this
+    // test finishes and never whether it passes.
     let events = invoked(&emulator, function, 1).await;
     assert_eq!(
         events.len(),
