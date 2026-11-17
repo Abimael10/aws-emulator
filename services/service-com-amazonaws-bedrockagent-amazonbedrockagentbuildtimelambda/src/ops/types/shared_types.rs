@@ -916,7 +916,14 @@ pub struct SessionSummaryConfiguration {
     pub max_recent_sessions: Option<i32>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagent#Agent")]
+/// `Agent`. Its schema and codec come from [`bedrock_agent_schema_and_codec!`] for the
+/// reason [`DataSource`]'s do: `createdAt`, `updatedAt` and `preparedAt` target
+/// `DateTimestamp`, which carries `@timestampFormat("date-time")`
+/// (`smithy_query(query="shape", shape="Agent")`), and the derive does not put that trait
+/// on a member schema — see `types/date_time_wire.rs`.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct Agent {
     pub agent_id: String,
@@ -943,6 +950,128 @@ pub struct Agent {
     pub memory_configuration: Option<MemoryConfiguration>,
     pub agent_collaboration: Option<String>,
 }
+
+bedrock_agent_schema_and_codec!(
+    Agent,
+    AGENT_SCHEMA,
+    "com.amazonaws.bedrockagent#Agent",
+    "com.amazonaws.bedrockagent",
+    "Agent",
+    (M_AGENT_ID, agent_id, "agentId", 0, req, string),
+    (M_AGENT_NAME, agent_name, "agentName", 1, req, string),
+    (M_AGENT_ARN, agent_arn, "agentArn", 2, req, string),
+    (
+        M_AGENT_VERSION,
+        agent_version,
+        "agentVersion",
+        3,
+        req,
+        string
+    ),
+    (M_CLIENT_TOKEN, client_token, "clientToken", 4, opt, string),
+    (M_INSTRUCTION, instruction, "instruction", 5, opt, string),
+    (M_AGENT_STATUS, agent_status, "agentStatus", 6, req, string),
+    (
+        M_FOUNDATION_MODEL,
+        foundation_model,
+        "foundationModel",
+        7,
+        opt,
+        string
+    ),
+    (M_DESCRIPTION, description, "description", 8, opt, string),
+    (
+        M_ORCHESTRATION_TYPE,
+        orchestration_type,
+        "orchestrationType",
+        9,
+        opt,
+        string
+    ),
+    (
+        M_CUSTOM_ORCHESTRATION,
+        custom_orchestration,
+        "customOrchestration",
+        10,
+        opt,
+        struct_of(CustomOrchestration)
+    ),
+    (
+        M_IDLE_SESSION_TTL_IN_SECONDS,
+        idle_session_ttl_in_seconds,
+        "idleSessionTTLInSeconds",
+        11,
+        req,
+        integer
+    ),
+    (
+        M_AGENT_RESOURCE_ROLE_ARN,
+        agent_resource_role_arn,
+        "agentResourceRoleArn",
+        12,
+        req,
+        string
+    ),
+    (
+        M_CUSTOMER_ENCRYPTION_KEY_ARN,
+        customer_encryption_key_arn,
+        "customerEncryptionKeyArn",
+        13,
+        opt,
+        string
+    ),
+    (M_CREATED_AT, created_at, "createdAt", 14, req, date_time),
+    (M_UPDATED_AT, updated_at, "updatedAt", 15, req, date_time),
+    (M_PREPARED_AT, prepared_at, "preparedAt", 16, opt, date_time),
+    (
+        M_FAILURE_REASONS,
+        failure_reasons,
+        "failureReasons",
+        17,
+        opt,
+        list_of_string
+    ),
+    (
+        M_RECOMMENDED_ACTIONS,
+        recommended_actions,
+        "recommendedActions",
+        18,
+        opt,
+        list_of_string
+    ),
+    (
+        M_PROMPT_OVERRIDE_CONFIGURATION,
+        prompt_override_configuration,
+        "promptOverrideConfiguration",
+        19,
+        opt,
+        struct_of(PromptOverrideConfiguration)
+    ),
+    (
+        M_GUARDRAIL_CONFIGURATION,
+        guardrail_configuration,
+        "guardrailConfiguration",
+        20,
+        opt,
+        struct_of(GuardrailConfiguration)
+    ),
+    (
+        M_MEMORY_CONFIGURATION,
+        memory_configuration,
+        "memoryConfiguration",
+        21,
+        opt,
+        struct_of(MemoryConfiguration)
+    ),
+    (
+        M_AGENT_COLLABORATION,
+        agent_collaboration,
+        "agentCollaboration",
+        22,
+        opt,
+        string
+    ),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.bedrockagent#AgentAliasRoutingConfigurationListItem")]
 #[derive(Debug, Clone, Default)]
@@ -1453,7 +1582,14 @@ pub struct FlowAliasConcurrencyConfiguration {
     pub max_concurrency: Option<i32>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagent#IngestionJob")]
+/// `IngestionJob`. Its schema and codec come from [`bedrock_agent_schema_and_codec!`] for
+/// the reason [`DataSource`]'s do: `startedAt`, `updatedAt` and `textReadyAt` target
+/// `DateTimestamp`, which carries `@timestampFormat("date-time")`
+/// (`smithy_query(query="shape", shape="IngestionJob")`), and the derive does not put that
+/// trait on a member schema — see `types/date_time_wire.rs`.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct IngestionJob {
     pub knowledge_base_id: String,
@@ -1467,6 +1603,66 @@ pub struct IngestionJob {
     pub updated_at: ::aws_smithy_types::DateTime,
     pub text_ready_at: Option<::aws_smithy_types::DateTime>,
 }
+
+bedrock_agent_schema_and_codec!(
+    IngestionJob,
+    INGESTION_JOB_SCHEMA,
+    "com.amazonaws.bedrockagent#IngestionJob",
+    "com.amazonaws.bedrockagent",
+    "IngestionJob",
+    (
+        M_KNOWLEDGE_BASE_ID,
+        knowledge_base_id,
+        "knowledgeBaseId",
+        0,
+        req,
+        string
+    ),
+    (
+        M_DATA_SOURCE_ID,
+        data_source_id,
+        "dataSourceId",
+        1,
+        req,
+        string
+    ),
+    (
+        M_INGESTION_JOB_ID,
+        ingestion_job_id,
+        "ingestionJobId",
+        2,
+        req,
+        string
+    ),
+    (M_DESCRIPTION, description, "description", 3, opt, string),
+    (M_STATUS, status, "status", 4, req, string),
+    (
+        M_STATISTICS,
+        statistics,
+        "statistics",
+        5,
+        opt,
+        struct_of(IngestionJobStatistics)
+    ),
+    (
+        M_FAILURE_REASONS,
+        failure_reasons,
+        "failureReasons",
+        6,
+        opt,
+        list_of_string
+    ),
+    (M_STARTED_AT, started_at, "startedAt", 7, req, date_time),
+    (M_UPDATED_AT, updated_at, "updatedAt", 8, req, date_time),
+    (
+        M_TEXT_READY_AT,
+        text_ready_at,
+        "textReadyAt",
+        9,
+        opt,
+        date_time
+    ),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.bedrockagent#IngestionJobStatistics")]
 #[derive(Debug, Clone, Default)]

@@ -8,12 +8,12 @@
 //! calling a handler directly.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_bedrockagent_amazonbedrockagentbuildtimelambda::state::{
-    service_state, AGENT_QUOTA, DEFAULT_IDLE_SESSION_TTL_SECONDS, MAX_AGENTS_PER_PAGE, PREPARE_SPAN,
+    service_state, AGENT_QUOTA, DEFAULT_IDLE_SESSION_TTL_SECONDS, MAX_AGENTS_PER_PAGE,
 };
 use service_com_amazonaws_bedrockagent_amazonbedrockagentbuildtimelambda::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -165,6 +165,39 @@ impl Emulator {
     }
 }
 
+/// How long one poll attempt waits before reading the agent again.
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// A generous cap on waiting for a transition the clock owes: far longer than
+/// any span this service owes, so a loaded machine still converges, and bounded
+/// so a stuck transition fails the test rather than hanging the suite.
+const POLL_CAP: Duration = Duration::from_secs(60);
+
+/// Look again at `agent_id` until it reports `status`, answering that read.
+///
+/// Waits for the CONDITION the clock owes rather than for a duration, so the
+/// verdict does not depend on how fast the host runs.
+async fn poll_agent_until_status(
+    emulator: &Emulator,
+    case: &str,
+    agent_id: &str,
+    status: &str,
+) -> Answer {
+    let deadline = Instant::now() + POLL_CAP;
+    loop {
+        let fetched = emulator.get_agent(agent_id).await;
+        if fetched.string(&["agent", "agentStatus"]) == status {
+            return fetched;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case}: the clock must carry agent {agent_id} to {status}, \
+             last read {fetched:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
 /// An `instruction` long enough for the member's modelled `length 40..4000`.
 pub(crate) fn instruction(flavour: &str) -> String {
     format!("You are a {flavour} assistant. Answer the customer precisely and cite your sources.")
@@ -270,12 +303,13 @@ async fn created_agents_round_trip_through_get_agent() {
             "NOT_PREPARED",
             "case {case}: a newly created agent has not been prepared"
         );
-        assert!(
-            created.member(&["agent", "createdAt"]).is_number()
-                && created.member(&["agent", "updatedAt"]).is_number(),
-            "case {case}: createdAt/updatedAt must be populated, got {:?}",
-            created.body["agent"]
-        );
+        for member in ["createdAt", "updatedAt"] {
+            crate::update_round_trip::assert_date_time_wire_form(
+                case,
+                member,
+                created.member(&["agent", member]),
+            );
+        }
         assert!(
             created.member(&["agent", "preparedAt"]).is_null(),
             "case {case}: an unprepared agent has no preparedAt, got {:?}",
@@ -457,9 +491,10 @@ async fn list_agents_pages_over_every_stored_agent() {
                         "case {case}: summary is missing {member}: {summary:?}"
                     );
                 }
-                assert!(
-                    summary["updatedAt"].is_number(),
-                    "case {case}: summary is missing updatedAt: {summary:?}"
+                crate::update_round_trip::assert_date_time_wire_form(
+                    &case,
+                    "updatedAt",
+                    &summary["updatedAt"],
                 );
                 assert_eq!(
                     summary["agentStatus"], "NOT_PREPARED",
@@ -572,9 +607,10 @@ async fn prepare_agent_mutates_the_stored_agent() {
         "PREPARING",
         "case prepare: expected PREPARING, got {prepared:?}"
     );
-    assert!(
-        prepared.member(&["preparedAt"]).is_number(),
-        "case prepare: expected preparedAt to be set, got {prepared:?}"
+    crate::update_round_trip::assert_date_time_wire_form(
+        "prepare",
+        "preparedAt",
+        prepared.member(&["preparedAt"]),
     );
 
     // The transient status is observable: a caller reading back immediately sees
@@ -586,9 +622,15 @@ async fn prepare_agent_mutates_the_stored_agent() {
         "case read during preparation: expected PREPARING, got {while_preparing:?}"
     );
 
-    // Once the span the clock owes has elapsed, the agent is PREPARED — and stays
-    // PREPARED across reads.
-    tokio::time::sleep(PREPARE_SPAN + Duration::from_millis(100)).await;
+    // Once the span the clock owes has come due, the agent is PREPARED — and
+    // stays PREPARED across reads. The test waits for that STATUS rather than
+    // for a duration, so a loaded or a fast host reaches the same verdict.
+    let converged = poll_agent_until_status(&emulator, "prepare", &agent_id, "PREPARED").await;
+    assert_eq!(
+        converged.member(&["agent", "preparedAt"]),
+        prepared.member(&["preparedAt"]),
+        "case read after preparation: preparedAt must be the instant PrepareAgent recorded"
+    );
     for read in ["first", "second"] {
         let fetched = emulator.get_agent(&agent_id).await;
         assert_eq!(
@@ -799,3 +841,141 @@ async fn unknown_agent_ids_are_not_found() {
         );
     }
 }
+
+/// Every timestamp the agent surface reports is on the wire in the modelled
+/// `date-time` form — an RFC-3339 string, never the epoch number the restJson1
+/// default writes for a timestamp whose format is dropped.
+///
+/// `Agent.createdAt`/`updatedAt`/`preparedAt`, `AgentSummary.updatedAt` and
+/// `PrepareAgentResponse.preparedAt` all target the one `DateTimestamp` shape,
+/// which carries `@timestampFormat("date-time")`
+/// (`smithy_query(query="shape", shape="Agent,AgentSummary,PrepareAgentResponse")`),
+/// so the rule is one rule across the create, the read, the listing and the
+/// preparation, and the values they report are the same instants in that form.
+#[tokio::test]
+async fn every_agent_timestamp_is_reported_in_the_modelled_date_time_wire_form() {
+    let emulator = Emulator::new();
+
+    // The rows differ along what the rule generalises over: how much of the
+    // agent the request fills in, which is what decides the members the
+    // response carries around its timestamps.
+    let cases: Vec<(&str, Value)> = vec![
+        (
+            "minimal: only the required agentName",
+            json!({ "agentName": "wire-form-minimal" }),
+        ),
+        (
+            "every lifecycle member supplied",
+            json!({
+                "agentName": "wire_form_full",
+                "description": "an agent whose every member is supplied",
+                "instruction": instruction("wire-form"),
+                "foundationModel": "anthropic.claude-v2",
+                "idleSessionTTLInSeconds": 5400,
+                "agentResourceRoleArn": "arn:aws:iam::000000000000:role/AgentRole",
+                "agentCollaboration": "DISABLED",
+            }),
+        ),
+    ];
+
+    for (case, request) in cases {
+        let created = emulator.create_agent(request).await;
+        assert_eq!(
+            created.status, 202,
+            "case {case}: expected CreateAgent -> 202, got {created:?}"
+        );
+        let agent_id = created.string(&["agent", "agentId"]);
+
+        // CreateAgent: both timestamps a fresh agent carries, each parsed back
+        // from the wire form an SDK configured for `date-time` reads.
+        let created_at = crate::update_round_trip::date_time_wire_instant(
+            case,
+            "agent.createdAt",
+            created.member(&["agent", "createdAt"]),
+        );
+        let updated_at = crate::update_round_trip::date_time_wire_instant(
+            case,
+            "agent.updatedAt",
+            created.member(&["agent", "updatedAt"]),
+        );
+        assert!(
+            updated_at >= created_at,
+            "case {case}: expected updatedAt at or after createdAt {created_at}, got {updated_at}"
+        );
+        assert!(
+            created.member(&["agent", "preparedAt"]).is_null(),
+            "case {case}: an unprepared agent reports no preparedAt, got {:?}",
+            created.member(&["agent", "preparedAt"])
+        );
+
+        // GetAgent reports the stored instants, in the same form and to the
+        // same value.
+        let fetched = emulator.get_agent(&agent_id).await;
+        for member in ["createdAt", "updatedAt"] {
+            crate::update_round_trip::assert_date_time_wire_form(
+                case,
+                member,
+                fetched.member(&["agent", member]),
+            );
+            assert_eq!(
+                fetched.member(&["agent", member]),
+                created.member(&["agent", member]),
+                "case {case}: expected GetAgent to report the {member} CreateAgent stored, got {:?}",
+                fetched.member(&["agent", member])
+            );
+        }
+
+        // ListAgents: the summary's own timestamp member.
+        let listed = emulator.list_agents(json!({})).await;
+        let summaries = listed
+            .member(&["agentSummaries"])
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case}: agentSummaries is not a list: {listed:?}"))
+            .clone();
+        let summary = summaries
+            .iter()
+            .find(|summary| summary["agentId"] == Value::String(agent_id.clone()))
+            .unwrap_or_else(|| panic!("case {case}: the listing omits {agent_id}: {listed:?}"));
+        crate::update_round_trip::assert_date_time_wire_form(
+            case,
+            "agentSummaries[].updatedAt",
+            &summary["updatedAt"],
+        );
+        assert_eq!(
+            summary["updatedAt"],
+            *created.member(&["agent", "updatedAt"]),
+            "case {case}: expected the summary to report the stored updatedAt, got {:?}",
+            summary["updatedAt"]
+        );
+
+        // PrepareAgent: the instant on its own response, and the same instant
+        // on the agent the following read reports.
+        let prepared = emulator.prepare_agent(&agent_id).await;
+        assert_eq!(
+            prepared.status, 202,
+            "case {case}: expected PrepareAgent -> 202, got {prepared:?}"
+        );
+        let prepared_at = crate::update_round_trip::date_time_wire_instant(
+            case,
+            "preparedAt",
+            prepared.member(&["preparedAt"]),
+        );
+        assert!(
+            prepared_at >= created_at,
+            "case {case}: expected preparedAt at or after createdAt {created_at}, got {prepared_at}"
+        );
+        let after = emulator.get_agent(&agent_id).await;
+        crate::update_round_trip::assert_date_time_wire_form(
+            case,
+            "agent.preparedAt",
+            after.member(&["agent", "preparedAt"]),
+        );
+        assert_eq!(
+            after.member(&["agent", "preparedAt"]),
+            prepared.member(&["preparedAt"]),
+            "case {case}: expected the agent to report the instant PrepareAgent recorded, got {:?}",
+            after.member(&["agent", "preparedAt"])
+        );
+    }
+}
+

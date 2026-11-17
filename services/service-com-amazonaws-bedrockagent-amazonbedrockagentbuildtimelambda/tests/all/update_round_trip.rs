@@ -390,17 +390,32 @@ fn fan_out_definition() -> Value {
     })
 }
 
-/// Assert `value` is the modelled `date-time` wire form: an RFC-3339 string,
-/// never the epoch number the protocol default would write.
-fn assert_date_time_wire_form(case: &str, member: &str, value: &Value) {
+/// Assert `value` is the modelled `date-time` wire form — an RFC-3339 string an
+/// SDK configured for `@timestampFormat("date-time")` parses, never the epoch
+/// number the restJson1 default would write — and answer the instant it names.
+///
+/// Shared with the suites of the other operation families that report a
+/// timestamp (`agent_lifecycle`, `ingestion_job_lifecycle`,
+/// `ingestion_job_listing`): every timestamp member of this service targets the
+/// one `DateTimestamp` shape, so one assertion serves them all.
+pub(crate) fn date_time_wire_instant(case: &str, member: &str, value: &Value) -> f64 {
     let text = value.as_str().unwrap_or_else(|| {
         panic!("case {case}: expected {member} to be a date-time string, got {value:?}")
     });
-    assert!(
-        text.contains('T') && text.ends_with('Z'),
-        "case {case}: expected {member} in the RFC-3339 form the modelled date-time \
-         format asks for, got {text:?}"
-    );
+    let parsed = ::aws_smithy_types::DateTime::from_str(text, ::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_else(|e| {
+            panic!(
+                "case {case}: expected {member} in the RFC-3339 form the modelled \
+                 date-time format asks for, got {text:?} ({e})"
+            )
+        });
+    parsed.as_secs_f64()
+}
+
+/// Assert `value` is the modelled `date-time` wire form: an RFC-3339 string,
+/// never the epoch number the protocol default would write.
+pub(crate) fn assert_date_time_wire_form(case: &str, member: &str, value: &Value) {
+    let _ = date_time_wire_instant(case, member, value);
 }
 
 /// Assert every member of `members` that `request` supplied is reported back by

@@ -78,12 +78,15 @@ impl Answer {
             .to_string()
     }
 
-    /// A timestamp member, as the epoch seconds the restJson1 `date-time`
-    /// binding puts on the wire.
+    /// A timestamp member, as the instant the modelled `date-time` wire form
+    /// names: every timestamp of this service is on the wire as an RFC-3339
+    /// string, so reading one back is parsing that form.
     fn job_instant(&self, member: &str) -> f64 {
-        self.job(member)
-            .as_f64()
-            .unwrap_or_else(|| panic!("ingestionJob.{member} is not a number in {:?}", self.body))
+        crate::update_round_trip::date_time_wire_instant(
+            "the stored job",
+            member,
+            self.job(member),
+        )
     }
 }
 
@@ -354,11 +357,13 @@ async fn started_ingestion_jobs_round_trip_through_get_ingestion_job() {
             "case {case}: expected the description the request supplied, got {:?}",
             started.job("description")
         );
-        assert!(
-            started.job("startedAt").is_number() && started.job("updatedAt").is_number(),
-            "case {case}: startedAt/updatedAt must be populated, got {:?}",
-            started.body
-        );
+        for member in ["startedAt", "updatedAt"] {
+            crate::update_round_trip::assert_date_time_wire_form(
+                case,
+                member,
+                started.job(member),
+            );
+        }
         assert!(
             started.job("textReadyAt").is_null(),
             "case {case}: no text is queryable before the job completes, got {:?}",

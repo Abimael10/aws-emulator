@@ -17,7 +17,15 @@ pub struct PrepareAgentInput {
     pub agent_id: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagent#PrepareAgentResponse")]
+/// `PrepareAgentResponse`. Its schema and codec come from
+/// [`bedrock_agent_schema_and_codec!`] rather than
+/// `#[smithy_macros::smithy(shape = ...)]` because `preparedAt` targets `DateTimestamp`,
+/// which carries `@timestampFormat("date-time")`
+/// (`smithy_query(query="shape", shape="PrepareAgentResponse")`), and the derive does not
+/// put that trait on a member schema — see `types/date_time_wire.rs` for that whole story.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct PrepareAgentOutput {
     pub agent_id: String,
@@ -25,4 +33,23 @@ pub struct PrepareAgentOutput {
     pub agent_version: String,
     pub prepared_at: ::aws_smithy_types::DateTime,
 }
+
+bedrock_agent_schema_and_codec!(
+    PrepareAgentOutput,
+    PREPARE_AGENT_OUTPUT_SCHEMA,
+    "com.amazonaws.bedrockagent#PrepareAgentResponse",
+    "com.amazonaws.bedrockagent",
+    "PrepareAgentResponse",
+    (M_AGENT_ID, agent_id, "agentId", 0, req, string),
+    (M_AGENT_STATUS, agent_status, "agentStatus", 1, req, string),
+    (
+        M_AGENT_VERSION,
+        agent_version,
+        "agentVersion",
+        2,
+        req,
+        string
+    ),
+    (M_PREPARED_AT, prepared_at, "preparedAt", 3, req, date_time),
+);
 

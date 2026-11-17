@@ -70,6 +70,9 @@ macro_rules! bedrock_agent_shape_type {
     (date_time) => {
         ::aws_smithy_schema::ShapeType::Timestamp
     };
+    (integer) => {
+        ::aws_smithy_schema::ShapeType::Integer
+    };
     (list_of_string) => {
         ::aws_smithy_schema::ShapeType::List
     };
@@ -85,7 +88,8 @@ macro_rules! bedrock_agent_shape_type {
 /// `@timestampFormat("date-time")` chain call it cannot.
 ///
 /// `$kind` is the member's shape kind — `string` (a `string` or an `enum` shape, both
-/// string-encoded), `date_time`, `list_of_string`, `list_of_struct(T)` or `struct_of(T)`.
+/// string-encoded), `integer`, `date_time`, `list_of_string`, `list_of_struct(T)` or
+/// `struct_of(T)`.
 macro_rules! bedrock_agent_member_schema {
     ($ns:literal, $local:literal, $wire:literal, $idx:literal, date_time) => {
         ::aws_smithy_schema::Schema::new_member(
@@ -120,6 +124,7 @@ macro_rules! bedrock_agent_member_schema {
 macro_rules! bedrock_agent_write_member {
     ($s:ident, $m:expr, $v:expr, string) => { $s.write_string($m, $v.as_str())?; };
     ($s:ident, $m:expr, $v:expr, date_time) => { $s.write_timestamp($m, $v)?; };
+    ($s:ident, $m:expr, $v:expr, integer) => { $s.write_integer($m, *$v)?; };
     ($s:ident, $m:expr, $v:expr, list_of_string) => {
         $s.write_list($m, &|__sl| {
             for __it in $v.iter() {
@@ -152,6 +157,7 @@ macro_rules! bedrock_agent_write_member {
 macro_rules! bedrock_agent_read_member {
     ($d:ident, $m:expr, string) => { $d.read_string($m)? };
     ($d:ident, $m:expr, date_time) => { $d.read_timestamp($m)? };
+    ($d:ident, $m:expr, integer) => { $d.read_integer($m)? };
     ($d:ident, $m:expr, list_of_string) => {{
         let mut __out: ::std::vec::Vec<::std::string::String> = ::std::vec::Vec::new();
         $d.read_list($m, &mut |__dl| {

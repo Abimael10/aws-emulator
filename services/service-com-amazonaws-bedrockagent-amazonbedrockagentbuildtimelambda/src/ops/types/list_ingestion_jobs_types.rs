@@ -44,7 +44,15 @@ pub struct ListIngestionJobsOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagent#IngestionJobSummary")]
+/// `IngestionJobSummary`. Its schema and codec come from
+/// [`bedrock_agent_schema_and_codec!`] rather than
+/// `#[smithy_macros::smithy(shape = ...)]` because `startedAt`, `updatedAt` and
+/// `textReadyAt` target `DateTimestamp`, which carries `@timestampFormat("date-time")`
+/// (`smithy_query(query="shape", shape="IngestionJobSummary")`), and the derive does not
+/// put that trait on a member schema — see `types/date_time_wire.rs` for that whole story.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct IngestionJobSummary {
     pub knowledge_base_id: String,
@@ -57,4 +65,56 @@ pub struct IngestionJobSummary {
     pub text_ready_at: Option<::aws_smithy_types::DateTime>,
     pub statistics: Option<IngestionJobStatistics>,
 }
+
+bedrock_agent_schema_and_codec!(
+    IngestionJobSummary,
+    INGESTION_JOB_SUMMARY_SCHEMA,
+    "com.amazonaws.bedrockagent#IngestionJobSummary",
+    "com.amazonaws.bedrockagent",
+    "IngestionJobSummary",
+    (
+        M_KNOWLEDGE_BASE_ID,
+        knowledge_base_id,
+        "knowledgeBaseId",
+        0,
+        req,
+        string
+    ),
+    (
+        M_DATA_SOURCE_ID,
+        data_source_id,
+        "dataSourceId",
+        1,
+        req,
+        string
+    ),
+    (
+        M_INGESTION_JOB_ID,
+        ingestion_job_id,
+        "ingestionJobId",
+        2,
+        req,
+        string
+    ),
+    (M_DESCRIPTION, description, "description", 3, opt, string),
+    (M_STATUS, status, "status", 4, req, string),
+    (M_STARTED_AT, started_at, "startedAt", 5, req, date_time),
+    (M_UPDATED_AT, updated_at, "updatedAt", 6, req, date_time),
+    (
+        M_TEXT_READY_AT,
+        text_ready_at,
+        "textReadyAt",
+        7,
+        opt,
+        date_time
+    ),
+    (
+        M_STATISTICS,
+        statistics,
+        "statistics",
+        8,
+        opt,
+        struct_of(IngestionJobStatistics)
+    ),
+);
 

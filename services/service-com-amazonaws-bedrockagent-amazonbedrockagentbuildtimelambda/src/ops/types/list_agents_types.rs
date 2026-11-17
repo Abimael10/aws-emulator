@@ -25,7 +25,14 @@ pub struct ListAgentsOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagent#AgentSummary")]
+/// `AgentSummary`. Its schema and codec come from [`bedrock_agent_schema_and_codec!`]
+/// rather than `#[smithy_macros::smithy(shape = ...)]` because `updatedAt` targets
+/// `DateTimestamp`, which carries `@timestampFormat("date-time")`
+/// (`smithy_query(query="shape", shape="AgentSummary")`), and the derive does not put
+/// that trait on a member schema — see `types/date_time_wire.rs` for that whole story.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct AgentSummary {
     pub agent_id: String,
@@ -36,4 +43,33 @@ pub struct AgentSummary {
     pub latest_agent_version: Option<String>,
     pub guardrail_configuration: Option<GuardrailConfiguration>,
 }
+
+bedrock_agent_schema_and_codec!(
+    AgentSummary,
+    AGENT_SUMMARY_SCHEMA,
+    "com.amazonaws.bedrockagent#AgentSummary",
+    "com.amazonaws.bedrockagent",
+    "AgentSummary",
+    (M_AGENT_ID, agent_id, "agentId", 0, req, string),
+    (M_AGENT_NAME, agent_name, "agentName", 1, req, string),
+    (M_AGENT_STATUS, agent_status, "agentStatus", 2, req, string),
+    (M_DESCRIPTION, description, "description", 3, opt, string),
+    (M_UPDATED_AT, updated_at, "updatedAt", 4, req, date_time),
+    (
+        M_LATEST_AGENT_VERSION,
+        latest_agent_version,
+        "latestAgentVersion",
+        5,
+        opt,
+        string
+    ),
+    (
+        M_GUARDRAIL_CONFIGURATION,
+        guardrail_configuration,
+        "guardrailConfiguration",
+        6,
+        opt,
+        struct_of(GuardrailConfiguration)
+    ),
+);
 

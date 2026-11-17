@@ -418,13 +418,15 @@ fn ids(case: &str, summaries: &[Value]) -> Vec<String> {
 }
 
 /// One timestamp member of a summary, rendered so that comparing the renderings
-/// compares the instants — whichever of the two shapes the `date-time` binding
-/// puts on the wire.
+/// compares the instants. The member is on the wire in the modelled `date-time`
+/// form, so the rendering is the instant it names, at a fixed width.
 fn instant_key(value: &Value) -> String {
-    match value.as_f64() {
-        Some(seconds) => format!("{seconds:030.9}"),
-        None => value.as_str().unwrap_or_default().to_string(),
-    }
+    let seconds = crate::update_round_trip::date_time_wire_instant(
+        "the sorted listing",
+        "a summary's startedAt",
+        value,
+    );
+    format!("{seconds:030.9}")
 }
 
 /// A `filters` entry selecting jobs whose status equals one of `values`: the
@@ -1216,3 +1218,146 @@ async fn the_listing_refuses_an_unknown_or_deleted_resource_a_foreign_token_and_
         "case after the refusals: a refused listing changes nothing, got {walked:?}"
     );
 }
+
+/// Every timestamp an ingestion job reports is on the wire in the modelled
+/// `date-time` form — an RFC-3339 string, never the epoch number the restJson1
+/// default writes for a timestamp whose format is dropped.
+///
+/// `IngestionJob.startedAt`/`updatedAt`/`textReadyAt` and the same three members
+/// of `IngestionJobSummary` all target the one `DateTimestamp` shape, which
+/// carries `@timestampFormat("date-time")`
+/// (`smithy_query(query="shape",shape="IngestionJob,IngestionJobSummary")`), so
+/// the rule is one rule across the start, the read and the listing, which report
+/// the same instants in that form.
+#[tokio::test]
+async fn every_ingestion_job_timestamp_is_reported_in_the_modelled_date_time_wire_form() {
+    let emulator = Emulator::new();
+    let knowledge_base_id = emulator
+        .knowledge_base("the timestamped store", "job-wire-kb")
+        .await;
+    let data_source_id = emulator
+        .data_source("the timestamped source", &knowledge_base_id, "job_wire_src")
+        .await;
+
+    // A job the clock has carried to COMPLETE carries all three modelled
+    // timestamps; one still running carries the two a running job has and no
+    // `textReadyAt`. The rows below span both.
+    let complete = emulator
+        .run_ingestion_job(
+            "the completed job",
+            &knowledge_base_id,
+            &data_source_id,
+            json!({}),
+        )
+        .await;
+
+    let started = emulator
+        .call(
+            "PUT",
+            &format!(
+                "/knowledgebases/{knowledge_base_id}/datasources/{data_source_id}\
+                 /ingestionjobs/"
+            ),
+            Some(json!({ "description": "a job the clock has not finished" })),
+        )
+        .await;
+    assert_eq!(
+        started.status, 202,
+        "case the started job: expected StartIngestionJob -> 202, got {started:?}"
+    );
+    let running = started.string(&["ingestionJob", "ingestionJobId"]);
+    // StartIngestionJob's own answer: the two instants a job has at its start.
+    let start_started_at = crate::update_round_trip::date_time_wire_instant(
+        "the started job",
+        "ingestionJob.startedAt",
+        started.member(&["ingestionJob", "startedAt"]),
+    );
+    let start_updated_at = crate::update_round_trip::date_time_wire_instant(
+        "the started job",
+        "ingestionJob.updatedAt",
+        started.member(&["ingestionJob", "updatedAt"]),
+    );
+    assert!(
+        start_updated_at >= start_started_at,
+        "case the started job: expected updatedAt at or after startedAt \
+         {start_started_at}, got {start_updated_at}"
+    );
+    assert!(
+        started.member(&["ingestionJob", "textReadyAt"]).is_null(),
+        "case the started job: no text is queryable before the job completes, got {:?}",
+        started.member(&["ingestionJob", "textReadyAt"])
+    );
+
+    for (case, ingestion_job_id, text_is_ready) in [
+        ("a completed job", complete.as_str(), true),
+        ("a running job", running.as_str(), false),
+    ] {
+        let read = emulator
+            .get_ingestion_job(&knowledge_base_id, &data_source_id, ingestion_job_id)
+            .await;
+        assert_eq!(
+            read.status, 200,
+            "case {case}: expected GetIngestionJob -> 200, got {read:?}"
+        );
+        let started_at = crate::update_round_trip::date_time_wire_instant(
+            case,
+            "ingestionJob.startedAt",
+            read.member(&["ingestionJob", "startedAt"]),
+        );
+        let updated_at = crate::update_round_trip::date_time_wire_instant(
+            case,
+            "ingestionJob.updatedAt",
+            read.member(&["ingestionJob", "updatedAt"]),
+        );
+        assert!(
+            updated_at >= started_at,
+            "case {case}: expected updatedAt at or after startedAt {started_at}, \
+             got {updated_at}"
+        );
+        if text_is_ready {
+            let text_ready_at = crate::update_round_trip::date_time_wire_instant(
+                case,
+                "ingestionJob.textReadyAt",
+                read.member(&["ingestionJob", "textReadyAt"]),
+            );
+            assert!(
+                text_ready_at >= started_at,
+                "case {case}: expected textReadyAt at or after startedAt {started_at}, \
+                 got {text_ready_at}"
+            );
+        } else {
+            assert!(
+                read.member(&["ingestionJob", "textReadyAt"]).is_null(),
+                "case {case}: no text is queryable before the job completes, got {:?}",
+                read.member(&["ingestionJob", "textReadyAt"])
+            );
+        }
+
+        // The listing reports the same instants, in the same form.
+        let (summaries, _) = emulator
+            .page(case, &knowledge_base_id, &data_source_id, json!({}))
+            .await;
+        let summary = summaries
+            .iter()
+            .find(|summary| summary_id(case, summary) == ingestion_job_id)
+            .unwrap_or_else(|| {
+                panic!("case {case}: the listing omits {ingestion_job_id}: {summaries:?}")
+            });
+        for member in ["startedAt", "updatedAt"] {
+            crate::update_round_trip::assert_date_time_wire_form(case, member, &summary[member]);
+            assert_eq!(
+                &summary[member],
+                read.member(&["ingestionJob", member]),
+                "case {case}: expected the summary to report the stored {member}, got {:?}",
+                summary[member]
+            );
+        }
+        assert_eq!(
+            &summary["textReadyAt"],
+            read.member(&["ingestionJob", "textReadyAt"]),
+            "case {case}: expected the summary to report the stored textReadyAt, got {:?}",
+            summary["textReadyAt"]
+        );
+    }
+}
+
