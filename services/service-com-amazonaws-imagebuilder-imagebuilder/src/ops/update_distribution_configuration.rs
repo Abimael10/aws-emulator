@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDistributionConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDistributionConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDistributionConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces the distribution configuration this service's state holds, so a later
+//! `GetDistributionConfiguration` reports what this request stored.
+//!
+//! The rules it follows, each from the modelled documentation quoted beside it:
+//!
+//! * the operation "doesn't support selective updates. The request replaces the stored
+//!   configuration, so include every setting that you want to keep", and `distributions`
+//!   "replaces the configuration's existing distributions entirely" — so the stored list is
+//!   the one this request carried, and a description it omits is cleared;
+//! * each entry of `distributions` is read by the requirements a create reads them by
+//!   (`crate::state::refused_distribution_entry`), and a target Region may appear at most
+//!   once in the list;
+//! * an ARN this Region holds no configuration under names nothing, which is reported
+//!   MISSING (`ResourceNotFoundException`) rather than as an invalid request;
+//! * `clientToken` is an idempotency token: a retry carrying it answers with the ORIGINAL
+//!   response, and the same token carrying different settings is
+//!   `IdempotentParameterMismatchException`.
 //!
 //! ## Shape of an operation
 //!
@@ -123,7 +132,23 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-imagebuilder-imagebuild
 // here — hence the `UpdateDistributionConfigurationError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.imagebuilder#UpdateDistributionConfiguration")]
+//
+// Two shapes are widened in through `extra_errors`, each one the SERVICE models and this
+// operation's own error list omits:
+//
+// * `ResourceNotFoundException` (HTTP 404, "At least one of the resources referenced by your
+//   request does not exist"), for the reason `UpdateInfrastructureConfiguration` widens it
+//   in: `distributionConfigurationArn` names a configuration that may not exist, and an ARN
+//   that names none is reported MISSING rather than dressed up as an invalid request, which
+//   is a different claim a client branches on;
+// * `InvalidParameterValueException` (HTTP 400, "The value that you provided for the
+//   specified parameter is invalid"), for the reason `CreateDistributionConfiguration`
+//   widens it in: it is the one class this service refuses a parameter of a request with,
+//   including the requirements on `distributions` the model cannot state.
+#[smithy_macros::operation_error(
+    "com.amazonaws.imagebuilder#UpdateDistributionConfiguration",
+    extra_errors = ["ResourceNotFoundException", "InvalidParameterValueException"]
+)]
 #[derive(Debug)]
 pub enum UpdateDistributionConfigurationErrorModeled {
     CallRateLimitExceededException(CallRateLimitExceededException),
@@ -131,8 +156,10 @@ pub enum UpdateDistributionConfigurationErrorModeled {
     ForbiddenException(ForbiddenException),
     IdempotentParameterMismatchException(IdempotentParameterMismatchException),
     InvalidParameterCombinationException(InvalidParameterCombinationException),
+    InvalidParameterValueException(InvalidParameterValueException),
     InvalidRequestException(InvalidRequestException),
     ResourceInUseException(ResourceInUseException),
+    ResourceNotFoundException(ResourceNotFoundException),
     ServiceException(ServiceException),
     ServiceUnavailableException(ServiceUnavailableException),
 }
@@ -188,18 +215,138 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDistributionConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDistributionConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDistributionConfiguration"))
+        // Every modelled constraint on this input — the ARN pattern, the string lengths,
+        // every constraint inside a distribution entry — has been refused by the centralized
+        // walk before this body runs, so what is checked here is only what the model cannot
+        // say.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateDistributionConfigurationErrorModeled::ServiceException(ServiceException {
+                message: Some(crate::state::store_unavailable_message()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+
+        // The replacement list is read by the requirements a create reads its own by, in the
+        // same order and with the same sentences: a list this operation stores is one a
+        // create would have stored. Read BEFORE anything is written, so a refused update
+        // leaves the stored configuration as it was.
+        if let Some(refused) = crate::state::refused_distribution_entry(&input.distributions) {
+            let message = Some(refused.message());
+            return Err(match refused.why {
+                crate::state::RefusedEntryRequirement::UnreachableTarget(_) => {
+                    UpdateDistributionConfigurationErrorModeled::InvalidParameterCombinationException(
+                        InvalidParameterCombinationException { message },
+                    )
+                }
+                crate::state::RefusedEntryRequirement::WithoutOutputs
+                | crate::state::RefusedEntryRequirement::AmiNameWithoutBuildDate => {
+                    UpdateDistributionConfigurationErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException { message },
+                    )
+                }
+            }
+            .into());
+        }
+
+        // `distributions`' own rule, read as a SET once every entry has been read on its own:
+        // "A Region can appear at most once in the list" — the same reading a create's list is
+        // read by ([`crate::state::duplicate_distribution_region`]).
+        if let Some(duplicate) = crate::state::duplicate_distribution_region(&input.distributions)
+        {
+            return Err(
+                UpdateDistributionConfigurationErrorModeled::InvalidParameterCombinationException(
+                    InvalidParameterCombinationException {
+                        message: Some(crate::state::duplicate_distribution_region_message(
+                            duplicate,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let fingerprint = crate::state::distribution_configuration_update_fingerprint(&input);
+
+        // The idempotency check, the lookup and the replacement happen under ONE lock, so
+        // concurrent updates are serialized: the configuration one of them stores is the one
+        // every later read reports.
+        let mut store = state.lock();
+
+        // "If you retry a request with the same client token, Image Builder returns the
+        // original response without running the operation again" — so a retry answers with
+        // the ORIGINAL response, down to its `requestId`, and does NOT write again. The same
+        // token carrying different settings is the modelled mismatch instead.
+        if let Some(receipt) =
+            store.distribution_configuration_update_receipt(&region, &input.client_token)
+        {
+            if receipt.fingerprint != fingerprint {
+                return Err(
+                    UpdateDistributionConfigurationErrorModeled::IdempotentParameterMismatchException(
+                        IdempotentParameterMismatchException {
+                            message: Some(crate::state::idempotent_parameter_mismatch_message()),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            return Ok(UpdateDistributionConfigurationOutput {
+                request_id: Some(receipt.request_id.clone()),
+                client_token: Some(receipt.client_token.clone()),
+                distribution_configuration_arn: Some(receipt.arn.clone()),
+            });
+        }
+
+        // The configuration this request names has to exist to be replaced.
+        let Some(stored) = store
+            .distribution_configuration(&input.distribution_configuration_arn, &region)
+            .cloned()
+        else {
+            return Err(not_found(&input.distribution_configuration_arn));
+        };
+
+        let request_id = crate::state::new_request_id();
+        let client_token = input.client_token.clone();
+        let arn = stored.arn.clone();
+
+        // The REPLACEMENT: every setting comes from this request — the list it carries
+        // "replaces the configuration's existing distributions entirely", and a description it
+        // omits is cleared — while the three members an update cannot carry are the stored
+        // record's: the name the ARN was derived from, the resource's own tags, and the
+        // instant it was created.
+        store.replace_distribution_configuration(
+            crate::state::DistributionConfigurationRecord {
+                arn: arn.clone(),
+                region,
+                name: stored.name,
+                description: input.description,
+                distributions: input.distributions,
+                tags: stored.tags,
+                date_created: stored.date_created,
+                // This request IS the last update, so its instant is the one every later
+                // read reports as `dateUpdated`.
+                date_updated: Some(crate::state::iso8601(::std::time::SystemTime::now())),
+            },
+            &client_token,
+            fingerprint,
+            request_id.clone(),
+        );
+
+        Ok(UpdateDistributionConfigurationOutput {
+            request_id: Some(request_id),
+            client_token: Some(client_token),
+            distribution_configuration_arn: Some(arn),
+        })
     }
+}
+
+/// How an ARN this Region holds no distribution configuration under is reported: the sentence
+/// this service's configuration resources carry, quoting the ARN the request named.
+fn not_found(arn: &str) -> UpdateDistributionConfigurationError {
+    UpdateDistributionConfigurationErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: Some(crate::state::resource_arn_not_found_message(arn)),
+        },
+    )
+    .into()
 }

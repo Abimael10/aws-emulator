@@ -945,10 +945,14 @@ async fn a_created_pipeline_reads_back_with_its_defaults() {
             "case {case:?}: expected the schedule the create named, carrying the start \
              condition it runs under, in {stored}"
         );
+        // Image Builder "tracks the number of consecutive failures for scheduled pipeline
+        // executions", so a count exists only once a scheduled execution has been tracked for
+        // the pipeline; none has, so the read reports no count at all.
         assert_eq!(
             stored.get("consecutiveFailures"),
-            Some(&json!(0)),
-            "case {case:?}: expected no consecutive scheduled failures in {stored}"
+            None,
+            "case {case:?}: expected no consecutive-failure count before any scheduled \
+             execution in {stored}"
         );
         assert!(
             stored.get("dateNextRun").is_none(),

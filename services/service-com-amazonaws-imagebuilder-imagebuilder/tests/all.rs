@@ -37,6 +37,10 @@ mod dependency_refusal_wording;
 mod distribution_ami_names;
 #[path = "all/distribution_configuration.rs"]
 mod distribution_configuration;
+#[path = "all/distribution_configuration_update.rs"]
+mod distribution_configuration_update;
+#[path = "all/distribution_entry_outputs.rs"]
+mod distribution_entry_outputs;
 #[path = "all/distribution_target_regions.rs"]
 mod distribution_target_regions;
 #[path = "all/error_response_envelope.rs"]
@@ -47,6 +51,8 @@ mod image_creation;
 mod image_output_resources;
 #[path = "all/image_packages.rs"]
 mod image_packages;
+#[path = "all/image_pipeline_consecutive_failures.rs"]
+mod image_pipeline_consecutive_failures;
 #[path = "all/image_pipeline_execution.rs"]
 mod image_pipeline_execution;
 #[path = "all/image_pipeline_listing.rs"]

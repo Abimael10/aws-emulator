@@ -156,6 +156,10 @@ pub use image_pipeline_listing::*;
 mod infrastructure_configuration_update;
 pub use infrastructure_configuration_update::*;
 
+/// How an UPDATE of a distribution configuration replaces the stored record.
+mod distribution_configuration_update;
+pub use distribution_configuration_update::*;
+
 /// How an UPDATE of an image pipeline replaces the stored record.
 mod image_pipeline_update;
 pub use image_pipeline_update::*;
@@ -2034,8 +2038,13 @@ impl ComAmazonawsImagebuilderImagebuilderState {
             workflows: record.workflows.clone(),
             logging_configuration: record.logging_configuration.clone(),
             // "Image Builder tracks the number of consecutive failures for scheduled
-            // pipeline executions": no scheduled execution has run, so none has failed.
-            consecutive_failures: Some(0),
+            // pipeline executions": the count exists only once a scheduled execution has
+            // been tracked for the pipeline, and nothing in this emulator runs a pipeline on
+            // its schedule — the same reason `dateNextRun` reports nothing — so none has been
+            // tracked and a read reports no count rather than claiming a run that none of
+            // them is. A run a caller starts by hand is not a scheduled execution: "if the
+            // pipeline runs manually and fails, the count remains the same."
+            consecutive_failures: None,
         })
     }
 

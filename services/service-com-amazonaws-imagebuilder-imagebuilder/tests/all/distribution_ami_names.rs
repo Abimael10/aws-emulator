@@ -231,13 +231,13 @@ async fn an_ami_name_without_the_build_date_tag_refuses_the_create() {
 }
 
 /// RULE: a name that includes the build-date tag names each build, whatever else it carries
-/// and however the tag is spaced — and an entry naming no output AMI name at all leaves the
-/// naming to Image Builder, so both are stored and read back.
+/// and however the tag is spaced — and AMI settings naming no output AMI name at all leave
+/// the naming to Image Builder, so both are stored and read back.
 #[tokio::test]
 async fn a_name_that_names_each_build_is_stored() {
     // (case, the AMI name the entry named, or none at all)
     let rows: Vec<(&str, Option<&str>)> = vec![
-        ("no AMI name at all", None),
+        ("AMI settings naming no AMI name at all", None),
         (
             "the tag as the documentation writes it",
             Some("golden-{{ imagebuilder:buildDate }}"),
@@ -258,7 +258,7 @@ async fn a_name_that_names_each_build_is_stored() {
         let name = format!("named-build-{index}");
         let distributions = match ami_name {
             Some(ami_name) => json!([entry("us-west-2", ami_name)]),
-            None => json!([{ "region": "us-west-2" }]),
+            None => json!([{ "region": "us-west-2", "amiDistributionConfiguration": {} }]),
         };
         let (status, code, body) = create(&router, &name, distributions).await;
         assert_eq!(

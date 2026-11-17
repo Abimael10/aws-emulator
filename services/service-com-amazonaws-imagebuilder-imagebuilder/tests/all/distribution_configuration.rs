@@ -167,6 +167,13 @@ fn arn_of(region: &str, normalized: &str) -> String {
     format!("arn:aws:imagebuilder:{region}:{ACCOUNT}:distribution-configuration/{normalized}")
 }
 
+/// One `distributions` entry naming `region` as its target and carrying the AMI settings an
+/// entry needs in order to distribute an output there, and nothing else: every entry has to
+/// configure at least one output for its target.
+fn ami_entry(region: &str) -> Value {
+    json!({ "region": region, "amiDistributionConfiguration": {} })
+}
+
 /// The error code a refusal carries, from `__type` (restJson1 renders the shape there,
 /// optionally namespace-qualified).
 fn error_code(case: &str, body: &Value) -> String {
@@ -240,10 +247,10 @@ struct Row {
 fn rows() -> Vec<Row> {
     vec![
         Row {
-            case: "one target Region carrying nothing but its name",
+            case: "one target Region whose AMI settings carry nothing",
             name: "minimal-distribution",
             normalized: "minimal-distribution",
-            distributions: || json!([{ "region": "us-west-2" }]),
+            distributions: || json!([ami_entry("us-west-2")]),
             extra: || json!({}),
         },
         Row {
@@ -360,7 +367,7 @@ fn rows() -> Vec<Row> {
             case: "a configuration carrying every optional member of its own",
             name: "Fully_Described Distribution",
             normalized: "fully-described-distribution",
-            distributions: || json!([{ "region": "ca-central-1" }]),
+            distributions: || json!([ami_entry("ca-central-1")]),
             extra: || {
                 json!({
                     "description": "every member a configuration itself carries",
@@ -481,7 +488,7 @@ async fn a_read_reports_the_same_configuration_every_time() {
     let body = create_body(
         "stable-distribution",
         "token-stable",
-        json!([{ "region": "us-west-2" }]),
+        json!([ami_entry("us-west-2")]),
         json!({ "tags": {"owner": "platform"} }),
     );
     let (status, created) = create(&router, &body).await;
@@ -518,7 +525,7 @@ async fn the_arn_carries_a_normalized_name_and_that_name_is_taken_once() {
     let body = create_body(
         equivalent[0],
         "token-first",
-        json!([{ "region": "us-west-2" }]),
+        json!([ami_entry("us-west-2")]),
         json!({}),
     );
     let (status, created) = create(&router, &body).await;
@@ -541,7 +548,7 @@ async fn the_arn_carries_a_normalized_name_and_that_name_is_taken_once() {
         let body = create_body(
             name,
             &format!("token-same-{n}"),
-            json!([{ "region": "us-west-2" }]),
+            json!([ami_entry("us-west-2")]),
             json!({}),
         );
         let (status, answer) = create(&router, &body).await;
@@ -564,7 +571,7 @@ async fn the_arn_carries_a_normalized_name_and_that_name_is_taken_once() {
     let body = create_body(
         equivalent[0],
         "token-other-region",
-        json!([{ "region": "us-west-2" }]),
+        json!([ami_entry("us-west-2")]),
         json!({}),
     );
     let (status, created) = create_in(&router, other, &body).await;
@@ -597,29 +604,29 @@ async fn a_region_appears_at_most_once_in_the_distributions_list() {
     let rows: Vec<(&str, Value, Option<&str>)> = vec![
         (
             "one Region, named once",
-            json!([{ "region": "us-west-2" }]),
+            json!([ami_entry("us-west-2")]),
             None,
         ),
         (
             "three Regions, each named once",
             json!([
-                { "region": "us-west-2" },
-                { "region": "us-east-1" },
-                { "region": "eu-west-1" },
+                ami_entry("us-west-2"),
+                ami_entry("us-east-1"),
+                ami_entry("eu-west-1"),
             ]),
             None,
         ),
         (
             "the same Region twice, adjacent",
-            json!([{ "region": "us-west-2" }, { "region": "us-west-2" }]),
+            json!([ami_entry("us-west-2"), ami_entry("us-west-2")]),
             Some("us-west-2"),
         ),
         (
             "the same Region twice, with another between them",
             json!([
-                { "region": "eu-west-1" },
-                { "region": "us-east-1" },
-                { "region": "eu-west-1" },
+                ami_entry("eu-west-1"),
+                ami_entry("us-east-1"),
+                ami_entry("eu-west-1"),
             ]),
             Some("eu-west-1"),
         ),
@@ -679,7 +686,7 @@ async fn one_client_token_creates_at_most_one_configuration() {
     let body = create_body(
         "idempotent-distribution",
         "token-reused",
-        json!([{ "region": "us-west-2" }, { "region": "us-east-1" }]),
+        json!([ami_entry("us-west-2"), ami_entry("us-east-1")]),
         json!({ "description": "the first request" }),
     );
 
@@ -703,7 +710,7 @@ async fn one_client_token_creates_at_most_one_configuration() {
             create_body(
                 "other-distribution",
                 "token-reused",
-                json!([{ "region": "us-west-2" }, { "region": "us-east-1" }]),
+                json!([ami_entry("us-west-2"), ami_entry("us-east-1")]),
                 json!({ "description": "the first request" }),
             ),
         ),
@@ -712,7 +719,7 @@ async fn one_client_token_creates_at_most_one_configuration() {
             create_body(
                 "idempotent-distribution",
                 "token-reused",
-                json!([{ "region": "us-west-2" }, { "region": "us-east-1" }]),
+                json!([ami_entry("us-west-2"), ami_entry("us-east-1")]),
                 json!({ "description": "a second request" }),
             ),
         ),
@@ -721,7 +728,7 @@ async fn one_client_token_creates_at_most_one_configuration() {
             create_body(
                 "idempotent-distribution",
                 "token-reused",
-                json!([{ "region": "us-east-1" }, { "region": "us-west-2" }]),
+                json!([ami_entry("us-east-1"), ami_entry("us-west-2")]),
                 json!({ "description": "the first request" }),
             ),
         ),
@@ -730,7 +737,7 @@ async fn one_client_token_creates_at_most_one_configuration() {
             create_body(
                 "idempotent-distribution",
                 "token-reused",
-                json!([{ "region": "us-west-2" }]),
+                json!([ami_entry("us-west-2")]),
                 json!({ "description": "the first request" }),
             ),
         ),
@@ -744,7 +751,7 @@ async fn one_client_token_creates_at_most_one_configuration() {
                         "region": "us-west-2",
                         "amiDistributionConfiguration": {"description": "added"},
                     },
-                    { "region": "us-east-1" },
+                    ami_entry("us-east-1"),
                 ]),
                 json!({ "description": "the first request" }),
             ),
@@ -754,7 +761,7 @@ async fn one_client_token_creates_at_most_one_configuration() {
             create_body(
                 "idempotent-distribution",
                 "token-reused",
-                json!([{ "region": "us-west-2" }, { "region": "us-east-1" }]),
+                json!([ami_entry("us-west-2"), ami_entry("us-east-1")]),
                 json!({"description": "the first request", "tags": {"owner": "platform"}}),
             ),
         ),
@@ -799,7 +806,7 @@ async fn a_dry_run_validates_and_stores_nothing() {
     let body = create_body(
         "dry-run-distribution",
         "token-dry-run",
-        json!([{ "region": "us-west-2" }]),
+        json!([ami_entry("us-west-2")]),
         json!({ "dryRun": true }),
     );
     let (status, answer) = create(&router, &body).await;
@@ -831,7 +838,7 @@ async fn a_dry_run_validates_and_stores_nothing() {
     let duplicate = create_body(
         "dry-run-distribution",
         "token-dry-run-invalid",
-        json!([{ "region": "us-west-2" }, { "region": "us-west-2" }]),
+        json!([ami_entry("us-west-2"), ami_entry("us-west-2")]),
         json!({ "dryRun": true }),
     );
     let (status, answer) = create(&router, &duplicate).await;
@@ -848,7 +855,7 @@ async fn a_dry_run_validates_and_stores_nothing() {
     let real = create_body(
         "dry-run-distribution",
         "token-dry-run",
-        json!([{ "region": "us-west-2" }]),
+        json!([ami_entry("us-west-2")]),
         json!({}),
     );
     let (status, created) = create(&router, &real).await;
@@ -869,7 +876,7 @@ async fn an_arn_nothing_was_stored_under_is_reported_missing() {
     let body = create_body(
         "present-distribution",
         "token-present",
-        json!([{ "region": "us-west-2" }]),
+        json!([ami_entry("us-west-2")]),
         json!({}),
     );
     let (status, created) = create(&router, &body).await;
@@ -967,7 +974,7 @@ async fn a_pipeline_resolves_a_reference_to_a_stored_configuration() {
     let body = create_body(
         "pipeline-distribution",
         "token-pipeline-distribution",
-        json!([{ "region": "us-west-2" }, { "region": "us-east-1" }]),
+        json!([ami_entry("us-west-2"), ami_entry("us-east-1")]),
         json!({}),
     );
     let (status, created) = create(&router, &body).await;

@@ -10,9 +10,9 @@
 //! * the ARN is derived from a NORMALIZED form of the name
 //!   (`crate::state::normalized_name`), and that normalized name must be unique in the
 //!   Region — a second create under it is `ResourceAlreadyExistsException`;
-//! * each entry of `distributions` must name a target Region this service can distribute
-//!   through and must name its output AMI per build, and a target Region may appear at most
-//!   once in the list;
+//! * each entry of `distributions` must configure at least one output for its target, must
+//!   name a target Region this service can distribute through and must name its output AMI
+//!   per build, and a target Region may appear at most once in the list;
 //! * `clientToken` is an idempotency token: a retry carrying it answers with the ORIGINAL
 //!   response, and the same token carrying different creation parameters is
 //!   `IdempotentParameterMismatchException`;
@@ -235,15 +235,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
 
-        // Two requirements of a distribution entry live in the model's prose rather than in
-        // a constraint, so the walk cannot refuse them: the entry has to name a target
-        // Region this service can distribute through, and the output AMI it names has to be
-        // named per build ([`crate::state::refused_distribution_entry`]). Each is a value of
-        // ONE member of ONE entry, so both are read per ENTRY, before the list is read as a
-        // set. A target that offers no AMI distribution refuses the entry's AMI settings
-        // TOGETHER with the Region they would apply in — a combination of parameters this
-        // operation does not accept — while a name that does not name each build is that
-        // one member's own value.
+        // Three requirements of a distribution entry live in the model's prose rather than in
+        // a constraint, so the walk cannot refuse them: the entry has to configure at least
+        // one output for its target, it has to name a target Region this service can
+        // distribute through, and the output AMI it names has to be named per build
+        // ([`crate::state::refused_distribution_entry`]). They are read per ENTRY, before the
+        // list is read as a set. An entry that configures NO output is a value of the
+        // `distributions` entry itself that this operation does not accept, and so is the AMI
+        // name that does not name each build; a target that offers no AMI distribution refuses
+        // the entry's AMI settings TOGETHER with the Region they would apply in — a
+        // combination of parameters this operation does not accept.
         if let Some(refused) = crate::state::refused_distribution_entry(&input.distributions) {
             let message = Some(refused.message());
             return Err(match refused.why {
@@ -252,7 +253,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         InvalidParameterCombinationException { message },
                     )
                 }
-                crate::state::RefusedEntryRequirement::AmiNameWithoutBuildDate => {
+                crate::state::RefusedEntryRequirement::WithoutOutputs
+                | crate::state::RefusedEntryRequirement::AmiNameWithoutBuildDate => {
                     CreateDistributionConfigurationErrorModeled::InvalidParameterValueException(
                         InvalidParameterValueException { message },
                     )
@@ -261,24 +263,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // `distributions`' own rule: "Each entry defines how output images are distributed
-        // in one target Amazon Web Services Region. A Region can appear at most once in the
-        // list." Two entries for one Region are two settings for the same target, which is
-        // a combination of parameters the service does not accept.
-        let mut targets: ::std::collections::BTreeSet<&str> = ::std::collections::BTreeSet::new();
-        for distribution in &input.distributions {
-            if !targets.insert(distribution.region.as_str()) {
-                return Err(
-                    CreateDistributionConfigurationErrorModeled::InvalidParameterCombinationException(
-                        InvalidParameterCombinationException {
-                            message: Some(crate::state::duplicate_distribution_region_message(
-                                &distribution.region,
-                            )),
-                        },
-                    )
-                    .into(),
-                );
-            }
+        // `distributions`' own rule, read as a SET once every entry has been read on its own:
+        // "A Region can appear at most once in the list"
+        // ([`crate::state::duplicate_distribution_region`], the one reading a create and an
+        // update share).
+        if let Some(duplicate) = crate::state::duplicate_distribution_region(&input.distributions)
+        {
+            return Err(
+                CreateDistributionConfigurationErrorModeled::InvalidParameterCombinationException(
+                    InvalidParameterCombinationException {
+                        message: Some(crate::state::duplicate_distribution_region_message(
+                            duplicate,
+                        )),
+                    },
+                )
+                .into(),
+            );
         }
 
         let fingerprint = crate::state::distribution_configuration_request_fingerprint(&input);

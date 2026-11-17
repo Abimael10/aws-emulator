@@ -7,10 +7,11 @@
 //! a signed AWS SDK request observes.
 //!
 //! The rule under test: a `distributions` entry's `region` is "the target Region" the
-//! entry's settings apply in, so an entry whose value is not a Region label names no target
-//! to distribute through and the create is refused — the AMI distribution of THAT entry is
-//! reported as unavailable in the Region the request named, by the entry's own position —
-//! while every entry naming a Region label is stored and read back.
+//! entry's settings apply in, so an entry whose value names no Region this service
+//! distributes through has no target to distribute to and the create is refused — the AMI
+//! distribution of THAT entry is reported as unavailable in the Region the request named, by
+//! the entry's own position — while every entry naming one of those Regions is stored and
+//! read back.
 
 use std::sync::Arc;
 
@@ -186,13 +187,14 @@ fn expected_message(index: usize, region: &str) -> String {
     )
 }
 
-/// RULE: a `distributions` entry whose `region` is not a Region label names no target, so
-/// the create is refused with that entry's AMI distribution reported unavailable in the
-/// Region the request named — and nothing is stored.
+/// RULE: a `distributions` entry whose `region` names no Region this service distributes
+/// through names no target, so the create is refused with that entry's AMI distribution
+/// reported unavailable in the Region the request named — and nothing is stored.
 ///
-/// The rows differ along what the rule generalises over: the FORM of the value that is not a
-/// Region label (case, a separator, a label past the length the field admits, a bare word),
-/// and the POSITION of the entry that carries it.
+/// The rows differ along what the rule generalises over: the FORM of the value that names no
+/// Region of this partition (case, a separator, a label past the length a Region field
+/// admits, a bare word, a well-formed label of a Region that does not exist, a Region of
+/// another partition), and the POSITION of the entry that carries it.
 #[tokio::test]
 async fn an_entry_naming_no_region_refuses_the_create() {
     // (case, the targets the request named, the position refused, the value refused)
@@ -210,13 +212,13 @@ async fn an_entry_naming_no_region_refuses_the_create() {
             "Eu-West-1",
         ),
         (
-            "the second target, after a Region label",
+            "the second target, after a Region of the partition",
             vec!["us-west-2", "AP-SOUTHEAST-3"],
             1,
             "AP-SOUTHEAST-3",
         ),
         (
-            "the third target, after two Region labels",
+            "the third target, after two Regions of the partition",
             vec!["us-west-2", "eu-central-1", "US_WEST_1"],
             2,
             "US_WEST_1",
@@ -240,6 +242,32 @@ async fn an_entry_naming_no_region_refuses_the_create() {
             "Oregon",
         ),
         (
+            "a well-formed label of a Region that does not exist",
+            vec!["us-nowhere-1"],
+            0,
+            "us-nowhere-1",
+        ),
+        (
+            "a Region code with its number changed",
+            vec!["us-west-2", "eu-west-9"],
+            1,
+            "eu-west-9",
+        ),
+        (
+            // The catalog holds the other partitions' Regions, and a distribution of this
+            // one reaches none of them.
+            "a GovCloud Region",
+            vec!["us-gov-west-1"],
+            0,
+            "us-gov-west-1",
+        ),
+        (
+            "a China Region, after a Region of this partition",
+            vec!["us-west-2", "cn-north-1"],
+            1,
+            "cn-north-1",
+        ),
+        (
             "two targets naming no Region, the first of them refused",
             vec!["US-EAST-2", "EU-WEST-1"],
             0,
@@ -250,8 +278,12 @@ async fn an_entry_naming_no_region_refuses_the_create() {
     for (index, (case, targets, position, refused)) in rows.into_iter().enumerate() {
         let router = emulator();
         let name = format!("unreachable-target-{index}");
-        let distributions =
-            Value::Array(targets.iter().map(|region| json!({ "region": region })).collect());
+        let distributions = Value::Array(
+            targets
+                .iter()
+                .map(|region| json!({ "region": region, "amiDistributionConfiguration": {} }))
+                .collect(),
+        );
         let answer = create(&router, &name, distributions).await;
 
         assert_eq!(
@@ -284,13 +316,14 @@ async fn an_entry_naming_no_region_refuses_the_create() {
     }
 }
 
-/// RULE: every entry naming a Region label is a target this service distributes to, so the
+/// RULE: every entry naming a Region this service distributes through is a target, so the
 /// create succeeds and the stored configuration reports those targets back.
 ///
-/// The rows differ along how many targets one configuration names and which Region labels
-/// they are, including the Region the request itself was signed for.
+/// The rows differ along how many targets one configuration names and which Regions they
+/// are, including the Region the request itself was signed for and Regions no fixture of this
+/// service names.
 #[tokio::test]
-async fn every_entry_naming_a_region_label_is_stored() {
+async fn every_entry_naming_a_region_of_the_partition_is_stored() {
     // (case, the targets the request named)
     let rows: Vec<(&str, Vec<&str>)> = vec![
         ("one target, the signing Region itself", vec!["us-west-2"]),
@@ -299,16 +332,25 @@ async fn every_entry_naming_a_region_label_is_stored() {
             "three targets across three areas",
             vec!["us-east-1", "ap-southeast-3", "eu-west-1"],
         ),
-        // The grammar bounds the label at twenty characters, so a label of exactly twenty is
-        // the last one it admits.
-        ("a target of the longest label the field admits", vec!["us-west-2-us-west-20"]),
+        // Regions read straight off this tree's one Region catalog
+        // (`emulator_telemetry::policy::KNOWN_REGIONS`, which
+        // `crate::state::distribution_target` reads a target against), which no fixture of
+        // this service names: a target is decided by that catalog, not by one recording.
+        (
+            "three targets no fixture of this service names",
+            vec!["af-south-1", "me-central-1", "mx-central-1"],
+        ),
     ];
 
     for (index, (case, targets)) in rows.into_iter().enumerate() {
         let router = emulator();
         let name = format!("reachable-target-{index}");
-        let distributions =
-            Value::Array(targets.iter().map(|region| json!({ "region": region })).collect());
+        let distributions = Value::Array(
+            targets
+                .iter()
+                .map(|region| json!({ "region": region, "amiDistributionConfiguration": {} }))
+                .collect(),
+        );
         let answer = create(&router, &name, distributions).await;
         assert_eq!(
             answer.status, 200,

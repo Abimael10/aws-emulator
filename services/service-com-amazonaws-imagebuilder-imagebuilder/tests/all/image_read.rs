@@ -358,7 +358,7 @@ async fn create_distribution(router: &MultiServiceRouter, region: &str, name: &s
     let body = json!({
         "name": name,
         "clientToken": format!("distribution-{region}-{name}"),
-        "distributions": [{ "region": region }],
+        "distributions": [{ "region": region, "amiDistributionConfiguration": {} }],
     });
     let case = format!("create the distribution configuration {name} in {region}");
     let (status, answer) = call_in(
