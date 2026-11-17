@@ -1595,9 +1595,15 @@ pub(super) async fn delete_security_policy(
 /// collection by — so the create's own answer replaces the computed physical id, and
 /// `Fn::GetAtt` reads `Id`, `Arn`, `CollectionEndpoint` and `DashboardEndpoint` off what
 /// the owning service reports rather than off anything rebuilt here. The resource's
-/// `Name`, `Type`, `Description`, `StandbyReplicas` and `Tags` are mapped onto the API's
-/// own members, and its `tags` carry the stack's propagated tags beside the declared ones
-/// ([`tags_of`]).
+/// `Name`, `Type`, `Description`, `StandbyReplicas`, `EncryptionConfig` and `Tags` are
+/// mapped onto the API's own members, and its `tags` carry the stack's propagated tags
+/// beside the declared ones ([`tags_of`]).
+///
+/// `EncryptionConfig` is the one STRUCTURED property of the type, and it is the setting the
+/// create needs when no `encryption` security policy covers the collection's name, so it
+/// travels as the `encryptionConfig` structure that call takes, its members re-cased out of
+/// the template's upper camel into the model's own spelling ([`lower_camel_members`]:
+/// `AWSOwnedKey` -> `aWSOwnedKey`, `KmsKeyArn` -> `kmsKeyArn`).
 pub(super) async fn create_collection(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -1616,6 +1622,14 @@ pub(super) async fn create_collection(
     ] {
         if let Some(value) = property(resource, declared) {
             request.insert(member.to_string(), Value::String(value));
+        }
+    }
+    if let Some(declared) = resource.properties.get(COLLECTION_ENCRYPTION_CONFIG) {
+        if !declared.is_null() {
+            request.insert(
+                "encryptionConfig".to_string(),
+                lower_camel_members(declared, 0)?,
+            );
         }
     }
     let tags: Vec<Value> = tags_of(&resource.properties, propagated)
@@ -1685,6 +1699,49 @@ pub(super) async fn create_collection(
     })
 }
 
+/// Whether OpenSearch Serverless has finished bringing up the collection a stack created.
+///
+/// `CreateCollection` answers the collection `CREATING` — the status of a collection "being
+/// created", which publishes no reachable endpoint and takes no index yet — and that service
+/// reports it `ACTIVE` once it is up (`smithy_query(query="shape",
+/// shape="CollectionStatus")`), so the resource's creation is finished there. `FAILED` is
+/// that shape's own terminal failure, which no wait will bring up, and a collection the
+/// service no longer holds is reported as an error detail rather than with a refusal.
+pub(super) async fn collection_readiness(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Readiness, Refusal> {
+    /// The status a collection that is up is reported in.
+    const ACTIVE: &str = "ACTIVE";
+    /// The status a create that failed leaves the collection in.
+    const FAILED: &str = "FAILED";
+
+    let answer = call_json_rpc(
+        ctx,
+        AOSS_SIGNING_NAME,
+        region,
+        AWS_JSON_1_0,
+        &format!("{AOSS_TARGET_PREFIX}.BatchGetCollection"),
+        &serde_json::json!({ "ids": [physical_resource_id] }),
+    )
+    .await?;
+    let Some(detail) = first_listed(&answer, "collectionDetails") else {
+        return Ok(Readiness::Failed(format!(
+            "OpenSearch Serverless holds no collection {physical_resource_id}"
+        )));
+    };
+    let status = detail
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    match status {
+        ACTIVE => Ok(Readiness::Ready),
+        FAILED => Ok(Readiness::Failed(FAILED.to_string())),
+        pending => Ok(Readiness::Pending(pending.to_string())),
+    }
+}
+
 /// Delete the collection a stack created, by the id the create reported. A collection the
 /// service no longer has is already in the state the delete asks for.
 pub(super) async fn delete_collection(
@@ -1709,10 +1766,211 @@ pub(super) async fn delete_collection(
     }
 }
 
+/// The property an `AWS::OpenSearchServerless::Collection` states its encryption setting
+/// under, which is the `EncryptionConfig` structure `CreateCollection` takes as
+/// `encryptionConfig` (`smithy_query(query="shape", shape="EncryptionConfig")`).
+const COLLECTION_ENCRYPTION_CONFIG: &str = "EncryptionConfig";
+
+/// Create the managed interface endpoint an `AWS::OpenSearchServerless::VpcEndpoint`
+/// declares.
+///
+/// `Ref` on this resource returns the endpoint's **Id** — the `vpce-…` value
+/// `VpcEndpointId`'s own `^vpce-[0-9a-z]*$` constrains, which is what `BatchGetVpcEndpoint`,
+/// `UpdateVpcEndpoint` and `DeleteVpcEndpoint` address an endpoint by — so the create's own
+/// answer replaces the id CloudFormation's naming rules computed from the declared `Name`:
+/// a name is a value that service's own API rejects where an id is required.
+///
+/// The type's `Name`, `VpcId`, `SubnetIds` and `SecurityGroupIds` are the create's own
+/// members. The VPC the endpoint is reached FROM and the subnets its interfaces sit in are
+/// REQUIRED members of that call (`smithy_query(query="operation",
+/// operation="CreateVpcEndpoint")`), so a declaration carrying neither describes no endpoint
+/// and is refused here rather than with a request the owning service would have to reject;
+/// `Name` is the third, and it is the one value CloudFormation decides — this resource's
+/// physical id. The type publishes no `Tags` property and that call takes none, so no tag is
+/// propagated to an endpoint.
+pub(super) async fn create_vpc_endpoint(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Created, Refusal> {
+    let mut request = Map::new();
+    request.insert(
+        "name".to_string(),
+        Value::String(resource.physical_resource_id.clone()),
+    );
+    request.insert(
+        "vpcId".to_string(),
+        Value::String(declared_property(resource, "VpcId")?),
+    );
+    let subnets = declared_text_list(&resource.properties, "SubnetIds");
+    if subnets.is_empty() {
+        return Err(missing_property(resource, "SubnetIds"));
+    }
+    request.insert(
+        "subnetIds".to_string(),
+        Value::Array(subnets.into_iter().map(Value::String).collect()),
+    );
+    // The security groups are OPTIONAL on both sides, so a declaration carrying none sends
+    // none rather than an empty list the member's own `length` would refuse.
+    let security_groups = declared_text_list(&resource.properties, "SecurityGroupIds");
+    if !security_groups.is_empty() {
+        request.insert(
+            "securityGroupIds".to_string(),
+            Value::Array(security_groups.into_iter().map(Value::String).collect()),
+        );
+    }
+    let reported = call_json_rpc(
+        ctx,
+        AOSS_SIGNING_NAME,
+        region,
+        AWS_JSON_1_0,
+        &format!("{AOSS_TARGET_PREFIX}.CreateVpcEndpoint"),
+        &Value::Object(request),
+    )
+    .await?;
+    let id = reported
+        .get("createVpcEndpointDetail")
+        .and_then(|detail| detail.get("id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| Refusal {
+            code: UNIDENTIFIED_FAILURE.to_string(),
+            message: "the created VPC endpoint carries no id".to_string(),
+        })?
+        .to_string();
+    // The one attribute the type publishes beside its `Ref`: the endpoint's `Id`, which IS
+    // the id that service minted.
+    let mut attributes = BTreeMap::new();
+    attributes.insert("Id".to_string(), id.clone());
+    Ok(Created {
+        physical_resource_id: Some(id),
+        attributes,
+    })
+}
+
+/// One property a resource type REQUIRES, as the text its API member takes.
+fn declared_property(resource: &StoredResource, name: &str) -> Result<String, Refusal> {
+    property(resource, name).ok_or_else(|| missing_property(resource, name))
+}
+
+/// The refusal for a required property a declaration does not carry, worded as
+/// [`declared_type`] words the same absence.
+fn missing_property(resource: &StoredResource, name: &str) -> Refusal {
+    Refusal {
+        code: MISSING_PROPERTY_CODE.to_string(),
+        message: format!("{} declares no {name}", resource.resource_type),
+    }
+}
+
+/// Whether OpenSearch Serverless has finished bringing up the endpoint a stack created.
+///
+/// `CreateVpcEndpoint` answers the endpoint `PENDING` — the status of a "Pending VPCEndpoint
+/// resource", in which no client reaches the collection through it — and that service
+/// reports it `ACTIVE` once the endpoint "is ready to use"
+/// (`smithy_query(query="shape", shape="VpcEndpointStatus")`), so the resource's creation is
+/// finished there. `FAILED` is that shape's own terminal failure, which no wait will bring
+/// up, and an endpoint the service no longer holds is reported as an error detail rather
+/// than with a refusal.
+pub(super) async fn vpc_endpoint_readiness(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Readiness, Refusal> {
+    /// The status an endpoint that is ready to use is reported in.
+    const ACTIVE: &str = "ACTIVE";
+    /// The status a create or a delete that failed leaves the endpoint in.
+    const FAILED: &str = "FAILED";
+
+    let Some(detail) = read_vpc_endpoint(ctx, region, physical_resource_id).await? else {
+        return Ok(Readiness::Failed(format!(
+            "OpenSearch Serverless holds no VPC endpoint {physical_resource_id}"
+        )));
+    };
+    let status = detail
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if status == ACTIVE {
+        return Ok(Readiness::Ready);
+    }
+    if status == FAILED {
+        // The failure the service itself reported, which is what the stack event carries.
+        let reported = ["failureMessage", "failureCode"]
+            .iter()
+            .filter_map(|member| detail.get(*member).and_then(Value::as_str))
+            .find(|reason| !reason.is_empty())
+            .unwrap_or(FAILED);
+        return Ok(Readiness::Failed(reported.to_string()));
+    }
+    Ok(Readiness::Pending(status.to_string()))
+}
+
+/// The one `vpcEndpointDetails` entry `BatchGetVpcEndpoint` reports for `id`, or `None` when
+/// it reports the id as an error detail instead — which is how that call answers an endpoint
+/// it no longer holds.
+async fn read_vpc_endpoint(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let answer = call_json_rpc(
+        ctx,
+        AOSS_SIGNING_NAME,
+        region,
+        AWS_JSON_1_0,
+        &format!("{AOSS_TARGET_PREFIX}.BatchGetVpcEndpoint"),
+        &serde_json::json!({ "ids": [id] }),
+    )
+    .await?;
+    Ok(first_listed(&answer, "vpcEndpointDetails"))
+}
+
+/// Delete the managed interface endpoint a stack created, by the id the create reported. An
+/// endpoint the service no longer holds is already in the state the delete asks for.
+pub(super) async fn delete_vpc_endpoint(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    match call_json_rpc(
+        ctx,
+        AOSS_SIGNING_NAME,
+        region,
+        AWS_JSON_1_0,
+        &format!("{AOSS_TARGET_PREFIX}.DeleteVpcEndpoint"),
+        &serde_json::json!({ "id": physical_resource_id }),
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The endpoint's configuration as OpenSearch Serverless reports it, for drift detection, in
+/// the TYPE's own property vocabulary — the same correspondence the create maps the other
+/// way, so an actual configuration is comparable with the template's.
+///
+/// `BatchGetVpcEndpoint` reports an endpoint it no longer holds as a
+/// `vpcEndpointErrorDetails` entry rather than with a refusal, so "no `vpcEndpointDetails`
+/// entry" is what says the endpoint was deleted.
+pub(super) async fn describe_vpc_endpoint(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let Some(detail) = read_vpc_endpoint(ctx, region, physical_resource_id).await? else {
+        return Ok(None);
+    };
+    Ok(Some(reported_as_properties(
+        &detail,
+        &[("Name", "name"), ("VpcId", "vpcId")],
+    )))
+}
+
 // ---------------------------------------------------------------------------
 // Amazon OpenSearch Service: AWS::OpenSearchService::Domain
 // ---------------------------------------------------------------------------
-
 /// Amazon OpenSearch Service's signing name, from its model (`sigv4Name: es`). It speaks
 /// `restJson1`, so its calls ride on [`call_rest_json`] with the method and URI each
 /// operation's own `http` binding declares.

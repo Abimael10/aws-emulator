@@ -484,11 +484,12 @@ pub(super) const NEPTUNE_GRAPH_ID_PREFIX: &str = "g";
 pub(super) const NEPTUNE_SNAPSHOT_ID_PREFIX: &str = "gs";
 pub(super) const NEPTUNE_GRAPH_ID_DIGITS: usize = 10;
 
-/// The `AWS::<cloudFormationName>::<Resource>` types of the two OpenSearch Serverless
+/// The `AWS::<cloudFormationName>::<Resource>` types of the OpenSearch Serverless
 /// resources a stack creates. The middle segment is that service's own
 /// `awsService.cloudFormationName` (`OpenSearchServerless`).
 pub const AOSS_COLLECTION: &str = "AWS::OpenSearchServerless::Collection";
 pub const AOSS_SECURITY_POLICY: &str = "AWS::OpenSearchServerless::SecurityPolicy";
+pub const AOSS_VPC_ENDPOINT: &str = "AWS::OpenSearchServerless::VpcEndpoint";
 
 /// The type of an Amazon OpenSearch Service domain — a different service from the
 /// serverless one above, whose own model is reached by the `es` signing name. Its middle

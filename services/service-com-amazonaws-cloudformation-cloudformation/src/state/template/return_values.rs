@@ -645,6 +645,13 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         || resource_type == LAMBDA_VERSION
         || resource_type == KMS_KEY
         || resource_type == AOSS_COLLECTION
+        // An OpenSearch Serverless managed interface ENDPOINT is the same case:
+        // `CreateVpcEndpoint` takes the endpoint's `name` and no identifier for it, and
+        // answers the `vpce-…` `id` that service minted — which `VpcEndpointId`'s own
+        // `^vpce-[0-9a-z]*$` constrains, so a name is a value that service's API rejects
+        // where an id is required — and that id is what `BatchGetVpcEndpoint`,
+        // `UpdateVpcEndpoint` and `DeleteVpcEndpoint` each take.
+        || resource_type == AOSS_VPC_ENDPOINT
         || resource_type == ACM_ACME_ENDPOINT
         // An ACM certificate is the same case: `RequestCertificate` takes no identifier
         // and answers the `CertificateArn` ACM minted, and that type's `Ref` returns that

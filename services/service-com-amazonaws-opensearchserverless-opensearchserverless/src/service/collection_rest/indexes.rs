@@ -184,7 +184,10 @@ pub(super) fn mapping_request(
 ///
 /// A mapping write ADDS to what the index holds: the members the body names replace the
 /// ones of the same name and every other stays, which is what makes a second write of one
-/// field leave the rest of the mapping alone.
+/// field leave the rest of the mapping alone. The merge is
+/// [`state::merged_index_schema`] — the one the control plane's `UpdateIndex` writes a
+/// schema through — applied to the `mappings` member this route addresses, so the two
+/// planes cannot disagree about what a schema write leaves behind.
 fn write_mapping(
     collection: &mut CollectionRecord,
     request: &Request<'_>,
@@ -201,53 +204,38 @@ fn write_mapping(
         }
         Err(refusal) => return *refusal,
     };
-    let Value::Object(added) = body else {
+    if !body.is_object() {
         return error(
             400,
             PARSE_EXCEPTION,
             "failed to parse: expected the mapping body to be an object",
         );
-    };
-    if !collection.indexes.contains_key(index_name) {
-        return index_not_found(index_name);
     }
-    let mut schema = schema_value(collection, index_name);
-    let held = schema
-        .as_object_mut()
-        .and_then(|members| {
-            members
-                .entry("mappings")
-                .or_insert_with(|| json!({}))
-                .as_object_mut()
-        });
-    let Some(held) = held else {
+    let Some(index) = collection.indexes.get_mut(index_name) else {
+        return index_not_found(index_name);
+    };
+    let submitted = match document_within(
+        &json!({ "mappings": body }),
+        state::MAX_INDEX_SCHEMA_NODES,
+        "the mapping body",
+    ) {
+        Ok(submitted) => submitted,
+        Err(refusal) => return *refusal,
+    };
+    let merged = state::merged_index_schema(index.index_schema.as_ref(), submitted);
+    // A merge of two documents that each fit can make one that does not, so what is stored
+    // is held to the bound one index's schema is stored under.
+    if !state::document_within_bounds(&merged, state::MAX_INDEX_SCHEMA_NODES) {
         return error(
             400,
             ILLEGAL_ARGUMENT_EXCEPTION,
-            &format!("the mappings of index [{index_name}] are not an object"),
+            &format!(
+                "the mappings of index [{index_name}] cannot hold more than {} values",
+                state::MAX_INDEX_SCHEMA_NODES
+            ),
         );
-    };
-    for (name, member) in added {
-        match (held.get_mut(&name), member) {
-            // `properties` is a map of fields, so a write of one field adds to the fields
-            // the index already maps rather than replacing all of them.
-            (Some(Value::Object(fields)), Value::Object(written)) if name == "properties" => {
-                fields.extend(written);
-            }
-            (_, member) => {
-                held.insert(name, member);
-            }
-        }
     }
-    let written = match document_within(&schema, state::MAX_INDEX_SCHEMA_NODES, "the mapping body") {
-        Ok(written) => written,
-        Err(refusal) => return *refusal,
-    };
-    match collection.indexes.get_mut(index_name) {
-        Some(index) => index.index_schema = Some(written),
-        // Unreachable: the index was found above and this call holds the store.
-        None => return index_not_found(index_name),
-    }
+    index.index_schema = Some(merged);
     ok(&json!({ "acknowledged": true }))
 }
 
@@ -266,15 +254,6 @@ pub(super) fn settings_request(
     ok(&json!({
         index_name: { "settings": settings(collection, index_name, index) }
     }))
-}
-
-/// The index's whole stored schema as JSON — `{}` for an index created without one.
-fn schema_value(collection: &CollectionRecord, index_name: &str) -> Value {
-    collection
-        .indexes
-        .get(index_name)
-        .and_then(|index| index.index_schema.as_ref())
-        .map_or_else(|| json!({}), json_from_document)
 }
 
 /// The index's field mappings: the `mappings` member of the schema its create carried, or

@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateIndex
-//! IMPLEMENTED: replaces the `indexSchema` held on the `IndexRecord` the requested
-//! collection id and index name address, so `GetIndex` reports the updated schema back. A
+//! IMPLEMENTED: merges the submitted `indexSchema` into the one held on the `IndexRecord`
+//! the requested collection id and index name address — objects merge member by member at
+//! every level and anything else replaces what it was written over — so a field added
+//! leaves the fields the index already mapped in place and `GetIndex` reports the union. A
 //! request that names no `indexSchema` leaves the stored one as it was. Refuses an index
-//! name the member's own documented rule rejects (`ValidationException`), a schema past
-//! the emulator's document bounds (`ValidationException`), and an id or a name that
-//! addresses no collection or no index (`ResourceNotFoundException`).
+//! name the member's own documented rule rejects (`ValidationException`), a submitted or a
+//! merged schema past the emulator's document bounds (`ValidationException`), and an id or a
+//! name that addresses no collection or no index (`ResourceNotFoundException`).
 //!
 //! ## Shape of an operation
 //!
@@ -167,7 +169,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The replacement schema is STORED, so it is held to the same document bounds the
-        // create holds a stored schema to: an update cannot grow one past what a create
+        // create holds a stored schema to: a write cannot grow one past what a create
         // could have written. See `crate::state::MAX_INDEX_SCHEMA_NODES`.
         if let Some(schema) = &input.index_schema {
             if !crate::state::document_within_bounds(schema, crate::state::MAX_INDEX_SCHEMA_NODES) {
@@ -204,13 +206,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // Only the member the request NAMES is applied: `indexSchema` is "the updated JSON
-        // schema definition for the index", so a request carrying one replaces the stored
-        // definition with it, and a request carrying none asks for no schema change and
-        // leaves the stored one alone. Writing the same schema twice therefore lands the
-        // same state, which is what `@idempotent` on this operation asks for.
+        // Only the member the request NAMES is applied, and a request carrying no
+        // `indexSchema` asks for no schema change at all. `indexSchema` is "the UPDATED JSON
+        // schema definition for the index" of an operation that "allows you to modify the
+        // index schema, including adding new fields or changing field mappings", so a
+        // submitted schema is MERGED into the stored one
+        // ([`crate::state::merged_index_schema`], the one merge the REST plane's mapping
+        // write goes through too): the members it names are written and every member it does
+        // not keeps what it held, so a field added leaves the fields the index already maps
+        // in place. Writing the same schema twice therefore lands the same state, which is
+        // what `@idempotent` on this operation asks for.
         if let Some(schema) = input.index_schema {
-            index.index_schema = Some(schema);
+            let merged = crate::state::merged_index_schema(index.index_schema.as_ref(), schema);
+            // A merge of two documents that each fit can make one that does not, so the
+            // document this writes is held to the same bound a stored schema is held to
+            // above.
+            if !crate::state::document_within_bounds(
+                &merged,
+                crate::state::MAX_INDEX_SCHEMA_NODES,
+            ) {
+                return Err(
+                    UpdateIndexErrorModeled::ValidationException(ValidationException {
+                        message: Some(crate::state::index_schema_bounds_message()),
+                    })
+                    .into(),
+                );
+            }
+            index.index_schema = Some(merged);
         }
 
         // `UpdateIndexResponse` models no members: the updated index is what the call

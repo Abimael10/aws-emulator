@@ -475,7 +475,7 @@ use super::template::{
     ACMPCA_PERMISSION,
     ACM_ACME_ENDPOINT, ACM_CERTIFICATE, AMPLIFYUIBUILDER_COMPONENT, AMPLIFYUIBUILDER_FORM,
     AMPLIFYUIBUILDER_THEME, AMPLIFY_APP, AMPLIFY_BRANCH, AOSS_COLLECTION,
-    AOSS_SECURITY_POLICY, APIGATEWAY_BASE_PATH_MAPPING, APIGATEWAY_DOMAIN_NAME, APIGATEWAYV2_API,
+    AOSS_SECURITY_POLICY, AOSS_VPC_ENDPOINT, APIGATEWAY_BASE_PATH_MAPPING, APIGATEWAY_DOMAIN_NAME, APIGATEWAYV2_API,
     APIGATEWAYV2_API_MAPPING, APIGATEWAYV2_AUTHORIZER, APIGATEWAYV2_DEPLOYMENT,
     APIGATEWAYV2_DOMAIN_NAME, APIGATEWAYV2_INTEGRATION, APIGATEWAYV2_ROUTE,
     APIGATEWAYV2_STAGE, BACKUP_GATEWAY_HYPERVISOR, BACKUP_PLAN, BACKUP_SELECTION, BACKUP_VAULT,
@@ -695,6 +695,11 @@ pub(super) enum Provisioner {
     AutoScalingScalingPolicy,
     OpenSearchServerlessCollection,
     OpenSearchServerlessSecurityPolicy,
+    /// `AWS::OpenSearchServerless::VpcEndpoint`: a managed interface endpoint of OpenSearch
+    /// Serverless, which `CreateVpcEndpoint` creates under the name the stack decided and
+    /// `DeleteVpcEndpoint` removes by the `vpce-…` id that service minted — the id this
+    /// type's `Ref` returns, because it is what every call on an endpoint takes.
+    OpenSearchServerlessVpcEndpoint,
     /// `AWS::OpenSearchService::Domain`: a domain of Amazon OpenSearch Service, which is a
     /// different service from the serverless one above — `CreateDomain` creates it and
     /// `DeleteDomain` deletes it.
@@ -1233,6 +1238,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         }
         AOSS_COLLECTION => Some(Provisioner::OpenSearchServerlessCollection),
         AOSS_SECURITY_POLICY => Some(Provisioner::OpenSearchServerlessSecurityPolicy),
+        AOSS_VPC_ENDPOINT => Some(Provisioner::OpenSearchServerlessVpcEndpoint),
         OPENSEARCH_DOMAIN => Some(Provisioner::OpenSearchServiceDomain),
         S3_BUCKET => Some(Provisioner::S3Bucket),
         S3_BUCKET_POLICY => Some(Provisioner::S3BucketPolicy),
@@ -1638,6 +1644,11 @@ impl Provisioner {
             }
             Self::OpenSearchServerlessCollection => {
                 create_collection(ctx, region, resource, propagated).await
+            }
+            // `AWS::OpenSearchServerless::VpcEndpoint` publishes no `Tags` property and
+            // `CreateVpcEndpoint` takes none, so an endpoint carries no propagated tag.
+            Self::OpenSearchServerlessVpcEndpoint => {
+                create_vpc_endpoint(ctx, region, resource).await
             }
             Self::OpenSearchServiceDomain => {
                 create_domain(ctx, region, resource, propagated).await
@@ -2577,6 +2588,20 @@ impl Provisioner {
             }
             Self::NeptuneGraphGraphSnapshot => {
                 graph_snapshot_readiness(ctx, region, physical_resource_id).await
+            }
+            // `CreateCollection` answers the collection `CREATING` — in which it publishes
+            // no reachable endpoint and takes no index — so the resource's creation is
+            // finished once OpenSearch Serverless reports it `ACTIVE`, which is also what
+            // the rest of a stack needs before it can use the collection.
+            Self::OpenSearchServerlessCollection => {
+                collection_readiness(ctx, region, physical_resource_id).await
+            }
+            // `CreateVpcEndpoint` answers the endpoint `PENDING` — a "Pending VPCEndpoint
+            // resource", through which no client reaches a collection yet — and OpenSearch
+            // Serverless reports it `ACTIVE` once it "is ready to use", so the resource's
+            // creation is finished once that service reports it there.
+            Self::OpenSearchServerlessVpcEndpoint => {
+                vpc_endpoint_readiness(ctx, region, physical_resource_id).await
             }
             _ => Ok(Readiness::Ready),
         }
@@ -3556,6 +3581,11 @@ impl Provisioner {
             Self::OpenSearchServerlessCollection => {
                 delete_collection(ctx, region, physical_resource_id).await
             }
+            // The endpoint is addressed by the `vpce-…` id that service minted, which is
+            // this resource's physical id.
+            Self::OpenSearchServerlessVpcEndpoint => {
+                delete_vpc_endpoint(ctx, region, physical_resource_id).await
+            }
             Self::OpenSearchServiceDomain => {
                 delete_domain(ctx, region, physical_resource_id).await
             }
@@ -4243,6 +4273,11 @@ impl Provisioner {
             }
             Self::OpenSearchServerlessSecurityPolicy => {
                 describe_security_policy(ctx, region, resource).await
+            }
+            // The endpoint as that service reports it, read by the id it minted and
+            // reported under the property names the type spells its members with.
+            Self::OpenSearchServerlessVpcEndpoint => {
+                describe_vpc_endpoint(ctx, region, physical_resource_id).await
             }
             Self::OpenSearchServiceDomain => {
                 describe_opensearch_domain(ctx, region, physical_resource_id).await

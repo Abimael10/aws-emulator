@@ -51,12 +51,16 @@ pub mod ec2_network;
 /// The documents of one index of a collection as the plane of another service bound to that
 /// index writes them, and the field mapping that index declares.
 pub mod index_documents;
+/// What an index's stored schema becomes when a writer submits another one: the ONE merge
+/// both planes that write a schema go through.
+pub mod index_schema;
 /// Whether a collection's endpoints are reachable at all: the `network` security policies
 /// that admit traffic to them.
 pub mod network_access;
 
 pub use announced_endpoints::AnnouncedEndpoints;
 pub use collection_plane::CollectionPlane;
+pub use index_schema::merged_index_schema;
 
 /// This service's ARN namespace, from the model's `aws.api#service` trait
 /// (`smithy_query(query="service_info")` -> `awsService.arnNamespace`). Also its SigV4
