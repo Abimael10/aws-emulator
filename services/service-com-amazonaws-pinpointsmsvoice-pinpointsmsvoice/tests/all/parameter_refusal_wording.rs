@@ -23,6 +23,10 @@
 //! text at all — the member travels as JSON `null`, which is the one value an SDK reports as
 //! unset, so the rows for it assert that null rather than an absent key.
 //!
+//! A request is refused ONCE, so where SEVERAL parameters are unusable the one sentence names
+//! every one of them that the refusing layer cannot use, in the order the input binds them —
+//! which the two-label operations are where this can be seen.
+//!
 //! The same member carries the text for EVERY error this service's model declares, which
 //! the `NotFoundException` rows pin, and a refused request changes nothing — the listing
 //! that follows one still answers 200 with its `ConfigurationSets` member.
@@ -464,6 +468,241 @@ async fn a_parameter_this_service_cannot_use_is_refused_in_its_own_wording() {
         "a refusal must leave the store untouched, got {:?}",
         harness.stored_set_names()
     );
+}
+
+/// How the two `@required` labels of a request to a two-label operation travel, as the
+/// path segment each of them binds.
+struct TwoLabels {
+    /// What makes this row different from the others.
+    name: &'static str,
+    /// The `{ConfigurationSetName}` segment, already percent-encoded.
+    configuration_set: &'static str,
+    /// The `{EventDestinationName}` segment, already percent-encoded.
+    event_destination: &'static str,
+    /// The sentence the ONE refusal must carry.
+    message: &'static str,
+}
+
+/// Every row makes both labels, or one of the two, unusable, and states the single sentence
+/// that names exactly the parameters unusable in the layer that refused it.
+///
+/// The rows differ along what the rule generalises over: HOW MANY parameters are unusable
+/// (two, one), WHICH of them (the first, the second), and the FORM of each unusable value
+/// (empty, so the request-binding layer refuses it; blank, so this service's validation
+/// does) — including the mixed row, where one label failed in each layer and only the
+/// earlier layer's sentence can be answered.
+///
+/// The `{EventDestinationName}` label is the LAST segment of both URIs, and a request
+/// cannot bind an empty value to a trailing segment — such a path names no route at all and
+/// never reaches an operation — so it is the leading label that carries the empty-value
+/// rows.
+const TWO_LABEL_CASES: &[TwoLabels] = &[
+    TwoLabels {
+        name: "both labels blank",
+        configuration_set: "%20",
+        event_destination: "%20",
+        message: "The following parameter is null, empty or invalid: \
+                  ['configurationSetName', 'eventDestinationName']",
+    },
+    TwoLabels {
+        name: "both labels blank, with differing blank runs",
+        configuration_set: "%20%09%20",
+        event_destination: "%20%20",
+        message: "The following parameter is null, empty or invalid: \
+                  ['configurationSetName', 'eventDestinationName']",
+    },
+    TwoLabels {
+        name: "the set name empty and the destination name blank: the binding layer first",
+        configuration_set: "",
+        event_destination: "%20",
+        message: MISSING_CONFIGURATION_SET_NAME,
+    },
+    TwoLabels {
+        name: "only the set name empty",
+        configuration_set: "",
+        event_destination: "events",
+        message: MISSING_CONFIGURATION_SET_NAME,
+    },
+    TwoLabels {
+        name: "only the set name blank",
+        configuration_set: "%20",
+        event_destination: "events",
+        message: INVALID_CONFIGURATION_SET_NAME,
+    },
+    TwoLabels {
+        name: "only the destination name blank",
+        configuration_set: EXISTING_SET,
+        event_destination: "%20",
+        message: INVALID_EVENT_DESTINATION_NAME,
+    },
+];
+
+/// The operations whose input binds TWO `@required` URI labels, by the method each binds
+/// them under and whether it takes a body
+/// (`smithy_query(query="operation",operation="DeleteConfigurationSetEventDestination,UpdateConfigurationSetEventDestination",model_path="services/service-com-amazonaws-pinpointsmsvoice-pinpointsmsvoice/smithy-model/com-amazonaws-pinpointsmsvoice-pinpointsmsvoice.json")`).
+const TWO_LABEL_OPERATIONS: &[(&str, &str, bool)] = &[
+    ("DeleteConfigurationSetEventDestination", "DELETE", false),
+    ("UpdateConfigurationSetEventDestination", "PUT", true),
+];
+
+/// RULE (how MANY parameters one refusal names): a request is refused ONCE, so the single
+/// `BadRequestException` it answers with names EVERY `@required` parameter unusable in the
+/// layer that refused it, in the order the input binds them — not merely the first one the
+/// handler looked at. The layer still picks the sentence, and the request-binding layer runs
+/// first: a request with one label that bound NO value and one that bound a BLANK value
+/// never reaches this service's validation, so it reads as the binding layer's sentence
+/// naming the empty one.
+///
+/// Only these two operations can show it — they are the ones whose input binds two
+/// `@required` URI labels — so the rows span both of them and both methods.
+#[tokio::test]
+async fn one_refusal_names_every_unusable_required_parameter() {
+    let harness = Harness::new();
+    // The rows that name an existing set must fail on their other parameter, not on a
+    // missing configuration set.
+    let created = harness
+        .call(
+            "POST",
+            "/v1/sms-voice/configuration-sets",
+            Some(json!({ "ConfigurationSetName": EXISTING_SET })),
+        )
+        .await;
+    assert_eq!(
+        created.status, 200,
+        "the fixture configuration set must be created, got {} {:?}",
+        created.status, created.body
+    );
+
+    for (operation, method, with_body) in TWO_LABEL_OPERATIONS {
+        for labels in TWO_LABEL_CASES {
+            let case = format!("{operation} with {}", labels.name);
+            let path = format!(
+                "/v1/sms-voice/configuration-sets/{}/event-destinations/{}",
+                labels.configuration_set, labels.event_destination
+            );
+            let answer = harness
+                .call(method, &path, with_body.then(empty_object))
+                .await;
+
+            assert_eq!(
+                answer.status, 400,
+                "case {case:?}: expected HTTP 400, got {} {:?}",
+                answer.status, answer.body
+            );
+            assert_eq!(
+                answer.error_code(),
+                "BadRequestException",
+                "case {case:?}: expected the modelled BadRequestException, got {:?}",
+                answer.body
+            );
+            assert_eq!(
+                answer.message(),
+                labels.message,
+                "case {case:?}: expected the message {:?}, got {:?}",
+                labels.message,
+                answer.body
+            );
+            assert!(
+                !answer.has_modelled_member(),
+                "case {case:?}: the detail text must travel in `message` alone, got {:?}",
+                answer.body
+            );
+        }
+    }
+
+    // A refusal stores nothing: only the set created above is there.
+    assert_eq!(
+        harness.stored_set_names(),
+        vec![EXISTING_SET.to_string()],
+        "a refusal must leave the store untouched, got {:?}",
+        harness.stored_set_names()
+    );
+}
+
+/// RULE (the control the rows above lean on): a request whose two labels BOTH bind a usable
+/// value is not refused for its parameters at all — it reaches the lookup, so a name that
+/// merely resolves to nothing is the 404 and a name that resolves answers 200.
+///
+/// The rows differ in the operation and in which of the two names resolves to nothing, so
+/// the control is not tied to one of them.
+#[tokio::test]
+async fn two_usable_labels_reach_the_lookup_instead_of_a_refusal() {
+    let harness = Harness::new();
+    let created = harness
+        .call(
+            "POST",
+            "/v1/sms-voice/configuration-sets",
+            Some(json!({ "ConfigurationSetName": EXISTING_SET })),
+        )
+        .await;
+    assert_eq!(
+        created.status, 200,
+        "the fixture configuration set must be created, got {} {:?}",
+        created.status, created.body
+    );
+
+    for (operation, method, with_body) in TWO_LABEL_OPERATIONS {
+        for (name, set, destination) in [
+            ("an absent configuration set", "absent-set", "events"),
+            ("an absent event destination", EXISTING_SET, "absent"),
+        ] {
+            let case = format!("{operation} with {name}");
+            let answer = harness
+                .call(
+                    method,
+                    &format!(
+                        "/v1/sms-voice/configuration-sets/{set}/event-destinations/{destination}"
+                    ),
+                    with_body.then(empty_object),
+                )
+                .await;
+            assert_eq!(
+                answer.status, 404,
+                "case {case:?}: expected HTTP 404, got {} {:?}",
+                answer.status, answer.body
+            );
+            assert_eq!(
+                answer.error_code(),
+                "NotFoundException",
+                "case {case:?}: expected the modelled NotFoundException, got {:?}",
+                answer.body
+            );
+        }
+    }
+
+    // A destination that exists is updated and then deleted through those same two labels,
+    // so no row above can be passing merely because the request was refused.
+    let destination = harness
+        .call(
+            "POST",
+            &format!("/v1/sms-voice/configuration-sets/{EXISTING_SET}/event-destinations"),
+            Some(named_destination()),
+        )
+        .await;
+    assert_eq!(
+        destination.status, 200,
+        "the fixture event destination must be created, got {} {:?}",
+        destination.status, destination.body
+    );
+    for (case, method) in [
+        ("UpdateConfigurationSetEventDestination", "PUT"),
+        ("DeleteConfigurationSetEventDestination", "DELETE"),
+    ] {
+        let answer = harness
+            .call(
+                method,
+                &format!(
+                    "/v1/sms-voice/configuration-sets/{EXISTING_SET}/event-destinations/events"
+                ),
+                (method == "PUT").then(|| json!({ "EventDestination": { "Enabled": false } })),
+            )
+            .await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: expected HTTP 200, got {} {:?}",
+            answer.status, answer.body
+        );
+    }
 }
 
 /// RULE (the same member, for every error this service's model declares): a configuration

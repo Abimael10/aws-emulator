@@ -144,10 +144,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // no configuration set to report on, so it is refused ahead of any lookup — which
         // is why this is a 400 and not the 404 a name that merely does not exist gets. The
         // layer, and so the sentence, is `refusal_wording`'s to decide.
-        if let Some(message) = super::types::refusal_wording::unusable_required_label(
+        if let Some(message) = super::types::refusal_wording::unusable_required_labels(&[(
             "ConfigurationSetName",
-            &input.configuration_set_name,
-        ) {
+            input.configuration_set_name.as_str(),
+        )]) {
             return Err(
                 GetConfigurationSetEventDestinationsErrorModeled::BadRequestException(
                     BadRequestException {

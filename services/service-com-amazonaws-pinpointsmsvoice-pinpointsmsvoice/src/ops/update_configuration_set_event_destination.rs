@@ -139,25 +139,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A `@required` path label the request binds no usable value to names nothing to
         // update, so it is refused ahead of any lookup — which is why this is a 400 and
-        // not the 404 a name that merely does not exist gets. Both labels are read, in the
-        // order the input declares them, and the layer (and so the sentence) is
+        // not the 404 a name that merely does not exist gets. Both labels are handed over
+        // together, in the order the input binds them, so the one refusal names every one
+        // of them the request cannot be read from; the layer (and so the sentence) is
         // `refusal_wording`'s to decide.
-        for (member, value) in [
-            ("ConfigurationSetName", &input.configuration_set_name),
-            ("EventDestinationName", &input.event_destination_name),
-        ] {
-            if let Some(message) =
-                super::types::refusal_wording::unusable_required_label(member, value)
-            {
-                return Err(
-                    UpdateConfigurationSetEventDestinationErrorModeled::BadRequestException(
-                        BadRequestException {
-                            message: Some(message),
-                        },
-                    )
-                    .into(),
-                );
-            }
+        if let Some(message) = super::types::refusal_wording::unusable_required_labels(&[
+            (
+                "ConfigurationSetName",
+                input.configuration_set_name.as_str(),
+            ),
+            (
+                "EventDestinationName",
+                input.event_destination_name.as_str(),
+            ),
+        ]) {
+            return Err(
+                UpdateConfigurationSetEventDestinationErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
         }
 
         // Every member of `EventDestinationDefinition` is optional, so an absent
