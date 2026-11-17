@@ -131,7 +131,8 @@ pub(super) struct Pending {
     pub stage: String,
     /// The Region the function is invoked at when the `authorizerUri` names none.
     pub region: String,
-    /// The authorizer's own name, for the log.
+    /// The authorizer's own name, for the trace record a call that produced no decision
+    /// leaves behind.
     pub authorizer_name: String,
     /// `Authorizer$authorizerUri`, which names the function.
     pub authorizer_uri: String,
@@ -322,13 +323,28 @@ pub(super) async fn obtained(ctx: &OperationContext<'_>, pending: &Pending) -> O
     let answered = match answer {
         Ok(answered) => answered,
         Err(error) => {
+            ::tracing::warn!(
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "the authorizer's function was not invoked"
+            );
             return Obtained::Unobtained {
                 refusal: super::AUTHORIZER_CONFIGURATION_ERROR,
-                reason: format!(
-                    "the authorizer's function did not answer the invocation: {}",
-                    ::aws_smithy_types::error::display::DisplayErrorContext(&error)
-                ),
-            }
+                // LAMBDA's own answer to the invocation that WAS issued: a refusal it worded
+                // — a function spelling it holds no record for, a call its own records do not
+                // admit — says this authorizer's function may not be invoked, which is the
+                // configuration error API Gateway words with its one permissions sentence,
+                // whichever record of the api named the function
+                // ([`super::lambda_proxy::INVALID_PERMISSIONS_REASON`]). Every other outcome
+                // is a different story: an invocation nothing answered, or one Lambda
+                // answered something else about, is no permissions determination at all.
+                reason: if super::lambda_proxy::invocation_refused(&error) {
+                    super::lambda_proxy::INVALID_PERMISSIONS_REASON.to_string()
+                } else {
+                    "the authorizer's function did not answer the invocation, so the call has \
+                     no authorizer decision"
+                        .to_string()
+                },
+            };
         }
     };
     let returned = answered
@@ -383,6 +399,14 @@ pub(super) async fn obtained(ctx: &OperationContext<'_>, pending: &Pending) -> O
 /// null" — has it invoked as this service's own principal, so the FUNCTION's resource policy
 /// is the grant. Both readings are [`super::lambda_proxy`]'s, called rather than copied: an
 /// integration's own `credentials` member words the same choice.
+///
+/// The FUNCTION's grant is read before the invocation rather than after it, because a function
+/// AWS admits nothing of must not RUN here: the in-process invocation carries this emulator's
+/// own credentials, so Lambda cannot be the one to take that decision for API Gateway. What is
+/// NOT pre-judged is whether the function exists at all — that is Lambda's own answer to the
+/// invocation this call goes on to issue ([`obtained`]) — and the sentence a refusal carries
+/// is API Gateway's one fixed wording for the class, the same one a method's own integration
+/// earns ([`super::lambda_proxy::INVALID_PERMISSIONS_REASON`]), naming no record of the api.
 async fn unadmitted(
     ctx: &OperationContext<'_>,
     region: &str,
@@ -399,11 +423,7 @@ async fn unadmitted(
     if super::lambda_proxy::invocation_admitted(client, function, &pending.authorizer_arn).await {
         return None;
     }
-    Some(format!(
-        "the authorizer's function allows this api's authorizer {} no invocation of it, so no \
-         invocation was made",
-        pending.authorizer_name
-    ))
+    Some(super::lambda_proxy::INVALID_PERMISSIONS_REASON.to_string())
 }
 
 /// The error message a failed run reported, when its payload carries one.

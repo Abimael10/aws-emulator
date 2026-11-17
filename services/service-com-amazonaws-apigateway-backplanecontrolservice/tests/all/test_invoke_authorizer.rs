@@ -61,8 +61,10 @@ const ROLE: &str = "arn:aws:iam::000000000000:role/lambda-exec";
 const HANDLER: &str = "lambda_function.lambda_handler";
 
 /// How long this suite waits for Lambda's own clock-owed transition (a created function
-/// becoming `Active`), and how often it looks.
-const WAIT: Duration = Duration::from_secs(20);
+/// becoming `Active`), and how often it looks. Generous: the wait is on the CONDITION, and
+/// nothing here is graded on how fast the host runs, so the deadline only bounds a wait that
+/// should never be reached — including on a host running the whole workspace's suites at once.
+const WAIT: Duration = Duration::from_secs(60);
 const LOOK: Duration = Duration::from_millis(100);
 
 /// The header the header-sourced authorizers declare as their identity source, and the
@@ -78,6 +80,21 @@ const HELD_TTL: u32 = 300;
 /// reserved test-invoke stage, as `TestInvokeAuthorizer` spells it in the `methodArn` it hands
 /// the authorizer.
 const TEST_INVOKE_ARN_STAGE: &str = "ESTestInvoke-stage";
+
+/// How the execution log opens the line that states a configuration error, and the ONE
+/// sentence API Gateway words a backing Lambda function it may not invoke with — fixed text
+/// with no variable part, naming neither the function nor any record of the api.
+const CONFIGURATION_ERROR: &str = "Execution failed due to configuration error: ";
+const INVALID_PERMISSIONS: &str = "Invalid permissions on Lambda function";
+
+/// The status of the gateway response a call whose authorizer could not be ASKED would have
+/// met: the `AUTHORIZER_CONFIGURATION_ERROR` response type's `500`.
+const NOT_ASKED: i64 = 500;
+
+/// A function name this account holds no record of, and an alias name no `CreateAlias` made:
+/// the two halves of a function spelling that can resolve to nothing.
+const ABSENT_FUNCTION: &str = "simulated-authorizer-absent";
+const ABSENT_ALIAS: &str = "sim2real-missing-alias";
 
 /// The one authorizer function every row is decided by: it reads the token out of whichever
 /// event it was handed, chooses what to return from that token, and publishes a value that is
@@ -695,7 +712,7 @@ fn rows() -> Vec<Row> {
             client_status: 500,
             returned: false,
             event: None,
-            log: Some("no invocation was made"),
+            log: Some(INVALID_PERMISSIONS),
         },
     ]
 }
@@ -1021,6 +1038,176 @@ async fn the_log_reports_the_endpoint_the_authorizer_was_asked_at() {
             !log.contains(function),
             "case {case:?}: a request carrying no identity source invokes nothing, so the log \
              must name no function, got {log:?}"
+        );
+    }
+}
+
+/// RULE: a backing Lambda function API Gateway may not invoke — the function's own
+/// resource-based policy granting this api's authorizer no invocation of it, or Lambda itself
+/// refusing the invocation that was issued — is ONE configuration error, worded with the fixed
+/// sentence API Gateway states for that class and carrying no variable part: no record of the
+/// api is named in it, and the authorizer produces no decision at all.
+///
+/// The rows differ along what the rule generalises over: WHY the function cannot be invoked (a
+/// resolvable function whose policy grants this authorizer nothing, a function name Lambda
+/// holds no record of, and a resolvable function qualified by an alias no `CreateAlias` made)
+/// and the authorizer TYPE, which decides the event the function would have been handed.
+#[tokio::test]
+async fn a_function_that_cannot_be_invoked_is_the_fixed_permissions_configuration_error() {
+    let router = emulator();
+    // The function is created and left granting nothing: no `AddPermission` is made anywhere
+    // in this test, so no authorizer below is granted an invocation of it.
+    let (status, created) = lambda(
+        &router,
+        "POST",
+        "/2015-03-31/functions",
+        Some(json!({
+            "FunctionName": FUNCTION,
+            "Role": ROLE,
+            "Runtime": "python3.12",
+            "Handler": HANDLER,
+            "Timeout": 10,
+            "Code": {
+                "ZipFile": base64::engine::general_purpose::STANDARD
+                    .encode(package(HANDLER_SOURCE)),
+            },
+        })),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "setup CreateFunction: expected HTTP 201, got {status} with {created}"
+    );
+    let function_arn = member("CreateFunction", &created, "FunctionArn");
+    wait_until_active(&router).await;
+
+    let api = accepted(
+        &router,
+        "CreateRestApi",
+        "POST",
+        "/restapis",
+        Some(json!({ "name": "unservable-authorizer-api" })),
+        201,
+    )
+    .await;
+    let api = member("CreateRestApi", &api, "id");
+
+    // (case, the authorizer's type, the part its name carries, the function its
+    // `authorizerUri` names).
+    let rows: Vec<(&str, &str, &str, String)> = vec![
+        (
+            "a resolvable function whose policy grants this authorizer nothing",
+            "TOKEN",
+            "ungranted-token",
+            function_arn.clone(),
+        ),
+        (
+            "the same function asked for by a REQUEST authorizer",
+            "REQUEST",
+            "ungranted-request",
+            function_arn.clone(),
+        ),
+        (
+            "a function name Lambda holds no record of",
+            "TOKEN",
+            "absent-function",
+            format!(
+                "arn:aws:lambda:{REGION}:{account}:function:{ABSENT_FUNCTION}",
+                account = engine::emulator_account_id(),
+            ),
+        ),
+        (
+            "a resolvable function qualified by an alias no CreateAlias made",
+            "TOKEN",
+            "absent-alias",
+            format!("{function_arn}:{ABSENT_ALIAS}"),
+        ),
+    ];
+
+    for (case, kind, part, function) in &rows {
+        let name = format!("unservable-{part}");
+        let authorizer_uri = format!(
+            "arn:aws:apigateway:{REGION}:lambda:path/2015-03-31/functions/{function}/invocations"
+        );
+        let created = accepted(
+            &router,
+            case,
+            "POST",
+            &format!("/restapis/{api}/authorizers"),
+            Some(json!({
+                "name": name,
+                "type": kind,
+                "authorizerUri": authorizer_uri,
+                "identitySource": format!("method.request.header.{IDENTITY_HEADER}"),
+            })),
+            201,
+        )
+        .await;
+        let authorizer = member(case, &created, "id");
+
+        // The identity source IS carried, so the authorizer is asked for this request.
+        let answered = apigw(
+            &router,
+            "POST",
+            &format!("/restapis/{api}/authorizers/{authorizer}"),
+            Some(json!({
+                "pathWithQueryString": "/orders",
+                "headers": presenting("allow-me"),
+            })),
+        )
+        .await;
+        assert_eq!(
+            answered.status,
+            200,
+            "case {case:?}: expected the simulation to be answered HTTP 200, got {} with {:?}",
+            answered.status,
+            answered.text()
+        );
+        let reported = answered.json();
+        assert_eq!(
+            reported.get("clientStatus").and_then(Value::as_i64),
+            Some(NOT_ASKED),
+            "case {case:?}: expected the status a client would have met for an authorizer that \
+             could not be asked, got {reported}"
+        );
+        // No decision exists, so neither member the authorizer's own return value fills is
+        // reported at all: a function that may not be invoked returned no policy and named no
+        // principal, and an absent member is absent rather than empty.
+        let returned = (reported.get("principalId"), reported.get("policy"));
+        assert_eq!(
+            returned,
+            (None, None),
+            "case {case:?}: expected no principal and no policy member for a function that \
+             was not invoked, got {reported}"
+        );
+
+        let log = reported
+            .get("log")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            log.contains(&authorizer_uri),
+            "case {case:?}: expected the execution log to report the endpoint request URI \
+             {authorizer_uri:?}, got {log:?}"
+        );
+        let failure = log
+            .lines()
+            .find(|line| line.contains(CONFIGURATION_ERROR))
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: expected a configuration-error line, got {log:?}")
+            });
+        assert!(
+            failure.ends_with(&format!("{CONFIGURATION_ERROR}{INVALID_PERMISSIONS}")),
+            "case {case:?}: expected the configuration error worded \
+             {CONFIGURATION_ERROR}{INVALID_PERMISSIONS}, got {failure:?}"
+        );
+        // The sentence has no variable part: the api's own authorizer is named nowhere in the
+        // log it returns.
+        assert!(
+            !log.contains(&name),
+            "case {case:?}: expected the configuration error to name no record of the api, but \
+             the log carries the authorizer name {name:?}: {log:?}"
         );
     }
 }

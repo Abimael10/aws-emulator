@@ -526,7 +526,9 @@ fn rows() -> Vec<Row> {
             credentials: Credentials::None { granted: false },
             decided: false,
             client_status: NOT_ASKED,
-            log: Some("no invocation was made"),
+            // The one fixed sentence API Gateway words a backing function it may not invoke
+            // with, which carries no variable part at all.
+            log: Some("Invalid permissions on Lambda function"),
         },
     ]
 }

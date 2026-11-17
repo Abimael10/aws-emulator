@@ -60,13 +60,16 @@
 //!
 //! Nothing is refused on evidence this emulator does not have: a `uri` whose function Lambda
 //! does not answer about at all, and an emulator with no Lambda mounted, each leave the call
-//! to be made, for the reason [`super::super::resource_policy`]'s own reading gives. What
-//! Lambda REPORTS is an answer rather than a silence: a function it holds no record of — the
-//! record itself, or the version or alias the `uri` qualifies it by — has no policy for a
-//! grant to live in, and a function whose policy it reports as absent carries none, so
-//! neither is invoked and both earn the method the ONE configuration error API Gateway words
-//! a missing grant with ([`INVALID_PERMISSIONS_REASON`]) — an unresolvable qualifier is
-//! reported as a permissions error, not as a not-found one.
+//! to be made, for the reason [`super::super::resource_policy`]'s own reading gives. And
+//! nothing is guessed that Lambda itself answers: whether the `uri`'s spelling — the function
+//! record, or the version or alias it is qualified by — resolves to anything at all is decided
+//! by LAMBDA, as its answer to the invocation that is issued ([`invocation_refused`]), while
+//! the grant the FUNCTION's own resource policy carries is read before the call, because a
+//! function API Gateway may not invoke must not RUN here. Both outcomes — a spelling Lambda
+//! holds no record for and a policy that admits this api nothing — earn the method the ONE
+//! configuration error API Gateway words a function it cannot invoke with
+//! ([`INVALID_PERMISSIONS_REASON`]): an unresolvable qualifier is reported as a permissions
+//! error, not as a not-found one.
 //!
 //! # How an outcome becomes the method response
 //!
@@ -499,9 +502,20 @@ async fn invoked(
             );
             return Err(UnservedIntegration {
                 refusal: API_CONFIGURATION_ERROR,
-                reason: "the AWS_PROXY integration's function did not answer the \
-                         invocation, so there is no function answer to pass through"
-                    .to_string(),
+                // LAMBDA refusing the invocation it was issued — a spelling it holds no
+                // record for, a call its own records do not admit — is the answer to
+                // whether this function may be invoked at all, so it is the configuration
+                // error API Gateway words with its one permissions sentence
+                // ([`INVALID_PERMISSIONS_REASON`]). Every other outcome is a different
+                // story: an invocation nothing answered, or one Lambda answered something
+                // else about.
+                reason: if invocation_refused(&error) {
+                    INVALID_PERMISSIONS_REASON.to_string()
+                } else {
+                    "the AWS_PROXY integration's function did not answer the \
+                     invocation, so there is no function answer to pass through"
+                        .to_string()
+                },
             });
         }
     };
@@ -604,10 +618,15 @@ async fn unpermitted(
     Some(INVALID_PERMISSIONS_REASON.to_string())
 }
 
-/// What API Gateway states in the execution log of a method whose integration's function
+/// What API Gateway states in the execution log of a call whose backing Lambda function
 /// grants it no invocation: "Invalid permissions on Lambda function", the sentence it words
-/// that configuration error with before answering the method's own `500`.
-const INVALID_PERMISSIONS_REASON: &str = "Invalid permissions on Lambda function";
+/// that configuration error with before answering the call's own `500`.
+///
+/// Fixed text, with no variable part: the sentence names neither the function nor any record
+/// of the api. `pub(super)` because an AUTHORIZER's function earns the same configuration
+/// error worded the same way ([`super::custom_authorizer`]) — one sentence for the class,
+/// read rather than spelled twice.
+pub(super) const INVALID_PERMISSIONS_REASON: &str = "Invalid permissions on Lambda function";
 
 /// The ROLE an api's record names for API Gateway to make a call under, out of the value that
 /// record carries, or `None` where it names none.
@@ -705,9 +724,10 @@ pub(super) async fn resolved_function_arn(
 ///
 /// `true` also when nothing about the function could be shown, which refuses nothing: a
 /// `uri` whose function Lambda does not answer about at all, and an emulator with no Lambda
-/// mounted, are not evidence of a missing grant. A function Lambda REPORTS as absent — the
-/// record itself, or the version or alias the spelling qualifies it by — is an answer rather
-/// than a silence: there is no function for a grant to be attached to, so it grants nothing.
+/// mounted, are not evidence of a missing grant. Whether the spelling resolves to a record at
+/// all is not decided here either: that is Lambda's own answer to the invocation this call
+/// goes on to issue, which refuses a spelling Lambda holds nothing for
+/// ([`invocation_refused`]) rather than being guessed at before the call is made.
 ///
 /// `pub(super)` because an authorizer's function is admitted by the same grant, read the
 /// same way ([`super::custom_authorizer`]).
@@ -728,24 +748,10 @@ pub(super) async fn invocation_admitted(
     {
         Ok(reported) => reported.function_arn.unwrap_or_else(|| function.to_string()),
         Err(error) => {
-            // Lambda REPORTING that it holds no such function is an answer, not a silence:
-            // the spelling — with whatever version or alias it qualifies the function by —
-            // resolves to no record at all, so there is nothing for a resource policy to be
-            // attached to and no grant that could admit this invocation.
-            if error.as_service_error().is_some_and(
-                ::aws_sdk_lambda::operation::get_function_configuration::GetFunctionConfigurationError
-                    ::is_resource_not_found_exception,
-            ) {
-                ::tracing::warn!(
-                    "the invoked function resolves to no record Lambda holds, so no grant \
-                     admits the invocation"
-                );
-                return false;
-            }
             ::tracing::warn!(
                 error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
-                "the invoked function was not judged: nothing answered for its \
-                 configuration"
+                "the invoked function's grant was not judged: its configuration was not read, \
+                 so the invocation itself is what decides this call"
             );
             return true;
         }
@@ -797,6 +803,45 @@ fn refused_by_lambda<E>(
     };
     let body = service.raw().body().bytes().unwrap_or_default();
     !::service_common::in_process_refusal::is_transport_refusal(body)
+}
+
+/// The two answers Lambda gives a call it did not make: the function the request spelled
+/// resolves to no record it holds (`404`, "the resource specified in the request does not
+/// exist"), and a call its own records do not admit (`403`).
+const FUNCTION_NOT_FOUND_STATUS: u16 = 404;
+const INVOCATION_FORBIDDEN_STATUS: u16 = 403;
+
+/// Whether Lambda ANSWERED this invocation by refusing to make it at all — which is what says
+/// the function may not be invoked, the configuration error [`INVALID_PERMISSIONS_REASON`]
+/// words.
+///
+/// Two things have to hold. The answer has to be LAMBDA's ([`refused_by_lambda`]): a failure
+/// the emulator itself produced — no service of it serves the endpoint, or more than one claims
+/// it — is nothing Lambda said. And the answer has to be one of the two that refuse the call
+/// rather than report something else about it: anything else Lambda answers (a throttle, a
+/// malformed request, a failure of the service itself) is not a permissions determination, and
+/// this sentence must not claim one that was never made.
+///
+/// The two are read off the STATUS the answer carries rather than off one operation's modelled
+/// error variants, because the same reading serves every call this plane makes to Lambda and
+/// an invocation Lambda refuses on permissions is not a modelled variant of `Invoke` at all —
+/// it arrives as the `403` the service answered with.
+///
+/// `pub(super)` because an authorizer's function is invoked over the same transport and its
+/// refusal read the same way ([`super::custom_authorizer`]).
+pub(super) fn invocation_refused<E>(
+    error: &::aws_smithy_runtime_api::client::result::SdkError<
+        E,
+        ::aws_smithy_runtime_api::client::orchestrator::HttpResponse,
+    >,
+) -> bool {
+    refused_by_lambda(error)
+        && error
+            .raw_response()
+            .map(|answered| answered.status().as_u16())
+            .is_some_and(|status| {
+                status == FUNCTION_NOT_FOUND_STATUS || status == INVOCATION_FORBIDDEN_STATUS
+            })
 }
 
 /// The Lambda client the invocation is made with.
