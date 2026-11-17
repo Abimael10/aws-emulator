@@ -286,6 +286,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut state = state.lock();
 
+        // Before anything is read, materialise what the service that OWNS these volumes has
+        // already done: a volume removed there is gone, so this service's record of it goes
+        // too — it is neither counted against the quota below nor left holding the
+        // `ClientToken` of the create that made it.
+        crate::state::drop_volumes_the_account_no_longer_holds(&*self.engine, &mut state, &region);
+
         // `@idempotent` + `@idempotencyToken`: "Unique token to prevent duplicate volume
         // creation" — a `ClientToken` this service has already created a volume for is
         // SPENT. The token is a single-use guard against a duplicate creation, not a cache

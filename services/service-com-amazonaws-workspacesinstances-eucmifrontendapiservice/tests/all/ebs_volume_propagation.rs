@@ -10,6 +10,12 @@
 //! it is deleted. A `SnapshotId` the account holds no snapshot for names nothing to restore,
 //! so the create is refused with the backing service's own refusal.
 //!
+//! The rule holds in BOTH directions, because there is one volume: a volume removed through
+//! the owning service's own API is gone, so no operation of this service still acts on it —
+//! it answers the not-found it answers for an id that was never minted, and the `ClientToken`
+//! of the create that made it is free again, exactly as this service's own `DeleteVolume`
+//! leaves it.
+//!
 //! Nothing here reaches into either store: the volume is believed to exist only because
 //! `ec2:DescribeVolumes` reported it, and its configuration only because EC2 reported that
 //! too. EC2 is driven through the AWS SDK over the router's own in-process callback.
@@ -592,5 +598,138 @@ async fn a_volume_restored_from_a_snapshot_the_account_holds_is_created_from_it(
             Some(source_size),
             "case {case:?}: expected the snapshot's own size, got {volume:?}"
         );
+    }
+}
+
+#[tokio::test]
+async fn a_volume_the_owning_service_removed_resolves_nowhere_here_either() {
+    let router = router();
+    let ec2 = ec2_client(&router);
+
+    // Rows differing in the configuration of the volume the account loses, and in the size
+    // a modification of it would ask for — so the refusals cannot turn on one volume's
+    // shape.
+    let configurations = [
+        (
+            "a volume of the default type",
+            json!({ "AvailabilityZone": "us-east-1a", "SizeInGB": 8 }),
+            16,
+        ),
+        (
+            "a tagged gp3 volume",
+            json!({
+                "AvailabilityZone": "us-east-1b",
+                "SizeInGB": 30,
+                "VolumeType": "gp3",
+                "TagSpecifications": [
+                    { "ResourceType": "volume", "Tags": [{ "Key": "k", "Value": "v" }] },
+                ],
+            }),
+            60,
+        ),
+        (
+            "an io2 volume",
+            json!({
+                "AvailabilityZone": "us-east-1c",
+                "SizeInGB": 4,
+                "VolumeType": "io2",
+                "Iops": 200,
+            }),
+            40,
+        ),
+    ];
+
+    for (case, body, grown) in configurations {
+        let volume_id = create_volume(&router, case, body).await;
+        settled_in(&ec2, case, &volume_id, &[STATE_AVAILABLE]).await;
+
+        // The volume is removed through the service that OWNS it, which is how these
+        // volumes are managed: this API exposes no describe or tag of its own.
+        ec2.delete_volume()
+            .volume_id(&volume_id)
+            .send()
+            .await
+            .unwrap_or_else(|error| {
+                panic!("case {case:?}: ec2:DeleteVolume of {volume_id} was refused: {error}")
+            });
+        assert!(
+            described(&ec2, &volume_id).await.is_none(),
+            "case {case:?}: expected EC2 to hold no volume {volume_id} after its own delete"
+        );
+
+        // So the account holds no such volume at all, and every operation of this service
+        // that acts on one answers as it does for an id that was never minted: there is ONE
+        // volume, and the two services cannot disagree about whether it exists.
+        for (operation, request) in [
+            ("DeleteVolume", json!({ "VolumeId": &volume_id })),
+            (
+                "ModifyVolume",
+                json!({ "VolumeId": &volume_id, "SizeInGB": grown }),
+            ),
+        ] {
+            let (status, payload) = call(&router, operation, request).await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected {operation} on a volume the account no longer holds \
+                 to be refused, got {status} with {payload}"
+            );
+            assert_eq!(
+                error_code(&payload),
+                "ResourceNotFoundException",
+                "case {case:?}: expected {operation} to answer this service's not-found, got \
+                 {payload}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_client_token_of_a_volume_the_account_lost_is_free_again() {
+    let router = router();
+    let ec2 = ec2_client(&router);
+
+    // Rows differing in the token's own form, inside the modelled `ClientToken`
+    // (len 1..64, ^[\x20-\x7E]+$ — `smithy_query(query="shape",shape="ClientToken")`): the
+    // shortest the shape admits, an ordinary one, and the longest.
+    let tokens = [
+        ("the shortest token the shape admits", "t".to_string()),
+        ("an ordinary token", "volume-token-1".to_string()),
+        ("the longest token the shape admits", "x".repeat(64)),
+    ];
+
+    for (case, token) in tokens {
+        let request = json!({
+            "AvailabilityZone": "us-east-1a",
+            "SizeInGB": 12,
+            "VolumeType": "gp3",
+            "ClientToken": &token,
+        });
+        let first = create_volume(&router, case, request.clone()).await;
+        settled_in(&ec2, case, &first, &[STATE_AVAILABLE]).await;
+
+        // While the volume that token created exists, the token is spent.
+        let (status, payload) = call(&router, "CreateVolume", request.clone()).await;
+        assert_eq!(
+            status, 409,
+            "case {case:?}: expected a spent token to be refused while its volume exists, got \
+             {status} with {payload}"
+        );
+
+        // Once the owning service has removed the volume, the record that token created is
+        // gone with it — so the token can create a volume again, exactly as it can after
+        // this service's own DeleteVolume.
+        ec2.delete_volume()
+            .volume_id(&first)
+            .send()
+            .await
+            .unwrap_or_else(|error| {
+                panic!("case {case:?}: ec2:DeleteVolume of {first} was refused: {error}")
+            });
+        let second = create_volume(&router, case, request).await;
+        assert_ne!(
+            second, first,
+            "case {case:?}: expected a volume of its own, got the removed {first}"
+        );
+        settled_in(&ec2, case, &second, &[STATE_CREATING, STATE_AVAILABLE]).await;
     }
 }

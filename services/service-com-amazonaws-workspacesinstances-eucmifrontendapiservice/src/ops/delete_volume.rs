@@ -156,6 +156,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is deletable here without a detach call of its own.
         let now = std::time::Instant::now();
         state.settle_all(now);
+        // And what the service that OWNS this volume has already done: a volume removed
+        // there is gone, so this service's record of it goes too and the delete answers
+        // not-found — there is ONE volume and one answer about whether it exists.
+        crate::state::drop_volumes_the_account_no_longer_holds(&*self.engine, &mut state, &region);
 
         // "Deletes a specified volume": the record goes, so a second delete of the same
         // id is not-found, and the volume quota — which is derived by counting the

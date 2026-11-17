@@ -380,6 +380,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // against the configuration the volume really has by now.
         let now = std::time::Instant::now();
         state.settle_all(now);
+        // And what the service that OWNS this volume has already done: a volume removed
+        // there is gone, so this service's record of it goes too and its id resolves to
+        // nothing here — there is ONE volume and one answer about whether it exists.
+        crate::state::drop_volumes_the_account_no_longer_holds(&*self.engine, &mut state, &region);
 
         // "Specifies the identifier of the volume to modify": an id that satisfies the
         // modelled `VolumeId` shape but names no volume THIS REGION holds is

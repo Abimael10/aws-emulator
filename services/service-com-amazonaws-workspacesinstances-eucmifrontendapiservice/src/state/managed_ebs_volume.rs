@@ -139,6 +139,48 @@ pub fn create_ebs_volume<Eng: Send + Sync + 'static>(
     })
 }
 
+/// Drop this service's record of every volume of Region `region` the service that OWNS EBS
+/// volumes no longer holds.
+///
+/// The volume a successful `CreateVolume` reports IS that EBS volume, so there is ONE volume
+/// and one answer to whether it exists: a volume removed through the owning service's own
+/// API is gone, and an operation here that looks its id up answers as it does for an id that
+/// was never minted, rather than acting on a record of a volume the account does not hold.
+/// Whether the volume is gone is the owning store's own reading of it
+/// ([`ec2_store::ComAmazonawsEc2Amazonec2State::volume_is_withdrawn`]), so the two services
+/// cannot disagree about which ids resolve.
+///
+/// The removal was owed at the instant the owning service removed the volume, whether or not
+/// anybody called here — so this materialises what has ALREADY happened, the way
+/// [`crate::state::ComAmazonawsWorkspacesinstancesEucmifrontendapiserviceState::settle_all`]
+/// materialises what the clock already owed, and a WRITER calls it. It goes through this
+/// store's own `remove_volume`, so the creating `ClientToken` and the volume's modification
+/// claims are retired with the record exactly as a `DeleteVolume` retires them.
+pub fn drop_volumes_the_account_no_longer_holds<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    state: &mut crate::state::ComAmazonawsWorkspacesinstancesEucmifrontendapiserviceState,
+    region: &str,
+) {
+    let Some(owner) = ec2_store::service_state(engine) else {
+        return;
+    };
+    let now = std::time::Instant::now();
+    let withdrawn: Vec<String> = {
+        let owner = owner.lock();
+        state
+            .volumes
+            .values()
+            .filter(|record| {
+                record.region == region && owner.volume_is_withdrawn(&record.id, now)
+            })
+            .map(|record| record.id.clone())
+            .collect()
+    };
+    for volume_id in withdrawn {
+        state.remove_volume(region, &volume_id);
+    }
+}
+
 /// Delete the EBS volume `volume_id`, as `DeleteVolume` does: the volume this service
 /// reported IS that EBS volume, so deleting it removes it from the account and no EBS read
 /// resolves it afterwards.
