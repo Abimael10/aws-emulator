@@ -200,15 +200,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                  type of filter being applied.",
             ));
         }
-        if filters
+        if let Some(name) = filters
             .iter()
-            .any(|filter| !is_valid_filter_name(filter.name.as_deref().unwrap_or_default()))
+            .map(|filter| filter.name.as_deref().unwrap_or_default())
+            .find(|name| !is_valid_filter_name(name))
         {
-            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-                "The filter criteria isn't valid. Valid filter types for the Name attribute of \
-                 filters are: {}.",
-                FILTER_NAMES.join(", ")
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                unknown_filter_type_message(name),
+            ));
         }
         // A filter selects by the values it carries, so one carrying none selects nothing
         // and cannot be applied: the values are required, not ignored.
@@ -219,6 +218,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::validation_error(
                 "The filter criteria isn't valid. The Values attribute and one or more filter \
                  values are required.",
+            ));
+        }
+        // The propagation filter selects on a BOOLEAN member, so a value that is not one of
+        // the two spellings of a Boolean states no criterion at all: it is refused, not read
+        // as a criterion that selects nothing.
+        if filters
+            .iter()
+            .filter(|filter| filter.name.as_deref() == Some(FILTER_PROPAGATE_AT_LAUNCH))
+            .flat_map(|filter| filter.values.iter().flatten())
+            .any(|value| boolean_filter_value(value).is_none())
+        {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                NON_BOOLEAN_PARAMETER_MESSAGE,
             ));
         }
 
@@ -283,6 +295,35 @@ fn is_valid_filter_name(name: &str) -> bool {
     FILTER_NAMES.contains(&name)
 }
 
+/// The message a filter naming a type this operation does not accept is refused with: the
+/// type the request asked to filter on, and the types that can be filtered on, space
+/// separated in the order documentation lists them.
+///
+/// The filter name is the only variable part; the rest, the separators included, is fixed
+/// text. This READ's own sentence — it states the offending type and the set it is not in,
+/// which is not the sentence the group read states about its own filter types.
+fn unknown_filter_type_message(name: &str) -> String {
+    format!(
+        "Filter type {name} is not correct. Allowed Filter types are: {}",
+        FILTER_NAMES.join(" ")
+    )
+}
+
+/// The message a Boolean filter value that is neither spelling of a Boolean is refused
+/// with: the whole sentence is fixed text, because the refusal is about the KIND of value
+/// the parameter takes rather than about the value submitted for it.
+const NON_BOOLEAN_PARAMETER_MESSAGE: &str = "Boolean parameter can only be true or false";
+
+/// The Boolean a filter value states, or `None` when it states none.
+///
+/// A Boolean parameter takes exactly the two spellings of a Boolean, so anything else —
+/// another casing, a number, a word that merely means one — states none. THE ONE reading of
+/// such a value for this operation, so the refusal above and the selection below cannot
+/// disagree about which values are Booleans.
+fn boolean_filter_value(value: &str) -> Option<bool> {
+    value.parse::<bool>().ok()
+}
+
 /// Whether one tag matches one filter. A filter's values are joined with OR; the caller
 /// joins the filters themselves with AND, as the model documents ("The result includes
 /// information for a particular tag only if it matches all the filters").
@@ -306,14 +347,14 @@ fn matches_filter(tag: &TagDescription, filter: &Filter) -> bool {
             .value
             .as_ref()
             .is_some_and(|value| values.contains(value)),
-        // "Accepts a Boolean value": only the two spellings of one select anything, so a
-        // value that is neither selects no tag. Every tag reports the flag — a tag created
-        // without it carries the service's default for the member
-        // (`crate::state::DEFAULT_PROPAGATE_AT_LAUNCH`) — so each tag is selected by
-        // exactly one of the two Booleans.
+        // "Accepts a Boolean value": the handler refuses a value that is not one before any
+        // tag is matched, so every value reaching here states one of the two Booleans. Every
+        // tag reports the flag — a tag created without it carries the service's default for
+        // the member (`crate::state::DEFAULT_PROPAGATE_AT_LAUNCH`) — so each tag is selected
+        // by exactly one of them.
         FILTER_PROPAGATE_AT_LAUNCH => values
             .iter()
-            .filter_map(|value| value.parse::<bool>().ok())
+            .filter_map(|value| boolean_filter_value(value))
             .any(|wanted| tag.propagate_at_launch == Some(wanted)),
         _ => false,
     }

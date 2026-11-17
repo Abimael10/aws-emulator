@@ -71,8 +71,9 @@ pub mod group_configuration;
 pub mod group_tags;
 
 pub use group_tags::{
-    propagates_at_launch, stored_tag, tag_description, DEFAULT_PROPAGATE_AT_LAUNCH,
-    GROUP_RESOURCE_TYPE,
+    named_tag_resources, propagates_at_launch, requested_keys_by_group, stored_tag, stored_tags,
+    tag_description, tagged_group_name, too_many_tags_in_one_call_message, too_many_tags_message,
+    DEFAULT_PROPAGATE_AT_LAUNCH, GROUP_RESOURCE_TYPE, MAX_TAGS_PER_CALL, MAX_TAGS_PER_GROUP,
 };
 
 /// The Elastic Load Balancing v2 targets a group's instances occupy in the target groups
@@ -2844,6 +2845,36 @@ pub fn audit(parts: &::http::request::Parts, operation: &str, resource: &str, ou
         access_key_id = %::engine::extract_akid(&parts.headers),
         "Auto Scaling state change"
     );
+}
+
+/// The most resource identifiers ONE audit record names.
+///
+/// A record is written per call, and a call that changes several resources is still one
+/// record: the identifiers are capped so the record's size is the emulator's choice rather
+/// than the caller's.
+pub const MAX_AUDITED_RESOURCES: usize = 10;
+
+/// The `resource` field of an audit record for a call that changed SEVERAL resources: how
+/// many it changed, and at most [`MAX_AUDITED_RESOURCES`] of their identifiers.
+///
+/// THE ONE COPY for every operation of this service that changes a set of resources at
+/// once, so no record a caller sized is written.
+pub fn audited_resources(resources: &[String]) -> String {
+    let named = resources
+        .iter()
+        .take(MAX_AUDITED_RESOURCES)
+        .cloned()
+        .collect::<Vec<String>>()
+        .join(",");
+    if resources.len() > MAX_AUDITED_RESOURCES {
+        let withheld = resources.len() - MAX_AUDITED_RESOURCES;
+        format!(
+            "{} resources: {named} (+{withheld} more)",
+            resources.len()
+        )
+    } else {
+        named
+    }
 }
 
 /// Convert a stored instant to the wire timestamp type.

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteTags
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteTags`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteTags::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the tags a request names from the Auto Scaling groups they name, by key: a key
+//! a group does not carry leaves it exactly as it was, and the request is taken as a whole
+//! — a tag naming a group the account does not hold removes nothing at all. The groups'
+//! tags are the same state `CreateOrUpdateTags` writes and `DescribeTags` reports
+//! ([`crate::state::group_tags`]).
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +151,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteTags` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteTagsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteTags"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteTagsErrorModeled::ResourceContentionFault(
+                ResourceContentionFault {
+                    message: Some(
+                        "the Auto Scaling store is not mounted on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let requested = input.tags;
+
+        // How many tags ONE call may state, checked FIRST — before the request is read for
+        // the groups it names and before the store is locked: every pass below is then over
+        // a bounded list, so no caller decides how much work this request costs.
+        if requested.len() > crate::state::MAX_TAGS_PER_CALL {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::too_many_tags_in_one_call_message(),
+            ));
+        }
+
+        // Untagging a group is an action IAM judges against THAT group, so every group this
+        // request removes a tag from is decided before anything is read or written: a
+        // refused request leaves the account exactly as it was.
+        for group_name in crate::state::named_tag_resources(&requested) {
+            if let Some(refusal) = crate::service::authorization::group_action_refusal(
+                &*self.engine,
+                ctx,
+                Self::NAME,
+                group_name,
+            ) {
+                return Err(refusal);
+            }
+        }
+
+        let removed = {
+            let mut state = store.lock();
+            state.materialize_due(&*self.engine, ::std::time::SystemTime::now());
+
+            // EVERY tag of the request is resolved to the group it is on BEFORE the first
+            // one is removed, exactly as the write path resolves them: the operation
+            // applies the request as a whole.
+            let targets = requested
+                .iter()
+                .map(|tag| crate::state::tagged_group_name(&state.groups, tag))
+                .collect::<Result<Vec<String>, _>>()
+                .map_err(|refusal| {
+                    crate::scaffolded::Scaffolded::validation_error(refusal.message())
+                })?;
+
+            // A tag of a group is identified by its KEY, so the `Value` a request carries
+            // beside the key says nothing about which tag to remove, and a key the group
+            // does not carry removes nothing.
+            let mut removed: Vec<String> = Vec::new();
+            for (group_name, tag) in targets.into_iter().zip(requested) {
+                if let Some(group) = state.groups.get_mut(&group_name) {
+                    if group.remove_tag(&tag.key) {
+                        removed.push(format!("{group_name}/{}", tag.key));
+                    }
+                }
+            }
+            removed
+        };
+
+        crate::state::audit(
+            ctx.parts(),
+            Self::NAME,
+            &crate::state::audited_resources(&removed),
+            "group tags removed",
+        );
+        Ok(DeleteTagsOutput)
     }
 }

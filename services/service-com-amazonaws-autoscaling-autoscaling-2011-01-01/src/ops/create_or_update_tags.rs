@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateOrUpdateTags
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateOrUpdateTags`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateOrUpdateTags::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes the tags a request carries onto the Auto Scaling groups they name: a key a group
+//! already carries is overwritten, a key it does not carry is added, and the request is
+//! taken as a whole — a tag naming a group the account does not hold, or one that would take
+//! a group past the account's tag quota, changes nothing at all. Every tag is stored through
+//! the one tag-store path of this service ([`crate::state::group_tags`]), so `DescribeTags`
+//! and the group's own read report what this operation wrote.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +163,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateOrUpdateTags` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateOrUpdateTagsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateOrUpdateTags"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateOrUpdateTagsErrorModeled::ResourceContentionFault(
+                ResourceContentionFault {
+                    message: Some(
+                        "the Auto Scaling store is not mounted on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let requested = input.tags;
+
+        // How many tags ONE call may state, checked FIRST — before the request is read for
+        // the groups it names, before the store is locked and before any quota is counted:
+        // every pass below is then over a bounded list, so no caller decides how much work
+        // this request costs.
+        if requested.len() > crate::state::MAX_TAGS_PER_CALL {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::too_many_tags_in_one_call_message(),
+            ));
+        }
+
+        // Tagging a group is an action IAM judges against THAT group, so every group this
+        // request writes to is decided before anything is read or written: a refused
+        // request leaves the account exactly as it was. The decision is taken on the name
+        // the request states, whether or not a group answers to it.
+        let named = crate::state::named_tag_resources(&requested);
+        for group_name in &named {
+            if let Some(refusal) = crate::service::authorization::group_action_refusal(
+                &*self.engine,
+                ctx,
+                Self::NAME,
+                group_name,
+            ) {
+                return Err(refusal);
+            }
+        }
+
+        let written = {
+            let mut state = store.lock();
+            state.materialize_due(&*self.engine, ::std::time::SystemTime::now());
+
+            // EVERY tag of the request is resolved to the group it is on BEFORE the first
+            // one is written: the operation applies the request as a whole, so a request
+            // that names one group it cannot tag tags none of them.
+            let targets = requested
+                .iter()
+                .map(|tag| crate::state::tagged_group_name(&state.groups, tag))
+                .collect::<Result<Vec<String>, _>>()
+                .map_err(|refusal| {
+                    crate::scaffolded::Scaffolded::validation_error(refusal.message())
+                })?;
+
+            // The account's quota for the tags of ONE group, checked for the request as a
+            // whole before any of it is applied: a call that would take a group past the
+            // quota is refused with the modelled limit error and writes nothing. The keys
+            // each group would receive are read off the request in one pass.
+            for (group_name, keys) in crate::state::requested_keys_by_group(&requested) {
+                let would_carry = state
+                    .groups
+                    .get(group_name)
+                    .map_or(0, |group| group.tag_count_after(keys.iter().copied()));
+                if would_carry > crate::state::MAX_TAGS_PER_GROUP {
+                    return Err(CreateOrUpdateTagsErrorModeled::LimitExceededFault(
+                        LimitExceededFault {
+                            message: Some(crate::state::too_many_tags_message(group_name)),
+                        },
+                    )
+                    .into());
+                }
+            }
+
+            let mut written: Vec<String> = Vec::with_capacity(targets.len());
+            for (group_name, tag) in targets.into_iter().zip(requested) {
+                let key = tag.key.clone();
+                // The group was resolved above under this same lock, so it is still held.
+                if let Some(group) = state.groups.get_mut(&group_name) {
+                    group.put_tag(tag);
+                }
+                written.push(format!("{group_name}/{key}"));
+            }
+            written
+        };
+
+        crate::state::audit(
+            ctx.parts(),
+            Self::NAME,
+            &crate::state::audited_resources(&written),
+            "group tags written",
+        );
+        Ok(CreateOrUpdateTagsOutput)
     }
 }

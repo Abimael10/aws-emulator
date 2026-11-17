@@ -771,16 +771,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let resource_id = state.mint_resource_id();
         let arn = crate::state::group_arn(&region, &resource_id, &name);
+        // How many tags ONE call may state, checked on the request's own length before the
+        // tags are read, exactly as the two tag-writing operations check it.
+        let requested_tags = input.tags.unwrap_or_default();
+        if requested_tags.len() > crate::state::MAX_TAGS_PER_CALL {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::too_many_tags_in_one_call_message(),
+            ));
+        }
         // A tag on an Auto Scaling group is stored against that group, under the one
         // supported resource type, and with the propagation decision the request stated
         // or the default when it stated none: the members the SERVICE decides are decided
-        // here, once, for every reader of the tag.
-        let tags = input
-            .tags
-            .unwrap_or_default()
-            .into_iter()
-            .map(|tag| crate::state::stored_tag(&name, tag))
-            .collect();
+        // here, once, for every reader of the tag. One entry per KEY, as every later write
+        // of a group's tags stores them, so a request that states a key twice leaves the
+        // group carrying that tag once.
+        let tags = crate::state::stored_tags(&name, requested_tags);
+        // A group carries at most the account's quota of tags, counted the way the tag
+        // writers count it — by the KEYS the group would carry — so one rule holds a group
+        // to one ceiling whichever operation writes its tags.
+        if tags.len() > crate::state::MAX_TAGS_PER_GROUP {
+            return Err(CreateAutoScalingGroupErrorModeled::LimitExceededFault(
+                LimitExceededFault {
+                    message: Some(crate::state::too_many_tags_message(&name)),
+                },
+            )
+            .into());
+        }
         let group = crate::state::StoredGroup {
             name: name.clone(),
             arn,
