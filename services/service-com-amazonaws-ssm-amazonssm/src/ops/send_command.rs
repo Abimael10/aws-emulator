@@ -41,8 +41,10 @@
 //! Two members are persisted and reported but not RESOLVED here. `OutputS3BucketName` is
 //! a bucket of another service, which this crate holds no state of, so a send is not
 //! refused `InvalidOutputFolder` for one the account may not hold; and `OutputS3Region` is
-//! the member whose own documentation says "the system ignores it", so nothing is stored
-//! for it at all.
+//! the member whose own documentation says "the system ignores it … Instead, Systems
+//! Manager automatically determines the Amazon Web Services Region of the S3 bucket", so
+//! nothing a request carries is stored for it and what the command REPORTS for it is the
+//! Region it was sent to ([`crate::state::commands::CommandRecord::to_command`]).
 //!
 //! ## Shape of an operation
 //!

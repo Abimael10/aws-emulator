@@ -1159,10 +1159,25 @@ async fn a_member_that_must_name_an_arn_is_refused_when_it_names_none() {
                     } else {
                         &parsed["Command"][member.as_str()]
                     };
-                    assert_eq!(
-                        reported, value,
-                        "case {case:?}: a command reports the {member} it was sent with"
-                    );
+                    match value.as_object() {
+                        // A configuration structure is reported with every member of its
+                        // own — the ones the send set, and the rest at their defaults
+                        // (`state::commands::CommandRecord::to_command`) — so what a send
+                        // set is what it is compared by.
+                        Some(sent) => {
+                            for (inner, held) in sent {
+                                assert_eq!(
+                                    &reported[inner.as_str()], held,
+                                    "case {case:?}: a command reports the \
+                                     {member}.{inner} it was sent with, got {reported:?}"
+                                );
+                            }
+                        }
+                        None => assert_eq!(
+                            reported, value,
+                            "case {case:?}: a command reports the {member} it was sent with"
+                        ),
+                    }
                 }
             }
             Some(code) => assert_eq!(
@@ -1379,6 +1394,312 @@ async fn the_command_history_the_store_keeps_is_bounded() {
         (400, "InvalidCommandId"),
         "the oldest command's history is the one dropped, got {status} with {reported:?}"
     );
+}
+
+/// Every member of `com.amazonaws.ssm#Command`, in the model's member order, as
+/// `smithy_query(query="shape", shape="Command")` lists them — followed by the five
+/// members the service reports beyond the published model
+/// (`crate::ops::types::command_wire`). A command reports all of them.
+///
+/// `Parameters` is deliberately not among them: it is the one member whose report depends
+/// on what the store holds, since a send that supplied no parameter value supplied no map
+/// (pinned below, and by `a_send_supplies_the_parameters_the_document_declares`).
+const COMMAND_MEMBERS: &[&str] = &[
+    "CommandId",
+    "DocumentName",
+    "DocumentVersion",
+    "Comment",
+    "ExpiresAfter",
+    "InstanceIds",
+    "Targets",
+    "RequestedDateTime",
+    "Status",
+    "StatusDetails",
+    "OutputS3Region",
+    "OutputS3BucketName",
+    "OutputS3KeyPrefix",
+    "MaxConcurrency",
+    "MaxErrors",
+    "TargetCount",
+    "CompletedCount",
+    "ErrorCount",
+    "DeliveryTimedOutCount",
+    "ServiceRole",
+    "NotificationConfig",
+    "CloudWatchOutputConfig",
+    "TimeoutSeconds",
+    "AlarmConfiguration",
+    "TriggeredAlarms",
+    "ClientName",
+    "ClientSourceId",
+    "HasSendCommandSignature",
+    "HasCancelCommandSignature",
+    "Interactive",
+];
+
+/// The two instants a command reports, which are `timestamp` members
+/// (`Command$ExpiresAfter`, `Command$RequestedDateTime`).
+const COMMAND_INSTANTS: &[&str] = &["ExpiresAfter", "RequestedDateTime"];
+
+/// What a command whose send configured nothing reports for each configurable member: an
+/// unset scalar as the empty string, an unset list as empty, and an unset configuration
+/// structure as the object with its own members at their defaults.
+fn unconfigured_members(region: &str) -> Vec<(&'static str, Value)> {
+    vec![
+        ("Comment", json!("")),
+        ("OutputS3Region", json!(region)),
+        ("OutputS3BucketName", json!("")),
+        ("OutputS3KeyPrefix", json!("")),
+        ("ServiceRole", json!("")),
+        ("ClientName", json!("")),
+        ("ClientSourceId", json!("")),
+        ("Targets", json!([])),
+        ("TriggeredAlarms", json!([])),
+        (
+            "NotificationConfig",
+            json!({"NotificationArn": "", "NotificationEvents": [], "NotificationType": ""}),
+        ),
+        (
+            "CloudWatchOutputConfig",
+            json!({"CloudWatchLogGroupName": "", "CloudWatchOutputEnabled": false}),
+        ),
+        (
+            "AlarmConfiguration",
+            json!({"Alarms": [], "IgnorePollAlarmFailure": false}),
+        ),
+        ("HasSendCommandSignature", json!(false)),
+        ("HasCancelCommandSignature", json!(false)),
+        ("Interactive", json!(false)),
+    ]
+}
+
+/// Assert `command` reports every member of the projection, and reports each instant at
+/// the millisecond resolution this protocol's `timestamp` carries.
+fn assert_complete_projection(case: &str, command: &Value) {
+    for member in COMMAND_MEMBERS {
+        assert!(
+            !command[*member].is_null(),
+            "case {case:?}: a command reports {member}, got {command:?}"
+        );
+    }
+    for member in COMMAND_INSTANTS {
+        let seconds = command[*member]
+            .as_f64()
+            .unwrap_or_else(|| panic!("case {case:?}: {member} is epoch seconds, got {command:?}"));
+        // Stated to the millisecond: the thousandths are whole. The tolerance only
+        // absorbs the float's own representation error — a nanosecond remainder would
+        // leave this a fraction of a millisecond away from whole.
+        let thousandths = seconds * 1_000.0;
+        assert!(
+            (thousandths - thousandths.round()).abs() < 0.01,
+            "case {case:?}: expected {member} at millisecond resolution, got {seconds}"
+        );
+    }
+}
+
+/// One row of the projection table: the send to make, the Region to make it in, and the
+/// members its own request configured.
+struct ProjectionRow {
+    case: &'static str,
+    region: &'static str,
+    body: Value,
+    /// `(member, value)` the echo must report for what this send set. A member not named
+    /// here is one the send left unset, and is checked against
+    /// [`unconfigured_members`] instead.
+    configured: Vec<(&'static str, Value)>,
+}
+
+/// A command reports its WHOLE configuration: every member of the projection is there on
+/// every read of it, with what the send set echoed and what it left unset reported as that
+/// member's default rather than omitted.
+#[tokio::test]
+async fn a_command_reports_every_member_of_its_projection() {
+    let topic = format!(
+        "arn:aws:sns:{REGION}:{}:command-status",
+        engine::emulator_account_id()
+    );
+    let role = format!(
+        "arn:aws:iam::{}:role/SSMNotificationRole",
+        engine::emulator_account_id()
+    );
+
+    // One row per shape of send the class holds: a send that configures nothing, one that
+    // configures every member it may, one that DESCRIBES its nodes rather than naming
+    // them, one of a document that needs no parameter at all, and one made through
+    // another Region — so the defaults are read off the request and the store rather than
+    // off one recorded call.
+    let rows = vec![
+        ProjectionRow {
+            case: "a send that configures nothing",
+            region: REGION,
+            body: json!({
+                "DocumentName": SHELL,
+                "InstanceIds": [LINUX],
+                "Parameters": {"commands": ["echo hello"]},
+            }),
+            configured: vec![
+                ("InstanceIds", json!([LINUX])),
+                ("Parameters", json!({"commands": ["echo hello"]})),
+            ],
+        },
+        ProjectionRow {
+            case: "a send that configures every member it may",
+            region: REGION,
+            body: json!({
+                "DocumentName": AGENT,
+                "InstanceIds": [LINUX, WINDOWS],
+                "Comment": "patch window",
+                "ServiceRoleArn": role,
+                "NotificationConfig": {
+                    "NotificationArn": topic,
+                    "NotificationEvents": ["Success"],
+                    "NotificationType": "Command",
+                },
+                "CloudWatchOutputConfig": {
+                    "CloudWatchLogGroupName": "/aws/ssm/run-command",
+                    "CloudWatchOutputEnabled": true,
+                },
+                "AlarmConfiguration": {"Alarms": [{"Name": "command-errors"}]},
+                "OutputS3BucketName": "command-output",
+                "OutputS3KeyPrefix": "runs",
+                "MaxConcurrency": "10%",
+                "MaxErrors": "2",
+                "TimeoutSeconds": 120,
+            }),
+            configured: vec![
+                ("InstanceIds", json!([LINUX, WINDOWS])),
+                ("Comment", json!("patch window")),
+                ("ServiceRole", json!(role.clone())),
+                (
+                    "NotificationConfig",
+                    json!({
+                        "NotificationArn": topic.clone(),
+                        "NotificationEvents": ["Success"],
+                        "NotificationType": "Command",
+                    }),
+                ),
+                (
+                    "CloudWatchOutputConfig",
+                    json!({
+                        "CloudWatchLogGroupName": "/aws/ssm/run-command",
+                        "CloudWatchOutputEnabled": true,
+                    }),
+                ),
+                (
+                    "AlarmConfiguration",
+                    json!({"Alarms": [{"Name": "command-errors"}], "IgnorePollAlarmFailure": false}),
+                ),
+                ("OutputS3BucketName", json!("command-output")),
+                ("OutputS3KeyPrefix", json!("runs")),
+                ("MaxConcurrency", json!("10%")),
+                ("MaxErrors", json!("2")),
+                ("TimeoutSeconds", json!(120)),
+            ],
+        },
+        ProjectionRow {
+            case: "a send that describes its nodes",
+            region: REGION,
+            body: json!({
+                "DocumentName": AGENT,
+                "Targets": [{"Key": "tag:env", "Values": ["prod"]}],
+            }),
+            configured: vec![
+                ("InstanceIds", json!([])),
+                (
+                    "Targets",
+                    json!([{"Key": "tag:env", "Values": ["prod"]}]),
+                ),
+            ],
+        },
+        ProjectionRow {
+            case: "a send that supplies no parameter",
+            region: REGION,
+            body: json!({"DocumentName": AGENT, "InstanceIds": [HYBRID]}),
+            configured: vec![("InstanceIds", json!([HYBRID]))],
+        },
+        ProjectionRow {
+            case: "a send made through another Region",
+            region: OTHER_REGION,
+            body: json!({
+                "DocumentName": SHELL,
+                "InstanceIds": [OTHER_ONLY],
+                "Parameters": {"commands": ["echo hello"]},
+            }),
+            configured: vec![
+                ("InstanceIds", json!([OTHER_ONLY])),
+                ("Parameters", json!({"commands": ["echo hello"]})),
+            ],
+        },
+    ];
+
+    for ProjectionRow {
+        case,
+        region,
+        body,
+        configured,
+    } in rows
+    {
+        let (router, engine) = service();
+        seed_inventory(&engine);
+        let (status, parsed) = call_in_region(&router, region, "SendCommand", &body).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the send to be served, got {status} with {parsed:?}"
+        );
+        let command = parsed["Command"].clone();
+        assert_complete_projection(case, &command);
+        for (member, expected) in &configured {
+            assert_eq!(
+                &command[*member], expected,
+                "case {case:?}: a command reports the {member} its send configured, got \
+                 {command:?}"
+            );
+        }
+        let set: Vec<&str> = configured.iter().map(|(member, _)| *member).collect();
+        for (member, expected) in unconfigured_members(region) {
+            if set.contains(&member) {
+                continue;
+            }
+            assert_eq!(
+                command[member], expected,
+                "case {case:?}: a send that left {member} unset reports its default, got \
+                 {command:?}"
+            );
+        }
+        // The one member outside the roster: `Parameters` is reported when the send
+        // supplied parameter values and not when it supplied none, because a send that
+        // supplied no value supplied no map for the store to report an entry of.
+        if !set.contains(&"Parameters") {
+            assert!(
+                command["Parameters"].is_null(),
+                "case {case:?}: a send that supplied no parameter reports none, got \
+                 {command:?}"
+            );
+        }
+
+        // The same projection on a READ of the same command: the member set belongs to the
+        // command, not to the call that reported it.
+        let (status, listed) = call_in_region(
+            &router,
+            region,
+            "ListCommands",
+            &json!({"CommandId": text(&command, "CommandId")}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the history read to be served, got {status} with \
+             {listed:?}"
+        );
+        assert_complete_projection(case, &listed["Commands"][0]);
+        for (member, expected) in &configured {
+            assert_eq!(
+                &listed["Commands"][0][*member], expected,
+                "case {case:?}: the listed command reports the {member} its send \
+                 configured, got {listed:?}"
+            );
+        }
+    }
 }
 
 /// A per-invocation read resolves the pair of ids it is handed against the invocations the

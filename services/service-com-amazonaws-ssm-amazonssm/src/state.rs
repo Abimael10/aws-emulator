@@ -1548,6 +1548,14 @@ pub const DOCUMENT_STATUS_UPDATING: &str = "Updating";
 /// clock makes it due rather than by any call.
 pub const DOCUMENT_TRANSITION_DELAY: Duration = Duration::from_secs(3);
 
+/// How many nanoseconds a millisecond is, which is the resolution this service states an
+/// instant at: a finer reading of the clock than what goes on the wire states a precision
+/// the value does not hold, so it is dropped rather than written. The one declaration of
+/// it, so the two places that quantise an instant — a maintenance window's rendered
+/// instants ([`maintenance_windows`]) and a command's reported ones
+/// ([`commands::wire_instant`]) — agree on what the resolution is.
+pub const NANOS_PER_MILLISECOND: u32 = 1_000_000;
+
 /// The `PlatformType` values, in the order the modelled enum
 /// (`smithy_query(query="shape",shape="PlatformType")`) lists them — which is the order a
 /// document's `PlatformTypes` are reported in, so a caller reading `PlatformTypes[0]`

@@ -40,7 +40,7 @@ use ::chrono::{Offset, TimeZone};
 
 use crate::ops::types::MaintenanceWindowIdentity;
 
-use super::ComAmazonawsSsmAmazonssmState;
+use super::{ComAmazonawsSsmAmazonssmState, NANOS_PER_MILLISECOND};
 
 /// What every maintenance window id starts with, from the modelled `MaintenanceWindowId`
 /// pattern (`^mw-[0-9a-f]{17}$`).
@@ -159,11 +159,6 @@ const INSTANT_UTC_DESIGNATOR: &str = "Z";
 
 /// The offset an instant read in a zone that is not at UTC ends with instead.
 const INSTANT_OFFSET_FORMAT: &str = "%:z";
-
-/// How many nanoseconds a millisecond is, which is the resolution an instant is written
-/// at: a finer reading of the clock than the service's own states a precision it does not
-/// hold, so it is dropped rather than written.
-const NANOS_PER_MILLISECOND: u32 = 1_000_000;
 
 /// The civil date-and-time form a window's `StartDate`/`EndDate` may state without a zone,
 /// the zone then being the window's own: both are documented "in ISO-8601 Extended format"

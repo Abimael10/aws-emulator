@@ -18,6 +18,7 @@ pub mod add_tags_to_resource_types;
 pub mod associate_ops_item_related_item_types;
 pub mod cancel_command_types;
 pub mod cancel_maintenance_window_execution_types;
+pub mod command_wire;
 pub mod create_activation_types;
 pub mod create_association_batch_types;
 pub mod create_association_types;
@@ -176,6 +177,8 @@ pub use associate_ops_item_related_item_types::*;
 pub use cancel_command_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use cancel_maintenance_window_execution_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use command_wire::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use create_activation_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

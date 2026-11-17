@@ -1026,36 +1026,8 @@ pub struct CommandFilter {
     pub value: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.ssm#Command")]
-#[derive(Debug, Clone, Default)]
-pub struct Command {
-    pub command_id: Option<String>,
-    pub document_name: Option<String>,
-    pub document_version: Option<String>,
-    pub comment: Option<String>,
-    pub expires_after: Option<::aws_smithy_types::DateTime>,
-    pub parameters: Option<std::collections::HashMap<String, Vec<String>>>,
-    pub instance_ids: Option<Vec<String>>,
-    pub targets: Option<Vec<Target>>,
-    pub requested_date_time: Option<::aws_smithy_types::DateTime>,
-    pub status: Option<String>,
-    pub status_details: Option<String>,
-    pub output_s3_region: Option<String>,
-    pub output_s3_bucket_name: Option<String>,
-    pub output_s3_key_prefix: Option<String>,
-    pub max_concurrency: Option<String>,
-    pub max_errors: Option<String>,
-    pub target_count: i32,
-    pub completed_count: i32,
-    pub error_count: i32,
-    pub delivery_timed_out_count: i32,
-    pub service_role: Option<String>,
-    pub notification_config: Option<NotificationConfig>,
-    pub cloud_watch_output_config: Option<CloudWatchOutputConfig>,
-    pub timeout_seconds: Option<i32>,
-    pub alarm_configuration: Option<AlarmConfiguration>,
-    pub triggered_alarms: Option<Vec<AlarmStateInformation>>,
-}
+// `com.amazonaws.ssm#Command` is declared in `super::command_wire` instead of here: the
+// wire carries five members this model does not declare, which the derive cannot express.
 
 #[smithy_macros::smithy(shape = "com.amazonaws.ssm#ComplianceStringFilter")]
 #[derive(Debug, Clone, Default)]

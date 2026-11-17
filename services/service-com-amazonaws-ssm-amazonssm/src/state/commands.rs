@@ -238,6 +238,65 @@ pub fn iso8601_elapsed(from: SystemTime, to: SystemTime) -> String {
     format!("PT{seconds}S")
 }
 
+/// `at` as the modelled timestamp this service reports it in: the instant TRUNCATED to the
+/// millisecond it falls in ([`super::NANOS_PER_MILLISECOND`]).
+///
+/// This protocol puts a `timestamp` on the wire as epoch seconds with a fraction, and the
+/// finest fraction AWS states one with is the millisecond — so the clock's nanosecond
+/// remainder is no part of the value, and dropping it is what keeps a reported instant in
+/// the form a client's parser reads. Truncated rather than rounded, so a reported instant
+/// never names one later than the call that stamped it.
+pub fn wire_instant(at: SystemTime) -> ::aws_smithy_types::DateTime {
+    let stamped = ::aws_smithy_types::DateTime::from(at);
+    ::aws_smithy_types::DateTime::from_secs_and_nanos(
+        stamped.secs(),
+        stamped.subsec_nanos() / super::NANOS_PER_MILLISECOND * super::NANOS_PER_MILLISECOND,
+    )
+}
+
+/// The `NotificationConfig` a command reports, from the one its send configured.
+///
+/// Every member is reported, because the structure is part of the command's configuration
+/// and a command reports its whole configuration ([`CommandRecord::to_command`]): a member
+/// the send left unset names no topic, asks for no event and asks for no notification
+/// type, which is the empty string, the empty list and the empty string respectively.
+fn reported_notification_config(configured: Option<&NotificationConfig>) -> NotificationConfig {
+    NotificationConfig {
+        notification_arn: Some(
+            configured
+                .and_then(|held| held.notification_arn.clone())
+                .unwrap_or_default(),
+        ),
+        notification_events: Some(
+            configured
+                .and_then(|held| held.notification_events.clone())
+                .unwrap_or_default(),
+        ),
+        notification_type: Some(
+            configured
+                .and_then(|held| held.notification_type.clone())
+                .unwrap_or_default(),
+        ),
+    }
+}
+
+/// The `CloudWatchOutputConfig` a command reports, from the one its send configured — read
+/// the same way, so a send that named no log group reports none by name and output not
+/// enabled (`CloudWatchOutputConfig$CloudWatchOutputEnabled` is `@default` false).
+fn reported_cloud_watch_output_config(
+    configured: Option<&CloudWatchOutputConfig>,
+) -> CloudWatchOutputConfig {
+    CloudWatchOutputConfig {
+        cloud_watch_log_group_name: Some(
+            configured
+                .and_then(|held| held.cloud_watch_log_group_name.clone())
+                .unwrap_or_default(),
+        ),
+        cloud_watch_output_enabled: configured
+            .is_some_and(|held| held.cloud_watch_output_enabled),
+    }
+}
+
 /// The `CommandInvocationStatus` of an invocation whose plugin exited zero (from the
 /// modelled enum, `crate::ops::types::COMMAND_INVOCATION_STATUS_VALUES`).
 pub const INVOCATION_STATUS_SUCCESS: &str = "Success";
@@ -515,47 +574,77 @@ impl CommandRecord {
 
     /// The modelled `Command` for this command: every member either echoed from the
     /// request as it was received, resolved by the send, or counted from the invocations
-    /// the store holds. A member the request left unset is left unset here too rather
-    /// than invented.
+    /// the store holds.
+    ///
+    /// The projection is COMPLETE: Run Command reports a command's whole configuration on
+    /// every read of it, so a member the request left unset is reported as what that member
+    /// holds for a command nobody configured — the empty string for a scalar, the empty
+    /// list for a list, and the structure with its own members at their defaults for a
+    /// configuration structure — rather than omitted. That is what lets a client read the
+    /// echo to confirm what the command was accepted with instead of having to tell "the
+    /// service did not report it" from "the service dropped it".
+    ///
+    /// The one member whose stored form decides whether it is reported is `Parameters`: a
+    /// send that supplied no parameter value supplied no map, and nothing in this service
+    /// holds an entry to report for it.
     pub fn to_command(&self) -> Command {
         Command {
             command_id: Some(self.command_id.clone()),
             document_name: Some(self.document_name.clone()),
             document_version: Some(self.document_version.clone()),
-            comment: self.comment.clone(),
-            expires_after: Some(::aws_smithy_types::DateTime::from(self.expires_after())),
+            comment: Some(self.comment.clone().unwrap_or_default()),
+            expires_after: Some(wire_instant(self.expires_after())),
             parameters: (!self.parameters.is_empty()).then(|| {
                 self.parameters
                     .iter()
                     .map(|(name, values)| (name.clone(), values.clone()))
                     .collect()
             }),
-            instance_ids: (!self.instance_ids.is_empty()).then(|| self.instance_ids.clone()),
-            targets: (!self.targets.is_empty()).then(|| self.targets.clone()),
-            requested_date_time: Some(::aws_smithy_types::DateTime::from(self.requested_at)),
+            instance_ids: Some(self.instance_ids.clone()),
+            targets: Some(self.targets.clone()),
+            requested_date_time: Some(wire_instant(self.requested_at)),
             status: Some(self.status.clone()),
             status_details: Some(self.status_details.clone()),
             // "(Deprecated) You can no longer specify this parameter. The system ignores
-            // it" (`SendCommandRequest$OutputS3Region`), so nothing is stored for it and
-            // nothing is reported.
-            output_s3_region: None,
-            output_s3_bucket_name: self.output_s3_bucket_name.clone(),
-            output_s3_key_prefix: self.output_s3_key_prefix.clone(),
+            // it. Instead, Systems Manager automatically determines the Amazon Web Services
+            // Region of the S3 bucket" (`Command$OutputS3Region`) — so what a request
+            // carried is ignored, and what is REPORTED is the Region Systems Manager
+            // determined, which is the Region the command was sent to.
+            output_s3_region: Some(self.region.clone()),
+            output_s3_bucket_name: Some(self.output_s3_bucket_name.clone().unwrap_or_default()),
+            output_s3_key_prefix: Some(self.output_s3_key_prefix.clone().unwrap_or_default()),
             max_concurrency: Some(self.max_concurrency.clone()),
             max_errors: Some(self.max_errors.clone()),
             target_count: self.target_count(),
             completed_count: self.completed_count(),
             error_count: self.error_count(),
             delivery_timed_out_count: self.delivery_timed_out_count(),
-            service_role: self.service_role.clone(),
-            notification_config: self.notification_config.clone(),
-            cloud_watch_output_config: self.cloud_watch_output_config.clone(),
+            service_role: Some(self.service_role.clone().unwrap_or_default()),
+            notification_config: Some(reported_notification_config(
+                self.notification_config.as_ref(),
+            )),
+            cloud_watch_output_config: Some(reported_cloud_watch_output_config(
+                self.cloud_watch_output_config.as_ref(),
+            )),
             timeout_seconds: Some(self.timeout_seconds),
-            alarm_configuration: self.alarm_configuration.clone(),
+            // `AlarmConfiguration`'s own members carry the defaults the model declares for
+            // them, so the structure a send configured no alarm with is the defaulted one:
+            // no alarm named, and a poll failure not ignored.
+            alarm_configuration: Some(self.alarm_configuration.clone().unwrap_or_default()),
             // "The CloudWatch alarm that was invoked by the command"
             // (`Command$TriggeredAlarms`): no alarm has been evaluated for a command
             // nothing has delivered, so none was invoked.
-            triggered_alarms: None,
+            triggered_alarms: Some(Vec::new()),
+            // The members beyond the published model. None of them is settable through this
+            // API — `SendCommandRequest` carries no client name, no client source id, no
+            // command signature and no interactive flag — so a command sent through it is
+            // reported as what it is: issued by no named client, carrying neither
+            // signature, and not interactive.
+            client_name: Some(String::new()),
+            client_source_id: Some(String::new()),
+            has_send_command_signature: Some(false),
+            has_cancel_command_signature: Some(false),
+            interactive: Some(false),
         }
     }
 
@@ -600,7 +689,7 @@ impl CommandRecord {
             comment: self.comment.clone(),
             document_name: Some(self.document_name.clone()),
             document_version: Some(self.document_version.clone()),
-            requested_date_time: Some(::aws_smithy_types::DateTime::from(self.requested_at)),
+            requested_date_time: Some(wire_instant(self.requested_at)),
             status: Some(invocation.status.clone()),
             status_details: Some(invocation.status_details.clone()),
             // "Gets the trace output sent by the agent" (`CommandInvocation$TraceOutput`):
@@ -640,8 +729,8 @@ impl CommandRecord {
             response_code: ran.response_code,
             // The agent took the command when it was sent and its run was owed to have
             // finished at the invocation's own due instant.
-            response_start_date_time: Some(::aws_smithy_types::DateTime::from(self.requested_at)),
-            response_finish_date_time: Some(::aws_smithy_types::DateTime::from(ran.due_at)),
+            response_start_date_time: Some(wire_instant(self.requested_at)),
+            response_finish_date_time: Some(wire_instant(ran.due_at)),
             output: Some(truncated_plugin_output(&ran.standard_output())),
             // The URLs name the files a plugin wrote to Amazon S3: "if the S3 bucket for the
             // command wasn't specified, then this string is empty"
@@ -649,8 +738,11 @@ impl CommandRecord {
             standard_output_url: Some(String::new()),
             standard_error_url: Some(String::new()),
             // "(Deprecated) You can no longer specify this parameter. The system ignores
-            // it" (`CommandPlugin$OutputS3Region`).
-            output_s3_region: None,
+            // it. Instead, Amazon Web Services Systems Manager automatically determines the
+            // S3 bucket region" (`CommandPlugin$OutputS3Region`) — the same reading
+            // `Command$OutputS3Region` gets in [`Self::to_command`]: what is reported is
+            // the Region the command was sent to.
+            output_s3_region: Some(self.region.clone()),
             output_s3_bucket_name: self.output_s3_bucket_name.clone(),
             output_s3_key_prefix: self.output_s3_key_prefix.clone(),
         }
