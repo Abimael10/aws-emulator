@@ -28,10 +28,16 @@
 //! The rows differ along what the rule generalises over: whether the bucket exists,
 //! whether it carries a policy and which permission that policy grants, whether
 //! the request names a key prefix, and which destination type it asks for.
+//!
+//! The READ side is pinned by its own table at the end of the file: a logging
+//! status is a status OF one cluster, so `DescribeLoggingStatus` answers with the
+//! record the cluster it NAMES carries — "logging off" for a cluster nobody
+//! configured — reports it without changing it, and refuses a cluster the account
+//! does not have.
 
 use service_com_amazonaws_redshift_redshiftserviceversion20121201::state;
 
-use crate::cluster_lifecycle::{Answer, Emulator, REGION};
+use crate::cluster_lifecycle::{element_blocks, Answer, Emulator, REGION};
 
 /// The cluster every case configures logging on.
 const CLUSTER: &str = "audit-logged-cluster";
@@ -163,28 +169,35 @@ async fn create_bucket(emulator: &Emulator, bucket: &str, policy: Option<String>
     }
 }
 
+/// Create `identifier` and leave it SERVING: a cluster the service is still
+/// working on takes no configuration change.
+///
+/// The provisioning span is crossed by moving the emulator's own clock, and the
+/// cluster is then read until it reports itself available — the CONDITION the
+/// case waits on — so nothing here waits for a fixed time.
+async fn serving_cluster(emulator: &Emulator, case: &str, identifier: &str) {
+    let created = emulator.create_minimal(identifier).await;
+    assert_eq!(
+        created.status, 200,
+        "case {case:?}: expected HTTP 200 from CreateCluster {identifier}, got {} with body {}",
+        created.status, created.body
+    );
+    emulator.advance_clock(state::PROVISIONING_SPAN);
+    emulator
+        .poll_until(
+            case,
+            "DescribeClusters",
+            &[("ClusterIdentifier", identifier)],
+            |answer| answer.text("ClusterStatus").as_deref() == Some(state::STATUS_AVAILABLE),
+        )
+        .await;
+}
+
 /// An emulator with Amazon S3 mounted, one available cluster, and the three
 /// buckets the rows below name.
 async fn harness() -> Emulator {
     let emulator = Emulator::with_s3();
-    let created = emulator
-        .call(
-            "CreateCluster",
-            &[
-                ("ClusterIdentifier", CLUSTER),
-                ("NodeType", "ra3.xlplus"),
-                ("MasterUsername", "admin"),
-            ],
-        )
-        .await;
-    assert_eq!(
-        created.status, 200,
-        "expected HTTP 200 from CreateCluster, got {} with body {}",
-        created.status, created.body
-    );
-    // Past the cluster's provisioning span, so it is available: a cluster the
-    // service is still working on takes no configuration change.
-    tokio::time::sleep(state::PROVISIONING_SPAN + std::time::Duration::from_millis(200)).await;
+    serving_cluster(&emulator, "the audit-logged cluster", CLUSTER).await;
 
     create_bucket(
         &emulator,
@@ -627,4 +640,255 @@ async fn enabling_logging_on_a_cluster_that_is_not_available_is_refused() {
         answered.error_code(),
         answered.body
     );
+}
+
+/// How many times each case below re-reads one cluster's logging status.
+///
+/// `DescribeLoggingStatus` only REPORTS, so every read of one unchanged cluster
+/// answers the same record: an implementation where reading a status altered it
+/// fails on the second pass, and no number of passes can fail a reporting one.
+const REPEATED_READS: usize = 3;
+
+/// One row of the reporting table: how a cluster's logging is configured, and
+/// what its logging status must then read as.
+struct Reporting {
+    case: &'static str,
+    /// The cluster this row configures, one per row, so a read of any of them
+    /// is a read of ONE cluster's record among several.
+    cluster: &'static str,
+    /// The `EnableLogging` members beside `ClusterIdentifier`, or `None` for a
+    /// cluster nobody configures logging on at all.
+    enable: Option<&'static [(&'static str, &'static str)]>,
+    /// Whether a `DisableLogging` naming no log type then stops the delivery
+    /// itself.
+    then_disabled: bool,
+    /// `LoggingEnabled`, as the answer spells the boolean.
+    logging_enabled: &'static str,
+    /// `BucketName`, `S3KeyPrefix` and `LogDestinationType`, each `None` where
+    /// the answer must not carry the member at all.
+    bucket_name: Option<&'static str>,
+    s3_key_prefix: Option<&'static str>,
+    log_destination_type: Option<&'static str>,
+    /// `LogExports`, in the order the configuration listed them.
+    log_exports: &'static [&'static str],
+}
+
+/// The rows the reporting table spans, differing along what the rule
+/// generalises over: the destination type the delivery was configured with, how
+/// many log types it exports, whether it names a bucket and a key prefix, and
+/// whether the cluster was ever configured or was configured and stopped again.
+///
+/// The log types are the ones the operation's own documentation publishes for an
+/// `s3` or `cloudwatch` destination — `connectionlog`, `useractivitylog` and
+/// `userlog` (`smithy_query(query="doc", shape="LoggingStatus",
+/// member="LogExports")`).
+const REPORTING_ROWS: &[Reporting] = &[
+    Reporting {
+        case: "an S3 delivery of two log types under a key prefix",
+        cluster: "logging-status-s3-prefixed",
+        enable: Some(&[
+            ("BucketName", DELIVERABLE_BUCKET),
+            ("S3KeyPrefix", "audit/redshift/"),
+            ("LogExports.member.1", "useractivitylog"),
+            ("LogExports.member.2", "connectionlog"),
+        ]),
+        then_disabled: false,
+        logging_enabled: "true",
+        bucket_name: Some(DELIVERABLE_BUCKET),
+        s3_key_prefix: Some("audit/redshift/"),
+        log_destination_type: Some(state::LOG_DESTINATION_S3),
+        log_exports: &["useractivitylog", "connectionlog"],
+    },
+    Reporting {
+        case: "an S3 delivery naming neither a prefix nor a log type",
+        cluster: "logging-status-s3-bare",
+        enable: Some(&[("BucketName", PUT_ONLY_BUCKET)]),
+        then_disabled: false,
+        logging_enabled: "true",
+        bucket_name: Some(PUT_ONLY_BUCKET),
+        s3_key_prefix: None,
+        log_destination_type: Some(state::LOG_DESTINATION_S3),
+        log_exports: &[],
+    },
+    Reporting {
+        case: "a CloudWatch delivery of one log type",
+        cluster: "logging-status-cloudwatch",
+        enable: Some(&[
+            ("LogDestinationType", state::LOG_DESTINATION_CLOUDWATCH),
+            ("LogExports.member.1", "userlog"),
+        ]),
+        then_disabled: false,
+        logging_enabled: "true",
+        bucket_name: None,
+        s3_key_prefix: None,
+        log_destination_type: Some(state::LOG_DESTINATION_CLOUDWATCH),
+        log_exports: &["userlog"],
+    },
+    Reporting {
+        case: "an S3 Tables delivery of three log types",
+        cluster: "logging-status-s3table",
+        enable: Some(&[
+            ("LogDestinationType", state::LOG_DESTINATION_S3_TABLE),
+            ("LogExports.member.1", "connectionlog"),
+            ("LogExports.member.2", "userlog"),
+            ("LogExports.member.3", "useractivitylog"),
+        ]),
+        then_disabled: false,
+        logging_enabled: "true",
+        bucket_name: None,
+        s3_key_prefix: None,
+        log_destination_type: Some(state::LOG_DESTINATION_S3_TABLE),
+        log_exports: &["connectionlog", "userlog", "useractivitylog"],
+    },
+    Reporting {
+        case: "a cluster nobody configured logging on",
+        cluster: "logging-status-unconfigured",
+        enable: None,
+        then_disabled: false,
+        logging_enabled: "false",
+        bucket_name: None,
+        s3_key_prefix: None,
+        log_destination_type: None,
+        log_exports: &[],
+    },
+    Reporting {
+        case: "a cluster whose delivery was configured and stopped again",
+        cluster: "logging-status-stopped",
+        enable: Some(&[
+            ("BucketName", DELIVERABLE_BUCKET),
+            ("S3KeyPrefix", "stopped/"),
+            ("LogExports.member.1", "connectionlog"),
+        ]),
+        then_disabled: true,
+        logging_enabled: "false",
+        bucket_name: None,
+        s3_key_prefix: None,
+        log_destination_type: None,
+        log_exports: &[],
+    },
+];
+
+/// The log types one answer reports, in document order.
+///
+/// Read through [`element_blocks`] rather than through an exact `<member>` match
+/// because the framework's serializer writes the service's XML namespace onto
+/// the first entry of a list, so that entry's open tag carries an attribute.
+fn reported_log_exports(body: &str) -> Vec<String> {
+    element_blocks(body, "member")
+}
+
+/// Every cluster reports ITS OWN logging record, and reporting one changes none
+/// of them.
+///
+/// The RULE: `DescribeLoggingStatus` answers with the logging record the cluster
+/// the request NAMES carries — the one the last `EnableLogging` or
+/// `DisableLogging` on that cluster left, and the "logging off" record for a
+/// cluster nobody configured — and, being a report, it leaves every cluster's
+/// record exactly as it found it. The delivery report (`LastSuccessfulDelivery\
+/// Time`, `LastFailureTime`, `LastFailureMessage`) describes log files that were
+/// actually written, and this control plane writes none, so no row carries one.
+#[tokio::test]
+async fn every_cluster_reports_its_own_logging_record_and_a_read_changes_none_of_them() {
+    let emulator = harness().await;
+
+    for row in REPORTING_ROWS {
+        serving_cluster(&emulator, row.case, row.cluster).await;
+        if let Some(enable) = row.enable {
+            let mut params: Vec<(&str, &str)> = vec![("ClusterIdentifier", row.cluster)];
+            params.extend_from_slice(enable);
+            let answered = enable_logging(&emulator, &params).await;
+            assert_eq!(
+                answered.status, 200,
+                "case {:?}: expected HTTP 200 from EnableLogging, got {} with body {}",
+                row.case, answered.status, answered.body
+            );
+        }
+        if row.then_disabled {
+            let stopped = emulator
+                .call("DisableLogging", &[("ClusterIdentifier", row.cluster)])
+                .await;
+            assert_eq!(
+                stopped.status, 200,
+                "case {:?}: expected HTTP 200 from DisableLogging, got {} with body {}",
+                row.case, stopped.status, stopped.body
+            );
+        }
+    }
+
+    // Every row is read, in full, REPEATED_READS times over: the first pass is
+    // what each cluster's configuration reads as, and every later pass is the
+    // same answer again — for this cluster and for the ones read beside it.
+    for pass in 1..=REPEATED_READS {
+        for row in REPORTING_ROWS {
+            let read = logging_status(&emulator, row.cluster).await;
+            assert_eq!(
+                read.status, 200,
+                "case {:?}: pass {pass} expected HTTP 200 from DescribeLoggingStatus, got {} \
+                 with body {}",
+                row.case, read.status, read.body
+            );
+            for (member, expected) in [
+                ("LoggingEnabled", Some(row.logging_enabled)),
+                ("BucketName", row.bucket_name),
+                ("S3KeyPrefix", row.s3_key_prefix),
+                ("LogDestinationType", row.log_destination_type),
+                // Nothing has delivered a log file, so there is no delivery or
+                // failure to report a time or a message for.
+                ("LastSuccessfulDeliveryTime", None),
+                ("LastFailureTime", None),
+                ("LastFailureMessage", None),
+            ] {
+                assert_eq!(
+                    read.text(member).as_deref(),
+                    expected,
+                    "case {:?}: pass {pass} expected {member}={expected:?}, got {:?} in body {}",
+                    row.case,
+                    read.text(member),
+                    read.body
+                );
+            }
+            let exports: Vec<String> = row.log_exports.iter().map(|it| it.to_string()).collect();
+            assert_eq!(
+                reported_log_exports(&read.body),
+                exports,
+                "case {:?}: pass {pass} expected the exported log types {exports:?}, got body {}",
+                row.case,
+                read.body
+            );
+        }
+    }
+}
+
+/// A logging-status read of a cluster the account does not have is refused with
+/// the fault that names it, whatever else the account holds: a status is a status
+/// OF a cluster.
+#[tokio::test]
+async fn a_logging_status_read_of_a_cluster_the_account_lacks_is_refused() {
+    let emulator = harness().await;
+
+    // The identifiers differ along what the member's grammar admits — a name of
+    // another shape, one at the published length, one that merely extends an
+    // identifier the account HAS — and none of them names a cluster.
+    for absent in [
+        "logging-status-absent",
+        "abc",
+        "audit-logged-cluster-2",
+        "a-rather-longer-cluster-identifier-nobody-created",
+    ] {
+        let answered = logging_status(&emulator, absent).await;
+        assert_eq!(
+            (answered.status, answered.error_code().as_deref()),
+            (404, Some("ClusterNotFound")),
+            "case {absent:?}: expected 404 ClusterNotFound, got {} / {:?} with body {}",
+            answered.status,
+            answered.error_code(),
+            answered.body
+        );
+        assert_eq!(
+            answered.text("Message").as_deref(),
+            Some(format!("Cluster {absent} not found.").as_str()),
+            "case {absent:?}: expected the refusal to name the cluster asked about, got {:?}",
+            answered.text("Message")
+        );
+    }
 }
