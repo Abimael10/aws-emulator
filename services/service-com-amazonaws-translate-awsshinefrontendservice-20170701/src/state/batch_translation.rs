@@ -28,8 +28,8 @@ use super::{
     translation_marker, Terminology, AUTO_LANGUAGE_CODE, MAX_DOCUMENT_BYTES,
 };
 use crate::ops::types::{
-    InputDataConfig, JobDetails, OutputDataConfig, TextTranslationJobProperties,
-    TranslationSettings,
+    InputDataConfig, InvalidRequestException, JobDetails, OutputDataConfig,
+    ResourceNotFoundException, TextTranslationJobProperties, TranslationSettings,
 };
 
 /// `JobStatus`'s seven values (`smithy_query shape=JobStatus`).
@@ -127,6 +127,39 @@ pub const MAX_JOB_RUN_TIME: Duration = Duration::from_secs(10);
 /// bound a caller looping on submission grows it until the host runs out of
 /// memory. The bound is this emulator's own.
 pub const MAX_STORED_JOBS: usize = 100;
+
+/// The service principal Amazon Translate assumes a job's data-access role as:
+/// the `iam` spelling of this service, which is also the service name its own
+/// ARNs carry ([`super::ARN_SERVICE`]).
+pub const JOB_SERVICE_PRINCIPAL: &str = "translate.amazonaws.com";
+
+/// How a submission naming a `DataAccessRoleArn` this service cannot assume is
+/// refused.
+///
+/// Two fixed sentences whose single variable part is the role ARN the request
+/// named: the caller is told which value was refused and what to change about
+/// it, which is the one thing a trust-policy failure is actionable on.
+pub fn unassumable_data_access_role(data_access_role_arn: &str) -> InvalidRequestException {
+    InvalidRequestException {
+        message: Some(format!(
+            "Translate is not authorized to assume role: {data_access_role_arn}. \
+             Please update the role's trust policy."
+        )),
+    }
+}
+
+/// The `ResourceNotFoundException` a batch-job operation answers for a `JobId`
+/// this account holds no job under.
+///
+/// ONE wording for the one condition, so the two operations that resolve a job
+/// by id — the read and the stop — cannot report it differently. The sentence is
+/// wholly fixed: it interpolates neither the job id (which is already in the
+/// caller's own request) nor anything out of the store.
+pub fn job_not_found() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some("Request failed due to job not found.".to_string()),
+    }
+}
 
 /// The URI scheme both of a job's data locations name: `S3Uri`'s modelled
 /// pattern is `^s3://...`, and that is the storage this emulator serves.

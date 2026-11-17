@@ -12,7 +12,10 @@
 //! process, so the counts, the message and the terminal status
 //! `DescribeTextTranslationJob` reports are what this job did. A job whose
 //! input or output location cannot be used reaches the modelled `FAILED`
-//! status rather than reporting a success nothing backs. The translation of
+//! status rather than reporting a success nothing backs. A job's data-access
+//! role is resolved against this account's IAM records before any of that
+//! happens, so a submission naming a role this account holds and this service
+//! cannot assume is refused rather than allocated a job id. The translation of
 //! one document is the transform every translate operation of this service
 //! shares ([`crate::state`]); the job's lifecycle and its data plane live in
 //! [`crate::state::batch_translation`].
@@ -122,9 +125,9 @@ use super::types::*;
 use std::time::SystemTime;
 
 use crate::state::batch_translation::{
-    job_id, parse_s3_uri, run_batch, BatchOutcome, BatchPlan, JobOutcome, TranslationJob,
-    CONTENT_TYPE_PLAIN, JOB_PHASE, MAX_PARALLEL_DATA_PER_JOB, MAX_STORED_JOBS,
-    MAX_TARGET_LANGUAGES,
+    job_id, parse_s3_uri, run_batch, unassumable_data_access_role, BatchOutcome, BatchPlan,
+    JobOutcome, TranslationJob, CONTENT_TYPE_PLAIN, JOB_PHASE, JOB_SERVICE_PRINCIPAL,
+    MAX_PARALLEL_DATA_PER_JOB, MAX_STORED_JOBS, MAX_TARGET_LANGUAGES,
 };
 use crate::state::{
     invalid_parameter_value, is_supported_language, request_region, resource_not_found,
@@ -345,7 +348,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             records
         };
 
-        // 3. The job's own work: every document under the input location is
+        // 3. What IAM settles about the role the job RUNS AS. "The Amazon
+        //    Resource Name (ARN) of an AWS Identity Access and Management (IAM)
+        //    role that grants Amazon Translate read access to your input data":
+        //    the job is carried out under that role, so the role is resolved
+        //    against this account's IAM records — the one reading of a
+        //    caller-supplied role ARN every service that takes one shares
+        //    (`service_common::iam_role`) — before any document is read or any
+        //    record is written. A role this account HOLDS whose stored trust
+        //    policy does not let this service's principal assume it is a role
+        //    this job could never run as, so the submission is refused and
+        //    nothing is allocated for it; a role those records say nothing about
+        //    is no evidence against the submission, because a data-access role
+        //    is routinely provisioned outside this emulator. Asked AFTER the
+        //    store's own checks above, so a submission that also names a
+        //    resource this account does not hold is still reported as that, and
+        //    asked while nothing has been written yet.
+        if ::service_common::iam_role::held_role_is_unassumable(
+            ctx,
+            &region,
+            &input.data_access_role_arn,
+            JOB_SERVICE_PRINCIPAL,
+        )
+        .await
+        {
+            return Err(StartTextTranslationJobErrorModeled::InvalidRequestException(
+                unassumable_data_access_role(&input.data_access_role_arn),
+            )
+            .into());
+        }
+
+        // 4. The job's own work: every document under the input location is
         //    translated into each target language and written to the output
         //    location, awaited with NO store lock held.
         let plan = BatchPlan {

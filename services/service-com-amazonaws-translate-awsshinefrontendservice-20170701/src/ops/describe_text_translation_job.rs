@@ -53,7 +53,8 @@ use super::types::*;
 
 use std::time::SystemTime;
 
-use crate::state::{resource_not_found, service_state, WireRefusal};
+use crate::state::batch_translation::job_not_found;
+use crate::state::{service_state, WireRefusal};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -141,8 +142,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = SystemTime::now();
 
         let store = state.lock();
+        // A `JobId` this account holds no job under is this service's
+        // job-not-found refusal, worded once for both operations that resolve a
+        // job by id ([`job_not_found`]) rather than as the sentence a call that
+        // addresses some other kind of resource answers.
         let Some(job) = store.jobs.get(&input.job_id) else {
-            return Err(WireRefusal::not_found(resource_not_found()).into());
+            return Err(WireRefusal::not_found(job_not_found()).into());
         };
         Ok(DescribeTextTranslationJobOutput {
             text_translation_job_properties: Some(job.properties(now)),

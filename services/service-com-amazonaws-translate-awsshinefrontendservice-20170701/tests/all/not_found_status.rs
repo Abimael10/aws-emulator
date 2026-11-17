@@ -16,6 +16,13 @@
 //! whether the resource never existed, was deleted, or was superseded — and a
 //! control case per addressing form, so a row's 400 is the not-found refusal and
 //! not a request this service refuses for some other reason.
+//!
+//! What such a refusal SAYS is the operation's own wording, and a second table
+//! below pins the one this service words for a batch translation JOB: an
+//! operation that resolves a job by id and finds none states the fixed sentence
+//! `Request failed due to job not found.`, with nothing interpolated into it —
+//! neither the job id the request asked for nor anything out of the store — and
+//! both operations that resolve a job by id state it identically.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -313,4 +320,131 @@ async fn the_same_calls_against_a_resource_that_is_there_succeed() {
         status, 200,
         "case \"DeleteTerminology\": the resource is there, got {status} {answered}"
     );
+}
+
+/// The sentence a batch-job operation states for a job id this account holds no
+/// job under, in full: it has no variable part at all.
+const JOB_NOT_FOUND_MESSAGE: &str = "Request failed due to job not found.";
+
+/// The operations whose whole request is a job id, and which therefore are the
+/// ones that report a job absent (`smithy_query query=operation
+/// operation=DescribeTextTranslationJob,StopTextTranslationJob`).
+/// `StartTextTranslationJob` resolves no job by id — it mints one — so it is
+/// not among them.
+const JOB_ID_OPERATIONS: [&str; 2] = ["DescribeTextTranslationJob", "StopTextTranslationJob"];
+
+/// The ids reported absent below, as `(case, job id)`.
+///
+/// Each satisfies `JobId`'s modelled length and pattern (`length 1..32`,
+/// `^([\p{L}\p{Z}\p{N}_.:/=+\-%@]*)$`, `smithy_query query=shape shape=JobId`),
+/// so every row reaches the handler's job lookup rather than the request walk,
+/// and the rows differ along the forms that pattern and those bounds admit.
+fn unknown_job_ids() -> [(&'static str, &'static str); 6] {
+    [
+        (
+            "an id of the length a submission mints",
+            UNKNOWN_JOB_ID,
+        ),
+        ("an id at the modelled minimum length", "j"),
+        (
+            "an id at the modelled maximum length, all letters",
+            "abcdefghijklmnopqrstuvwxyzabcdef",
+        ),
+        (
+            "an id of the punctuation the modelled pattern admits",
+            "job_.:/=+-%@1",
+        ),
+        (
+            "an id of letters outside ASCII and a separator",
+            "trabajo señal",
+        ),
+        (
+            "an id of digits alone",
+            "00000000000000000000000000000001",
+        ),
+    ]
+}
+
+/// A batch submission under `token`, with everything a well-formed job needs.
+fn submission(token: &str) -> Value {
+    let mut body = start_job_body(&[], &[]);
+    body["ClientToken"] = json!(token);
+    body
+}
+
+/// The job id one submission minted.
+async fn submitted_job_id(router: &MultiServiceRouter, token: &str) -> String {
+    let (status, body) = call(router, "StartTextTranslationJob", &submission(token)).await;
+    assert_eq!(
+        status, 200,
+        "setup {token:?}: StartTextTranslationJob answered {status} {body}"
+    );
+    body["JobId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("setup {token:?}: no JobId in {body}"))
+        .to_string()
+}
+
+/// Both operations that resolve a batch translation job by id report an id this
+/// account holds no job under with the ONE job-not-found refusal — the
+/// not-found status, the modelled shape, and the fixed job-not-found sentence —
+/// whatever form that id takes.
+#[tokio::test]
+async fn an_unknown_job_id_is_reported_as_a_job_that_was_not_found() {
+    let router = router();
+    // A job that IS there, so every row below is refused because of the id it
+    // named rather than because the store holds no job at all.
+    let present = submitted_job_id(&router, "token-job-not-found").await;
+
+    for (case, job_id) in unknown_job_ids() {
+        assert_ne!(
+            job_id, present,
+            "case {case:?}: the row's id has to be one no submission minted"
+        );
+        for operation in JOB_ID_OPERATIONS {
+            let (status, answered) = call(&router, operation, &json!({"JobId": job_id})).await;
+            assert_eq!(
+                status, NOT_FOUND_STATUS,
+                "case {case:?}: {operation} expected HTTP {NOT_FOUND_STATUS}, got {status} \
+                 {answered}"
+            );
+            assert_eq!(
+                error_code(&answered),
+                NOT_FOUND_CODE,
+                "case {case:?}: {operation} expected {NOT_FOUND_CODE}, got {answered}"
+            );
+            assert_eq!(
+                message(&answered),
+                JOB_NOT_FOUND_MESSAGE,
+                "case {case:?}: {operation} expected {JOB_NOT_FOUND_MESSAGE:?}, got {answered}"
+            );
+        }
+    }
+}
+
+/// The control for the table above: the same two operations, naming the job a
+/// submission really minted, answer that job — so a row's refusal is about the
+/// id it named and not about the shape of its request.
+#[tokio::test]
+async fn the_same_calls_naming_a_job_that_was_submitted_answer_it() {
+    let router = router();
+    let job_id = submitted_job_id(&router, "token-job-is-there").await;
+
+    for operation in JOB_ID_OPERATIONS {
+        let (status, answered) = call(&router, operation, &json!({"JobId": job_id})).await;
+        assert_eq!(
+            status, 200,
+            "case {operation:?}: the job is there, got {status} {answered}"
+        );
+        assert_eq!(
+            error_code(&answered),
+            "<no __type>",
+            "case {operation:?}: a served call names no error, got {answered}"
+        );
+        assert_ne!(
+            message(&answered),
+            JOB_NOT_FOUND_MESSAGE,
+            "case {operation:?}: a served call states no refusal, got {answered}"
+        );
+    }
 }
