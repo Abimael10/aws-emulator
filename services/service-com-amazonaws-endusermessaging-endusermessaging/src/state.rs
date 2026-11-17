@@ -31,6 +31,14 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// The `brand-profile` resource segment of a brand-profile ARN.
 const BRAND_PROFILE_RESOURCE: &str = "brand-profile";
 
+/// The prefix a `brandProfileId` carries, as `BrandProfileIdOrArn` documents the
+/// bare identifier (`bp-abc12345678901234`).
+const BRAND_PROFILE_ID_PREFIX: &str = "bp";
+
+/// How many characters follow a `brandProfileId`'s prefix and hyphen, as the bare
+/// identifier `BrandProfileIdOrArn` documents is written.
+const BRAND_PROFILE_ID_BODY_LENGTH: usize = 17;
+
 /// The `notify-code-configuration` resource segment of a notify-code-configuration
 /// ARN, as `NotifyCodeConfigurationIdOrArn` documents it.
 const NOTIFY_CODE_CONFIGURATION_RESOURCE: &str = "notify-code-configuration";
@@ -157,7 +165,7 @@ impl ComAmazonawsEndusermessagingEndusermessagingState {
     /// the loop re-draws rather than ever handing back an id already in use.
     pub fn mint_brand_profile_id(&mut self) -> String {
         loop {
-            let id = self.next_candidate_id("bp");
+            let id = self.next_candidate_id(BRAND_PROFILE_ID_PREFIX);
             if !self.brand_profiles.contains_key(&id) {
                 return id;
             }
@@ -236,14 +244,21 @@ impl ComAmazonawsEndusermessagingEndusermessagingState {
     /// Resolve a `BrandProfileIdOrArn` to the id of a stored profile.
     ///
     /// The shape accepts either a bare id or the profile's full ARN, so every
-    /// operation taking one resolves both; an unknown value answers `None`, which
-    /// the caller renders as `ResourceNotFoundException`.
-    pub fn resolve_brand_profile_id(&self, id_or_arn: &str) -> Option<&str> {
-        if let Some((id, _)) = self.brand_profiles.get_key_value(id_or_arn) {
-            return Some(id.as_str());
-        }
-        let id = resource_id_from_arn(id_or_arn, BRAND_PROFILE_RESOURCE)?;
-        self.brand_profiles.get_key_value(id).map(|(id, _)| id.as_str())
+    /// operation taking one resolves both. The two ways a value reaches no profile
+    /// are different failures, so they are told apart before any lookup: a value
+    /// that is not an identifier of this resource at all cannot name a profile in
+    /// any state, and is refused as invalid input; an identifier of the documented
+    /// form that this state holds no record for is refused as not found.
+    pub fn resolve_brand_profile_id(&self, id_or_arn: &str) -> Result<&str, UnreachableResource> {
+        let Some(id) = brand_profile_id_of(id_or_arn) else {
+            return Err(UnreachableResource::Invalid(invalid_brand_profile_id(
+                id_or_arn,
+            )));
+        };
+        self.brand_profiles
+            .get_key_value(id)
+            .map(|(id, _)| id.as_str())
+            .ok_or_else(|| UnreachableResource::NotFound(brand_profile_not_found(id_or_arn)))
     }
 
     /// Resolve a `NotifyCodeConfigurationIdOrArn` to the id of a stored
@@ -281,20 +296,88 @@ impl ComAmazonawsEndusermessagingEndusermessagingState {
 /// The id named by an ARN of this service's `resource` type
 /// (`arn:<partition>:end-user-messaging:<region>:<account>:<resource>/<id>`), or
 /// `None` for anything that is not one.
+///
+/// The ARN itself is read by the workspace's one ARN parse
+/// ([`::service_common::arn`]), once, so this service does not decide for itself what
+/// an ARN is; what belongs here is only which vendor its ARNs carry and which
+/// resource type the caller asked about. AWS writes a resource in either the
+/// `<type>/<id>` or the `<type>:<id>` form, so both separators end the type — and
+/// requiring one of them is what keeps a longer type name from matching a shorter
+/// one.
 fn resource_id_from_arn<'a>(candidate: &'a str, resource: &str) -> Option<&'a str> {
-    let mut fields = candidate.splitn(6, ':');
-    let (Some("arn"), Some(_partition), Some(ARN_NAMESPACE), Some(_region), Some(_account), Some(segment)) = (
-        fields.next(),
-        fields.next(),
-        fields.next(),
-        fields.next(),
-        fields.next(),
-        fields.next(),
-    ) else {
-        return None;
-    };
-    let id = segment.strip_prefix(resource)?.strip_prefix('/')?;
+    let arn = ::service_common::arn::parse_of(candidate, ARN_NAMESPACE)?;
+    let rest = arn.resource.strip_prefix(resource)?;
+    let id = rest.strip_prefix('/').or_else(|| rest.strip_prefix(':'))?;
     (!id.is_empty()).then_some(id)
+}
+
+/// Whether `candidate` is a bare `brandProfileId`: the system-generated identifier
+/// `BrandProfileIdOrArn` documents, its resource prefix followed by the alphanumeric
+/// body of the documented length.
+fn is_brand_profile_id(candidate: &str) -> bool {
+    candidate
+        .strip_prefix(BRAND_PROFILE_ID_PREFIX)
+        .and_then(|rest| rest.strip_prefix('-'))
+        .is_some_and(|body| {
+            body.len() == BRAND_PROFILE_ID_BODY_LENGTH
+                && body.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        })
+}
+
+/// The `brandProfileId` a well-formed `BrandProfileIdOrArn` names, whichever of the
+/// two forms the shape documents it took, or `None` for a value that is neither.
+///
+/// A bare identifier names itself; an ARN of this service's `brand-profile` resource
+/// names the identifier in its resource field. The ARN form carries the same bare
+/// identifier, so a value is well formed only when the identifier it names is.
+/// Whether that identifier reaches a stored profile is a separate question, asked
+/// after this one.
+pub fn brand_profile_id_of(id_or_arn: &str) -> Option<&str> {
+    if is_brand_profile_id(id_or_arn) {
+        return Some(id_or_arn);
+    }
+    let id = resource_id_from_arn(id_or_arn, BRAND_PROFILE_RESOURCE)?;
+    is_brand_profile_id(id).then_some(id)
+}
+
+/// The JSON pointer naming the member a refused `brandProfileId` arrived on, as
+/// `ValidationExceptionField$path` documents it.
+const BRAND_PROFILE_ID_POINTER: &str = "/brandProfileId";
+
+/// `ValidationException` for a `BrandProfileIdOrArn` that is not an identifier of a
+/// brand profile at all — neither a bare `brandProfileId` nor the ARN of one.
+///
+/// Such a value can name no profile in any state, so it is a refusal about the input
+/// rather than about a missing resource. The fixed text is this refusal's; the only
+/// variable part is the value the request gave, and `fieldList` points at the member
+/// it came in on.
+fn invalid_brand_profile_id(id_or_arn: &str) -> crate::ops::types::ValidationException {
+    crate::ops::types::ValidationException {
+        message: format!("invalid brand profile ID format: {id_or_arn}"),
+        field_list: Some(vec![crate::ops::types::ValidationExceptionField {
+            path: BRAND_PROFILE_ID_POINTER.to_string(),
+            message: format!(
+                "The value must be a brand profile identifier: the bare ID, or the full \
+                 Amazon Resource Name of the form \
+                 arn:<partition>:{ARN_NAMESPACE}:<region>:<account-id>:{BRAND_PROFILE_RESOURCE}/<id>"
+            ),
+        }]),
+    }
+}
+
+/// `ValidationException` for an update request that carries no updatable member at
+/// all.
+///
+/// Every updatable member of an update of this API is optional on its own — any one
+/// of them is enough — but a request carrying none of them asks for no change, and
+/// is refused before anything is resolved or written. Worded as a sentence, the way
+/// this API words a refusal its model does not express, and about the request as a
+/// whole rather than about one member, so no `fieldList` names a member at fault.
+pub fn nothing_to_update() -> crate::ops::types::ValidationException {
+    crate::ops::types::ValidationException {
+        message: "At least one field must be provided for update".to_string(),
+        field_list: None,
+    }
 }
 
 /// The ARN of a brand profile in `region`.

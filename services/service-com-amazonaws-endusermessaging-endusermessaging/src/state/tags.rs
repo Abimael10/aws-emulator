@@ -30,15 +30,19 @@ pub enum TaggedResource {
     NotifyCodeConfiguration(String),
 }
 
-/// Why a `resourceArn` reaches no stored resource, as the refusal the tagging
-/// operations answer with.
+/// Why an identifier a request gave reaches no stored resource, as the refusal the
+/// operation naming it answers with.
+///
+/// The distinction is the client-visible one: a value that cannot address a resource
+/// of this request at all is a bad request, which no later state can make good, while
+/// a well-formed identifier this state holds no record for is a missing resource.
 #[derive(Debug)]
 pub enum UnreachableResource {
-    /// The value cannot address a resource of this request at all: it is not an ARN,
-    /// it names another vendor's namespace, or it is scoped to another Region.
-    /// `ValidationException`, HTTP 400.
+    /// The value cannot address a resource of this request at all: it is not an
+    /// identifier or ARN of this resource, it names another vendor, or it is scoped to
+    /// another Region. `ValidationException`, HTTP 400.
     Invalid(crate::ops::types::ValidationException),
-    /// An ARN of this service and this Region that names no stored resource.
+    /// A well-formed identifier of this resource that names no stored record.
     /// `ResourceNotFoundException`, HTTP 404.
     NotFound(crate::ops::types::ResourceNotFoundException),
 }

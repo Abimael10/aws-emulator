@@ -198,16 +198,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .clamp(1, MAX_PAGE_SIZE);
 
         let store = state.lock();
-        // The attributes belong to one profile, so an identifier that names no stored
-        // profile is the operation's own `ResourceNotFoundException` rather than an
-        // empty page.
-        let Some(profile) = store
+        // The attributes belong to one profile, so an identifier that is not one of a
+        // brand profile, or that names no stored profile, is the operation's own
+        // refusal rather than an empty page.
+        let brand_profile_id = store
             .resolve_brand_profile_id(&input.brand_profile_id)
-            .and_then(|id| store.brand_profiles.get(id))
-        else {
+            .map(str::to_string)
+            .map_err(|unreachable| match unreachable {
+                crate::state::UnreachableResource::Invalid(invalid) => {
+                    ListBrandProfileAttributesErrorModeled::ValidationException(invalid)
+                }
+                crate::state::UnreachableResource::NotFound(missing) => {
+                    ListBrandProfileAttributesErrorModeled::ResourceNotFoundException(missing)
+                }
+            })?;
+        // The resolution and this read share one lock, so the record the identifier
+        // resolved to is still here.
+        let Some(profile) = store.brand_profiles.get(&brand_profile_id) else {
             return Err(
-                ListBrandProfileAttributesErrorModeled::ResourceNotFoundException(
-                    crate::state::brand_profile_not_found(&input.brand_profile_id),
+                ListBrandProfileAttributesErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: crate::state::RESOLVED_RESOURCE_VANISHED.to_string(),
+                    },
                 )
                 .into(),
             );

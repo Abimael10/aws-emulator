@@ -462,17 +462,16 @@ async fn each_profile_holds_its_own_copy_of_the_template() {
     );
 }
 
-/// The identifiers a `BrandProfileIdOrArn` accepts that name nothing: a
-/// minted-shaped id, a short bare id, one carrying each punctuation the shape's
-/// `^[A-Za-z0-9_:/-]+$` pattern allows, the maximum length the shape's
-/// `@length(1..256)` permits, and a well-formed ARN for a profile that was never
+/// The identifiers a `BrandProfileIdOrArn` accepts, in the documented form of a bare
+/// `brandProfileId` or of the ARN of one, that name nothing: a minted-shaped id of
+/// digits, the bare-ID form the shape's own documentation gives as its example, one
+/// whose body mixes both cases, and a well-formed ARN for a profile that was never
 /// created.
 fn unknown_identifiers() -> Vec<String> {
     vec![
         "bp-00000000000000000".to_string(),
-        "x".to_string(),
-        "A_b-c:d/e".to_string(),
-        "z".repeat(256),
+        "bp-abc12345678901234".to_string(),
+        "bp-AbCdEfGhIjKlMnOpQ".to_string(),
         format!("arn:aws:{SIGNING_NAME}:{REGION}:{ACCOUNT_ID}:brand-profile/bp-11111111111111111"),
     ]
 }

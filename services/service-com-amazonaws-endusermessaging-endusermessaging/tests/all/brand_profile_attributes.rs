@@ -832,8 +832,8 @@ async fn an_identifier_that_names_nothing_is_not_found() {
     let em = Emulator::new();
     let profile = em.profile("Lookup owner").await;
 
-    // A profile the store does not hold, for a create and for a read.
-    for unknown in ["bp-00000000000000000", "not-a-profile"] {
+    // A profile the store does not hold, in each form a `BrandProfileIdOrArn` takes.
+    for unknown in ["bp-00000000000000000", "bp-abc12345678901234"] {
         let created = em
             .create_attributes(unknown, batch(&[Attribute::text("Any", Some("v"))]))
             .await;

@@ -2,7 +2,8 @@
 
 //! @op UpdateBrandProfile
 //! IMPLEMENTED: applies the members this request carries to the stored brand profile
-//! and reports the post-update record.
+//! and reports the post-update record; a request that carries no updatable member at
+//! all is refused before anything is read or written.
 //!
 //! ## Shape of an operation
 //!
@@ -169,6 +170,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // Both updatable members are optional on their own, so any one of them is
+        // enough; a request carrying neither asks for no change at all and is refused
+        // before the identifier is resolved and before anything is written, which is
+        // what leaves the stored record — `updatedAt` included — exactly as it was.
+        if input.brand_profile_name.is_none() && input.deletion_protection_enabled.is_none() {
+            return Err(UpdateBrandProfileErrorModeled::ValidationException(
+                crate::state::nothing_to_update(),
+            )
+            .into());
+        }
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UpdateBrandProfileErrorModeled::InternalServerException(
                 InternalServerException {
@@ -178,19 +189,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let mut store = state.lock();
-        let Some(id) = store
+        let id = store
             .resolve_brand_profile_id(&input.brand_profile_id)
             .map(str::to_string)
-        else {
-            return Err(UpdateBrandProfileErrorModeled::ResourceNotFoundException(
-                crate::state::brand_profile_not_found(&input.brand_profile_id),
+            .map_err(|unreachable| match unreachable {
+                crate::state::UnreachableResource::Invalid(invalid) => {
+                    UpdateBrandProfileErrorModeled::ValidationException(invalid)
+                }
+                crate::state::UnreachableResource::NotFound(missing) => {
+                    UpdateBrandProfileErrorModeled::ResourceNotFoundException(missing)
+                }
+            })?;
+        // The resolution and this write share one lock, so the record the identifier
+        // resolved to is still here.
+        let Some(profile) = store.brand_profiles.get_mut(&id) else {
+            return Err(UpdateBrandProfileErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::RESOLVED_RESOURCE_VANISHED.to_string(),
+                },
             )
             .into());
         };
-        let profile = store
-            .brand_profiles
-            .get_mut(&id)
-            .expect("the id just resolved against this store");
 
         // Only the members the request carries are applied; an omitted member leaves
         // the stored value as it was.

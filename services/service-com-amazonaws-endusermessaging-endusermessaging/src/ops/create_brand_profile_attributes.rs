@@ -170,21 +170,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
-        // The attributes belong to one profile, so an identifier that names no stored
-        // profile is this operation's `ResourceNotFoundException`. Everything below
-        // addresses the profile by the id this resolves to — a `BrandProfileIdOrArn`
-        // may be either spelling, and only one of them is the stored key.
-        let Some(brand_profile_id) = store
+        // The attributes belong to one profile, so an identifier that is not one of a
+        // brand profile, or that names no stored profile, is refused against the
+        // profile. Everything below addresses the profile by the id this resolves to —
+        // a `BrandProfileIdOrArn` may be either spelling, and only one of them is the
+        // stored key.
+        let brand_profile_id = store
             .resolve_brand_profile_id(&input.brand_profile_id)
             .map(str::to_string)
-        else {
-            return Err(
-                CreateBrandProfileAttributesErrorModeled::ResourceNotFoundException(
-                    crate::state::brand_profile_not_found(&input.brand_profile_id),
-                )
-                .into(),
-            );
-        };
+            .map_err(|unreachable| match unreachable {
+                crate::state::UnreachableResource::Invalid(invalid) => {
+                    CreateBrandProfileAttributesErrorModeled::ValidationException(invalid)
+                }
+                crate::state::UnreachableResource::NotFound(missing) => {
+                    CreateBrandProfileAttributesErrorModeled::ResourceNotFoundException(missing)
+                }
+            })?;
 
         // How much media the store already holds, read before the profile is borrowed
         // for writing: the ceiling it is compared against is a ceiling on the whole

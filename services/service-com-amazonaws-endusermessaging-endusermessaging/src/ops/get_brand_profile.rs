@@ -171,12 +171,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let store = state.lock();
-        let Some(profile) = store
+        let brand_profile_id = store
             .resolve_brand_profile_id(&input.brand_profile_id)
-            .and_then(|id| store.brand_profiles.get(id))
-        else {
-            return Err(GetBrandProfileErrorModeled::ResourceNotFoundException(
-                crate::state::brand_profile_not_found(&input.brand_profile_id),
+            .map(str::to_string)
+            .map_err(|unreachable| match unreachable {
+                crate::state::UnreachableResource::Invalid(invalid) => {
+                    GetBrandProfileErrorModeled::ValidationException(invalid)
+                }
+                crate::state::UnreachableResource::NotFound(missing) => {
+                    GetBrandProfileErrorModeled::ResourceNotFoundException(missing)
+                }
+            })?;
+        // The resolution and this read share one lock, so the record the identifier
+        // resolved to is still here.
+        let Some(profile) = store.brand_profiles.get(&brand_profile_id) else {
+            return Err(GetBrandProfileErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::RESOLVED_RESOURCE_VANISHED.to_string(),
+                },
             )
             .into());
         };

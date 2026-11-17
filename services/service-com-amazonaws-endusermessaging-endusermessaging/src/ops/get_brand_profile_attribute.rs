@@ -175,19 +175,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let store = state.lock();
 
-        // An attribute belongs to one profile, so an identifier naming no stored
-        // profile is a not-found of the PROFILE, reported against the value given.
-        let Some(brand_profile_id) = store
+        // An attribute belongs to one profile, so an identifier that is not one of a
+        // brand profile, or that names no stored profile, is refused against the
+        // PROFILE, reported against the value given.
+        let brand_profile_id = store
             .resolve_brand_profile_id(&input.brand_profile_id)
             .map(str::to_string)
-        else {
-            return Err(
-                GetBrandProfileAttributeErrorModeled::ResourceNotFoundException(
-                    crate::state::brand_profile_not_found(&input.brand_profile_id),
-                )
-                .into(),
-            );
-        };
+            .map_err(|unreachable| match unreachable {
+                crate::state::UnreachableResource::Invalid(invalid) => {
+                    GetBrandProfileAttributeErrorModeled::ValidationException(invalid)
+                }
+                crate::state::UnreachableResource::NotFound(missing) => {
+                    GetBrandProfileAttributeErrorModeled::ResourceNotFoundException(missing)
+                }
+            })?;
         // A name that profile holds no attribute under is a not-found of the
         // ATTRIBUTE, reported against the name the request named it by.
         let Some(attribute) = store.brand_profile_attribute(&brand_profile_id, &input.attribute_name)

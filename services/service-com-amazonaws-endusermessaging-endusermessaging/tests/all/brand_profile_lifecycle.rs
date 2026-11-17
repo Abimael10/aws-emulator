@@ -21,8 +21,9 @@
 //! * `UpdateBrandProfile` applies the members present and leaves the rest alone;
 //! * `DeleteBrandProfile` removes the record, and refuses with `ConflictException`
 //!   while deletion protection is on;
-//! * an id that names nothing is `ResourceNotFoundException` (404), and a value
-//!   outside a modelled constraint is `ValidationException` (400);
+//! * an identifier of the documented form that names nothing is
+//!   `ResourceNotFoundException` (404), and a value outside a modelled constraint is
+//!   `ValidationException` (400);
 //! * a repeated `clientToken` reports the first profile instead of creating another;
 //! * `ListTagsForResource` reports the tags stored on the resource its `resourceArn`
 //!   names — for every tag set a create may carry, and for every taggable resource
@@ -554,10 +555,11 @@ async fn every_page_size_walks_the_whole_list_exactly_once() {
 async fn an_update_applies_only_the_members_it_carries() {
     let em = Emulator::new();
 
-    // Each row is one update body; `expected` is (name, deletionProtectionEnabled)
-    // after it is applied to a profile created as ("before", false).
+    // Each row is one update body carrying at least one updatable member; `expected`
+    // is (name, deletionProtectionEnabled) after it is applied to a profile created
+    // as ("before", false). A body carrying NO updatable member is refused rather
+    // than applied, which `brand_profile_refusal_bodies` pins.
     let cases: Vec<(Value, &str, bool)> = vec![
-        (json!({}), "before", false),
         (json!({ "brandProfileName": "after" }), "after", false),
         (json!({ "deletionProtectionEnabled": true }), "before", true),
         (
@@ -720,11 +722,17 @@ async fn deletion_protection_refuses_the_delete_until_it_is_turned_off() {
 #[tokio::test]
 async fn an_id_that_names_nothing_is_a_404_on_every_operation_that_takes_one() {
     let em = Emulator::new();
-    // Rows: never minted, minted-looking, and an id belonging to a deleted profile.
+    // Rows: two identifiers of the documented form that were never minted, and the id
+    // of a deleted profile. Each is a well-formed `brandProfileId`, so what is missing
+    // is the resource and not the form of the identifier.
     let deleted = em.create_named("gone").await.string("brandProfileId");
     assert_eq!(em.delete(&deleted).await.status, 200, "teardown must work");
 
-    for reference in ["bp-nosuchprofile", "never_created", deleted.as_str()] {
+    for reference in [
+        "bp-nosuchprofile0000",
+        "bp-abc12345678901234",
+        deleted.as_str(),
+    ] {
         for (method, body) in [
             ("GET", None),
             ("PUT", Some(json!({ "brandProfileName": "x" }))),

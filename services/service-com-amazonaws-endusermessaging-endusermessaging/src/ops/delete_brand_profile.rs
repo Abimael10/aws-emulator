@@ -161,36 +161,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let mut store = state.lock();
-        let Some(id) = store
+        let id = store
             .resolve_brand_profile_id(&input.brand_profile_id)
             .map(str::to_string)
-        else {
-            return Err(DeleteBrandProfileErrorModeled::ResourceNotFoundException(
-                crate::state::brand_profile_not_found(&input.brand_profile_id),
-            )
-            .into());
-        };
+            .map_err(|unreachable| match unreachable {
+                crate::state::UnreachableResource::Invalid(invalid) => {
+                    DeleteBrandProfileErrorModeled::ValidationException(invalid)
+                }
+                crate::state::UnreachableResource::NotFound(missing) => {
+                    DeleteBrandProfileErrorModeled::ResourceNotFoundException(missing)
+                }
+            })?;
 
         // Deletion protection refuses the delete and leaves the profile in place:
         // `ConflictException` is the modelled failure for a resource whose current
         // state forbids the request.
-        {
-            let profile = store
-                .brand_profiles
-                .get(&id)
-                .expect("the id just resolved against this store");
-            if profile.deletion_protection_enabled {
-                return Err(DeleteBrandProfileErrorModeled::ConflictException(
-                    crate::state::brand_profile_deletion_protection_conflict(&id),
-                )
-                .into());
-            }
+        //
+        // The resolution and these reads share one lock, so the record the identifier
+        // resolved to is still here; a state that disagreed is reported as this
+        // service's own failure rather than panicking the request.
+        let Some(profile) = store.brand_profiles.get(&id) else {
+            return Err(DeleteBrandProfileErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::RESOLVED_RESOURCE_VANISHED.to_string(),
+                },
+            )
+            .into());
+        };
+        if profile.deletion_protection_enabled {
+            return Err(DeleteBrandProfileErrorModeled::ConflictException(
+                crate::state::brand_profile_deletion_protection_conflict(&id),
+            )
+            .into());
         }
 
-        let removed = store
-            .brand_profiles
-            .remove(&id)
-            .expect("the id just resolved against this store");
+        let Some(removed) = store.brand_profiles.remove(&id) else {
+            return Err(DeleteBrandProfileErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::RESOLVED_RESOURCE_VANISHED.to_string(),
+                },
+            )
+            .into());
+        };
         // The client token that minted it no longer names a profile, so drop it with
         // the record rather than leaving a token that resolves to nothing.
         store.forget_create_tokens_for(&id);
