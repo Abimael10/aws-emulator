@@ -357,7 +357,8 @@ pub const MAX_CLIENT_TOKENS: usize = 1024;
 /// The service's `arnNamespace` / sigv4 signing name, used to build data store ARNs.
 pub const ARN_SERVICE: &str = "medical-imaging";
 
-/// The region an ARN names when the request carries no SigV4 credential scope.
+/// The region an ARN names when the request carries no SigV4 credential scope, or one
+/// whose region field is not spelled like a Region identifier (`is_region_identifier`).
 pub const DEFAULT_REGION: &str = "us-east-1";
 
 // ---------------------------------------------------------------------------
@@ -2463,12 +2464,33 @@ fn splitmix64(seed: u64) -> u64 {
 /// The region this request is signed for, used to build ARNs.
 ///
 /// Read from the SigV4 credential scope (`<akid>/<date>/<region>/<name>/aws4_request`)
-/// through the one parser the core vends; an unsigned request falls back to
-/// [`DEFAULT_REGION`].
+/// through the one parser the core vends, and NARROWED to the alphabet a Region
+/// identifier is spelled in (`is_region_identifier`, below): the scope's region field is
+/// caller-supplied text the parser only requires to be non-empty, while the region this
+/// service reads out of it becomes a segment of every ARN it mints and of the Amazon S3
+/// authority an import addresses. A request carrying no credential scope — or one whose
+/// region field is not spelled like a Region identifier — is served in
+/// [`DEFAULT_REGION`], so no ARN this service reports can carry a region segment outside
+/// what [`ARN_PATTERN`] admits and [`parse_resource_arn`] reads back.
 pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
     ::emulator_server::sigv4_credential_scope(&ctx.parts().headers)
         .map(|scope| scope.region)
+        .filter(|region| is_region_identifier(region))
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// `[a-z0-9-]+`: the alphabet a Region identifier is spelled in, which is what
+/// [`ARN_PATTERN`] constrains the region segment of an ARN to — a shape, not a list, so a
+/// region this emulator has never heard of is still a region while text carrying anything
+/// else is not one.
+///
+/// One predicate, so the value [`request_region`] admits INTO an ARN and the value
+/// [`parse_resource_arn`] reads back OUT of one are held to the same rule.
+fn is_region_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 /// The ARN of a data store in `region`:
@@ -2543,11 +2565,7 @@ pub fn parse_resource_arn(arn: &str) -> Option<ResourceArn> {
     }
     // `[a-z0-9-]+`: the pattern constrains the region's alphabet, not its shape.
     let region = fields.next()?;
-    if region.is_empty()
-        || !region
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-    {
+    if !is_region_identifier(region) {
         return None;
     }
     // `[0-9]{12}`: an account id.
