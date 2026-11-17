@@ -2119,13 +2119,17 @@ impl NotFoundResource {
     /// Either way the sentence is fixed and the identifier is its only variable part,
     /// whatever step of the path made the event missing — an event of another session of
     /// the same actor included, which is not found for exactly the same reason as one that
-    /// was never written. Every other resource is stated as its label, `": "`, then its
-    /// identifier.
+    /// was never written. A BATCH EVALUATION is worded by a sentence with NO variable part
+    /// at all ([`BATCH_EVALUATION_NOT_FOUND_MESSAGE`]): the batch-evaluation API names the
+    /// resource it could not reach and the retry that would succeed, and spells neither the
+    /// identifier nor the resource type. Every other resource is stated as its label,
+    /// `": "`, then its identifier.
     #[must_use]
     pub fn message(self, identifier: &str) -> String {
         match self {
             Self::EventRead => format!("Unable to find event with id {identifier}"),
             Self::EventDelete => format!("{} not found with id: {identifier}", self.label()),
+            Self::BatchEvaluation => BATCH_EVALUATION_NOT_FOUND_MESSAGE.to_string(),
             _ => format!("{} not found: {identifier}", self.label()),
         }
     }

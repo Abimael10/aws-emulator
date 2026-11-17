@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! End-to-end tests for the AgentCore batch-evaluation surface —
-//! `StartBatchEvaluation`, `GetBatchEvaluation` and `ListBatchEvaluations`.
+//! `StartBatchEvaluation`, `GetBatchEvaluation`, `ListBatchEvaluations`,
+//! `StopBatchEvaluation` and `DeleteBatchEvaluation`.
 //!
 //! The rules under test:
 //!
@@ -20,7 +21,15 @@
 //!   already started, while two starts carrying different tokens are two jobs even under
 //!   one `batchEvaluationName`;
 //! * a `batchEvaluationId` no job is held for is refused 404 `ResourceNotFoundException`
-//!   with the sentence this service words every missed lookup with;
+//!   with the fixed sentence the batch-evaluation plane refuses every missed lookup with;
+//! * a DELETE is decided by the status the job is in: one that has not finished is refused
+//!   409 `ConflictException` naming that status and is left running and readable, one that
+//!   has finished is removed and the delete accepted with 202 reporting `DELETING`, and an
+//!   id a delete has already removed is refused 404 like any id no job is held for;
+//! * a STOP is decided the same way, the other way round: a job that still has work to end
+//!   is accepted with 202, reported `STOPPING` and carried to `STOPPED` one span later by
+//!   the clock alone, while a job whose run is already over or already ending is refused
+//!   409 `ConflictException` naming that status;
 //! * `ListBatchEvaluations` reports exactly the jobs this emulator holds, cut from ONE
 //!   total order (newest first), one `maxResults`-sized page at a time with an opaque
 //!   `nextToken` resuming after it: whatever page size a caller asks for, following the
@@ -41,6 +50,13 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_bedrockagentcore_amazonbedrockagentcore as agentcore;
+
+/// The whole `ResourceNotFoundException` message a batch-evaluation lookup that misses is
+/// refused with. Spelled out here rather than read from the emulator's own constant, so
+/// the assertion states the expectation instead of re-stating the implementation.
+const BATCH_EVALUATION_NOT_FOUND_SENTENCE: &str =
+    "Failed to retrieve the resource because it doesn't exist. \
+     Retry the request with a different resource identifier.";
 
 /// A `clientToken` of the modelled length (33..256) and pattern.
 const CLIENT_TOKEN: &str = "batchevalclienttoken00000000000001";
@@ -166,9 +182,10 @@ fn is_batch_evaluation_arn(arn: &str, id: &str) -> bool {
         && segments[5] == format!("batch-evaluate/{id}")
 }
 
-/// Move a stored job's start instant `by` further into the past, so a case can reach the
-/// far side of a lifecycle span without sleeping for it. This is the test reaching into
-/// the store the handlers share, not an emulator behaviour.
+/// Move a stored job's lifecycle clock `by` further into the past — the instant it was
+/// started and, when a stop has been asked for, the instant that stop was served — so a
+/// case can reach the far side of a lifecycle span without sleeping for it. This is the
+/// test reaching into the store the handlers share, not an emulator behaviour.
 fn age_batch_evaluation(engine: &engine::InMemoryEngine, id: &str, by: Duration) {
     let state = agentcore::state::service_state(engine).expect("the service state");
     let mut store = state.lock();
@@ -177,6 +194,46 @@ fn age_batch_evaluation(engine: &engine::InMemoryEngine, id: &str, by: Duration)
         .get_mut(id)
         .expect("the batch evaluation that was just started");
     job.created_at -= by;
+    if let Some(stop_requested_at) = job.stop_requested_at {
+        job.stop_requested_at = Some(stop_requested_at - by);
+    }
+}
+
+/// The same reach into the store the other way round: move a stored job's lifecycle clock
+/// `by` further into the FUTURE, so a case that must observe the job BEFORE a transition
+/// falls due has a generous margin to do it in instead of racing the host for the span
+/// itself. A job whose start instant is `by` from now does not begin running for `by` plus
+/// one span, whatever else the machine is busy with.
+fn defer_batch_evaluation(engine: &engine::InMemoryEngine, id: &str, by: Duration) {
+    let state = agentcore::state::service_state(engine).expect("the service state");
+    let mut store = state.lock();
+    let job = store
+        .batch_evaluations
+        .get_mut(id)
+        .expect("the batch evaluation that was just started");
+    job.created_at += by;
+    if let Some(stop_requested_at) = job.stop_requested_at {
+        job.stop_requested_at = Some(stop_requested_at + by);
+    }
+}
+
+/// A margin far longer than any case needs, for the transitions a case must NOT have
+/// reached yet: the lifecycle is driven by moving the stored instants, so nothing waits for
+/// it, and a loaded machine cannot carry a job past a transition mid-case.
+const GENEROUS_MARGIN: Duration = Duration::from_secs(600);
+
+/// Place a started job well short of the instant it begins running, so every call of a
+/// case sees it as `PENDING` (or, once a stop has been asked for, as `STOPPING`).
+fn place_short_of_its_run(engine: &engine::InMemoryEngine, id: &str) {
+    defer_batch_evaluation(engine, id, GENEROUS_MARGIN);
+}
+
+/// Place a started job in the MIDDLE of its run, half a span from each end of it: the run
+/// is one span long, so this is the widest margin a case that must see `IN_PROGRESS` can be
+/// given.
+fn place_inside_its_run(engine: &engine::InMemoryEngine, id: &str) {
+    let span = agentcore::state::BATCH_EVALUATION_TRANSITION_SPAN;
+    age_batch_evaluation(engine, id, span + span / 2);
 }
 
 /// How many batch evaluation jobs this emulator holds — the check that a replayed start
@@ -591,8 +648,9 @@ async fn a_replayed_client_token_answers_with_the_job_it_already_started() {
     }
 }
 
-/// A `batchEvaluationId` no job is held for is refused 404 `ResourceNotFoundException`,
-/// naming the resource and the identifier that did not resolve.
+/// A `batchEvaluationId` no job is held for is refused 404 `ResourceNotFoundException`
+/// with the batch-evaluation plane's fixed not-found sentence, which spells no part of the
+/// request.
 #[tokio::test]
 async fn a_batch_evaluation_id_no_job_is_held_for_is_refused() {
     let (router, _engine) = emulator();
@@ -631,8 +689,12 @@ async fn a_batch_evaluation_id_no_job_is_held_for_is_refused() {
         );
         assert_eq!(
             text(&body, "message"),
-            format!("Batch Evaluation not found: {id}"),
-            "case {case:?}: expected the service's not-found sentence for {id:?}, got {body:?}"
+            BATCH_EVALUATION_NOT_FOUND_SENTENCE,
+            "case {case:?}: expected the plane's fixed not-found sentence for {id:?}, got {body:?}"
+        );
+        assert!(
+            !text(&body, "message").contains(&id),
+            "case {case:?}: expected the sentence to spell no part of the request, got {body:?}"
         );
     }
 
@@ -985,5 +1047,609 @@ async fn a_batch_evaluation_listing_outside_its_modelled_input_is_refused_with_4
         batch_evaluation_count(&engine),
         1,
         "expected the refusals above to have changed nothing"
+    );
+}
+
+/// `DeleteBatchEvaluation`: `DELETE /evaluations/batch-evaluate/{batchEvaluationId}`.
+async fn delete_batch_evaluation(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
+    send(
+        router,
+        "DELETE",
+        &format!("/evaluations/batch-evaluate/{id}"),
+        None,
+    )
+    .await
+}
+
+/// Every value of `BatchEvaluationStatus` (source: smithy_query query="shape"
+/// shape="BatchEvaluationStatus"), with whether a job in it has finished — which is what
+/// decides whether a delete of the job is accepted — and whether it still has work a stop
+/// could end.
+const EVERY_BATCH_EVALUATION_STATUS: [(&str, bool, bool); 8] = [
+    ("PENDING", false, true),
+    ("IN_PROGRESS", false, true),
+    ("STOPPING", false, false),
+    ("DELETING", false, false),
+    ("COMPLETED", true, false),
+    ("COMPLETED_WITH_ERRORS", true, false),
+    ("FAILED", true, false),
+    ("STOPPED", true, false),
+];
+
+/// The whole `ConflictException` message a delete of a job in `status` is refused with.
+/// Spelled out here rather than read from the emulator's own helper, so the assertion
+/// states the expectation instead of re-stating the implementation.
+fn not_deletable_sentence(status: &str) -> String {
+    format!(
+        "Cannot delete batch evaluation in status {status}. \
+         Only COMPLETED, COMPLETED_WITH_ERRORS, FAILED, or STOPPED evaluations can be deleted."
+    )
+}
+
+/// The whole `ConflictException` message a stop of a job in `status` is refused with,
+/// spelled out here for the same reason.
+fn not_stoppable_sentence(status: &str) -> String {
+    format!(
+        "Cannot stop batch evaluation in status {status}. \
+         Only PENDING or IN_PROGRESS evaluations can be stopped."
+    )
+}
+
+/// A delete is decided by the status the job is in, over the WHOLE status enum: a job that
+/// has finished is deletable and one that is still on its way somewhere is not, with the
+/// refusal naming the status it is in. A stop is decided the same way, the other way
+/// round: only a job that still has work to end can be stopped.
+///
+/// The clock only carries a job through `PENDING`, `IN_PROGRESS`, `COMPLETED`, `STOPPING`
+/// and `STOPPED`, so the rule is checked here against every value
+/// `BatchEvaluationStatus` publishes, and the cases below drive the statuses a started job
+/// actually reaches end to end.
+#[test]
+fn the_statuses_a_batch_evaluation_can_be_deleted_or_stopped_in() {
+    for (status, finished, stoppable) in EVERY_BATCH_EVALUATION_STATUS {
+        assert_eq!(
+            agentcore::state::batch_evaluation_status_is_terminal(status),
+            finished,
+            "case {status:?}: expected deletable={finished}, got {}",
+            agentcore::state::batch_evaluation_status_is_terminal(status)
+        );
+        assert_eq!(
+            agentcore::state::batch_evaluation_status_is_stoppable(status),
+            stoppable,
+            "case {status:?}: expected stoppable={stoppable}, got {}",
+            agentcore::state::batch_evaluation_status_is_stoppable(status)
+        );
+        if !finished {
+            assert_eq!(
+                agentcore::state::batch_evaluation_not_deletable_message(status),
+                not_deletable_sentence(status),
+                "case {status:?}: expected the refusal to name the status the job is in, got {:?}",
+                agentcore::state::batch_evaluation_not_deletable_message(status)
+            );
+        }
+        if !stoppable {
+            assert_eq!(
+                agentcore::state::batch_evaluation_not_stoppable_message(status),
+                not_stoppable_sentence(status),
+                "case {status:?}: expected the refusal to name the status the job is in, got {:?}",
+                agentcore::state::batch_evaluation_not_stoppable_message(status)
+            );
+        }
+    }
+}
+
+/// Deleting a batch evaluation that has not finished is refused 409 `ConflictException`
+/// naming the status it is in, and the refused delete leaves the job exactly where it was:
+/// a row per status a job can be in before it has run to its end.
+#[tokio::test]
+async fn deleting_a_batch_evaluation_that_has_not_finished_is_refused_with_409() {
+    // `stop_first` says whether the row asks for the job to stop before the refused
+    // delete, `place` puts the job at the point of its lifecycle the row is about, and the
+    // status is what the job is in there.
+    #[allow(clippy::type_complexity)]
+    let cases: [(&str, bool, fn(&engine::InMemoryEngine, &str), &str); 3] = [
+        ("short of its run", false, place_short_of_its_run, "PENDING"),
+        ("inside its run", false, place_inside_its_run, "IN_PROGRESS"),
+        (
+            "a stop still taking effect",
+            true,
+            place_short_of_its_run,
+            "STOPPING",
+        ),
+    ];
+
+    for (case, stop_first, place, expected_status) in cases {
+        let (router, engine) = emulator();
+        let (status, started) =
+            start_batch_evaluation(&router, minimal_request("delete_while_running")).await;
+        assert_eq!(
+            status, 202,
+            "case {case:?}: expected HTTP 202 from StartBatchEvaluation, got {status} with {started:?}"
+        );
+        let id = text(&started, "batchEvaluationId").to_string();
+        if stop_first {
+            let (status, stopped) = stop_batch_evaluation(&router, &id).await;
+            assert_eq!(
+                status, 202,
+                "case {case:?}: expected the stop to be accepted, got {status} with {stopped:?}"
+            );
+        }
+        place(&engine, &id);
+
+        // The job is in the status the row names, so the refusals below are about that
+        // status and not about where the host's clock happened to be.
+        let (_, before) = get_batch_evaluation(&router, &id).await;
+        assert_eq!(
+            text(&before, "status"),
+            expected_status,
+            "case {case:?}: expected the job to be {expected_status} before the delete, got {before:?}"
+        );
+
+        // Twice: a refused delete is not a step of the lifecycle, so the second refusal
+        // says exactly what the first one did.
+        for attempt in 1..=2 {
+            let (status, body) = delete_batch_evaluation(&router, &id).await;
+            assert_eq!(
+                status, 409,
+                "case {case:?}: expected HTTP 409 on attempt {attempt}, got {status} with {body:?}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "ConflictException",
+                "case {case:?}: expected ConflictException on attempt {attempt}, got {body:?}"
+            );
+            assert_eq!(
+                text(&body, "message"),
+                not_deletable_sentence(expected_status),
+                "case {case:?}: expected the refusal to name status {expected_status}, got {body:?}"
+            );
+        }
+
+        // The job is still there: still readable, still in the status it was in, and still
+        // the only record this plane holds.
+        let (status, read) = get_batch_evaluation(&router, &id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the refused job to still read back, got {status} with {read:?}"
+        );
+        assert_eq!(
+            text(&read, "status"),
+            expected_status,
+            "case {case:?}: expected the refused delete to change no status, got {read:?}"
+        );
+        assert_eq!(
+            batch_evaluation_count(&engine),
+            1,
+            "case {case:?}: expected the refused delete to remove nothing"
+        );
+    }
+}
+
+/// A batch evaluation that has finished is deleted: 202 with the job's identity and
+/// `DELETING`, after which the id addresses nothing — a read and a second delete are both
+/// refused 404 with the plane's fixed not-found sentence.
+#[tokio::test]
+async fn a_finished_batch_evaluation_is_deleted_and_its_id_then_addresses_nothing() {
+    let span = agentcore::state::BATCH_EVALUATION_TRANSITION_SPAN;
+    // Each row is a point at or past the instant the job has run to its end.
+    let cases: [(&str, Duration); 3] = [
+        ("at the second span", span * 2),
+        ("just past the run", span * 2 + Duration::from_secs(1)),
+        ("long past the run", span * 200),
+    ];
+
+    for (case, aged_by) in cases {
+        let (router, engine) = emulator();
+        // A second job is started and never deleted, so the delete below is shown to
+        // remove ONE job and not the plane's contents.
+        let (_, bystander) =
+            start_batch_evaluation(&router, minimal_request("kept_alongside")).await;
+        let bystander_id = text(&bystander, "batchEvaluationId").to_string();
+
+        let mut request = minimal_request("delete_when_finished");
+        request["clientToken"] = json!(CLIENT_TOKEN);
+        let (status, started) = start_batch_evaluation(&router, request.clone()).await;
+        assert_eq!(
+            status, 202,
+            "case {case:?}: expected HTTP 202 from StartBatchEvaluation, got {status} with {started:?}"
+        );
+        let id = text(&started, "batchEvaluationId").to_string();
+        let arn = text(&started, "batchEvaluationArn").to_string();
+        age_batch_evaluation(&engine, &id, aged_by);
+        age_batch_evaluation(&engine, &bystander_id, aged_by);
+
+        let (status, deleted) = delete_batch_evaluation(&router, &id).await;
+        assert_eq!(
+            status, 202,
+            "case {case:?}: expected HTTP 202 from DeleteBatchEvaluation, got {status} with {deleted:?}"
+        );
+        assert_eq!(
+            text(&deleted, "batchEvaluationId"),
+            id,
+            "case {case:?}: expected the deleted job's id, got {deleted:?}"
+        );
+        assert_eq!(
+            text(&deleted, "batchEvaluationArn"),
+            arn,
+            "case {case:?}: expected the ARN minted when the job was started, got {deleted:?}"
+        );
+        assert!(
+            is_batch_evaluation_arn(text(&deleted, "batchEvaluationArn"), &id),
+            "case {case:?}: expected a batch evaluation ARN for {id:?}, got {deleted:?}"
+        );
+        assert_eq!(
+            text(&deleted, "status"),
+            "DELETING",
+            "case {case:?}: expected the accepted deletion to report DELETING, got {deleted:?}"
+        );
+
+        // The id now addresses nothing: a read and a repeat delete are both refused with
+        // the same fixed sentence, and the repeat delete is never accepted a second time.
+        let (status, read) = get_batch_evaluation(&router, &id).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: expected HTTP 404 reading the deleted job, got {status} with {read:?}"
+        );
+        assert_eq!(
+            error_code(&read),
+            "ResourceNotFoundException",
+            "case {case:?}: expected ResourceNotFoundException reading the deleted job, got {read:?}"
+        );
+        assert_eq!(
+            text(&read, "message"),
+            BATCH_EVALUATION_NOT_FOUND_SENTENCE,
+            "case {case:?}: expected the plane's fixed not-found sentence, got {read:?}"
+        );
+
+        let (status, again) = delete_batch_evaluation(&router, &id).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: expected HTTP 404 from the repeat delete, got {status} with {again:?}"
+        );
+        assert_eq!(
+            error_code(&again),
+            "ResourceNotFoundException",
+            "case {case:?}: expected ResourceNotFoundException from the repeat delete, got {again:?}"
+        );
+        assert_eq!(
+            text(&again, "message"),
+            BATCH_EVALUATION_NOT_FOUND_SENTENCE,
+            "case {case:?}: expected the plane's fixed not-found sentence, got {again:?}"
+        );
+
+        // The deleted job is gone from the listing while the one beside it is not.
+        let listed: Vec<String> = list_every_batch_evaluation(&router, 100)
+            .await
+            .iter()
+            .map(|summary| text(summary, "batchEvaluationId").to_string())
+            .collect();
+        assert_eq!(
+            listed,
+            vec![bystander_id.clone()],
+            "case {case:?}: expected only the job that was not deleted to be listed, got {listed:?}"
+        );
+        assert_eq!(
+            batch_evaluation_count(&engine),
+            1,
+            "case {case:?}: expected the delete to have removed exactly the one job"
+        );
+
+        // The `clientToken` that started the deleted job no longer answers with it: there
+        // is nothing left for a replayed start to report, so it starts a new job.
+        let (status, replayed) = start_batch_evaluation(&router, request.clone()).await;
+        assert_eq!(
+            status, 202,
+            "case {case:?}: expected a replayed start after the delete to be accepted, got {status} with {replayed:?}"
+        );
+        assert_ne!(
+            text(&replayed, "batchEvaluationId"),
+            id,
+            "case {case:?}: expected a replayed start to mint a new job, got {replayed:?}"
+        );
+    }
+}
+
+/// `StopBatchEvaluation`: `POST /evaluations/batch-evaluate/{batchEvaluationId}/stop`.
+async fn stop_batch_evaluation(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
+    send(
+        router,
+        "POST",
+        &format!("/evaluations/batch-evaluate/{id}/stop"),
+        None,
+    )
+    .await
+}
+
+/// A stop of a job that still has work to end is accepted, puts the job on the stop's
+/// clock — `STOPPING`, then `STOPPED` one span later — and reports the job's identity: a
+/// row per status a stop is still possible in.
+#[tokio::test]
+async fn stopping_a_running_batch_evaluation_carries_it_to_stopped() {
+    let span = agentcore::state::BATCH_EVALUATION_TRANSITION_SPAN;
+    // Where the job is on its lifecycle when the stop arrives, and the status that is.
+    #[allow(clippy::type_complexity)]
+    let cases: [(&str, fn(&engine::InMemoryEngine, &str), &str); 2] = [
+        ("short of its run", place_short_of_its_run, "PENDING"),
+        ("inside its run", place_inside_its_run, "IN_PROGRESS"),
+    ];
+
+    for (case, place, status_before) in cases {
+        let (router, engine) = emulator();
+        let mut request = minimal_request("stop_then_delete");
+        request["description"] = json!("the nightly regression run");
+        let (status, started) = start_batch_evaluation(&router, request).await;
+        assert_eq!(
+            status, 202,
+            "case {case:?}: expected HTTP 202 from StartBatchEvaluation, got {status} with {started:?}"
+        );
+        let id = text(&started, "batchEvaluationId").to_string();
+        let arn = text(&started, "batchEvaluationArn").to_string();
+        place(&engine, &id);
+
+        // The job is in the status the row names, so the stop below is a stop of a run
+        // that is still owed.
+        let (_, before) = get_batch_evaluation(&router, &id).await;
+        assert_eq!(
+            text(&before, "status"),
+            status_before,
+            "case {case:?}: expected the job to be {status_before} before the stop, got {before:?}"
+        );
+
+        let (status, stopped) = stop_batch_evaluation(&router, &id).await;
+        assert_eq!(
+            status, 202,
+            "case {case:?}: expected HTTP 202 from StopBatchEvaluation, got {status} with {stopped:?}"
+        );
+        assert_eq!(
+            text(&stopped, "batchEvaluationId"),
+            id,
+            "case {case:?}: expected the stopped job's id, got {stopped:?}"
+        );
+        assert_eq!(
+            text(&stopped, "batchEvaluationArn"),
+            arn,
+            "case {case:?}: expected the ARN minted when the job was started, got {stopped:?}"
+        );
+        assert_eq!(
+            text(&stopped, "status"),
+            "STOPPING",
+            "case {case:?}: expected the accepted stop to report STOPPING, got {stopped:?}"
+        );
+        assert_eq!(
+            text(&stopped, "description"),
+            "the nightly regression run",
+            "case {case:?}: expected the stored description, got {stopped:?}"
+        );
+
+        // Reading the job says the same thing, and a read advances nothing: the job is
+        // STOPPING until the stop's own span has passed, so the stop instant is moved
+        // clear of that span first and the reads cannot race it.
+        defer_batch_evaluation(&engine, &id, GENEROUS_MARGIN);
+        for read_number in 1..=2 {
+            let (status, read) = get_batch_evaluation(&router, &id).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected HTTP 200 from read {read_number}, got {status} with {read:?}"
+            );
+            assert_eq!(
+                text(&read, "status"),
+                "STOPPING",
+                "case {case:?}: expected STOPPING on read {read_number}, got {read:?}"
+            );
+        }
+
+        // Once the stop's span has passed the job has stopped — and a job the stop ended
+        // stays stopped however long is left of the run it was carrying out.
+        age_batch_evaluation(&engine, &id, GENEROUS_MARGIN + span);
+        let (_, read) = get_batch_evaluation(&router, &id).await;
+        assert_eq!(
+            text(&read, "status"),
+            "STOPPED",
+            "case {case:?}: expected STOPPED one span after the stop, got {read:?}"
+        );
+        age_batch_evaluation(&engine, &id, span * 200);
+        let (_, later) = get_batch_evaluation(&router, &id).await;
+        assert_eq!(
+            text(&later, "status"),
+            "STOPPED",
+            "case {case:?}: expected a stopped job to stay stopped, got {later:?}"
+        );
+    }
+}
+
+/// A stop of a job with no run left to end is refused 409 `ConflictException` naming the
+/// status it is in, and an id no job is held for is refused 404: a row per status a stop
+/// cannot be served in.
+#[tokio::test]
+async fn stopping_a_batch_evaluation_with_no_run_left_is_refused() {
+    let span = agentcore::state::BATCH_EVALUATION_TRANSITION_SPAN;
+    // `stop_first` says whether the row stops the job before the refused stop, `aged_by`
+    // and `deferred_by` where the row then puts its lifecycle clock, and the status that
+    // leaves the job in.
+    let cases: [(&str, bool, Duration, Duration, &str); 3] = [
+        (
+            "already finished",
+            false,
+            span * 2 + GENEROUS_MARGIN,
+            Duration::ZERO,
+            "COMPLETED",
+        ),
+        (
+            "a stop already taking effect",
+            true,
+            Duration::ZERO,
+            GENEROUS_MARGIN,
+            "STOPPING",
+        ),
+        (
+            "already stopped",
+            true,
+            span + GENEROUS_MARGIN,
+            Duration::ZERO,
+            "STOPPED",
+        ),
+    ];
+
+    for (case, stop_first, aged_by, deferred_by, expected_status) in cases {
+        let (router, engine) = emulator();
+        let (status, started) =
+            start_batch_evaluation(&router, minimal_request("stop_refused")).await;
+        assert_eq!(
+            status, 202,
+            "case {case:?}: expected HTTP 202 from StartBatchEvaluation, got {status} with {started:?}"
+        );
+        let id = text(&started, "batchEvaluationId").to_string();
+        if stop_first {
+            let (status, stopped) = stop_batch_evaluation(&router, &id).await;
+            assert_eq!(
+                status, 202,
+                "case {case:?}: expected the first stop to be accepted, got {status} with {stopped:?}"
+            );
+        }
+        age_batch_evaluation(&engine, &id, aged_by);
+        defer_batch_evaluation(&engine, &id, deferred_by);
+
+        let (_, read) = get_batch_evaluation(&router, &id).await;
+        assert_eq!(
+            text(&read, "status"),
+            expected_status,
+            "case {case:?}: expected the job to be {expected_status} before the refused stop, got {read:?}"
+        );
+
+        let (status, body) = stop_batch_evaluation(&router, &id).await;
+        assert_eq!(
+            status, 409,
+            "case {case:?}: expected HTTP 409, got {status} with {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ConflictException",
+            "case {case:?}: expected ConflictException, got {body:?}"
+        );
+        assert_eq!(
+            text(&body, "message"),
+            not_stoppable_sentence(expected_status),
+            "case {case:?}: expected the refusal to name status {expected_status}, got {body:?}"
+        );
+
+        // The refused stop changed nothing.
+        let (_, after) = get_batch_evaluation(&router, &id).await;
+        assert_eq!(
+            text(&after, "status"),
+            expected_status,
+            "case {case:?}: expected the refused stop to change no status, got {after:?}"
+        );
+    }
+
+    // An id no job is held for is refused the way every missed lookup of this plane is.
+    let (router, _engine) = emulator();
+    let (status, body) = stop_batch_evaluation(&router, "never_started-0a1b2c3d4e").await;
+    assert_eq!(
+        status, 404,
+        "expected HTTP 404 stopping an id no job is held for, got {status} with {body:?}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "ResourceNotFoundException",
+        "expected ResourceNotFoundException stopping an unknown id, got {body:?}"
+    );
+    assert_eq!(
+        text(&body, "message"),
+        BATCH_EVALUATION_NOT_FOUND_SENTENCE,
+        "expected the plane's fixed not-found sentence, got {body:?}"
+    );
+}
+
+/// The documented lifecycle end to end: start, a delete refused while the job runs, a
+/// stop, a delete still refused while the stop takes effect, then the delete accepted once
+/// the job has stopped and the id refused for good afterwards.
+#[tokio::test]
+async fn a_batch_evaluation_is_started_stopped_and_then_deleted() {
+    let span = agentcore::state::BATCH_EVALUATION_TRANSITION_SPAN;
+    let (router, engine) = emulator();
+
+    let (status, started) =
+        start_batch_evaluation(&router, minimal_request("full_lifecycle")).await;
+    assert_eq!(
+        status, 202,
+        "expected HTTP 202 from StartBatchEvaluation, got {status} with {started:?}"
+    );
+    let id = text(&started, "batchEvaluationId").to_string();
+    // The job is kept clear of the instant it would start running, so each leg below is
+    // reached in the status it is about however loaded the machine is.
+    place_short_of_its_run(&engine, &id);
+
+    // Running: the delete is refused and the job keeps going.
+    let (status, refused) = delete_batch_evaluation(&router, &id).await;
+    assert_eq!(
+        status, 409,
+        "expected the delete of a running job to be refused, got {status} with {refused:?}"
+    );
+    assert_eq!(
+        text(&refused, "message"),
+        not_deletable_sentence("PENDING"),
+        "expected the refusal to name the status the job is in, got {refused:?}"
+    );
+
+    // Stopping: still not deletable, and the refusal names the new status.
+    let (status, stopped) = stop_batch_evaluation(&router, &id).await;
+    assert_eq!(
+        status, 202,
+        "expected HTTP 202 from StopBatchEvaluation, got {status} with {stopped:?}"
+    );
+    defer_batch_evaluation(&engine, &id, GENEROUS_MARGIN);
+    let (status, refused) = delete_batch_evaluation(&router, &id).await;
+    assert_eq!(
+        status, 409,
+        "expected the delete of a stopping job to be refused, got {status} with {refused:?}"
+    );
+    assert_eq!(
+        text(&refused, "message"),
+        not_deletable_sentence("STOPPING"),
+        "expected the refusal to name the status the job is in, got {refused:?}"
+    );
+
+    // Stopped: the delete is accepted, and the id addresses nothing afterwards.
+    age_batch_evaluation(&engine, &id, GENEROUS_MARGIN + span);
+    let (_, read) = get_batch_evaluation(&router, &id).await;
+    assert_eq!(
+        text(&read, "status"),
+        "STOPPED",
+        "expected the stop to have taken effect, got {read:?}"
+    );
+    let (status, deleted) = delete_batch_evaluation(&router, &id).await;
+    assert_eq!(
+        status, 202,
+        "expected the delete of a stopped job to be accepted, got {status} with {deleted:?}"
+    );
+    assert_eq!(
+        text(&deleted, "status"),
+        "DELETING",
+        "expected the accepted deletion to report DELETING, got {deleted:?}"
+    );
+    for (case, (status, body)) in [
+        ("read", get_batch_evaluation(&router, &id).await),
+        ("repeat delete", delete_batch_evaluation(&router, &id).await),
+        ("stop", stop_batch_evaluation(&router, &id).await),
+    ] {
+        assert_eq!(
+            status, 404,
+            "case {case:?}: expected HTTP 404 after the delete, got {status} with {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ResourceNotFoundException",
+            "case {case:?}: expected ResourceNotFoundException after the delete, got {body:?}"
+        );
+        assert_eq!(
+            text(&body, "message"),
+            BATCH_EVALUATION_NOT_FOUND_SENTENCE,
+            "case {case:?}: expected the plane's fixed not-found sentence, got {body:?}"
+        );
+    }
+    assert_eq!(
+        batch_evaluation_count(&engine),
+        0,
+        "expected the deleted job to be gone from the store"
     );
 }

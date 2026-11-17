@@ -18,6 +18,13 @@
 //! written by a read: the instants a transition falls due follow from the instant the
 //! job was started.
 //!
+//! `StopBatchEvaluation` and `DeleteBatchEvaluation` are the two calls that end a job, and
+//! both are decided by the status it is in when they arrive. A stop is accepted only while
+//! there is still work to end ([`BATCH_EVALUATION_STOPPABLE_STATUSES`]) and from then on
+//! the job is on the STOP's clock — `STOPPING`, then `STOPPED` one span later. A delete is
+//! accepted only once the job has finished ([`BATCH_EVALUATION_TERMINAL_STATUSES`]), and
+//! it removes the record, so the id it addressed afterwards resolves to nothing at all.
+//!
 //! The plane has an explicit ceiling: `StartBatchEvaluation` is its growth site and a
 //! caller chooses both the names it starts jobs under and the `clientToken` each insert
 //! is recorded with, so it is bounded by [`MAX_BATCH_EVALUATIONS`] and
@@ -68,6 +75,104 @@ pub const BATCH_EVALUATION_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
 /// `BatchEvaluationStatus` for a job that has run to its end, from the same enum.
 pub const BATCH_EVALUATION_STATUS_COMPLETED: &str = "COMPLETED";
 
+/// `BatchEvaluationStatus` for a job that ran to its end but could not evaluate every
+/// session it was given, from the same enum.
+pub const BATCH_EVALUATION_STATUS_COMPLETED_WITH_ERRORS: &str = "COMPLETED_WITH_ERRORS";
+
+/// `BatchEvaluationStatus` for a job that gave up, from the same enum.
+pub const BATCH_EVALUATION_STATUS_FAILED: &str = "FAILED";
+
+/// `BatchEvaluationStatus` for a job a stop has been asked for but has not taken effect
+/// yet, from the same enum.
+pub const BATCH_EVALUATION_STATUS_STOPPING: &str = "STOPPING";
+
+/// `BatchEvaluationStatus` for a job a stop ended, from the same enum.
+pub const BATCH_EVALUATION_STATUS_STOPPED: &str = "STOPPED";
+
+/// `BatchEvaluationStatus` for a job a delete has been accepted for, from the same enum —
+/// the status the delete reports back for the deletion it accepted.
+pub const BATCH_EVALUATION_STATUS_DELETING: &str = "DELETING";
+
+/// The statuses a batch evaluation job has FINISHED in: a job in one of them is running
+/// no longer, so there is no work left for a delete to interrupt. Every other value of
+/// `BatchEvaluationStatus` names a job that is still on its way somewhere (`PENDING`,
+/// `IN_PROGRESS`, `STOPPING`, `DELETING`).
+///
+/// The order is the order [`batch_evaluation_not_deletable_message`] lists them in.
+pub const BATCH_EVALUATION_TERMINAL_STATUSES: [&str; 4] = [
+    BATCH_EVALUATION_STATUS_COMPLETED,
+    BATCH_EVALUATION_STATUS_COMPLETED_WITH_ERRORS,
+    BATCH_EVALUATION_STATUS_FAILED,
+    BATCH_EVALUATION_STATUS_STOPPED,
+];
+
+/// Whether a job reported under `status` has finished
+/// ([`BATCH_EVALUATION_TERMINAL_STATUSES`]) — which is what decides whether a delete of
+/// it can be accepted.
+#[must_use]
+pub fn batch_evaluation_status_is_terminal(status: &str) -> bool {
+    BATCH_EVALUATION_TERMINAL_STATUSES.contains(&status)
+}
+
+/// The message a delete of a batch evaluation job that has not finished is refused with.
+///
+/// The sentence names the status the job is in at the instant of the delete — its only
+/// variable part — and then the statuses a job can be deleted in
+/// ([`BATCH_EVALUATION_TERMINAL_STATUSES`]), so a caller is told both what blocks the
+/// delete and what to wait for.
+#[must_use]
+pub fn batch_evaluation_not_deletable_message(status: &str) -> String {
+    let [first, second, third, last] = BATCH_EVALUATION_TERMINAL_STATUSES;
+    format!(
+        "Cannot delete batch evaluation in status {status}. \
+         Only {first}, {second}, {third}, or {last} evaluations can be deleted."
+    )
+}
+
+/// The statuses a batch evaluation job can be STOPPED in: a stop ends work that is still
+/// owed, so there has to be some. Every other value of `BatchEvaluationStatus` names a
+/// job whose run is already over or already ending.
+///
+/// The order is the order [`batch_evaluation_not_stoppable_message`] lists them in.
+pub const BATCH_EVALUATION_STOPPABLE_STATUSES: [&str; 2] = [
+    BATCH_EVALUATION_STATUS_PENDING,
+    BATCH_EVALUATION_STATUS_IN_PROGRESS,
+];
+
+/// Whether a job reported under `status` still has work a stop could end
+/// ([`BATCH_EVALUATION_STOPPABLE_STATUSES`]) — which is what decides whether a stop of it
+/// can be accepted.
+#[must_use]
+pub fn batch_evaluation_status_is_stoppable(status: &str) -> bool {
+    BATCH_EVALUATION_STOPPABLE_STATUSES.contains(&status)
+}
+
+/// The message a stop of a batch evaluation job that has no work left to end is refused
+/// with, worded as the delete's own refusal is: the status the job is in at the instant of
+/// the call — its only variable part — and then the statuses a job can be stopped in
+/// ([`BATCH_EVALUATION_STOPPABLE_STATUSES`]).
+#[must_use]
+pub fn batch_evaluation_not_stoppable_message(status: &str) -> String {
+    let [first, last] = BATCH_EVALUATION_STOPPABLE_STATUSES;
+    format!(
+        "Cannot stop batch evaluation in status {status}. \
+         Only {first} or {last} evaluations can be stopped."
+    )
+}
+
+/// The message a lookup of a batch evaluation job that this plane holds none for is
+/// refused with — the whole `ResourceNotFoundException` message, which is FIXED text: the
+/// batch-evaluation API words this refusal after the resource the request failed to reach
+/// and the retry that would succeed, so neither the `batchEvaluationId` the request
+/// spelled nor the resource type appears in it.
+///
+/// One sentence for every caller that misses — the read, the listing's own lookups and the
+/// delete, including a delete or a read of an id a delete has already removed — so the
+/// "gone" answer cannot be worded two ways.
+pub const BATCH_EVALUATION_NOT_FOUND_MESSAGE: &str =
+    "Failed to retrieve the resource because it doesn't exist. \
+     Retry the request with a different resource identifier.";
+
 /// One batch evaluation job: what `StartBatchEvaluation` persisted, which is what every
 /// later read of the job reports.
 #[derive(Debug, Clone)]
@@ -90,6 +195,10 @@ pub struct BatchEvaluationRecord {
     pub tags: Option<HashMap<String, String>>,
     pub kms_key_arn: Option<String>,
     pub created_at: SystemTime,
+    /// The instant a `StopBatchEvaluation` asked for this job to stop, or `None` while
+    /// none has: the stop is what takes the job off the run's own clock
+    /// ([`Self::status_as_of`]).
+    pub stop_requested_at: Option<SystemTime>,
     /// The value [`ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState::next_seq`]
     /// handed this job: its eviction order, and what keeps two jobs started in the same
     /// millisecond apart.
@@ -128,6 +237,7 @@ impl BatchEvaluationRecord {
             tags,
             kms_key_arn,
             created_at,
+            stop_requested_at: None,
             seq,
         }
     }
@@ -145,16 +255,40 @@ impl BatchEvaluationRecord {
             .and_then(|running_at| running_at.checked_add(BATCH_EVALUATION_TRANSITION_SPAN))
     }
 
+    /// The instant this job has stopped, read the same way as [`Self::running_at`]: one
+    /// span after a stop was asked for, or `None` while none has been.
+    pub fn stopped_at(&self) -> Option<SystemTime> {
+        self.stop_requested_at
+            .and_then(|requested_at| requested_at.checked_add(BATCH_EVALUATION_TRANSITION_SPAN))
+    }
+
     /// This job's `BatchEvaluationStatus` at `now`: `PENDING` until it starts running,
     /// `IN_PROGRESS` while it is, and `COMPLETED` once it has run to its end. Read off
     /// the stored start instant and the clock, so a report of the job states the
     /// transition that was already due without writing anything.
+    ///
+    /// A job a stop was asked for is on the STOP's clock instead, from the instant that
+    /// call was served: `STOPPING` until one span has passed and `STOPPED` after it. The
+    /// run it was carrying out is over either way, so the instants the original run would
+    /// have fallen due at no longer say anything about the job.
     pub fn status_as_of(&self, now: SystemTime) -> &'static str {
+        if self.stop_requested_at.is_some() {
+            return match self.stopped_at() {
+                Some(stopped_at) if now >= stopped_at => BATCH_EVALUATION_STATUS_STOPPED,
+                _ => BATCH_EVALUATION_STATUS_STOPPING,
+            };
+        }
         match (self.running_at(), self.finished_at()) {
             (_, Some(finished_at)) if now >= finished_at => BATCH_EVALUATION_STATUS_COMPLETED,
             (Some(running_at), _) if now >= running_at => BATCH_EVALUATION_STATUS_IN_PROGRESS,
             _ => BATCH_EVALUATION_STATUS_PENDING,
         }
+    }
+
+    /// Record that a stop was asked for at `now`, which is what moves this job onto the
+    /// stop's clock ([`Self::status_as_of`]).
+    pub fn stop(&mut self, now: SystemTime) {
+        self.stop_requested_at = Some(now);
     }
 
     /// This job as the modelled `BatchEvaluationSummary`, as of `now`.
@@ -193,7 +327,17 @@ impl BatchEvaluationRecord {
     /// When this job last changed at `now`: the instant of the most recent lifecycle
     /// transition the clock has made due, which is its start instant while it is still
     /// `PENDING`.
+    ///
+    /// A job a stop was asked for reports the instant of that call while it is `STOPPING`
+    /// and the instant it stopped once it has, for the same reason
+    /// [`Self::status_as_of`] reads the stop's clock rather than the run's.
     pub fn updated_at_as_of(&self, now: SystemTime) -> SystemTime {
+        if let Some(stop_requested_at) = self.stop_requested_at {
+            return match self.stopped_at() {
+                Some(stopped_at) if now >= stopped_at => stopped_at,
+                _ => stop_requested_at,
+            };
+        }
         match (self.running_at(), self.finished_at()) {
             (_, Some(finished_at)) if now >= finished_at => finished_at,
             (Some(running_at), _) if now >= running_at => running_at,
@@ -315,5 +459,44 @@ impl ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState {
                     batch_evaluation_id,
                 )
             })
+    }
+
+    /// The same lookup taken mutably, for the stop that changes what it found.
+    pub fn resolve_batch_evaluation_mut(
+        &mut self,
+        batch_evaluation_id: &str,
+    ) -> Result<&mut BatchEvaluationRecord, String> {
+        self.batch_evaluations
+            .get_mut(batch_evaluation_id)
+            .ok_or_else(|| {
+                resource_not_found_message(
+                    NotFoundResource::BatchEvaluation,
+                    batch_evaluation_id,
+                )
+            })
+    }
+
+    /// Remove the batch evaluation job a delete addressed and hand it back, or the
+    /// sentence this plane refuses a missed lookup with.
+    ///
+    /// The `clientToken` records that point at it go with it, exactly as they do when the
+    /// plane's ceiling evicts a job: a token whose job is gone would otherwise let a
+    /// replayed start answer with a job no caller can read.
+    pub fn remove_batch_evaluation(
+        &mut self,
+        batch_evaluation_id: &str,
+    ) -> Result<BatchEvaluationRecord, String> {
+        let removed = self
+            .batch_evaluations
+            .remove(batch_evaluation_id)
+            .ok_or_else(|| {
+                resource_not_found_message(
+                    NotFoundResource::BatchEvaluation,
+                    batch_evaluation_id,
+                )
+            })?;
+        self.batch_evaluation_idempotency
+            .retain(|_, held| held != &removed.batch_evaluation_id);
+        Ok(removed)
     }
 }

@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopBatchEvaluation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopBatchEvaluation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopBatchEvaluation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stopping a batch evaluation job ends the run it was carrying out, and it is decided by
+//! the status the job is in at the instant of the call:
+//!
+//! * a job that still has work to end
+//!   ([`crate::state::BATCH_EVALUATION_STOPPABLE_STATUSES`]) is put on the stop's clock
+//!   and the stop is accepted with 202, reporting `STOPPING` — the job reaches `STOPPED`
+//!   one lifecycle span later, with no further call needed to make it so;
+//! * a job whose run is already over or already ending is refused `ConflictException`
+//!   (409) naming that status, and is left exactly as it was;
+//! * a `batchEvaluationId` this plane holds no job for is refused
+//!   `ResourceNotFoundException` (404).
 //!
 //! ## Shape of an operation
 //!
@@ -138,6 +141,16 @@ impl From<StopBatchEvaluationErrorModeled> for StopBatchEvaluationError {
     }
 }
 
+/// The refusal a `batchEvaluationId` that resolves to no held job is answered with: 404
+/// `ResourceNotFoundException`, worded by the batch-evaluation plane itself
+/// (`crate::state::BATCH_EVALUATION_NOT_FOUND_MESSAGE`).
+fn not_found(message: String) -> StopBatchEvaluationError {
+    StopBatchEvaluationErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
+
 /// The `StopBatchEvaluation` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -174,18 +187,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopBatchEvaluation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopBatchEvaluationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopBatchEvaluation"))
+        // Request metadata is not read by this operation: the `batchEvaluationId` is
+        // bound into `input` by the centralized request walk, and the ARN this reports is
+        // the one minted when the job was started.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StopBatchEvaluationErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the shared engine does not carry this service's state".to_string()),
+            })
+        })?;
+
+        // One reading of the clock for the whole call: the status this stop is decided
+        // against, and the instant the job is stopping from, are the same moment.
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let job = store
+            .resolve_batch_evaluation_mut(&input.batch_evaluation_id)
+            .map_err(not_found)?;
+
+        let status = job.status_as_of(now);
+        if !crate::state::batch_evaluation_status_is_stoppable(status) {
+            // There is no run left for this call to end — the job has finished, or a stop
+            // is already taking effect — so the modelled answer is the one for a request
+            // that conflicts with the current state of the resource, and nothing is
+            // written.
+            return Err(StopBatchEvaluationErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(crate::state::batch_evaluation_not_stoppable_message(status)),
+                },
+            )
+            .into());
+        }
+
+        job.stop(now);
+        Ok(StopBatchEvaluationOutput {
+            batch_evaluation_id: job.batch_evaluation_id.clone(),
+            batch_evaluation_arn: job.batch_evaluation_arn.clone(),
+            // The status of the job AFTER the stop request, which is what the output
+            // member reports: the stop has been accepted and is taking effect.
+            status: job.status_as_of(now).to_string(),
+            description: job.description.clone(),
+        })
     }
 }

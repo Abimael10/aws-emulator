@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteBatchEvaluation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteBatchEvaluation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteBatchEvaluation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deleting a batch evaluation job is the last leg of its lifecycle, and it is decided by
+//! the status the job is in at the instant of the call:
+//!
+//! * a job that has not finished is refused `ConflictException` (409) naming that status,
+//!   and is left exactly where it was — still readable, and still deletable once it
+//!   finishes;
+//! * a job that HAS finished
+//!   ([`crate::state::BATCH_EVALUATION_TERMINAL_STATUSES`]) is removed and the delete is
+//!   accepted with 202, reporting the job's identity and `DELETING`;
+//! * a `batchEvaluationId` this plane holds no job for — one that was never started, or
+//!   one a delete already removed — is refused `ResourceNotFoundException` (404), so a
+//!   delete is never accepted twice for one job.
 //!
 //! ## Shape of an operation
 //!
@@ -135,6 +139,17 @@ impl From<DeleteBatchEvaluationErrorModeled> for DeleteBatchEvaluationError {
     }
 }
 
+/// The refusal a `batchEvaluationId` that resolves to no held job is answered with: 404
+/// `ResourceNotFoundException`, worded by the batch-evaluation plane itself
+/// (`crate::state::BATCH_EVALUATION_NOT_FOUND_MESSAGE`), whether the id was never started
+/// or a delete has already removed it.
+fn not_found(message: String) -> DeleteBatchEvaluationError {
+    DeleteBatchEvaluationErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
+
 /// The `DeleteBatchEvaluation` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -171,18 +186,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteBatchEvaluation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteBatchEvaluationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteBatchEvaluation"))
+        // Request metadata is not read by this operation: the `batchEvaluationId` is
+        // bound into `input` by the centralized request walk, and the ARN this reports is
+        // the one minted when the job was started.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteBatchEvaluationErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the shared engine does not carry this service's state".to_string()),
+            })
+        })?;
+
+        // One reading of the clock for the whole call, so the status this delete is
+        // decided against is the one a read of the same job would report at that instant.
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let status = store
+            .resolve_batch_evaluation(&input.batch_evaluation_id)
+            .map_err(not_found)?
+            .status_as_of(now);
+
+        if !crate::state::batch_evaluation_status_is_terminal(status) {
+            // Work is still owed on this job, so deleting it would discard a run in
+            // flight: the modelled answer for a request that conflicts with the current
+            // state of the resource. Nothing is written here — the job keeps running and
+            // stays readable, and the same delete is accepted once it has finished.
+            return Err(DeleteBatchEvaluationErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(crate::state::batch_evaluation_not_deletable_message(status)),
+                },
+            )
+            .into());
+        }
+
+        let removed = store
+            .remove_batch_evaluation(&input.batch_evaluation_id)
+            .map_err(not_found)?;
+
+        Ok(DeleteBatchEvaluationOutput {
+            batch_evaluation_id: removed.batch_evaluation_id,
+            batch_evaluation_arn: removed.batch_evaluation_arn,
+            // The status of the DELETION this call accepted, which is what the output
+            // member reports: the job is on its way out and no longer readable.
+            status: crate::state::BATCH_EVALUATION_STATUS_DELETING.to_string(),
+        })
     }
 }
