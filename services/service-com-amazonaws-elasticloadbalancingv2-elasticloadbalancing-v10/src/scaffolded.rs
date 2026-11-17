@@ -229,6 +229,36 @@ pub static VALIDATION_ERROR_SCHEMA: Schema = Schema::new_struct(
     &[&VALIDATION_ERROR_MESSAGE],
 );
 
+/// The `message` member of the synthetic `AccessDenied` error shape.
+static ACCESS_DENIED_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#AccessDenied$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message");
+
+/// Schema for the synthetic `AccessDenied` error shape.
+///
+/// In the `smithy.framework` namespace for the same reason as `NotImplemented`: the shape is
+/// not in any service's model, so it must not collide with a modeled one. It exists because
+/// `AccessDenied` is the error code Elastic Load Balancing refuses a caller the IAM policies
+/// in force do not permit with, and the error code is what a client branches on. It is a
+/// CLIENT fault (HTTP 403), so the query envelope reports it as `<Type>Sender</Type>`.
+pub static ACCESS_DENIED_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#AccessDenied",
+        "smithy.framework",
+        "AccessDenied",
+    ),
+    ShapeType::Structure,
+    &[&ACCESS_DENIED_MESSAGE],
+);
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -254,6 +284,11 @@ pub enum Scaffolded<E> {
     /// `message` member; only the wire code differs from
     /// [`Scaffolded::ValidationException`].
     ValidationError(ValidationException),
+    /// The caller may not perform the action the request named on the resource it addressed,
+    /// with HTTP 403 and the error code `AccessDenied`. Not a bad request: the request is one
+    /// the service would serve for a caller the IAM policies in force permit. The payload is
+    /// the same single `message` member as the refusals above.
+    AccessDenied(ValidationException),
 }
 
 impl<E> Scaffolded<E> {
@@ -293,6 +328,16 @@ impl<E> Scaffolded<E> {
     pub fn validation_error(message: impl Into<String>) -> Self {
         Self::ValidationError(ValidationException::new(message))
     }
+
+    /// Refuse the request with HTTP 403 `AccessDenied`.
+    ///
+    /// For a request the IAM policies in force on the principal it speaks for do not permit:
+    /// say who was refused, which action and on which resource, because that is what the
+    /// caller has to have granted. The decision itself and the sentence belong to
+    /// [`crate::service::target_group_authorization`].
+    pub fn access_denied(message: impl Into<String>) -> Self {
+        Self::AccessDenied(ValidationException::new(message))
+    }
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
@@ -302,6 +347,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
             Self::Modeled(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
             Self::ValidationError(e) => write!(f, "{e}"),
+            Self::AccessDenied(e) => write!(f, "{e}"),
         }
     }
 }
@@ -315,6 +361,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
             Self::Modeled(e) => e.source(),
             Self::ValidationException(e) => e.source(),
             Self::ValidationError(e) => e.source(),
+            Self::AccessDenied(e) => e.source(),
         }
     }
 }
@@ -330,6 +377,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.as_serializable(),
             Self::ValidationException(e) => e,
             Self::ValidationError(e) => e,
+            Self::AccessDenied(e) => e,
         }
     }
 
@@ -339,6 +387,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.variant_schema(),
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
             Self::ValidationError(_) => &VALIDATION_ERROR_SCHEMA,
+            Self::AccessDenied(_) => &ACCESS_DENIED_SCHEMA,
         }
     }
 
@@ -352,6 +401,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.shape_name(),
             Self::ValidationException(_) => "ValidationException",
             Self::ValidationError(_) => VALIDATION_ERROR,
+            Self::AccessDenied(_) => crate::service::target_group_authorization::ACCESS_DENIED,
         }
     }
 
@@ -365,6 +415,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.http_status(),
             Self::ValidationException(_) => 400,
             Self::ValidationError(_) => 400,
+            // Not a bad request: the request is one this service would serve for a caller the
+            // policies in force permit.
+            Self::AccessDenied(_) => 403,
         }
     }
 
@@ -381,6 +434,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // comes from [`OperationError::shape_name`] above, not from a modelled trait,
             // and it IS the code AWS answers with — so there is nothing to override.
             Self::ValidationError(_) => None,
+            // Same reason again: the `<Code>AccessDenied</Code>` the envelope renders comes
+            // from [`OperationError::shape_name`] above.
+            Self::AccessDenied(_) => None,
         }
     }
 }

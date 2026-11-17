@@ -123,6 +123,10 @@ pub mod listener_socket;
 
 pub mod management_events;
 
+/// Whether the IAM policies in force on the calling principal permit a call addressed to the
+/// target group it names, which every call that WRITES one takes before it reads the store.
+pub mod target_group_authorization;
+
 /// The ORDER this service states an enum's value set in when it refuses a value outside
 /// it, which is the service's own rather than the model's declaration order.
 mod enum_value_sets;

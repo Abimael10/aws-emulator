@@ -127,6 +127,14 @@ service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 aws-sdk-s3 = { version = "1", default-features = false }
 flate2 = "1"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+# The account's IAM records and its STS sessions, which is what a call addressed to a target
+# group is AUTHORIZED against: who a request speaks for is the session STS minted its key for
+# (or the user IAM holds that key), and what that principal may do is the identity-policy
+# documents and the permissions boundary IAM holds for it
+# (`src/service/target_group_authorization.rs`). Both are read through those services' OWN
+# accessors on the shared engine, so a policy `iam:PutRolePolicy` wrote decides the next call.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -175,9 +183,9 @@ aws-sdk-s3 = { version = "1", default-features = false }
 # A Lambda target runs as its execution ROLE, so the suite that drives the published address
 # end to end creates that role through IAM's own API and the session the run's SDK calls are
 # signed with is minted by the token service: both are mounted beside this service on the
-# suite's own engine (`tests/all/alb_lambda_target_published_address.rs`). TEST-ONLY.
-service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
-service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
+# suite's own engine (`tests/all/alb_lambda_target_published_address.rs`). Both are normal
+# dependencies of this crate (the authorization gate reads their stores), so there is nothing
+# further to declare for the suites.
 
 [lints]
 workspace = true

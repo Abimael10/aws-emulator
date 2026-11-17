@@ -141,6 +141,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::scaffolded::Scaffolded::not_implemented("ModifyTargetGroupAttributes")
         })?;
 
+        // Whether the caller may act on the target group it named at all, decided BEFORE
+        // anything the request names is read or written
+        // ([`crate::service::target_group_authorization`]).
+        if let Some(refusal) = crate::service::target_group_authorization::target_group_action_refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.target_group_arn,
+        ) {
+            return Err(refusal);
+        }
+
         // The FORM of the ARN is judged BEFORE the store is read: a value that is not an
         // ARN this API could have minted for the Region the request addresses names no
         // target group that could exist, so it is the request that has to be fixed rather
