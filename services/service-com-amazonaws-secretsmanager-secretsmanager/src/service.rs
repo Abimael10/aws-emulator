@@ -39,11 +39,38 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! ## Credentials the account has withdrawn
+//!
+//! A long-term access key the account holds authenticates a request only while its stored
+//! `Status` is `Active`, so a request signed with one whose status the account has moved
+//! off `Active` resolves to NO principal: neither a secret's resource policy nor the
+//! caller's identity policies are consulted, because there is no caller to consult them
+//! for. That is an AUTHENTICATION outcome, so it is refused BEFORE any operation runs and
+//! with this service's own unknown-credential code ([`UNUSABLE_CREDENTIAL_CODE`]) rather
+//! than with an authorization denial or any modelled resource error.
+//!
+//! The rule, the sentence and the pre-dispatch refusal are the tree's one copy
+//! ([`::service_common::unusable_credential`]); this file only names the code this service
+//! states it with and hands it the account's own answer for the presented key, read through
+//! the identity service's OWN accessor over the records its `CreateAccessKey` /
+//! `UpdateAccessKey` wrote — the same store this service's authorization reads its
+//! principal's documents from ([`crate::state::authorization`]).
 
 use smithy_server_runtime::{http, ErasedOperation, Refusal, Refused, Service};
 use std::sync::Arc;
 
+use ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam_store;
+use ::service_common::unusable_credential::UnusableCredential;
+
 mod validation;
+
+/// The error code this service answers a signed request whose credential it will not accept
+/// with: an `awsJson` service's unknown-credential code, the one
+/// [`::service_common::authentication_refusal`] states for this protocol family. An
+/// AUTHENTICATION failure — no principal was resolved — rather than an authorization denial,
+/// so it is the code an SDK's credential-refresh path keys on.
+const UNUSABLE_CREDENTIAL_CODE: &str = "UnrecognizedClientException";
 
 /// The `com-amazonaws-secretsmanager-secretsmanager` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -52,6 +79,13 @@ mod validation;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The SAME shared engine the generated entry threaded into every operation, kept here
+    /// too because the pre-dispatch credential check below has to read the access keys the
+    /// identity service's own operations wrote. Never a store of its own: it is the `Arc`
+    /// the router handed to `new`.
+    engine: Arc<Eng>,
+    /// Answers a request presenting a credential this account will not accept.
+    unusable_credential: UnusableCredential,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -60,7 +94,9 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            engine,
+            unusable_credential: UnusableCredential::stated_as(UNUSABLE_CREDENTIAL_CODE),
         }
     }
 }
@@ -91,8 +127,19 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // correctly; `None` (the default) lets the generated routing table resolve
         // it. `req` is the whole request, so a decision that depends on the body —
         // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        //
+        // A credential the account has withdrawn is refused HERE, before the operation it
+        // named runs (see the module docs): the modelled walk deserializes, validates and
+        // dispatches before any handler could answer, so this pre-dispatch seam is the only
+        // place an authentication outcome is reachable from. A READ — one lock taken to look
+        // one key up — so a refused request changes nothing a later caller sees, and the
+        // request's auth schemes are unaffected: the router reads them off the MODELLED
+        // operation the routing key names.
+        self.unusable_credential
+            .refusal_for(req, self.entry.protocol(), |access_key_id| {
+                iam_store::service_state(&*self.engine)
+                    .is_none_or(|iam| iam.lock().access_key_is_usable(access_key_id))
+            })
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

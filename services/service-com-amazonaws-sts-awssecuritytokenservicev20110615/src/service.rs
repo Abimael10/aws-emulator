@@ -41,6 +41,22 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! ## Credentials the account has withdrawn
+//!
+//! A long-term access key the account holds authenticates a request only while its stored
+//! `Status` is `Active`, so a request signed with one whose status the account has moved
+//! off `Active` resolves to NO principal — there is no caller to report and none to mint a
+//! session for. That is an AUTHENTICATION outcome, so it is refused BEFORE any operation
+//! runs and with the unknown-credential code this service already answers an unresolvable
+//! credential with ([`UNRESOLVED_CREDENTIAL_CODE`]), so a credential this service will not
+//! accept and one it cannot resolve at all are stated alike.
+//!
+//! The rule, the sentence and the pre-dispatch refusal are the tree's one copy
+//! ([`::service_common::unusable_credential`]); this file only reaches it ahead of dispatch
+//! and hands it the account's own answer for the presented key, read through the identity
+//! service's OWN accessor over the records its `CreateAccessKey` / `UpdateAccessKey` wrote
+//! ([`crate::state::iam_state`]).
 
 pub mod management_events;
 pub mod message_text;
@@ -447,6 +463,8 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// a refused request is stated with the value it was refused for whichever operation
     /// it named, and no served call goes unrecorded.
     stated: smithy_server_runtime::OperationRoutingTable,
+    /// Answers a request presenting a credential this account will not accept.
+    unusable_credential: ::service_common::unusable_credential::UnusableCredential,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -462,6 +480,10 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             engine,
             protocol: QuerySignedCalls::new(),
             stated,
+            unusable_credential:
+                ::service_common::unusable_credential::UnusableCredential::stated_as(
+                    UNRESOLVED_CREDENTIAL_CODE,
+                ),
         }
     }
 
@@ -556,6 +578,24 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // the model does not name resolves to `None` here exactly as it does in the
         // generated table, which leaves the request on the router's own routing-error path
         // and this service's protocol-correct answer.
+        // A credential the account has WITHDRAWN — a long-term access key whose stored
+        // `Status` it has moved off `Active` — is refused here, before the operation it
+        // named runs: such a key authenticates nothing, so no session is minted and no
+        // identity is reported for it. The rule, the sentence and the refusal are the
+        // tree's one copy ([`::service_common::unusable_credential`]), handed the
+        // account's own answer for the presented key through the identity service's OWN
+        // accessor over the records `iam:CreateAccessKey` / `iam:UpdateAccessKey` wrote
+        // ([`crate::state::iam_state`]) — a READ, so a refused request changes nothing a
+        // later caller sees.
+        if let Some(refusal) =
+            self.unusable_credential
+                .refusal_for(req, &self.protocol, |access_key_id| {
+                    crate::state::iam_state(&*self.engine)
+                        .is_none_or(|iam| iam.lock().access_key_is_usable(access_key_id))
+                })
+        {
+            return Some(refusal);
+        }
         let action = self.protocol.routing_key(req).ok()?;
         self.stated.get(action)
     }
