@@ -21,6 +21,12 @@
 //! Nothing here is written to the store: the token carries its own claims and its own
 //! signature, so what a verifier decides about it comes from the token and the published
 //! key set rather than from a record this service would have to keep.
+//!
+//! The refusal texts below are what the SERVICE answers each error class with. A shape's
+//! `@documentation` is API-reference prose written for a reader of the reference, not the
+//! `message` the wire carries, so none of them is sourced from it: each is the fixed text of
+//! its class, and a part of a message that varies at all comes from the request or from the
+//! store rather than from a description of the shape.
 
 use ::std::time::SystemTime;
 
@@ -124,34 +130,59 @@ pub fn web_identity_token_payload_too_large(claims: &::serde_json::Value) -> boo
     claims.to_string().len() > MAX_WEB_IDENTITY_TOKEN_PAYLOAD_BYTES
 }
 
-/// How AWS words `JWTPayloadSizeExceededException`, as the shape itself states the
-/// condition: the payload is over the maximum, and the member to reduce is the request's
-/// tags. It carries nothing from the request, because what the caller has to change is the
-/// member and not one value of it.
+/// How AWS words `JWTPayloadSizeExceededException` on the wire: the one fixed phrase it
+/// answers an oversized claim set with — not the reference prose the shape is DOCUMENTED
+/// with, and not a rendering of the budget or of the size measured, neither of which it
+/// reports.
 #[must_use]
 pub fn jwt_payload_size_exceeded_message() -> String {
-    "The requested token payload size exceeds the maximum allowed size. Reduce the number \
-     of request tags included in the GetWebIdentityToken API call to reduce the token \
-     payload size."
-        .to_string()
+    "JWT payload exceeds maximum allowed size".to_string()
 }
 
-/// How AWS words `SessionDurationEscalationException`, as that shape states the condition.
+/// How AWS words `SessionDurationEscalationException` on the wire: the one fixed sentence
+/// stating the rule the request broke — the token's expiry has to precede the session's.
+/// Like the two refusals beside it, it is the SERVICE's own text rather than the shape's
+/// documentation, and it interpolates neither of the two instants it compares.
 #[must_use]
 pub fn session_duration_escalation_message() -> String {
-    "The requested token duration would extend the session beyond its original expiration \
-     time. You cannot use this operation to extend the lifetime of a session beyond what \
-     was granted when the session was originally created."
-        .to_string()
+    "Requested token expiry time must be before the original session's expiry time.".to_string()
 }
 
-/// How AWS words `OutboundWebIdentityFederationDisabledException`, as that shape states the
-/// condition: the feature is off for this account, and it has to be turned on first.
+/// How AWS words `OutboundWebIdentityFederationDisabledException`: the one fixed sentence it
+/// answers every request refused for this reason with, naming the feature that is off.
+///
+/// It is the SERVICE's own wording and not the prose the shape is DOCUMENTED with — the two
+/// are different texts, and a client matching, logging or surfacing a refusal reads the
+/// first. The message carries nothing from the request or from state, because the only thing
+/// to report is that the account has the feature off.
 #[must_use]
 pub fn outbound_web_identity_federation_disabled_message() -> String {
-    "The outbound web identity federation feature is not enabled for this account. To use \
-     this feature, you must first enable it through the Amazon Web Services Management \
-     Console or API."
+    "OutboundWebIdentityFederation is disabled.".to_string()
+}
+
+/// Whether `algorithm` is one a web identity token may be signed under: "valid values are
+/// RS256 (RSA with SHA-256) and ES384 (ECDSA using P-384 curve with SHA-384)"
+/// (`GetWebIdentityTokenRequest$SigningAlgorithm`, this service's model) — which is the set
+/// the account's issuer publishes a key for
+/// (`::service_com_amazonaws_iam_awsidentitymanagementv20100508::state::JWT_SIGNING_ALGORITHMS`),
+/// so this operation admits exactly the algorithms a relying party can verify a token under.
+///
+/// The model constrains the member's LENGTH and not its value set, so the set is a rule this
+/// service enforces over the REQUEST itself: it is a property of the request and of nothing
+/// else, which is why it is decided from the value rather than by looking for a key.
+#[must_use]
+pub fn supported_signing_algorithm(algorithm: &str) -> bool {
+    ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state::JWT_SIGNING_ALGORITHMS
+        .contains(&algorithm)
+}
+
+/// How AWS refuses a `SigningAlgorithm` outside that set: one fixed sentence for the error
+/// class, pointing the caller at the operation's own documentation for the algorithms it
+/// admits. It names no request value, so every such refusal reads the same.
+#[must_use]
+pub fn unsupported_signing_algorithm_message() -> String {
+    "Requested SigningAlgorithm is not supported. See the GetWebIdentityToken documentation \
+     for supported algorithms"
         .to_string()
 }
 

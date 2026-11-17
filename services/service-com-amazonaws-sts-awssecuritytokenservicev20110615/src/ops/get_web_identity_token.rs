@@ -244,9 +244,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|session| session.expires_at);
         drop(registry);
 
-        // "The outbound web identity federation feature is not enabled for this account.
-        // To use this feature, you must first enable it" — so with the feature off there is
-        // no issuer to vend against and nothing is signed.
+        // "The cryptographic algorithm to use for signing the JSON Web Token (JWT). Valid
+        // values are RS256 … and ES384" (`GetWebIdentityTokenRequest$SigningAlgorithm`):
+        // the model constrains the member's LENGTH and not its value set, so the set is
+        // enforced here. It is a rule about the REQUEST, so it is decided before anything
+        // the ACCOUNT holds is consulted — a request naming an algorithm this operation
+        // does not sign under is malformed whatever the account has enabled, and is told so
+        // rather than answered with an entitlement refusal it cannot act on.
+        if !token::supported_signing_algorithm(&input.signing_algorithm) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                token::unsupported_signing_algorithm_message(),
+            ));
+        }
+
+        // With the feature off the account has no issuer to vend against, so nothing is
+        // signed; `OutboundWebIdentityFederationDisabledException` reports exactly that.
         let Some((issuer_identifier, signing_key)) = issuer else {
             return Err(
                 GetWebIdentityTokenErrorModeled::OutboundWebIdentityFederationDisabledException(
@@ -258,15 +270,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // "The cryptographic algorithm to use for signing the JSON Web Token (JWT). Valid
-        // values are RS256 … and ES384" (`GetWebIdentityTokenRequest$SigningAlgorithm`):
-        // the model constrains the member's LENGTH and not its value set, so the set is
-        // enforced here — and the key it names is the one the account's issuer publishes
-        // for it, so a token is signed only under an algorithm a verifier can check it
-        // under.
+        // The key the account's issuer publishes for that algorithm, so a token is signed
+        // only under a key a verifier can fetch. The algorithm is one this operation admits
+        // (decided above) and an issuer holds a key per admitted algorithm, so a missing key
+        // is not a fault of the request: it is key material the issuer never managed to
+        // publish, which is this service's own failure and is reported as one rather than as
+        // something the caller could correct.
         let Some(key) = signing_key else {
-            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
-                unsupported_signing_algorithm_message(&input.signing_algorithm),
+            return Err(internal_failure(
+                "the account's web identity issuer publishes no key for the requested \
+                 signing algorithm; no token was issued",
             ));
         };
 
@@ -315,7 +328,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(web_identity_token) = key.signed_compact_jws(&claims) else {
             // The issuer's key could not sign, so there is no token to report: a value
             // whose third segment is not a signature is not a token this issuer vended.
-            return Err(crate::scaffolded::Scaffolded::validation_error(
+            // Nothing about the request asked for this either, so it is reported the same
+            // way as a key the issuer never published.
+            return Err(internal_failure(
                 "the account's web identity issuer could not sign a token; none was issued",
             ));
         };
@@ -329,19 +344,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// How AWS refuses a `SigningAlgorithm` outside the set this operation documents: the
-/// validation clause naming the member, the value as submitted and the values it admits.
+/// How this operation reports a failure of its OWN: key material the account's issuer never
+/// managed to publish, or a key that could not sign.
 ///
-/// The set is the issuer's own published algorithms
-/// (`::service_com_amazonaws_iam_awsidentitymanagementv20100508::state::JWT_SIGNING_ALGORITHMS`),
-/// so the refusal lists exactly the algorithms a token of this account can be signed —
-/// and verified — under.
-fn unsupported_signing_algorithm_message(submitted: &str) -> String {
-    let admitted =
-        ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state::JWT_SIGNING_ALGORITHMS
-            .join(", ");
-    format!(
-        "1 validation error detected: Value '{submitted}' at 'signingAlgorithm' failed to \
-         satisfy constraint: Member must satisfy enum value set: [{admitted}]"
-    )
+/// Neither is anything a caller sent, so neither is a 4xx the caller could act on: AWS
+/// answers a fault of the service with the `InternalFailure` code and HTTP 500, which is
+/// also the class an SDK retry policy may retry — correct here, because a retry of a request
+/// that is itself well formed is exactly what might succeed.
+fn internal_failure(message: &str) -> GetWebIdentityTokenError {
+    crate::scaffolded::Scaffolded::Refused(crate::scaffolded::ServiceRefusal::new(
+        INTERNAL_FAILURE_CODE,
+        INTERNAL_FAILURE_STATUS,
+        message,
+    ))
 }
+
+/// The error code AWS answers a fault of the service itself with, on every protocol.
+const INTERNAL_FAILURE_CODE: &str = "InternalFailure";
+
+/// The status that code carries.
+const INTERNAL_FAILURE_STATUS: u16 = 500;
+

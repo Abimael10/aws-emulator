@@ -14,13 +14,20 @@
 //!   account announced, the way a relying party reaches them, so a token that verifies here
 //!   is one a third party holding only that URL could verify.
 //! * the feature must be ON for the account: with it off — never enabled, or enabled and
-//!   disabled again — the call is `OutboundWebIdentityFederationDisabledException`.
+//!   disabled again — the call is `OutboundWebIdentityFederationDisabledException`, worded
+//!   with the one fixed sentence the service answers that class with, whatever the request
+//!   asked for.
 //! * `SigningAlgorithm` must be one the issuer publishes a key for; any other five-
-//!   character value is refused with the validation clause naming the set.
+//!   character value is the 400 `ValidationError`, decided from the REQUEST before the
+//!   account's entitlement is consulted, and a value outside the member's own `@length` is
+//!   refused at the boundary.
 //! * a token may not outlast the credential that asked for it:
 //!   `SessionDurationEscalationException`.
 //! * the request's tags become custom claims, and a tag set that pushes the claim set past
 //!   the token payload budget is `JWTPayloadSizeExceededException`.
+//!
+//! Every refusal's `Message` is asserted against the fixed text the SERVICE answers that
+//! error class with, which is not the prose its shape is documented with.
 
 use std::time::{Duration, SystemTime};
 
@@ -427,13 +434,71 @@ async fn the_issuer_publishes_its_discovery_document_and_its_key_set() {
     );
 }
 
+/// One row of the refusal table: the case it is about, the audiences, the algorithm, the
+/// duration asked for, and how many tags the request carries.
+type RefusedRequest<'a> = (String, Vec<&'a str>, &'a str, Option<i64>, usize);
+
+/// The one fixed sentence the service answers a federation-disabled refusal with. It names
+/// no value of the request and nothing of the account beyond the feature being off, so every
+/// such refusal reads identically — which is why the table below asserts it over requests
+/// that differ in every member they can.
+const FEDERATION_DISABLED_MESSAGE: &str = "OutboundWebIdentityFederation is disabled.";
+
 /// RULE: the feature has to be ON for the account. With it off — never enabled, or enabled
-/// and disabled again — the call is refused with
-/// `OutboundWebIdentityFederationDisabledException` and nothing is vended.
+/// and disabled again — the call is refused with HTTP 403,
+/// `OutboundWebIdentityFederationDisabledException` and that one fixed sentence, and nothing
+/// is vended.
+///
+/// Rows span both account histories crossed with requests differing in algorithm, audience
+/// count, duration and tag count: none of that reaches the message, which is the point.
 #[tokio::test]
 async fn the_account_must_have_the_feature_enabled() {
-    // One row: the case, and whether the account enabled the feature before disabling it.
-    for (case, enabled_first) in [
+    let ten: Vec<String> = (1..=10)
+        .map(|at| format!("https://relying.party/{at}"))
+        .collect();
+    let ten: Vec<&str> = ten.iter().map(String::as_str).collect();
+
+    // One request row: the case, the audiences, the algorithm, the duration and the number
+    // of tags.
+    let requests: Vec<RefusedRequest<'_>> = SIGNING_ALGORITHMS
+        .iter()
+        .flat_map(|algorithm| {
+            [
+                (
+                    "one audience, no duration, no tags",
+                    vec!["https://relying.party"],
+                    None,
+                    0,
+                ),
+                (
+                    "three audiences, the shortest duration, three tags",
+                    vec!["https://a.example", "https://b.example", "urn:c"],
+                    Some(MIN_DURATION_SECONDS),
+                    3,
+                ),
+                (
+                    "ten audiences, the longest duration, one tag",
+                    ten.clone(),
+                    Some(MAX_DURATION_SECONDS),
+                    1,
+                ),
+            ]
+            .into_iter()
+            .map(move |(case, audiences, duration, tags)| {
+                (
+                    format!("{algorithm}, {case}"),
+                    audiences,
+                    *algorithm,
+                    duration,
+                    tags,
+                )
+            })
+        })
+        .collect();
+
+    // One account row: the case, and whether the account enabled the feature before
+    // disabling it.
+    for (history, enabled_first) in [
         ("an account that never enabled the feature", false),
         ("an account that enabled and disabled it again", true),
     ] {
@@ -442,15 +507,168 @@ async fn the_account_must_have_the_feature_enabled() {
             enable_federation(&router).await;
             disable_federation(&router).await;
         }
-        let params = token_params(&["https://relying.party"], "RS256", None);
+        for (request, audiences, algorithm, duration, tags) in &requests {
+            let case = format!("{history}, {request}");
+            let mut params = token_params(audiences, algorithm, *duration);
+            for at in 1..=*tags {
+                params.push((format!("Tags.member.{at}.Key"), format!("team{at}")));
+                params.push((format!("Tags.member.{at}.Value"), format!("platform{at}")));
+            }
+            let (status, body) = call(&router, LONG_TERM_KEY, ACTION, &borrowed(&params)).await;
+            assert_eq!(
+                (status, element(&body, "Code").as_deref()),
+                (
+                    403,
+                    Some("OutboundWebIdentityFederationDisabledException")
+                ),
+                "case {case:?}: expected the disabled-feature refusal, got {status} {body}"
+            );
+            let message = member(&case, &body, "Message");
+            assert_eq!(
+                message, FEDERATION_DISABLED_MESSAGE,
+                "case {case:?}: expected {FEDERATION_DISABLED_MESSAGE:?}, got {message:?}"
+            );
+            assert!(
+                element(&body, "WebIdentityToken").is_none(),
+                "case {case:?}: a refused call must vend no token: {body}"
+            );
+        }
+    }
+}
+
+/// The one fixed sentence the service answers an unsupported `SigningAlgorithm` with: it
+/// names no request value and points the caller at the operation's own documentation.
+const UNSUPPORTED_ALGORITHM_MESSAGE: &str =
+    "Requested SigningAlgorithm is not supported. See the GetWebIdentityToken documentation \
+     for supported algorithms";
+
+/// RULE: `SigningAlgorithm` is a rule about the REQUEST, so it is decided before the
+/// account's entitlement: a five-character value outside the set the operation signs under
+/// is HTTP 400 `ValidationError` with that one fixed sentence, whatever the account's
+/// outbound web identity federation is set to — while the SAME account answers an admitted
+/// algorithm from its own state (403 with the feature off, a token with it on).
+///
+/// Rows span a value of no algorithm at all, the wrong case of an admitted one, and real
+/// JOSE algorithms this operation does not sign under — each five characters, so the
+/// member's own `@length` admits it and the set is what refuses it — crossed with an account
+/// that never enabled the feature, one that has it on, and one that disabled it again.
+#[tokio::test]
+async fn a_signing_algorithm_outside_the_published_set_is_refused() {
+    // One row: the case, and what the account did with the feature.
+    for (history, enable, disable) in [
+        ("an account that never enabled the feature", false, false),
+        ("an account with the feature on", true, false),
+        ("an account that enabled and disabled it again", true, true),
+    ] {
+        let (router, _engine) = emulator_with_iam();
+        if enable {
+            enable_federation(&router).await;
+        }
+        if disable {
+            disable_federation(&router).await;
+        }
+
+        for algorithm in ["XX256", "rs256", "ES256", "HS256", "RS384"] {
+            let case = format!("{history}, {algorithm}");
+            let params = token_params(&["https://relying.party"], algorithm, None);
+            let (status, body) = call(&router, LONG_TERM_KEY, ACTION, &borrowed(&params)).await;
+            assert_eq!(
+                (status, element(&body, "Code").as_deref()),
+                (400, Some("ValidationError")),
+                "case {case:?}: expected the input refusal, got {status} {body}"
+            );
+            let message = member(&case, &body, "Message");
+            assert_eq!(
+                message, UNSUPPORTED_ALGORITHM_MESSAGE,
+                "case {case:?}: expected {UNSUPPORTED_ALGORITHM_MESSAGE:?}, got {message:?}"
+            );
+            assert!(
+                element(&body, "WebIdentityToken").is_none(),
+                "case {case:?}: a refused call must vend no token: {body}"
+            );
+        }
+
+        // The control: the same account and the same request but for an ADMITTED algorithm,
+        // which is what pins the ordering — the entitlement decides only once the request
+        // itself is valid.
+        for algorithm in SIGNING_ALGORITHMS {
+            let case = format!("{history}, {algorithm} (admitted)");
+            let params = token_params(&["https://relying.party"], algorithm, None);
+            let (status, body) = call(&router, LONG_TERM_KEY, ACTION, &borrowed(&params)).await;
+            if enable && !disable {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: expected a vended token, got {status} {body}"
+                );
+                assert!(
+                    !member(&case, &body, "WebIdentityToken").is_empty(),
+                    "case {case:?}: expected a token, got {body}"
+                );
+            } else {
+                assert_eq!(
+                    (status, element(&body, "Code").as_deref()),
+                    (
+                        403,
+                        Some("OutboundWebIdentityFederationDisabledException")
+                    ),
+                    "case {case:?}: expected the disabled-feature refusal, got {status} {body}"
+                );
+            }
+        }
+    }
+}
+
+/// RULE: `SigningAlgorithm` is `@required` and its target `jwtAlgorithmType` carries
+/// `@length` min 5 / max 5, so a value of any other length — one character under that bound,
+/// one over it, the empty value, or the member left out — is refused at the boundary, with
+/// the constraint clause naming the member and the bound rather than the value-set refusal
+/// the handler words, and vends nothing.
+#[tokio::test]
+async fn a_signing_algorithm_outside_the_modelled_length_is_refused() {
+    let (router, _engine) = emulator_with_iam();
+    enable_federation(&router).await;
+
+    // One row: the value sent (`None` for the member left out) and the clause the refusal
+    // states. The member's length bounds are both 5, so the rows are one short, one long,
+    // the empty value, and no member at all.
+    let rows: [(Option<&str>, &str); 4] = [
+        (
+            Some("RS25"),
+            "1 validation error detected: Value 'RS25' at 'signingAlgorithm' failed to \
+             satisfy constraint: Member must have length greater than or equal to 5",
+        ),
+        (
+            Some("RS2566"),
+            "1 validation error detected: Value 'RS2566' at 'signingAlgorithm' failed to \
+             satisfy constraint: Member must have length less than or equal to 5",
+        ),
+        (
+            Some(""),
+            "1 validation error detected: Value '' at 'signingAlgorithm' failed to satisfy \
+             constraint: Member must have length greater than or equal to 5",
+        ),
+        (
+            None,
+            "1 validation error detected: Value null at 'signingAlgorithm' failed to satisfy \
+             constraint: Member must not be null",
+        ),
+    ];
+
+    for (sent, expected) in rows {
+        let case = sent.unwrap_or("the member left out");
+        let mut params = token_params(&["https://relying.party"], sent.unwrap_or_default(), None);
+        if sent.is_none() {
+            params.retain(|(name, _)| name != "SigningAlgorithm");
+        }
         let (status, body) = call(&router, LONG_TERM_KEY, ACTION, &borrowed(&params)).await;
         assert_eq!(
-            (status, element(&body, "Code").as_deref()),
-            (
-                403,
-                Some("OutboundWebIdentityFederationDisabledException")
-            ),
-            "case {case:?}: expected the disabled-feature refusal, got {status} {body}"
+            status, 400,
+            "case {case:?}: expected a client refusal, got {status} {body}"
+        );
+        let message = member(case, &body, "Message");
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected {expected:?}, got {message:?}"
         );
         assert!(
             element(&body, "WebIdentityToken").is_none(),
@@ -459,42 +677,14 @@ async fn the_account_must_have_the_feature_enabled() {
     }
 }
 
-/// RULE: `SigningAlgorithm` must be one the account's issuer publishes a key for. Any other
-/// five-character value is refused with the validation clause naming the member, the value
-/// as submitted and the set it had to be in.
-///
-/// Rows span a value of no algorithm at all, the wrong case of an admitted one, and a real
-/// JOSE algorithm this issuer publishes no key for — each five characters, so the member's
-/// own `@length` admits it and the set is what refuses it.
-#[tokio::test]
-async fn a_signing_algorithm_outside_the_published_set_is_refused() {
-    let (router, _engine) = emulator_with_iam();
-    enable_federation(&router).await;
+/// The one fixed sentence the service answers a duration-escalation refusal with: the rule
+/// the request broke, with neither of the two instants it compares in it.
+const SESSION_DURATION_ESCALATION_MESSAGE: &str =
+    "Requested token expiry time must be before the original session's expiry time.";
 
-    for case in ["XX256", "rs256", "ES256", "HS256", "RS384"] {
-        let params = token_params(&["https://relying.party"], case, None);
-        let (status, body) = call(&router, LONG_TERM_KEY, ACTION, &borrowed(&params)).await;
-        assert_eq!(
-            (status, element(&body, "Code").as_deref()),
-            (400, Some("InvalidParameterValue")),
-            "case {case:?}: expected the value refusal, got {status} {body}"
-        );
-        let message = member(case, &body, "Message");
-        assert_eq!(
-            message,
-            format!(
-                "1 validation error detected: Value '{case}' at 'signingAlgorithm' failed to \
-                 satisfy constraint: Member must satisfy enum value set: [ES384, RS256]"
-            ),
-            "case {case:?}: unexpected wording: {message}"
-        );
-    }
-}
-
-/// RULE: a token may not outlast the credential that asked for it — "you cannot use this
-/// operation to extend the lifetime of a session beyond what was granted when the session
-/// was originally created" (`SessionDurationEscalationException`). A long-term key has no
-/// such ceiling.
+/// RULE: a token may not outlast the credential that asked for it — the requested expiry has
+/// to precede the calling session's own (`SessionDurationEscalationException`). A long-term
+/// key has no such ceiling.
 ///
 /// Rows span a session with more life left than the token asks for, one with exactly as
 /// much, one with less, and the long-term key.
@@ -538,6 +728,11 @@ async fn a_token_may_not_outlast_the_credential_that_asked_for_it() {
                 Some("SessionDurationEscalationException"),
                 "case {case:?}: expected the escalation refusal, got {body}"
             );
+            let message = member(case, &body, "Message");
+            assert_eq!(
+                message, SESSION_DURATION_ESCALATION_MESSAGE,
+                "case {case:?}: expected {SESSION_DURATION_ESCALATION_MESSAGE:?}, got {message:?}"
+            );
             assert!(
                 element(&body, "WebIdentityToken").is_none(),
                 "case {case:?}: a refused call must vend no token: {body}"
@@ -554,6 +749,10 @@ async fn a_token_may_not_outlast_the_credential_that_asked_for_it() {
 /// One row of the tag table: the case it is about, the `(key, value)` tags the request
 /// carries, and whether the token payload budget refuses them.
 type TagRow = (&'static str, Vec<(String, String)>, bool);
+
+/// The one fixed phrase the service answers an oversized claim set with: it reports neither
+/// the budget nor the size measured.
+const JWT_PAYLOAD_SIZE_EXCEEDED_MESSAGE: &str = "JWT payload exceeds maximum allowed size";
 
 /// RULE: "these tags are added as custom claims to the JWT"
 /// (`GetWebIdentityTokenRequest$Tags`) — each tag becomes a claim of its own key — and a tag
@@ -613,6 +812,11 @@ async fn request_tags_become_claims_until_the_payload_budget_is_passed() {
                 (status, element(&body, "Code").as_deref()),
                 (400, Some("JWTPayloadSizeExceededException")),
                 "case {case:?}: expected the payload-size refusal, got {status} {body}"
+            );
+            let message = member(case, &body, "Message");
+            assert_eq!(
+                message, JWT_PAYLOAD_SIZE_EXCEEDED_MESSAGE,
+                "case {case:?}: expected {JWT_PAYLOAD_SIZE_EXCEEDED_MESSAGE:?}, got {message:?}"
             );
             assert!(
                 element(&body, "WebIdentityToken").is_none(),
