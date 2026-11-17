@@ -15,7 +15,9 @@
 //! sends every later delivery to the new bucket):
 //!
 //! * WHEN — `BufferingHints`, whose `SizeInMBs` and `IntervalInSeconds` decide when a
-//!   buffer is flushed ([`delivery_window`]).
+//!   buffer is flushed ([`delivery_window`]): the interval is the stream's own flush
+//!   cadence, so each turn of it writes every record accepted since the previous turn
+//!   ([`next_flush_at`]).
 //! * WHERE — the bucket of `BucketARN`, under `Prefix` with the automatic
 //!   `YYYY/MM/DD/HH` expansion ("The \"YYYY/MM/DD/HH\" time format prefix is
 //!   automatically used for delivered Amazon S3 files" — `Prefix`), or under the prefix
@@ -868,14 +870,14 @@ fn buffer_limits(hints: Option<&BufferingHints>) -> (usize, Duration) {
     (size, interval)
 }
 
-/// How long after it opened a buffer holding `buffered_bytes` under these hints is held
-/// before its delivery comes due.
+/// The LONGEST a buffer holding `buffered_bytes` under these hints is held before its
+/// delivery comes due, which is the turn of the cadence [`due_at`] lays from it.
 ///
 /// The configured `IntervalInSeconds` is the wait the producer asked for — "buffer incoming
 /// data for the specified period of time, in seconds, before delivering it to the
-/// destination" (`BufferingHints$IntervalInSeconds`) — so that is how long a buffer still
-/// filling is held, and [`DEFAULT_BUFFER_INTERVAL`] is how long one whose configuration
-/// names no interval is. A buffer that has reached `SizeInMBs` is due at
+/// destination" (`BufferingHints$IntervalInSeconds`) — so that is how often the stream's
+/// buffer is flushed ([`next_flush_at`]), and [`DEFAULT_BUFFER_INTERVAL`] is how often one
+/// whose configuration names no interval is. A buffer that has reached `SizeInMBs` is due at
 /// [`FULL_BUFFER_DELIVERY_SPAN`] instead, whichever interval was configured, because the
 /// first of the two conditions satisfied is what flushes a buffer. That span also floors
 /// the window: `IntervalInSeconds` admits 0, and a zero window would hand a caller a
@@ -1386,6 +1388,11 @@ fn stream_icebergs(stream: &DeliveryStream) -> Vec<iceberg::IcebergTarget> {
 /// When this stream's buffer comes due for delivery, or `None` when nothing is owed — an
 /// empty buffer, or a destination with no location, no endpoint and no index to deliver
 /// to.
+///
+/// A buffer that has reached the destination's size threshold is due straight away; every
+/// other one is due at the next turn of the stream's own flush cadence ([`next_flush_at`]),
+/// so what the records it holds wait is what is LEFT of the interval the hints state and
+/// never more than one of them.
 #[must_use]
 pub fn due_at(stream: &DeliveryStream) -> Option<SystemTime> {
     let opened_at = stream.records.first()?.received_at;
@@ -1419,11 +1426,53 @@ pub fn due_at(stream: &DeliveryStream) -> Option<SystemTime> {
                 .map(|iceberg| delivery_window(iceberg.hints.as_ref(), buffered)),
         )
         .min()?;
-    let due = opened_at + window;
+    let due = if window <= FULL_BUFFER_DELIVERY_SPAN {
+        // A buffer that has reached its SIZE threshold is flushed without waiting for the
+        // next turn of the cadence: "whichever condition is satisfied first"
+        // ([`FULL_BUFFER_DELIVERY_SPAN`]).
+        opened_at + window
+    } else {
+        // The next turn of the stream's cadence — and never inside
+        // [`FULL_BUFFER_DELIVERY_SPAN`] of the put that OPENED this buffer, which is the
+        // same floor that span puts under every other window: a buffer that opened just
+        // before a turn rides the one after it rather than handing a caller a delivery its
+        // own put had not yet returned from.
+        next_flush_at(stream.create_timestamp, window, opened_at)
+            .max(opened_at + FULL_BUFFER_DELIVERY_SPAN)
+    };
     Some(match stream.delivery_retry_at {
         Some(retry_at) if retry_at > due => retry_at,
         _ => due,
     })
+}
+
+/// The turn of the stream's buffering cadence that flushes a buffer which became non-empty
+/// at `opened_at`: the first instant on the `cycle` grid laid from `anchor` that is strictly
+/// later than it.
+///
+/// `IntervalInSeconds` is how long data is buffered BEFORE it is delivered ("buffer incoming
+/// data for the specified period of time, in seconds, before delivering it to the
+/// destination" — `BufferingHints$IntervalInSeconds`), and "Firehose buffers data up to 5 MB
+/// or for 5 minutes, whichever condition is satisfied first" (`CreateDeliveryStream`) states
+/// it as an UPPER bound on that wait rather than a delay each record is held for: the
+/// interval belongs to the STREAM's flush cadence, which turns that often for as long as the
+/// stream exists, and each turn writes every record accepted since the previous one. So a
+/// record that arrives while the buffer is already filling rides the flush that buffer is
+/// already waiting for — it waits what is LEFT of the interval, never a second one — and the
+/// longest any record waits is one whole interval, which is the bound the hint states.
+///
+/// Anchoring that cadence to the stream rather than to an arrival is what makes the wait a
+/// property of the stream: the phase of the grid is the stream's own, so a producer putting
+/// records at a steady spacing does not keep re-arming a timer with its own puts and thereby
+/// hold every record for the same, maximal, share of the interval.
+fn next_flush_at(anchor: SystemTime, cycle: Duration, opened_at: SystemTime) -> SystemTime {
+    let cycle_nanos = cycle.as_nanos().max(1);
+    let elapsed = opened_at
+        .duration_since(anchor)
+        .unwrap_or_default()
+        .as_nanos();
+    let offset = (elapsed / cycle_nanos + 1).saturating_mul(cycle_nanos);
+    anchor + Duration::from_nanos(u64::try_from(offset).unwrap_or(u64::MAX))
 }
 
 /// The earliest instant this store owes a delivery at, if any.
@@ -2060,6 +2109,14 @@ fn common_attributes_header(attributes: &[(String, String)]) -> String {
 
 /// The authority of `url`, which the request names as its `Host`, or `None` when the value
 /// carries none.
+///
+/// A HEADER value and nothing else. The request this names the `Host` of is handed to the
+/// emulator's own in-process connector ([`DeliveryHop::transport`], which
+/// [`DeliveryHop::through`] takes from `OperationContext::callback`) and to nothing else, so
+/// this authority is never resolved, never connected to and never dialled: the only
+/// destinations a delivery can reach are the ones this process serves itself
+/// ([`post_to_endpoint`]). The value it is read out of is a `HttpEndpointUrl`, admitted by
+/// that member's own modelled pattern (`^https://`).
 fn authority_of(url: &str) -> Option<String> {
     let uri: ::http::Uri = url.parse().ok()?;
     uri.authority().map(::std::string::ToString::to_string)
@@ -4179,11 +4236,81 @@ fn next_due_or_poll(
 
 #[cfg(test)]
 mod tests {
-    //! The text accounting a client-supplied `MetadataExtractionQuery` has to pass before
-    //! any engine sees it: what [`admissible_program`] admits, and what it refuses so that
-    //! the memory and step bound that function documents actually holds.
+    //! Two things decided without a destination to deliver to: WHEN a buffer is flushed
+    //! ([`next_flush_at`]), and the text accounting a client-supplied
+    //! `MetadataExtractionQuery` has to pass before any engine sees it — what
+    //! [`admissible_program`] admits, and what it refuses so that the memory and step bound
+    //! that function documents actually holds.
 
-    use super::{admissible_program, MAX_PROGRAM_CONSTRUCTIONS, MAX_PROGRAM_ITERATIONS};
+    use std::time::{Duration, SystemTime};
+
+    use super::{
+        admissible_program, next_flush_at, MAX_PROGRAM_CONSTRUCTIONS, MAX_PROGRAM_ITERATIONS,
+    };
+
+    /// RULE: the interval is the STREAM's flush cadence rather than a delay each record is
+    /// held for, so a buffer is flushed at the first turn of that cadence after it became
+    /// non-empty — and two buffers that opened in the same turn come due together, which is
+    /// what lets a record that arrived while the interval was running ride the flush that
+    /// buffer is already waiting for.
+    #[test]
+    fn a_buffer_is_due_at_the_next_turn_of_the_streams_cadence() {
+        let anchor = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let cycle = Duration::from_secs(60);
+        // (case, when the buffer became non-empty, after the anchor, and when its flush is
+        // owed, also after the anchor — in milliseconds, so a sub-second arrival is a row)
+        let rows: [(&str, i64, u64); 8] = [
+            ("a buffer that opened at the anchor", 0, 60_000),
+            ("a buffer that opened a millisecond into the cycle", 1, 60_000),
+            ("a buffer that opened halfway through the cycle", 30_000, 60_000),
+            ("a buffer that opened a millisecond before the turn", 59_999, 60_000),
+            ("a buffer that opened exactly on a turn", 60_000, 120_000),
+            ("a buffer that opened in the third cycle", 125_000, 180_000),
+            ("a buffer that opened long after the anchor", 3_601_000, 3_660_000),
+            // A record cannot land before the stream that took it was created; a clock that
+            // nevertheless reads one that way is owed the cadence's first turn.
+            ("a buffer that opened before the anchor", -5_000, 60_000),
+        ];
+
+        for (case, opened_after, due_after) in rows {
+            let opened_at = if opened_after < 0 {
+                anchor - Duration::from_millis(opened_after.unsigned_abs())
+            } else {
+                anchor + Duration::from_millis(opened_after.unsigned_abs())
+            };
+            let due = next_flush_at(anchor, cycle, opened_at);
+            let expected = anchor + Duration::from_millis(due_after);
+            assert_eq!(
+                due, expected,
+                "case {case:?}: expected the flush {due_after} ms after the anchor, got \
+                 {:?} after it",
+                due.duration_since(anchor)
+            );
+        }
+
+        // The cadence is the stream's, so every buffer that opens inside one turn is owed
+        // the SAME flush however long after the previous one it arrived.
+        let together: Vec<SystemTime> = [1_u64, 100, 30_000, 59_000]
+            .into_iter()
+            .map(|after| next_flush_at(anchor, cycle, anchor + Duration::from_millis(after)))
+            .collect();
+        assert!(
+            together.iter().all(|due| *due == together[0]),
+            "case \"four arrivals inside one turn\": expected one flush instant for all of \
+             them, got {together:?}"
+        );
+
+        // And a cadence of a quarter of a second — what a destination asking for no
+        // buffering at all is held for — turns on its own grid just the same.
+        let quarter = Duration::from_millis(250);
+        let due = next_flush_at(anchor, quarter, anchor + Duration::from_millis(1_100));
+        assert_eq!(
+            due,
+            anchor + Duration::from_millis(1_250),
+            "case \"a quarter-second cadence\": expected the turn at 1,250 ms, got {:?}",
+            due.duration_since(anchor)
+        );
+    }
 
     #[test]
     fn a_program_that_reads_a_partition_key_out_of_a_record_is_admitted() {
