@@ -16,6 +16,8 @@
 //!   reads itself;
 //! * the status reported is the one the query has already reached on the clock, and only a
 //!   query that has started has results;
+//! * every aggregate the `stats` command documents is computed over the group's own values,
+//!   and a group of records carrying NO value for the grouping field reports no value for it;
 //! * `maxItems` pages the results and the `nextToken` of one query's results continues that
 //!   query's enumeration and no other;
 //! * a `queryId` this account holds no query under is refused as an incorrectly specified
@@ -171,6 +173,10 @@ type StatisticsCase<'a> = (&'a str, (i64, i64), &'a str, f64, f64);
 /// One case of the query-language table: what the case is, the language, the request that
 /// starts it, and the rows it must produce.
 type LanguageCase<'a> = (&'a str, &'a str, Value, Vec<Vec<(&'a str, &'a str)>>);
+
+/// One case of the PPL source table: what the case is, the query string it starts, the groups
+/// it must report as `(service, count, total)`, and how many records its `where` keeps.
+type SourceCase<'a> = (&'a str, String, Vec<(&'a str, &'a str, &'a str)>, f64);
 
 /// Each pipeline command produces the rows it computes from the stored events.
 #[tokio::test]
@@ -1184,5 +1190,462 @@ async fn an_unheld_query_id_is_refused_as_an_incorrectly_specified_parameter() {
             query_results_invalid_query_id_message(&query_id),
             "case {case:?}: the refusal names the id that was rejected, got {message:?}"
         );
+    }
+}
+
+/// How long a case below waits, in all, for a started query to reach a terminal status: a
+/// deadline generous enough for a loaded host, reached by POLLING the query rather than by
+/// sleeping for a span the test guessed.
+const TERMINAL_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How long such a poll waits before asking again.
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// Start `request` and poll its results until the query reports `Complete`, which is the
+/// condition these cases wait for — never a span of the host's clock.
+async fn completed_by_polling(logs: &Logs, case: &str, request: &Value) -> Value {
+    let id = start(logs, request).await;
+    let deadline = std::time::Instant::now() + TERMINAL_DEADLINE;
+    loop {
+        let answer = logs.ok(RESULTS, &json!({"queryId": id})).await;
+        let status = answer["status"].as_str().unwrap_or_default().to_string();
+        if status == QUERY_STATUS_COMPLETE {
+            return answer;
+        }
+        assert!(
+            status != QUERY_STATUS_FAILED
+                && status != QUERY_STATUS_CANCELLED
+                && std::time::Instant::now() < deadline,
+            "case {case:?}: the query must complete, got status {status:?} with {answer}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// The log group the aggregate cases read.
+const AGGREGATE_GROUP: &str = "/insights/results-aggregates";
+
+/// The events those cases aggregate, as `(offset from the base instant, message)` pairs:
+/// three events of one service, two of another, and one that names NO service — which is what
+/// makes the group of records carrying no value for the grouping key a case of its own.
+const AGGREGATE_EVENTS: [(i64, &str); 6] = [
+    (1_000, r#"{"svc":"api","ms":10,"user":"u1"}"#),
+    (2_000, r#"{"svc":"api","ms":20,"user":"u2"}"#),
+    (3_000, r#"{"svc":"api","ms":30,"user":"u1"}"#),
+    (4_000, r#"{"svc":"db","ms":100,"user":"u3"}"#),
+    (5_000, r#"{"svc":"db","ms":300,"user":"u3"}"#),
+    (6_000, r#"{"ms":5,"user":"u4"}"#),
+];
+
+/// A log group holding `events`, and the window a query of it is started with in the epoch
+/// SECONDS `StartQuery` documents for its range.
+async fn group_holding(logs: &Logs, group: &str, stream: &str, events: &[(i64, &str)]) -> (i64, i64) {
+    logs.ok("CreateLogGroup", &json!({"logGroupName": group}))
+        .await;
+    logs.ok(
+        "CreateLogStream",
+        &json!({"logGroupName": group, "logStreamName": stream}),
+    )
+    .await;
+    // Aligned on a whole second, because a query's window is stated in whole SECONDS.
+    let base = base_ms() / 1_000 * 1_000;
+    let stamped: Vec<(i64, &str)> = events
+        .iter()
+        .map(|(offset, message)| (base + offset, *message))
+        .collect();
+    logs.ok(
+        "PutLogEvents",
+        &json!({
+            "logGroupName": group,
+            "logStreamName": stream,
+            "logEvents": batch(&stamped),
+        }),
+    )
+    .await;
+    (base / 1_000 - 60, now_ms() / 1_000 + 60)
+}
+
+/// RULE: every aggregate the `stats` command documents is COMPUTED over the group's values,
+/// so a query naming several of them completes and reports one row per group.
+///
+/// The aggregates are the ones the query language lists for a `stats` command — `count`,
+/// `count_distinct`, `sum`, `avg`, `min`, `max`, `pct` (`stddev` has a case of its own, since
+/// its value is not a whole number) — and each expected value below is hand-computed from
+/// [`AGGREGATE_EVENTS`].
+#[tokio::test]
+async fn every_documented_stats_aggregate_is_computed_over_the_group() {
+    let logs = Logs::new();
+    let window = group_holding(&logs, AGGREGATE_GROUP, STREAM, &AGGREGATE_EVENTS).await;
+    let case = "one stats command naming seven aggregates, grouped by a discovered field";
+    let answer = completed_by_polling(
+        &logs,
+        case,
+        &json!({
+            "logGroupName": AGGREGATE_GROUP,
+            "startTime": window.0,
+            "endTime": window.1,
+            "queryString":
+                "stats count(*) as n, sum(ms) as total, avg(ms) as mean, min(ms) as fastest, \
+                 max(ms) as slowest, count_distinct(user) as users, pct(ms, 50) as p50 by svc \
+                 | sort svc asc",
+        }),
+    )
+    .await;
+    let produced = rows(&answer);
+
+    // One row per group, the group carrying no `svc` last: a sort places a value the record
+    // does not carry after every value it does.
+    let expected: [(&str, Vec<(&str, &str)>); 3] = [
+        (
+            "the three events of api",
+            vec![
+                ("svc", "api"),
+                ("n", "3"),
+                ("total", "60"),
+                ("mean", "20"),
+                ("fastest", "10"),
+                ("slowest", "30"),
+                ("users", "2"),
+                ("p50", "20"),
+            ],
+        ),
+        (
+            "the two events of db",
+            vec![
+                ("svc", "db"),
+                ("n", "2"),
+                ("total", "400"),
+                ("mean", "200"),
+                ("fastest", "100"),
+                ("slowest", "300"),
+                ("users", "1"),
+                ("p50", "100"),
+            ],
+        ),
+        (
+            "the event naming no service",
+            vec![
+                ("n", "1"),
+                ("total", "5"),
+                ("mean", "5"),
+                ("fastest", "5"),
+                ("slowest", "5"),
+                ("users", "1"),
+                ("p50", "5"),
+            ],
+        ),
+    ];
+    assert_eq!(
+        produced.len(),
+        expected.len(),
+        "case {case:?}: expected {} groups, got {produced:?}",
+        expected.len()
+    );
+    for (index, (group, pairs)) in expected.iter().enumerate() {
+        let row = &produced[index];
+        for (field, wanted) in pairs {
+            assert_eq!(
+                &value(row, field),
+                wanted,
+                "case {group:?}: the row must carry {field}={wanted}, got {row:?}"
+            );
+        }
+    }
+}
+
+/// RULE: a group of records that carry NO value for the grouping field reports no value for
+/// it — the key member is absent from that row — so "the field is missing" is told apart from
+/// "the field is present and empty".
+#[tokio::test]
+async fn a_group_with_no_value_for_the_key_omits_the_key_from_its_row() {
+    let logs = Logs::new();
+    const GROUP_KEYS: &str = "/insights/results-group-keys";
+    // One event carrying a value, one carrying EMPTY text under the same field, and one
+    // carrying the field not at all: the three cases the rule has to tell apart.
+    let events: [(i64, &str); 3] = [
+        (1_000, r#"{"svc":"api","ms":1}"#),
+        (2_000, r#"{"svc":"","ms":2}"#),
+        (3_000, r#"{"ms":3}"#),
+    ];
+    let window = group_holding(&logs, GROUP_KEYS, STREAM, &events).await;
+    let case = "a stats grouped by a field one event does not carry";
+    let answer = completed_by_polling(
+        &logs,
+        case,
+        &json!({
+            "logGroupName": GROUP_KEYS,
+            "startTime": window.0,
+            "endTime": window.1,
+            "queryString": "stats count(*) as n, sum(ms) as total by svc",
+        }),
+    )
+    .await;
+    let produced = rows(&answer);
+    assert_eq!(
+        produced.len(),
+        3,
+        "case {case:?}: the three events form three groups — a value, empty text and no value \
+         at all, got {produced:?}"
+    );
+
+    // The group of the records with no value for the key: exactly one row carries no `svc`
+    // member, and it is the one the keyless event formed.
+    let keyless: Vec<&BTreeMap<String, String>> = produced
+        .iter()
+        .filter(|row| !row.contains_key("svc"))
+        .collect();
+    assert_eq!(
+        keyless.len(),
+        1,
+        "case {case:?}: one group holds the records with no value for the key, got {produced:?}"
+    );
+    assert_eq!(
+        (value(keyless[0], "n"), value(keyless[0], "total")),
+        ("1".to_string(), "3".to_string()),
+        "case {case:?}: that group holds the one event carrying no svc, got {:?}",
+        keyless[0]
+    );
+
+    // The record carrying EMPTY text under the field is a group of its own, keyed by that
+    // empty text — which is why the keyless group may not report one.
+    let empty: Vec<&BTreeMap<String, String>> = produced
+        .iter()
+        .filter(|row| row.get("svc").is_some_and(String::is_empty))
+        .collect();
+    assert_eq!(
+        empty.len(),
+        1,
+        "case {case:?}: the event whose svc is empty text keeps a group of its own, got \
+         {produced:?}"
+    );
+    assert_eq!(
+        value(empty[0], "total"),
+        "2",
+        "case {case:?}: that group holds the event whose svc is empty, got {:?}",
+        empty[0]
+    );
+}
+
+/// RULE: a percentile answers the value standing at the RANK its call names among the group's
+/// ordered values, by nearest rank.
+///
+/// The rank is a PERCENT — `pct(fieldName, value)` as the query language's aggregation
+/// functions list writes it — so 0 and 100 are the bounds it is named between; a rank past the
+/// maximum names no value beyond the greatest one the group holds.
+#[tokio::test]
+async fn a_percentile_answers_the_value_standing_at_the_rank_it_names() {
+    let logs = Logs::new();
+    const PERCENTILE_GROUP: &str = "/insights/results-percentile";
+    // Four distinct values, so each rank below picks a different one of them.
+    let events: [(i64, &str); 4] = [
+        (1_000, r#"{"ms":10}"#),
+        (2_000, r#"{"ms":20}"#),
+        (3_000, r#"{"ms":30}"#),
+        (4_000, r#"{"ms":40}"#),
+    ];
+    let window = group_holding(&logs, PERCENTILE_GROUP, STREAM, &events).await;
+
+    // (the rank the call names, the value standing at it among 10, 20, 30, 40)
+    let cases: [(&str, &str); 6] = [
+        ("0", "10"),
+        ("25", "10"),
+        ("50", "20"),
+        ("75", "30"),
+        ("100", "40"),
+        ("101", "40"),
+    ];
+    for (rank, wanted) in cases {
+        let case = format!("the value at rank {rank}");
+        let answer = completed_by_polling(
+            &logs,
+            &case,
+            &json!({
+                "logGroupName": PERCENTILE_GROUP,
+                "startTime": window.0,
+                "endTime": window.1,
+                "queryString": format!("stats pct(ms, {rank}) as at"),
+            }),
+        )
+        .await;
+        let produced = rows(&answer);
+        assert_eq!(
+            produced.len(),
+            1,
+            "case {case:?}: a stats naming no grouping reports exactly one row, got {produced:?}"
+        );
+        assert_eq!(
+            value(&produced[0], "at"),
+            wanted,
+            "case {case:?}: expected {wanted}, got {:?}",
+            produced[0]
+        );
+    }
+}
+
+/// RULE: the spread an aggregate reports is computed from the group's own values — the
+/// `stddev` the aggregation-functions list names.
+#[tokio::test]
+async fn the_spread_of_a_groups_values_is_computed_over_the_group() {
+    let logs = Logs::new();
+    const SPREAD_GROUP: &str = "/insights/results-spread";
+    let window = group_holding(&logs, SPREAD_GROUP, STREAM, &AGGREGATE_EVENTS).await;
+    let case = "the spread of each service's durations";
+    let answer = completed_by_polling(
+        &logs,
+        case,
+        &json!({
+            "logGroupName": SPREAD_GROUP,
+            "startTime": window.0,
+            "endTime": window.1,
+            "queryString": "stats stddev(ms) as spread by svc | sort svc asc",
+        }),
+    )
+    .await;
+    let produced = rows(&answer);
+
+    // Hand-computed from [`AGGREGATE_EVENTS`]: api holds 10, 20 and 30 around a mean of 20,
+    // db holds 100 and 300 around a mean of 200, and the keyless group holds one value, which
+    // is no distance from its own mean.
+    let expected: [(&str, f64); 3] = [
+        ("api", (200.0f64 / 3.0).sqrt()),
+        ("db", 100.0),
+        ("the group naming no service", 0.0),
+    ];
+    assert_eq!(
+        produced.len(),
+        expected.len(),
+        "case {case:?}: expected {} groups, got {produced:?}",
+        expected.len()
+    );
+    for (index, (group, wanted)) in expected.iter().enumerate() {
+        let said = value(&produced[index], "spread");
+        let actual = said.parse::<f64>().unwrap_or_else(|_| {
+            panic!("case {group:?}: the spread is reported as a number, got {said:?}")
+        });
+        assert!(
+            (actual - wanted).abs() < 1e-9,
+            "case {group:?}: expected a spread of {wanted}, got {actual}"
+        );
+    }
+}
+
+/// RULE: a PPL pipeline's `source` selector names the log groups the query reads however the
+/// query string QUOTES it, and a back-quoted identifier resolves the field it names — so the
+/// query scans the events of the groups it selects and reports what its `where` kept.
+#[tokio::test]
+async fn a_ppl_pipeline_reads_the_log_groups_its_quoted_selector_names() {
+    let logs = Logs::new();
+    const PPL_GROUP: &str = "/insights/results-ppl-source";
+    // Two streams, so a `where` on the generated `@logStream` field selects part of the
+    // window; the hyphenated key is what a back-quoted identifier has to resolve.
+    let first: [(i64, &str); 4] = [
+        (1_000, r#"{"svc":"api","ms":10,"status-code":500}"#),
+        (2_000, r#"{"svc":"api","ms":20,"status-code":500}"#),
+        (3_000, r#"{"svc":"db","ms":100,"status-code":500}"#),
+        (4_000, r#"{"svc":"api","ms":30,"status-code":200}"#),
+    ];
+    let window = group_holding(&logs, PPL_GROUP, "a", &first).await;
+    let base = base_ms() / 1_000 * 1_000;
+    logs.ok(
+        "CreateLogStream",
+        &json!({"logGroupName": PPL_GROUP, "logStreamName": "b"}),
+    )
+    .await;
+    logs.ok(
+        "PutLogEvents",
+        &json!({
+            "logGroupName": PPL_GROUP,
+            "logStreamName": "b",
+            "logEvents": batch(&[
+                (base + 5_000, r#"{"svc":"api","ms":40,"status-code":500}"#),
+                (base + 6_000, r#"{"svc":"db","ms":50,"status-code":500}"#),
+            ]),
+        }),
+    )
+    .await;
+    // Every event of the window is scanned whatever the pipeline selects.
+    let scanned = (first.len() + 2) as f64;
+
+    // (case, the query string, the rows it must produce keyed by service, the events its
+    // `where` keeps) — the rows differ along how the selector is QUOTED and whether the
+    // hyphenated key is written as a field reference at all.
+    let selector = format!("logGroups(logGroupIdentifier: ['{PPL_GROUP}'])");
+    let kept: Vec<(&str, &str, &str)> = vec![("api", "2", "30"), ("db", "1", "100")];
+    let cases: Vec<SourceCase<'_>> = vec![
+        (
+            "a back-quoted source selector and back-quoted field references",
+            format!(
+                "source = `{selector}` | where `@logStream` = 'a' and `status-code` = 500 \
+                 | stats count() as n, sum(ms) as total by svc"
+            ),
+            kept.clone(),
+            3.0,
+        ),
+        (
+            "the same selector written unquoted",
+            format!(
+                "source = {selector} | where `@logStream` = 'a' and `status-code` = 500 \
+                 | stats count() as n, sum(ms) as total by svc"
+            ),
+            kept.clone(),
+            3.0,
+        ),
+        (
+            // Without the back quotes the hyphenated name is no field reference at all, so
+            // the condition it stands in selects nothing.
+            "the hyphenated key written without back quotes",
+            format!(
+                "source = `{selector}` | where `@logStream` = 'a' and status-code = 500 \
+                 | stats count() as n, sum(ms) as total by svc"
+            ),
+            Vec::new(),
+            0.0,
+        ),
+    ];
+
+    for (case, query_string, wanted, matched) in cases {
+        let answer = completed_by_polling(
+            &logs,
+            case,
+            // The query names the log groups it reads itself, so the request names none.
+            &json!({
+                "queryLanguage": "PPL",
+                "startTime": window.0,
+                "endTime": window.1,
+                "queryString": query_string,
+            }),
+        )
+        .await;
+        assert_eq!(
+            answer["statistics"]["recordsScanned"].as_f64(),
+            Some(scanned),
+            "case {case:?}: every event of the window is scanned, got {answer}"
+        );
+        assert_eq!(
+            answer["statistics"]["recordsMatched"].as_f64(),
+            Some(matched),
+            "case {case:?}: expected {matched} records matched, got {answer}"
+        );
+        let produced = rows(&answer);
+        assert_eq!(
+            produced.len(),
+            wanted.len(),
+            "case {case:?}: expected {} groups, got {produced:?}",
+            wanted.len()
+        );
+        for (service, count, total) in wanted {
+            let row = produced
+                .iter()
+                .find(|row| value(row, "svc") == service)
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: expected a group for {service}, got {produced:?}")
+                });
+            assert_eq!(
+                (value(row, "n"), value(row, "total")),
+                (count.to_string(), total.to_string()),
+                "case {case:?}: the {service} group must carry n={count} and total={total}, got \
+                 {row:?}"
+            );
+        }
     }
 }

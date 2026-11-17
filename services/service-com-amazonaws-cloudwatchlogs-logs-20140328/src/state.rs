@@ -3577,7 +3577,7 @@ pub fn resource_not_found_message(resource_kind: &str) -> String {
 /// named by `queryId`: the service states the id it was handed rather than the resource kind,
 /// and calls it INVALID rather than absent — a caller holding several ids learns which one was
 /// rejected, and keeps the distinction the service draws between an id it cannot place and a
-/// query that is simply no longer running ([`query_not_running_message`]).
+/// query that is simply no longer running ([`query_already_ended_refusal`]).
 ///
 /// The only variable part is the `queryId` the request carried, taken from it verbatim.
 ///

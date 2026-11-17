@@ -497,14 +497,21 @@ pub fn query_not_found_message(query_id: &str) -> String {
     format!("Query with id [{query_id}] is not a completed or cancelled query.")
 }
 
-/// The refusal `StopQuery` answers for a query that has already ended: it "stops a CloudWatch
-/// Logs Insights query that is in progress", and "if the query has already ended, the
-/// operation returns an error indicating that the specified query is not running". The
-/// message is built from the request, in the same `Query with id [..]` form every refusal of
-/// this service that names a query by its id takes, so a caller stopping queries in a loop
-/// can attribute the refusal to one id.
-pub fn query_not_running_message(query_id: &str) -> String {
-    format!("Query with id [{query_id}] is not running.")
+/// The refusal `StopQuery` answers for a query that has already ENDED: it "stops a CloudWatch
+/// Logs Insights query that is in progress", and "if the query has already ended, the operation
+/// returns an error indicating that the specified query is not running".
+///
+/// The fixed text states that the query ended, and the variable part is the TERMINAL STATUS it
+/// ended in — read from this service's own state, one of the `QueryStatus` values a query
+/// reaches — so a caller learns which outcome the query it asked to stop had already reached.
+/// It is stated inside the SDK envelope every refusal of this service carries
+/// ([`super::with_sdk_error_envelope`]), so the status and the code written in the text are the
+/// ones the response answers with.
+pub fn query_already_ended_refusal(status: &str) -> String {
+    super::with_sdk_error_envelope(
+        &format!("Query is already ended with {status}"),
+        super::ENVELOPE_INVALID_PARAMETER,
+    )
 }
 
 /// What a lookup table's CSV body describes: the column names of its header row and how

@@ -5,9 +5,11 @@
 //!
 //! The rule under test: an ephemeral field a stage defines — the captures of a `parse`, the
 //! columns a `lookup` joins — is a field of the records that stage produces, so the rows the
-//! query answers carry it beside the columns the result already carried; and a stage that
-//! CHOOSES the columns (`fields`, `display`, an aggregation) decides them for everything after
-//! it, so a projection placed after such a stage narrows the result to what it names.
+//! query answers carry it; the default columns `@timestamp` and `@message` are what a pipeline
+//! producing NONE OF ITS OWN carries, so the first stage to produce columns replaces them and a
+//! later one adds to what the pipeline has already chosen. A stage that CHOOSES the columns
+//! (`fields`, `display`, an aggregation) decides them for everything after it, so a projection
+//! placed after such a stage narrows the result to what it names.
 //!
 //! The table spans what the rule generalises over: which form the `parse` takes (a glob naming
 //! several fields, a named capture group), whether the pipeline projected columns before the
@@ -143,9 +145,15 @@ fn rows(case: &str, answer: &Value) -> Vec<BTreeMap<String, String>> {
         .collect()
 }
 
-/// One row of the table: what the case is, the query string it starts, and the `(field, value)`
-/// pairs every row of its result must carry, in row order.
-type Case = (&'static str, String, Vec<Vec<(&'static str, &'static str)>>);
+/// One row of the table: what the case is, the query string it starts, the `(field, value)`
+/// pairs every row of its result must carry, in row order, and the columns those rows must NOT
+/// carry at all.
+type Case = (
+    &'static str,
+    String,
+    Vec<Vec<(&'static str, &'static str)>>,
+    Vec<&'static str>,
+);
 
 /// RULE: the fields a pipeline DEFINES are reported in its rows.
 #[tokio::test]
@@ -162,17 +170,23 @@ async fn the_fields_a_pipeline_defines_are_reported_in_its_rows() {
                 vec![("svc", "alpha"), ("lat", "100"), ("st", "ok owner=u1")],
                 vec![("svc", "beta"), ("lat", "200"), ("st", "ok owner=u2")],
             ],
+            // The pipeline produced its own columns, so the default projection it never asked
+            // for is not reported beside them.
+            vec!["@timestamp", "@message"],
         ),
         (
             "a named capture group, with no projection at all",
             r"parse @message /lat=(?<latency>\d+)/ | sort @timestamp asc".to_string(),
             vec![vec![("latency", "100")], vec![("latency", "200")]],
+            vec!["@timestamp", "@message"],
         ),
         (
             "a projection BEFORE the defining stage, which the parse adds to",
             r#"fields @timestamp, @message | parse @message "svc=* lat=*" as svc, lat | sort @timestamp asc"#
                 .to_string(),
             vec![vec![("svc", "alpha"), ("lat", "100 status=ok owner=u1")]],
+            // The pipeline chose these columns itself, so they are reported.
+            Vec::new(),
         ),
         (
             "a lookup joining a column onto each record",
@@ -180,10 +194,11 @@ async fn the_fields_a_pipeline_defines_are_reported_in_its_rows() {
                 r#"parse @message "svc=* lat=* status=* owner=*" as svc, lat, st, owner | lookup {TABLE} owner OUTPUT team | sort @timestamp asc"#
             ),
             vec![vec![("team", "alpha-team")], vec![("team", "beta-team")]],
+            vec!["@timestamp", "@message"],
         ),
     ];
 
-    for (case, query_string, expected) in &cases {
+    for (case, query_string, expected, absent) in &cases {
         let produced = completed_rows(&logs, case, window, query_string).await;
         for (index, wanted) in expected.iter().enumerate() {
             let row = produced
@@ -196,14 +211,18 @@ async fn the_fields_a_pipeline_defines_are_reported_in_its_rows() {
                     "case {case:?}: row {index} must carry {field}={value}, got {row:?}"
                 );
             }
-            // The default columns and the row's pointer are still there: a defined field is
-            // reported BESIDE what the result already carried.
-            for carried in ["@timestamp", "@message", "@ptr"] {
+            // The columns the pipeline did not produce are not reported at all.
+            for dropped in absent {
                 assert!(
-                    row.contains_key(carried),
-                    "case {case:?}: row {index} still carries {carried}, got {row:?}"
+                    !row.contains_key(*dropped),
+                    "case {case:?}: row {index} must carry nothing for {dropped}, got {row:?}"
                 );
             }
+            // Every row of log records identifies the record it came from.
+            assert!(
+                row.contains_key("@ptr"),
+                "case {case:?}: row {index} still carries @ptr, got {row:?}"
+            );
         }
     }
 }

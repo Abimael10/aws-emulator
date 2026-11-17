@@ -9,8 +9,10 @@
 //!   whichever non-terminal status it is in — and then reports `success` true, leaves the
 //!   query `Cancelled`, and cancels the completion the clock still owed it, so the query
 //!   never reports a terminal status it did not reach;
-//! * a stop naming a query that has already ended, in any terminal status, is refused
-//!   `InvalidParameterException` and leaves that query's outcome exactly as it was;
+//! * a stop naming a query that has ENDED — reached an outcome of its own — is refused
+//!   `InvalidParameterException`, naming the terminal status it ended in, and leaves that
+//!   query's outcome exactly as it was; a stop naming a query that is already `Cancelled` asks
+//!   for the state the query is already in, so it succeeds and changes nothing;
 //! * a stop naming an id this account holds no query under is refused
 //!   `ResourceNotFoundException`, for every id the member admits.
 //!
@@ -101,6 +103,30 @@ async fn reported_status(logs: &Logs, id: &str) -> String {
         .to_string()
 }
 
+/// How long a case waits, in all, for a query to reach the status the clock owes it: a
+/// deadline generous enough for a loaded host, reached by looking at the reported status again
+/// until it holds rather than by sleeping for a span the test guessed.
+const STATUS_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How long such a poll waits before looking again.
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// Wait until `DescribeQueries` reports `wanted` for the query carrying `id`.
+async fn await_status(logs: &Logs, id: &str, wanted: &str) {
+    let deadline = std::time::Instant::now() + STATUS_DEADLINE;
+    loop {
+        let status = reported_status(logs, id).await;
+        if status == wanted {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case the query {id}: expected it to reach {wanted}, got {status}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
 /// A stop succeeds exactly when the query is still in progress, and the query it stopped is
 /// `Cancelled` from then on.
 #[tokio::test]
@@ -184,8 +210,9 @@ async fn a_stop_succeeds_while_the_query_is_in_progress_and_leaves_it_cancelled(
     }
 }
 
-/// A stop of a query that has already ended is refused, and the ended query keeps the outcome
-/// it reached.
+/// A stop of a query that has ENDED is refused, naming the terminal status it reached; a stop
+/// of a query that is already `Cancelled` asks for the state that query is in, so it succeeds
+/// and leaves it there. Either way the query keeps the outcome it had.
 #[tokio::test]
 async fn a_stop_of_a_query_that_has_already_ended_is_refused() {
     let logs = Logs::new();
@@ -202,34 +229,59 @@ async fn a_stop_of_a_query_that_has_already_ended_is_refused() {
         Some(true),
         "case the first stop: stopping a query in progress succeeds, got {success}"
     );
-    tokio::time::sleep(past_completion()).await;
+    // The completion the clock owes the other query is waited for as a CONDITION, looked at
+    // again until it holds.
+    await_status(&logs, &completed, COMPLETE).await;
 
-    // (case, the query, the terminal status it is in)
-    let cases: [(&str, &String, &str); 2] = [
-        ("a query the clock completed", &completed, COMPLETE),
-        ("a query an earlier stop cancelled", &cancelled, CANCELLED),
+    // (case, the query, the terminal status it is in, whether a stop of it is the no-op it
+    // asks for rather than a refusal)
+    let cases: [(&str, &String, &str, bool); 2] = [
+        ("a query the clock completed", &completed, COMPLETE, false),
+        (
+            "a query an earlier stop cancelled",
+            &cancelled,
+            CANCELLED,
+            true,
+        ),
     ];
-    for (case, id, terminal) in cases {
+    for (case, id, terminal, idempotent) in cases {
         assert_eq!(
             reported_status(&logs, id).await,
             terminal,
             "case {case:?}: the query under test must be {terminal}"
         );
-        let (code, message) = logs.refusal(STOP, &json!({"queryId": id})).await;
-        assert_eq!(
-            code, INVALID_PARAMETER,
-            "case {case:?}: expected {INVALID_PARAMETER}, got {code} with message {message:?}"
-        );
-        assert!(
-            message.contains(id.as_str()),
-            "case {case:?}: the refusal names the query the caller asked to stop, got \
-             {message:?}"
-        );
-        // The refusal changes nothing: the ended query keeps the outcome it reached.
+        if idempotent {
+            let answer = logs.ok(STOP, &json!({"queryId": id})).await;
+            assert_eq!(
+                answer["success"].as_bool(),
+                Some(true),
+                "case {case:?}: a stop of a query that IS stopped reports the success of the \
+                 state it asked for, got {answer}"
+            );
+        } else {
+            let (code, message) = logs.refusal(STOP, &json!({"queryId": id})).await;
+            assert_eq!(
+                code, INVALID_PARAMETER,
+                "case {case:?}: expected {INVALID_PARAMETER}, got {code} with message \
+                 {message:?}"
+            );
+            // The refusal states that the query ended and WHICH terminal status it ended in,
+            // inside the envelope reporting the status, the code and this response's own
+            // request id.
+            let sentence =
+                crate::harness::without_sdk_envelope(case, &message, 400, INVALID_PARAMETER);
+            assert_eq!(
+                sentence,
+                format!("Query is already ended with {terminal}"),
+                "case {case:?}: the refusal names the terminal status the query reached, got \
+                 {message:?}"
+            );
+        }
+        // Neither outcome changes the query: it keeps the terminal status it reached.
         assert_eq!(
             reported_status(&logs, id).await,
             terminal,
-            "case {case:?}: a refused stop leaves the query {terminal}"
+            "case {case:?}: the query is left {terminal}"
         );
     }
 }

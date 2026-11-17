@@ -463,7 +463,7 @@ fn call(name: &str, args: &[Expr], wildcard: bool, record: &Record, budget: &Bud
 ///
 /// The set is the one both query-language surfaces aggregate with: a `stats` command's
 /// functions and a SQL `SELECT`'s, which name the same computations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AggregateFunction {
     /// How many values the group holds — which, over a record's own presence, is how many
     /// records it holds.
@@ -478,10 +478,26 @@ pub enum AggregateFunction {
     Minimum,
     /// The greatest.
     Maximum,
+    /// The value standing at a RANK among the group's values, which is what the percentile
+    /// aggregate of the query language computes (`pct(fieldName, value)`): the rank is the
+    /// PERCENT the call's second argument names, so the function carries it. A call that names
+    /// no rank is read as the one [`DEFAULT_PERCENTILE_RANK`] stands for.
+    Percentile(f64),
+    /// How far the group's numbers spread around their mean.
+    StandardDeviation,
 }
+
+/// The rank a percentile aggregate carries when it is named without one: the MIDDLE of the
+/// group's values. A call that names its own rank — every `pct(fieldName, value)` does —
+/// replaces it with that one ([`AggregateFunction::at_rank`]).
+pub const DEFAULT_PERCENTILE_RANK: f64 = 50.0;
 
 impl AggregateFunction {
     /// The aggregate `name` names, lowercased, or `None` when it names none.
+    ///
+    /// The name alone decides WHICH computation; an argument of the call that is part of the
+    /// computation rather than of what it is computed over — a percentile's rank — is read
+    /// where the call's arguments are read, and replaces the default this answers.
     pub fn parse(name: &str) -> Option<Self> {
         match name.to_lowercase().as_str() {
             "count" => Some(Self::Count),
@@ -490,17 +506,35 @@ impl AggregateFunction {
             "avg" | "average" | "mean" => Some(Self::Average),
             "min" => Some(Self::Minimum),
             "max" => Some(Self::Maximum),
+            "pct" | "percentile" => Some(Self::Percentile(DEFAULT_PERCENTILE_RANK)),
+            "stddev" => Some(Self::StandardDeviation),
             _ => None,
         }
+    }
+
+    /// The same aggregate computed at `rank` instead, for a percentile whose call names one.
+    /// Every other aggregate carries no rank and is answered as it is.
+    pub fn at_rank(self, rank: f64) -> Self {
+        match self {
+            Self::Percentile(_) => Self::Percentile(rank),
+            other => other,
+        }
+    }
+
+    /// Whether this aggregate's value is the one standing at a rank among the group's values,
+    /// so a caller reading a call's arguments knows a rank is part of the call.
+    pub fn is_percentile(self) -> bool {
+        matches!(self, Self::Percentile(_))
     }
 }
 
 /// What one aggregate has taken in so far, folded record by record.
 ///
-/// An aggregate is accumulated INCREMENTALLY — count, sum, mean, least and greatest each need
-/// a fixed amount of state per group — so a group costs the same whether it holds one record
-/// or every record of the scan. Only `count_distinct` has to remember values, which is
-/// bounded by [`MAX_DISTINCT_VALUES`] and charged to the run's budget.
+/// An aggregate is accumulated INCREMENTALLY — count, sum, mean, spread, least and greatest
+/// each need a fixed amount of state per group — so a group costs the same whether it holds
+/// one record or every record of the scan. Only `count_distinct` and a percentile have to
+/// remember values, which is bounded by [`MAX_DISTINCT_VALUES`] and [`MAX_RANKED_VALUES`] and
+/// charged to the run's budget.
 ///
 /// A value a record does not carry contributes to nothing — counting a field counts the
 /// records that HAVE it — so a missing value is left out of every function, and a function
@@ -511,6 +545,10 @@ pub struct Accumulator {
     count: u64,
     /// Their total, over those that are numbers.
     sum: f64,
+    /// The total of their SQUARES, over those same values: with the total and how many there
+    /// were, this is what a spread around the mean is computed from without remembering the
+    /// values themselves.
+    sum_of_squares: f64,
     /// How many of them were numbers, so a mean over none answers nothing.
     numbers: u64,
     /// The least value seen, as a value rather than a number, so a minimum over text is the
@@ -520,12 +558,20 @@ pub struct Accumulator {
     greatest: Option<Value>,
     /// The distinct values seen, for a `count_distinct`.
     distinct: std::collections::BTreeSet<String>,
+    /// The group's numbers IN ORDER, for a percentile: the value standing at a rank is the one
+    /// at that position of the ordered values, so they are kept ordered as they arrive.
+    ranked: Vec<f64>,
 }
 
-/// THE EMULATOR'S OWN CEILING on how many DISTINCT values one `count_distinct` remembers:
-/// the only aggregate whose state grows with the values it sees, so it is the only one that
-/// needs a ceiling of its own.
+/// THE EMULATOR'S OWN CEILING on how many DISTINCT values one `count_distinct` remembers: one
+/// of the two aggregates whose state grows with the values it sees, so it needs a ceiling of
+/// its own.
 pub const MAX_DISTINCT_VALUES: usize = 100_000;
+
+/// THE EMULATOR'S OWN CEILING on how many values one percentile remembers, on the same terms:
+/// the value standing at a rank is found among the values themselves, so they are held — and
+/// held to this many.
+pub const MAX_RANKED_VALUES: usize = 100_000;
 
 impl Accumulator {
     /// Take one value into this aggregate, spending the run's budget for anything it has to
@@ -537,7 +583,17 @@ impl Accumulator {
         self.count = self.count.saturating_add(1);
         if let Some(number) = value.number() {
             self.sum += number;
+            self.sum_of_squares += number * number;
             self.numbers = self.numbers.saturating_add(1);
+            // The values a percentile is read out of are kept ORDERED as they arrive, so the
+            // value standing at a rank is read without ordering the group again.
+            if function.is_percentile() && self.ranked.len() < MAX_RANKED_VALUES {
+                if !budget.store(std::mem::size_of::<f64>()) {
+                    return false;
+                }
+                let at = self.ranked.partition_point(|held| *held < number);
+                self.ranked.insert(at, number);
+            }
         }
         if self
             .least
@@ -579,7 +635,35 @@ impl Accumulator {
             }
             AggregateFunction::Minimum => self.least.clone().unwrap_or(Value::Null),
             AggregateFunction::Maximum => self.greatest.clone().unwrap_or(Value::Null),
+            AggregateFunction::Percentile(rank) => self.at_rank(rank),
+            AggregateFunction::StandardDeviation => {
+                if self.numbers == 0 {
+                    return Value::Null;
+                }
+                let count = self.numbers as f64;
+                let mean = self.sum / count;
+                // The spread of the values the group HOLDS around their own mean, which is
+                // what a group of values has rather than a sample drawn from something larger.
+                let variance = (self.sum_of_squares / count - mean * mean).max(0.0);
+                Value::Number(variance.sqrt())
+            }
         }
+    }
+
+    /// The value standing at `rank` percent among the group's ordered numbers, by NEAREST
+    /// RANK: the value at the first position that covers that share of them, which is position
+    /// `ceil(rank / 100 × count)` of the order, counted from one. A group whose values are no
+    /// numbers has no value at any rank.
+    fn at_rank(&self, rank: f64) -> Value {
+        if self.ranked.is_empty() {
+            return Value::Null;
+        }
+        let share = rank.clamp(0.0, 100.0) / 100.0;
+        let position = (share * self.ranked.len() as f64).ceil() as usize;
+        let at = position.max(1) - 1;
+        self.ranked
+            .get(at.min(self.ranked.len() - 1))
+            .map_or(Value::Null, |number| Value::Number(*number))
     }
 }
 

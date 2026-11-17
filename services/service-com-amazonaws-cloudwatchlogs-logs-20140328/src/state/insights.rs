@@ -84,9 +84,10 @@ pub const FIELD_LOG: &str = "@log";
 /// When the event was accepted by `PutLogEvents`.
 pub const FIELD_INGESTION_TIME: &str = "@ingestionTime";
 
-/// The columns a query that selects none of its own reports: the timestamp and the message
-/// of each matched event, which is what a Logs Insights result carries before any `fields`
-/// or `display` command narrows it.
+/// The columns a query that produces none of its own reports: the timestamp and the message
+/// of each matched event, which is what a Logs Insights result carries while no command of the
+/// query has named a column — a projection (`fields`, `display`), a field a command defines, or
+/// an aggregation's own columns.
 pub const DEFAULT_COLUMNS: [&str; 2] = [FIELD_TIMESTAMP, FIELD_MESSAGE];
 
 /// THE EMULATOR'S OWN CEILING on how many stored events ONE run reads, so a query's cost is
@@ -403,6 +404,11 @@ impl ExecutionFailure {
 /// Reading the results of a query is a read of this service's shared state, and every other
 /// request of the service waits on that same state: so the store is read once, into this,
 /// and the pipeline then runs over the records it holds with the state released.
+///
+/// The run's [`Budget`] is created HERE rather than where the stages are applied, because
+/// reading the store is work a caller's query asks for like any other: the candidate events a
+/// scan looks at are charged to it, so the deadline and the step budget bound the READ as well
+/// as what is computed over what it read.
 #[derive(Debug)]
 pub struct Prepared {
     /// What the query string says to do.
@@ -411,6 +417,8 @@ pub struct Prepared {
     scan: Scan,
     /// The query being run, as it was stored.
     query: QueryRecord,
+    /// What this run may spend, already charged for the read above.
+    budget: Budget,
 }
 
 /// What a query string compiled or parsed to, ready to run.
@@ -436,10 +444,12 @@ enum Plan {
 /// service cannot run is prepared as unrunnable, which [`run`] answers as the `Failed` status
 /// of an execution that produced nothing rather than as a refusal of the call.
 pub fn prepare(store: &State, query: &QueryRecord) -> Prepared {
+    let budget = Budget::new();
     let unrunnable = |reason: String| Prepared {
         plan: Plan::Unrunnable(reason),
         scan: Scan::default(),
         query: query.clone(),
+        budget: Budget::new(),
     };
     let planned = match query.query_language.as_str() {
         super::DEFAULT_QUERY_LANGUAGE => pipeline::plan_logs_insights(&query.query_string),
@@ -456,19 +466,22 @@ pub fn prepare(store: &State, query: &QueryRecord) -> Prepared {
 
     // Which log groups the query reads, which is a question about what this account holds.
     let groups = match &plan {
-        Plan::Pipeline { stages, .. } => {
-            resolve_groups(store, &pipeline::source_selectors(stages), &query.log_group_names)
-        }
+        Plan::Pipeline { stages, .. } => resolve_groups(
+            store,
+            &pipeline::source_selectors(stages),
+            &query.log_group_names,
+            &budget,
+        ),
         // The `FROM` clause IS where a SQL statement names the log groups it reads, so what
         // it names is what the statement reads — a clause naming a log group this account
         // does not hold reads no events rather than falling back to the request's members.
         Plan::Sql(parsed) => match sql::from_clause_groups(parsed) {
-            Ok(selectors) => selected_groups(store, &selectors),
+            Ok(selectors) => selected_groups(store, &selectors, &budget),
             Err(failure) => return unrunnable(failure.reason),
         },
         Plan::Unrunnable(_) => Vec::new(),
     };
-    let mut scan = scan(store, &groups, query);
+    let mut scan = scan(store, &groups, query, &budget);
 
     // A `lookup` stage joins the rows of one of this account's lookup tables onto each
     // record, so the tables it names are read here too — the join itself then needs nothing
@@ -486,19 +499,25 @@ pub fn prepare(store: &State, query: &QueryRecord) -> Prepared {
         plan,
         scan,
         query: query.clone(),
+        budget,
     }
 }
 
 /// Run a prepared query, answering its rows and the counts over the run.
 ///
 /// Reached with this service's state RELEASED (see [`Prepared`]): everything the run needs is
-/// in hand, so one caller's query neither holds the store nor waits on it. The run spends a
-/// [`Budget`] — expression evaluations, computed bytes and wall-clock time — and yields as it
-/// goes, so a cancelled or timed-out request has somewhere to land and a query that asks for
-/// more than the budget is abandoned rather than run to the end.
+/// in hand, so one caller's query neither holds the store nor waits on it. The run spends the
+/// [`Budget`] its preparation opened — expression evaluations, computed bytes and wall-clock
+/// time, already charged for the events the scan looked at — and yields as it goes, so a
+/// cancelled or timed-out request has somewhere to land and a query that asks for more than the
+/// budget is abandoned rather than run to the end.
 pub async fn run(prepared: Prepared) -> Execution {
-    let Prepared { plan, scan, query } = prepared;
-    let budget = Budget::new();
+    let Prepared {
+        plan,
+        scan,
+        query,
+        budget,
+    } = prepared;
     match plan {
         Plan::Unrunnable(reason) => Execution {
             failed: Some(reason),
@@ -536,19 +555,75 @@ pub struct Scan {
     pub lookup_tables: BTreeMap<String, String>,
 }
 
+/// One event the scan may read, under the order the records of a run are read in: the NEWEST
+/// event first, and among events sharing an instant and an ingestion sequence, by the log
+/// group's and then the log stream's name.
+///
+/// The GREATEST candidate is the one a run reads FIRST, so a bounded min-heap of candidates
+/// holds at its top the one a run would read last — which is the one to drop when more
+/// candidates than a run may read have been seen ([`MAX_SCANNED_EVENTS`]).
+struct Candidate<'a> {
+    /// The event's own timestamp, in epoch milliseconds.
+    timestamp: i64,
+    /// Its ingestion sequence, which orders events sharing a timestamp.
+    seq: u64,
+    /// The log group holding it.
+    group: &'a str,
+    /// The log stream holding it.
+    stream: &'a str,
+    /// The stored event itself.
+    event: &'a super::StoredEvent,
+}
+
+impl Ord for Candidate<'_> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Newer first, so a greater instant and a greater sequence are GREATER; the names
+        // order the other way, because the earlier name is read first.
+        self.timestamp
+            .cmp(&other.timestamp)
+            .then_with(|| self.seq.cmp(&other.seq))
+            .then_with(|| other.group.cmp(self.group))
+            .then_with(|| other.stream.cmp(self.stream))
+    }
+}
+
+impl PartialOrd for Candidate<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Candidate<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for Candidate<'_> {}
+
 /// Read the records of `groups` whose events fall inside the query's time range.
 ///
 /// The range is the one `StartQuery` was given, in the epoch SECONDS that operation
 /// documents, and both of its ends are read: "The range is inclusive, so the specified end
 /// time is included in the query".
-pub fn scan(store: &State, groups: &[String], query: &QueryRecord) -> Scan {
+///
+/// WHAT BOUNDS IT, given that a request names the groups and the window and this runs with the
+/// store LOCKED: the candidates in hand are held to the most events one run reads
+/// ([`MAX_SCANNED_EVENTS`]) rather than to however many the window holds — one stream
+/// contributes only its newest that many, and a heap of that size keeps the newest of them all
+/// and drops the rest as they arrive, so the memory is that bound and the work is one
+/// comparison pass rather than a sort of everything ever ingested. Looking at one candidate is
+/// charged to the run's `budget`, so the step budget and the wall-clock deadline bound this
+/// read as well as what is computed over what it read.
+pub fn scan(store: &State, groups: &[String], query: &QueryRecord, budget: &Budget) -> Scan {
     let start_ms = query.start_time_secs.saturating_mul(MILLIS_PER_SECOND);
     let end_ms = query.end_time_secs.saturating_mul(MILLIS_PER_SECOND);
     let account = ::engine::emulator_account_id();
-    // Every event of the window, newest first: a stream keeps its events sorted by
-    // `(timestamp, ingestion_seq)`, so the window is one contiguous run per stream, found by
-    // two binary searches and then merged across the streams of every group read.
-    let mut selected: Vec<(i64, u64, &str, &str, &super::StoredEvent)> = Vec::new();
+    // A stream keeps its events sorted by `(timestamp, ingestion_seq)`, so the window is one
+    // contiguous run per stream, found by two binary searches; the runs of every group read are
+    // then merged through this heap, newest first.
+    let mut selected: std::collections::BinaryHeap<std::cmp::Reverse<Candidate<'_>>> =
+        std::collections::BinaryHeap::new();
     let mut groups_read = 0usize;
     for name in groups {
         let Some(group) = store.log_groups.get(name) else {
@@ -562,38 +637,56 @@ pub fn scan(store: &State, groups: &[String], query: &QueryRecord) -> Scan {
             let until = stream
                 .events
                 .partition_point(|event| event.timestamp <= end_ms);
-            for event in &stream.events[from..until.max(from)] {
-                selected.push((
-                    event.timestamp,
-                    event.ingestion_seq,
-                    group.name.as_str(),
-                    stream.name.as_str(),
+            let window = &stream.events[from..until.max(from)];
+            // Only the NEWEST events of one stream's window can reach the records a run reads,
+            // and they are its last: the rest are cut here rather than materialised.
+            let newest = window.len().saturating_sub(MAX_SCANNED_EVENTS);
+            for event in &window[newest..] {
+                // Looking at one candidate is work the run pays for.
+                if !budget.tick() {
+                    break;
+                }
+                selected.push(std::cmp::Reverse(Candidate {
+                    timestamp: event.timestamp,
+                    seq: event.ingestion_seq,
+                    group: group.name.as_str(),
+                    stream: stream.name.as_str(),
                     event,
-                ));
+                }));
+                // The heap holds the newest candidates a run may read and no more, so one
+                // request cannot grow it past that bound however many events it names.
+                if selected.len() > MAX_SCANNED_EVENTS {
+                    selected.pop();
+                }
+            }
+            if budget.exhausted() {
+                break;
             }
         }
+        if budget.exhausted() {
+            break;
+        }
     }
-    selected.sort_by(|left, right| {
-        right
-            .0
-            .cmp(&left.0)
-            .then_with(|| right.1.cmp(&left.1))
-            .then_with(|| left.2.cmp(right.2))
-            .then_with(|| left.3.cmp(right.3))
-    });
 
     let mut scan = Scan {
         groups: groups_read,
         ..Scan::default()
     };
-    for (timestamp, seq, group, stream, event) in selected {
+    // Ascending in the reversed order is descending in the candidates' own: the newest first.
+    for std::cmp::Reverse(candidate) in selected.into_sorted_vec() {
         if scan.scanned >= MAX_SCANNED_EVENTS || scan.bytes >= MAX_SCANNED_BYTES {
             break;
         }
         scan.scanned = scan.scanned.saturating_add(1);
-        scan.bytes = scan.bytes.saturating_add(event.message.len());
-        scan.records
-            .push(record_of(group, stream, event, timestamp, seq, account));
+        scan.bytes = scan.bytes.saturating_add(candidate.event.message.len());
+        scan.records.push(record_of(
+            candidate.group,
+            candidate.stream,
+            candidate.event,
+            candidate.timestamp,
+            candidate.seq,
+            account,
+        ));
     }
     scan
 }
@@ -827,7 +920,12 @@ pub fn result_set_record(store: &State, pointer: &str) -> Option<Record> {
 /// select log groups for the query" (`StartQuery`), and the SQL languages "specify the log
 /// group names inside the querystring instead of here"
 /// (`StartQuery$logGroupIdentifiers`).
-pub fn resolve_groups(store: &State, selected: &[GroupSelector], fallback: &[String]) -> Vec<String> {
+pub fn resolve_groups(
+    store: &State,
+    selected: &[GroupSelector],
+    fallback: &[String],
+    budget: &Budget,
+) -> Vec<String> {
     if selected.is_empty() {
         return fallback.to_vec();
     }
@@ -835,7 +933,7 @@ pub fn resolve_groups(store: &State, selected: &[GroupSelector], fallback: &[Str
     // query reads the log groups the START resolved: only a SQL query names the log groups
     // to read in its query string instead of in the request, so for every other language the
     // request's own members are what the query was started over.
-    let names: Vec<String> = selected_groups(store, selected)
+    let names: Vec<String> = selected_groups(store, selected, budget)
         .into_iter()
         .filter(|name| store.log_groups.contains_key(name))
         .collect();
@@ -847,19 +945,39 @@ pub fn resolve_groups(store: &State, selected: &[GroupSelector], fallback: &[Str
 
 /// The log groups `selected` names, and nothing else — what a SQL statement's `FROM` clause
 /// resolves to, because that clause IS where such a statement names the log groups it reads.
-pub fn selected_groups(store: &State, selected: &[GroupSelector]) -> Vec<String> {
+///
+/// WHAT BOUNDS IT, given that the selectors come from a caller's query string and this runs
+/// with the store locked: a query reads at most [`super::MAX_QUERY_LOG_GROUPS`] log groups, so
+/// the resolution stops once it has that many; the names already resolved are held in a SET,
+/// so one more name costs a lookup rather than a scan of them all; and resolving one selector,
+/// and examining one log group for it, are both charged to `budget` — so the step budget and
+/// the wall-clock deadline bound this read as well.
+pub fn selected_groups(
+    store: &State,
+    selected: &[GroupSelector],
+    budget: &Budget,
+) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
+    let mut resolved: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for selector in selected {
+        if names.len() >= super::MAX_QUERY_LOG_GROUPS || !budget.tick() {
+            break;
+        }
         match selector {
             GroupSelector::Name(identifier) => {
                 let name = super::log_group_name_from_identifier(identifier).to_string();
-                if !names.contains(&name) {
+                if resolved.insert(name.clone()) {
                     names.push(name);
                 }
             }
             GroupSelector::NamePrefix(prefix) => {
                 for name in store.log_groups.keys() {
-                    if name.starts_with(prefix.as_str()) && !names.contains(name) {
+                    // Every log group this account holds is examined for one prefix, so each
+                    // one examined is work the caller's query pays for.
+                    if names.len() >= super::MAX_QUERY_LOG_GROUPS || !budget.tick() {
+                        break;
+                    }
+                    if name.starts_with(prefix.as_str()) && resolved.insert(name.clone()) {
                         names.push(name.clone());
                     }
                 }
@@ -887,16 +1005,30 @@ pub enum GroupSelector {
 /// name prefix, account ID, and log class" — the prefixes select, and a key this service does
 /// not resolve against state (an account id, a log class) selects nothing of its own and is
 /// skipped rather than making the query unrunnable.
+///
+/// Either form may be written QUOTED, which is how the pipelined languages write an identifier
+/// that carries anything (a back-quoted `logGroups(logGroupIdentifier: ['…'])`): the quoting is
+/// part of how the selector is WRITTEN and not part of what it names, so it is taken off
+/// wherever it stands ([`trim_identifier`]) and the selector selects the same either way.
+///
+/// WHAT BOUNDS IT: the selectors are read out of a caller's query string and each one is then
+/// resolved against every log group this account holds, so their number is held to
+/// [`MAX_GROUP_SELECTORS`] — a query reads at most [`super::MAX_QUERY_LOG_GROUPS`] log groups,
+/// so no further selector could add one it may read.
 pub fn read_group_selectors(text: &str) -> Vec<GroupSelector> {
     let mut selectors: Vec<GroupSelector> = Vec::new();
     let mut rest = text.trim();
     // `logGroups(...)`: the keys inside the brackets select, so the bracketed text is read
     // key by key and everything outside it is read as a name list.
     while let Some(open) = rest.find('(') {
+        if selectors.len() >= MAX_GROUP_SELECTORS {
+            return selectors;
+        }
         let keyword = rest[..open].trim();
         let selector_call = keyword
             .rsplit(|character: char| character.is_whitespace() || character == '=')
             .next()
+            .map(trim_identifier)
             .unwrap_or_default()
             .eq_ignore_ascii_case(LOG_GROUPS_SELECTOR);
         let Some(close) = rest[open..].find(')').map(|at| open + at) else {
@@ -908,12 +1040,18 @@ pub fn read_group_selectors(text: &str) -> Vec<GroupSelector> {
                 // by identifier; a key this service does not resolve against state (an
                 // account id, a log class) selects nothing of its own.
                 let key = key.trim_end_matches('s').to_string();
+                let read = MAX_GROUP_SELECTORS.saturating_sub(selectors.len());
                 if key.eq_ignore_ascii_case(NAME_PREFIX_KEY) {
-                    selectors.extend(values.into_iter().map(GroupSelector::NamePrefix));
+                    selectors.extend(
+                        values
+                            .into_iter()
+                            .take(read)
+                            .map(GroupSelector::NamePrefix),
+                    );
                 } else if key.eq_ignore_ascii_case(LOG_GROUP_IDENTIFIER_KEY)
                     || key.eq_ignore_ascii_case(LOG_GROUP_NAME_KEY)
                 {
-                    selectors.extend(values.into_iter().map(GroupSelector::Name));
+                    selectors.extend(values.into_iter().take(read).map(GroupSelector::Name));
                 }
             }
             // The text before the call is the keyword itself, so only what follows the call
@@ -925,6 +1063,9 @@ pub fn read_group_selectors(text: &str) -> Vec<GroupSelector> {
     }
     // Whatever is left names log groups directly: `SOURCE 'a', 'b'`.
     for token in rest.split(',') {
+        if selectors.len() >= MAX_GROUP_SELECTORS {
+            break;
+        }
         let name = trim_identifier(token);
         if !name.is_empty() {
             selectors.push(GroupSelector::Name(name.to_string()));
@@ -932,6 +1073,13 @@ pub fn read_group_selectors(text: &str) -> Vec<GroupSelector> {
     }
     selectors
 }
+
+/// THE EMULATOR'S OWN CEILING on how many source selectors are read out of ONE query string:
+/// each one is resolved against every log group this account holds
+/// ([`selected_groups`]), so their number is a factor of that work and the caller writes it.
+/// It is the most log groups one query may read ([`super::MAX_QUERY_LOG_GROUPS`]), because a
+/// selector past that one could select no log group the query may read.
+pub const MAX_GROUP_SELECTORS: usize = super::MAX_QUERY_LOG_GROUPS;
 
 /// The function a query's source selector calls to select log groups by their properties.
 const LOG_GROUPS_SELECTOR: &str = "loggroups";

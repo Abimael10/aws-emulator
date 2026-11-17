@@ -582,10 +582,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     }
                 }
             }
-            crate::state::insights::selected_groups(&store, &selectors)
-                .into_iter()
-                .filter(|name| store.log_groups.contains_key(name))
-                .collect()
+            // Resolving the clause's selectors against this account's log groups is work the
+            // request asked for, and it is done with the store held: it is bounded by the same
+            // budget a run of the query spends ([`crate::state::insights::Budget`]), so one
+            // statement cannot buy an unbounded resolution here either.
+            crate::state::insights::selected_groups(
+                &store,
+                &selectors,
+                &crate::state::insights::Budget::new(),
+            )
+            .into_iter()
+            .filter(|name| store.log_groups.contains_key(name))
+            .collect()
         } else {
             let query_selects_sources = compiled
                 .as_ref()

@@ -5,11 +5,13 @@
 //!
 //! The rule under test: a field a pipeline command CREATES on the records — a capture a
 //! `parse` extracts, a column a `lookup` joins — is an output column of the result, so it
-//! reaches every row `GetQueryResults` reports, beside whatever columns the result already
-//! carried; a later `fields`/`display` names the columns itself, so a projection after such a
-//! stage narrows the result to what it names. A row states only the columns the record it came
-//! from carries, so a record a pattern did not match reports none of the created fields rather
-//! than empty ones, and every row of log records carries the `@ptr` of its record.
+//! reaches every row `GetQueryResults` reports; the default columns `@timestamp` and `@message`
+//! are what a pipeline reporting NONE OF ITS OWN carries, so the first command to produce
+//! columns replaces them and a later one adds to what the pipeline has already chosen. A later
+//! `fields`/`display` names the columns itself, so a projection after such a stage narrows the
+//! result to what it names. A row states only the columns the record it came from carries, so a
+//! record a pattern did not match reports none of the created fields rather than empty ones,
+//! and every row of log records carries the `@ptr` of its record.
 //!
 //! Every case drives the service the way a client does — `POST /` with
 //! `X-Amz-Target: Logs_20140328.<Operation>` through the router that mounts it — so a response
@@ -54,6 +56,11 @@ const EVENTS: [(i64, &str); 4] = [
 /// requested in the query are returned, along with a @ptr field, which is the identifier for
 /// the log record" (`GetQueryResults`).
 const POINTER: &str = "@ptr";
+
+/// The columns a result carries before any command of the pipeline produces one of its own:
+/// the event's instant and its message. A pipeline that DOES produce its own columns reports
+/// those instead, so these are exactly what such a result must not carry.
+const DEFAULT_COLUMNS: [&str; 2] = ["@timestamp", "@message"];
 
 /// A log group holding [`EVENTS`], and the window a query of it is started with in the epoch
 /// SECONDS `StartQuery` documents for its range.
@@ -159,14 +166,6 @@ struct ExpectedRow<'a> {
 /// rows it must produce.
 type ProjectionCase<'a> = (&'a str, String, Vec<ExpectedRow<'a>>);
 
-/// A row that must carry exactly these `(field, value)` pairs among its columns.
-fn carrying<'a>(present: &[(&'a str, &'a str)]) -> ExpectedRow<'a> {
-    ExpectedRow {
-        present: present.to_vec(),
-        absent: Vec::new(),
-    }
-}
-
 /// A row that must carry these pairs and nothing for the columns in `absent`.
 fn carrying_only<'a>(present: &[(&'a str, &'a str)], absent: &[&'a str]) -> ExpectedRow<'a> {
     ExpectedRow {
@@ -229,15 +228,24 @@ async fn the_fields_a_parse_creates_are_the_results_columns() {
                  as svc, lat, st | sort @timestamp asc"
             ),
             vec![
-                carrying(&[("lat", "100"), ("st", "200"), ("svc", "alpha")]),
-                carrying(&[("lat", "200"), ("st", "500"), ("svc", "beta")]),
-                carrying(&[("lat", "90"), ("st", "200"), ("svc", "gamma")]),
-                // The line the pattern does not match: a row of its own, carrying none of
-                // the created columns rather than empty ones.
+                // The pipeline produces its own columns, so the default ones it never asked
+                // for are not reported beside them.
                 carrying_only(
-                    &[("@message", EVENTS[3].1)],
-                    &["svc", "lat", "st"],
+                    &[("lat", "100"), ("st", "200"), ("svc", "alpha")],
+                    &DEFAULT_COLUMNS,
                 ),
+                carrying_only(
+                    &[("lat", "200"), ("st", "500"), ("svc", "beta")],
+                    &DEFAULT_COLUMNS,
+                ),
+                carrying_only(
+                    &[("lat", "90"), ("st", "200"), ("svc", "gamma")],
+                    &DEFAULT_COLUMNS,
+                ),
+                // The line the pattern does not match: a row of its own, carrying none of
+                // the created columns rather than empty ones — and none of the default ones
+                // either, so its only field is the pointer to its record.
+                carrying_only(&[], &["svc", "lat", "st", "@message", "@timestamp"]),
             ],
         ),
         (
@@ -245,9 +253,9 @@ async fn the_fields_a_parse_creates_are_the_results_columns() {
             r"filter @message like /lat=/ | parse @message /lat=(?<lat>\d+)/ | sort lat desc"
                 .to_string(),
             vec![
-                carrying(&[("lat", "200")]),
-                carrying(&[("lat", "100")]),
-                carrying(&[("lat", "90")]),
+                carrying_only(&[("lat", "200")], &DEFAULT_COLUMNS),
+                carrying_only(&[("lat", "100")], &DEFAULT_COLUMNS),
+                carrying_only(&[("lat", "90")], &DEFAULT_COLUMNS),
             ],
         ),
         (
@@ -256,9 +264,9 @@ async fn the_fields_a_parse_creates_are_the_results_columns() {
              lat=(?<lat>\\d+)/ | sort svc asc"
                 .to_string(),
             vec![
-                carrying(&[("lat", "100"), ("svc", "alpha")]),
-                carrying(&[("lat", "200"), ("svc", "beta")]),
-                carrying(&[("lat", "90"), ("svc", "gamma")]),
+                carrying_only(&[("lat", "100"), ("svc", "alpha")], &DEFAULT_COLUMNS),
+                carrying_only(&[("lat", "200"), ("svc", "beta")], &DEFAULT_COLUMNS),
+                carrying_only(&[("lat", "90"), ("svc", "gamma")], &DEFAULT_COLUMNS),
             ],
         ),
         (
@@ -267,9 +275,9 @@ async fn the_fields_a_parse_creates_are_the_results_columns() {
              | sort @timestamp asc"
                 .to_string(),
             vec![
-                carrying(&[("tail", "100 status=200")]),
-                carrying(&[("tail", "200 status=500")]),
-                carrying(&[("tail", "90 status=200")]),
+                carrying_only(&[("tail", "100 status=200")], &DEFAULT_COLUMNS),
+                carrying_only(&[("tail", "200 status=500")], &DEFAULT_COLUMNS),
+                carrying_only(&[("tail", "90 status=200")], &DEFAULT_COLUMNS),
             ],
         ),
         (
@@ -333,20 +341,65 @@ async fn the_columns_a_lookup_joins_are_the_results_columns() {
         "a lookup of a field the pipeline parsed out itself",
         &query_string,
         &[
-            carrying(&[
-                ("lat", "100"),
-                ("st", "200"),
-                ("svc", "alpha"),
-                ("team", "platform"),
-            ]),
-            carrying(&[
-                ("lat", "200"),
-                ("st", "500"),
-                ("svc", "beta"),
-                ("team", "west"),
-            ]),
+            carrying_only(
+                &[
+                    ("lat", "100"),
+                    ("st", "200"),
+                    ("svc", "alpha"),
+                    ("team", "platform"),
+                ],
+                &DEFAULT_COLUMNS,
+            ),
+            carrying_only(
+                &[
+                    ("lat", "200"),
+                    ("st", "500"),
+                    ("svc", "beta"),
+                    ("team", "west"),
+                ],
+                &DEFAULT_COLUMNS,
+            ),
             carrying_only(&[("lat", "90"), ("st", "200"), ("svc", "gamma")], &["team"]),
         ],
     )
     .await;
+}
+
+/// RULE, the other way round: a pipeline that produces NO columns of its own reports the
+/// default ones, so the columns a result carries are the pipeline's own only where it has them.
+#[tokio::test]
+async fn a_pipeline_producing_no_columns_of_its_own_reports_the_default_ones() {
+    let logs = Logs::new();
+    let window = group_with_events(&logs).await;
+
+    // (case, a pipeline whose commands produce no column of their own)
+    let cases: [(&str, String); 3] = [
+        ("a filter alone", format!("filter @message like /{MARKER}/")),
+        (
+            "a filter and a sort",
+            format!("filter @message like /{MARKER}/ | sort @timestamp desc"),
+        ),
+        (
+            "a filter and a bound on the rows",
+            format!("filter @message like /{MARKER}/ | limit 2"),
+        ),
+    ];
+    for (case, query_string) in cases {
+        let answer = completed(&logs, case, window, &query_string).await;
+        let produced = rows(case, &answer);
+        let row = produced
+            .first()
+            .unwrap_or_else(|| panic!("case {case:?}: expected a row, got {produced:?}"));
+        for column in DEFAULT_COLUMNS {
+            assert!(
+                row.contains_key(column),
+                "case {case:?}: a pipeline naming no columns of its own reports {column}, got \
+                 {row:?}"
+            );
+        }
+        assert!(
+            row.get(POINTER).is_some_and(|pointer| !pointer.is_empty()),
+            "case {case:?}: the row identifies the record it came from, got {row:?}"
+        );
+    }
 }

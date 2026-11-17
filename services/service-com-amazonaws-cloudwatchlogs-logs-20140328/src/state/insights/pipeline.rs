@@ -18,9 +18,9 @@
 //! * `parse` extracts ephemeral fields from a field's text, by regular expression or by the
 //!   glob pattern whose `*`s the `as` clause names;
 //! * a field a stage DEFINES — a `parse` capture, an `eval` definition, a column a `lookup`
-//!   joins — is reported as a column of the result beside the columns it already carried
-//!   ([`declare_fields`]), so a pipeline that creates fields and projects nothing further
-//!   still answers the fields it created;
+//!   joins — is reported as a column of the result ([`declare_fields`]), so a pipeline that
+//!   creates fields and projects nothing further answers the fields it created and not the
+//!   default columns it never asked for;
 //! * `stats` aggregates the records into one row per group, and `pattern` groups them by the
 //!   shape of their messages;
 //! * `sort`, `limit`/`head` and `dedup` order, bound and deduplicate what is left;
@@ -398,19 +398,21 @@ fn store(record: &mut Record, field: &str, value: String, budget: &Budget) {
 /// Report the ephemeral fields `names` as columns of the result.
 ///
 /// A stage that DEFINES a field — a `parse`'s captures, an `eval`'s assignment, the columns a
-/// `lookup` joins — puts a field on every record it produces, and the fields the records carry
-/// are what the result reports: an ephemeral field is "available for use in subsequent
-/// commands" of the pipeline AND in the rows the query answers, so a run that computed one
-/// answers it beside the columns the result already carried. A stage that CHOOSES the columns
+/// `lookup` joins — puts a field on every record it produces, and those fields are the columns
+/// the result reports: an ephemeral field is "available for use in subsequent commands" of the
+/// pipeline AND in the rows the query answers. The default columns are what a pipeline
+/// REPORTING NONE OF ITS OWN carries, so the first stage to produce columns REPLACES them and a
+/// later one adds to what the pipeline has already chosen. A stage that CHOOSES the columns
 /// (`fields`, `display`, an aggregation) still decides them for everything after it, so a
 /// projection narrowing the result after such a stage narrows it to what it names.
 fn declare_fields<N: IntoIterator<Item = String>>(rows: &mut Rows, names: N) {
-    let columns = rows.columns.get_or_insert_with(|| {
-        DEFAULT_COLUMNS
-            .iter()
-            .map(|column| (*column).to_string())
-            .collect()
-    });
+    let mut names = names.into_iter().peekable();
+    // A stage that defined nothing chose nothing: a pipeline whose commands produce no columns
+    // of their own still reports the default ones.
+    if names.peek().is_none() {
+        return;
+    }
+    let columns = rows.columns.get_or_insert_with(Vec::new);
     for name in names {
         if !columns.contains(&name) {
             columns.push(name);
@@ -669,12 +671,16 @@ fn stats(rows: &mut Rows, arguments: &str, budget: &Budget) -> Result<(), Execut
     // fixed amount of state, so a group costs the same whatever it holds, and the groups
     // themselves are bounded ([`MAX_GROUPS`]). Kept in the order of the group's key values,
     // so one store answers one query the same way every time.
-    let mut groups: BTreeMap<Vec<String>, Vec<expression::Accumulator>> = BTreeMap::new();
+    let mut groups: BTreeMap<Vec<Option<String>>, Vec<expression::Accumulator>> = BTreeMap::new();
     for record in &rows.records {
         if !budget.tick() {
             break;
         }
-        let key: Vec<String> = groupings
+        // A record carrying NO value for a grouping key is grouped under the ABSENCE of one,
+        // which is a group of its own rather than a group keyed by empty text: the two are told
+        // apart here, so the row a group reports can state which of them it is
+        // ([`Grouping::key`]).
+        let key: Vec<Option<String>> = groupings
             .iter()
             .map(|(_, grouping)| grouping.key(record, budget))
             .collect();
@@ -704,7 +710,12 @@ fn stats(rows: &mut Rows, arguments: &str, budget: &Budget) -> Result<(), Execut
         .map(|(key, collected)| {
             let mut record = Record::default();
             for ((name, _), value) in groupings.iter().zip(key) {
-                store(&mut record, name, value, budget);
+                // The group of the records that carry no value for this key reports no value
+                // for it: the key member is ABSENT from such a row rather than present with
+                // nothing in it, so a reader can tell that group from one keyed by empty text.
+                if let Some(value) = value {
+                    store(&mut record, name, value, budget);
+                }
             }
             for ((name, aggregate), accumulator) in aggregates.iter().zip(collected.iter()) {
                 store(
@@ -1068,6 +1079,10 @@ struct Aggregate {
 
 impl Aggregate {
     /// Read one parsed expression as an aggregate, or `None` when it is not a call to one.
+    ///
+    /// An argument that is part of the COMPUTATION rather than of what it is computed over is
+    /// read here: a percentile's rank is the call's second argument (`pct(fieldName, value)`),
+    /// so a percentile named without one is no aggregate this service can compute.
     fn read(expression: &Expr) -> Option<Self> {
         let Expr::Call {
             name,
@@ -1084,6 +1099,11 @@ impl Aggregate {
         {
             return None;
         }
+        let function = if function.is_percentile() {
+            function.at_rank(literal_number(args.get(1)?)?)
+        } else {
+            function
+        };
         Some(Self { function, over })
     }
 
@@ -1094,6 +1114,16 @@ impl Aggregate {
             None => Value::Bool(true),
             Some(expression) => expression::evaluate(expression, record, budget),
         }
+    }
+}
+
+/// The number one argument of a call is WRITTEN as, when it is written as one: an argument
+/// that is part of the computation — a percentile's rank — is a number of the query string
+/// rather than something read off a record, so only a literal is one.
+fn literal_number(expression: &Expr) -> Option<f64> {
+    match expression {
+        Expr::Literal(value) => value.number(),
+        _ => None,
     }
 }
 
@@ -1146,19 +1176,22 @@ impl Grouping {
         Ok(Self::Value(expression.clone()))
     }
 
-    /// This key's value for one record.
-    fn key(&self, record: &Record, budget: &Budget) -> String {
+    /// This key's value for one record, or `None` when the record carries no value to be
+    /// grouped by: such records aggregate into ONE group whose row omits the key, which is what
+    /// tells "no value for this field" apart from "this field is empty text".
+    fn key(&self, record: &Record, budget: &Budget) -> Option<String> {
         match self {
-            Self::Value(expression) => {
-                expression::evaluate(expression, record, budget).rendered()
-            }
+            Self::Value(expression) => match expression::evaluate(expression, record, budget) {
+                Value::Null => None,
+                value => Some(value.rendered()),
+            },
             Self::Bin { field, width } => {
                 let timestamp = record
                     .get(field)
                     .and_then(super::parse_timestamp)
                     .unwrap_or_default();
                 let floored = timestamp - timestamp.rem_euclid(*width);
-                super::format_timestamp(floored)
+                Some(super::format_timestamp(floored))
             }
         }
     }

@@ -187,21 +187,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Stops a CloudWatch Logs Insights query that is in progress. If the query has
         // already ended, the operation returns an error indicating that the specified query is
-        // not running." A query in any terminal status has ended, so it is refused as the
-        // incorrectly specified parameter it is and the outcome it reached is left untouched;
-        // only a query still in progress — scheduled or running — is stopped.
-        if !query.is_active() {
-            return Err(invalid_parameter(crate::state::query_not_running_message(
-                &input.query_id,
-            )));
+        // not running." A query that RAN to an outcome of its own — it completed, failed or
+        // timed out — has ended, so it is refused as the incorrectly specified parameter it is,
+        // naming the terminal status it reached, and that outcome is left untouched.
+        //
+        // A query that is already CANCELLED is the one terminal status a stop is idempotent
+        // over: the state the caller asks for is the state the query is in, so a stop with
+        // nothing left to do reports the success of a query that IS stopped rather than a
+        // refusal — a defensive re-stop (a retry, a cleanup path) is not a bad request.
+        if !query.is_active() && query.status != crate::state::QUERY_STATUS_CANCELLED {
+            return Err(invalid_parameter(
+                crate::state::query_already_ended_refusal(&query.status),
+            ));
         }
 
-        query.cancel();
+        // Only a query still in progress has an execution left to stop; one an earlier stop
+        // already cancelled stays exactly as it is.
+        if query.is_active() {
+            query.cancel();
+        }
 
         Ok(StopQueryOutput {
             // "This is true if the query was stopped by the StopQuery operation": this call is
-            // what stopped it, and a call that stops nothing answers one of the modelled
-            // errors above instead of reporting a stop it did not perform.
+            // what stopped it — or found it already stopped, which leaves the caller the same
+            // query — and a call that stops nothing answers one of the modelled errors above
+            // instead of reporting a stop it did not perform.
             success: true,
         })
     }
