@@ -19,13 +19,22 @@
 //! rows differ along what the rule generalises over: the workflow type (EXPRESS and
 //! STANDARD), the logging `level` (`ALL` and `ERROR`), `includeExecutionData`, and the
 //! outcome the run reaches (succeeded and failed).
+//!
+//! The second rule, about HOW MANY records a delivery writes: the group holds exactly ONE
+//! record per history event the `level` selects, however many ATTEMPTS the execution took
+//! — so an execution that failed, was redriven and failed again holds one
+//! `ExecutionFailed` record per failed attempt, which is what a client counting failures
+//! in that group (an alarm, a metric filter, an audit report) counts. Each record reports
+//! the `redrive_count` its OWN attempt ran under, the increment of a redrive being visible
+//! from the events that redrive produced on.
 
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
 use service_com_amazonaws_sfn_awsstepfunctions::state::{
-    observability, EXECUTION_SETTLE_DELAY,
+    observability, EVENT_EXECUTION_FAILED, EXECUTION_SETTLE_DELAY,
 };
 
 use crate::execution_observability::{create, logging, Observed, FAILING_DEFINITION};
@@ -439,4 +448,274 @@ async fn an_express_runs_history_api_is_refused_while_its_logs_carry_it() {
         (400, "InvalidArn"),
         "expected the EXPRESS execution's history API to be refused, got {status} with {answer:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// How MANY records one execution's delivery writes
+// ---------------------------------------------------------------------------
+
+/// Wait until the execution `arn` reports a terminal status, and answer that status.
+///
+/// The wait is for the CONDITION the clock owes — a status that is no longer `RUNNING` —
+/// looked for again until it holds or [`DELIVERY_DEADLINE`] passes, so a row reports
+/// rather than hangs and nothing depends on how fast the host runs.
+async fn settled(observed: &Observed, arn: &str, case: &str) -> String {
+    let deadline = Instant::now() + DELIVERY_DEADLINE;
+    loop {
+        let described = observed
+            .ok("DescribeExecution", &json!({ "executionArn": arn }))
+            .await;
+        let status = string(&described, "status");
+        if status != "RUNNING" {
+            return status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected the attempt's outcome to come due within \
+             {DELIVERY_DEADLINE:?}, got {described:?}"
+        );
+        ::tokio::time::sleep(POLL).await;
+    }
+}
+
+/// How many messages of each `type` a list of delivered events holds.
+fn per_type(messages: &[Value]) -> BTreeMap<String, usize> {
+    let mut counted: BTreeMap<String, usize> = BTreeMap::new();
+    for event_type in types(messages) {
+        *counted.entry(event_type).or_default() += 1;
+    }
+    counted
+}
+
+/// One delivered record as the three envelope members that identify it and the attempt
+/// it belongs to: its history `id`, its `type` and the `redrive_count` it carries.
+///
+/// A list of these is what makes a record delivered TWICE visible — one history event
+/// has one id — and what pins each record to its own attempt.
+type Record = (String, String, String);
+
+/// The [`Record`] of each delivered message, in history-id order.
+fn records(messages: &[Value], case: &str) -> Vec<Record> {
+    let mut held: Vec<(i64, Record)> = messages
+        .iter()
+        .map(|message| {
+            let text = |member: &str| {
+                message
+                    .get(member)
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "case {case:?}: expected a delivered event to carry {member} as \
+                             text, got {message:?}"
+                        )
+                    })
+                    .to_string()
+            };
+            let id = text("id");
+            let order = id.parse::<i64>().unwrap_or_else(|error| {
+                panic!("case {case:?}: expected a whole id, got {id:?} ({error})")
+            });
+            (order, (id, text("type"), text("redrive_count")))
+        })
+        .collect();
+    held.sort_by_key(|(order, _)| *order);
+    held.into_iter().map(|(_, record)| record).collect()
+}
+
+/// The [`Record`] the logging `level` owes for each event of the execution's OWN
+/// history, in the history's order.
+///
+/// The expectation is read off the history the delivery mirrors rather than written
+/// here, so a row asserts about this run's own events: `delivered_at_level` is the one
+/// statement of which class a level selects, and the redrive count an event was written
+/// at is counted off the history — an attempt opens with the `ExecutionRedriven` event
+/// that redrove it, and the increment that redrive made is visible from the events it
+/// produced on, so the boundary event itself still reads the count of the attempt that
+/// ended.
+async fn owed_by_history(observed: &Observed, arn: &str, level: &str, case: &str) -> Vec<Record> {
+    let history = observed
+        .ok("GetExecutionHistory", &json!({ "executionArn": arn }))
+        .await;
+    let events = history
+        .get("events")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_else(|| panic!("case {case:?}: expected a history, got {history:?}"));
+    let mut owed: Vec<Record> = Vec::new();
+    let mut redrives: i64 = 0;
+    for event in &events {
+        let event_type = event
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("case {case:?}: expected an event type, got {event:?}"));
+        let id = event
+            .get("id")
+            .and_then(Value::as_i64)
+            .unwrap_or_else(|| panic!("case {case:?}: expected an event id, got {event:?}"));
+        let written_at = redrives;
+        if event_type == "ExecutionRedriven" {
+            redrives += 1;
+        }
+        if observability::delivered_at_level(level, event_type) {
+            owed.push((
+                id.to_string(),
+                event_type.to_string(),
+                written_at.to_string(),
+            ));
+        }
+    }
+    owed
+}
+
+/// The delivered messages of `group`, waited for until it holds at least `wanted` of
+/// them — so a row that must then count them is not reading a delivery in flight, and a
+/// group that holds MORE than the history selects is still reported by the count below
+/// rather than hidden by the wait.
+async fn delivered_at_least(
+    observed: &Observed,
+    group: &str,
+    wanted: usize,
+    case: &str,
+) -> Vec<Value> {
+    let deadline = Instant::now() + DELIVERY_DEADLINE;
+    loop {
+        let messages = crate::vended_log_event_members::delivered(observed, case, group).await;
+        if messages.len() >= wanted {
+            return messages;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected {wanted} delivered events in {group} within \
+             {DELIVERY_DEADLINE:?}, got {messages:?}"
+        );
+        ::tokio::time::sleep(POLL).await;
+    }
+}
+
+/// An execution a redrive re-ran delivers each of its history events ONCE: its group
+/// holds one record per event the level selects — one `ExecutionFailed` per failed
+/// attempt — and no event is written a second time by a later attempt's delivery.
+///
+/// The rows differ along what the rule generalises over: the `level` that selects the
+/// records (`ALL`, `ERROR`, `FATAL` — every value of `LogLevel` that logs anything) and
+/// how many times the execution is redriven (once and twice, so a row with three
+/// attempts is not a repeat of a row with two).
+#[tokio::test]
+async fn a_redriven_run_delivers_each_of_its_events_once() {
+    let observed = Observed::new();
+
+    // (case, the configuration's level, how many times the execution is redriven)
+    let rows: Vec<(&str, &str, usize)> = vec![
+        (
+            "redriven once, logged at ALL",
+            observability::LOG_LEVEL_ALL,
+            1,
+        ),
+        (
+            "redriven once, logged at ERROR",
+            observability::LOG_LEVEL_ERROR,
+            1,
+        ),
+        (
+            "redriven once, logged at FATAL",
+            observability::LOG_LEVEL_FATAL,
+            1,
+        ),
+        (
+            "redriven twice, logged at ALL",
+            observability::LOG_LEVEL_ALL,
+            2,
+        ),
+        (
+            "redriven twice, logged at FATAL",
+            observability::LOG_LEVEL_FATAL,
+            2,
+        ),
+    ];
+
+    for (index, (case, level, redrives)) in rows.into_iter().enumerate() {
+        let group = format!("/aws/vendedlogs/states/attempts-{index}");
+        observed
+            .logs("CreateLogGroup", &json!({ "logGroupName": group }))
+            .await;
+        let machine = create(
+            &observed,
+            &format!("attempts-{index}"),
+            FAILING_DEFINITION,
+            "STANDARD",
+            Some(logging(level, &group, true)),
+        )
+        .await;
+        let started = observed
+            .ok(
+                "StartExecution",
+                &json!({ "stateMachineArn": machine, "name": "run", "input": "{}" }),
+            )
+            .await;
+        let execution = string(&started, "executionArn");
+        let status = settled(&observed, &execution, case).await;
+        assert_eq!(
+            status, "FAILED",
+            "case {case:?}: expected the first attempt to fail, got {status:?}"
+        );
+
+        for attempt in 0..redrives {
+            observed
+                .ok(
+                    "RedriveExecution",
+                    &json!({ "executionArn": execution.clone() }),
+                )
+                .await;
+            let status = settled(&observed, &execution, case).await;
+            assert_eq!(
+                status, "FAILED",
+                "case {case:?}: expected redriven attempt {} to fail, got {status:?}",
+                attempt + 1
+            );
+        }
+
+        let owed = owed_by_history(&observed, &execution, level, case).await;
+        let messages = delivered_at_least(&observed, &group, owed.len(), case).await;
+        // One record per event the level selects, each naming its own history event and
+        // the attempt it belongs to: a record written twice would be an id delivered
+        // twice, and an attempt's events reporting the latest count would be a
+        // `redrive_count` that is not the one its own attempt ran under.
+        assert_eq!(
+            records(&messages, case),
+            owed,
+            "case {case:?}: expected one delivered record per selected history event, each with \
+             the redrive count its attempt ran under, got {messages:?}"
+        );
+        // One `ExecutionFailed` per attempt that failed — the count a client reads out of
+        // the group — stated without the history, so the row pins the figure itself.
+        let attempts = redrives + 1;
+        assert_eq!(
+            per_type(&messages)
+                .get(EVENT_EXECUTION_FAILED)
+                .copied()
+                .unwrap_or_default(),
+            attempts,
+            "case {case:?}: expected one ExecutionFailed record per failed attempt, got \
+             {messages:?}"
+        );
+        // The boundary event's own DETAIL reports the redrive it made — "the number of
+        // times you've redriven an execution" — beside an envelope that still reads the
+        // count before it, so the two are not two spellings of one figure.
+        for (position, message) in messages
+            .iter()
+            .filter(|message| message.get("type").and_then(Value::as_str) == Some("ExecutionRedriven"))
+            .enumerate()
+        {
+            let reached = i64::try_from(position).expect("the count fits") + 1;
+            assert_eq!(
+                message
+                    .get("details")
+                    .and_then(|details| details.get("redriveCount"))
+                    .and_then(Value::as_i64),
+                Some(reached),
+                "case {case:?}: expected the boundary event to report the redrive it reached, \
+                 got {message:?}"
+            );
+        }
+    }
 }

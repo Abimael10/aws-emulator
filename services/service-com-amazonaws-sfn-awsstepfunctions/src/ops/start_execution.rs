@@ -608,6 +608,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Nothing of this execution's history has been counted into the series its
             // tasks publish yet.
             observed_events: 0,
+            // And nothing of it has been delivered to a log group yet.
+            delivered_events: 0,
         };
 
         // Phase 3, under the lock again: admit it. Every check is re-made, because

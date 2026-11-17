@@ -2504,6 +2504,8 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
                 // Nothing of this child's history has been counted into the series its
                 // tasks publish yet.
                 observed_events: 0,
+                // And nothing of it has been delivered to a log group yet.
+                delivered_events: 0,
             };
             recorded.push(record.arn.clone());
             self.insert_child_execution(record);

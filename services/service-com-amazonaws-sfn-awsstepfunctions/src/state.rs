@@ -1941,6 +1941,22 @@ pub struct Execution {
     /// events past it are the ones not counted yet, which is what makes an event
     /// counted exactly once however many times the store is settled.
     pub observed_events: usize,
+    /// How many of this execution's history events have been HANDED to the log group
+    /// its state machine's `loggingConfiguration` names
+    /// ([`ComAmazonawsSfnAwsstepfunctionsState::observe_execution_settled`]).
+    ///
+    /// A cursor into the history for the same reason [`Self::observed_events`] is one:
+    /// the history only ever grows, so the events past it are the ones the log stream
+    /// has not carried yet. A delivery is what the execution's log says HAPPENED, so
+    /// each event belongs in it once — and an execution a redrive re-ran has the events
+    /// of its earlier attempts in it already, which is what keeps the second attempt's
+    /// delivery from writing the first attempt's records a second time.
+    ///
+    /// It moves whether or not that delivery carried anything — a configuration that
+    /// logs nothing, a level that selected none of these events — because the delivery
+    /// is LIVE: a group a configuration starts naming carries what happens from then on
+    /// rather than the history of the attempts before it.
+    pub delivered_events: usize,
 }
 
 /// How many distinct READS one execution's history remembers handing cursors out

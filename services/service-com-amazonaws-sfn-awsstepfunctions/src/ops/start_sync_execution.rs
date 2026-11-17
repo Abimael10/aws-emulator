@@ -566,6 +566,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The run's history arrives complete, and is counted into the series its
             // tasks publish as the record is stored.
             observed_events: 0,
+            // It is delivered to the log group its configuration names at that same
+            // instant, so nothing of it has been delivered yet either.
+            delivered_events: 0,
         };
 
         // `inputDetails`/`outputDetails` say whether the data itself is included: it

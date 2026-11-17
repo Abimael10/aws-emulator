@@ -633,10 +633,16 @@ fn log_stream_of(state_machine_name: &str, execution_name: &str) -> String {
 ///
 /// The envelope members are the event's own identity — the id, the type, the event it
 /// follows and the instant it happened — beside the execution it belongs to and how
-/// many times that execution has been redriven, which is what makes a delivered event
-/// traceable back to the history it came from and tells a redriven run from a first
-/// one. Every one of them is carried as TEXT, which is the form a vended event's
-/// numeric members are delivered in.
+/// many times that execution had been redriven when the event was written
+/// (`redrive_count`), which is what makes a delivered event traceable back to the
+/// history it came from and tells an event of a redriven attempt from one of the first.
+/// Every one of them is carried as TEXT, which is the form a vended event's numeric
+/// members are delivered in.
+///
+/// `redrive_count` is therefore the count AS OF this event rather than the count the
+/// record carries now ([`delivered_messages`]): a history "append[s] their event
+/// history to the existing event history", so the events of each attempt keep the count
+/// their own attempt ran under however many times the execution is redriven afterwards.
 ///
 /// `details` is the event's own detail object ([`log_details`]), the same detail
 /// `GetExecutionHistory` reports for that event type, so a consumer can join a log
@@ -648,6 +654,7 @@ fn log_stream_of(state_machine_name: &str, execution_name: &str) -> String {
 fn log_message(
     event: &super::HistoryEvent,
     execution: &super::Execution,
+    redrive_count: i32,
     include_execution_data: bool,
 ) -> String {
     let mut message = ::serde_json::Map::new();
@@ -678,9 +685,46 @@ fn log_message(
     );
     message.insert(
         "redrive_count".to_string(),
-        execution.redrive_count.to_string().into(),
+        redrive_count.to_string().into(),
     );
     ::serde_json::Value::Object(message).to_string()
+}
+
+/// The log messages the history events of `execution` from the position `from` on owe
+/// the log group, as `(instant in epoch milliseconds, message)` — the events `level`
+/// selects, each carrying the redrive count its OWN attempt ran under.
+///
+/// `from` is how far the stream has already been written
+/// ([`super::Execution::delivered_events`]), so an attempt delivers the events it added
+/// and leaves the records of the attempts before it where they are.
+///
+/// The count one event was written at is counted off the history itself: an attempt
+/// opens with the `ExecutionRedriven` event that redrove it, and the increment that
+/// redrive made is visible from the events it PRODUCED on — so the boundary event
+/// itself carries the count of the attempt that ended, and every event after it the
+/// count of the attempt it belongs to.
+fn delivered_messages(
+    execution: &super::Execution,
+    level: &str,
+    include_execution_data: bool,
+    from: usize,
+) -> Vec<(i64, String)> {
+    let mut messages: Vec<(i64, String)> = Vec::new();
+    let mut redrives: i32 = 0;
+    for (position, event) in execution.history.iter().enumerate() {
+        let written_at = redrives;
+        if event.event_type == super::EVENT_EXECUTION_REDRIVEN {
+            redrives = redrives.saturating_add(1);
+        }
+        if position < from || !delivered_at_level(level, &event.event_type) {
+            continue;
+        }
+        messages.push((
+            epoch_millis(event.timestamp),
+            log_message(event, execution, written_at, include_execution_data),
+        ));
+    }
+    messages
 }
 
 /// The members of a vended event's `details` that carry the execution's own PAYLOAD.
@@ -1076,6 +1120,12 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
     /// Called by the one place an owed outcome is materialised (`settle`) and by
     /// [`Self::observe_execution_started`] for a record that arrives terminal, so
     /// every execution that ends is counted exactly once.
+    ///
+    /// The DELIVERY is of the events the ending attempt added, which is what the log
+    /// group of an execution a redrive re-ran holds one record per event of: each
+    /// attempt writes its own events and the attempts before it keep theirs, so a
+    /// client counting the failures in that group counts one per failed attempt
+    /// ([`super::Execution::delivered_events`]).
     pub(super) fn observe_execution_settled(&mut self, execution_arn: &str) {
         let Some(execution) = self.executions.get(execution_arn) else {
             return;
@@ -1127,21 +1177,20 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         let queued = execution_datapoints(execution, &measured, stopped);
         // The events the state machine's logging configuration delivers, selected by
         // its own `level` and carrying the execution data only where it asks for it.
+        // Only the events this attempt added are delivered: the ones before the
+        // execution's own cursor ([`super::Execution::delivered_events`]) are already in
+        // the log group, written when the attempt that produced them ended.
+        let delivered_through = execution.history.len();
         let delivery = machine.and_then(|machine| {
             let configuration = machine.logging_configuration.as_ref()?;
             let level = configuration.level.as_deref().unwrap_or(super::LOG_LEVEL_OFF);
             let (region, log_group) = log_group_of(configuration)?;
-            let events: Vec<(i64, String)> = execution
-                .history
-                .iter()
-                .filter(|event| delivered_at_level(level, &event.event_type))
-                .map(|event| {
-                    (
-                        epoch_millis(event.timestamp),
-                        log_message(event, execution, configuration.include_execution_data),
-                    )
-                })
-                .collect();
+            let events = delivered_messages(
+                execution,
+                level,
+                configuration.include_execution_data,
+                execution.delivered_events,
+            );
             (!events.is_empty()).then(|| Delivery {
                 log_group,
                 region,
@@ -1149,6 +1198,12 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
                 events,
             })
         });
+        // The cursor moves over every event this attempt ended with, whether or not the
+        // delivery carried any of them, for the reason that member states: a log group
+        // carries what happens from the instant its configuration names it on.
+        if let Some(execution) = self.executions.get_mut(execution_arn) {
+            execution.delivered_events = delivered_through;
+        }
         for datapoint in queued {
             self.pending_observations.queue_datapoint(datapoint);
         }
