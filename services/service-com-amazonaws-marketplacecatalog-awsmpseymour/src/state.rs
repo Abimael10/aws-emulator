@@ -26,10 +26,13 @@ use crate::ops::types::{
     ExpressPrivateOfferConfigurationSummary, Filter, FrameworkFilters, FrameworkSummary,
     MachineLearningProductSummary, OfferSetSummary, OfferSummary, ResaleAuthorizationSummary,
     ResourceInUseException, ResourceNotFoundException, SaaSProductSummary, Tag,
-    ValidationException, AMI_PRODUCT_SORT_BY_VALUES, CONTAINER_PRODUCT_SORT_BY_VALUES,
-    DATA_PRODUCT_SORT_BY_VALUES, EXPRESS_PRIVATE_OFFER_CONFIGURATION_SORT_BY_VALUES,
-    MACHINE_LEARNING_PRODUCT_SORT_BY_VALUES, OFFER_SET_SORT_BY_VALUES, OFFER_SORT_BY_VALUES,
-    RESALE_AUTHORIZATION_SORT_BY_VALUES, SAA_S_PRODUCT_SORT_BY_VALUES,
+    ValidationException, AMI_PRODUCT_SORT_BY_VALUES, AMI_PRODUCT_VISIBILITY_STRING_VALUES,
+    CONTAINER_PRODUCT_SORT_BY_VALUES, CONTAINER_PRODUCT_VISIBILITY_STRING_VALUES,
+    DATA_PRODUCT_SORT_BY_VALUES, DATA_PRODUCT_VISIBILITY_STRING_VALUES,
+    EXPRESS_PRIVATE_OFFER_CONFIGURATION_SORT_BY_VALUES, MACHINE_LEARNING_PRODUCT_SORT_BY_VALUES,
+    MACHINE_LEARNING_PRODUCT_VISIBILITY_STRING_VALUES, OFFER_SET_SORT_BY_VALUES,
+    OFFER_SORT_BY_VALUES, RESALE_AUTHORIZATION_SORT_BY_VALUES, SAA_S_PRODUCT_SORT_BY_VALUES,
+    SAA_S_PRODUCT_VISIBILITY_STRING_VALUES,
 };
 
 /// The only catalog this service serves.
@@ -369,10 +372,15 @@ pub const ENTITY_NAME_DETAIL_MEMBERS: &[&str] = &["ProductTitle", "Name"];
 /// per-type summary and `*VisibilityFilter` in the model gives it.
 pub const ENTITY_VISIBILITY_DETAIL_MEMBER: &str = "Visibility";
 
-/// The `Visibility` values an entity may carry: the union of the model's five
-/// `*VisibilityString` enums (`AmiProductVisibilityString`,
-/// `ContainerProductVisibilityString`, `DataProductVisibilityString`,
-/// `MachineLearningProductVisibilityString`, `SaaSProductVisibilityString`).
+/// The `Visibility` values an entity of a type the model declares no visibility
+/// enum for may carry: the union of the model's five `*VisibilityString` enums
+/// (`AmiProductVisibilityString`, `ContainerProductVisibilityString`,
+/// `DataProductVisibilityString`, `MachineLearningProductVisibilityString`,
+/// `SaaSProductVisibilityString`).
+///
+/// A type that HAS such an enum is bounded by that enum alone and never by this
+/// union — see [`entity_type_visibility_values`], which is what every read and
+/// write of an entity's `Visibility` goes through.
 pub const ENTITY_VISIBILITY_VALUES: &[&str] =
     &["Draft", "Limited", "Public", "Restricted", "Unavailable"];
 
@@ -1097,7 +1105,8 @@ pub struct EntityRecord {
     /// makes `EntityIdentifier` (`<id>@<revision>`) move when the entity does.
     pub revision: u32,
     pub name: Option<String>,
-    /// One of [`ENTITY_VISIBILITY_VALUES`].
+    /// One of the values this entity's own type publishes
+    /// ([`entity_type_visibility_values`]).
     pub visibility: String,
     /// `DateTimeISO8601`: `....-..-..T..:..:..Z`.
     pub last_modified_date: String,
@@ -1132,7 +1141,7 @@ impl EntityRecord {
     /// shape.
     fn product_summary(&self, entity_type: &str) -> Option<(Option<String>, Option<String>)> {
         (self.entity_type == entity_type && PRODUCT_ENTITY_TYPES.contains(&entity_type))
-            .then(|| (self.summary_name(), Some(self.visibility.clone())))
+            .then(|| (self.summary_name(), self.summary_visibility()))
     }
 
     /// The `EntitySummary` projection `ListEntities` reports.
@@ -1242,6 +1251,18 @@ impl EntityRecord {
         entity_name_contract(&self.entity_type)
             .admits_text(&name)
             .then_some(name)
+    }
+
+    /// The `Visibility` this entity's per-type summary reports: the value the
+    /// record holds, when the enum that summary member targets publishes it
+    /// ([`entity_visibility_contract`]).
+    ///
+    /// Judged here as well as on the write path, for the same reason
+    /// [`EntityRecord::summary_name`] is.
+    fn summary_visibility(&self) -> Option<String> {
+        entity_visibility_contract(&self.entity_type)
+            .admits_text(&self.visibility)
+            .then(|| self.visibility.clone())
     }
 
     /// The string this entity's summary reports at `member`: the string the
@@ -1473,6 +1494,43 @@ pub fn entity_type_sort_by_values(entity_type: &str) -> &'static [&'static str] 
         "SaaSProduct" => SAA_S_PRODUCT_SORT_BY_VALUES,
         _ => ENTITY_SORT_BY,
     }
+}
+
+/// The `Visibility` values the model declares for `entity_type`: the values of
+/// that type's own `*VisibilityString` enum.
+///
+/// One value is reported by two members, exactly as an entity's name is
+/// ([`entity_name_contract`]): `EntitySummary$Visibility` reports it for every
+/// type and is bounded only by `VisibilityValue`'s length and pattern, while the
+/// summary of a type that declares its own visibility enum reports the same
+/// value through that enum (`SaaSProductSummary$Visibility` targets
+/// `SaaSProductVisibilityString`) and that type's `*VisibilityFilter` selects on
+/// it through the same enum — so for such a type the value has to be one that
+/// enum publishes, the narrower of the two. Those enums are rendered from the
+/// model into the `*_VISIBILITY_STRING_VALUES` constant of that name in
+/// `crate::ops::types`, and this answers those constants themselves, so a value
+/// added to or dropped from one of them moves the set this service accepts,
+/// stores and reports for that type with it — the five do not publish the same
+/// values. A type the model declares no visibility enum for reports its
+/// visibility through the common member alone, so what bounds it is the set
+/// those enums publish between them ([`ENTITY_VISIBILITY_VALUES`]).
+pub fn entity_type_visibility_values(entity_type: &str) -> &'static [&'static str] {
+    match entity_type {
+        "AmiProduct" => AMI_PRODUCT_VISIBILITY_STRING_VALUES,
+        "ContainerProduct" => CONTAINER_PRODUCT_VISIBILITY_STRING_VALUES,
+        "DataProduct" => DATA_PRODUCT_VISIBILITY_STRING_VALUES,
+        "MachineLearningProduct" => MACHINE_LEARNING_PRODUCT_VISIBILITY_STRING_VALUES,
+        "SaaSProduct" => SAA_S_PRODUCT_VISIBILITY_STRING_VALUES,
+        _ => ENTITY_VISIBILITY_VALUES,
+    }
+}
+
+/// The contract the value an entity's `Visibility` is read from
+/// ([`ENTITY_VISIBILITY_DETAIL_MEMBER`]) has to satisfy for an entity of
+/// `entity_type`: the enumerated contract of the values that type publishes
+/// ([`entity_type_visibility_values`]).
+pub fn entity_visibility_contract(entity_type: &str) -> DetailContract {
+    choice(entity_type_visibility_values(entity_type))
 }
 
 /// The attributes a list of `entity_type` sorts on BEYOND [`ENTITY_SORT_BY`]:
@@ -2132,7 +2190,7 @@ impl ComAmazonawsMarketplacecatalogAwsmpseymourState {
                     if let Some(name) = detail_name(&entity_type, &members) {
                         entry.name = Some(name);
                     }
-                    if let Some(visibility) = detail_visibility(&members) {
+                    if let Some(visibility) = detail_visibility(&entity_type, &members) {
                         entry.visibility = visibility;
                     }
                     if let Value::Object(held) = &mut entry.details {
@@ -2742,15 +2800,17 @@ fn detail_name(entity_type: &str, members: &Map<String, Value>) -> Option<String
         .map(str::to_string)
 }
 
-/// The `Visibility` the details of an applied change give an entity, if any.
+/// The `Visibility` the details of an applied change give an entity of
+/// `entity_type`, if any.
 ///
-/// Only an applied change set reaches here, and a value outside
-/// [`ENTITY_VISIBILITY_VALUES`] fails the change set before it is applied
-/// ([`details_defects`]), so nothing outside the modelled set reaches a record.
-fn detail_visibility(members: &Map<String, Value>) -> Option<String> {
+/// Only an applied change set reaches here, and a value that type's own enum
+/// does not publish ([`entity_visibility_contract`]) fails the change set
+/// before it is applied ([`details_defects`]), so nothing outside the set the
+/// model declares for that type reaches a record.
+fn detail_visibility(entity_type: &str, members: &Map<String, Value>) -> Option<String> {
     let value = members.get(ENTITY_VISIBILITY_DETAIL_MEMBER)?.as_str()?;
-    ENTITY_VISIBILITY_VALUES
-        .contains(&value)
+    entity_visibility_contract(entity_type)
+        .admits_text(value)
         .then(|| value.to_string())
 }
 
@@ -3088,10 +3148,10 @@ const EXPRESS_PRIVATE_OFFER_CONFIGURATION_SUMMARY_MEMBERS: &[(&str, DetailContra
 /// the contract the model declares for the summary member that reports it.
 ///
 /// The five `*ProductSummary` shapes report only the entity's name and its
-/// visibility, which [`entity_name_contract`] and [`ENTITY_VISIBILITY_VALUES`]
-/// bound for every type, so a product type names nothing further here — and
-/// neither does a type whose summary the model does not declare
-/// ([`SHAPED_ENTITY_TYPES`]).
+/// visibility, which [`entity_name_contract`] and
+/// [`entity_visibility_contract`] bound per type, so a product type names
+/// nothing further here — and neither does a type whose summary the model does
+/// not declare ([`SHAPED_ENTITY_TYPES`]).
 fn summary_member_contracts(entity_type: &str) -> &'static [(&'static str, DetailContract)] {
     match entity_type {
         "Offer" => OFFER_SUMMARY_MEMBERS,
@@ -3177,9 +3237,9 @@ pub fn entity_name_contract(entity_type: &str) -> DetailContract {
 /// `@pattern` of a member targeting a string shape. The member an entity's
 /// `Name` comes from ([`ENTITY_NAME_DETAIL_MEMBERS`]) is bounded by
 /// [`entity_name_contract`], the one its `Visibility` comes from
-/// ([`ENTITY_VISIBILITY_DETAIL_MEMBER`]) by the values the model's
-/// `*VisibilityString` enums publish ([`ENTITY_VISIBILITY_VALUES`]), and every
-/// member the listed entity's per-type summary reports by
+/// ([`ENTITY_VISIBILITY_DETAIL_MEMBER`]) by the values the `*VisibilityString`
+/// enum of the entity's own type publishes ([`entity_visibility_contract`]), and
+/// every member the listed entity's per-type summary reports by
 /// [`summary_member_contracts`]. A member NO summary reports is carried into
 /// the entity's details untouched and reported only inside the opaque `Details`
 /// document, so nothing here judges it.
@@ -3196,14 +3256,12 @@ pub fn details_defects(entity_type: &str, details: Option<&Value>) -> Vec<ErrorD
             }
         }
     }
+    let visibility = entity_visibility_contract(entity_type);
     if let Some(value) = members.get(ENTITY_VISIBILITY_DETAIL_MEMBER) {
-        if value
-            .as_str()
-            .is_none_or(|text| !ENTITY_VISIBILITY_VALUES.contains(&text))
-        {
+        if !visibility.admits(value) {
             defects.push(invalid_detail_value(
                 ENTITY_VISIBILITY_DETAIL_MEMBER,
-                &format!("one of {ENTITY_VISIBILITY_VALUES:?}"),
+                &visibility.accepts(),
                 value,
             ));
         }

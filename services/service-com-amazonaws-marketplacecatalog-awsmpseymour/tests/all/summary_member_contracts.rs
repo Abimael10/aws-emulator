@@ -125,6 +125,50 @@ const ENUMERATED_MEMBERS: &[(&str, &str, &str, &[&str], bool)] = &[
     ),
 ];
 
+/// The `Visibility` values the model publishes for each entity type, written out here
+/// from the model rather than read from the crate (`smithy_query(query="shape",
+/// shape="AmiProductVisibilityString,ContainerProductVisibilityString,
+/// DataProductVisibilityString,MachineLearningProductVisibilityString,
+/// SaaSProductVisibilityString")`): the five enums do NOT publish the same values, and
+/// `DataProductVisibilityString` is the only one that publishes `Unavailable`.
+///
+/// `(entity type, the values its own enum publishes, the per-type summary member that
+/// reports them beside `EntitySummary$Visibility`)`. A type the model declares no
+/// visibility enum for carries no such member, and its value is bounded by what the five
+/// publish between them.
+const VISIBILITY_TYPES: &[(&str, &[&str], Option<&str>)] = &[
+    (
+        "AmiProduct",
+        &["Limited", "Public", "Restricted", "Draft"],
+        Some("AmiProductSummary"),
+    ),
+    (
+        "ContainerProduct",
+        &["Limited", "Public", "Restricted", "Draft"],
+        Some("ContainerProductSummary"),
+    ),
+    (
+        "DataProduct",
+        &["Limited", "Public", "Restricted", "Unavailable", "Draft"],
+        Some("DataProductSummary"),
+    ),
+    (
+        "MachineLearningProduct",
+        &["Limited", "Public", "Restricted", "Draft"],
+        Some("MachineLearningProductSummary"),
+    ),
+    (
+        "SaaSProduct",
+        &["Limited", "Public", "Restricted", "Draft"],
+        Some("SaaSProductSummary"),
+    ),
+    (
+        "Offer",
+        &["Limited", "Public", "Restricted", "Unavailable", "Draft"],
+        None,
+    ),
+];
+
 /// How long after the start a change set has certainly ended its run: the two spans the
 /// implementation publishes, plus a margin for a slow machine.
 fn wait_for_the_end_of_the_run() {
@@ -862,6 +906,150 @@ async fn every_published_value_of_an_enumerated_summary_member_is_accepted_and_n
     }
     for ((case, _, _, member), id) in refused.iter().zip(ids.iter().skip(accepted.len())) {
         assert_refused(&router, case, id, member).await;
+    }
+}
+
+/// An entity's `Visibility` is judged against the enum the model declares for ITS OWN
+/// type: every value that type's enum publishes is applied and reported, and a value the
+/// enum does not publish fails the change set and is reported by no projection — even when
+/// another type's enum publishes it.
+///
+/// The rows span every type the model declares a visibility enum for and one it declares
+/// none for, each with every value its own enum publishes ([`VISIBILITY_TYPES`]) and, as
+/// the refused cases, the values published for another type but not this one plus a value
+/// no enum publishes at all.
+#[tokio::test]
+async fn an_entity_visibility_is_judged_against_its_own_types_enum() {
+    // Every value some type publishes, so a value refused for one type can be the value
+    // another type accepts.
+    let published_somewhere: Vec<&str> = {
+        let mut values: Vec<&str> = Vec::new();
+        for (_, published, _) in VISIBILITY_TYPES {
+            for value in *published {
+                if !values.contains(value) {
+                    values.push(value);
+                }
+            }
+        }
+        values
+    };
+
+    // (case, entity type, details, the per-type summary member, the expected value)
+    let mut accepted: Vec<(String, &'static str, Value, Option<&'static str>, String)> = Vec::new();
+    // (case, entity type, details, the member the reported defect names)
+    let mut refused: Vec<(String, &'static str, Value, &'static str)> = Vec::new();
+    for (entity_type, published, summary_member) in VISIBILITY_TYPES {
+        assert!(
+            !published.contains(&OUTSIDE_EVERY_SET),
+            "{entity_type} must not publish the value this test holds outside every set, \
+             got {published:?}"
+        );
+        for value in *published {
+            let named = with(
+                &json!({}),
+                name_member(entity_type),
+                json!(format!("{entity_type}-visibility-{value}")),
+            );
+            accepted.push((
+                format!("{entity_type} Visibility {value:?}, which it publishes"),
+                entity_type,
+                with(&named, "Visibility", json!(value)),
+                *summary_member,
+                (*value).to_string(),
+            ));
+        }
+        let outside: Vec<&str> = published_somewhere
+            .iter()
+            .copied()
+            .filter(|value| !published.contains(value))
+            .chain(std::iter::once(OUTSIDE_EVERY_SET))
+            .collect();
+        for value in outside {
+            let named = with(
+                &json!({}),
+                name_member(entity_type),
+                json!(format!("{entity_type}-rejected-{value}")),
+            );
+            refused.push((
+                format!("{entity_type} Visibility {value:?}, which it does not publish"),
+                entity_type,
+                with(&named, "Visibility", json!(value)),
+                "Visibility",
+            ));
+        }
+    }
+    assert!(
+        refused
+            .iter()
+            .any(|(case, _, _, _)| case.starts_with("SaaSProduct") && case.contains("Unavailable")),
+        "the cases must cover a value another type's enum publishes and this one's does \
+         not, got {:?}",
+        refused.iter().map(|(case, ..)| case).collect::<Vec<_>>()
+    );
+
+    let router = emulator();
+    let mut rows: Vec<Row> = accepted
+        .iter()
+        .map(|(case, entity_type, details, _, _)| (case.clone(), *entity_type, details.clone()))
+        .collect();
+    rows.extend(
+        refused
+            .iter()
+            .map(|(case, entity_type, details, _)| (case.clone(), *entity_type, details.clone())),
+    );
+    let ids = run_rows(&router, &rows).await;
+
+    for ((case, entity_type, details, summary_member, value), id) in accepted.iter().zip(&ids) {
+        let described = describe_change_set(&router, id).await;
+        assert_eq!(
+            described.text("/Status"),
+            "SUCCEEDED",
+            "case {case:?}: a value the type's own enum publishes must be applied, got {:?}",
+            described.body
+        );
+        let summary = listed_by_name(&router, case, entity_type, details).await;
+        assert_eq!(
+            summary.pointer("/Visibility"),
+            Some(&json!(value)),
+            "case {case:?}: the summary must report the applied visibility, got {summary:?}"
+        );
+        if let Some(member) = summary_member {
+            let pointer = format!("/{member}/Visibility");
+            assert_eq!(
+                summary.pointer(&pointer),
+                Some(&json!(value)),
+                "case {case:?}: the per-type summary must report it at {pointer}, got \
+                 {summary:?}"
+            );
+        }
+    }
+
+    for ((case, _, _, member), id) in refused.iter().zip(ids.iter().skip(accepted.len())) {
+        assert_refused(&router, case, id, member).await;
+    }
+
+    // The other side of the same rule: nothing this catalog serves for a type reports a
+    // visibility that type's enum does not publish, in either member that reports it.
+    for (entity_type, published, summary_member) in VISIBILITY_TYPES {
+        for summary in list_entities(&router, entity_type).await {
+            let common = summary["Visibility"].as_str().unwrap_or_default();
+            assert!(
+                published.contains(&common),
+                "{entity_type}: EntitySummary$Visibility must report a value the type \
+                 publishes ({published:?}), got {common:?} in {summary:?}"
+            );
+            if let Some(member) = summary_member {
+                let own = summary
+                    .pointer(&format!("/{member}/Visibility"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                assert!(
+                    published.contains(&own),
+                    "{entity_type}: {member}$Visibility must report a value the type \
+                     publishes ({published:?}), got {own:?} in {summary:?}"
+                );
+            }
+        }
     }
 }
 

@@ -15,7 +15,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_marketplacecatalog_awsmpseymour::state::{
-    CHANGE_SET_APPLYING, CHANGE_SET_PREPARING, ENTITY_VISIBILITY_VALUES, MAX_DETAILS_DEPTH,
+    entity_type_visibility_values, CHANGE_SET_APPLYING, CHANGE_SET_PREPARING, MAX_DETAILS_DEPTH,
     PRODUCT_ENTITY_TYPES,
 };
 use service_com_amazonaws_marketplacecatalog_awsmpseymour::EmulatedService;
@@ -868,8 +868,8 @@ async fn a_change_against_an_existing_entity_updates_it() {
 }
 
 /// An entity's `Visibility` is the one its applied details named, over the whole set the
-/// model's `*VisibilityString` enums publish — and a value outside that set is not
-/// applied at all.
+/// `*VisibilityString` enum of its own type publishes — and a value outside that set is
+/// not applied at all.
 #[tokio::test]
 async fn an_entity_reports_the_visibility_its_details_named() {
     let router = emulator();
@@ -894,8 +894,9 @@ async fn an_entity_reports_the_visibility_its_details_named() {
         listed.body
     );
 
-    // Then every published value, including the ones the issue never cited.
-    for visibility in ENTITY_VISIBILITY_VALUES {
+    // Then every value this type's own enum publishes, including the ones the issue never
+    // cited.
+    for visibility in entity_type_visibility_values("DataProduct") {
         let router = emulator();
         let entity_id = created_entity(
             &router,

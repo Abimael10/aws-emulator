@@ -19,7 +19,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_marketplacecatalog_awsmpseymour::state::{
-    CHANGE_SET_APPLYING, CHANGE_SET_PREPARING, ENTITY_VISIBILITY_VALUES, MAX_RESOURCE_TAGS,
+    entity_type_visibility_values, CHANGE_SET_APPLYING, CHANGE_SET_PREPARING,
+    ENTITY_VISIBILITY_VALUES, MAX_RESOURCE_TAGS,
 };
 use service_com_amazonaws_marketplacecatalog_awsmpseymour::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -529,11 +530,13 @@ async fn a_change_set_whose_content_cannot_be_applied_fails_with_its_errors() {
 }
 
 /// The same rule's other side: details the catalog CAN read are applied, so a change set
-/// carrying them succeeds and reports no failure. Every value the model's
-/// `*VisibilityString` enums publish is such a value.
+/// carrying them succeeds and reports no failure. Every value the `*VisibilityString` enum
+/// of the entity's OWN type publishes is such a value.
 #[tokio::test]
 async fn a_change_set_whose_content_can_be_applied_reports_no_failure() {
-    let mut rows: Vec<(String, Value)> = ENTITY_VISIBILITY_VALUES
+    // These rows create an `AmiProduct`, so the values under test are the ones
+    // `AmiProductVisibilityString` publishes.
+    let mut rows: Vec<(String, Value)> = entity_type_visibility_values("AmiProduct")
         .iter()
         .map(|visibility| {
             (
