@@ -12,8 +12,12 @@
 //! modeled not-found.
 //!
 //! The table spans what the rule generalises over: the number of namespaces, the
-//! page size (including one past the number held), the prefix (one that matches
-//! every, some and no namespace), a resumed page, and the region.
+//! page size (including one past the number held and each bound the model
+//! publishes for it), the prefix (one that matches every, some and no
+//! namespace), a resumed page, and the region.
+//!
+//! Because the listing only reports, walking every page of a bucket leaves what
+//! a later caller sees exactly as it was.
 
 use serde_json::{json, Value};
 
@@ -239,6 +243,170 @@ async fn the_listing_reports_the_namespaces_the_bucket_holds() {
         "the other bucket must list its own namespace alone, got {body}",
         body = elsewhere.body
     );
+}
+
+/// The page size is served at each bound `ListNamespacesLimit` publishes and
+/// refused one past either of them. The bounds are the model's own —
+/// `ListNamespacesLimit` is `@range(min: 1, max: 1000)`
+/// (`smithy_query(query="shape", shape="ListNamespacesLimit")`) — so a value
+/// outside them never reaches the handler: the parameter validator in front of
+/// the service refuses it under its own code, which
+/// `tests/all/parameter_validation_refusals.rs` pins for the other members.
+#[tokio::test]
+async fn the_page_size_is_served_at_every_published_bound_and_refused_past_it() {
+    let emulator = Emulator::new();
+    let region = "us-west-2";
+    let held = ["beta", "alpha", "gamma"];
+    let bucket_arn = create_bucket(&emulator, region, "list-namespaces-bounds", &held).await;
+
+    // (the case, the page size, the namespaces the page must report, whether a
+    // continuation token must come back)
+    for (case, size, expected, expect_token) in [
+        ("the published minimum page size", 1, vec!["alpha"], true),
+        (
+            "the published maximum page size",
+            1000,
+            vec!["alpha", "beta", "gamma"],
+            false,
+        ),
+    ] {
+        let reply = emulator
+            .list_namespaces(region, &bucket_arn, &[("maxNamespaces", size.to_string())])
+            .await;
+        assert_eq!(
+            reply.status, 200,
+            "case {case:?}: a page size at a published bound must be served, got {status} {body}",
+            status = reply.status,
+            body = reply.body
+        );
+        let actual = listed(&reply.body, case);
+        assert_eq!(
+            actual, expected,
+            "case {case:?}: expected {expected:?}, got {actual:?}"
+        );
+        assert_eq!(
+            reply.optional_text("continuationToken").is_some(),
+            expect_token,
+            "case {case:?}: expected a continuation token: {expect_token}, got {token:?}",
+            token = reply.optional_text("continuationToken")
+        );
+    }
+
+    // (the case, the page size sent, the requirement the refusal must state)
+    for (case, size, requirement) in [
+        (
+            "one under the published minimum",
+            "0",
+            "Member must have value greater than or equal to 1",
+        ),
+        (
+            "one over the published maximum",
+            "1001",
+            "Member must have value less than or equal to 1000",
+        ),
+    ] {
+        let refused = emulator
+            .list_namespaces(region, &bucket_arn, &[("maxNamespaces", size.to_string())])
+            .await;
+        assert_eq!(
+            refused.status, 400,
+            "case {case:?}: expected 400, got {status} {body}",
+            status = refused.status,
+            body = refused.body
+        );
+        assert_eq!(
+            refused.error_code.as_deref(),
+            Some("ValidationException"),
+            "case {case:?}: expected ValidationException, got {actual:?}",
+            actual = refused.error_code
+        );
+        assert_eq!(
+            refused.message(),
+            format!(
+                "1 validation error detected: Value at 'maxNamespaces' failed to satisfy \
+                 constraint: {requirement}"
+            ),
+            "case {case:?}: expected the validator's envelope, got {actual:?}",
+            actual = refused.message()
+        );
+    }
+}
+
+/// The listing is a pure read: walking every page of a bucket changes nothing a
+/// later caller sees, whatever page size the walk uses.
+#[tokio::test]
+async fn walking_every_page_leaves_what_a_later_caller_sees_unchanged() {
+    let emulator = Emulator::new();
+    let region = "ap-south-1";
+    let held = ["ledger", "events", "events_raw"];
+    let in_order = vec!["events", "events_raw", "ledger"];
+    let bucket_arn = create_bucket(&emulator, region, "list-namespaces-reads", &held).await;
+
+    let before = emulator.list_namespaces(region, &bucket_arn, &[]).await;
+    assert_eq!(
+        listed(&before.body, "before the walk"),
+        in_order,
+        "the whole listing must report every namespace held, got {body}",
+        body = before.body
+    );
+
+    // One walk per page size, including a size smaller than the bucket holds, so
+    // the walk takes several pages and the token is used each time.
+    for size in [1, 2, 3] {
+        let case = format!("a walk in pages of {size}");
+        let mut walked: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        // A walk of a bucket holding N namespaces takes at most N pages of one;
+        // the bound keeps a token that never clears from looping forever.
+        for _ in 0..=held.len() {
+            let mut query = vec![("maxNamespaces", size.to_string())];
+            if let Some(resume) = &token {
+                query.push(("continuationToken", resume.clone()));
+            }
+            let page = emulator.list_namespaces(region, &bucket_arn, &query).await;
+            assert_eq!(
+                page.status, 200,
+                "case {case:?}: every page must be served, got {status} {body}",
+                status = page.status,
+                body = page.body
+            );
+            walked.extend(listed(&page.body, &case));
+            token = page.optional_text("continuationToken");
+            if token.is_none() {
+                break;
+            }
+        }
+        assert_eq!(
+            token, None,
+            "case {case:?}: the walk must reach a page carrying no token, got {token:?}"
+        );
+        assert_eq!(
+            walked, in_order,
+            "case {case:?}: the pages together must be the whole listing, expected \
+             {in_order:?}, got {walked:?}"
+        );
+
+        let after = emulator.list_namespaces(region, &bucket_arn, &[]).await;
+        assert_eq!(
+            after.body, before.body,
+            "case {case:?}: the walk must leave the listing unchanged, expected {expected}, got \
+             {actual}",
+            expected = before.body,
+            actual = after.body
+        );
+    }
+
+    // And each namespace still reads back on its own, so the walk consumed
+    // nothing the single read reports either.
+    for name in in_order {
+        let read = emulator.get_namespace(region, &bucket_arn, name).await;
+        assert_eq!(
+            read.status, 200,
+            "case {name:?}: the namespace must still read back, got {status} {body}",
+            status = read.status,
+            body = read.body
+        );
+    }
 }
 
 #[tokio::test]
